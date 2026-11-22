@@ -202,6 +202,7 @@ TEST(the_join_credits_each_segment_to_the_area_holding_its_midpoint_and_none_out
     size_t named = 0;
     for (size_t o = 0; o < b.objects.size(); o++) {
         if (b.objects[o].id != 30) continue;
+        REQUIRE(choices[o].named());
         named++;
         CHECK(b.lines.keys[choices[o].key] == "r900");
         CHECK(b.lines.displays[choices[o].display] == "Test River");
@@ -236,6 +237,7 @@ TEST(a_segment_of_no_length_lends_its_line_no_wikidata_item) {
     size_t named = 0;
     for (size_t o = 0; o < b.objects.size(); o++) {
         if (b.objects[o].id != 31) continue;
+        REQUIRE(choices[o].named());
         named++;
         CHECK(b.lines.keys[choices[o].key] == "nMill");
         CHECK_EQ(choices[o].qid, 50u);
@@ -321,7 +323,17 @@ TEST(a_regions_share_holds_the_polygons_its_cells_list_whole_with_their_names) {
     CHECK_EQ(region.identities[0], planet.identities[3]);
     CHECK_EQ(region.arcs.polygons.size(), size_t(1));
     CHECK_EQ(region.arcs.set(ArcSet::Full).arcs(), size_t(3));
-    for (const CellItemPair& c : region.cells) CHECK_EQ(c.item_id & ID_MASK, 0u);
+    // Its cells are the planet's it keeps, in their order, with their
+    // interior marks, each of the lake's new id.
+    std::vector<CellItemPair> cells;
+    for (size_t i = 0; i < planet.cells.size(); i++)
+        if (kept[i]) cells.push_back({planet.cells[i].cell_id, planet.cells[i].item_id & INTERIOR_FLAG});
+    REQUIRE(!cells.empty());
+    REQUIRE(region.cells.size() == cells.size());
+    for (size_t i = 0; i < cells.size(); i++) {
+        CHECK_EQ(region.cells[i].cell_id, cells[i].cell_id);
+        CHECK_EQ(region.cells[i].item_id, cells[i].item_id);
+    }
     CHECK(region.arcs.stage == &kWaterArcStage);
 }
 
@@ -548,6 +560,10 @@ TEST(polygons_of_one_object_meeting_at_their_smallest_vertex_keep_slots_of_their
     pinched.members = {{80, "outer"}, {81, "outer"}};
     c.relations.push_back(pinched);
     const Layer day1 = build(c);
+    // Each pair is two polygons of its own.
+    std::map<std::string, size_t> polygons;
+    for (size_t p = 0; p < day1.size(); p++) polygons[name_of(day1, p)]++;
+    for (const char* name : {"Pinched Sea", "Twice Sea", "Pinched Lake"}) CHECK_EQ(polygons[name], size_t(2));
     std::set<uint64_t> ids(day1.identities.begin(), day1.identities.end());
     CHECK_EQ(ids.size(), day1.size());
     // The next day, the same data: every polygon in its slot, no slot more.
@@ -852,13 +868,20 @@ TEST(a_waterway_relation_of_a_local_name_alone_shows_the_name_en_its_river_ways_
                        {82, "Χείμαρρος", nullptr, 2000}})) == Names({"Alpha River"}));
     // A relation none of whose ways is any length shows its own name.
     CHECK(shown(river("Χείμαρρος", nullptr, {{83, "Χείμαρρος", "Alpha River", 0}})) == Names({"Χείμαρρος"}));
-    // Another key's lines keep their names.
-    Collected c = fixture();
+    // Another key's lines keep their names beside a relation that shows its
+    // ways' name:en.
+    Collected c = river("小渋川", nullptr, {{51, "小渋川", "Koshibu River", 2000}});
+    const Collected others = fixture();
+    c.lines.insert(c.lines.end(), others.lines.begin(), others.lines.end());
+    CHECK(shown(c) == Names({"Koshibu River"}));
     const Build b = assemble(c, 1);
-    Names others;
-    for (const NamingLine& l : b.lines.lines)
-        if (b.lines.keys[l.key] == "r900") others.insert(b.lines.displays[l.display]);
-    CHECK(others == Names({"Test River"}));
+    Names main, tributary;
+    for (const NamingLine& l : b.lines.lines) {
+        if (b.lines.keys[l.key] == "r900") main.insert(b.lines.displays[l.display]);
+        if (b.lines.keys[l.key] == "nBach") tributary.insert(b.lines.displays[l.display]);
+    }
+    CHECK(main == Names({"Test River"}));
+    CHECK(tributary == Names({"Brook"}));
 }
 
 TEST(a_name_en_shows_once_its_ways_hold_more_than_half_of_their_rivers_length) {
@@ -989,20 +1012,22 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     const bool rewrite = std::getenv("GEOCODER_WRITE_TESTDATA") != nullptr;
     std::map<std::string, std::map<std::string, std::vector<char>>> days;
     for (const auto& [day, dir] : {std::pair<std::string, std::string>{"day1", one}, {"day2", two}, {"day3", three}}) {
-        const auto written = tree(dir + "/water/all/exact");
-        size_t client = 0;
-        for (const auto& [name, bytes] : written) {
-            if (name.size() > 8 && name.compare(name.size() - 8, 8, ".osm_ids") == 0) continue;
-            client++;
-            days[day][name] = bytes;
-            const std::string path = fixture_dir + "/" + day + "/" + name;
-            if (rewrite) {
+        for (const auto& [name, bytes] : tree(dir + "/water/all/exact"))
+            if (name.size() <= 8 || name.compare(name.size() - 8, 8, ".osm_ids") != 0) days[day][name] = bytes;
+        CHECK_EQ(days[day].size(), size_t(10));
+        // The day's fixture dir is those files and no other: the patch tests
+        // copy it whole.
+        const std::string day_dir = fixture_dir + "/" + day;
+        if (rewrite) {
+            fs::remove_all(day_dir);
+            for (const auto& [name, bytes] : days[day]) {
+                const std::string path = day_dir + "/" + name;
                 fs::create_directories(fs::path(path).parent_path());
                 std::ofstream(path, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
             }
-            CHECK(bytes_of(path) == bytes);
         }
-        CHECK_EQ(client, size_t(10));
+        REQUIRE(fs::is_directory(day_dir));
+        CHECK(tree(day_dir) == days[day]);
     }
     for (const char* f : {"water_meta.json", "attribution.json"}) {
         CHECK(days["day1"][f] == days["day2"][f]);
