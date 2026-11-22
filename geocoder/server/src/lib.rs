@@ -1959,7 +1959,11 @@ impl Index {
         // For each admin level, the smallest-area polygon holding the point, the first in
         // visiting order among equals (`ScanPip::holds`: an entry flagged interior holds it
         // without a test). Owned AdminPolygon values so the backing admin_polygons file can be a
-        // chunked source.
+        // chunked source. Nominatim ranks every boundary holding the point; a larger one of a
+        // level is left out here, as it would rank wrong where the boundary below it is one
+        // Nominatim takes out for repeating its parent (the same wikidata and geometry,
+        // placex_triggers.sql:895-899, which the polygons don't carry): Brussels' level 10
+        // boundary would rank 20 under Bruxelles - Brussel and name the suburb the Pentagon names.
         let mut best_by_level: [Option<AdminPolygon>; 12] = [None; 12];
         // Class='place' polygons (admin_level=15 marker) that cover the query point. These
         // drive the second-nested-check rule (placex_triggers.sql lines 944-963) — Nominatim
@@ -3045,7 +3049,12 @@ impl Index {
         // address_havelevel: the ranks the address's boundaries hold take no
         // place node. A boundary-derived city/town/village covers rank 16
         // whatever its rank, so place nodes must not fill (or fuzzy-anchor
-        // on) a competing rank-16 candidate.
+        // on) a competing rank-16 candidate. Nominatim gives a boundary its
+        // linked place's rank even below its own (placex_triggers.sql:1129):
+        // the parish of Winsford, linked to a town, ranks 16 where its
+        // admin_level gives 20. The place type here need not be the one
+        // Nominatim links, so promote_nested_ranks only raises, and the hold
+        // stands in for that rank.
         let rank16 = admin.city.is_some() || admin.town.is_some() || admin.village.is_some();
         let held_ranks = admin.boundary_ranks | if rank16 { 1 << CurrentBoundaries::CITY } else { 0 };
 

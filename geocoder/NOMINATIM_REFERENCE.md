@@ -118,6 +118,8 @@ What the polygons at a point cannot tell, and Nominatim decides on the whole geo
 - Every place type ranks a boundary (place=locality makes Northern Ireland's townlands rank 25); the builder keeps 14 types.
 - Levels 11 and 12 (level 11 holds the postal areas here), and administrative ways only at levels 8 to 12.
 
+Two rules wait for those. Nominatim ranks every boundary holding the point; here only the smallest of each admin_level is ranked, as a larger one round a replicated boundary would rank too high (Brussels' level 10 boundary under Bruxelles - Brussel would take the suburb from the Pentagon). And a boundary labelled city, town or village holds rank 16 from place nodes whatever its own rank, standing in for the linked place's rank that Nominatim gives it even below its own (the parish of Winsford ranks 16, its admin_level 20): holding only its own rank lets villages such as Argir in Tórshavn into the address.
+
 Smallest-area-wins then settles polygons that still map to the same output field (if two polygons both map to "county", the smaller one wins).
 
 ## Step 5: Competing polygons
