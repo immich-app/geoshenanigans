@@ -90,7 +90,8 @@ CLEANUP = "Cleanup old Tigris builds"
 
 # compress_index.py for a step run: one line in its log as a failed unit's, the status it is given.
 # What it took the place search's files on is the job's status, or none (none written, as past
-# its wait); a status in $LATE_SEARCH_STATUS is then written as the job's, too late.
+# its wait); a status in $LATE_SEARCH_STATUS is then written as the job's, too late. Its .zst,
+# one, is there once it is done (status 0 or 3).
 FAKE_COMPRESS = """\
 import os, sys
 print("planet/full/places.tt.zst: verify: place_nodes.bin differs; its files go as .zst")
@@ -102,21 +103,25 @@ if "--late-search-taken" in args:
 if os.environ.get("LATE_SEARCH_STATUS"):
     with open(status, "w") as f:
         f.write(os.environ["LATE_SEARCH_STATUS"])
-sys.exit(int(os.environ["COMPRESS_STATUS"]))
+code = int(os.environ["COMPRESS_STATUS"])
+if code in (0, 3):
+    open(os.path.join(args[0], "planet/full/geo_cells.bin.zst"), "w").close()
+sys.exit(code)
 """
 
 SEARCH_FILES = ("planet/search/full/simplified/all/places.fst", "planet/search/full/simplified/all/search_meta.json")
 
-# checksums.sh zst for a step run: one line, for the step's output dir alone.
+# checksums.sh zst for a step run: one line, for the step's output dir alone, once its .zst is there.
 ZST_LINE = "0" * 64 + "  ./planet/full/geo_cells.bin.zst"
 FAKE_CHECKSUMS = f"""#!/bin/sh
-[ "$1" = zst ] && [ "$2" = "$WORKDIR/output" ] || exit 2
+[ "$1" = zst ] && [ "$2" = "$WORKDIR/output" ] && [ -f "$2/planet/full/geo_cells.bin.zst" ] || exit 2
 echo "{ZST_LINE}"
 """
 
 
 def env_after(name, compress_status, search_status="0\n", late_status="", job=None, left=None):
-    """What the step `name` puts in GITHUB_ENV (a dict) when compress_index.py exits `compress_status`,
+    """What the step `name` (or each of a list of steps, one after the other in one workspace) puts in
+    GITHUB_ENV (a dict) when compress_index.py exits `compress_status`,
     run as Actions runs it, on a night of no variants, with s5cmd, compress_index.py,
     generate_patches.sh and checksums.sh that do nothing else, place-search built and the place
     search job's status `search_status` (None: none written), then `late_status` written as its
@@ -127,7 +132,7 @@ def env_after(name, compress_status, search_status="0\n", late_status="", job=No
     with tempfile.TemporaryDirectory() as tmp:
         ws, work, bin_dir = (os.path.join(tmp, d) for d in ("ws", "work", "bin"))
         tools = os.path.join(ws, "geocoder", "builder", "tools")
-        for d in (tools, os.path.join(work, "output"), bin_dir):
+        for d in (tools, os.path.join(work, "output", "planet", "full"), bin_dir):
             os.makedirs(d)
         for rel in SEARCH_FILES:
             os.makedirs(os.path.dirname(os.path.join(work, "output", rel)), exist_ok=True)
@@ -156,16 +161,20 @@ def env_after(name, compress_status, search_status="0\n", late_status="", job=No
         os.symlink(sys.executable, os.path.join(bin_dir, "python3"))
         github_env = os.path.join(tmp, "github_env")
         open(github_env, "w").close()
-        script = step_script(name)
-        assert "${{" not in script, f"{name}'s script takes an expression"
+        scripts = [(step_name, step_script(step_name)) for step_name in ([name] if isinstance(name, str) else name)]
+        for step_name, script in scripts:
+            assert "${{" not in script, f"{step_name}'s script takes an expression"
         env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_WORKSPACE": ws, "WORKDIR": work,
                "GITHUB_ENV": github_env, "GITHUB_STEP_SUMMARY": os.path.join(tmp, "summary"),
                "COMPRESS_STATUS": str(compress_status), "NEW_DATE": "2026-11-17", "OLD_DATE": "2026-11-16",
                "S3_ENDPOINT": "https://s3.invalid", "S3_BUCKET": "bucket", "S3_PREFIX": "geocoder",
                "TMPDIR": tmp, "RUNNER_TEMP": tmp, "LATE_SEARCH_STATUS": late_status}
         try:
-            r = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", script], env=env, capture_output=True,
-                               text=True, timeout=120)
+            for step_name, script in scripts:
+                r = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", script], env=env,
+                                   capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    break
             if job is not None:
                 job["running"] = alive(job["pid"])
                 job["search"] = sorted(rel for rel in SEARCH_FILES if os.path.exists(os.path.join(work, "output", rel)))
@@ -179,7 +188,7 @@ def env_after(name, compress_status, search_status="0\n", late_status="", job=No
             if job is not None and alive(job["pid"]):
                 os.kill(job["pid"], 9)
         if r.returncode != 0:
-            raise AssertionError(f"{name} exited {r.returncode}: {r.stdout}{r.stderr}")
+            raise AssertionError(f"{step_name} exited {r.returncode}: {r.stdout}{r.stderr}")
         with open(github_env) as f:
             return dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
 
@@ -275,6 +284,17 @@ class NightlyTransportTest(unittest.TestCase):
                 self.assertEqual(job["running"], not failed)
                 # The index files go once compressed, but for search_meta.json, which stays beside its .zst.
                 self.assertEqual(job["search"], [] if failed else [SEARCH_FILES[1]])
+
+    # On a patch night the patch step compresses and the compress step, which skips its own, reads the status
+    # that compression took the place search's files on: one it left out fails the run as above.
+    def test_a_place_search_the_patch_steps_compression_left_out_fails_the_run(self):
+        job = {}
+        env = env_after((PATCH_STEP, COMPRESS_STEP), 0, search_status=None, late_status="0\n", job=job)
+
+        self.assertEqual(env.get("SEARCH_INDEX_FAILED"), "1", env)
+        self.assertEqual(runs("Fail run on place search index failure", env), True)
+        self.assertFalse(job["running"])
+        self.assertEqual(job["search"], [])
 
     def test_latest_json_and_the_cleanup_wait_for_a_night_of_no_failed_patch_or_unit(self):
         self.assertIsNotNone(latest_json_guard())

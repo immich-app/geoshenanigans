@@ -152,11 +152,14 @@ def step_script(name):
 class NightlyChecksumsTest(unittest.TestCase):
     TOOL = '"$GITHUB_WORKSPACE/geocoder/builder/tools/checksums.sh"'
 
-    # The .zst are hashed as soon as compression ends, in both steps that compress, beside the patches on a patch
-    # night; Finalize hashes the rest after its splice, and the .zst itself when that hash is missing.
+    # The .zst are hashed as soon as compression ends, after compress_index.py in both steps that compress, beside
+    # the patches on a patch night; Finalize hashes the rest after its splice, and the .zst itself when that hash is
+    # missing.
     def test_the_zst_are_hashed_when_compression_ends_and_the_rest_after_the_splice(self):
         for name in ("Generate patches and verify", "Compress index files"):
-            self.assertIn(f'{self.TOOL} zst "$WORKDIR/output" > "$WORKDIR/zst.sha256.part"', step_script(name), name)
+            script = step_script(name)
+            zst = script.index(f'{self.TOOL} zst "$WORKDIR/output" > "$WORKDIR/zst.sha256.part"')
+            self.assertLess(script.index('compress_index.py" "$WORKDIR/output"'), zst, name)
         finalize = step_script("Finalize upload and configurations.json")
         splice = finalize.index('mv "$WORKDIR/output/configurations.tmp" "$WORKDIR/output/configurations.json"')
         merge = finalize.index(f'{self.TOOL} all "$WORKDIR/output" "$WORKDIR/zst.sha256" > "$WORKDIR/output/checksums.sha256"')
