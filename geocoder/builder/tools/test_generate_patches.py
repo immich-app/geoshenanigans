@@ -323,6 +323,31 @@ class GeneratePatchesTest(unittest.TestCase):
         for variant in ("r/a", "r/b"):
             self.assertEqual(night.result(variant)[0], "PASS")
 
+    # Verifies that wait start only while a CPU of the budget is free, as diffs do. On two CPUs in 2 GiB + 100 MiB,
+    # r/big's diff (1.5 GiB) keeps r/a's verify (1 GiB) back, and r/c's diff starts beside it. When r/big's diff ends
+    # both verifies fit the scratch beside r/c's diff, which runs until r/a's verify has started: r/big's waits for
+    # a CPU.
+    def test_queued_verifies_start_only_while_a_cpu_is_free(self):
+        night = Night(self, ["r/big", "r/a", "r/c"])
+        night.sizes("r/big", 3, 768 * MIB)
+        night.sizes("r/a", 2, 1)
+        night.sizes("r/c", 1, 1)
+        night.scenario["meet"] = {"diff:r/big": "diff:r/c", "diff:r/c": "verify:r/a"}
+
+        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=AMPLE_MEMORY_KIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=2 * GIB + 100 * MIB,
+                  **fake_cpus(self, 2))
+
+        lines = re.findall(r"(?m)^\[[\d:]+\] ((?:start|end) (?:diff|verify) \S+?):? (.*)$", night.stderr)
+        events = [event for event, _ in lines]
+        self.assertLess(events.index("end diff r/big"), events.index("start verify r/a"), night.stderr)
+        self.assertLess(events.index("start diff r/c"), events.index("end diff r/big"), night.stderr)
+        verifies = [int(re.search(r"\(running: (\d+) jobs?", rest)[1]) for event, rest in lines
+                    if event.startswith("start verify")]
+        self.assertEqual(len(verifies), 3, night.stderr)
+        self.assertTrue(all(n < 2 for n in verifies), night.stderr)
+        for variant in ("r/big", "r/a", "r/c"):
+            self.assertEqual(night.result(variant)[0], "PASS")
+
     # No diff of 2 GiB starts in 1.1 GiB, and no verify (1 GiB) in half a
     # GiB: the variant fails, its reason in .mismatches, and the others go on.
     def test_a_variant_that_cannot_fit_the_free_space_fails_by_name(self):
@@ -477,17 +502,19 @@ class GeneratePatchesTest(unittest.TestCase):
             self.assertEqual(night.result(variant)[0], "PASS")
 
     # What the caller's other jobs hold beside the patches comes off the budget: two diffs of 129 MiB that run
-    # side by side in 300 MiB take turns when 150 MiB of it is held elsewhere.
+    # side by side in 300 MiB take turns when 150 MiB of it is held elsewhere, each started with no diff's memory
+    # running.
     def test_the_memory_reserve_comes_off_the_budget(self):
         night = Night(self, ["r/a", "r/b"])
         night.sizes("r/a", 512, 1)
         night.sizes("r/b", 512, 1)
-        night.scenario["hold"] = {"diff:r/a": 0.3, "diff:r/b": 0.3}
 
         night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=300 * MIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=8 * GIB,
                   GEOCODER_PATCH_MEM_RESERVE_KIB=150 * MIB, **fake_cpus(self, 2))
 
         self.assert_the_diffs_took_turns(night)
+        running = re.findall(r"(?m)^\[[\d:]+\] start diff \S+: .* \(running: \d+ jobs?, (\d+) KiB of memory, ", night.stderr)
+        self.assertEqual(running, ["0", "0"], night.stderr)
 
     # On the same two CPUs.
     def test_without_the_memory_reserve_the_same_diffs_run_side_by_side(self):
