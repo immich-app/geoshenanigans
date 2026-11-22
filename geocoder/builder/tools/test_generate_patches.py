@@ -391,6 +391,67 @@ class GeneratePatchesTest(unittest.TestCase):
         self.assertEqual(night.events, {})
 
 
+# A water dir on two days (geocoder/testdata/water_dir, which the builder's
+# s2 tests check is what the water layer writes): admin geometry, admin cells
+# and a core of its own, no place files and no other string tier, slots of its
+# own; day 2 moves one vertex of one of its four polygons.
+WATER_DIR_FIXTURE = os.path.join(HERE, "..", "..", "testdata", "water_dir")
+
+
+def real_tool(name, env):
+    """The tool generate_patches.sh would run: $env, else the builder's build dir's, else None."""
+    path = os.environ.get(env) or os.path.join(HERE, "..", "build", name)
+    return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
+
+
+@unittest.skipUnless(real_tool("geocoder-diff", "GEOCODER_DIFF") and real_tool("geocoder-patch", "GEOCODER_PATCH"),
+                     "needs geocoder-diff and geocoder-patch (GEOCODER_DIFF / GEOCODER_PATCH, or builder/build)")
+class WaterDirPatchTest(unittest.TestCase):
+    """The real diff and patcher on a water dir at <region>/water/all/exact: it patches on its own."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root)
+        self.old, self.new = os.path.join(self.root, "old"), os.path.join(self.root, "new")
+        for day, src in ((self.old, "day1"), (self.new, "day2")):
+            shutil.copytree(os.path.join(WATER_DIR_FIXTURE, src), os.path.join(day, "r", "water", "all", "exact"))
+            # A mode dir's street tier, which a variant one or two dirs down would borrow as its own (a dir of
+            # one .bin file is no variant).
+            write_file(os.path.join(day, "r", "full", "strings_street.bin"), 4 << 20)
+        self.results, self.logs = os.path.join(self.root, "results"), os.path.join(self.root, "logs")
+        os.makedirs(os.path.join(self.root, "scratch"))
+        env = dict(os.environ, GEOCODER_DIFF=real_tool("geocoder-diff", "GEOCODER_DIFF"),
+                   GEOCODER_PATCH=real_tool("geocoder-patch", "GEOCODER_PATCH"), TMPDIR=os.path.join(self.root, "scratch"))
+        self.run_ = subprocess.run(["bash", os.path.join(HERE, "generate_patches.sh"), self.old, self.new, self.results,
+                                    self.logs], env=env, capture_output=True, text=True, timeout=300)
+
+    def test_a_water_dir_diffs_patches_and_verifies_on_its_own(self):
+        self.assertEqual(self.run_.returncode, 0, self.run_.stdout + self.run_.stderr)
+        result = read(os.path.join(self.results, "r_water_all_exact")).split()
+        # All ten client files, the JSON ones among them, as the new day's.
+        self.assertEqual(result[:2], ["PASS", "10"], result)
+        self.assertTrue(os.path.getsize(os.path.join(self.new, "r", "water", "all", "exact", "patch.gcpatch")) > 0)
+        self.assertEqual(read(os.path.join(self.results, "r_full")).split(), ["SKIP"])
+        # Its strings are its core alone, three dirs down from the mode dirs: its estimate holds no street tier.
+        weight = int(re.search(r"^r/water/all/exact: diff (\d+) KiB of memory", self.run_.stdout, re.M).group(1))
+        self.assertLess(weight, 2 * DIFF_DAY_KIB + MIB)
+
+    def test_a_moved_polygon_sends_its_own_slots_alone(self):
+        log = read(os.path.join(self.logs, "r_water_all_exact.log"))
+        # The pond keeps its slot (its way's) and its arc's: its record is replaced there and its arc's block
+        # edited, a few bytes, the same length; the other three polygons, every ring block and the arc slots
+        # stay as they were.
+        self.assertRegex(log, r"admin_polygons\.bin by slot: match=3 replace=1 insert=0 delete=0")
+        self.assertIn("admin_rings.bin: unchanged", log)
+        self.assertIn("arc_index.bin: unchanged", log)
+        arcs = re.search(r"arc_vertices\.bin: .* recs m/i/d/r=(\d+)/(\d+)/(\d+)/(\d+)", log)
+        self.assertIsNotNone(arcs, log)
+        kept, inserted, deleted, _ = map(int, arcs.groups())
+        self.assertEqual(inserted, deleted)
+        self.assertTrue(0 < inserted <= 8, log)
+        self.assertGreater(kept, 100)
+
+
 # The nightly's patch step (geocoder-build.yml): its reserve, as a shell
 # command over $WORKDIR/output, and how it starts generate_patches.sh.
 def nightly_patch_step():

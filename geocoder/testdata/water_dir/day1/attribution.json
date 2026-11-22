@@ -1,0 +1,12 @@
+[
+  {
+    "id": "osm",
+    "text": "© OpenStreetMap contributors",
+    "url": "https://www.openstreetmap.org/copyright",
+    "licence": "ODbL 1.0",
+    "licence_url": "https://opendatacommons.org/licenses/odbl/1-0/",
+    "notices": [
+      "This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0."
+    ]
+  }
+]

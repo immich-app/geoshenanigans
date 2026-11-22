@@ -240,7 +240,8 @@ add_executable(geocoder-s2-tests
 )
 target_include_directories(geocoder-s2-tests PRIVATE src tools tests)
 # tests/s2/test_admin_dirs_build.cpp runs build-index on a PBF it writes.
-target_compile_definitions(geocoder-s2-tests PRIVATE GEOCODER_BUILD_INDEX_BIN="$<TARGET_FILE:build-index>")
+target_compile_definitions(geocoder-s2-tests PRIVATE GEOCODER_BUILD_INDEX_BIN="$<TARGET_FILE:build-index>"
+    GEOCODER_TESTDATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../testdata")
 add_dependencies(geocoder-s2-tests build-index)
 # It loads what build-index writes with the server's read path too: the
 # query-server crate's grid_query example, which cargo builds here (with the

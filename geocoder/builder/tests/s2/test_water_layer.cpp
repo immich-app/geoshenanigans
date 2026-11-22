@@ -4,6 +4,7 @@
 #include "water_layer.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -514,4 +515,35 @@ TEST(polygons_of_one_object_meeting_at_their_smallest_vertex_keep_slots_of_their
     const std::string all = std::to_string(day1.size());
     CHECK(summary.find(all + " polygons in " + all + " slots (" + all + " kept, 0 by fallback)") != std::string::npos);
     CHECK(tree(one) == tree(two));
+}
+
+// geocoder/testdata/water_dir: the client files of a water dir on two days,
+// which tools/test_generate_patches.py diffs, patches and verifies with the
+// real tools. Day 2 is day 1 with the pond's second vertex moved, on day 1's
+// slots. With GEOCODER_WRITE_TESTDATA set this writes them instead.
+TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
+    const ScratchDir root("water-fixture");
+    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    write(build(fixture()), one);
+    Collected moved = fixture();
+    REQUIRE(moved.closed_ways[0].way == 20);
+    moved.closed_ways[0].vertices[1].lat_e7 += 300;
+    write(build(moved, one), two, one);
+    const std::string fixture_dir = std::string(GEOCODER_TESTDATA_DIR) + "/water_dir";
+    const bool rewrite = std::getenv("GEOCODER_WRITE_TESTDATA") != nullptr;
+    for (const auto& [day, dir] : {std::pair<std::string, std::string>{"day1", one}, {"day2", two}}) {
+        const auto written = tree(dir + "/water/all/exact");
+        size_t client = 0;
+        for (const auto& [name, bytes] : written) {
+            if (name.size() > 8 && name.compare(name.size() - 8, 8, ".osm_ids") == 0) continue;
+            client++;
+            const std::string path = fixture_dir + "/" + day + "/" + name;
+            if (rewrite) {
+                fs::create_directories(fs::path(path).parent_path());
+                std::ofstream(path, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            }
+            CHECK(bytes_of(path) == bytes);
+        }
+        CHECK_EQ(client, size_t(10));
+    }
 }
