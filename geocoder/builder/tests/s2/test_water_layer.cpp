@@ -214,6 +214,40 @@ TEST(the_join_credits_each_segment_to_the_area_holding_its_midpoint_and_none_out
     CHECK_EQ(named, size_t(1));
 }
 
+TEST(a_segment_of_no_length_lends_its_line_no_wikidata_item) {
+    // Two lines of one key in the river area no line names: one along it,
+    // of Q50, and one of two vertices at one point, of Q3.
+    Collected c = fixture();
+    LineIn mill;
+    mill.way = 45;
+    mill.key = "nMill";
+    mill.local = mill.display = "Mill";
+    mill.qid = 50;
+    mill.vertices = {pt(kLat + 401000, kLng + 1000), pt(kLat + 401000, kLng + 9000)};
+    c.lines.push_back(mill);
+    LineIn point = mill;
+    point.way = 46;
+    point.qid = 3;
+    point.vertices = {pt(kLat + 405000, kLng + 5000), pt(kLat + 405000, kLng + 5000)};
+    c.lines.push_back(point);
+    Build b = assemble(c, 1);
+    std::vector<uint32_t> rivers;
+    for (uint32_t p = 0; p < b.rings.polygons.size(); p++)
+        if (b.objects[b.object_of[p]].tags.river_area) rivers.push_back(p);
+    NamingCounts counts;
+    std::vector<Credit> credits = credit_naming_lines(b.rings, rivers, b.object_of, b.lines, counts, 2);
+    for (const Credit& cr : credits) CHECK(cr.mm > 0);
+    const std::vector<NameChoice> choices = pick_names(credits, b.objects.size(), 1);
+    size_t named = 0;
+    for (size_t o = 0; o < b.objects.size(); o++) {
+        if (b.objects[o].id != 31) continue;
+        named++;
+        CHECK(b.lines.keys[choices[o].key] == "nMill");
+        CHECK_EQ(choices[o].qid, 50u);
+    }
+    CHECK_EQ(named, size_t(1));
+}
+
 TEST(a_lake_of_many_islands_is_cut_into_pieces_that_each_carry_the_lakes_name_type_and_area) {
     Collected c = fixture();
     // A lake of 0.4 x 0.4 degrees with 12 x 12 islands, one way round.
@@ -554,6 +588,18 @@ TEST(an_osm_sea_is_no_water_area_as_the_marine_areas_hold_the_seas) {
     CHECK_EQ(tags_from({{"natural", "bay"}, {"place", "sea"}, {"name", "Bay of Biscay"}}).code, code::kNaturalBay);
 }
 
+TEST(a_wikidata_tag_names_an_item_only_as_one_whole_q_number) {
+    auto qid = [](const char* wikidata) {
+        return tags_from({{"natural", "water"}, {"name", "See"}, {"wikidata", wikidata}}).qid;
+    };
+    CHECK_EQ(qid("Q123"), 123u);
+    CHECK_EQ(qid("Q4294967295"), 4294967295u);
+    // Two items, a number past 32 bits (2^32 + 123), and what follows or
+    // comes before the number: none.
+    for (const char* other : {"Q123;Q456", "Q4294967419", "Q12x", "Q 12", "Q+12", "Q-12", " Q12", "Q", "q12", "12"})
+        CHECK_EQ(qid(other), 0u);
+}
+
 TEST(an_osm_bay_or_strait_of_a_marine_areas_name_that_it_overlaps_is_left_out) {
     Collected c = with_marine();
     // The North Sea is the square at lat .. lat + 0.2, kLng + 0.2 .. 0.4.
@@ -751,6 +797,28 @@ TEST(a_member_of_a_waterway_relation_of_a_local_name_alone_keeps_its_own_name_en
     CHECK(none.key == "r901" && none.display == "小渋川" && none.way_en.empty());
     CHECK(danube.key == "r902" && danube.display == "Danube" && danube.way_en.empty());
     CHECK(brook.key == "nBach" && brook.display == "Brook" && brook.way_en.empty());
+}
+
+TEST(a_member_of_a_waterway_relation_without_a_wikidata_item_keeps_its_own) {
+    Collected c;
+    CollectedWaterway with, without;
+    with.id = 4200;
+    with.name = with.local_name = "Aare";
+    with.english = true;
+    with.qid = 72;
+    with.ways = {4201};
+    without.id = 4300;
+    without.name = without.local_name = "Reuss";
+    without.english = true;
+    without.ways = {4301};
+    c.waterways = {with, without};
+    index_collected(c);
+    LineIn aare, reuss;
+    REQUIRE(line_key(c, 4201, "Aare", nullptr, 9, aare));
+    REQUIRE(line_key(c, 4301, "Reuss", nullptr, 9, reuss));
+    CHECK(aare.key == "r4200" && reuss.key == "r4300");
+    CHECK_EQ(aare.qid, 72u);
+    CHECK_EQ(reuss.qid, 9u);
 }
 
 TEST(a_waterway_relation_of_a_local_name_alone_shows_the_name_en_its_river_ways_carry_over_most_of_its_length) {

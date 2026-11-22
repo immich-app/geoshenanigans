@@ -25,6 +25,18 @@ TEST(a_segments_midpoint_is_on_the_e7_grid_rounded_down) {
     CHECK(segment_midpoint({899999999, 1799999999}, {899999999, 1799999999}) == PackedLocation({899999999, 1799999999}));
 }
 
+TEST(a_segment_across_the_antimeridian_has_its_midpoint_there) {
+    // The short way round, either way along it; the midpoint on the side
+    // it falls on.
+    CHECK(segment_midpoint({0, 1799998000}, {10, -1799999000}) == PackedLocation({5, 1799999500}));
+    CHECK(segment_midpoint({10, -1799999000}, {0, 1799998000}) == PackedLocation({5, 1799999500}));
+    CHECK(segment_midpoint({0, 1799999000}, {0, -1799998000}) == PackedLocation({0, -1799999500}));
+    CHECK(segment_midpoint({0, -1799999001}, {0, 1799999000}) == PackedLocation({0, 1799999999}));
+    // Half the world east to west, as long either way round: half way along
+    // it as it runs.
+    CHECK(segment_midpoint({0, -900000000}, {0, 900000000}) == PackedLocation({0, 0}));
+}
+
 TEST(an_area_takes_the_key_of_most_length_and_that_keys_display_of_most_length) {
     // Object 0: key 1 (500 + 400) beats key 0 (800); key 1's display 3 has
     // 500 against display 2's 400. Object 1: keys tie, the smaller wins;

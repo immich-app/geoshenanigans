@@ -59,10 +59,18 @@ inline uint64_t segment_mm(PackedLocation a, PackedLocation b) {
     return static_cast<uint64_t>(std::llround(2 * kEarthRadiusMm * std::asin(std::min(1.0, std::sqrt(h)))));
 }
 
-// A segment's midpoint on the e7 grid, rounded down.
+// A segment's midpoint on the e7 grid, rounded down: along the shorter way
+// round, across the antimeridian for ends more than 180 degrees of
+// longitude apart, and back on the world there.
 inline PackedLocation segment_midpoint(PackedLocation a, PackedLocation b) {
-    return {static_cast<int32_t>((int64_t(a.lat_e7) + b.lat_e7) >> 1),
-            static_cast<int32_t>((int64_t(a.lon_e7) + b.lon_e7) >> 1)};
+    constexpr int64_t kHalfTurn = 1800000000, kTurn = 2 * kHalfTurn;
+    int64_t lng_b = b.lon_e7;
+    if (lng_b - a.lon_e7 > kHalfTurn) lng_b -= kTurn;
+    else if (a.lon_e7 - lng_b > kHalfTurn) lng_b += kTurn;
+    int64_t lng = (int64_t(a.lon_e7) + lng_b) >> 1;
+    if (lng > kHalfTurn) lng -= kTurn;
+    else if (lng < -kHalfTurn) lng += kTurn;
+    return {static_cast<int32_t>((int64_t(a.lat_e7) + b.lat_e7) >> 1), static_cast<int32_t>(lng)};
 }
 
 // A line's length inside an area object: `mm` of a line of `key` and

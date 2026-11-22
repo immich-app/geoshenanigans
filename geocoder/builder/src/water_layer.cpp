@@ -195,7 +195,7 @@ bool line_key(const Collected& c, int64_t way, const char* name, const char* nam
         line.key = "r" + std::to_string(w.id);
         line.local = w.local_name;
         line.display = w.name;
-        line.qid = w.qid;
+        line.qid = w.qid ? w.qid : way_qid;
         if (!w.english && name_en) line.way_en = name_en;
         return true;
     }

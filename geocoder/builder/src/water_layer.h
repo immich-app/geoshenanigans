@@ -29,7 +29,9 @@
 // points into one of these.
 #pragma once
 
+#include <charconv>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
@@ -61,10 +63,15 @@ struct ObjectTags {
     uint32_t qid = 0;
 };
 
-// The Q number of a wikidata tag ("Q123" -> 123), 0 for none.
+// The Q number of a wikidata tag ("Q123" -> 123), 0 for none and for a tag
+// that is more than a Q and the digits of a 32-bit number: two items, a
+// number past 32 bits, a sign or a space.
 inline uint32_t qid_of(const char* wikidata) {
     if (!wikidata || wikidata[0] != 'Q') return 0;
-    return static_cast<uint32_t>(std::strtoul(wikidata + 1, nullptr, 10));
+    const char* end = wikidata + std::strlen(wikidata);
+    uint32_t q = 0;
+    const auto [at, error] = std::from_chars(wikidata + 1, end, q);
+    return error == std::errc() && at == end ? q : 0;
 }
 
 // The tags of an object in scope, or none (code 0, no verbatim).
@@ -161,9 +168,10 @@ void index_collected(Collected& c);
 
 // The key and display name of a waterway=river or canal way, given its
 // tags: its waterway relation's id and name (a member of one), else its
-// local name and its name:en (else name); false for neither. A member of a
-// relation of a local name alone keeps its own name:en (LineIn::way_en),
-// which assemble may show in the relation's place.
+// local name and its name:en (else name); false for neither. Its wikidata
+// item is its relation's, else its own. A member of a relation of a local
+// name alone keeps its own name:en (LineIn::way_en), which assemble may show
+// in the relation's place.
 bool line_key(const Collected& c, int64_t way, const char* name, const char* name_en, uint32_t way_qid, LineIn& line);
 
 // Keys every line by its way's tags (line_key) against the waterway
