@@ -2053,6 +2053,29 @@ mod tests {
         assert!(held(&dir) == files_of(&bucket, &s), "{:?}", held(&dir).keys().collect::<Vec<_>>());
     }
 
+    // A file at the temp name of a file the selection takes, which no
+    // removal before the fetches takes away where the ledger marks no fetch
+    // of it unknown (here a dir with no ledger, its temp files a killed
+    // fetch's or an operator's), goes as the fetch makes its temp file new:
+    // the file comes down in place, in the region dir and in its water dir
+    // alike, and no temp file stays.
+    #[tokio::test]
+    async fn a_fetch_replaces_a_file_at_its_temp_name() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let s = wet("europe", "admin", "simplified", "none", "all");
+        let root = ScratchDir::new();
+        let dir = root.path().join("europe");
+        std::fs::create_dir_all(dir.join("water")).unwrap();
+        for tmp in ["admin_cells.bin.tmp", "water/admin_cells.bin.tmp"] {
+            std::fs::write(dir.join(tmp), "the first bytes of a fetch").unwrap();
+        }
+
+        let got = download(&bucket, &s, root.path()).await.map_err(|e| e.to_string());
+
+        assert_eq!(got, Ok(()));
+        assert!(held(&dir) == files_of(&bucket, &s), "{:?}", held(&dir).keys().collect::<Vec<_>>());
+    }
+
     // What a decode killed in the water dir left there is finished before
     // the download lists the files to remove, as in the region dir: water
     // all, then a download of major killed once its admin_polygons.bin went
