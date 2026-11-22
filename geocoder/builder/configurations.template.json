@@ -38,6 +38,24 @@
       ]
     },
     {
+      "id": "codepoint-open",
+      "text": "Ordnance Survey Code-Point Open",
+      "url": "https://www.ordnancesurvey.co.uk/products/code-point-open",
+      "licence": "OGL v3.0",
+      "licence_url": "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",
+      "notices": [
+        "GeoNames's GB_full.csv.zip is derived from Code-Point Open.",
+        "Contains Ordnance Survey data © Crown copyright and database right 2022.",
+        "Contains Royal Mail data © Royal Mail copyright and database right 2022.",
+        "Contains National Statistics data © Crown copyright and database right 2022."
+      ],
+      "applies_to": [
+        "mode.full",
+        "mode.no-addresses",
+        "mode.admin"
+      ]
+    },
+    {
       "id": "tiger",
       "text": "US Census Bureau TIGER/Line",
       "url": "https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html",

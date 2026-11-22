@@ -285,14 +285,14 @@ class TemplateAttributionTest(unittest.TestCase):
     def applies(self, entry):
         return sorted(c for c in self.components if any(fnmatch.fnmatchcase(c, p) for p in entry["applies_to"]))
 
-    def test_credits_osm_geonames_and_tiger_under_their_licences(self):
-        self.assertEqual([e["id"] for e in self.entries], ["osm", "geonames", "tiger"])
-        self.assertEqual([e["licence"] for e in self.entries], ["ODbL 1.0", "CC BY 4.0", "Public domain"])
+    def test_credits_osm_geonames_code_point_open_and_tiger_under_their_licences(self):
+        self.assertEqual([e["id"] for e in self.entries], ["osm", "geonames", "codepoint-open", "tiger"])
+        self.assertEqual([e["licence"] for e in self.entries], ["ODbL 1.0", "CC BY 4.0", "OGL v3.0", "Public domain"])
         for e in self.entries:
             self.assertEqual(set(e) - {"licence_url"}, {"id", "text", "url", "licence", "notices", "applies_to"}, e["id"])
             self.assertTrue(e["text"] and e["url"].startswith("https://") and e["notices"], e["id"])
         # Public domain has no licence to link.
-        self.assertEqual(["licence_url" in e for e in self.entries], [True, True, False])
+        self.assertEqual(["licence_url" in e for e in self.entries], [True, True, True, False])
         self.assertEqual(self.entries[0]["text"], "© OpenStreetMap contributors")
 
     def test_osm_applies_to_every_component_and_the_others_to_the_dirs_of_postcode_centroids(self):

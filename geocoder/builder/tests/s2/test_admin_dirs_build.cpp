@@ -16,8 +16,9 @@
 // addresses in cell order, whatever their names, and its postcode centroids
 // in cell order in each mode dir, which a chained build writes as a fresh one
 // does. Every mode dir credits the sources of the data it holds in
-// attribution.json: OpenStreetMap, GeoNames where a postcode centroid there
-// came from it, TIGER where an interpolation or a centroid did.
+// attribution.json: OpenStreetMap, GeoNames and Code-Point Open, which its
+// GB data is derived from, where a postcode centroid there came from it,
+// TIGER where an interpolation or a centroid did.
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -1569,7 +1570,9 @@ TEST(each_mode_dir_credits_the_sources_of_its_data) {
     const auto files = build("multi", {"--continents", "--multi-output", "--multi-quality", "--external-postcodes", london,
                                        "--tiger-data", tiger});
     const std::map<std::string, Ids> want = {
-        {"planet", {"osm", "geonames", "tiger"}}, {"europe", {"osm", "geonames"}}, {"north-america", {"osm", "tiger"}}};
+        {"planet", {"osm", "geonames", "codepoint-open", "tiger"}},
+        {"europe", {"osm", "geonames", "codepoint-open"}},
+        {"north-america", {"osm", "tiger"}}};
     for (const std::string& region : kRegions) {
         const auto it = want.find(region);
         for (const char* mode : {"full", "no-addresses", "admin"}) {

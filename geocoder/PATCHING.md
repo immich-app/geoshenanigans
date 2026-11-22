@@ -297,14 +297,16 @@ The data is owed credit, and the dataset carries it in two places:
   |---|---|---|---|
   | `osm` | OpenStreetMap: the dataset is a derivative database of it | ODbL 1.0 | every dir |
   | `geonames` | GeoNames: postcode centroids where OSM has none (GB_full, which the nightly loads), with the Royal Mail notice of its readme | CC BY 4.0 | the dirs of `full`, `no-addresses` and `admin`, the ones holding postcode centroids |
+  | `codepoint-open` | Ordnance Survey Code-Point Open, which GB_full is derived from, with the Ordnance Survey, Royal Mail and National Statistics statements of its licence | OGL v3.0 | the same, always beside `geonames` |
   | `tiger` | US Census Bureau TIGER/Line: US address ranges and ZIPs, and postcode centroids where OSM has none | Public domain, credited as a courtesy | the same |
 
 - **`attribution.json`** in every mode dir (`full/`, `no-addresses/`,
   `admin/`, `admin-minimal/`, `admin-minimal-poi/`): a JSON array of the
   entries above, without `applies_to`, of the sources of the data that dir
-  holds, in the list's order. OSM's is always there; GeoNames's where the dir
-  holds a postcode centroid that came from it, TIGER's where it holds an
-  interpolation or a centroid that did (so `europe/admin/` credits GeoNames,
+  holds, in the list's order. OSM's is always there; GeoNames's and
+  Code-Point Open's where the dir holds a postcode centroid that came from
+  GeoNames, TIGER's where it holds an interpolation or a centroid that did
+  (so `europe/admin/` credits GeoNames and Code-Point Open,
   `north-america/full/` TIGER, and the admin-minimal dirs, which hold no
   postcodes, OSM alone). The quality and POI dirs hold OpenStreetMap data
   only, which the mode dir's OSM entry covers.

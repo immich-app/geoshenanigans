@@ -32,9 +32,10 @@ TEST(attribution_of_osm_alone_is_its_entry) {
 TEST(attribution_lists_its_sources_in_the_templates_order) {
     const std::string all = attribution_json(ATTRIBUTION_TIGER | ATTRIBUTION_GEONAMES | ATTRIBUTION_OSM);
     const size_t osm = all.find("\"id\": \"osm\""), geonames = all.find("\"id\": \"geonames\""),
-                 tiger = all.find("\"id\": \"tiger\"");
-    REQUIRE(osm != std::string::npos && geonames != std::string::npos && tiger != std::string::npos);
-    CHECK(osm < geonames && geonames < tiger);
+                 codepoint = all.find("\"id\": \"codepoint-open\""), tiger = all.find("\"id\": \"tiger\"");
+    REQUIRE(osm != std::string::npos && geonames != std::string::npos && codepoint != std::string::npos &&
+            tiger != std::string::npos);
+    CHECK(osm < geonames && geonames < codepoint && codepoint < tiger);
     // GeoNames's notices are its readme's lines, quotes and all; TIGER's
     // public domain names no licence URL.
     CHECK(all.find(R"("The Data is provided \"as is\" without warranty or any representation of accuracy, timeliness or completeness.")") !=
@@ -45,7 +46,31 @@ TEST(attribution_lists_its_sources_in_the_templates_order) {
 
     const std::string some = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_TIGER);
     CHECK(some.find("\"id\": \"geonames\"") == std::string::npos);
+    CHECK(some.find("\"id\": \"codepoint-open\"") == std::string::npos);
     CHECK(some.find("\"id\": \"tiger\"") != std::string::npos);
+}
+
+TEST(attribution_of_geonames_carries_the_credit_of_code_point_open) {
+    // GeoNames's GB_full is derived from Ordnance Survey's Code-Point Open,
+    // whose entry, under the Open Government Licence, travels with it: the
+    // attribution statements of its licence.txt, the year GeoNames's Royal
+    // Mail notice gives.
+    const std::string geonames = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES);
+    const size_t at = geonames.find("\"id\": \"codepoint-open\"");
+    REQUIRE(at != std::string::npos);
+    const std::string entry = geonames.substr(at, geonames.find('}', at) - at);
+    for (const char* line : {
+             R"("text": "Ordnance Survey Code-Point Open")",
+             R"("url": "https://www.ordnancesurvey.co.uk/products/code-point-open")",
+             R"("licence": "OGL v3.0")",
+             R"("licence_url": "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/")",
+             R"("GeoNames's GB_full.csv.zip is derived from Code-Point Open.")",
+             R"("Contains Ordnance Survey data © Crown copyright and database right 2022.")",
+             R"("Contains Royal Mail data © Royal Mail copyright and database right 2022.")",
+             R"("Contains National Statistics data © Crown copyright and database right 2022.")"}) {
+        if (entry.find(line) == std::string::npos) std::printf("    %s\n", line);
+        CHECK(entry.find(line) != std::string::npos);
+    }
 }
 
 namespace {

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 
@@ -14,7 +15,9 @@
 enum AttributionSource : uint8_t {
     // Everything but the two below.
     ATTRIBUTION_OSM = 1 << 0,
-    // Postcode centroids where OSM has none (--external-postcodes).
+    // Postcode centroids where OSM has none (--external-postcodes):
+    // GeoNames's GB_full, derived from Ordnance Survey's Code-Point Open,
+    // whose credit travels with it.
     ATTRIBUTION_GEONAMES = 1 << 1,
     // US address ranges, their ZIPs, and postcode centroids where OSM has
     // none (--tiger-data).
@@ -28,25 +31,36 @@ struct AttributionEntry {
     const char* url;
     const char* licence;
     const char* licence_url;  // nullptr: none (public domain)
-    const char* notices[2];   // nullptr where there are fewer
+    const char* notices[4];   // nullptr where there are fewer
 };
 
 // GeoNames's notices are the lines of the readme of its postal code files
 // (download.geonames.org/export/zip/readme.txt, also in GB.zip) that cover
-// GB_full.csv.zip, verbatim.
+// GB_full.csv.zip, verbatim. Code-Point Open's are the attribution
+// statements of its licence.txt (Doc/licence.txt in its download), verbatim
+// but for the year, 2022, the one of GeoNames's Royal Mail notice, of the
+// release GB_full came from; its licence there,
+// www.ordnancesurvey.co.uk/opendata/licence, is the Open Government Licence
+// v3.0.
 inline constexpr AttributionEntry kAttribution[] = {
     {ATTRIBUTION_OSM, "osm", "© OpenStreetMap contributors", "https://www.openstreetmap.org/copyright", "ODbL 1.0",
      "https://opendatacommons.org/licenses/odbl/1-0/",
-     {"This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0.", nullptr}},
+     {"This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0."}},
     {ATTRIBUTION_GEONAMES, "geonames", "GeoNames", "https://www.geonames.org/", "CC BY 4.0",
      "https://creativecommons.org/licenses/by/4.0/",
      {"UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.",
       "The Data is provided \"as is\" without warranty or any representation of accuracy, timeliness or completeness."}},
+    {ATTRIBUTION_GEONAMES, "codepoint-open", "Ordnance Survey Code-Point Open",
+     "https://www.ordnancesurvey.co.uk/products/code-point-open", "OGL v3.0",
+     "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",
+     {"GeoNames's GB_full.csv.zip is derived from Code-Point Open.",
+      "Contains Ordnance Survey data © Crown copyright and database right 2022.",
+      "Contains Royal Mail data © Royal Mail copyright and database right 2022.",
+      "Contains National Statistics data © Crown copyright and database right 2022."}},
     {ATTRIBUTION_TIGER, "tiger", "US Census Bureau TIGER/Line",
      "https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html", "Public domain", nullptr,
      {"Address ranges and ZIP codes in the United States from the US Census Bureau's TIGER/Line files, which are in "
-      "the public domain.",
-      nullptr}},
+      "the public domain."}},
 };
 
 // `s` as a JSON string: quotes and backslashes escaped, control characters
@@ -85,7 +99,8 @@ inline std::string attribution_json(uint8_t sources) {
         out += "    \"licence\": " + json_quote(e.licence) + ",\n";
         if (e.licence_url) out += "    \"licence_url\": " + json_quote(e.licence_url) + ",\n";
         out += "    \"notices\": [";
-        for (size_t n = 0; n < 2 && e.notices[n]; n++) out += (n ? ",\n      " : "\n      ") + json_quote(e.notices[n]);
+        for (size_t n = 0; n < std::size(e.notices) && e.notices[n]; n++)
+            out += (n ? ",\n      " : "\n      ") + json_quote(e.notices[n]);
         out += "\n    ]\n  }";
     }
     return out + "\n]\n";

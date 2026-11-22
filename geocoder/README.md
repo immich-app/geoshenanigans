@@ -326,8 +326,9 @@ The server is designed to run inside memory-constrained deployments
 
 The indexes are a derivative database of [OpenStreetMap](https://www.openstreetmap.org/copyright)
 (© OpenStreetMap contributors, ODbL 1.0), with GB postcode centroids from
-[GeoNames](https://www.geonames.org/) (CC BY 4.0; contains Royal Mail data)
-and US address ranges and ZIP codes from the US Census Bureau's TIGER/Line
+[GeoNames](https://www.geonames.org/) (CC BY 4.0), derived from Ordnance
+Survey's Code-Point Open (OGL v3.0; contains OS, Royal Mail and National
+Statistics data), and US address ranges and ZIP codes from the US Census Bureau's TIGER/Line
 files (public domain). The `attribution` list of each build's
 configurations.json gives every source's credit and licence, and each mode
 dir's `attribution.json` the ones of the data it holds
