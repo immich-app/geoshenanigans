@@ -51,16 +51,18 @@ impl Stamps {
     }
 }
 
-/// The stat of each of the files `names` present in `dir`, by name.
+/// The stat of each of the files `names` present in `dir`, by name; an error names the file it
+/// is of.
 fn stamps_of(dir: &Path, names: &[&str]) -> std::io::Result<BTreeMap<String, FileStamp>> {
     let mut out = BTreeMap::new();
     for name in names {
-        match std::fs::metadata(dir.join(name)) {
+        let path = dir.join(name);
+        match std::fs::metadata(&path) {
             Ok(m) => {
                 out.insert(name.to_string(), FileStamp::of(&m));
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            Err(e) => return Err(std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
         }
     }
     Ok(out)
@@ -73,7 +75,7 @@ fn stamps_of(dir: &Path, names: &[&str]) -> std::io::Result<BTreeMap<String, Fil
 /// fails.
 pub fn load<T>(dir: &Path, load: impl FnOnce() -> Result<T, String>) -> Result<(T, Stamps), String> {
     let stamps = || {
-        let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+        let io = |e: std::io::Error| e.to_string();
         Ok::<_, String>((Stamps::of(dir).map_err(io)?, stamps_of(&dir.join(WATER_DIR), &WATER_FILES).map_err(io)?))
     };
     let before = stamps()?;
@@ -150,7 +152,7 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// hashing or after it, as the files hashed would not be the ones loaded.
 fn fingerprint_loaded(dir: &Path, loaded: &Stamps, hashes: &mut HashCache) -> Result<Fingerprint, String> {
     let io = |e: std::io::Error| format!("{}: {e}", dir.display());
-    let unchanged = || match Stamps::of(dir).map_err(io)? {
+    let unchanged = || match Stamps::of(dir).map_err(|e| e.to_string())? {
         now if now == *loaded => Ok(()),
         _ => Err(format!("The dataset in {} changed since it was loaded: load it again", dir.display())),
     };
@@ -849,6 +851,22 @@ mod tests {
             assert!(got.unwrap_err().contains("changed while it was loading"), "{what}");
         }
         assert_eq!(kept.unwrap().1, Stamps::of(&ds.0).unwrap());
+    }
+
+    // A file that can't be looked up (here under a water dir that is a file, as under one that
+    // can't be searched) fails the load before the geocoder index opens it, naming it.
+    #[test]
+    fn load_names_a_file_it_cant_look_up() {
+        let ds = TempDir::new("unsearchable");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let water = ds.0.join(WATER_DIR);
+        std::fs::write(&water, b"not a dir").unwrap();
+        let first = water.join(WATER_FILES[0]);
+
+        let got = load(&ds.0, || Ok(()));
+
+        assert!(got.as_ref().is_err_and(|e| e.starts_with(&format!("{}: ", first.display()))), "{got:?}");
+        assert_eq!(stamps_of(&water, &WATER_FILES).unwrap_err().kind(), ErrorKind::NotADirectory);
     }
 
     #[test]
