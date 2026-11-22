@@ -101,8 +101,8 @@ pub struct PlaceSearchOptions {
 
 #[napi]
 impl Geocoder {
-    /// Load an index directory and its `water/` dir where it has one (mmap; near-instant, ~3 MiB
-    /// resident).
+    /// Load an index directory and its optional `water/` layer. Index data is memory-mapped;
+    /// opening a water layer also reads its metadata and validates its cell index.
     #[napi(factory)]
     pub fn load(dir: String) -> Result<Geocoder> {
         let (idx, loaded) = dataset::load(Path::new(&dir), || {
