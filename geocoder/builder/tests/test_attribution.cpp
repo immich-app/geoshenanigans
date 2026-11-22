@@ -199,6 +199,16 @@ std::string canonical(const std::string& s, size_t at = 0, const std::string& dr
     return canonical_value(s, at, drop);
 }
 
+// The JSON document `s` in that form: one value, and nothing after it but
+// space. Throws on anything else after it.
+std::string canonical_document(const std::string& s) {
+    size_t i = 0;
+    const std::string out = canonical_value(s, i, "");
+    while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) i++;
+    if (i != s.size()) throw std::runtime_error("more after the value at " + std::to_string(i));
+    return out;
+}
+
 }  // namespace
 
 TEST(attribution_canonical_form_drops_only_the_members_named) {
@@ -208,11 +218,26 @@ TEST(attribution_canonical_form_drops_only_the_members_named) {
     CHECK_EQ(canonical(R"({"b": 1, "a": 2})", 0, "b"), std::string(R"({"a":2})"));
 }
 
+TEST(attribution_canonical_document_is_one_value_and_space) {
+    CHECK_EQ(canonical_document(" [1, {\"a\": 2}]\n"), std::string(R"([1,{"a":2}])"));
+    for (const char* bad : {"[1] [2]", "[1],", "[1]x", "[1]\n]", "[1"}) {
+        bool threw = false;
+        try {
+            canonical_document(bad);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        if (!threw) std::printf("    %s\n", bad);
+        CHECK(threw);
+    }
+}
+
 TEST(attribution_entries_are_the_templates) {
     // configurations.template.json's top-level `attribution` list, each entry
     // without its `applies_to`, is what a dir of every source credits: the
     // same entries in the same order, each with the same fields and notices,
-    // so neither can credit a licence or a notice to another source.
+    // so neither can credit a licence or a notice to another source. The
+    // written document is that list alone, whole.
     std::ifstream f(GEOCODER_TEMPLATE_PATH);
     REQUIRE(f.good());
     const std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -221,7 +246,7 @@ TEST(attribution_entries_are_the_templates) {
     REQUIRE(at != std::string::npos && json.find(key, at + 1) == std::string::npos);
     const std::string all =
         attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES | ATTRIBUTION_TIGER | ATTRIBUTION_WIKIDATA);
-    const std::string templates = canonical(json, at + key.size() - 1, "applies_to"), written = canonical(all);
+    const std::string templates = canonical(json, at + key.size() - 1, "applies_to"), written = canonical_document(all);
     if (templates != written) std::printf("    template: %s\n    written:  %s\n", templates.c_str(), written.c_str());
     CHECK(templates == written);
 }
