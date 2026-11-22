@@ -8,6 +8,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -61,6 +62,15 @@ sut.cpu_budget = lambda: 4
 sut.BYTES_PER_THREAD = 64 << 10
 {plant}
 sys.argv = ["compress_index.py", {out!r}, "--transport-bin", {transport!r}]
+sys.exit(sut.main())
+'''
+
+# A compress_index.py run in a child process with the arguments `args`, as the nightly runs it.
+LATE_RUN = r'''
+import sys
+sys.path.insert(0, {here!r})
+import compress_index as sut
+sys.argv = ["compress_index.py", *{args!r}]
 sys.exit(sut.main())
 '''
 
@@ -149,7 +159,9 @@ def load_template():
 
 class CompressIndexTest(unittest.TestCase):
     def setUp(self):
+        # The tree goes, and the env comes back, in cleanups: after those a test adds, which end its child runs.
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.out = os.path.join(self.tmp.name, "output")
         os.makedirs(self.out)
         with open(os.path.join(self.out, "configurations.json"), "w") as f:
@@ -161,6 +173,7 @@ class CompressIndexTest(unittest.TestCase):
         self.log = os.path.join(self.tmp.name, "transport.log")
         self.env = mock.patch.dict(os.environ, {"FAKE_TRANSPORT_LOG": self.log, "FAKE_VERIFY_FAILS": ""})
         self.env.start()
+        self.addCleanup(self.env.stop)
         places = {"place_cells.bin": content(10, 3000), "place_nodes.bin": content(11), "place_hidden.bin": content(12, 500)}
         self.files = {
             "planet/full/geo_cells.bin": content(1),
@@ -200,10 +213,6 @@ class CompressIndexTest(unittest.TestCase):
             "planet/poi/major/pois.tt.zst": ("pois", ["planet/poi/major/poi_records.bin", "planet/poi/major/poi_vertices.bin"]),
         }
         self.members = {m: u for u, (_, members) in self.units.items() for m in members}
-
-    def tearDown(self):
-        self.env.stop()
-        self.tmp.cleanup()
 
     def path(self, rel):
         return os.path.join(self.out, rel)
@@ -572,19 +581,31 @@ sut.compress = compress
         return found
 
     def start_late_run(self, *args):
-        """run_main on a thread, as the nightly runs it beside the place search; returns the thread and what it
-        will leave in `result` (the configurations.json it wrote, what it printed)."""
-        result = {}
+        """compress_index.py as the nightly runs it beside the place search, in a child process in a session of its
+        own, which the test's end kills, session and all, and reaps; returns the child."""
+        printed = open(os.path.join(self.tmp.name, "late-run.out"), "w")
+        script = LATE_RUN.format(here=HERE, args=[self.out, "--transport-bin", self.transport, *args])
+        child = subprocess.Popen([sys.executable, "-c", script], stdout=printed, start_new_session=True)
 
-        def run():
-            printed = io.StringIO()
-            with contextlib.redirect_stdout(printed):
-                result["cfg"] = self.run_main(*args)
-            result["printed"] = printed.getvalue()
+        def end():
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=10)
+            printed.close()
+        self.addCleanup(end)
+        return child
 
-        thread = threading.Thread(target=run, daemon=True)
-        thread.start()
-        return thread, result
+    def late_run_result(self, child):
+        """The late run's exit status once it has ended (at most 60 s), the configurations.json it wrote and what
+        it printed."""
+        try:
+            status = child.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            self.fail("the run hung")
+        with open(self.path("configurations.json")) as f:
+            cfg = json.load(f)
+        with open(os.path.join(self.tmp.name, "late-run.out")) as f:
+            return status, cfg, f.read()
 
     # The nightly starts compression when build-index exits, beside the place search: everything else is
     # compressed while it runs, its files once its status is written, and the tables and bytes are those of a
@@ -596,14 +617,14 @@ sut.compress = compress
         status = os.path.join(self.tmp.name, "place-search.status")
         taken = os.path.join(self.tmp.name, "place-search.taken")
 
-        thread, result = self.start_late_run("--late-search", status, "--late-search-taken", taken)
+        child = self.start_late_run("--late-search", status, "--late-search-taken", taken)
         deadline = time.time() + 60
         early = ["planet/full/geo_cells.bin.zst", "planet/full/addr_points.bin.zst", "planet/full/street_ways.tt.zst",
                  "planet/poi/major/pois.tt.zst"]
         while time.time() < deadline and not all(os.path.exists(self.path(r)) for r in early):
             time.sleep(0.05)
         time.sleep(0.5)
-        self.assertTrue(thread.is_alive())
+        self.assertIsNone(child.poll())
         self.assertEqual([r for r in early if not os.path.exists(self.path(r))], [])
         with open(self.path("configurations.json")) as f:
             self.assertNotIn("files", json.load(f))
@@ -611,11 +632,10 @@ sut.compress = compress
             write(self.path(rel), self.files[rel])
         with open(status, "w") as f:
             f.write("0\n")
-        thread.join(60)
+        code, cfg, _ = self.late_run_result(child)
 
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(self.status, 0)
-        self.assertEqual(result["cfg"], expected_cfg)
+        self.assertEqual(code, 0)
+        self.assertEqual(cfg, expected_cfg)
         self.assertEqual(self.zst_files(), expected_zst)
         for rel in self.SEARCH:
             self.assertEqual(unzstd(self.path(rel) + ".zst"), self.files[rel])
@@ -645,18 +665,16 @@ sut.compress = compress
         status = os.path.join(self.tmp.name, "place-search.status")
         taken = os.path.join(self.tmp.name, "place-search.taken")
 
-        thread, result = self.start_late_run("--late-search", status, "--late-search-timeout", "1",
-                                             "--late-search-taken", taken)
-        thread.join(60)
+        child = self.start_late_run("--late-search", status, "--late-search-timeout", "1", "--late-search-taken", taken)
+        code, cfg, printed = self.late_run_result(child)
         with open(status, "w") as f:
             f.write("0\n")
 
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(self.status, 0)
-        self.assertEqual(sorted(result["cfg"]["files"]), sorted(r for r in self.files if r not in self.SEARCH))
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(cfg["files"]), sorted(r for r in self.files if r not in self.SEARCH))
         for rel in self.SEARCH:
             self.assertFalse(os.path.exists(self.path(rel) + ".zst"), rel)
-        self.assertIn("no place search status", result["printed"])
+        self.assertIn("no place search status", printed)
         with open(taken) as f:
             self.assertEqual(f.read(), "none\n")
 
