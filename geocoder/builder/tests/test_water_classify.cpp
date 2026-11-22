@@ -14,13 +14,12 @@ using namespace water;
 namespace {
 
 Class of(const char* natural, const char* water_tag = nullptr, const char* waterway = nullptr,
-         const char* landuse = nullptr, const char* place = nullptr) {
+         const char* landuse = nullptr) {
     Tags t;
     t.natural = natural;
     t.water = water_tag;
     t.waterway = waterway;
     t.landuse = landuse;
-    t.place = place;
     return classify(t);
 }
 
@@ -50,7 +49,9 @@ TEST(each_water_tag_is_the_kind_and_rank_nominatim_gives_it) {
     CHECK(kind_of(of("strait"), table) == "natural/strait 22");
     CHECK(kind_of(of("wetland"), table) == "natural/wetland 22");
     CHECK(kind_of(of("glacier"), table) == "natural/glacier 22");
-    CHECK(kind_of(of(nullptr, nullptr, nullptr, nullptr, "sea"), table) == "place/sea 2");
+    // The marine areas' kinds.
+    CHECK(table.kind(code::kPlaceSea).cls == "place" && table.kind(code::kPlaceSea).type == "sea");
+    CHECK(table.kind(code::kPlaceOcean).cls == "place" && table.kind(code::kPlaceOcean).type == "ocean");
 }
 
 TEST(river_and_canal_areas_are_one_class_and_streams_and_ditches_none) {
@@ -67,11 +68,9 @@ TEST(river_and_canal_areas_are_one_class_and_streams_and_ditches_none) {
     CHECK(!of(nullptr, nullptr, "river").any());
 }
 
-TEST(the_first_matching_row_decides_so_the_caspian_is_a_lake) {
+TEST(the_first_matching_row_decides) {
     TypeTable table;
-    CHECK(kind_of(of("water", "lake", nullptr, nullptr, "sea"), table) == "water/lake 20");
     CHECK(kind_of(of("water", nullptr, nullptr, "reservoir"), table) == "natural/water 22");
-    CHECK(kind_of(of("bay", nullptr, nullptr, nullptr, "sea"), table) == "natural/bay 22");
     CHECK(kind_of(of("wetland", "lake"), table) == "natural/wetland 22");
 }
 

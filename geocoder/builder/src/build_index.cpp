@@ -1897,7 +1897,6 @@ static water::ObjectTags water_way_tags(const WayTags& t) {
         if (std::strcmp(key, "water") == 0) return t.water;
         if (std::strcmp(key, "waterway") == 0) return t.waterway;
         if (std::strcmp(key, "landuse") == 0) return t.landuse;
-        if (std::strcmp(key, "place") == 0) return t.place;
         if (std::strcmp(key, "name") == 0) return t.name;
         if (std::strcmp(key, "name:en") == 0) return t.name_en;
         if (std::strcmp(key, "wikidata") == 0) return t.wikidata;
@@ -1915,7 +1914,7 @@ static bool water_way_wanted(const WayTags& t, bool member, bool in_waterway, Cl
     if (water::is_naming_waterway(t.waterway) &&
         (in_waterway || (t.name && *t.name) || (t.name_en && *t.name_en)))
         return true;
-    return (t.natural || t.landuse || t.place || t.waterway) && closed() && water::in_scope(water_way_tags(t));
+    return (t.natural || t.landuse || t.waterway) && closed() && water::in_scope(water_way_tags(t));
 }
 
 static bool is_scale_list(const char* arg) {

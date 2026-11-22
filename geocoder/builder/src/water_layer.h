@@ -74,7 +74,6 @@ ObjectTags object_tags(Tag tag) {
     t.water = tag("water");
     t.waterway = tag("waterway");
     t.landuse = tag("landuse");
-    t.place = tag("place");
     const Class c = classify(t);
     const char* name_en = tag("name:en");
     const char* name = tag("name");

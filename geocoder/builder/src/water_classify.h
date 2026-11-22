@@ -5,8 +5,9 @@
 // (name:en or name), but for river and canal areas, which can take the name
 // of the waterway running through them (water_names.h). Out of scope:
 // water=stream, ditch, drain and fish_pass (Nominatim imports none of them),
-// water=* without natural=water (Nominatim needs natural=water), and
-// natural=coastline.
+// water=* without natural=water (Nominatim needs natural=water),
+// natural=coastline, and place=sea: the marine areas (marine.h) hold the
+// seas, and Nominatim answers no place=sea.
 //
 //   natural=water + water=river, or waterway=riverbank   waterway/river (a river area)
 //   natural=water + water=canal                           waterway/canal (a canal area)
@@ -17,7 +18,6 @@
 //   landuse=reservoir                                     landuse/reservoir
 //   landuse=basin                                         landuse/basin
 //   natural=bay | strait | wetland | glacier              natural/<value>
-//   place=sea                                             place/sea
 //
 // The major tier (water_major_keeps) holds areas of 100 km² or more and
 // whole rivers: a river's areas together, by its waterway relation, its
@@ -41,7 +41,6 @@ struct Tags {
     const char* water = nullptr;
     const char* waterway = nullptr;
     const char* landuse = nullptr;
-    const char* place = nullptr;
 };
 
 // An object's kind: a fixed code, or a water=* value outside the fixed
@@ -75,7 +74,6 @@ inline Class classify(const Tags& t) {
     if (is(t.natural, "strait")) return {code::kNaturalStrait, nullptr, false};
     if (is(t.natural, "wetland")) return {code::kWetland, nullptr, false};
     if (is(t.natural, "glacier")) return {code::kGlacier, nullptr, false};
-    if (is(t.place, "sea")) return {code::kPlaceSea, nullptr, false};
     return c;
 }
 

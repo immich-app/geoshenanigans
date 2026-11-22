@@ -517,6 +517,28 @@ TEST(polygons_of_one_object_meeting_at_their_smallest_vertex_keep_slots_of_their
     CHECK(tree(one) == tree(two));
 }
 
+namespace {
+
+// An object's tags as the layer reads them (object_tags), from key-value
+// pairs.
+ObjectTags tags_from(const std::map<std::string, std::string>& kv) {
+    return object_tags([&](const char* key) -> const char* {
+        auto it = kv.find(key);
+        return it == kv.end() ? nullptr : it->second.c_str();
+    });
+}
+
+}  // namespace
+
+TEST(an_osm_sea_is_no_water_area_as_the_marine_areas_hold_the_seas) {
+    CHECK(!in_scope(tags_from({{"place", "sea"}, {"name", "Ionian Sea"}})));
+    // Another kind's tags decide as before: the Caspian is a lake, a bay a
+    // bay.
+    CHECK_EQ(tags_from({{"natural", "water"}, {"water", "lake"}, {"place", "sea"}, {"name", "Caspian Sea"}}).code,
+             code::kLake);
+    CHECK_EQ(tags_from({{"natural", "bay"}, {"place", "sea"}, {"name", "Bay of Biscay"}}).code, code::kNaturalBay);
+}
+
 // geocoder/testdata/water_dir: the client files of a water dir on two days,
 // which tools/test_generate_patches.py diffs, patches and verifies with the
 // real tools. Day 2 is day 1 with the pond's second vertex moved, on day 1's

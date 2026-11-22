@@ -513,6 +513,8 @@ land polygons (OpenStreetMap's coastline, ODbL) and along a 1-degree grid by
 `tools/marine_import.py`. They go into the same store, records, arcs, cells
 and dirs as OSM's water, and win nowhere a smaller area holds the point: a
 bay, harbour or lake inside a sea answers there, the sea out in open water.
+OSM's own `place=sea` areas stay out of the layer: the marine areas hold the
+seas, and Nominatim answers no `place=sea`.
 
 - **They don't change from day to day.** The nightly never runs the tool: it
   downloads the version `data/marine.json` pins (a run of Update Marine
