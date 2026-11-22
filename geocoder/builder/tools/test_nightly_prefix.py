@@ -87,7 +87,8 @@ def block_from(script, first_line):
 
 class FakeS5cmd:
     """An s5cmd on PATH that logs its arguments, a line a call, and does nothing else; with $UPLOAD_PID set (a pid
-    file), each call says whether that process still ran (a zombie, which writes nothing, counts as ended)."""
+    file, of a session's leader), each call says whether a process of that session still ran (a zombie, which
+    writes nothing, counts as ended)."""
 
     def __init__(self, test):
         self.root = tempfile.mkdtemp()
@@ -96,9 +97,8 @@ class FakeS5cmd:
         for tool in ("s5cmd", "python3"):
             with open(os.path.join(self.root, tool), "w") as f:
                 f.write(f'#!/bin/sh\necho "{tool} $*" >> "{self.calls}"\n'
-                        f'[ -z "$UPLOAD_PID" ] || {{ case $(sed "s/.*) //" "/proc/$(cat "$UPLOAD_PID")/stat" 2> /dev/null '
-                        f'| cut -c1) in ""|Z|X) echo "  upload ended" ;; *) echo "  upload running" ;; esac; }} '
-                        f'>> "{self.calls}"\n')
+                        f'[ -z "$UPLOAD_PID" ] || {{ if ps -o stat= -s "$(cat "$UPLOAD_PID")" | grep -q "^[^Z]"; '
+                        f'then echo "  upload running"; else echo "  upload ended"; fi; }} >> "{self.calls}"\n')
             os.chmod(os.path.join(self.root, tool), 0o755)
         self.path = f"{self.root}:{os.environ['PATH']}"
 
@@ -243,7 +243,7 @@ class ScratchPbfCacheTest(unittest.TestCase):
 # pattern's last / before its first *, each with its file's time (UTC) as its last modification; cp of a prefix's
 # every object (<prefix>/*); and cat of an object. Each call is logged to $FAKE_CALLS. A copy fails at its object
 # number $FAKE_COPY_FAILS_AFTER, or passes over the key $FAKE_COPY_DROPS and says nothing; with
-# $FAKE_LIST_FAILS_AFTER_COPY set, every ls after a copy fails.
+# $FAKE_LIST_FAILS_AFTER_COPY set to a URL, every ls under it after a copy prints its keys and then fails.
 FAKE_BUCKET_S5CMD = r"""#!{python}
 import os, re, shutil, sys, time
 args = sys.argv[1:]
@@ -267,12 +267,13 @@ def keys(url):
         sys.exit("ERROR no object found")
     return found
 if verb == "ls":
-    if copied and os.environ.get("FAKE_LIST_FAILS_AFTER_COPY"):
-        sys.exit("ERROR listing failed")
     for k in keys(urls[0]):
         path = os.path.join(local(urls[0]), k)
         print(f"{{time.strftime('%Y/%m/%d %H:%M:%S', time.gmtime(os.path.getmtime(path)))}} "
               f"{{os.path.getsize(path):>15}}  {{k}}")
+    failing = os.environ.get("FAKE_LIST_FAILS_AFTER_COPY")
+    if copied and failing and urls[0].startswith(failing):
+        sys.exit("ERROR listing failed")
 elif verb == "rm":
     for k in keys(urls[0]):
         os.remove(os.path.join(local(urls[0]), k))
@@ -399,12 +400,18 @@ class SeedPreviousTest(unittest.TestCase):
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("planet/full/places.tt.zst", done.stdout + done.stderr)
 
-    # Listings that failed after the copy compare as two empty ones: the check fails instead.
+    # A listing after the copy that failed, though it printed every key, the live build's or the seed's: the check
+    # fails rather than compare what it printed.
     def test_a_listing_that_failed_fails_the_setup(self):
-        done, _ = self.run_seed("nightly-speed-1121", "true", FAKE_LIST_FAILS_AFTER_COPY="1")
+        for listing in ("s3://bucket/geocoder/", "s3://bucket/nightly-speed-1121/"):
+            with self.subTest(listing=listing):
+                if os.path.exists(self.calls):
+                    os.remove(self.calls)
 
-        self.assertNotEqual(done.returncode, 0)
-        self.assertIn("::error::", done.stdout)
+                done, _ = self.run_seed("nightly-speed-1121", "true", FAKE_LIST_FAILS_AFTER_COPY=listing)
+
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn("::error::Could not list", done.stdout)
 
     # A live build past the full-index window keeps its patches and configurations.json alone: the test would
     # build fresh from it, not patch. Setup fails before it deletes what the scratch prefix holds at that date.

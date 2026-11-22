@@ -8,11 +8,11 @@ import gzip
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 
@@ -203,8 +203,8 @@ class DownloadTest(unittest.TestCase):
 # The download step's tools as the step runs them. s5cmd lists the keys of $FAKE_CACHED (":"-separated, under the
 # cache bucket) and copies any to a local path, the PBF in $FAKE_PBF_SECONDS by the step's clock (date), and a fifth of
 # a second by the wall's, after which it logs "copied <path>"; curl answers the wikidata and TIGER lookups and
-# downloads, and the day's diff as $FAKE_DIFF says: "ok" (a gzip), or "stall" (it writes its pid to $FAKE_DIFF_PID and
-# never ends); aria2c (the mirror) writes the PBF. Each call goes to $FAKE_CALLS.
+# downloads, and the day's diff as $FAKE_DIFF says: "ok" (a gzip), "bad" (bytes that are no gzip), or "stall" (it
+# writes its pid to $FAKE_DIFF_PID and never ends); aria2c (the mirror) writes the PBF. Each call goes to $FAKE_CALLS.
 FAKE_S5CMD = r"""#!{python}
 import os, sys, time
 args = sys.argv[1:]
@@ -259,6 +259,8 @@ elif "/replication/day/" in url and os.environ["FAKE_DIFF"] == "stall":
     with open(os.environ["FAKE_DIFF_PID"], "w") as f:
         f.write(str(os.getpid()))
     time.sleep(300)
+elif "/replication/day/" in url and os.environ["FAKE_DIFF"] == "bad":
+    put(b"<osmChange/>")
 elif "/replication/day/" in url:
     put(gzip.compress(b"<osmChange/>"))
 else:
@@ -413,6 +415,15 @@ class DownloadStepTest(unittest.TestCase):
         with gzip.open(os.path.join(self.work, "diff-today.osc.gz")) as f:
             self.assertEqual(f.read(), b"<osmChange/>")
         self.assertIn("[diff] seq 4710", out)
+
+    # A diff that came down broken fails no step: the download leaves none, and Apply replication diffs fetches it.
+    def test_a_failed_diff_leaves_it_to_the_apply(self):
+        outputs, out, _ = self.download(["geocoder-cache/planet-2026-11-20.osm.pbf"], "bad")
+
+        self.assertEqual(outputs["pbf_source"], "yesterday")
+        self.assertEqual(len(self.diff_fetches()), 1)
+        self.assertEqual(self.diff_files(), [])
+        self.assertIn("[diff] Apply replication diffs fetches it", out)
 
     # The fetch has the time the step has left to its 60-minute timeout, less 2 minutes, and at most its 10: a PBF
     # that came down in 52 minutes leaves it 6, where 10 would hold the step past its timeout, a cancelled step the
@@ -701,14 +712,14 @@ class PostBuildTest(unittest.TestCase):
         block = block_at(step_script(name), 'if [ -f "$WORKDIR/pbf-cache.log" ] && [ "$PBF_CACHE" = geocoder-cache ]; then')
         for pbf_cache, waits in (("geocoder-cache", True), ("geocoder-scratch/nightly-speed-1121", False)):
             with self.subTest(pbf_cache=pbf_cache):
-                took, out = self.wait_for(': > "$WORKDIR/pbf-cache.log"\n' + block, "pbf-cache.status",
-                                          env={"PBF_CACHE": pbf_cache})
+                slept, out = self.wait_for(': > "$WORKDIR/pbf-cache.log"\n' + block, "pbf-cache.status",
+                                           env={"PBF_CACHE": pbf_cache})
 
                 if waits:
-                    self.assertGreaterEqual(took, 0.9)
+                    self.assertGreater(slept, 0)
                     self.assertIn("Caching today's PBF ended at", out)
                 else:
-                    self.assertLess(took, 0.9)
+                    self.assertEqual(slept, 0)
                     self.assertNotIn("Caching today's PBF", out)
 
     # The step only starts the job: it returns while the job runs, leaves the job's session for Compress index
@@ -764,31 +775,25 @@ class PostBuildTest(unittest.TestCase):
                                                 os.path.join(root, "search.status"), "1800"])
 
     def wait_for(self, script, status, env=None):
-        """Runs `script` with a sleep of 10 ms; `status` (a file under the run's dir) is written "0" a second in.
-        Returns how long it took and what it printed."""
+        """Runs `script` with a sleep that returns at once, and writes `status` (a file under the run's dir) "0" at
+        its first call. Returns how many times it was called and what the script printed."""
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root)
         bin_dir = os.path.join(root, "bin")
         os.makedirs(bin_dir)
+        sleeps, path = (shlex.quote(os.path.join(root, name)) for name in ("sleeps", status))
         with open(os.path.join(bin_dir, "sleep"), "w") as f:
-            f.write("#!/bin/sh\nexec /usr/bin/sleep 0.01\n")
+            f.write(f'#!/bin/sh\necho "$*" >> {sleeps}\n[ -e {path} ] || echo 0 > {path}\n')
         os.chmod(os.path.join(bin_dir, "sleep"), 0o755)
         open(os.path.join(root, "sidecars.run"), "w").close()
-
-        def write_status():
-            with open(os.path.join(root, status + ".part"), "w") as f:
-                f.write("0\n")
-            os.rename(os.path.join(root, status + ".part"), os.path.join(root, status))
-
-        timer = threading.Timer(1.0, write_status)
-        timer.start()
-        self.addCleanup(timer.cancel)
-        start = time.time()
         done = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True, timeout=30,
                               env={"PATH": f"{bin_dir}:{os.environ['PATH']}", "WORKDIR": root, "RUNNER_TEMP": root,
                                    **(env or {})})
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        return time.time() - start, done.stdout
+        if not os.path.exists(os.path.join(root, "sleeps")):
+            return 0, done.stdout
+        with open(os.path.join(root, "sleeps")) as f:
+            return len(f.read().splitlines()), done.stdout
 
     # Both steps that compress wait, before they start it, for geocoder-transport's build (its status).
     def test_compression_waits_for_geocoder_transport(self):
@@ -796,9 +801,9 @@ class PostBuildTest(unittest.TestCase):
             with self.subTest(name=name):
                 loop = loop_of(step_script(name), 'until [ -s "$RUNNER_TEMP/search.status" ]')
 
-                took, _ = self.wait_for("WAIT_START=$(date +%s)\nCOMPRESS_START=$WAIT_START\n" + loop, "search.status")
+                slept, _ = self.wait_for("WAIT_START=$(date +%s)\nCOMPRESS_START=$WAIT_START\n" + loop, "search.status")
 
-                self.assertGreaterEqual(took, 0.9)
+                self.assertGreater(slept, 0)
 
     # The compress step after a failed background run lets the sidecars' upload that run started end before it
     # clears the prefix; Finalize lets it end before its first pass.
@@ -807,10 +812,10 @@ class PostBuildTest(unittest.TestCase):
             with self.subTest(name=name):
                 block = block_at(step_script(name), 'if [ -f "$WORKDIR/sidecars.run" ]; then')
 
-                took, out = self.wait_for("COMPRESS_START=$(date +%s)\nUPLOAD_START=$COMPRESS_START\n" + block,
-                                          "sidecars.status")
+                slept, out = self.wait_for("COMPRESS_START=$(date +%s)\nUPLOAD_START=$COMPRESS_START\n" + block,
+                                           "sidecars.status")
 
-                self.assertGreaterEqual(took, 0.9)
+                self.assertGreater(slept, 0)
                 self.assertNotIn("::warning::", out)
 
     # An upload still running when the wait for it ends is stopped, its session and all, and gone, before the
@@ -823,7 +828,8 @@ class PostBuildTest(unittest.TestCase):
                 self.addCleanup(shutil.rmtree, root)
                 open(os.path.join(root, "sidecars.run"), "w").close()
                 upload = subprocess.Popen(["/usr/bin/sleep", "300"], start_new_session=True)
-                self.addCleanup(upload.kill)
+                # Ended and reaped however the test ends (a no-op kill once the test has reaped it).
+                self.addCleanup(lambda upload=upload: (upload.kill(), upload.wait(timeout=10)))
                 with open(os.path.join(root, "sidecars.pid"), "w") as f:
                     f.write(f"{upload.pid}\n")
                 block = block_at(step_script(name), 'if [ -f "$WORKDIR/sidecars.run" ]; then')
@@ -1235,7 +1241,7 @@ class WatchdogTest(unittest.TestCase):
         self.assertEqual(self.report([mixed, scratch, live]), live)
 
     def test_the_report_takes_a_retry_as_a_live_run(self):
-        retry = {"id": 8, "run_attempt": 1, "display_title": LIVE_DISPATCH_TITLE, "conclusion": "success"}
+        retry = {"id": 8, "run_attempt": 2, "display_title": LIVE_DISPATCH_TITLE, "conclusion": "success"}
         live = {"id": 7, "run_attempt": 1, "display_title": LIVE_TITLE, "conclusion": "failure"}
 
         self.assertEqual(self.report([retry, live]), retry)

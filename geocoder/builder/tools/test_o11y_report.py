@@ -392,7 +392,10 @@ class NightlyReportTest(unittest.TestCase):
         body = dict(nightly_steps())
         self.assertEqual(names[names.index("Finalize upload and configurations.json") + 1:][:4],
                          ["Install 1Password CLI", "Report to o11y", "Cleanup old Tigris builds", "Cleanup old cache bucket"])
-        self.assertEqual(names[-1], "Wait for the o11y report")
+        # The job's last step as GitHub reads it: an unnamed step (a bare uses: or run:) after it counts too.
+        import yaml
+        with open(WORKFLOW) as f:
+            self.assertEqual(yaml.safe_load(f)["jobs"]["build"]["steps"][-1].get("name"), "Wait for the o11y report")
         # The live nightly's alone: a run under a scratch s3_prefix is a test, on main too.
         for name in ("Install 1Password CLI", "Report to o11y", "Wait for the o11y report"):
             self.assertIn("if: always() && github.ref == 'refs/heads/main' && env.S3_PREFIX == 'geocoder'\n", body[name], name)
