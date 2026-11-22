@@ -3,7 +3,9 @@
 // bucket on localhost (test_bucket.rs), whose template build has real
 // transport units. Its datasets load through an injected loader: a small
 // dataset of each one's own (write_dataset), its country named by the
-// dataset's id; the real load of a build's 28 is the box gate's.
+// dataset's id; the real load of a build's 28 is the box gate's. Its water
+// dirs load as the builder's water dir fixture (water_fixture), whose water
+// lies around 47 N 8 E, off the datasets' country.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -21,7 +23,7 @@ use query_server::{
 use crate::portal::catalog::{self, Object};
 use crate::portal::search;
 use crate::portal::sync::{self, BuildDir, BUILDS, COMPLETE, MANIFEST, REFUSED, SETS};
-use crate::portal::{load_dataset, lookup, router, Config, Loader, Portal, BUILD_VERSION, LOOKUPS_AT_ONCE, SEARCHES_AT_ONCE};
+use crate::portal::{load_dataset, load_water, lookup, router, Config, Loader, Portal, BUILD_VERSION, LOOKUPS_AT_ONCE, SEARCHES_AT_ONCE};
 use crate::downloader::{basename, resolve_files, Configurations, RegionSelection};
 use crate::scratch_dir::ScratchDir;
 use crate::test_bucket::{self, TestBucket, DATE};
@@ -80,6 +82,13 @@ fn write_dataset(dir: &Path, country: &str) {
     }
 }
 
+/// The builder's water dir fixture of its third day (geocoder/testdata/
+/// water_dir, water.rs's tests): Test Lake at 47.005 N 8.002 E, its island
+/// at 8.005 E, a pond, a river and the North Sea at 45.001 N 8.001 E.
+fn water_fixture() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../testdata/water_dir/day3")
+}
+
 /// The datasets an injected loader loads (fixtures).
 struct Fixtures {
     dir: ScratchDir,
@@ -124,6 +133,7 @@ fn config_at(url: &str, load: Loader) -> Config {
         lookups_at_once: LOOKUPS_AT_ONCE,
         searches_at_once: SEARCHES_AT_ONCE,
         load,
+        load_water: Arc::new(|_: &Path| load_water(&water_fixture())),
         open_search: Arc::new(search::open_search),
         search_jobs: 4,
         free_space: |_| Ok(u64::MAX),
@@ -338,21 +348,26 @@ fn the_build_version_it_serves_is_the_templates() {
 // same status, content type and bytes from /reverse (each debug= among
 // them) and /polygons, for points in and out of the dataset, off the globe,
 // and without a key or a good one, with dataset= or without.
-#[tokio::test]
-async fn a_dataset_answers_byte_for_byte_what_query_server_answers_from_its_files() {
-    let files = ScratchDir::new();
-    let dir = files.path().join("dataset");
-    write_dataset(&dir, "Testland");
+/// query-server's /reverse and /polygons, serving the dataset in `dir`.
+fn query_server_of(dir: &Path) -> Router {
     let index = Arc::new(MultiIndex::load(dir.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap());
-    let region_state = Arc::new(crate::region_state::RegionState::new(index.clone(), dir.clone()));
-    let query_server = Router::new()
+    let region_state = Arc::new(crate::region_state::RegionState::new(index.clone(), dir.to_path_buf()));
+    Router::new()
         .route("/reverse", get(crate::reverse_geocode))
         .route("/polygons", get(crate::polygons_geojson))
         .layer(axum::Extension(index))
         .layer(axum::Extension(region_state))
         .layer(axum::Extension(Arc::new(auth::RateLimiter::default())))
         .layer(axum::middleware::from_fn(handlers::cors_middleware))
-        .with_state(db());
+        .with_state(db())
+}
+
+#[tokio::test]
+async fn a_dataset_answers_byte_for_byte_what_query_server_answers_from_its_files() {
+    let files = ScratchDir::new();
+    let dir = files.path().join("dataset");
+    write_dataset(&dir, "Testland");
+    let query_server = query_server_of(&dir);
     // A portal whose every dataset is that dir.
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
     let data = ScratchDir::new();
@@ -361,6 +376,8 @@ async fn a_dataset_answers_byte_for_byte_what_query_server_answers_from_its_file
     p.round(true).await.unwrap();
     let (ours, theirs) = (serve(router(p, db())).await, serve(query_server).await);
 
+    // None of these points is in water: the answers are the dataset's
+    // alone, whatever the water.
     let mut queries = Vec::new();
     for at in ["lat=10.5&lon=20.5", "lat=10.501&lon=20.499", "lat=10.95&lon=20.95", "lat=40&lon=40"] {
         for debug in ["", "&debug=all", "&debug=primary", "&debug=places", "&debug=admin", "&debug=other"] {
@@ -420,6 +437,21 @@ async fn a_builds_objects_cover_every_selection_it_serves_and_its_sync_fetches_e
         assert_eq!(dataset.files.iter().collect::<Vec<_>>(), files, "{s:?}");
     }
     assert_eq!(plan.datasets.len(), allowed.len());
+    // Beside them, each water value's files, those its selection puts in the
+    // dataset's water/ dir, of a water dir of its own.
+    let water_values: Vec<String> = template_values("water").into_iter().filter(|v| v != "none").collect();
+    assert_eq!(plan.water.iter().map(|w| w.id.clone()).collect::<Vec<_>>(), water_values);
+    for w in &plan.water {
+        let resolved = resolve_files(&cfg, &RegionSelection { water: w.id.clone(), ..allowed[0].clone() }).unwrap();
+        let files: Vec<&String> = resolved.paths.iter().filter(|p| resolved.dest(p).starts_with("water/")).collect();
+        assert!(files.len() >= 9 && files.iter().all(|f| f.starts_with("planet/water/") && cfg.files.contains_key(*f)), "{}: {files:?}", w.id);
+        assert_eq!(w.files.iter().collect::<Vec<_>>(), files, "{}", w.id);
+        for f in &files {
+            assert!(held.contains_key(f.as_str()), "{}: {f}", w.id);
+            units.extend(cfg.files[*f].unit.clone());
+            taken.insert(f.to_string());
+        }
+    }
     assert_eq!(held.keys().map(|f| f.to_string()).collect::<BTreeSet<_>>(), taken);
     let unit_objects: Vec<&String> = plan.objects.iter().filter(|o| o.unit).map(|o| &o.path).collect();
     assert_eq!(unit_objects, units.iter().collect::<Vec<_>>());
@@ -443,15 +475,158 @@ async fn a_builds_objects_cover_every_selection_it_serves_and_its_sync_fetches_e
             }
         }
     }
-    for d in &plan.datasets {
-        let links = d.links();
-        let mut names: Vec<String> = std::fs::read_dir(root.join(SETS).join(&d.id)).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    let sets = plan.datasets.iter().map(|d| (d.id.clone(), d.links())).chain(plan.water.iter().map(|w| (w.set(), w.links())));
+    for (set, links) in sets {
+        let mut names: Vec<String> = std::fs::read_dir(root.join(SETS).join(&set)).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         names.sort();
-        assert_eq!(names, links.keys().cloned().collect::<Vec<_>>(), "{}", d.id);
+        assert_eq!(names, links.keys().cloned().collect::<Vec<_>>(), "{set}");
         for (name, path) in links {
-            assert_eq!(inode(&root.join(SETS).join(&d.id).join(&name)), inode(&root.join(&path)), "{} {name}", d.id);
+            assert_eq!(inode(&root.join(SETS).join(&set).join(&name)), inode(&root.join(&path)), "{set} {name}");
         }
     }
+    let water: Vec<String> = plan.water.iter().map(|w| w.set()).collect();
+    assert_eq!(water, ["water/major", "water/all", "water/all-exact"]);
+}
+
+/// Copies the files of the dir `from` into the dir `to`.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+    }
+}
+
+// A water dir answers beside a dataset's address as a dataset whose water/
+// dir holds its files answers: /reverse with water= one of the build's
+// water values, or without water= (all), the status, content type and bytes
+// query-server answers from the dataset's files with the water dir beside
+// them, at points in water and out of it, debug=all's (whose result names
+// the water) and debug=admin's among them; with water=none, those of the
+// dataset alone. The header X-Geocoder-Water names the water it answered
+// with.
+#[tokio::test]
+async fn a_water_dir_answers_as_a_dataset_whose_water_dir_holds_its_files() {
+    let files = ScratchDir::new();
+    let (dry, wet) = (files.path().join("dry"), files.path().join("wet"));
+    write_dataset(&dry, "Testland");
+    write_dataset(&wet, "Testland");
+    copy_dir(&water_fixture(), &wet.join(query_server::WATER_DIR));
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let at = dry.clone();
+    let p = portal(data.path(), config(&bucket, Arc::new(move |_: &Path| load_dataset(&at))));
+    p.round(true).await.unwrap();
+    let (ours, wet_qs, dry_qs) = (serve(router(p, db())).await, serve(query_server_of(&wet)).await, serve(query_server_of(&dry)).await);
+
+    let mut wet_answers = 0;
+    // Testville; Test Lake, its island, the pond, the river and the North Sea.
+    for (lat, lon) in [(10.5, 20.5), (47.005, 8.002), (47.005, 8.005), (47.02005, 8.00005), (47.0305, 8.0005), (45.001, 8.001)] {
+        for debug in ["", "&debug=all", "&debug=admin"] {
+            let q = format!("lat={lat}&lon={lon}&key=test{debug}");
+            let (wet_want, dry_want) = (fetch(&format!("{wet_qs}/reverse?{q}")).await, fetch(&format!("{dry_qs}/reverse?{q}")).await);
+            assert_eq!(wet_want.status, 200, "{q}");
+            wet_answers += usize::from(wet_want.body.contains("\"water\":{") || wet_want.body.contains("\"water\": {"));
+            for (water, named, want) in [("", "all", &wet_want), ("&water=all", "all", &wet_want), ("&water=major", "major", &wet_want), ("&water=all-exact", "all-exact", &wet_want), ("&water=none", "none", &dry_want)] {
+                let got = fetch(&format!("{ours}/reverse?{q}{water}")).await;
+                assert_eq!((got.status, &got.content_type, &got.body), (want.status, &want.content_type, &want.body), "{q}{water}");
+                assert_eq!(got.header("x-geocoder-water"), Some(named), "{q}{water}");
+            }
+        }
+    }
+    // The lake, the pond, the river and the sea, in the answer and in
+    // debug=all's result.
+    assert_eq!(wet_answers, 8);
+}
+
+// /datasets lists the build's water dirs apart from its datasets' axes: no
+// water first, all the default, each other value with its sizes; /health
+// names them. A /reverse answers with the water water= names, none for
+// none, all without it, and answers 400 for a value the build doesn't
+// offer, naming those it does, before its key is checked.
+#[tokio::test]
+async fn water_is_none_or_a_water_dir_of_the_build_and_all_by_default() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let (cfg, manifest) = manifest_of(&bucket).await;
+    let plan = catalog::plan(&cfg, &manifest).unwrap();
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let p = portal(data.path(), config(&bucket, load));
+    p.round(true).await.unwrap();
+    let url = serve(router(p, db())).await;
+
+    let listed = fetch(&format!("{url}/datasets")).await.json();
+    let axes: Vec<&str> = listed["axes"].as_array().unwrap().iter().map(|a| a["id"].as_str().unwrap()).collect();
+    assert_eq!(axes, ["region", "mode", "quality", "poi_tier"]);
+    let water = &listed["water"];
+    assert_eq!((water["default"].as_str(), water["label"].as_str()), (Some("all"), Some("Bodies of water")));
+    let values: Vec<&str> = water["values"].as_array().unwrap().iter().map(|v| v["id"].as_str().unwrap()).collect();
+    assert_eq!(values, ["none", "major", "all", "all-exact"]);
+    for (v, w) in water["values"].as_array().unwrap()[1..].iter().zip(&plan.water) {
+        assert_eq!((v["size_disk"].as_u64(), v["size_download"].as_u64()), (Some(w.size_disk), Some(w.size_download)), "{}", w.id);
+        assert!(w.size_disk > 0 && w.size_download > 0, "{}", w.id);
+    }
+    assert_eq!(water["values"][0].get("size_disk"), None);
+    assert_eq!(fetch(&format!("{url}/health")).await.json()["water"], serde_json::json!(["water/major", "water/all", "water/all-exact"]));
+
+    let lake = serde_json::json!({"name": "Test Lake", "class": "water", "type": "lake"});
+    for (water, named) in [("", "all"), ("&water=all", "all"), ("&water=major", "major"), ("&water=all-exact", "all-exact"), ("&water=none", "none")] {
+        for dataset in ["", "&dataset=smallest"] {
+            let got = fetch(&format!("{url}/reverse?lat=47.005&lon=8.002&key=test{water}{dataset}")).await;
+            assert_eq!((got.status, got.header("x-geocoder-water")), (200, Some(named)), "{water}{dataset}");
+            assert!(got.header("access-control-expose-headers").unwrap().contains("x-geocoder-water"));
+            let want = if named == "none" { serde_json::json!({"address": {}}) } else { serde_json::json!({"address": {}, "water": lake}) };
+            assert_eq!(got.json(), want, "{water}{dataset}");
+        }
+    }
+    for key in ["&key=test", "", "&key=nope"] {
+        let got = fetch(&format!("{url}/reverse?lat=47.005&lon=8.002{key}&water=rivers")).await;
+        assert_eq!((got.status, got.body.as_str()), (400, "unknown water \"rivers\": this build offers water none, major, all, all-exact"), "{key}");
+    }
+}
+
+// A build whose manifest has none of a water value's files serves no water
+// dir of it: water= of it is a 400, and without all's, a /reverse without
+// water= answers with none, which /datasets gives as the default; without
+// any, /datasets has no water. One that has some of a value's files and
+// lacks others can't be planned, and says why.
+#[tokio::test]
+async fn a_build_lacking_a_water_values_files_serves_no_water_dir_of_it() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let without = |part: &'static str| {
+        move |m: &mut serde_json::Value| {
+            let files = m["files"].as_object_mut().unwrap();
+            let gone: Vec<String> = files.keys().filter(|path| path.contains(part)).cloned().collect();
+            assert!(!gone.is_empty(), "{part}");
+            for path in gone {
+                files.remove(&path);
+            }
+        }
+    };
+
+    let major = plan_edited(&bucket, without("/water/all/")).await.unwrap();
+    assert_eq!(major.water.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["major"]);
+    assert_eq!(major.water_of(0, None), Ok(None));
+    assert_eq!(major.water_of(0, Some("none")), Ok(None));
+    assert_eq!(major.water_of(0, Some("major")), Ok(Some(0)));
+    assert_eq!(major.water_of(0, Some("all")), Err("unknown water \"all\": this build offers water none, major".to_string()));
+    let listed = major.json("id", "dir");
+    assert_eq!(listed["water"]["default"], "none");
+    assert_eq!(listed["water"]["values"].as_array().unwrap().iter().map(|v| v["id"].as_str().unwrap()).collect::<Vec<_>>(), ["none", "major"]);
+
+    let dry = plan_edited(&bucket, without("/water/")).await.unwrap();
+    assert!(dry.water.is_empty() && dry.water_axis.is_none());
+    assert_eq!(dry.water_of(0, None), Ok(None));
+    assert_eq!(dry.json("id", "dir")["water"], serde_json::Value::Null);
+    assert_eq!(dry.datasets.len(), major.datasets.len());
+
+    let meta = "planet/water/major/simplified/water_meta.json";
+    let got = plan_edited(&bucket, move |m| {
+        m["files"].as_object_mut().unwrap().remove(meta).unwrap();
+    })
+    .await
+    .map(|_| ());
+    assert_eq!(got, Err(format!("water major: {meta} is not in the manifest")));
 }
 
 // A build of another build version is refused once its manifest says so,
@@ -898,8 +1073,7 @@ async fn a_sync_killed_part_way_resumes_in_its_dir_fetching_only_what_had_not_co
     want.sort();
     assert_eq!(resumed, want);
     let (cfg, _) = manifest_of(&bucket).await;
-    // The water dirs' files the portal doesn't serve yet: it fetches none.
-    for f in cfg.files.keys().filter(|f| f.starts_with("planet/") && !f.contains("/water/")) {
+    for f in cfg.files.keys().filter(|f| f.starts_with("planet/")) {
         assert!(std::fs::read(root.join(f)).unwrap() == bucket.file(f), "{f}");
     }
 }

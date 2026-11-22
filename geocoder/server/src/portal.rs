@@ -8,7 +8,10 @@
 // (search.rs), /datasets lists the datasets and the combinations the
 // constraints exclude, /health tells the build served (by its publication
 // ID, sync::publication_id), how the sync goes and how each place search
-// index does, POST /feedback keeps the reports of those who disagree with
+// index does, /reverse with water=<value> answers a dataset's address with
+// the water of the build's water dir of that value (catalog::Water: one
+// loaded once for every dataset, as a dataset with that water dir answers
+// it; all by default, where the build has it), POST /feedback keeps the reports of those who disagree with
 // an answer (feedback.rs), and /test is the page. Beside the build's
 // datasets, /datasets lists the column of what Immich stores today
 // (immich.rs: its reverse geocoding over the geodata of its release image,
@@ -43,7 +46,7 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 
 use crate::{auth, handlers};
-use query_server::{MultiIndex, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
+use query_server::{MultiIndex, WaterLayer, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
 
 /// The build version of the files this server reads, the build.version of
 /// configurations.template.json (a test here and
@@ -82,6 +85,9 @@ pub const SEARCH_QUERY_MAX: usize = 256;
 /// How a dataset's dir loads: into a MultiIndex of one slot.
 pub type Loader = Arc<dyn Fn(&Path) -> Result<MultiIndex, String> + Send + Sync>;
 
+/// How a water dir's dir of links loads: into its water layer.
+pub type WaterLoader = Arc<dyn Fn(&Path) -> Result<WaterLayer, String> + Send + Sync>;
+
 /// How the portal syncs and loads.
 pub struct Config {
     /// The bucket (BASE_URL).
@@ -103,6 +109,8 @@ pub struct Config {
     pub searches_at_once: usize,
     /// How a dataset's dir loads (load_dataset).
     pub load: Loader,
+    /// How a water dir loads (load_water).
+    pub load_water: WaterLoader,
     /// How a dataset's place search opens over the index of its group
     /// (search::open_search).
     pub open_search: search::Opener,
@@ -130,6 +138,7 @@ impl Config {
             lookups_at_once: LOOKUPS_AT_ONCE,
             searches_at_once: SEARCHES_AT_ONCE,
             load: Arc::new(load_dataset),
+            load_water: Arc::new(load_water),
             open_search: Arc::new(search::open_search),
             search_jobs: search_jobs(std::env::var("PORTAL_SEARCH_JOBS").ok().as_deref(), cpus),
             free_space,
@@ -159,6 +168,15 @@ pub fn load_dataset(dir: &Path) -> Result<MultiIndex, String> {
     Ok(index)
 }
 
+/// The water layer in the dir `dir` (the links to one water dir's files), as
+/// a dataset's water/ dir holding them loads (query_server::WaterLayer::open,
+/// its cells at the datasets' admin cell level). An error where it doesn't
+/// load, or holds no water files.
+pub fn load_water(dir: &Path) -> Result<WaterLayer, String> {
+    let at = dir.to_str().ok_or_else(|| format!("{} is no UTF-8 path", dir.display()))?;
+    WaterLayer::open(at, DEFAULT_ADMIN_CELL_LEVEL)?.ok_or_else(|| format!("{at} holds no water files"))
+}
+
 /// The bytes free to this process in the file system of `dir` (statvfs).
 pub fn free_space(dir: &Path) -> std::io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;
@@ -183,6 +201,9 @@ pub struct Served {
     pub plan: catalog::Plan,
     /// Each dataset's index, as plan.datasets orders them.
     pub indexes: Vec<Arc<MultiIndex>>,
+    /// Each water dir's layer, as plan.water orders them, which every
+    /// dataset of its region answers with.
+    pub water: Vec<Arc<WaterLayer>>,
     /// What /datasets answers.
     pub datasets_json: String,
     /// Each dataset's place search.
@@ -372,6 +393,7 @@ async fn health(State(app): State<Arc<App>>) -> Response {
             "status": "ok",
             "build": { "date": served.plan.date, "version": served.plan.version, "id": served.id, "dir": served.dir },
             "datasets": served.plan.datasets.len(),
+            "water": served.plan.water.iter().map(|w| w.set()).collect::<Vec<_>>(),
             "search": served.search.json(),
             "sync": sync,
         }).to_string()),
@@ -451,6 +473,8 @@ struct Params {
     key: Option<String>,
     debug: Option<String>,
     dataset: Option<String>,
+    /// The water a /reverse answers with (Plan::water_of).
+    water: Option<String>,
 }
 
 /// A lookup's answer's body, which holds the lookup's place (Portal::lookups)
@@ -532,10 +556,53 @@ async fn held(places: &Arc<tokio::sync::Semaphore>, served: &Served, at: usize, 
     resp
 }
 
+/// The answer of /reverse at (lat, lon) from `index` with the water of
+/// `water`, as a dataset whose water/ dir holds those files answers it
+/// (query_server::Address's water: last, absent where no water holds the
+/// point, and never in an answer of no continent): query-server's
+/// (handlers::reverse_answer), its water field that of `water`, debug=all's
+/// result's too. The other debug answers tell nothing of water.
+pub fn reverse_with_water(index: &MultiIndex, water: Option<&WaterLayer>, lat: f64, lon: f64, debug: Option<&str>) -> Response {
+    let Some(water) = water.filter(|_| matches!(debug, None | Some("all"))) else {
+        return handlers::reverse_answer(index, lat, lon, debug);
+    };
+    let json_answer = |json: String| ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response();
+    if debug.is_some() {
+        // As reverse_answer's debug=all: of the first continent that
+        // bbox-matches the point.
+        let arcs = index.loaded_matches(lat, lon);
+        let Some(idx) = arcs.first() else { return handlers::reverse_answer(index, lat, lon, debug) };
+        let mut address = idx.query(lat, lon);
+        if address.water.is_none() {
+            address.water = water.at(lat, lon);
+        }
+        let combined = serde_json::json!({
+            "result": serde_json::to_value(&address).unwrap_or_default(),
+            "admin_polygons": idx.debug_admin(lat, lon),
+            "primary_features": idx.debug_primary(lat, lon),
+            "place_nodes": idx.debug_places(lat, lon),
+        });
+        return json_answer(serde_json::to_string_pretty(&combined).unwrap_or_default());
+    }
+    let mut json = index.query_json(lat, lon);
+    if json != "{}" && json.ends_with('}') {
+        if let Some(detail) = water.at(lat, lon) {
+            json.pop();
+            json.push_str(",\"water\":");
+            json.push_str(&serde_json::to_string(&detail).unwrap_or_default());
+            json.push('}');
+        }
+    }
+    json_answer(json)
+}
+
 /// /reverse of a dataset, checked as query-server checks it, answered as a
-/// lookup. The dataset is found first: a request the portal can't answer
-/// (no build served, a dataset it doesn't offer) takes nothing of its key's
-/// rate, and tells nothing /datasets doesn't.
+/// lookup with the water water= names (Plan::water_of: all by default, where
+/// the build has it), named by the header X-Geocoder-Water (none, or the
+/// water dir's value). The dataset and the water are found first: a request
+/// the portal can't answer (no build served, a dataset or water it doesn't
+/// offer) takes nothing of its key's rate, and tells nothing /datasets
+/// doesn't.
 async fn reverse(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, Query(p): Query<Params>) -> Response {
     if is_immich(&app.portal, p.dataset.as_deref()) {
         return immich_reverse(&app, peer, p).await;
@@ -544,10 +611,25 @@ async fn reverse(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Soc
         Ok(found) => found,
         Err(resp) => return resp,
     };
+    let water = match served.plan.water_of(at, p.water.as_deref()) {
+        Ok(water) => water,
+        Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
+    };
     if let Err(resp) = handlers::check_reverse(&app.db, &app.limiter, p.key.as_deref(), p.lat, p.lon, peer.ip()) {
         return resp;
     }
-    lookup(&app.portal, served, at, move |index| handlers::reverse_answer(index, p.lat, p.lon, p.debug.as_deref())).await
+    let named = water.map_or(catalog::NO_WATER.to_string(), |w| served.plan.water[w].id.clone());
+    let layer = water.map(|w| served.water[w].clone());
+    let mut resp = lookup(&app.portal, served, at, move |index| reverse_with_water(index, layer.as_deref(), p.lat, p.lon, p.debug.as_deref())).await;
+    let h = resp.headers_mut();
+    if let Ok(named) = axum::http::HeaderValue::from_str(&named) {
+        h.insert("x-geocoder-water", named);
+    }
+    h.insert(
+        "access-control-expose-headers",
+        "x-geocoder-build, x-geocoder-build-id, x-geocoder-build-dir, x-geocoder-dataset, x-geocoder-water".parse().unwrap(),
+    );
+    resp
 }
 
 /// /polygons of a dataset, as reverse.

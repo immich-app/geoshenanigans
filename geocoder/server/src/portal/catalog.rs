@@ -2,16 +2,24 @@
 // each selection of a region it serves (REGIONS) that the manifest's
 // constraints allow, the files of each as a client downloads them
 // (downloader::resolve_files), the objects one sync fetches for all of them,
-// the groups of datasets whose place search is one index (Group), and what
-// /datasets says of them. The constraints are read here only: /datasets
-// lists the combinations they exclude, with each one's message and what it
-// requires, for the page to grey out.
+// the groups of datasets whose place search is one index (Group), the water
+// dirs served beside them (Water), and what /datasets says of them. The
+// constraints are read here only: /datasets lists the combinations they
+// exclude, with each one's message and what it requires, for the page to
+// grey out.
+//
+// Water is no axis of a dataset here, as it is of a client's selection: the
+// datasets are the selections of water none, and each water value of the
+// build with files (major, all, all-exact) is one water dir of its own,
+// whose layer the portal loads once and answers beside any dataset's
+// address, as a dataset with that water dir would (water=).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::Deserialize;
 
 use crate::downloader::{self, basename, Configurations, RegionSelection};
+use query_server::WATER_DIR;
 use place_search::dataset::DATASET_FILES;
 use query_server::ADMIN_GEOMETRY_FILES;
 
@@ -21,6 +29,18 @@ pub const REGIONS: [&str; 1] = ["planet"];
 /// The preset a /reverse or /polygons without dataset= answers: the
 /// dataset :3002 served before the portal had more than one.
 pub const DEFAULT_PRESET: &str = "with-addresses";
+
+/// The water axis of a client's selection, which the portal serves as water
+/// dirs beside its datasets (Water), not as an axis of theirs.
+pub const WATER_AXIS: &str = "water";
+
+/// The water value of no water: the datasets' own, which takes no water
+/// dir.
+pub const NO_WATER: &str = "none";
+
+/// The water a /reverse without water= answers with, where the build has
+/// it; else none.
+pub const DEFAULT_WATER: &str = "all";
 
 /// What the portal reads of configurations.json besides what the
 /// downloader does (downloader::Configurations): the build, the axes, the
@@ -182,6 +202,26 @@ pub struct Excluded {
     pub requires: BTreeMap<String, String>,
 }
 
+/// A water dir the portal serves beside its datasets: the files a client
+/// selection of `id` (major, all, all-exact) puts in the dataset's water/
+/// dir, which the sync links into a dir of its own (Water::set) and the
+/// portal loads once, for every dataset of its region.
+#[derive(Debug, Clone)]
+pub struct Water {
+    pub region: String,
+    /// The water axis value.
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+    /// Its files as the build lays them out, in path order, as a dataset's.
+    pub files: Vec<String>,
+    /// The bytes of the files its dir holds.
+    pub size_disk: u64,
+    /// The bytes a client downloads for it: its files' .zst and transport
+    /// units, each unit once.
+    pub size_download: u64,
+}
+
 /// An object of the build the sync puts in place: a file published as its
 /// own .zst, or a transport unit, for all its files.
 #[derive(Debug, Clone)]
@@ -224,6 +264,12 @@ pub struct Plan {
     /// The groups of datasets whose place search is one index, in the order
     /// of their first datasets.
     pub groups: Vec<Group>,
+    /// The water axis as the manifest gives it, where it has one with water
+    /// dirs.
+    pub water_axis: Option<Axis>,
+    /// The water dirs served, by region then in the water axis's order: each
+    /// value of it with files, in each region served.
+    pub water: Vec<Water>,
 }
 
 /// The values of an axis of `manifest`, in their order (by key where two
@@ -335,9 +381,7 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
                         mode: mode.to_string(),
                         quality: quality.to_string(),
                         poi_tier: tier.to_string(),
-                        // Water is not served yet: each dataset is a
-                        // selection of no water.
-                        water: "none".to_string(),
+                        water: NO_WATER.to_string(),
                     };
                     let id = dataset_id(&sel);
                     if !plain_name(&id) {
@@ -350,33 +394,7 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
                         continue;
                     }
                     let resolved = downloader::resolve_files(cfg, &sel).map_err(|e| format!("{id}: {e}"))?;
-                    let mut files = Vec::new();
-                    for path in &resolved.paths {
-                        if cfg.files.contains_key(path) {
-                            check_path(path, region).map_err(|why| format!("{id}: {why}"))?;
-                            files.push(path);
-                        } else if !resolved.optional.contains(path) {
-                            return Err(format!("{id}: {path} is not in the manifest"));
-                        }
-                    }
-                    let fetches = downloader::fetches(cfg, &resolved, &files).map_err(|e| format!("{id}: {e}"))?;
-                    for fetch in &fetches {
-                        for path in std::iter::once(fetch.path()).chain(fetch.files().into_iter().map(|f| f.path)) {
-                            check_path(path, region).map_err(|why| format!("{id}: {why}"))?;
-                        }
-                        // A unit decodes into its own dir.
-                        let dir = |path: &str| path.rsplit_once('/').map(|(dir, _)| dir.to_string());
-                        if fetch.files().iter().any(|f| dir(f.path) != dir(fetch.path())) {
-                            return Err(format!("{id}: {} holds files of another dir", fetch.path()));
-                        }
-                        objects.entry(fetch.path().to_string()).or_insert_with(|| Object {
-                            path: fetch.path().to_string(),
-                            unit: matches!(fetch, downloader::Fetch::Unit { .. }),
-                            size: fetch.size(),
-                            files: fetch.files().iter().map(|f| f.path.to_string()).collect(),
-                            link: None,
-                        });
-                    }
+                    let (files, fetches) = taken(cfg, &resolved, &resolved.paths, region, &mut objects).map_err(|why| format!("{id}: {why}"))?;
                     let mut dataset = Dataset {
                         id,
                         selection: sel,
@@ -384,8 +402,8 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
                         description: None,
                         preset: None,
                         size_disk: 0,
-                        size_download: fetches.iter().map(|f| f.size()).sum(),
-                        files: files.into_iter().cloned().collect(),
+                        size_download: fetches,
+                        files,
                         group: 0,
                     };
                     dataset.size_disk = dataset.links().values().map(|p| cfg.files[p].size_raw).sum();
@@ -394,6 +412,8 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
             }
         }
     }
+
+    let (water_axis, water) = water(cfg, manifest, &datasets, &mut objects)?;
 
     let mut presets = Vec::new();
     for preset in &manifest.presets {
@@ -458,7 +478,102 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
         presets,
         default,
         groups,
+        water_axis,
+        water,
     })
+}
+
+/// The files of `paths` (of `resolved`) the manifest has, each at a path
+/// the sync can keep (check_path) under `region`, and the bytes their
+/// download takes; each object that fetches them added to `objects`. An
+/// error, why, where a path that must be there isn't, or a fetch is no
+/// object the sync can keep.
+fn taken(
+    cfg: &Configurations,
+    resolved: &downloader::ResolvedFiles,
+    paths: &[String],
+    region: &str,
+    objects: &mut BTreeMap<String, Object>,
+) -> Result<(Vec<String>, u64), String> {
+    let mut files = Vec::new();
+    for path in paths {
+        if cfg.files.contains_key(path) {
+            check_path(path, region)?;
+            files.push(path);
+        } else if !resolved.optional.contains(path) {
+            return Err(format!("{path} is not in the manifest"));
+        }
+    }
+    let fetches = downloader::fetches(cfg, resolved, &files).map_err(|e| e.to_string())?;
+    for fetch in &fetches {
+        for path in std::iter::once(fetch.path()).chain(fetch.files().into_iter().map(|f| f.path)) {
+            check_path(path, region)?;
+        }
+        // A unit decodes into its own dir.
+        let dir = |path: &str| path.rsplit_once('/').map(|(dir, _)| dir.to_string());
+        if fetch.files().iter().any(|f| dir(f.path) != dir(fetch.path())) {
+            return Err(format!("{} holds files of another dir", fetch.path()));
+        }
+        objects.entry(fetch.path().to_string()).or_insert_with(|| Object {
+            path: fetch.path().to_string(),
+            unit: matches!(fetch, downloader::Fetch::Unit { .. }),
+            size: fetch.size(),
+            files: fetch.files().iter().map(|f| f.path.to_string()).collect(),
+            link: None,
+        });
+    }
+    Ok((files.into_iter().cloned().collect(), fetches.iter().map(|f| f.size()).sum()))
+}
+
+/// The water axis of `manifest` and the water dirs the portal serves of
+/// it: of each region served, each value of the axis but NO_WATER whose
+/// files (those a selection of it puts in the dataset's water/ dir: the
+/// region's first dataset's with that water, downloader::resolve_files) the
+/// manifest has, their objects added to `objects`. A value whose files the
+/// manifest has none of is not served (a build without that water dir); an
+/// error where it has some of them and lacks others, or where a value is no
+/// plain name.
+fn water(
+    cfg: &Configurations,
+    manifest: &Manifest,
+    datasets: &[Dataset],
+    objects: &mut BTreeMap<String, Object>,
+) -> Result<(Option<Axis>, Vec<Water>), String> {
+    let Some(axis) = manifest.axes.get(WATER_AXIS) else { return Ok((None, Vec::new())) };
+    let mut served = Vec::new();
+    for region in REGIONS {
+        let Some(base) = datasets.iter().find(|d| d.selection.region == region) else { continue };
+        for (value, v) in values(manifest, WATER_AXIS)? {
+            if value == NO_WATER {
+                continue;
+            }
+            if !plain_value(value) {
+                return Err(format!("the manifest's {WATER_AXIS} value {value:?} is not a plain name (letters, digits, '-' and '_')"));
+            }
+            let sel = RegionSelection { water: value.clone(), ..base.selection.clone() };
+            let id = format!("{WATER_AXIS} {value}");
+            let resolved = downloader::resolve_files(cfg, &sel).map_err(|e| format!("{id}: {e}"))?;
+            let in_dir = |path: &&String| resolved.dest(path).starts_with(&format!("{WATER_DIR}/"));
+            let paths: Vec<String> = resolved.paths.iter().filter(in_dir).cloned().collect();
+            let listed = paths.iter().filter(|p| cfg.files.contains_key(*p)).count();
+            if listed == 0 {
+                continue;
+            }
+            let (files, size_download) = taken(cfg, &resolved, &paths, region, objects).map_err(|why| format!("{id}: {why}"))?;
+            let mut water = Water {
+                region: region.to_string(),
+                id: value.clone(),
+                label: v.label.clone(),
+                description: v.description.clone(),
+                files,
+                size_disk: 0,
+                size_download,
+            };
+            water.size_disk = water.links().values().map(|p| cfg.files[p].size_raw).sum();
+            served.push(water);
+        }
+    }
+    Ok((if served.is_empty() { None } else { Some(axis.clone()) }, served))
 }
 
 /// The groups of `datasets` (Group), each dataset given its own; the
@@ -501,6 +616,26 @@ fn groups(cfg: &Configurations, manifest: &Manifest, datasets: &mut [Dataset]) -
 }
 
 impl Plan {
+    /// The water dir a lookup of the dataset `at` answers with, by what
+    /// `wanted` names (water=): none for NO_WATER, else the water dir of
+    /// that value in the dataset's region; without water=, DEFAULT_WATER's
+    /// where the build has it, else none. Else why not, for a 400: what the
+    /// build offers.
+    pub fn water_of(&self, at: usize, wanted: Option<&str>) -> Result<Option<usize>, String> {
+        let region = &self.datasets[at].selection.region;
+        let find = |value: &str| self.water.iter().position(|w| &w.region == region && w.id == value);
+        match wanted {
+            None => Ok(find(DEFAULT_WATER)),
+            Some(NO_WATER) => Ok(None),
+            Some(value) => find(value).map(Some).ok_or_else(|| {
+                let offered: Vec<&str> = std::iter::once(NO_WATER)
+                    .chain(self.water.iter().filter(|w| &w.region == region).map(|w| w.id.as_str()))
+                    .collect();
+                format!("unknown water \"{value}\": this build offers water {}", offered.join(", "))
+            }),
+        }
+    }
+
     /// The dataset `wanted` names: a preset's id, or a dataset's. Else why
     /// not, for a 400: the constraint's message for a selection it rules
     /// out, or what the build offers.
@@ -544,8 +679,25 @@ impl Plan {
                 "values": values.iter().map(|(id, v)| serde_json::json!({ "id": id, "label": v.label, "description": v.description })).collect::<Vec<_>>(),
             })
         }).collect();
+        // The water dirs served, as the water axis's values (NO_WATER first),
+        // each with its sizes; none for a build without one.
+        let water = self.water_axis.as_ref().map(|axis| {
+            let mut values: Vec<serde_json::Value> = Vec::new();
+            if let Some(none) = axis.values.get(NO_WATER) {
+                values.push(serde_json::json!({ "id": NO_WATER, "label": none.label, "description": none.description }));
+            }
+            for w in &self.water {
+                values.push(serde_json::json!({
+                    "id": w.id, "label": w.label, "description": w.description, "region": w.region,
+                    "size_disk": w.size_disk, "size_download": w.size_download,
+                }));
+            }
+            let default = if self.water.iter().any(|w| w.id == DEFAULT_WATER) { DEFAULT_WATER } else { NO_WATER };
+            serde_json::json!({ "label": axis.label, "description": axis.description, "default": default, "values": values })
+        });
         serde_json::json!({
             "build": { "date": self.date, "version": self.version, "id": id, "dir": dir },
+            "water": water,
             "default": self.datasets[self.default].id,
             "axes": axes,
             "presets": self.presets.iter().map(|(p, at)| serde_json::json!({
@@ -576,6 +728,30 @@ impl Dataset {
     /// The path of each file its dir holds, by its name: of two of one name,
     /// the later.
     pub fn links(&self) -> BTreeMap<String, String> {
-        self.files.iter().map(|path| (basename(path).to_string(), path.clone())).collect()
+        links(&self.files)
     }
+}
+
+impl Water {
+    /// Its dir's name in a build's sets dir: `water/<id>`, after
+    /// `<region>/` where the region isn't planet (as dataset_id names a
+    /// dataset's).
+    pub fn set(&self) -> String {
+        let set = format!("{WATER_DIR}/{}", self.id);
+        if self.region == "planet" {
+            set
+        } else {
+            format!("{}/{set}", self.region)
+        }
+    }
+
+    /// The path of each file its dir holds, by its name, as a dataset's.
+    pub fn links(&self) -> BTreeMap<String, String> {
+        links(&self.files)
+    }
+}
+
+/// The path of each of `files` by its name: of two of one name, the later.
+fn links(files: &[String]) -> BTreeMap<String, String> {
+    files.iter().map(|path| (basename(path).to_string(), path.clone())).collect()
 }
