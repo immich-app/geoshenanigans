@@ -2400,6 +2400,7 @@ static int run(int argc, char* argv[]) {
                             way.id = rel.id;
                             way.name = w_name_en ? w_name_en : w_name;
                             way.local_name = w_name ? w_name : w_name_en;
+                            way.english = w_name_en != nullptr;
                             way.qid = water::qid_of(rel.tag("wikidata"));
                             for (const auto& m : rel.members)
                                 if (m.type == 'w') way.ways.push_back(m.ref);

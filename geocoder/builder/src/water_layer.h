@@ -107,6 +107,7 @@ struct CollectedWaterway {
     std::string local_name;  // name, else name:en
     uint32_t qid = 0;
     std::vector<int64_t> ways;
+    bool english = false;  // whether `name` is its name:en
 };
 
 // A closed way in scope.
@@ -124,6 +125,9 @@ struct LineIn {
     std::string display;
     uint32_t qid = 0;
     std::vector<PackedLocation> vertices;
+    // The way's own name:en, read for a member of a waterway relation of a
+    // local name alone (CollectedWaterway::english false); else empty.
+    std::string way_en;
 };
 
 // Everything the passes collect for the layer.
@@ -147,7 +151,9 @@ void index_collected(Collected& c);
 
 // The key and display name of a waterway=river or canal way, given its
 // tags: its waterway relation's id and name (a member of one), else its
-// local name and its name:en (else name); false for neither.
+// local name and its name:en (else name); false for neither. A member of a
+// relation of a local name alone keeps its own name:en (LineIn::way_en),
+// which assemble shows in the relation's place.
 bool line_key(const Collected& c, int64_t way, const char* name, const char* name_en, uint32_t way_qid, LineIn& line);
 
 // --- The layer ---
@@ -186,7 +192,10 @@ struct Build {
 // runs (a marine ring's marine::ring_runs). A relation with a member way the
 // passes didn't find is left out. Uses up the collected areas and
 // geometries; moves the lines into the build's NamingLines, keys and names
-// sorted.
+// sorted. The names follow the dataset's (name:en, else name): the lines of
+// a waterway relation of a local name alone show the name:en most of its
+// river ways that have one carry (the smaller of a tie), else the
+// relation's name.
 Build assemble(Collected& c, unsigned threads);
 
 // Leaves out each OSM natural=bay or strait that is a marine area's

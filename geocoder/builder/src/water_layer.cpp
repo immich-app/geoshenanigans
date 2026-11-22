@@ -173,6 +173,7 @@ bool line_key(const Collected& c, int64_t way, const char* name, const char* nam
         line.local = w.local_name;
         line.display = w.name;
         line.qid = w.qid;
+        if (!w.english && name_en) line.way_en = name_en;
         return true;
     }
     if (!name && !name_en) return false;
@@ -299,6 +300,26 @@ Build assemble(Collected& c, unsigned threads) {
     std::sort(c.lines.begin(), c.lines.end(), [](const LineIn& x, const LineIn& y) { return x.way < y.way; });
     c.lines.erase(std::unique(c.lines.begin(), c.lines.end(), [](const LineIn& x, const LineIn& y) { return x.way == y.way; }),
                   c.lines.end());
+    // A waterway relation of a local name alone shows the name:en most of its
+    // river ways carry, the smaller of a tie.
+    {
+        std::map<std::string, std::map<std::string, size_t>> votes;  // key -> name:en -> ways
+        for (const LineIn& l : c.lines)
+            if (!l.way_en.empty()) votes[l.key][l.way_en]++;
+        std::map<std::string, std::string> shown;
+        for (const auto& [key, names] : votes) {
+            size_t most = 0;
+            for (const auto& [name, ways] : names)
+                if (ways > most) {
+                    most = ways;
+                    shown[key] = name;
+                }
+        }
+        for (LineIn& l : c.lines) {
+            auto it = shown.find(l.key);
+            if (it != shown.end()) l.display = it->second;
+        }
+    }
     {
         std::map<std::string, std::string> keys;
         std::set<std::string> displays;

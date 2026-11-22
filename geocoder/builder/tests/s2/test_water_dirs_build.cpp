@@ -124,6 +124,26 @@ std::vector<std::string> names_in(const std::vector<char>& file) {
 const std::vector<std::string> kRegions = {"planet", "africa", "asia", "europe", "north-america", "south-america",
                                            "oceania", "central-america", "antarctica"};
 
+// The objects by type, then id, as a PBF holds them.
+std::vector<TestObject> sorted(std::vector<TestObject> objs) {
+    std::stable_sort(objs.begin(), objs.end(), [](const TestObject& a, const TestObject& b) {
+        return a.type != b.type ? a.type < b.type : a.id < b.id;
+    });
+    return objs;
+}
+
+// The names of the planet's water/all/exact dir of a build-index run on
+// `objects` (and `extra` arguments), into dir.
+std::vector<std::string> planet_water_names(const std::vector<TestObject>& objects, const std::string& dir,
+                                            std::vector<std::string> extra = {}) {
+    const std::string pbf = dir + ".osm.pbf";
+    write_test_pbf(pbf, sorted(objects), 1000);
+    std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, dir, pbf, "--multi-output", "--multi-quality"};
+    words.insert(words.end(), extra.begin(), extra.end());
+    if (!gctest::run(words, dir + ".log")) return {"build failed"};
+    return names_in(bytes_of(dir + "/planet/water/all/exact/strings_core.bin"));
+}
+
 }  // namespace
 
 TEST(build_index_writes_every_regions_water_dirs_and_a_chained_build_writes_them_again) {
@@ -231,4 +251,39 @@ TEST(a_build_without_multi_output_writes_the_exact_water_tier_beside_its_modes_f
         CHECK(one.at(std::string("planet/water/") + f) == multi.at(std::string("planet/water/all/exact/") + f));
     }
     CHECK(!one.count("planet/water/admin_polygons.osm_ids"));
+}
+
+TEST(a_river_area_shows_its_waterway_relations_name_as_the_datasets_names_go) {
+    // name:en, else name, as admin, place and POI names go. A relation of a
+    // local name alone shows its river ways' most common name:en; one with a
+    // name:en of its own shows that.
+    const int32_t lat0 = 350000000, lng0 = 1380000000;
+    std::vector<TestObject> objects;
+    int64_t next = 1;
+    auto at = [&](int32_t lat, int32_t lng) {
+        objects.push_back(node(next, lat, lng));
+        return next++;
+    };
+    auto square = [&](int32_t lat, int32_t lng, int32_t side) {
+        const int64_t a = at(lat, lng), b = at(lat, lng + side), c = at(lat + side, lng + side), d = at(lat + side, lng);
+        return std::vector<int64_t>{a, b, c, d, a};
+    };
+    objects.push_back(way(100, square(lat0, lng0, 10000), {{"natural", "water"}, {"water", "river"}}));
+    objects.push_back(way(101, {at(lat0 + 2000, lng0 + 2000), at(lat0 + 6000, lng0 + 6000)},
+                          {{"waterway", "river"}, {"name", "小渋川"}, {"name:en", "Koshibu River"}}));
+    objects.push_back(way(102, {at(lat0 + 50000, lng0), at(lat0 + 52000, lng0)},
+                          {{"waterway", "river"}, {"name", "小渋川"}, {"name:en", "Koshibu River"}}));
+    objects.push_back(way(103, {at(lat0 + 60000, lng0), at(lat0 + 62000, lng0)},
+                          {{"waterway", "river"}, {"name", "小渋川"}, {"name:en", "Koshibu-gawa"}}));
+    objects.push_back(way(104, {at(lat0 + 70000, lng0), at(lat0 + 72000, lng0)}, {{"waterway", "river"}, {"name", "小渋川"}}));
+    objects.push_back(relation(950, {{"type", "waterway"}, {"waterway", "river"}, {"name", "小渋川"}},
+                               {{101, ""}, {102, ""}, {103, ""}, {104, ""}}));
+    objects.push_back(way(110, square(lat0 + 100000, lng0, 10000), {{"natural", "water"}, {"water", "river"}}));
+    objects.push_back(way(111, {at(lat0 + 102000, lng0 + 2000), at(lat0 + 106000, lng0 + 6000)},
+                          {{"waterway", "river"}, {"name", "Donau"}, {"name:en", "Danube River"}}));
+    objects.push_back(relation(951, {{"type", "waterway"}, {"waterway", "river"}, {"name", "Donau"}, {"name:en", "Danube"}},
+                               {{111, ""}}));
+    const ScratchDir root("water-river-names");
+    const std::vector<std::string> names = planet_water_names(objects, root.path() + "/out");
+    CHECK(names == std::vector<std::string>({"Danube", "Koshibu River"}));
 }

@@ -587,6 +587,56 @@ TEST(an_osm_bay_or_strait_of_a_marine_areas_name_that_it_overlaps_is_left_out) {
     CHECK_EQ(marine, size_t(3));
 }
 
+TEST(a_waterway_relation_of_a_local_name_alone_shows_the_name_en_most_of_its_river_ways_carry) {
+    Collected c = fixture();
+    CollectedWaterway local, english;
+    local.id = 901;
+    local.name = local.local_name = "小渋川";
+    local.ways = {51, 52, 53, 54};
+    english.id = 902;
+    english.name = "Danube";
+    english.local_name = "Donau";
+    english.english = true;
+    english.ways = {61};
+    c.waterways = {local, english};
+    index_collected(c);
+    // A member of a relation of a local name alone keeps its own name:en;
+    // one of a relation with a name:en of its own, and a way of none, don't.
+    auto keyed = [&](int64_t way, const char* name, const char* name_en) {
+        LineIn line;
+        CHECK(line_key(c, way, name, name_en, 0, line));
+        line.vertices = {pt(kLat + 700000, kLng + int32_t(way) * 1000), pt(kLat + 701000, kLng + int32_t(way) * 1000)};
+        return line;
+    };
+    const LineIn a = keyed(51, "小渋川", "Koshibu River"), danube = keyed(61, "Donau", "Danube River"),
+                 brook = keyed(70, "Bach", "Brook");
+    CHECK(a.key == "r901" && a.display == "小渋川" && a.way_en == "Koshibu River");
+    CHECK(danube.key == "r902" && danube.display == "Danube" && danube.way_en.empty());
+    CHECK(brook.key == "nBach" && brook.display == "Brook" && brook.way_en.empty());
+    c.lines.push_back(a);
+    c.lines.push_back(keyed(52, "小渋川", "Koshibu River"));
+    c.lines.push_back(keyed(53, "小渋川", "Koshibu-gawa"));
+    c.lines.push_back(keyed(54, "小渋川", nullptr));
+    c.lines.push_back(danube);
+    // A tie goes to the smaller name.
+    for (const auto& [way, en] : std::vector<std::pair<int64_t, std::string>>{{80, "Zeta River"}, {81, "Alpha River"}}) {
+        LineIn line;
+        line.way = way;
+        line.key = "r903";
+        line.local = line.display = "Χείμαρρος";
+        line.way_en = en;
+        line.vertices = {pt(kLat + 800000, kLng + int32_t(way) * 1000), pt(kLat + 801000, kLng + int32_t(way) * 1000)};
+        c.lines.push_back(line);
+    }
+    const Build b = assemble(c, 1);
+    std::map<std::string, std::set<std::string>> shown;
+    for (const NamingLine& l : b.lines.lines) shown[b.lines.keys[l.key]].insert(b.lines.displays[l.display]);
+    CHECK(shown["r901"] == std::set<std::string>({"Koshibu River"}));
+    CHECK(shown["r902"] == std::set<std::string>({"Danube"}));
+    CHECK(shown["r903"] == std::set<std::string>({"Alpha River"}));
+    CHECK(shown["r900"] == std::set<std::string>({"Test River"}));
+}
+
 // geocoder/testdata/water_dir: the client files of a water dir on two days,
 // which tools/test_generate_patches.py diffs, patches and verifies with the
 // real tools. Day 2 is day 1 with the pond's second vertex moved, on day 1's
