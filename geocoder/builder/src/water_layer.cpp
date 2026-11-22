@@ -337,10 +337,17 @@ Build assemble(Collected& c, unsigned threads) {
         return static_cast<uint32_t>(std::lower_bound(sorted.begin(), sorted.end(), s) - sorted.begin());
     };
     for (LineIn& l : c.lines) {
-        if (l.vertices.size() < 2) continue;
-        b.lines.lines.push_back({l.way, index_of(b.lines.keys, l.key), index_of(b.lines.displays, l.display), l.qid,
-                                 b.lines.vertices.size(), static_cast<uint32_t>(l.vertices.size())});
-        b.lines.vertices.insert(b.lines.vertices.end(), l.vertices.begin(), l.vertices.end());
+        if (l.runs.empty()) l.runs.push_back(static_cast<uint32_t>(l.vertices.size()));
+        const uint32_t key = index_of(b.lines.keys, l.key), display = index_of(b.lines.displays, l.display);
+        size_t at = 0;
+        for (const uint32_t run : l.runs) {
+            if (run >= 2) {
+                b.lines.lines.push_back({l.way, key, display, l.qid, b.lines.vertices.size(), run});
+                b.lines.vertices.insert(b.lines.vertices.end(), l.vertices.begin() + static_cast<std::ptrdiff_t>(at),
+                                        l.vertices.begin() + static_cast<std::ptrdiff_t>(at + run));
+            }
+            at += run;
+        }
         std::vector<PackedLocation>().swap(l.vertices);
     }
     free_storage(c.lines);

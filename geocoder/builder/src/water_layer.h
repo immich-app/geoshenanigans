@@ -125,6 +125,9 @@ struct LineIn {
     std::string display;
     uint32_t qid = 0;
     std::vector<PackedLocation> vertices;
+    // Its vertices' runs between nodes the input lacks, their counts in
+    // order, each a line of its own; empty for one run of them all.
+    std::vector<uint32_t> runs;
     // The way's own name:en, read for a member of a waterway relation of a
     // local name alone (CollectedWaterway::english false); else empty.
     std::string way_en;

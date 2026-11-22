@@ -3077,20 +3077,13 @@ static int run(int argc, char* argv[]) {
 
                     // The water layer's ways. The other layers read only the
                     // ways way_needs_nodes resolves, as if the water layer
-                    // weren't there.
+                    // weren't there. A node the input lacks joins nothing: a
+                    // member way short of one is left out, so its relation
+                    // is, as for a missing member, and a line breaks there.
                     if (water_wanted) {
-                        auto valid = [&] {
-                            std::vector<PackedLocation> geom;
-                            geom.reserve(refs_size);
-                            for (const auto& loc : resolved_locs)
-                                if (loc.valid()) geom.push_back(loc);
-                            return geom;
-                        };
-                        if (water_member) {
-                            auto geom = valid();
-                            if (!geom.empty())
-                                local.water_way_geoms.push_back({way_id, std::move(geom), refs_data[0], refs_data[refs_size-1]});
-                        }
+                        if (water_member && all_valid)
+                            local.water_way_geoms.push_back({way_id, std::vector<PackedLocation>(resolved_locs.begin(), resolved_locs.end()),
+                                                             refs_data[0], refs_data[refs_size-1]});
                         if (refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
                             water::ObjectTags wtags = water_way_tags(t);
                             if (water::in_scope(wtags))
@@ -3100,8 +3093,18 @@ static int run(int argc, char* argv[]) {
                         if (water::is_naming_waterway(t.waterway)) {
                             water::LineIn line;
                             if (water::line_key(water_collected, way_id, t.name, t.name_en, water::qid_of(t.wikidata), line)) {
-                                line.vertices = valid();
-                                if (line.vertices.size() >= 2) local.water_lines.push_back(std::move(line));
+                                uint32_t run = 0, longest = 0;
+                                for (const auto& loc : resolved_locs) {
+                                    if (loc.valid()) {
+                                        line.vertices.push_back(loc);
+                                        longest = std::max(longest, ++run);
+                                    } else if (run) {
+                                        line.runs.push_back(run);
+                                        run = 0;
+                                    }
+                                }
+                                if (run && !line.runs.empty()) line.runs.push_back(run);
+                                if (longest >= 2) local.water_lines.push_back(std::move(line));
                             }
                         }
                     }

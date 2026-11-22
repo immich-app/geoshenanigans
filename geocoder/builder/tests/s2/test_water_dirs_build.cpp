@@ -287,3 +287,42 @@ TEST(a_river_area_shows_its_waterway_relations_name_as_the_datasets_names_go) {
     const std::vector<std::string> names = planet_water_names(objects, root.path() + "/out");
     CHECK(names == std::vector<std::string>({"Danube", "Koshibu River"}));
 }
+
+TEST(a_node_the_input_lacks_leaves_a_gap_that_no_water_ring_or_line_crosses) {
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    std::vector<TestObject> objects;
+    int64_t next = 1;
+    auto at = [&](int32_t lat, int32_t lng) {
+        objects.push_back(node(next, lat, lng));
+        return next++;
+    };
+    auto square = [&](int32_t lat, int32_t lng, int32_t side) {
+        const int64_t a = at(lat, lng), b = at(lat, lng + side), c = at(lat + side, lng + side), d = at(lat + side, lng);
+        return std::vector<int64_t>{a, b, c, d, a};
+    };
+    const int64_t missing = 99999;
+    // A lake relation whose way lacks a corner: left out, not closed across
+    // the gap.
+    std::vector<int64_t> corner_gone = square(lat0, lng0, 10000);
+    corner_gone[2] = missing;
+    objects.push_back(way(100, corner_gone));
+    objects.push_back(relation(500, {{"type", "multipolygon"}, {"natural", "water"}, {"water", "lake"}, {"name", "Chord Lake"}},
+                               {{100, "outer"}}));
+    // A whole lake beside it stays.
+    objects.push_back(way(101, square(lat0, lng0 + 20000, 10000)));
+    objects.push_back(relation(501, {{"type", "multipolygon"}, {"natural", "water"}, {"water", "lake"}, {"name", "Whole Lake"}},
+                               {{101, "outer"}}));
+    // A river area the line of a river would cross only along a gap: its
+    // nodes either side lie west and east of it.
+    objects.push_back(way(110, square(lat0 + 100000, lng0, 10000), {{"natural", "water"}, {"water", "river"}}));
+    objects.push_back(way(111, {at(lat0 + 105000, lng0 - 5000), missing, at(lat0 + 105000, lng0 + 15000)},
+                          {{"waterway", "river"}, {"name", "Gap River"}}));
+    // One a run of a river's resolved nodes runs through names.
+    objects.push_back(way(120, square(lat0 + 200000, lng0, 10000), {{"natural", "water"}, {"water", "river"}}));
+    objects.push_back(way(121, {at(lat0 + 202000, lng0 + 2000), at(lat0 + 206000, lng0 + 6000), missing,
+                                at(lat0 + 250000, lng0 + 50000)},
+                          {{"waterway", "river"}, {"name", "Run River"}}));
+    const ScratchDir root("water-missing-nodes");
+    const std::vector<std::string> names = planet_water_names(objects, root.path() + "/out");
+    CHECK(names == std::vector<std::string>({"Run River", "Whole Lake"}));
+}

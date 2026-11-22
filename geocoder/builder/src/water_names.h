@@ -1,8 +1,9 @@
 // How a river or canal area with no name of its own takes one: the waterway
 // with the most length inside it. Each candidate line is a waterway=river or
-// canal way, keyed by the type=waterway relation it belongs to (the lowest
-// relation id, where it belongs to two) or else by its own local name (the
-// name tag, not name:en), so a river whose ways vary in name:en is one key.
+// canal way (a run of one, where the input lacks a node of it), keyed by the
+// type=waterway relation it belongs to (the lowest relation id, where it
+// belongs to two) or else by its own local name (the name tag, not
+// name:en), so a river whose ways vary in name:en is one key.
 // Each segment of a candidate line credits its length, in integer
 // millimetres, to the area object that holds its midpoint (an object's
 // outer rings together). The object takes the key of the largest total, a
