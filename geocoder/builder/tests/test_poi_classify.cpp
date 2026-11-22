@@ -35,6 +35,8 @@ struct Tags {
     const char* shop = nullptr;
     const char* landuse = nullptr;
     const char* emergency = nullptr;
+    // A polygon (a closed way), not a node.
+    bool area = false;
 };
 
 std::optional<PoiClassification> classify(const Tags& t) {
@@ -42,7 +44,27 @@ std::optional<PoiClassification> classify(const Tags& t) {
                         t.natural, t.railway, t.aeroway, t.man_made, t.building,
                         t.craft, t.power, t.place, t.waterway, t.office,
                         t.wikipedia, t.wikidata, t.highway, t.shop, t.landuse,
-                        t.emergency);
+                        t.emergency, t.area);
+}
+
+// `t` with its tag `key` set to `value`.
+Tags with(Tags t, const char* key, const char* value) {
+    const std::pair<const char*, const char* Tags::*> keys[] = {
+        {"tourism", &Tags::tourism}, {"historic", &Tags::historic}, {"boundary", &Tags::boundary},
+        {"amenity", &Tags::amenity}, {"leisure", &Tags::leisure},   {"natural", &Tags::natural},
+        {"railway", &Tags::railway}, {"aeroway", &Tags::aeroway},   {"man_made", &Tags::man_made},
+        {"building", &Tags::building}, {"craft", &Tags::craft},     {"power", &Tags::power},
+        {"place", &Tags::place},     {"waterway", &Tags::waterway}, {"office", &Tags::office},
+        {"highway", &Tags::highway}, {"shop", &Tags::shop},         {"landuse", &Tags::landuse},
+        {"emergency", &Tags::emergency}};
+    bool known = false;
+    for (const auto& [name, member] : keys)
+        if (!std::strcmp(name, key)) {
+            t.*member = value;
+            known = true;
+        }
+    REQUIRE(known);
+    return t;
 }
 
 // The water kinds Nominatim ranks below 30 (settings/address-levels.json):
@@ -269,4 +291,43 @@ TEST(poi_classify_a_water_object_keeps_its_category_beside_a_tag_of_no_rank_30) 
                             kind.natural ? kind.natural : kind.landuse, key, value);
             CHECK_EQ(uint8_t(category_of(t)), uint8_t(kind.category));
         }
+}
+
+TEST(poi_classify_a_water_object_beside_a_main_tag_of_a_lower_address_rank_keeps_its_category) {
+    // Nominatim ranks an object by the lowest positive address rank of its
+    // main tags (ranking.sql compute_place_rank): place=locality (25) and
+    // place=suburb (20) anywhere, and on an area landuse=residential (24),
+    // highway=footway (27) and highway=residential (26), rank such an object
+    // below 30, whatever POI main tag it carries too, so it stays water. A
+    // landuse or highway node ranks 30 (ranking.sql:175-180): beside those, a
+    // water node is a rank-30 POI of its shop.
+    struct Lower {
+        const char* key;
+        const char* value;
+        bool on_a_node;
+    };
+    const Lower lower[] = {{"place", "locality", true},      {"place", "suburb", true},
+                           {"landuse", "residential", false}, {"highway", "footway", false},
+                           {"highway", "residential", false}};
+    for (const WaterKind& kind : kWaterKinds)
+        for (const Lower& l : lower) {
+            if (kind.landuse && !std::strcmp(l.key, "landuse")) continue;
+            for (const bool area : {true, false}) {
+                Tags t = with(with(water(kind), "shop", "bakery"), l.key, l.value);
+                t.area = area;
+                const PoiCategory want = area || l.on_a_node ? kind.category : PoiCategory::SHOP_BAKERY;
+                if (category_of(t) != want)
+                    std::printf("    %s=%s with shop=bakery and %s=%s, %s\n", kind.natural ? "natural" : "landuse",
+                                kind.natural ? kind.natural : kind.landuse, l.key, l.value, area ? "an area" : "a node");
+                CHECK_EQ(uint8_t(category_of(t)), uint8_t(want));
+            }
+        }
+    // building=*, the fallback tag of rank 30, makes no rank-30 POI beside
+    // one either.
+    for (const WaterKind& kind : kWaterKinds) {
+        if (!kind.natural) continue;
+        Tags t = with(with(water(kind), "building", "yes"), "place", "locality");
+        t.wikidata = "Q1";
+        CHECK_EQ(uint8_t(category_of(t)), uint8_t(kind.category));
+    }
 }

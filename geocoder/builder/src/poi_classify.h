@@ -33,9 +33,10 @@ inline bool poi_tag_is(const char* v, std::initializer_list<const char*> values)
 // does every key it doesn't list. Nominatim ranks an object by the lowest
 // positive address rank of its main tags' categories (lib-sql/functions/
 // ranking.sql compute_place_rank), and a water kind's is 0, so beside such a
-// tag the object is a rank-30 POI, of that tag's class where it is no
-// fallback tag. Of those keys this reads the ones the classifier takes;
-// building=*, a fallback tag, counts only beside natural=* (classify_poi).
+// tag the object is a rank-30 POI unless a main tag of a lower positive rank
+// is there too (has_lower_rank_main_tag). Of those keys this reads the ones
+// the classifier takes; building=*, a fallback tag, counts only beside
+// natural=* (classify_poi).
 inline bool has_poi_main_tag(const char* t_amenity, const char* t_leisure, const char* t_emergency,
                              const char* t_tourism, const char* t_historic, const char* t_shop,
                              const char* t_craft, const char* t_office, const char* t_aeroway,
@@ -65,6 +66,34 @@ inline bool has_poi_main_tag(const char* t_amenity, const char* t_leisure, const
                                                  "lighthouse", "watermill", "tunnel"});
 }
 
+// Whether an object carries a main tag of a positive address rank below 30
+// (settings/address-levels.json), which then ranks it whatever POI main tag
+// it carries too (ranking.sql compute_place_rank takes the lowest positive
+// address rank): place=* of an address rank (:3-35; every place value is a
+// main tag, presets.lua MAIN_TAGS.all_boundaries) and, on an `area` (a
+// polygon, not a node), landuse=residential and the other landuse kinds of an
+// address rank (:50-59; a landuse node ranks 30, ranking.sql:178-180) and the
+// highway kinds of rank 26 and 27 (:95-120; a highway node ranks 30,
+// ranking.sql:175-177). boundary=administrative ranks by an admin_level the
+// classifier doesn't read, and the country tables (place=county in ca and de,
+// ...) by a country: both are left out.
+inline bool has_lower_rank_main_tag(const char* t_place, const char* t_landuse, const char* t_highway, bool area) {
+    if (t_place && poi_tag_is(t_place, {"county", "district", "municipality", "city", "town", "borough", "village",
+                                        "suburb", "hamlet", "croft", "subdivision", "allotments", "neighbourhood",
+                                        "quarter", "isolated_dwelling", "farm", "city_block", "mountain_pass", "square",
+                                        "locality"}))
+        return true;
+    if (!area) return false;
+    if (t_landuse && poi_tag_is(t_landuse, {"residential", "farm", "farmyard", "industrial", "commercial", "allotments",
+                                            "retail"}))
+        return true;
+    return t_highway && poi_tag_is(t_highway, {"service", "cycleway", "path", "footway", "steps", "bridleway",
+                                               "motorway_link", "primary_link", "trunk_link", "secondary_link",
+                                               "tertiary_link", "residential", "track", "unclassified", "tertiary",
+                                               "secondary", "primary", "living_street", "trunk", "motorway",
+                                               "pedestrian", "road", "construction"});
+}
+
 // POI classification: maps a node/way's raw OSM tag values to a
 // (category, tier, flags) triple (PoiClassification, defined in types.h),
 // or nullopt when nothing matches or no POI dir ships the tier (a generic
@@ -76,9 +105,10 @@ inline bool has_poi_main_tag(const char* t_amenity, const char* t_leisure, const
 // reservoir and basin) rank below 30 in Nominatim (address-levels.json:66-79
 // and 50-59), whose POI lane takes rank 30 alone; the server keeps them out of
 // the primary slot. An object that also carries a POI main tag
-// (has_poi_main_tag) is a rank-30 POI there: it takes no water category, and
-// is classified by that tag, or as a generic rank-30 feature where the tag
-// has no category of its own.
+// (has_poi_main_tag) is a rank-30 POI there, unless a main tag of a lower
+// positive rank ranks it (has_lower_rank_main_tag): it takes no water
+// category, and is classified by that tag, or as a generic rank-30 feature
+// where the tag has no category of its own.
 inline std::optional<PoiClassification> classify_poi(
     const char* t_tourism, const char* t_historic, const char* t_boundary,
     const char* t_amenity, const char* t_leisure, const char* t_natural,
@@ -86,13 +116,15 @@ inline std::optional<PoiClassification> classify_poi(
     const char* t_building, const char* t_craft, const char* t_power,
     const char* t_place, const char* t_waterway, const char* t_office,
     const char* t_wikipedia, const char* t_wikidata, const char* t_highway,
-    const char* t_shop, const char* t_landuse, const char* t_emergency) {
+    const char* t_shop, const char* t_landuse, const char* t_emergency, bool area) {
     PoiCategory cat = PoiCategory::UNKNOWN;
 
-    // A POI main tag takes the place of a water kind (above): `water` gives
-    // the kind's category, or none where `yields`, and notes that it yielded.
-    const bool poi_main = has_poi_main_tag(t_amenity, t_leisure, t_emergency, t_tourism, t_historic, t_shop,
-                                           t_craft, t_office, t_aeroway, t_railway, t_man_made);
+    // A POI main tag takes the place of a water kind (above) where the object
+    // ranks 30: `water` gives the kind's category, or none where `yields`,
+    // and notes that it yielded.
+    const bool ranks_30 = !has_lower_rank_main_tag(t_place, t_landuse, t_highway, area);
+    const bool poi_main = ranks_30 && has_poi_main_tag(t_amenity, t_leisure, t_emergency, t_tourism, t_historic,
+                                                       t_shop, t_craft, t_office, t_aeroway, t_railway, t_man_made);
     bool water_yielded = false;
     auto water = [&](PoiCategory kind, bool yields) {
         water_yielded = yields;
@@ -309,7 +341,7 @@ inline std::optional<PoiClassification> classify_poi(
         // landuse=*, also a fallback tag, building is its class, the
         // alphabetically first (init.lua process_tags), and Nominatim's POI
         // lane takes no class building (reverse.py:192-195).
-        const bool yields = poi_main || (t_building && std::strcmp(t_building, "no") != 0);
+        const bool yields = poi_main || (ranks_30 && t_building && std::strcmp(t_building, "no") != 0);
         if (std::strcmp(t_natural, "peak") == 0) cat = PoiCategory::PEAK;
         else if (std::strcmp(t_natural, "volcano") == 0) cat = PoiCategory::VOLCANO;
         else if (std::strcmp(t_natural, "beach") == 0) cat = PoiCategory::BEACH;
