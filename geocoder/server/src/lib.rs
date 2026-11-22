@@ -3415,7 +3415,7 @@ impl Index {
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
         };
         let display_name = format_address(&address);
-        Address { display_name, address, places }
+        Address { licence: Licence, display_name, address, places }
     }
 }
 
@@ -4056,7 +4056,7 @@ mod query_tests {
     fn a_boundary_without_a_country_city_or_state_has_no_answer() {
         let idx = index(&[SHOALS], &[SHOALS_VILLAGE]);
 
-        assert_eq!(answer(&idx, 5.05, 112.65), serde_json::json!({"address": {}}));
+        assert_eq!(answer(&idx, 5.05, 112.65), serde_json::json!({"licence": OSM_LICENCE, "address": {}}));
     }
 
     #[test]
@@ -4064,7 +4064,7 @@ mod query_tests {
         let idx = index(&[SHOALS], &[MCMURDO]);
 
         for (lat, lng) in [(-82.0, 60.0), (5.2, 112.65)] {
-            assert_eq!(answer(&idx, lat, lng), serde_json::json!({"address": {}}), "({}, {})", lat, lng);
+            assert_eq!(answer(&idx, lat, lng), serde_json::json!({"licence": OSM_LICENCE, "address": {}}), "({}, {})", lat, lng);
         }
     }
 
@@ -5357,8 +5357,25 @@ pub struct PoiDetail {
     pub distance_m: f64,
 }
 
+/// The licence of every answer, Nominatim's (src/nominatim_api/v1/
+/// classtypes.py OSM_ATTRIBUTION): its json and jsonv2 results carry it
+/// first after their place_id (v1/format_json.py format_base_json), and
+/// these answers have no place_id.
+pub const OSM_LICENCE: &str = "Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright";
+
+/// An answer's `licence`, OSM_LICENCE.
+#[derive(Clone, Copy, Default)]
+pub struct Licence;
+
+impl Serialize for Licence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(OSM_LICENCE)
+    }
+}
+
 #[derive(Serialize, Default)]
 pub struct Address<'a> {
+    pub licence: Licence,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub address: AddressDetails<'a>,
@@ -7701,10 +7718,29 @@ mod query_path_tests {
         };
         let (lat, lng) = ORIGIN;
         assert!(world.query_json(lat, lng).contains("Testland"));
+        assert!(world.query_json(lat, lng).starts_with(r#"{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","#));
         // The first two are the origin's own point once S2 wraps them onto the globe.
         for (lat, lng) in [(lat, lng + 360.0), (180.0 - lat, lng - 180.0), (f64::NAN, lng), (lat, f64::INFINITY), (90.5, lng), (lat, -180.5)] {
             assert_eq!(world.query_json(lat, lng), "{}", "({}, {})", lat, lng);
         }
+    }
+
+    /// What a lookup that finds nothing answers: Nominatim's licence, and no address.
+    const NOTHING_FOUND: &str = r#"{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","address":{}}"#;
+
+    #[test]
+    fn every_answer_carries_nominatims_licence_at_its_head() {
+        // Nominatim's json and jsonv2 write "licence" first in every result but for its
+        // place_id, which these answers have none of (v1/format_json.py format_base_json),
+        // worded as its v1/classtypes.py OSM_ATTRIBUTION. An answer of nothing found carries
+        // it too.
+        let index = TestIndex::new().street("Main Street", &parallel(0.0, 200.0)).load();
+        let (lat, lng) = query_point(1.0, 0.0);
+        let answer = serde_json::to_string(&index.query(lat, lng)).unwrap();
+        assert!(answer.starts_with(r#"{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","display_name":"Main Street"#), "{answer}");
+        // 60 km north: outside Testland.
+        let (lat, lng) = query_point(60_000.0, 0.0);
+        assert_eq!(serde_json::to_string(&index.query(lat, lng)).unwrap(), NOTHING_FOUND);
     }
 
     #[test]
@@ -7723,10 +7759,10 @@ mod query_path_tests {
         // Each is p once S2 wraps it onto the globe.
         for (wlat, wlng) in [(lat, lng + 360.0), (lat, lng - 360.0), (180.0 - lat, lng - 180.0), (-180.0 - lat, lng + 180.0)] {
             assert_eq!(cell(wlat, wlng), cell(lat, lng), "({wlat}, {wlng})");
-            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), r#"{"address":{}}"#, "({wlat}, {wlng})");
+            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), NOTHING_FOUND, "({wlat}, {wlng})");
         }
         for (wlat, wlng) in [(f64::NAN, lng), (lat, f64::NAN), (lat, f64::INFINITY), (f64::NEG_INFINITY, lng)] {
-            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), r#"{"address":{}}"#, "({wlat}, {wlng})");
+            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), NOTHING_FOUND, "({wlat}, {wlng})");
         }
     }
 
@@ -9811,6 +9847,9 @@ mod admin_scan_tests {
         idx
     }
 
+    /// What a lookup that finds nothing answers: Nominatim's licence, and no address.
+    const NOTHING_FOUND: &str = r#"{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","address":{}}"#;
+
     #[test]
     fn a_point_off_the_globe_is_in_no_poi_though_its_wrapped_cell_lists_one_interior() {
         let around_q = (21.99, 27.5, 22.05, 27.6);
@@ -9826,7 +9865,7 @@ mod admin_scan_tests {
                 assert_eq!(cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL), cells()[0], "({lat}, {lng})");
                 assert_eq!(pois(lat, lng), [], "({lat}, {lng}) interior {interior}");
                 assert!(idx.find_nearest_poi_with_parent(lat, lng).is_none(), "({lat}, {lng}) interior {interior}");
-                assert_eq!(serde_json::to_string(&idx.query(lat, lng)).unwrap(), r#"{"address":{}}"#, "({lat}, {lng}) interior {interior}");
+                assert_eq!(serde_json::to_string(&idx.query(lat, lng)).unwrap(), NOTHING_FOUND, "({lat}, {lng}) interior {interior}");
             }
             for (lat, lng) in [(f64::NAN, Q.1), (Q.0, f64::NAN), (Q.0, f64::INFINITY), (f64::NEG_INFINITY, Q.1)] {
                 assert_eq!(pois(lat, lng), [], "({lat}, {lng})");

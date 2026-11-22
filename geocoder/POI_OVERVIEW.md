@@ -6,6 +6,7 @@ The geocoder now includes a POI layer that tells you what notable places are nea
 
 ```json
 {
+  "licence": "Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright",
   "display_name": "Avenue Anatole France 5, 75007 Paris, France",
   "address": {
     "house_number": "5",

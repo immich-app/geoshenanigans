@@ -156,6 +156,7 @@ Response follows [Nominatim](https://nominatim.org/release-docs/latest/api/Rever
 
 ```json
 {
+  "licence": "Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright",
   "display_name": "Avenue de la Costa 42, 98000 Monaco, Monaco",
   "address": {
     "house_number": "42",
@@ -170,7 +171,12 @@ Response follows [Nominatim](https://nominatim.org/release-docs/latest/api/Rever
 }
 ```
 
-Fields are omitted when not available.
+Fields are omitted when not available, but `licence`, which every answer
+carries first, as Nominatim's results do, worded as Nominatim words it
+(`OSM_ATTRIBUTION` in its `src/nominatim_api/v1/classtypes.py`); an answer
+that found nothing carries it too (`{"licence": "...", "address": {}}`).
+Where no loaded region covers the point the answer is `{}`, without it, as
+Nominatim's `{"error":"Unable to geocode"}` is.
 
 Status codes:
 - `200` - success
