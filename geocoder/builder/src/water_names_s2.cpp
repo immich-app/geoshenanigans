@@ -60,8 +60,10 @@ std::vector<Credit> credit_naming_lines(const AdminExactRings& rings, const std:
     if (threads == 0) threads = parallel_threads();
     const PackedLocation* v = rings.vertices.data();
 
-    // The polygons' covering: (cell, polygon | INTERIOR_FLAG), by cell.
+    // The polygons' covering: (cell, polygon | INTERIOR_FLAG), by cell; and
+    // the box of each one's rings, which a probe outside needn't test.
     std::vector<std::vector<CellItemPair>> found(threads);
+    std::vector<ExactRingBox> boxes(rings.polygons.size());
     const std::vector<uint32_t> largest_first = costliest_first(polygons.size(), [&](size_t k) {
         return static_cast<float>(rings.occurrences(polygons[k]));
     }, threads);
@@ -82,6 +84,13 @@ std::vector<Credit> credit_naming_lines(const AdminExactRings& rings, const std:
             merge_cell_lists(lists, boundary);
             for (const auto& [cell, interior] : admin_polygon_cells(boundary, v, spans, n, kAdminCellLevel))
                 found[worker].push_back({cell, interior ? p | INTERIOR_FLAG : p});
+            ExactRingBox box = exact_ring_box(v + spans[0].begin, spans[0].count);
+            for (uint32_t r = 1; r < n; r++) {
+                const ExactRingBox hole = exact_ring_box(v + spans[r].begin, spans[r].count);
+                box = {std::min(box.lat_lo, hole.lat_lo), std::max(box.lat_hi, hole.lat_hi),
+                       std::min(box.lng_lo, hole.lng_lo), std::max(box.lng_hi, hole.lng_hi)};
+            }
+            boxes[p] = box;
         }
     }, threads);
     std::vector<CellItemPair> cover;
@@ -131,10 +140,10 @@ std::vector<Credit> credit_naming_lines(const AdminExactRings& rings, const std:
                 const bool interior = (it->item_id & INTERIOR_FLAG) != 0;
                 for (size_t i = from; i < to; i++) {
                     const NamingLine& line = lines.lines[mids[i].line];
+                    const PackedLocation* lv = lines.vertices.data() + line.first + mids[i].index;
                     if (interior) {
-                        const PackedLocation* lv = lines.vertices.data() + line.first + mids[i].index;
                         credit(credits[worker], object_of[p], line, segment_mm(lv[0], lv[1]));
-                    } else {
+                    } else if (!exact_ring_box_excludes(boxes[p], segment_midpoint(lv[0], lv[1]))) {
                         probes[worker].push_back({p, mids[i].line, mids[i].index});
                     }
                 }

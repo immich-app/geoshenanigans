@@ -290,7 +290,7 @@ inline __int128 polygon_area2(const SplitPolygon& poly) {
 }  // namespace split_detail
 
 // Why split_polygon left a polygon whole.
-enum class SplitRefusal : uint8_t { None, FewHoles, Cut, Sample };
+enum class SplitRefusal : uint8_t { None, FewHoles, Cut, Sample, WayRuns };
 
 inline const char* refusal_name(SplitRefusal r) {
     switch (r) {
@@ -298,6 +298,7 @@ inline const char* refusal_name(SplitRefusal r) {
         case SplitRefusal::FewHoles: return "few holes";
         case SplitRefusal::Cut: return "crossings that don't pair up";
         case SplitRefusal::Sample: return "pieces holding other points";
+        case SplitRefusal::WayRuns: return "way runs that don't cover its rings";
     }
     return "";
 }

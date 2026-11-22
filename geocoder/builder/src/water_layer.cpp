@@ -427,7 +427,10 @@ void split_polygons(Build& b, unsigned threads) {
                 if (q == 0) poly.outer = std::move(sr);
                 else poly.holes.push_back(std::move(sr));
             }
-            if (!runs_whole) continue;
+            if (!runs_whole) {
+                refusals[k] = SplitRefusal::WayRuns;
+                continue;
+            }
             pieces[k] = split_polygon(poly, kSplitMaxHoles, &lines[k], &refusals[k]);
             if (pieces[k].size() == 1) pieces[k].clear();
         }
