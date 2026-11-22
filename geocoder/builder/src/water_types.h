@@ -6,9 +6,13 @@
 // Nominatim (class water, the value verbatim), with a code from 0x8000 up:
 // the code the previous build gave it (its water_meta.json), else the code
 // of its hash, else the next free one; so a value keeps its code from one
-// build to the next and a new one never takes another's.
+// build to the next and a new one never takes another's. A patch carries
+// water_meta.json whole, as it carries any JSON file (1 MiB at most), so the
+// values it lists are as many as fit in kMetaVerbatimBytes: the previous
+// build's first, then those of most objects; any other is natural/water.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -109,65 +113,9 @@ struct MetaType {
     uint8_t rank;
 };
 
-// The kinds of a build: the fixed ones, and the water=* values outside them
-// with their codes.
-class TypeTable {
-public:
-    // Gives each of `values` (water=* values outside the fixed table) a code:
-    // the one `previous` (the previous build's kinds, water_meta.json) gave
-    // it, then, in value order, its hash's, else the next free one round the
-    // verbatim codes. Throws past the 32,768 verbatim codes.
-    void assign(const std::set<std::string>& values, const std::vector<MetaType>& previous) {
-        verbatim_.clear();
-        std::set<uint16_t> taken;
-        for (const MetaType& m : previous) {
-            if (m.code < kVerbatimBase || m.cls != "water" || !values.count(m.type) || verbatim_.count(m.type) ||
-                taken.count(m.code))
-                continue;
-            verbatim_[m.type] = m.code;
-            taken.insert(m.code);
-        }
-        for (const std::string& v : values) {
-            if (verbatim_.count(v)) continue;
-            if (taken.size() >= 0x8000) throw std::length_error("water types past 32,768 verbatim codes");
-            uint16_t c = static_cast<uint16_t>(kVerbatimBase | (value_hash(v) & 0x7FFF));
-            while (taken.count(c)) c = static_cast<uint16_t>(kVerbatimBase | ((c + 1) & 0x7FFF));
-            verbatim_[v] = c;
-            taken.insert(c);
-        }
-        by_code_.clear();
-        for (const auto& [v, c] : verbatim_) by_code_[c] = v;
-    }
-
-    // The code of a water=* value outside the fixed table; throws for one
-    // assign() was not given.
-    uint16_t verbatim_code(const std::string& value) const {
-        auto it = verbatim_.find(value);
-        if (it == verbatim_.end()) throw std::logic_error("water type '" + value + "' has no code");
-        return it->second;
-    }
-
-    // The kind of a code: fixed or assigned. Throws for an unknown one.
-    MetaType kind(uint16_t code) const {
-        if (code >= 1 && code <= kFixedKindCount) {
-            const Kind& k = kFixedKinds[code - 1];
-            return {code, k.cls, k.type, k.rank};
-        }
-        auto it = by_code_.find(code);
-        if (it == by_code_.end()) throw std::logic_error("unknown water type code " + std::to_string(code));
-        return {code, "water", it->second, kVerbatimRank};
-    }
-
-    uint8_t rank(uint16_t code) const { return kind(code).rank; }
-
-    size_t verbatim_count() const { return verbatim_.size(); }
-
-private:
-    std::map<std::string, uint16_t> verbatim_;
-    std::map<uint16_t, std::string> by_code_;
-};
-
-// --- water_meta.json ---
+// What water_meta.json's kinds outside the fixed table take at most: its
+// fixed kinds and its frame take the rest of the 1 MiB a patch carries.
+inline constexpr size_t kMetaVerbatimBytes = 768 * 1024;
 
 inline void json_escape(std::string& out, const std::string& s) {
     static const char* hex = "0123456789abcdef";
@@ -185,20 +133,120 @@ inline void json_escape(std::string& out, const std::string& s) {
     }
 }
 
+// A kind's line in water_meta.json, without the comma and line end between
+// two.
+inline std::string meta_entry(const MetaType& k) {
+    std::string out = "  {\"code\": " + std::to_string(k.code) + ", \"class\": \"";
+    json_escape(out, k.cls);
+    out += "\", \"type\": \"";
+    json_escape(out, k.type);
+    out += "\", \"rank\": " + std::to_string(k.rank) + "}";
+    return out;
+}
+
+// The kinds of a build: the fixed ones, and the water=* values outside them
+// with their codes.
+class TypeTable {
+public:
+    // Gives the water=* values outside the fixed table (`uses`: each value
+    // and how many objects carry it) codes, as many as water_meta.json lists
+    // in kMetaVerbatimBytes, taken in turn while the next fits: the values
+    // `previous` (the previous build's kinds, water_meta.json) has, in its
+    // order, then those of most objects, the smaller of a tie. A value keeps
+    // the code `previous` gave it; the others take, in value order, their
+    // hash's, else the next free one round the verbatim codes. A value past
+    // the budget is natural/water. Throws past the 32,768 verbatim codes.
+    void assign(const std::map<std::string, size_t>& uses, const std::vector<MetaType>& previous) {
+        verbatim_.clear();
+        generic_.clear();
+        std::map<std::string, uint16_t> before;
+        std::set<uint16_t> codes_before;
+        std::vector<std::string> order;
+        for (const MetaType& m : previous) {
+            if (m.code < kVerbatimBase || m.cls != "water" || !uses.count(m.type) || before.count(m.type) ||
+                codes_before.count(m.code))
+                continue;
+            before[m.type] = m.code;
+            codes_before.insert(m.code);
+            order.push_back(m.type);
+        }
+        std::vector<std::pair<std::string, size_t>> others;
+        for (const auto& [v, n] : uses)
+            if (!before.count(v)) others.push_back({v, n});
+        std::stable_sort(others.begin(), others.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        for (const auto& [v, n] : others) order.push_back(v);
+        std::set<std::string> listed;
+        size_t bytes = 0;
+        for (const std::string& v : order) {
+            const size_t entry = meta_entry({kVerbatimBase, "water", v, kVerbatimRank}).size() + 2;
+            if (bytes + entry > kMetaVerbatimBytes) break;
+            bytes += entry;
+            listed.insert(v);
+        }
+        std::set<uint16_t> taken;
+        for (const auto& [v, c] : before)
+            if (listed.count(v)) {
+                verbatim_[v] = c;
+                taken.insert(c);
+            }
+        for (const std::string& v : listed) {
+            if (verbatim_.count(v)) continue;
+            if (taken.size() >= 0x8000) throw std::length_error("water types past 32,768 verbatim codes");
+            uint16_t c = static_cast<uint16_t>(kVerbatimBase | (value_hash(v) & 0x7FFF));
+            while (taken.count(c)) c = static_cast<uint16_t>(kVerbatimBase | ((c + 1) & 0x7FFF));
+            verbatim_[v] = c;
+            taken.insert(c);
+        }
+        for (const auto& [v, n] : uses)
+            if (!listed.count(v)) generic_.insert(v);
+        by_code_.clear();
+        for (const auto& [v, c] : verbatim_) by_code_[c] = v;
+    }
+
+    // The code of a water=* value outside the fixed table: its own, or
+    // natural/water's for one past water_meta.json's budget; throws for one
+    // assign() was not given.
+    uint16_t verbatim_code(const std::string& value) const {
+        auto it = verbatim_.find(value);
+        if (it != verbatim_.end()) return it->second;
+        if (generic_.count(value)) return code::kNaturalWater;
+        throw std::logic_error("water type '" + value + "' has no code");
+    }
+
+    // The kind of a code: fixed or assigned. Throws for an unknown one.
+    MetaType kind(uint16_t code) const {
+        if (code >= 1 && code <= kFixedKindCount) {
+            const Kind& k = kFixedKinds[code - 1];
+            return {code, k.cls, k.type, k.rank};
+        }
+        auto it = by_code_.find(code);
+        if (it == by_code_.end()) throw std::logic_error("unknown water type code " + std::to_string(code));
+        return {code, "water", it->second, kVerbatimRank};
+    }
+
+    uint8_t rank(uint16_t code) const { return kind(code).rank; }
+
+    size_t verbatim_count() const { return verbatim_.size(); }
+    // The values past water_meta.json's budget, natural/water.
+    size_t generic_count() const { return generic_.size(); }
+
+private:
+    std::map<std::string, uint16_t> verbatim_;
+    std::map<uint16_t, std::string> by_code_;
+    std::set<std::string> generic_;
+};
+
+// --- water_meta.json ---
+
 // The water_meta.json of a dir whose records use `codes`: each kind by code,
 // ascending, one a line.
 inline std::string meta_json(const TypeTable& table, const std::set<uint16_t>& codes) {
     std::string out = "{\"types\": [\n";
     bool first = true;
     for (uint16_t c : codes) {
-        const MetaType k = table.kind(c);
         if (!first) out += ",\n";
         first = false;
-        out += "  {\"code\": " + std::to_string(k.code) + ", \"class\": \"";
-        json_escape(out, k.cls);
-        out += "\", \"type\": \"";
-        json_escape(out, k.type);
-        out += "\", \"rank\": " + std::to_string(k.rank) + "}";
+        out += meta_entry(table.kind(c));
     }
     out += "\n]}\n";
     return out;

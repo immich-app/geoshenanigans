@@ -684,9 +684,9 @@ void split_polygons(Build& b, unsigned threads) {
 }
 
 std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_planet_dir) {
-    std::set<std::string> values;
+    std::map<std::string, size_t> uses;
     for (const Object& o : b.objects)
-        if (!o.tags.verbatim.empty()) values.insert(o.tags.verbatim);
+        if (!o.tags.verbatim.empty()) uses[o.tags.verbatim]++;
     std::vector<MetaType> previous;
     const std::string dir = prev_planet_dir.empty() ? "" : prev_planet_dir + "/" + kWaterArcTiers[1].dir;
     // A previous build that wrote water dirs (its polygon sidecar there) has
@@ -704,7 +704,10 @@ std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_pl
         previous = *kinds;
     }
     auto table = std::make_shared<TypeTable>();
-    table->assign(values, previous);
+    table->assign(uses, previous);
+    if (table->generic_count())
+        std::cerr << "  Water types: " << table->generic_count()
+                  << " water=* values past what water_meta.json lists are natural/water" << std::endl;
     return table;
 }
 

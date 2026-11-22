@@ -3,11 +3,13 @@
 // fixed table, water_meta.json, and the major tier's rule.
 #include "water_classify.h"
 
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "patch_format.h"
 #include "test_framework.h"
 
 using namespace water;
@@ -33,7 +35,7 @@ std::string kind_of(const Class& c, const TypeTable& table) {
 
 TEST(each_water_tag_is_the_kind_and_rank_nominatim_gives_it) {
     TypeTable table;
-    table.assign({"ganga_river"}, {});
+    table.assign({{"ganga_river", 1}}, {});
     CHECK(kind_of(of("water", "lake"), table) == "water/lake 20");
     CHECK(kind_of(of("water", "reservoir"), table) == "water/reservoir 20");
     CHECK(kind_of(of("water", "pond"), table) == "water/pond 24");
@@ -87,7 +89,7 @@ TEST(only_river_and_canal_areas_stay_in_scope_without_a_name) {
 
 TEST(a_verbatim_type_keeps_the_code_the_previous_build_gave_it_and_a_new_one_takes_a_free_one) {
     TypeTable first;
-    first.assign({"ganga_river", "salt_lake"}, {});
+    first.assign({{"ganga_river", 1}, {"salt_lake", 1}}, {});
     const uint16_t ganga = first.verbatim_code("ganga_river"), salt = first.verbatim_code("salt_lake");
     CHECK(ganga >= kVerbatimBase && salt >= kVerbatimBase && ganga != salt);
     CHECK_EQ(ganga, uint16_t(kVerbatimBase | (value_hash("ganga_river") & 0x7FFF)));
@@ -101,7 +103,7 @@ TEST(a_verbatim_type_keeps_the_code_the_previous_build_gave_it_and_a_new_one_tak
     std::vector<MetaType> previous = meta;
     previous.push_back({static_cast<uint16_t>(kVerbatimBase | (value_hash("moor") & 0x7FFF)), "water", "taken", 22});
     TypeTable second;
-    second.assign({"ganga_river", "salt_lake", "moor", "taken"}, previous);
+    second.assign({{"ganga_river", 1}, {"salt_lake", 1}, {"moor", 1}, {"taken", 1}}, previous);
     CHECK_EQ(second.verbatim_code("ganga_river"), ganga);
     CHECK_EQ(second.verbatim_code("salt_lake"), salt);
     CHECK_EQ(second.verbatim_code("taken"), previous.back().code);
@@ -109,14 +111,14 @@ TEST(a_verbatim_type_keeps_the_code_the_previous_build_gave_it_and_a_new_one_tak
     CHECK_EQ(second.verbatim_code("moor"), uint16_t(previous.back().code + 1));
     // A previous code of a value gone is free again.
     TypeTable third;
-    third.assign({"moor"}, previous);
+    third.assign({{"moor", 1}}, previous);
     CHECK_EQ(third.verbatim_code("moor"), previous.back().code);
     CHECK(gctest::refusal_of<std::logic_error>([&] { third.verbatim_code("ganga_river"); }) != "");
 }
 
 TEST(water_meta_json_round_trips_quotes_and_controls_and_refuses_what_it_did_not_write) {
     TypeTable table;
-    table.assign({"a \"quoted\" \\ value\x01"}, {});
+    table.assign({{"a \"quoted\" \\ value\x01", 1}}, {});
     const uint16_t c = table.verbatim_code("a \"quoted\" \\ value\x01");
     const std::optional<std::vector<MetaType>> back = parse_meta_json(meta_json(table, {c}));
     REQUIRE(back.has_value() && back->size() == 1u);
@@ -153,9 +155,49 @@ TEST(a_riverbank_tagged_natural_water_too_is_a_river_area) {
     CHECK(!of("water", "stream", "riverbank").any());
 }
 
+TEST(water_meta_json_of_every_kind_stays_within_what_a_patch_carries_inline) {
+    // 20,000 water=* values of 255 bytes, which no file a patch carries could
+    // list, beside one of many objects and one the previous build had.
+    std::map<std::string, size_t> uses;
+    for (int k = 0; k < 20000; k++) {
+        std::string v = "v" + std::to_string(k);
+        v.resize(255, 'x');
+        uses[v] = 2;
+    }
+    uses["zz_of_many"] = 50;
+    TypeTable before;
+    before.assign({{"zz_from_before", 1}}, {});
+    const std::optional<std::vector<MetaType>> previous =
+        parse_meta_json(meta_json(before, {before.verbatim_code("zz_from_before")}));
+    REQUIRE(previous.has_value());
+    uses["zz_from_before"] = 1;
+    TypeTable table;
+    table.assign(uses, *previous);
+    std::set<uint16_t> codes;
+    for (uint16_t c = 1; c <= kFixedKindCount; c++) codes.insert(c);
+    size_t coded = 0;
+    for (const auto& [value, n] : uses) {
+        const uint16_t c = table.verbatim_code(value);
+        if (c == code::kNaturalWater) continue;
+        CHECK(c >= kVerbatimBase);
+        codes.insert(c);
+        coded++;
+    }
+    CHECK(meta_json(table, codes).size() <= MAX_INLINE_CLIENT_FILE_BYTES);
+    CHECK(coded > 2000 && coded < uses.size());
+    CHECK_EQ(coded, table.verbatim_count());
+    // The previous build's value keeps its code, and the values of most
+    // objects come first; the rest are natural/water.
+    CHECK_EQ(table.verbatim_code("zz_from_before"), before.verbatim_code("zz_from_before"));
+    CHECK(table.verbatim_code("zz_of_many") >= kVerbatimBase);
+    CHECK(table.kind(code::kNaturalWater).cls == "natural" && table.kind(code::kNaturalWater).type == "water");
+    // A value it was not given has no code.
+    CHECK(gctest::refusal_of<std::logic_error>([&] { table.verbatim_code("never_given"); }) != "");
+}
+
 TEST(water_meta_json_cut_short_or_with_more_after_it_is_no_table_and_one_of_no_kinds_is_one) {
     TypeTable table;
-    table.assign({"salt_pond"}, {});
+    table.assign({{"salt_pond", 1}}, {});
     const std::string whole = meta_json(table, {code::kLake, table.verbatim_code("salt_pond")});
     REQUIRE(parse_meta_json(whole).has_value());
     CHECK_EQ(parse_meta_json(whole)->size(), size_t(2));

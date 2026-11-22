@@ -490,7 +490,11 @@ What keeps a day's patch small:
   (`src/water_types.h`) are allocated against the previous build's
   `water_meta.json`, so a new rare value never renumbers another. A build on
   top of one that wrote water dirs stops when that file can't be read or is
-  none the builder writes.
+  none the builder writes. The file lists as many values as fit in 768 KiB
+  (`kMetaVerbatimBytes`), the previous build's first and then those of most
+  objects, so that a patch always carries it inline; a value past that is
+  `natural/water`.
+
 
 The simplified tier's crossing repair counts only crossings between rings of
 one polygon (`ArcTier::crossings_within_polygons`): water areas overlap
