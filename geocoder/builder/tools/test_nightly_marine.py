@@ -63,7 +63,9 @@ def marine_block():
 
 # s5cmd as the blocks run it: `cp SRC DST` serves $FAKE_S3/<SRC past s3://> (a SRC ending in *.osm_ids copies
 # every sidecar under its prefix, by its path past the prefix, into the DST dir) and fails for an object in
-# $FAKE_S3_FAIL; `ls PATTERN` prints what $FAKE_S3_LS holds, or fails with $FAKE_S3_LS_ERROR.
+# $FAKE_S3_FAIL; `cp FILE DST`, of a local FILE, puts it at $FAKE_S3/<DST past s3://> and adds that path to
+# $FAKE_S3/uploads; `cat SRC` prints $FAKE_S3/<SRC past s3://>; `ls PATTERN` prints what $FAKE_S3_LS holds, or
+# fails with $FAKE_S3_LS_ERROR.
 FAKE_S5CMD = r"""#!/bin/sh
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -85,7 +87,18 @@ case "$cmd" in
     if [ -n "$FAKE_S3_LS_ERROR" ]; then echo "ERROR \"ls $1\": $FAKE_S3_LS_ERROR" >&2; exit 1; fi
     if [ -z "$FAKE_S3_LS" ]; then echo "ERROR \"ls $1\": no object found" >&2; exit 1; fi
     echo "$FAKE_S3_LS" ;;
+  cat)
+    src=${1#s3://}
+    [ -f "$FAKE_S3/$src" ] || { echo "ERROR \"cat $1\": NoSuchKey" >&2; exit 1; }
+    cat "$FAKE_S3/$src" ;;
   cp)
+    case "$1" in
+      s3://*) ;;
+      *)
+        dst=${2#s3://}
+        mkdir -p "$(dirname "$FAKE_S3/$dst")" && cp "$1" "$FAKE_S3/$dst" && echo "$dst" >> "$FAKE_S3/uploads"
+        exit ;;
+    esac
     src=${1#s3://}; dst=$2
     case "$src" in
       *'*.osm_ids')
@@ -102,6 +115,30 @@ case "$cmd" in
   *) exit 2 ;;
 esac
 """
+
+
+# The venv's python as the marine workflow's build runs it: `-I TOOL build ... -o OUT --stats STATS ...` writes
+# OUT and copies $FAKE_STATS to STATS; `-I TOOL stats PATH` prints a total line.
+FAKE_PYTHON = r"""#!/bin/sh
+shift 2
+cmd=$1; shift
+case "$cmd" in
+  build)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -o) out=$2; shift 2 ;;
+        --stats) stats=$2; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf GCMARINE > "$out"
+    cp "$FAKE_STATS" "$stats" ;;
+  stats) printf 'total\t0 objects\n' ;;
+  *) exit 2 ;;
+esac
+"""
+
+REPO = os.path.join(HERE, "..", "..", "..")
 
 
 def fake_s5cmd(bin_dir):
@@ -340,10 +377,18 @@ class MarineWorkflowTest(unittest.TestCase):
         self.assertEqual(env, "VERSION=20261122\n")
 
     def test_a_published_version_is_refused(self):
+        for listed in ("2026/11/22 10:00:00   1234 marine_areas.bin.zst\n2026/11/22 10:00:01    567 manifest.json",
+                       "2026/11/22 10:00:01    567 manifest.json", "2026/11/22 10:00:00     89 notes.txt"):
+            with self.subTest(listed=listed):
+                run, env = self.run_version(listed=listed)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn("already published", run.stdout)
+                self.assertEqual(env, "")
+
+    def test_a_version_whose_file_went_up_without_its_manifest_goes_ahead_to_finish_it(self):
         run, env = self.run_version(listed="2026/11/22 10:00:00   1234 marine_areas.bin.zst")
-        self.assertNotEqual(run.returncode, 0)
-        self.assertIn("already published", run.stdout)
-        self.assertEqual(env, "")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(env, "UNFINISHED=true\nVERSION=20261122\n")
 
     def test_a_listing_that_fails_stops_the_run_as_it_cannot_tell(self):
         run, env = self.run_version(error="AccessDenied: Access Denied")
@@ -357,6 +402,89 @@ class MarineWorkflowTest(unittest.TestCase):
         self.assertIn("test_marine_import", tests)
         self.assertIn("skipped", tests)
         self.assertLess(text.index("- name: Test the tool"), text.index("- name: Build the marine areas"))
+
+    def run_build(self, summary):
+        """The Build step with the tool's summary `summary`: the run, and whether it compressed the file."""
+        with tempfile.TemporaryDirectory() as t:
+            os.makedirs(os.path.join(t, "venv", "bin"))
+            with open(os.path.join(t, "venv", "bin", "python"), "w") as f:
+                f.write(FAKE_PYTHON)
+            os.chmod(os.path.join(t, "venv", "bin", "python"), 0o755)
+            with open(os.path.join(t, "summary.json"), "w") as f:
+                json.dump(summary, f)
+            env = {"PATH": os.environ["PATH"], "RUNNER_TEMP": t, "FAKE_STATS": os.path.join(t, "summary.json")}
+            run = subprocess.run(["bash", "-e", "-c", script(read(MARINE_WORKFLOW), "Build the marine areas")],
+                                 cwd=t, env=env, capture_output=True, text=True, timeout=60)
+            return run, os.path.exists(os.path.join(t, "marine-out", "marine_areas.bin.zst"))
+
+    def test_a_build_of_no_seas_no_oceans_or_no_polygons_stops_the_run(self):
+        good = {"objects": 101, "oceans": 7, "polygons": 54731}
+        run, compressed = self.run_build(good)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertTrue(compressed)
+        for summary in ({"objects": 0, "oceans": 0, "polygons": 0}, {**good, "objects": 0}, {**good, "oceans": 0},
+                        {**good, "polygons": 0}):
+            with self.subTest(summary=summary):
+                run, compressed = self.run_build(summary)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn("::error::", run.stdout)
+                self.assertFalse(compressed)
+
+    def run_upload(self, unfinished=False, held=None):
+        """The Upload step of version 20261122, the bucket holding `held` as its file when not None: the run,
+        the paths it put in the bucket, its step summary and the bucket's file after it."""
+        with tempfile.TemporaryDirectory() as t:
+            s3, bin_dir = os.path.join(t, "s3"), os.path.join(t, "bin")
+            for d in (s3, bin_dir, os.path.join(t, "marine-src"), os.path.join(t, "marine-out")):
+                os.makedirs(d)
+            fake_s5cmd(bin_dir)
+            for name, data in [("marine-src/eez_iho.geojson", b"{}"),
+                               ("marine-src/land-polygons-split-4326.zip", b"PK"),
+                               ("marine-out/marine_areas.bin", b"GCMARINE"),
+                               ("marine-out/marine_areas.bin.zst", b"zst"),
+                               ("marine-out/stats.json", b'{"objects": 101}')]:
+                with open(os.path.join(t, name), "wb") as f:
+                    f.write(data)
+            published = os.path.join(s3, "bucket", "geocoder", "marine", "20261122", "marine_areas.bin.zst")
+            if held is not None:
+                os.makedirs(os.path.dirname(published))
+                with open(published, "wb") as f:
+                    f.write(held)
+            summary = os.path.join(t, "summary.md")
+            env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNNER_TEMP": t, "VERSION": "20261122",
+                   "S3_BUCKET": "bucket", "S3_ENDPOINT": "https://s3.example", "EEZ_IHO_URL": "https://eez.example",
+                   "LAND_URL": "https://land.example", "LAND_DATE": "2026-11-20", "GITHUB_SHA": "0" * 40,
+                   "GITHUB_STEP_SUMMARY": summary, "FAKE_S3": s3}
+            if unfinished:
+                env["UNFINISHED"] = "true"
+            run = subprocess.run(["bash", "-e", "-c", script(read(MARINE_WORKFLOW), "Upload to Tigris")], cwd=REPO,
+                                 env=env, capture_output=True, text=True, timeout=60)
+            uploads = read(os.path.join(s3, "uploads")).split() if os.path.exists(os.path.join(s3, "uploads")) else []
+            with open(published, "rb") as f:
+                after = f.read()
+            return run, uploads, read(summary) if os.path.exists(summary) else "", after
+
+    def test_a_new_version_uploads_its_file_then_its_manifest_and_gives_its_pin(self):
+        run, uploads, summary, after = self.run_upload()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(uploads, ["bucket/geocoder/marine/20261122/marine_areas.bin.zst",
+                                   "bucket/geocoder/marine/20261122/manifest.json"])
+        self.assertEqual(after, b"zst")
+        self.assertIn(f'"sha256": "{hashlib.sha256(b"zst").hexdigest()}"', summary)
+
+    def test_a_version_whose_file_went_up_alone_gets_its_manifest_when_this_run_built_the_same_file(self):
+        run, uploads, summary, after = self.run_upload(unfinished=True, held=b"zst")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(uploads, ["bucket/geocoder/marine/20261122/manifest.json"])
+        self.assertIn(f'"sha256": "{hashlib.sha256(b"zst").hexdigest()}"', summary)
+
+    def test_a_version_whose_file_went_up_alone_is_refused_when_this_run_built_another(self):
+        run, uploads, summary, after = self.run_upload(unfinished=True, held=b"another zst")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("::error::", run.stdout)
+        self.assertEqual(uploads, [])
+        self.assertEqual(summary, "")
+        self.assertEqual(after, b"another zst")
 
 
 if __name__ == "__main__":

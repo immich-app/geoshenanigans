@@ -75,10 +75,16 @@ jobs:
           # A version a pin names must stay as it was published. A listing that fails for any other reason than
           # an empty prefix says nothing either way, so the run stops.
           if LISTED=$(s5cmd --endpoint-url "$S3_ENDPOINT" ls "s3://$S3_BUCKET/geocoder/marine/$VERSION/*" 2>&1); then
-            echo "::error::Marine areas $VERSION are already published; pick another version"
-            exit 1
-          fi
-          if ! grep -q 'no object found' <<< "$LISTED"; then
+            # A version's manifest.json goes up last: a prefix of the file alone is a run that stopped between
+            # the two, which this run finishes if it builds the same file (Upload checks).
+            if grep -Eq '(^|[ /])manifest\.json$' <<< "$LISTED" ||
+              ! grep -Eq '(^|[ /])marine_areas\.bin\.zst$' <<< "$LISTED"; then
+              echo "::error::Marine areas $VERSION are already published; pick another version"
+              exit 1
+            fi
+            echo "::notice::Marine areas $VERSION have no manifest.json: this run finishes them if it builds the same file"
+            echo "UNFINISHED=true" >> "$GITHUB_ENV"
+          elif ! grep -q 'no object found' <<< "$LISTED"; then
             echo "::error::Could not tell whether marine areas $VERSION are published: $LISTED"
             exit 1
           fi
@@ -119,6 +125,11 @@ jobs:
             --eez-iho "$SRC/eez_iho.geojson" --land "$SRC/land-polygons-split-4326.zip" \
             -o "$OUT/marine_areas.bin" --stats "$OUT/stats.json" --workers "$(nproc)"
           "$RUNNER_TEMP/venv/bin/python" -I geocoder/builder/tools/marine_import.py stats "$OUT/marine_areas.bin" | tail -1
+          # A source that parses but holds no sea areas gives a file of none, which no version may publish.
+          if ! jq -e '.objects > 0 and .oceans > 0 and .polygons > 0' "$OUT/stats.json" > /dev/null; then
+            echo "::error::The marine areas came out without a sea, an ocean or a polygon: $(jq -c . "$OUT/stats.json")"
+            exit 1
+          fi
           zstd -19 -T0 -q "$OUT/marine_areas.bin" -o "$OUT/marine_areas.bin.zst"
 
       - name: Upload to Tigris
@@ -148,7 +159,18 @@ jobs:
                         land: {url: $land_url, sha256: $land_sha256, data_date: $land_date}},
               stats: $stats[0], commit: $commit, built_at: $built_at}' > "$OUT/manifest.json"
           cat "$OUT/manifest.json"
-          $S5 cp "$OUT/marine_areas.bin.zst" "s3://$S3_BUCKET/geocoder/marine/$VERSION/marine_areas.bin.zst"
+          if [ "${UNFINISHED:-}" = true ]; then
+            # The file a run before this one uploaded without its manifest.json: this run finishes the version
+            # only if it built the same file.
+            HELD=$($S5 cat "s3://$S3_BUCKET/geocoder/marine/$VERSION/marine_areas.bin.zst" | sha256sum | cut -c1-64)
+            if [ "$HELD" != "$SHA" ]; then
+              echo "::error::Marine areas $VERSION hold another marine_areas.bin.zst (sha256 $HELD) than this run built ($SHA); pick another version"
+              exit 1
+            fi
+            echo "Marine areas $VERSION hold this run's marine_areas.bin.zst already"
+          else
+            $S5 cp "$OUT/marine_areas.bin.zst" "s3://$S3_BUCKET/geocoder/marine/$VERSION/marine_areas.bin.zst"
+          fi
           $S5 cp "$OUT/manifest.json" "s3://$S3_BUCKET/geocoder/marine/$VERSION/manifest.json"
           {
             echo "## Marine areas $VERSION"
