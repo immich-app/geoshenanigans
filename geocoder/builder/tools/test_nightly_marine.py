@@ -286,6 +286,44 @@ class MarineWorkflowTest(unittest.TestCase):
         # A version is never overwritten: one a pin names stays as it was.
         self.assertIn("already published", script(text, "Version"))
 
+    def test_runs_go_one_at_a_time_so_none_overwrites_a_version_another_published(self):
+        text = read(MARINE_WORKFLOW)
+        block = re.search(r"(?m)^concurrency:\n((?:  .*\n)+)", text)
+        self.assertIsNotNone(block, "no workflow-level concurrency group")
+        self.assertRegex(block.group(1), r"(?m)^  group: \S+$")
+        self.assertRegex(block.group(1), r"(?m)^  cancel-in-progress: false$")
+
+    def run_version(self, listed="", error=""):
+        with tempfile.TemporaryDirectory() as t:
+            bin_dir = os.path.join(t, "bin")
+            os.makedirs(bin_dir)
+            fake_s5cmd(bin_dir)
+            env_file = os.path.join(t, "github_env")
+            open(env_file, "w").close()
+            env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_ENV": env_file, "REQUESTED": "20261122",
+                   "S3_ENDPOINT": "https://s3.example", "S3_BUCKET": "bucket", "FAKE_S3_LS": listed,
+                   "FAKE_S3_LS_ERROR": error}
+            run = subprocess.run(["bash", "-e", "-c", script(read(MARINE_WORKFLOW), "Version")], env=env,
+                                 capture_output=True, text=True, timeout=60)
+            return run, read(env_file)
+
+    def test_a_new_version_goes_ahead(self):
+        run, env = self.run_version()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(env, "VERSION=20261122\n")
+
+    def test_a_published_version_is_refused(self):
+        run, env = self.run_version(listed="2026/11/22 10:00:00   1234 marine_areas.bin.zst")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("already published", run.stdout)
+        self.assertEqual(env, "")
+
+    def test_a_listing_that_fails_stops_the_run_as_it_cannot_tell(self):
+        run, env = self.run_version(error="AccessDenied: Access Denied")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("::error::", run.stdout)
+        self.assertEqual(env, "")
+
     def test_the_tool_is_tested_before_it_builds_with_the_geometry_tests_run(self):
         text = read(MARINE_WORKFLOW)
         tests = script(text, "Test the tool")

@@ -25,6 +25,12 @@ env:
 permissions:
   contents: read
 
+# One run at a time, the next waiting for the last to finish: a run checks that its version is new before it
+# uploads, which only holds while no other run can upload in between.
+concurrency:
+  group: geocoder-marine
+  cancel-in-progress: false
+
 jobs:
   marine:
     runs-on: ubuntu-latest
@@ -66,9 +72,14 @@ jobs:
             echo "::error::Version '$VERSION' is not YYYYMMDD"
             exit 1
           fi
-          # A version a pin names must stay as it was published.
-          if s5cmd --endpoint-url "$S3_ENDPOINT" ls "s3://$S3_BUCKET/geocoder/marine/$VERSION/*" > /dev/null 2>&1; then
+          # A version a pin names must stay as it was published. A listing that fails for any other reason than
+          # an empty prefix says nothing either way, so the run stops.
+          if LISTED=$(s5cmd --endpoint-url "$S3_ENDPOINT" ls "s3://$S3_BUCKET/geocoder/marine/$VERSION/*" 2>&1); then
             echo "::error::Marine areas $VERSION are already published; pick another version"
+            exit 1
+          fi
+          if ! grep -q 'no object found' <<< "$LISTED"; then
+            echo "::error::Could not tell whether marine areas $VERSION are published: $LISTED"
             exit 1
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
