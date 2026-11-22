@@ -40,6 +40,7 @@
 #include "country_code.h"
 #include "id_allocator.h"
 #include "pbf_test_objects.h"
+#include "poi_files.h"
 #include "postcode_files.h"
 #include "scratch_dir.h"
 #include "side_blocks.h"
@@ -1024,6 +1025,59 @@ TEST(a_building_is_written_with_its_footprint_which_the_server_takes_its_distanc
     REQUIRE(answers.size() == 1);
     CHECK(says(answers[0], "7") && !says(answers[0], "1"));
     if (!says(answers[0], "7")) std::printf("    %s\n", answers[0].c_str());
+}
+
+// A named basin that is also a fire pond, landuse=basin with
+// emergency=fire_water_pond, is a rank-30 POI of its emergency tag in
+// Nominatim (poi_classify.h): the way pass resolves its nodes though neither
+// key makes a POI way alone, the build writes its polygon as FIRE_WATER_POND,
+// and the server answers it at a point inside, on its parent street.
+TEST(a_basin_that_is_a_fire_pond_is_written_as_one_and_answered) {
+    const ScratchDir root("fire-pond-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    // 22 m by 60 m, 33 m north of Teststrasse and 600 m west of its address.
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    const int32_t south = lat0 + 1403000, north = lat0 + 1405000, west = lng0 + 1420000, east = lng0 + 1428000;
+    const int32_t corners[4][2] = {{south, west}, {south, east}, {north, east}, {north, west}};
+    std::vector<TestObject> objects = fixture();
+    for (int k = 0; k < 4; k++) objects.push_back(node(990 + k, corners[k][0], corners[k][1]));
+    objects.push_back(way(4020, {990, 991, 992, 993, 990},
+                          {{"emergency", "fire_water_pond"}, {"landuse", "basin"}, {"name", "Feuerweiher Testdorf"}}));
+    std::stable_sort(objects.begin(), objects.end(), [](const TestObject& a, const TestObject& b) {
+        return a.type != b.type ? a.type < b.type : a.id < b.id;
+    });
+    write_test_pbf(pbf, objects, 1000);
+    const std::string out = root.path() + "/single";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
+
+    const auto files = tree(out);
+    const std::string records = "planet/poi/all/poi_records.bin", vertices = "planet/poi/all/poi_vertices.bin";
+    REQUIRE(files.count(records) && files.count(vertices));
+    const auto& r2 = files.at(records);
+    const auto& v2 = files.at(vertices);
+    const poi_files::Logical pois = poi_files::decode(reinterpret_cast<const uint8_t*>(r2.data()), r2.size(),
+                                                      reinterpret_cast<const uint8_t*>(v2.data()), v2.size());
+    REQUIRE(pois.records.size() == poi_files::LOGICAL_STRIDE);
+    static_assert(sizeof(PoiRecord) == poi_files::LOGICAL_STRIDE, "a logical POI record is a PoiRecord");
+    PoiRecord pond;
+    std::memcpy(&pond, pois.records.data(), sizeof pond);
+    CHECK_EQ(int(pond.category), int(PoiCategory::FIRE_WATER_POND));
+    CHECK_EQ(pond.vertex_count, 5u);
+    CHECK(pond.parent_street_id != NO_DATA);
+
+    // The dataset of a client of all POIs: the planet dir's files and
+    // poi/all's beside them.
+    const std::string dataset = root.path() + "/dataset";
+    fs::create_directories(dataset);
+    for (const char* dir : {"planet", "planet/poi/all"})
+        for (const auto& e : fs::directory_iterator(out + "/" + dir))
+            if (e.is_regular_file())
+                fs::copy_file(e.path(), dataset + "/" + e.path().filename().string(), fs::copy_options::overwrite_existing);
+    const std::vector<std::string> answers = server_answers(dataset, {{47.1404, 8.1424}}, root.path() + "/q", log);
+    REQUIRE(answers.size() == 1);
+    CHECK(answer_string(answers[0], {"display_name"}).value_or("").rfind("Feuerweiher Testdorf, ", 0) == 0);
+    CHECK(answer_string(answers[0], {"address", "road"}) == std::optional<std::string>("Teststrasse"));
+    if (!says(answers[0], "Feuerweiher Testdorf")) std::printf("    %s\n", answers[0].c_str());
 }
 
 // A build logs, for each dir it writes with addresses and for each POI tier,

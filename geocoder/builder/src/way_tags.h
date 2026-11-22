@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "geometry.h"
+#include "poi_classify.h"
 
 struct WayTags {
     const char* interpolation = nullptr;
@@ -54,7 +55,13 @@ struct WayTags {
             natural || aeroway || railway || man_made || building ||
             craft || power || place || waterway || office ||
             (boundary && (std::strcmp(boundary, "national_park") == 0 ||
-                          std::strcmp(boundary, "protected_area") == 0));
+                          std::strcmp(boundary, "protected_area") == 0)) ||
+            // A reservoir or basin beside a POI main tag is a POI of that tag
+            // (poi_classify.h), whose key (emergency, shop) may make no POI
+            // way alone.
+            (landuse && (std::strcmp(landuse, "reservoir") == 0 || std::strcmp(landuse, "basin") == 0) &&
+             has_poi_main_tag(amenity, leisure, emergency, tourism, historic, shop, craft, office, aeroway, railway,
+                              man_made));
     }
 };
 
