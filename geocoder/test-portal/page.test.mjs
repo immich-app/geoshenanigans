@@ -1714,3 +1714,158 @@ test('the form thanks with the counts of the reports, or says why a send failed'
   assert.equal(feedbackError(429, 'at most 20 reports a minute'), 'Too many reports from here just now: try again in a minute.');
   assert.equal(feedbackError(400, 'a report says what was expected or comments'), 'Not sent: HTTP 400: a report says what was expected or comments');
 });
+
+// -- The Immich column --
+// The column of what Immich stores today, as /datasets lists it among its
+// others (server/src/portal/immich.rs), and its answers.
+const IMMICH = {
+  id: 'immich-cities500',
+  kind: 'immich',
+  label: 'Immich today (GeoNames cities500)',
+  description: 'What Immich v3.4.2 stores for a photo here: the nearest GeoNames cities500 place in a box of 25 km about the point, else the Natural Earth country, else nothing.',
+  immich: { release: 'v3.4.2', commit: 'b6b4b80df113656bfa4872cab31c7319e89438a9', geodata_date: '2026-10-29T14:18:17+00:00', max_distance_m: 25000 },
+  search: null,
+};
+
+// /datasets of the template with the Immich column among its others.
+function withImmich(c = catalog()) {
+  return { ...c, others: [IMMICH] };
+}
+
+// An answer of the Immich column: what it stores and how it found it.
+function immichData(how, stored, extra = {}) {
+  const shown = [stored.city, stored.state, stored.country].filter(Boolean);
+  const address = Object.fromEntries(Object.entries(stored).filter(([, v]) => v));
+  return {
+    lat: 48.8566, lon: 2.3522, display_name: shown.length ? shown.join(', ') : null, address,
+    immich: { ...IMMICH.immich, stored, how, place: null, natural_earth: null, ...extra },
+  };
+}
+
+const PARIS = {
+  geonameid: 2988507, name: 'Paris', latitude: 48.85341, longitude: 2.3488, feature_code: 'PPLC', country_code: 'FR',
+  admin1_code: '11', admin1: 'Île-de-France', admin2_code: '75', admin2: 'Paris', distance_m: 1234.5, beyond_max_distance: false,
+};
+
+test('the Immich column is one of the others: a link or the picker names it, and it is no custom pick', () => {
+  const { resolveColumn, pickerHtml, parseLink, linkSearch, columnKey } = core();
+  const c = withImmich();
+  const col = resolveColumn(c, 'immich-cities500');
+  assert.equal(col.dataset.id, 'immich-cities500');
+  assert.equal(col.dataset.kind, 'immich');
+  assert.equal(col.custom, false);
+  assert.equal(col.error, null);
+  assert.equal(columnKey(col), 'immich-cities500');
+  // Made a custom pick, it starts from the default dataset's axes.
+  assert.deepEqual(plain(col.selection), { region: 'planet', mode: 'full', quality: 'simplified', poi_tier: 'all' });
+  assert.match(resolveColumn(catalog(), 'immich-cities500').error, /^unknown dataset "immich-cities500"/);
+
+  const link = parseLink('?d=with-addresses&d=immich-cities500&at=48.8566,2.3522');
+  assert.deepEqual(plain(link.datasets), ['with-addresses', 'immich-cities500']);
+  assert.equal(linkSearch({ datasets: link.datasets, point: link.points[0] }), '?d=with-addresses&d=immich-cities500&at=48.8566,2.3522');
+
+  const picker = pickerHtml(c, col, 1, 2);
+  assert.match(picker, /<option value="immich-cities500" selected title="What Immich v3\.4\.2 stores[^"]*">Immich today \(GeoNames cities500\)<\/option>/);
+  assert.ok(picker.includes('<div class="picker-name">Immich today (GeoNames cities500)</div>'), picker);
+  assert.ok(picker.includes('Immich v3.4.2 · geodata of 2026-10-29 · immich-cities500'), picker);
+  assert.ok(!picker.includes('on disk'), picker);
+  assert.ok(!picker.includes('data-axis='), picker);
+  assert.ok(!picker.includes('<option value="" selected>'), picker);
+  const preset = pickerHtml(c, resolveColumn(c, 'with-addresses'), 0, 2);
+  assert.match(preset, /<option value="immich-cities500" title="[^"]*">Immich today/);
+  assert.match(preset, /<option value="with-addresses" selected/);
+});
+
+test('the Immich column shows what Immich stores and how it found it, beside the other columns', () => {
+  const { detailHtml, resolveColumn, answersDiffer } = core();
+  const c = withImmich();
+  const geocoder = resolveColumn(c, 'with-addresses').dataset;
+  const views = [
+    { label: geocoder.label, color: '#111', dataset: geocoder,
+      answer: { data: { display_name: 'Rue de Rivoli, Paris', address: { road: 'Rue de Rivoli', city: 'Paris', state: 'Île-de-France', country: 'France' } }, build: ID, ms: 3 } },
+    { label: IMMICH.label, color: '#222', dataset: IMMICH,
+      answer: { data: immichData('cities500', { city: 'Paris', state: 'Île-de-France', country: 'France' }, { place: PARIS, in_box: 57 }), build: null, dataset: IMMICH.id, ms: 2 } },
+  ];
+  const out = detailHtml(views, ID);
+  assert.ok(out.includes('<div class="answer-name">Paris, Île-de-France, France</div>'), out);
+  assert.ok(out.includes('cities500: <strong>Paris</strong> (PPLC, geonameid 2988507) at 48.85341, 2.34880, 1.2 km away, the nearest of 57 in the 25 km box'), out);
+  assert.ok(out.includes('state: admin1 FR.11 → Île-de-France · country: FR → France · admin2 (not stored): Paris'), out);
+  assert.ok(out.includes('Immich v3.4.2 · geodata of 2026-10-29T14:18:17+00:00'), out);
+  assert.ok(!out.includes('beyond 25 km'), out);
+  // Its answer is of no build: no sizes, no flag of another build.
+  assert.equal(out.match(/ GiB on disk · /g).length, 1, out);
+  assert.ok(!out.includes('tag stale'), out);
+  // The field table sets its city, state and country beside the others'.
+  assert.match(out, /<tr class="missing">\s*<td[^>]*>road<\/td>/);
+  for (const field of ['city', 'state', 'country']) assert.match(out, new RegExp(`<tr class="">\\s*<td[^>]*>${field}</td>`), field);
+  assert.deepEqual([...out.matchAll(/data-feedback="(\d+)"/g)].map((m) => m[1]), ['0', '1']);
+  assert.equal(answersDiffer(views.map((v) => v.answer.data)), true);
+
+  const corner = detailHtml([{ ...views[1], answer: { data: immichData('cities500', { city: 'Far', state: null, country: 'France' },
+    { place: { ...PARIS, name: 'Far', admin1: null, distance_m: 33_900, beyond_max_distance: true }, in_box: 1 }) } }], ID);
+  assert.ok(corner.includes('33.9 km away, the nearest of 1 in the 25 km box'), corner);
+  assert.ok(corner.includes('>beyond 25 km</span> in a corner of the box'), corner);
+  assert.ok(corner.includes('state: admin1 FR.11 → none'), corner);
+
+  const kosovo = detailHtml([{ ...views[1], answer: { data: immichData('natural_earth', { city: null, state: null, country: null },
+    { natural_earth: { admin: 'Kosovo', adm0_a3: 'KOS', type: 'Disputed', feature: 120, polygon: 0 } }) } }], ID);
+  assert.ok(kosovo.includes("No cities500 place in the 25 km box: Natural Earth's <strong>Kosovo</strong> (KOS, Disputed) holds the point"), kosovo);
+  assert.ok(kosovo.includes('countryInfo.txt has no KOS: Immich stores no country'), kosovo);
+  assert.ok(kosovo.includes('<div class="answer-name">—</div>'), kosovo);
+  const france = detailHtml([{ ...views[1], answer: { data: immichData('natural_earth', { city: null, state: null, country: 'France' },
+    { natural_earth: { admin: 'France', adm0_a3: 'FRA', type: 'Country', feature: 1, polygon: 3 } }) } }], ID);
+  assert.ok(!france.includes('countryInfo.txt has no'), france);
+
+  const sea = detailHtml([{ ...views[1], answer: { data: immichData('nothing', { city: null, state: null, country: null }) } }], ID);
+  assert.ok(sea.includes('No cities500 place in the 25 km box and no Natural Earth country holds the point: Immich stores no place'), sea);
+  const null_island = detailHtml([{ ...views[1], answer: { data: immichData('no_gps', { city: null, state: null, country: null }) } }], ID);
+  assert.ok(null_island.includes('0, 0: Immich takes it for no GPS and stores no place'), null_island);
+});
+
+test('the Immich column has no search and no polygons, and says so in its search head', () => {
+  const { resolveColumn, searchDatasets, searchHeadsHtml, searchMatrixHtml, searchRows, overlayTarget, polygonKey } = core();
+  const c = withImmich();
+  const columns = ['with-addresses', 'immich-cities500', 'smallest'].map((token) => resolveColumn(c, token));
+  assert.deepEqual(plain(searchDatasets(columns)), ['full.simplified.all', 'admin-minimal.simplified.none']);
+
+  const results = { results: [hit('Paris', 48.85, 2.35)], us: 900, ms: 5, index: 'full.simplified.all' };
+  const views = [searchView('With addresses', '#111', results, columns[0].dataset), searchView(IMMICH.label, '#222', null, IMMICH)];
+  const heads = searchHeadsHtml(views, null);
+  assert.ok(heads.includes(`${IMMICH.label}: <span class="warn">no search</span>: this column looks up points alone, as Immich does`), heads);
+  assert.equal([...heads.matchAll(/data-feedback-search="(\d+)"/g)].length, 1, heads);
+  const matrix = searchMatrixHtml(searchRows([results.results, null]), views, false);
+  assert.ok(matrix.includes(`title="${IMMICH.label}: no search">·</td>`), matrix);
+
+  assert.equal(polygonKey(columns[1]), null);
+  assert.equal(overlayTarget(1, columns, ID), null);
+  assert.deepEqual(plain(overlayTarget(2, columns, ID)), { key: 'admin-minimal.simplified.none', build: ID });
+});
+
+test("a report of the Immich column's answer names its dataset and no build", () => {
+  const { reverseTarget, feedbackReport } = core();
+  const data = immichData('cities500', { city: 'Paris', state: 'Île-de-France', country: 'France' }, { place: PARIS, in_box: 57 });
+  const view = { label: IMMICH.label, color: '#222', dataset: IMMICH, answer: { data, build: null, dataset: IMMICH.id, ms: 2 } };
+  const report = plain(feedbackReport(reverseTarget(view, { id: 'r1', lat: 48.8566, lng: 2.3522 }), { city: 'Paris 1er' },
+    { columns: ['with-addresses', 'immich-cities500'], point: { lat: 48.8566, lng: 2.3522 }, q: '' }));
+  assert.equal(report.dataset, 'immich-cities500');
+  assert.equal(report.build, null);
+  assert.deepEqual(report.answer, data);
+  assert.equal(report.expected.city, 'Paris 1er');
+  assert.deepEqual(report.page.columns, ['with-addresses', 'immich-cities500']);
+});
+
+test('every string of the Immich column is escaped where the page shows it', () => {
+  const { pickerHtml, detailHtml, resolveColumn } = core();
+  const hostileImmich = { ...IMMICH, label: '<img src=x onerror=alert(1)>', description: '"><script>alert(2)</script>',
+    immich: { ...IMMICH.immich, release: '<b>v3</b>', geodata_date: '<i>today</i>' } };
+  const c = { ...catalog(), others: [hostileImmich] };
+  const picker = pickerHtml(c, resolveColumn(c, 'immich-cities500'), 0, 1);
+  assertEscaped(picker);
+  const place = { ...PARIS, name: '<img src=x onerror=alert(1)>', feature_code: '<b>P</b>', admin1: '<em>x</em>', admin2: '<u>y</u>' };
+  const data = immichData('cities500', { city: place.name, state: '<em>x</em>', country: '<i>c</i>' }, { place, in_box: '<b>1</b>', release: '<b>v3</b>' });
+  const ne = immichData('natural_earth', { city: null, state: null, country: null },
+    { natural_earth: { admin: '<b>K</b>', adm0_a3: '<i>K</i>', type: '<u>t</u>', feature: 0, polygon: 0 } });
+  for (const d of [data, ne]) {
+    assertEscaped(detailHtml([{ label: hostileImmich.label, color: '#222', dataset: hostileImmich, answer: { data: d } }], ID));
+  }
+});

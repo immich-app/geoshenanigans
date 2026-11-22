@@ -396,6 +396,8 @@
   .answer-label { font-size: 11px; text-transform: uppercase; margin-bottom: 2px; }
   .answer-meta { font-size: 11px; color: var(--text-dim); overflow-wrap: anywhere; }
   .answer-name { font-size: 13px; color: var(--text-dim); margin-top: 4px; overflow-wrap: anywhere; }
+  .immich-how { font-size: 11px; color: var(--text-dim); margin-top: 4px; overflow-wrap: anywhere; }
+  .immich-how strong { color: var(--text); font-weight: 600; }
   .fields { width: 100%; border-collapse: collapse; font-size: 13px; }
   .fields tr { border-bottom: 1px solid var(--border); }
   .fields th { text-align: left; padding: 4px 8px; }
@@ -622,7 +624,8 @@ function buildOrder(a, b) {
 }
 
 // -- The link --
-// ?d=<dataset> for each column (a preset's id, or <mode>.<quality>.<poi_tier>),
+// ?d=<dataset> for each column (a preset's id, <mode>.<quality>.<poi_tier>,
+// or the id of one of /datasets' others, immich-cities500),
 // at=<lat>,<lon> for each point to look up, b=<build>, the build the
 // answers came from (its publication ID; a date alone still opens), and
 // q=<text>, the search box's text as it was typed.
@@ -709,9 +712,31 @@ function defaultDataset(catalog) {
   return catalog.datasets.find((d) => d.id === catalog.default) || catalog.datasets[0];
 }
 
+// The column of /datasets' others (no dataset of the build: the Immich
+// column, what Immich stores today) that `token` names, if one.
+function otherOf(catalog, token) {
+  return (catalog.others || []).find((o) => o.id === token) || null;
+}
+
+// Whether a column's `dataset` is none of the build's but one of the
+// others: it looks up points alone, with no search and no polygons.
+function pointsOnly(dataset) {
+  return Boolean(dataset && dataset.kind);
+}
+
+// The datasets the search asks: the columns', but those that look up
+// points alone.
+function searchDatasets(columns) {
+  return columns.filter((c) => c.dataset && !pointsOnly(c.dataset)).map((c) => c.dataset.id);
+}
+
 // The column `token` picks: its dataset, whether it is a custom pick (no
-// preset's id), the selection its axes show, and why it has no dataset.
+// preset's id), the selection its axes show, and why it has no dataset. One
+// of the others is no custom pick; its axes, were it made one, the default
+// dataset's.
 function resolveColumn(catalog, token) {
+  const other = otherOf(catalog, token);
+  if (other) return { token, dataset: other, custom: false, selection: { ...defaultDataset(catalog).selection }, error: null, note: null };
   const preset = catalog.presets.find((p) => p.id === token);
   const dataset = catalog.datasets.find((d) => d.id === (preset ? preset.dataset : token)) || null;
   const excluded = catalog.excluded.find((x) => x.id === token) || null;
@@ -1222,6 +1247,7 @@ function searchHeadsHtml(views, health) {
     let state = '';
     if (!a) {
       if (v.error) state = `<span class="warn">${esc(v.error)}</span>`;
+      else if (pointsOnly(v.dataset)) state = '<span class="warn">no search</span>: this column looks up points alone, as Immich does; click the map or a result';
     } else if (a.loading) {
       state = '<span class="loading-spinner"></span>searching…';
     } else if (a.building) {
@@ -1280,7 +1306,7 @@ function searchMatrixHtml(rows, views, expanded) {
       } else if (answered[c]) {
         html += `<td class="rank absent" title="${esc(`${v.label}: not among its results`)}">–</td>`;
       } else {
-        html += `<td class="rank unanswered" title="${esc(`${v.label}: no answer`)}">·</td>`;
+        html += `<td class="rank unanswered" title="${esc(`${v.label}: ${pointsOnly(v.dataset) ? 'no search' : 'no answer'}`)}">·</td>`;
       }
     });
     const kind = Object.hasOwn(SEARCH_KINDS, row.kind) ? SEARCH_KINDS[row.kind] : { label: row.kind, title: row.kind };
@@ -1323,6 +1349,9 @@ function pickerHtml(catalog, col, index, count) {
     const size = d ? ` · ${formatSize(d.size_disk)}` : '';
     html += `<option value="${esc(p.id)}"${!col.custom && col.token === p.id ? ' selected' : ''} title="${esc(p.description)}">${esc(p.label)}${size}</option>`;
   }
+  for (const o of catalog.others || []) {
+    html += `<option value="${esc(o.id)}"${!col.custom && col.token === o.id ? ' selected' : ''} title="${esc(o.description)}">${esc(o.label)}</option>`;
+  }
   html += `<option value=""${col.custom ? ' selected' : ''}>Custom…</option></select>`;
   if (count > 1) html += `<button class="picker-remove" data-col="${index}" data-action="remove" title="Remove this column">×</button>`;
   html += '</div>';
@@ -1344,7 +1373,11 @@ function pickerHtml(catalog, col, index, count) {
     for (const line of constraints) html += `<div class="picker-constraint">${esc(line)}</div>`;
   }
   const d = col.dataset;
-  if (d) {
+  if (pointsOnly(d)) {
+    html += `<div class="picker-name">${esc(d.label)}</div>`;
+    html += `<div class="picker-meta">${esc(otherMeta(d))} · ${esc(d.id)}</div>`;
+    if (d.description) html += `<div class="picker-desc">${esc(d.description)}</div>`;
+  } else if (d) {
     html += `<div class="picker-name">${esc(d.label)}</div>`;
     html += `<div class="picker-meta">${esc(selectionLabel(catalog, d.selection))} · ${esc(d.id)}</div>`;
     html += `<div class="picker-meta">${formatSize(d.size_disk)} on disk · ${formatSize(d.size_download)} download</div>`;
@@ -1353,6 +1386,47 @@ function pickerHtml(catalog, col, index, count) {
   if (col.note) html += `<div class="picker-note">${esc(col.note)}</div>`;
   if (col.error) html += `<div class="picker-error">${esc(col.error)}</div>`;
   return `${html}</div>`;
+}
+
+// What one of the others is of: for the Immich column, its release and the
+// date of its geodata.
+function otherMeta(d) {
+  const m = d.immich || {};
+  return `Immich ${m.release || 'release'} · geodata of ${String(m.geodata_date || '?').slice(0, 10)}`;
+}
+
+// How Immich found what it stores (the JSON's immich, of the Immich
+// column's answer): the cities500 place, how far, among how many in the
+// box, and where its state and country come from; or the Natural Earth
+// country, which countryInfo.txt may not name; or why nothing. Then the
+// release and its geodata.
+function immichHtml(data) {
+  const m = data && data.immich;
+  if (!m) return '';
+  const km = Number(m.max_distance_m) / 1000;
+  const stored = m.stored || {};
+  const lines = [];
+  const p = m.place;
+  if (m.how === 'cities500' && p) {
+    lines.push(`cities500: <strong>${esc(p.name)}</strong> (${esc(p.feature_code)}, geonameid ${esc(p.geonameid)}) at`
+      + ` ${Number(p.latitude).toFixed(5)}, ${Number(p.longitude).toFixed(5)}, ${formatMetres(Number(p.distance_m))} away,`
+      + ` the nearest of ${esc(m.in_box)} in the ${km} km box`);
+    if (p.beyond_max_distance) {
+      lines.push(`<span class="tag" title="earth_box is a cube: Immich doesn't check the distance of what is in it">beyond ${km} km</span> in a corner of the box`);
+    }
+    lines.push(`state: admin1 ${esc(p.country_code)}.${esc(p.admin1_code)} → ${esc(p.admin1 ?? 'none')} · country: ${esc(p.country_code)} → ${esc(stored.country ?? 'none')}`
+      + ` · admin2 (not stored): ${esc(p.admin2 ?? '—')}`);
+  } else if (m.how === 'natural_earth' && m.natural_earth) {
+    const ne = m.natural_earth;
+    lines.push(`No cities500 place in the ${km} km box: Natural Earth's <strong>${esc(ne.admin)}</strong> (${esc(ne.adm0_a3)}, ${esc(ne.type)}) holds the point`);
+    if (!stored.country) lines.push(`countryInfo.txt has no ${esc(ne.adm0_a3)}: Immich stores no country`);
+  } else if (m.how === 'no_gps') {
+    lines.push('0, 0: Immich takes it for no GPS and stores no place');
+  } else {
+    lines.push(`No cities500 place in the ${km} km box and no Natural Earth country holds the point: Immich stores no place`);
+  }
+  lines.push(`Immich ${esc(m.release || 'release')} · geodata of ${esc(m.geodata_date)}`);
+  return `<div class="immich-how">${lines.map((l) => `<div>${l}</div>`).join('')}</div>`;
 }
 
 // The key of the control of the pickers whose element's data-* attributes
@@ -1389,7 +1463,9 @@ function detailHtml(views, served) {
     if (Number.isFinite(a.ms)) meta.push(`${Math.round(a.ms)} ms`);
     if (meta.length) html += `<div class="answer-meta">${meta.join(' · ')}</div>`;
     const stale = a.build && served && !sameBuild(a.build, served);
-    if (v.dataset && !stale) html += `<div class="answer-meta">${formatSize(v.dataset.size_disk)} on disk · ${formatSize(v.dataset.size_download)} download</div>`;
+    if (v.dataset && !pointsOnly(v.dataset) && !stale) {
+      html += `<div class="answer-meta">${formatSize(v.dataset.size_disk)} on disk · ${formatSize(v.dataset.size_download)} download</div>`;
+    }
     if (stale) {
       html += `<span class="tag stale" title="The server serves build ${esc(served)} now: Re-test asks it again">build ${esc(a.build)}, not ${esc(served)}</span>`;
     }
@@ -1397,6 +1473,7 @@ function detailHtml(views, served) {
     else if (a.error) html += `<div class="result-error">${esc(a.error)}</div>`;
     else if (a.data) html += `<div class="answer-name">${a.data.display_name ? esc(a.data.display_name) : '—'}</div>`;
     else html += '<div class="answer-meta">not asked yet</div>';
+    if (pointsOnly(v.dataset) && a.data) html += immichHtml(a.data);
     if (v.dataset && a.data) html += `<button class="tool feedback-btn" data-feedback="${i}" title="Tell us what you expected here">Disagree?</button>`;
     html += '</div>';
   }
@@ -1578,12 +1655,19 @@ function nextPolygons(current, count) {
   return next < count ? next : 'off';
 }
 
+// The key of the dataset whose polygons the overlay on the column `col`
+// shows: its columnKey; none for a column that looks up points alone.
+function polygonKey(col) {
+  return pointsOnly(col.dataset) ? null : columnKey(col);
+}
+
 // What the polygon overlay on the column `column` ('off', or a place in
 // `columns`) shows of a result: the dataset of that column (its key) in the
-// build `build`; none while it is off or its column has no dataset.
+// build `build`; none while it is off or its column has no dataset, or one
+// that looks up points alone.
 function overlayTarget(column, columns, build) {
   const col = column === 'off' ? null : columns[column];
-  const key = col ? columnKey(col) : null;
+  const key = col ? polygonKey(col) : null;
   return key === null ? null : { key, build };
 }
 
@@ -2035,8 +2119,10 @@ columnsEl.addEventListener('change', (e) => {
     if (el.value) {
       setColumn(i, resolveColumn(catalog, el.value));
     } else {
-      // Custom: the axes of the dataset the column had.
-      const from = columns[i].dataset || datasetOf(catalog, columns[i].selection) || defaultDataset(catalog);
+      // Custom: the axes of the dataset the column had (of one of the
+      // others, those its selection keeps).
+      const had = pointsOnly(columns[i].dataset) ? null : columns[i].dataset;
+      const from = had || datasetOf(catalog, columns[i].selection) || defaultDataset(catalog);
       setColumn(i, resolveColumn(catalog, from.id));
     }
   } else if (el.dataset.axis) {
@@ -2100,7 +2186,7 @@ const searchBox = document.getElementById('searchInput');
 const searchOut = document.getElementById('searchOut');
 const placeSearch = new PlaceSearch({
   request: (url, signal) => pacer.request(url, 'search', signal),
-  datasets: () => columns.filter((c) => c.dataset).map((c) => c.dataset.id),
+  datasets: () => searchDatasets(columns),
   changed: searchChanged,
 });
 searchBox.value = link.q;
@@ -2597,7 +2683,7 @@ const polygonOverlay = new PolygonOverlay({
   erase: erasePolygons,
   shown: () => {
     const col = polygonsColumn === 'off' ? null : columns[polygonsColumn];
-    const key = col ? columnKey(col) : null;
+    const key = col ? polygonKey(col) : null;
     return key === null || selectedId === null ? null : { id: selectedId, key };
   },
 });
@@ -2741,7 +2827,7 @@ function drawPolygons(fc) {
 function updatePolygonLayer(id) {
   const col = polygonsColumn === 'off' ? null : columns[polygonsColumn];
   const r = results.find(x => x.id === id);
-  if (!col || columnKey(col) === null || !r) { clearPolygonLayer(); return; }
+  if (!col || polygonKey(col) === null || !r) { clearPolygonLayer(); return; }
   ensurePolygonLayer();
   const dataset = col.dataset ? `&dataset=${encodeURIComponent(col.dataset.id)}` : '';
   polygonOverlay.show(id, columnKey(col), `/polygons?lat=${r.lat}&lon=${r.lng}&key=test${dataset}`)
@@ -2762,7 +2848,7 @@ function togglePolygons() {
 function updatePolygonsBtn() {
   const btn = document.getElementById('polygonsBtn');
   const col = polygonsColumn === 'off' ? null : columns[polygonsColumn];
-  btn.textContent = `Polygons: ${col ? columnLabel(col) : 'Off'}`;
+  btn.textContent = `Polygons: ${col ? columnLabel(col) : 'Off'}${col && polygonKey(col) === null ? ' (none)' : ''}`;
   btn.style.background = col ? COLUMN_COLORS[polygonsColumn] : 'var(--surface2)';
 }
 
