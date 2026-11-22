@@ -241,15 +241,24 @@ class TestPortalTest(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(run.stdout.strip(), str(load_template()["build"]["version"]))
 
-    # The page shows the answers' data, so it credits each source the template does, with its
-    # licence.
-    def test_the_page_credits_every_source_of_the_template(self):
+    # The page shows the answers of the planet's full dataset, whose attribution.json lists every
+    # source of the template, so its credit names each, in the template's order, with its licence
+    # and every notice of it: the GeoNames readme's warranty line too, a disclaimer CC BY 4.0
+    # keeps a notice of.
+    def test_the_page_credits_every_source_of_the_template_with_its_notices(self):
         with open(os.path.join(PORTAL, "index.html"), encoding="utf-8") as f:
             page = f.read()
-        for entry in load_template()["attribution"]:
+        credit = re.findall(r'<footer class="data-credit">(.*?)</footer>', page, re.S)
+        self.assertEqual(len(credit), 1)
+        sources = re.findall(r"<p>(.*?)</p>", credit[0], re.S)
+        entries = load_template()["attribution"]
+        self.assertEqual(len(sources), len(entries))
+        for entry, source in zip(entries, sources):
             for field in ("text", "url", "licence", "licence_url"):
                 if field in entry:
-                    self.assertIn(entry[field], page, (entry["id"], field))
+                    self.assertIn(entry[field], source, (entry["id"], field))
+            for notice in entry["notices"]:
+                self.assertIn(notice, source, entry["id"])
 
     def unit_of(self, name):
         """The transport unit entrypoint.sh --unit-of fetches a file through, or ""."""

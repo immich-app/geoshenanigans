@@ -231,7 +231,8 @@
   }
   .detail-panel.visible { display: block; }
 
-  /* The credit of the data the answers come from (configurations.template.json "attribution"). */
+  /* The credit of the data the answers come from: each source of the planet's full dataset
+     (configurations.template.json "attribution"), its licence and its notices. */
   .data-credit {
     padding: 8px 16px;
     border-top: 1px solid var(--border);
@@ -239,6 +240,7 @@
     line-height: 1.5;
     color: var(--text-dim);
   }
+  .data-credit p { margin: 4px 0 0; }
   .data-credit a { color: var(--accent); }
 
   .detail-panel h3 {
@@ -363,15 +365,17 @@
     </div>
 
     <footer class="data-credit">
-      Answers from
-      <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a>,
-      <a href="https://opendatacommons.org/licenses/odbl/1-0/" target="_blank" rel="noopener">ODbL 1.0</a>;
-      GB postcodes from <a href="https://www.geonames.org/" target="_blank" rel="noopener">GeoNames</a>,
-      <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>
-      (contains Royal Mail data Royal Mail copyright and database right 2022);
-      US address ranges and ZIP codes from
-      <a href="https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html" target="_blank" rel="noopener">US Census Bureau TIGER/Line</a>
-      (Public domain).
+      The answers come from the data of these sources.
+      <p><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a>,
+        <a href="https://opendatacommons.org/licenses/odbl/1-0/" target="_blank" rel="noopener">ODbL 1.0</a>.
+        This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0.</p>
+      <p><a href="https://www.geonames.org/" target="_blank" rel="noopener">GeoNames</a>,
+        <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>, for GB postcodes.
+        UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.
+        The Data is provided "as is" without warranty or any representation of accuracy, timeliness or completeness.</p>
+      <p><a href="https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html" target="_blank" rel="noopener">US Census Bureau TIGER/Line</a>,
+        Public domain.
+        Address ranges and ZIP codes in the United States from the US Census Bureau's TIGER/Line files, which are in the public domain.</p>
     </footer>
   </div>
 </div>
