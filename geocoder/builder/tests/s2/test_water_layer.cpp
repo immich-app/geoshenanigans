@@ -384,13 +384,21 @@ TEST(the_water_dirs_hold_every_file_and_keep_each_polygons_slot_the_next_day) {
     CHECK(day3.identities[2] != day1.identities[3]);
     const std::string three = root.path() + "/three";
     const std::string summary = write(day3, three, one);
-    CHECK(summary.find("3 polygons in 4 slots (3 kept, 1 by fallback)") != std::string::npos);
+    CHECK(summary.find("3 polygons in 4 slots (3 kept, 1 by fallback, 0 recycled)") != std::string::npos);
     const auto after = tree(three);
     const std::vector<char>& records = after.at("water/all/exact/admin_polygons.bin");
     REQUIRE(records.size() == 4 * sizeof(AdminPolygonRecord));
     AdminPolygonRecord pond;
     std::memcpy(&pond, records.data(), sizeof pond);
     CHECK_EQ(pond.name_id, NO_DATA);
+
+    // A pond of another way the day after takes the freed slot: recycled,
+    // not kept.
+    Collected again = edited;
+    again.closed_ways.push_back({21, tags(4, "Pond"), square(kLat + 200000, kLng, 1000)});
+    const std::string four = root.path() + "/four";
+    CHECK(write(build(again, three), four, three).find("4 polygons in 4 slots (3 kept, 0 by fallback, 1 recycled)") !=
+          std::string::npos);
 }
 
 namespace {
@@ -529,7 +537,7 @@ TEST(marine_areas_keep_their_slots_from_one_day_to_the_next) {
     const Layer day2 = build(c, one);
     CHECK(day2.identities[4] != day1.identities[4]);
     const std::string summary = write(day2, two, one);
-    CHECK(summary.find("7 polygons in 7 slots (7 kept, 1 by fallback)") != std::string::npos);
+    CHECK(summary.find("7 polygons in 7 slots (7 kept, 1 by fallback, 0 recycled)") != std::string::npos);
     const auto a = tree(one), b = tree(two);
     CHECK(a.at("water/all/exact/admin_polygons.bin") == b.at("water/all/exact/admin_polygons.bin"));
 }
@@ -572,7 +580,8 @@ TEST(polygons_of_one_object_meeting_at_their_smallest_vertex_keep_slots_of_their
     write(day1, one);
     const std::string summary = write(build(c, one), two, one);
     const std::string all = std::to_string(day1.size());
-    CHECK(summary.find(all + " polygons in " + all + " slots (" + all + " kept, 0 by fallback)") != std::string::npos);
+    CHECK(summary.find(all + " polygons in " + all + " slots (" + all + " kept, 0 by fallback, 0 recycled)") !=
+          std::string::npos);
     CHECK(tree(one) == tree(two));
 }
 

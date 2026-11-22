@@ -128,7 +128,9 @@ bool load_polygon_sidecar(IdAllocator& alloc, const std::string& path) {
 struct PolygonSlots {
     std::vector<uint32_t> slot_of;  // parallel to the layer's records, NO_DATA for a polygon not here
     uint32_t count = 0;
-    size_t kept = 0, by_fallback = 0;
+    // The polygons that kept a live slot of the previous build's (by_fallback
+    // of them by their fallback keys), and those that took a freed one.
+    size_t kept = 0, by_fallback = 0, recycled = 0;
 };
 
 PolygonSlots polygon_slots(const Layer& layer, const std::vector<uint32_t>& ids, const std::string& prev_dir,
@@ -141,7 +143,10 @@ PolygonSlots polygon_slots(const Layer& layer, const std::vector<uint32_t>& ids,
     std::vector<gc::id_alloc::FallbackPass> passes;
     passes.push_back({[&](size_t k) { return layer.fallbacks[ids[k]]; },
                       [&](uint32_t s) { return s < prev_fallback.size() ? prev_fallback[s] : gc::id_alloc::kNoFallbackKey; }});
-    const uint32_t previous_slots = alloc.total_slots();
+    // The previous slots a polygon kept: those it can claim, live ones
+    // (IdAllocator recycles the others).
+    std::vector<uint8_t> was_live(alloc.total_slots());
+    for (size_t s = 0; s < was_live.size(); s++) was_live[s] = gc::id_alloc::is_reclaimable(alloc.slots()[s]);
     const std::vector<uint32_t> slots = alloc.allocate_all(ids.size(), [&](size_t k) {
         const uint64_t key = layer.identities[ids[k]];
         return gc::id_alloc::SlotIdentity{static_cast<ObjectType>(key >> 56), key & 0x00FFFFFFFFFFFFFFull, 0};
@@ -154,7 +159,9 @@ PolygonSlots polygon_slots(const Layer& layer, const std::vector<uint32_t>& ids,
     out.slot_of.assign(layer.size(), NO_DATA);
     for (size_t k = 0; k < ids.size(); k++) {
         out.slot_of[ids[k]] = slots[k];
-        out.kept += slots[k] < previous_slots;
+        if (slots[k] >= was_live.size()) continue;
+        out.kept += was_live[slots[k]];
+        out.recycled += !was_live[slots[k]];
     }
     std::vector<uint64_t> at_slot(out.count, gc::id_alloc::kNoFallbackKey);
     for (size_t k = 0; k < ids.size(); k++) at_slot[slots[k]] = layer.fallbacks[ids[k]];
@@ -1242,9 +1249,9 @@ std::string write_set(const Layer& layer, const std::vector<uint32_t>& ids, cons
     for (const auto& [t, dir] : tier_dirs) arc_bytes += blocks.tiers[t].bytes.size();
     std::ostringstream line;
     line << ids.size() << " polygons in " << slots.count << " slots (" << slots.kept << " kept, " << slots.by_fallback
-         << " by fallback), " << ring_bytes << " ring bytes, " << arc_bytes << " arc bytes, " << count_cells(cells)
-         << " cells, " << cells.size() << " entries, " << names.bytes().size() << " name bytes, " << codes.size()
-         << " types";
+         << " by fallback, " << slots.recycled << " recycled), " << ring_bytes << " ring bytes, " << arc_bytes
+         << " arc bytes, " << count_cells(cells) << " cells, " << cells.size() << " entries, " << names.bytes().size()
+         << " name bytes, " << codes.size() << " types";
     return line.str();
 }
 
