@@ -171,3 +171,24 @@ TEST(the_same_polygon_cuts_the_same_way_whatever_its_rings_start_and_run) {
     for (const SplitPolygon& x : b) kb.insert(x.key);
     CHECK(ka == kb);
 }
+
+TEST(a_cut_puts_its_vertex_where_it_does_with_the_edge_run_the_other_way) {
+    // Half way between two units it rounds away from zero, whichever end
+    // the edge starts at and on either side of zero.
+    using split_detail::P;
+    auto both = [](P a, P b, int64_t line) {
+        const P there = split_detail::crossing(a, b, line), back = split_detail::crossing(b, a, line);
+        CHECK(there == back);
+        CHECK_EQ(there.y, line);
+        return there.x;
+    };
+    CHECK_EQ(both({0, 0}, {1, 2}, 1), int64_t(1));
+    CHECK_EQ(both({0, 0}, {-1, 2}, 1), int64_t(-1));
+    CHECK_EQ(both({-3, -2}, {-2, 0}, -1), int64_t(-3));
+    CHECK_EQ(both({5, -1}, {2, 1}, 0), int64_t(4));
+    CHECK_EQ(both({-7, 10}, {6, 12}, 11), int64_t(-1));
+    CHECK_EQ(both({1800000000, -900000000}, {1799999999, 900000000}, 0), int64_t(1800000000));
+    // Elsewhere the nearest unit.
+    CHECK_EQ(both({0, 0}, {10, 3}, 1), int64_t(3));
+    CHECK_EQ(both({0, 0}, {-10, 3}, 2), int64_t(-7));
+}

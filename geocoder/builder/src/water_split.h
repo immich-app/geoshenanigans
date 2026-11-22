@@ -85,19 +85,20 @@ inline __int128 area2(const std::vector<P>& v) {
 }
 
 // Where the edge a-b, which runs from one side of y = L to the other (a.y < L
-// <= b.y, or b.y < L <= a.y), meets the line: x rounded to the nearest unit,
-// half away from zero; an end on the line is itself.
+// <= b.y, or b.y < L <= a.y), meets the line: x, (a.x (b.y - L) + b.x (L -
+// a.y)) / (b.y - a.y), rounded to the nearest unit, half away from zero, the
+// same whichever end the edge starts at; an end on the line is itself.
 inline P crossing(P a, P b, int64_t L) {
     if (a.y == L) return a;
     if (b.y == L) return b;
-    const __int128 num = static_cast<__int128>(b.x - a.x) * (L - a.y);
+    const __int128 num = static_cast<__int128>(a.x) * (b.y - L) + static_cast<__int128>(b.x) * (L - a.y);
     const __int128 den = b.y - a.y;
     __int128 q = num / den, r = num % den;
     // Round the quotient half away from zero.
     const bool negative = (num < 0) != (den < 0);
     const __int128 r2 = (r < 0 ? -r : r) * 2, d = den < 0 ? -den : den;
     if (r2 >= d) q += negative ? -1 : 1;
-    return {a.x + static_cast<int64_t>(q), L};
+    return {static_cast<int64_t>(q), L};
 }
 
 // A stretch of a ring on one side of the line: from where it crosses onto
