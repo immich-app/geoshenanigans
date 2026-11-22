@@ -1128,8 +1128,35 @@ TEST(a_way_tagged_as_the_multipolygon_whose_outer_ring_it_is_leaves_the_island_o
     lacking.tags = tags(code::kLake, "Broken Lake");
     lacking.members = {{2720, "outer"}, {99999, "inner"}};
     c.relations.push_back(lacking);
+    // And ways that are the outer rings of relations of their names but of
+    // another kind: a lake in a wetland of its name, and a pond of a water=*
+    // value of its own in a lake of another such value.
+    const Ring moor = square(lat + 600000, kLng, 100000), salt = square(lat + 800000, kLng, 100000);
+    add_geometry(c, 2730, moor);
+    c.closed_ways.push_back({2730, tags(code::kLake, "Moor Lake"), moor});
+    CollectedArea wetland;
+    wetland.id = 2830;
+    wetland.tags = tags(code::kWetland, "Moor Lake");
+    wetland.members = {{2730, "outer"}};
+    c.relations.push_back(wetland);
+    add_geometry(c, 2740, salt);
+    ObjectTags pond = tags(0, "Salt Water"), lake = pond;
+    pond.verbatim = "salt_pond";
+    lake.verbatim = "salt_lake";
+    c.closed_ways.push_back({2740, pond, salt});
+    CollectedArea salt_lake;
+    salt_lake.id = 2840;
+    salt_lake.tags = lake;
+    salt_lake.members = {{2740, "outer"}};
+    c.relations.push_back(salt_lake);
     const Layer layer = build(c);
-    CHECK(ways_held(layer, {2700, 2701, 2710, 2720}).first == std::set<int64_t>({2701, 2710, 2720}));
+    CHECK(ways_held(layer, {2700, 2701, 2710, 2720, 2730, 2740}).first ==
+          std::set<int64_t>({2701, 2710, 2720, 2730, 2740}));
+    for (int64_t relation : {2830, 2840}) {
+        size_t held = 0;
+        for (size_t p = 0; p < layer.size(); p++) held += layer.fallbacks[p] == relation_ring_fallback(relation, 0);
+        CHECK_EQ(held, size_t(1));
+    }
     // The lake is the relation's polygon, the island a hole in it.
     size_t twins = 0;
     for (size_t p = 0; p < layer.size(); p++)

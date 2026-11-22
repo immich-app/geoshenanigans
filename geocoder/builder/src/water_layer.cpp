@@ -279,14 +279,17 @@ Build assemble(Collected& c, unsigned threads) {
             if (whole) outer_of[way].push_back(i);
         }
     }
-    // Whether closed way w is such an outer ring of a relation of its names:
-    // one body tagged twice, which the relation gives, its islands left out.
+    // Whether closed way w is such an outer ring of a relation of its kind
+    // and names: one body tagged twice, which the relation gives, its
+    // islands left out.
     auto twin = [&](const ClosedWayArea& w) {
         auto it = outer_of.find(w.way);
         if (it == outer_of.end()) return false;
         for (uint32_t i : it->second) {
             const ObjectTags& t = c.relations[i].tags;
-            if (t.name == w.tags.name && t.local_name == w.tags.local_name) return true;
+            if (t.code == w.tags.code && t.verbatim == w.tags.verbatim && t.name == w.tags.name &&
+                t.local_name == w.tags.local_name)
+                return true;
         }
         return false;
     };
@@ -462,15 +465,18 @@ void keep_objects(Build& b, const std::vector<uint8_t>& keep) {
         for (uint32_t k = 0; k < poly.ring_count; k++) {
             const uint32_t ring = poly.first_ring + k;
             const RingSpan span = r.rings[ring];
-            std::copy(r.vertices.begin() + span.begin, r.vertices.begin() + span.begin + span.count,
-                      r.vertices.begin() + static_cast<std::ptrdiff_t>(vertices));
+            // A ring in its place stays; one further on moves down to it.
+            if (span.begin != vertices)
+                std::copy(r.vertices.begin() + span.begin, r.vertices.begin() + span.begin + span.count,
+                          r.vertices.begin() + static_cast<std::ptrdiff_t>(vertices));
             if (with_runs) {
                 const auto [first, last] = r.runs_of_ring(ring);
                 const size_t n = static_cast<size_t>(last - first);
                 const size_t from = static_cast<size_t>(first - r.runs.data());
-                std::copy(r.runs.begin() + static_cast<std::ptrdiff_t>(from),
-                          r.runs.begin() + static_cast<std::ptrdiff_t>(from + n),
-                          r.runs.begin() + static_cast<std::ptrdiff_t>(runs));
+                if (from != runs)
+                    std::copy(r.runs.begin() + static_cast<std::ptrdiff_t>(from),
+                              r.runs.begin() + static_cast<std::ptrdiff_t>(from + n),
+                              r.runs.begin() + static_cast<std::ptrdiff_t>(runs));
                 r.first_run[rings] = static_cast<uint32_t>(runs);
                 runs += n;
             }
