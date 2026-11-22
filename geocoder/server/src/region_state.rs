@@ -7,17 +7,18 @@
 //
 // 1. Configuration push (PUT /admin/configuration): full snapshot of what
 //    regions the user wants, plus mode/quality/poi_tier/water. Server preloads
-//    regions in the snapshot that aren't already loaded, and where the
-//    selection changed downloads each loaded region again for it.
+//    regions in the snapshot that aren't already loaded, and downloads each
+//    loaded region again whose files it hasn't downloaded for the selection.
 //
 // 2. Lazy on-demand: a /reverse request lands on a continent we don't
 //    have, the request handler calls `ensure_loaded` which blocks
 //    until the download finishes.
 //
 // Per-region mutex serialises concurrent ensure_loaded calls so each
-// region is downloaded at most once even under request fan-in. A download
-// runs in a task of its own, which holds the mutex to its end: a request
-// that gives up leaves it to run on.
+// region is downloaded at most once even under request fan-in, and guards
+// the selection the region was last downloaded for. A download runs in a
+// task of its own, which holds the mutex to its end: a request that gives
+// up leaves it to run on.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -27,9 +28,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::downloader::{
-    check_selection, download_region, Configurations, DownloadError, DownloadProgress, RegionSelection, COMPONENT_AXES,
-};
+use crate::downloader::{check_selection, download_region, Configurations, DownloadError, DownloadProgress, RegionSelection};
 use query_server::{MultiIndex, BUILD_STAMP, FILE_LEDGER};
 
 /// How long a fetched configurations.json is trusted before latest.json
@@ -118,8 +117,11 @@ pub struct RegionState {
     pub configurations_ttl: Duration,
     /// Per-region serialisation. Concurrent requests for the same region
     /// share one inner Mutex; only the leader actually downloads, the
-    /// rest wait on the lock and find the region already loaded.
-    pub region_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// rest wait on the lock and find the region already loaded. It holds
+    /// the selection whose files this server last downloaded into the
+    /// region and installed, none before it did (for a region it loaded
+    /// from its dir as it started, say), which the region's files are of.
+    pub region_locks: Mutex<HashMap<String, Arc<Mutex<Option<RegionSelection>>>>>,
     pub http: reqwest::Client,
 }
 
@@ -149,12 +151,16 @@ impl RegionState {
 
     /// Replace the active configuration. Persists to disk and kicks
     /// off background downloads: of each preload region not loaded yet,
-    /// and, where the selection (mode, quality, poi_tier or water) changed,
-    /// of each loaded region again whose dir the downloader filled, for the
-    /// new selection's files, which load in place of the index it had once
-    /// they are in. Till then, and where the download or the load fails, the
-    /// region answers as before. Returns immediately — downloads run as
-    /// tokio tasks.
+    /// and of each loaded region again whose dir the downloader filled,
+    /// unless this server's last download of it that went through and was
+    /// installed was of the new selection (mode, quality, poi_tier and
+    /// water), for the new selection's files, which load in place of the
+    /// index it had once they are in. So a region it loaded from its dir as
+    /// it started is downloaded again once, and one whose download failed on
+    /// each configuration, of the same selection too, till one goes through.
+    /// Till then, and where the download or the load fails, the region
+    /// answers as before. Returns immediately — downloads run as tokio
+    /// tasks.
     ///
     /// Refused, changing nothing, when the manifest at hand has no
     /// component for its mode, quality, poi_tier or water.
@@ -167,8 +173,7 @@ impl RegionState {
         // The manifest at hand: the cached one, when it is of this base_url
         // and within its TTL. Without one the first download reports a
         // value the build lacks. The check reads no region.
-        let before = self.config.lock().await.clone();
-        let same_bucket = before.base_url == new_cfg.base_url;
+        let same_bucket = self.config.lock().await.base_url == new_cfg.base_url;
         if let Some((fetched_at, manifest)) = self.configurations.lock().await.as_ref() {
             if same_bucket && fetched_at.elapsed() < self.configurations_ttl {
                 check_selection(manifest, &new_cfg.selection(""))?;
@@ -185,32 +190,28 @@ impl RegionState {
         // referenced build may have changed).
         *self.configurations.lock().await = None;
 
-        // Spawn preload downloads, and where the selection changed one of
-        // each other region, which downloads it again if it is loaded. Each
+        // Spawn preload downloads, and one of each other region, which
+        // downloads it again if it is loaded and of another selection. Each
         // task decides under the region's mutex (download_if), so a download
         // of the selection before that holds it ends first, and its region
         // is then downloaded again; even if a /reverse request beats the
         // preload to the punch, only one download runs.
-        let changed = COMPONENT_AXES.iter()
-            .any(|axis| before.selection("").axis(axis) != new_cfg.selection("").axis(axis));
         let mut regions: Vec<(String, bool)> = Vec::new();
         for region in &new_cfg.preload {
             if !regions.iter().any(|(r, _)| r == region) {
                 regions.push((region.clone(), true));
             }
         }
-        if changed {
-            for c in &self.multi_index.continents {
-                if !regions.iter().any(|(r, _)| r == c.name) {
-                    regions.push((c.name.to_string(), false));
-                }
+        for c in &self.multi_index.continents {
+            if !regions.iter().any(|(r, _)| r == c.name) {
+                regions.push((c.name.to_string(), false));
             }
         }
         let mut tasks = Vec::new();
         for (region, preload) in regions {
             let s = self.clone();
             tasks.push(tokio::spawn(async move {
-                if let Err(e) = s.download_if(&region, preload, changed).await {
+                if let Err(e) = s.download_if(&region, preload, true).await {
                     eprintln!("{} {}: {}", if preload { "preload" } else { "download" }, region, e);
                 }
             }));
@@ -270,10 +271,13 @@ impl RegionState {
 
     /// Downloads `region` and installs it, as ensure_loaded does, where it
     /// isn't loaded and `unloaded`, or is and `loaded`; else returns. A
-    /// loaded region is downloaded again only where its continent dir is
-    /// the downloader's, holding its ledger or its stamp: one holding
-    /// neither was laid out by other means (by hand, by the test portal),
-    /// as the flat layout's one slot was, and is never downloaded again.
+    /// loaded region is downloaded again only where the configuration's
+    /// selection isn't the one this server last downloaded it for and
+    /// installed, and its continent dir is the downloader's, holding its
+    /// ledger or its stamp: one holding neither was laid out by other means
+    /// (by hand, by the test portal), as the flat layout's one slot was, and
+    /// is never downloaded again. The selection is noted once the download
+    /// and the install went through, and only then.
     async fn download_if(self: &Arc<Self>, region: &str, unloaded: bool, loaded: bool) -> Result<(), DownloadError> {
         // Per-region serialisation. Acquire the inner mutex so only
         // one concurrent request runs the download below; the rest
@@ -281,10 +285,10 @@ impl RegionState {
         let inner = {
             let mut g = self.region_locks.lock().await;
             g.entry(region.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .or_insert_with(|| Arc::new(Mutex::new(None)))
                 .clone()
         };
-        let guard = inner.lock_owned().await;
+        let mut installed = inner.lock_owned().await;
 
         // Bail early if `region` isn't a known continent.
         let Some(slot) = self.multi_index.continents.iter().find(|c| c.name == region) else {
@@ -293,7 +297,8 @@ impl RegionState {
         // Checked after acquiring the lock: an earlier waiter may have
         // just finished the download.
         let wanted = if slot.index.load().is_some() {
-            loaded && slot.continent.is_some() && self.downloaded_into(region).await
+            let selection = self.config.lock().await.selection(region);
+            loaded && slot.continent.is_some() && installed.as_ref() != Some(&selection) && self.downloaded_into(region).await
         } else {
             unloaded
         };
@@ -303,8 +308,8 @@ impl RegionState {
 
         let (state, region) = (self.clone(), region.to_string());
         tokio::spawn(async move {
-            let _guard = guard;
-            state.download_and_install(&region).await
+            *installed = Some(state.download_and_install(&region).await?);
+            Ok(())
         })
         .await
         .map_err(|e| DownloadError::Io(format!("download task: {}", e)))?
@@ -323,13 +328,14 @@ impl RegionState {
         false
     }
 
-    /// Downloads `region` and installs it: the task of download_if. A region
-    /// loaded already answers from the files its index mapped until the new
-    /// index is installed, and goes on doing so where the download or the
-    /// load fails: Index::load maps each file it reads and opens none by its
-    /// path later, and a download writes no file in place, but renames a new
-    /// one over it or removes it, which leaves a mapped file as it was.
-    async fn download_and_install(&self, region: &str) -> Result<(), DownloadError> {
+    /// Downloads `region` and installs it, returning the selection it
+    /// downloaded: the task of download_if. A region loaded already answers
+    /// from the files its index mapped until the new index is installed, and
+    /// goes on doing so where the download or the load fails: Index::load
+    /// maps each file it reads and opens none by its path later, and a
+    /// download writes no file in place, but renames a new one over it or
+    /// removes it, which leaves a mapped file as it was.
+    async fn download_and_install(&self, region: &str) -> Result<RegionSelection, DownloadError> {
         let configurations = self.ensure_configurations().await?;
         let cfg = self.config.lock().await.clone();
         let sel = cfg.selection(region);
@@ -362,7 +368,7 @@ impl RegionState {
             .await
             .map_err(|e| DownloadError::Io(format!("load task: {}", e)))?
             .map_err(DownloadError::UnknownRegion)?;
-        Ok(())
+        Ok(sel)
     }
 }
 
@@ -770,7 +776,10 @@ mod tests {
     // A loaded region whose download of a new selection fails answers from
     // the index it had: the new files load only once all are in. Here a
     // water file comes down with other bytes than its sha256, and the dir is
-    // left without its stamp, as a download that did not finish.
+    // left without its stamp, as a download that did not finish. The region
+    // is still of the selection it was last downloaded for, the one before:
+    // once the bucket recovers, a configuration of the same selection as the
+    // one whose download failed downloads it again, and loads it with water.
     #[tokio::test]
     async fn a_loaded_region_whose_new_selection_fails_to_download_keeps_its_index() {
         let bucket = test_bucket::serve_tampered(test_bucket::template_components(), |path, bytes| {
@@ -787,13 +796,54 @@ mod tests {
         let was = slot.index.load_full().unwrap();
 
         let cfg = Configuration { water: "all".into(), ..state.get_configuration().await };
-        for task in state.configure(cfg).await.unwrap() {
+        for task in state.configure(cfg.clone()).await.unwrap() {
             task.await.unwrap();
         }
 
         assert!(Arc::ptr_eq(&was, &slot.index.load_full().unwrap()));
         assert_eq!(seen.borrow().len(), 1);
         assert!(!root.path().join("europe").join(BUILD_STAMP).exists());
+
+        bucket.mend();
+        for task in state.configure(cfg.clone()).await.unwrap() {
+            task.await.unwrap();
+        }
+
+        let now = slot.index.load_full().unwrap();
+        assert_eq!((Arc::ptr_eq(&was, &now), now.water.is_some()), (false, true));
+        assert_eq!(seen.borrow().last(), Some(&names_of(&bucket, &cfg.selection("europe"))));
+    }
+
+    // A server knows the selection of a region's files only once it
+    // downloaded them: a configuration downloads each loaded region again
+    // that it loaded from its dir as it started, for the configuration's
+    // selection (here the one it started with, water all), and loads it once
+    // that is in; a configuration of that selection after it downloads the
+    // region no more.
+    #[tokio::test]
+    async fn a_region_loaded_as_the_server_started_is_downloaded_again_for_a_configuration() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let root = ScratchDir::new();
+        let cfg = Configuration { base_url: bucket.url.clone(), water: "all".into(), ..Configuration::default() };
+        std::fs::write(root.path().join("configuration.json"), serde_json::to_string(&cfg).unwrap()).unwrap();
+        download_region(&reqwest::Client::new(), &bucket.url, &bucket.manifest, &cfg.selection("europe"), root.path(), |_| {}).await.unwrap();
+        make_loadable(&root.path().join("europe"));
+        let mi = MultiIndex::load(root.path().to_str().unwrap(), 17, 10, 660.0).unwrap();
+        let state = Arc::new(RegionState::new(Arc::new(mi), root.path().to_path_buf()));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        on_each_download(seen.clone());
+        let slot = state.multi_index.continents.iter().find(|c| c.name == "europe").unwrap();
+        let was = slot.index.load_full().expect("the dir loads as the server starts");
+
+        for _ in 0..2 {
+            for task in state.configure(cfg.clone()).await.unwrap() {
+                task.await.unwrap();
+            }
+        }
+
+        let now = slot.index.load_full().unwrap();
+        assert_eq!((Arc::ptr_eq(&was, &now), now.water.is_some()), (false, true));
+        assert_eq!(*seen.borrow(), [names_of(&bucket, &cfg.selection("europe"))]);
     }
 
     // A region whose download of the selection before still runs as the

@@ -165,7 +165,7 @@ pub fn check_selection(cfg: &Configurations, sel: &RegionSelection) -> Result<()
 /// Per-region selection passed in by the configuration endpoint. The
 /// mode/quality/poi_tier/water strings have to match component IDs in
 /// configurations.components (e.g. "simplified", "major").
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionSelection {
     pub region: String,
     pub mode: String,

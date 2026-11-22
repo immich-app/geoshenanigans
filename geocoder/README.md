@@ -76,14 +76,17 @@ The server downloads a continent from the latest build the first time a query
 lands in it: `admin` mode, `simplified` boundaries, no POIs and no water unless an
 admin sets another selection with `PUT /admin/configuration` (a JSON body of
 `base_url`, `mode`, `quality`, `poi_tier`, `water` and the regions to `preload`;
-a body without `water` takes `none`). A PUT whose selection differs downloads
-each loaded continent again for it, with the latest build, and loads it once
-that is in; till then, and where the download or the load fails, the continent
-answers from the files it had. A loaded continent whose dir holds neither the
-downloader's ledger nor its stamp (`.file_sha256`, `.build_date`, below) was
-laid out by other means, by hand or by the test portal, and is never
-downloaded again. A value the build doesn't offer fails each
-download, naming those it does, and the PUT is refused with them (400) when the
+a body without `water` takes `none`). A PUT downloads each loaded continent
+again for its selection, with the latest build, unless the server's last
+download of it that went through was of that selection, and loads it once that
+is in; till then, and where the download or the load fails, the continent
+answers from the files it had, and the next PUT, of the same selection too,
+downloads it again. A continent the server loaded from its dir as it started
+is downloaded again on the first PUT. A loaded continent whose dir holds
+neither the downloader's ledger nor its stamp (`.file_sha256`, `.build_date`,
+below) was laid out by other means, by hand or by the test portal, and is never
+downloaded again. A value the build doesn't offer fails each download, naming
+those it does, and the PUT is refused with them (400) when the
 server has the build's manifest at hand. The files of a component with a `dir`
 (the water values') go in that sub-dir of the continent dir, `water/`, which the
 server loads with it. A continent dir keeps a ledger of what each of its files

@@ -10,7 +10,7 @@
 //! body back half way (TestBucket::hold).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, State};
@@ -37,6 +37,7 @@ pub struct TestBucket {
     file_requests: Arc<AtomicUsize>,
     files: BTreeMap<String, Vec<u8>>,
     hold: Arc<Mutex<Option<Hold>>>,
+    mended: Arc<AtomicBool>,
 }
 
 /// An object whose body the bucket holds back half way (TestBucket::hold).
@@ -79,6 +80,12 @@ impl TestBucket {
     pub fn file(&self, path: &str) -> &[u8] {
         &self.files[path]
     }
+
+    /// Has it serve each object as the manifest gives it from now on, one a
+    /// serve_tampered changed of its true bytes, as a bucket that recovered.
+    pub fn mend(&self) {
+        self.mended.store(true, Ordering::SeqCst);
+    }
 }
 
 /// The template's components.
@@ -89,6 +96,9 @@ pub fn template_components() -> serde_json::Value {
 struct Served {
     manifest: String,
     objects: HashMap<String, Vec<u8>>,
+    /// The true bodies of the objects tampered with, served once mended.
+    true_objects: HashMap<String, Vec<u8>>,
+    mended: Arc<AtomicBool>,
     file_requests: Arc<AtomicUsize>,
     hold: Arc<Mutex<Option<Hold>>>,
 }
@@ -102,6 +112,7 @@ async fn get(State(s): State<Arc<Served>>, Path(path): Path<String>) -> Response
     }
     if let Some((object, body)) = path.strip_prefix(&format!("{DATE}/")).and_then(|p| s.objects.get_key_value(p)) {
         s.file_requests.fetch_add(1, Ordering::SeqCst);
+        let body = if s.mended.load(Ordering::SeqCst) { s.true_objects.get(object).unwrap_or(body) } else { body };
         let held = s.hold.lock().unwrap().take_if(|h| h.path == *object);
         if let Some(Hold { reached, go, .. }) = held {
             use futures_util::StreamExt;
@@ -231,7 +242,8 @@ pub async fn serve(components: serde_json::Value) -> TestBucket {
 
 /// Serves a build whose manifest has `components`, each object's bytes
 /// before zstd (a unit's stream, a file's bytes) given to `tamper` by its
-/// path, to change, the manifest still the true files'.
+/// path, to change, the manifest still the true files' (and the true bytes
+/// served once it is mended).
 pub async fn serve_tampered(components: serde_json::Value, tamper: impl Fn(&str, &mut Vec<u8>)) -> TestBucket {
     let template: serde_json::Value = serde_json::from_str(TEMPLATE).unwrap();
     let regions: Vec<&String> = template["axes"]["region"]["values"].as_object().unwrap().keys().collect();
@@ -249,7 +261,7 @@ pub async fn serve_tampered(components: serde_json::Value, tamper: impl Fn(&str,
         by_dir.entry(dir.to_string()).or_default().insert(name.to_string());
     }
 
-    let (mut files, mut objects) = (BTreeMap::new(), HashMap::new());
+    let (mut files, mut objects, mut true_objects) = (BTreeMap::new(), HashMap::new(), HashMap::new());
     let (mut entries, mut units) = (serde_json::Map::new(), serde_json::Map::new());
     for (dir, names) in &by_dir {
         let fixture = dataset(dir);
@@ -269,7 +281,11 @@ pub async fn serve_tampered(components: serde_json::Value, tamper: impl Fn(&str,
             let mut stream = Vec::new();
             transport::encode(kind, scratch.path(), (kind == Kind::Cols).then_some(held[0]), &mut stream).unwrap();
             let path = format!("{dir}/{}", u["unit"].as_str().unwrap());
+            let true_stream = stream.clone();
             tamper(&path, &mut stream);
+            if stream != true_stream {
+                true_objects.insert(path.clone(), zstd::encode_all(&true_stream[..], 3).unwrap());
+            }
             let body = zstd::encode_all(&stream[..], 3).unwrap();
             for f in &held {
                 entries.insert(format!("{dir}/{f}"), serde_json::json!({ "size_raw": bytes[f].len(), "sha256": sha256(&bytes[f]), "unit": path }));
@@ -285,6 +301,9 @@ pub async fn serve_tampered(components: serde_json::Value, tamper: impl Fn(&str,
             if !in_unit.contains(&path) {
                 let mut sent = b.clone();
                 tamper(&format!("{path}.zst"), &mut sent);
+                if sent != *b {
+                    true_objects.insert(format!("{path}.zst"), zstd::encode_all(&b[..], 3).unwrap());
+                }
                 let body = zstd::encode_all(&sent[..], 3).unwrap();
                 entries.insert(path.clone(), serde_json::json!({ "size_zst": body.len(), "size_raw": b.len(), "sha256": sha256(b) }));
                 objects.insert(format!("{path}.zst"), body);
@@ -294,11 +313,13 @@ pub async fn serve_tampered(components: serde_json::Value, tamper: impl Fn(&str,
     }
     let manifest = serde_json::json!({ "build": { "date": DATE }, "components": components, "files": entries, "units": units });
 
-    let (file_requests, hold) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)));
-    let served = Arc::new(Served { manifest: manifest.to_string(), objects, file_requests: file_requests.clone(), hold: hold.clone() });
+    let (file_requests, hold, mended) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)));
+    let served = Arc::new(Served {
+        manifest: manifest.to_string(), objects, true_objects, mended: mended.clone(), file_requests: file_requests.clone(), hold: hold.clone(),
+    });
     let app = axum::Router::new().route("/builds/{*path}", axum::routing::get(get)).with_state(served);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    TestBucket { url: format!("http://{addr}"), manifest: serde_json::from_value(manifest).unwrap(), file_requests, files, hold }
+    TestBucket { url: format!("http://{addr}"), manifest: serde_json::from_value(manifest).unwrap(), file_requests, files, hold, mended }
 }
