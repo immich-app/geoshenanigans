@@ -507,6 +507,10 @@ enum class PoiCategory : uint8_t {
     POWER_PLANT = 150,
     // office
     GOVERNMENT = 160,
+    // leisure=swimming_area and emergency=fire_water_pond, most often on
+    // named water, which Nominatim imports as rank-30 POIs of these tags
+    // (poi_classify.h has_poi_main_tag).
+    SWIMMING_AREA = 161, FIRE_WATER_POND = 162,
 
     // Generic rank-30 node (amenity/shop/tourism/historic/leisure/man_made/
     // craft/office/waterway/natural/aeroway/railway/power) that didn't
@@ -616,6 +620,7 @@ inline uint8_t poi_get_default_tier(PoiCategory cat) {
         case PoiCategory::VEHICLE_INSPECTION:
         case PoiCategory::SAUNA: case PoiCategory::HORSE_RIDING:
         case PoiCategory::BIRD_HIDE: case PoiCategory::MINIATURE_GOLF:
+        case PoiCategory::SWIMMING_AREA: case PoiCategory::FIRE_WATER_POND:
         case PoiCategory::SHOP_SUPERMARKET: case PoiCategory::SHOP_CONVENIENCE:
         case PoiCategory::SHOP_CLOTHES: case PoiCategory::SHOP_MALL:
         case PoiCategory::SHOP_DEPARTMENT_STORE: case PoiCategory::SHOP_BAKERY:
@@ -734,6 +739,8 @@ inline const char* poi_category_label(PoiCategory cat) {
         case PoiCategory::WINERY: return "winery"; case PoiCategory::BREWERY: return "brewery";
         case PoiCategory::POWER_PLANT: return "power_plant";
         case PoiCategory::GOVERNMENT: return "government";
+        case PoiCategory::SWIMMING_AREA: return "swimming_area";
+        case PoiCategory::FIRE_WATER_POND: return "fire_water_pond";
         case PoiCategory::HOTEL: return "hotel";
         case PoiCategory::MOTEL: return "motel";
         case PoiCategory::GUEST_HOUSE: return "guest_house";

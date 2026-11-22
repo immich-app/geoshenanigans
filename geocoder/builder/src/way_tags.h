@@ -43,6 +43,8 @@ struct WayTags {
     const char* ele = nullptr;
     const char* shop = nullptr;
     const char* landuse = nullptr;
+    // Classifies a POI way (poi_classify.h), but makes none on its own.
+    const char* emergency = nullptr;
 
     // Prefer name:en where present (English-only mode)
     const char* best_name() const { return (name_en && name_en[0]) ? name_en : name; }
@@ -81,7 +83,10 @@ inline WayTags parse_way_tags(const uint32_t* tag_keys, const uint32_t* tag_vals
                 else if (k == "building") t.building = v;
                 break;
             case 'c': if (k == "craft") t.craft = v; break;
-            case 'e': if (k == "ele") t.ele = v; break;
+            case 'e':
+                if (k == "ele") t.ele = v;
+                else if (k == "emergency") t.emergency = v;
+                break;
             case 'f': if (k == "footway") t.footway = v; break;
             case 'h':
                 if (k == "highway") t.highway = v;

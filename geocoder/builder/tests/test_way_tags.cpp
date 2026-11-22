@@ -47,6 +47,12 @@ TEST(way_tags_parse_picks_known_keys) {
     CHECK_EQ(std::string(t.iso), "NZ");
     CHECK(t.tourism == nullptr);
     CHECK(t.landuse == nullptr);
+    CHECK(t.emergency == nullptr);
+
+    const WayTags pond = TagBlock({{"natural", "water"}, {"emergency", "fire_water_pond"}, {"ele", "412"}}).parse();
+    REQUIRE(pond.emergency && pond.natural && pond.ele);
+    CHECK_EQ(std::string(pond.emergency), "fire_water_pond");
+    CHECK_EQ(std::string(pond.ele), "412");
 }
 
 TEST(way_tags_parse_ignores_out_of_range_indices) {
@@ -76,6 +82,9 @@ TEST(way_tags_poi_tags_include_protected_boundaries_only) {
     CHECK(TagBlock({{"building", "yes"}}).parse().has_poi_tags());
     CHECK(!TagBlock({{"landuse", "forest"}}).parse().has_poi_tags());
     CHECK(!TagBlock({{"shop", "bakery"}}).parse().has_poi_tags());
+    // emergency=* classifies a POI way, as landuse=* and shop=* do, but makes
+    // none on its own.
+    CHECK(!TagBlock({{"emergency", "fire_water_pond"}}).parse().has_poi_tags());
 }
 
 TEST(way_needs_nodes_matches_the_way_pass_rule) {
@@ -97,5 +106,6 @@ TEST(way_needs_nodes_matches_the_way_pass_rule) {
     CHECK(!needs({{"highway", "footway"}, {"footway", "sidewalk"}, {"name", "X"}}));
     CHECK(!needs({{"landuse", "residential"}, {"name", "X"}}));
     CHECK(!needs({{"shop", "bakery"}, {"name", "X"}}));
+    CHECK(!needs({{"emergency", "fire_water_pond"}, {"name", "X"}}));
     CHECK(!needs({{"amenity", "school"}}));
 }

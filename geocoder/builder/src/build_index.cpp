@@ -2505,6 +2505,7 @@ static int run(int argc, char* argv[]) {
                         const char* n_highway = nullptr;
                         const char* n_shop = nullptr;
                         const char* n_landuse = nullptr;
+                        const char* n_emergency = nullptr;
                         for (size_t i = 0; i < ntags; i++) {
                             if (tag_keys[i] >= st.size()) continue;
                             const auto& k = st[tag_keys[i]];
@@ -2522,7 +2523,10 @@ static int run(int argc, char* argv[]) {
                                     else if (k == "boundary") n_boundary = v;
                                     break;
                                 case 'c': if (k == "craft") n_craft = v; break;
-                                case 'e': if (k == "ele") n_ele = v; break;
+                                case 'e':
+                                    if (k == "ele") n_ele = v;
+                                    else if (k == "emergency") n_emergency = v;
+                                    break;
                                 case 'h':
                                     if (k == "historic") n_historic = v;
                                     else if (k == "highway") n_highway = v;
@@ -2587,7 +2591,7 @@ static int run(int argc, char* argv[]) {
                                 n_man_made, n_building, n_craft, n_power, n_place, n_waterway,
                                 n_office,
                                 n_wikipedia, n_wikidata,
-                                n_highway, n_shop, n_landuse);
+                                n_highway, n_shop, n_landuse, n_emergency);
                             const char* name = poi_name(n_name_en, n_name);
                             if (cls && name) {
                                 PoiRecord pr{};
@@ -3071,7 +3075,7 @@ static int run(int argc, char* argv[]) {
                             t.man_made, t.building, t.craft, t.power, t.place, t.waterway,
                             t.office,
                             t.wikipedia, t.wikidata,
-                            t.highway, t.shop, t.landuse);
+                            t.highway, t.shop, t.landuse, t.emergency);
                         if (cls) {
                             // Compute centroid
                             double sum_lat = 0, sum_lng = 0;

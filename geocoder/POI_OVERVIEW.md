@@ -39,13 +39,27 @@ POIs are extracted from these OSM tag families:
 | Tourism | museum, attraction, viewpoint, theme_park, zoo, gallery, artwork, aquarium, camp_site, resort | Musée du Louvre, Stonehenge, Grand Canyon viewpoint |
 | Historic | castle, monument, ruins, archaeological_site, memorial, battlefield, fort, ship | Edinburgh Castle, Colosseum, Machu Picchu |
 | Amenity | place_of_worship, university, hospital, theatre, cinema, library, marketplace, embassy, casino | Notre-Dame, Harvard, British Museum |
-| Leisure | park, nature_reserve, stadium, garden, water_park, golf_course, marina | Central Park, Serengeti, Wembley |
-| Natural | peak, volcano, beach, cave_entrance, waterfall, glacier, geyser, bay, cape, island | Mount Fuji, Niagara Falls, Iceland glaciers |
+| Leisure | park, nature_reserve, stadium, garden, water_park, golf_course, marina, swimming_area | Central Park, Serengeti, Wembley |
+| Natural | peak, volcano, beach, cave_entrance, waterfall, glacier, geyser, bay, cape, island, water, wetland | Mount Fuji, Niagara Falls, Iceland glaciers |
+| Emergency | fire_water_pond | Löschweiher |
 | Transport | aerodrome, station, ferry_terminal | Heathrow, Gare du Nord |
 | Man-made | tower, lighthouse, windmill, bridge, pier, dam, observatory | Eiffel Tower, Golden Gate Bridge |
 | Building | cathedral, palace | St. Peter's Basilica, Versailles |
 | Boundary | national_park, protected_area | Yellowstone, Great Barrier Reef |
 | Other | winery, brewery, power_plant | Napa Valley wineries |
+
+## POIs and the address
+
+The POI nearest the point can be the answer's primary feature, as Nominatim's
+rank-30 POIs are: it then gives the address its `road` (its parent street)
+and its `postcode`. Water never does, as Nominatim ranks every water kind
+below 30: lakes, ponds and other `natural=water`, wetlands, bays and
+glaciers, and reservoirs and basins mapped as areas. They still show as the
+`landmark` and in `places`. A water object that is also a POI of another main
+tag (a fountain, a swimming area, a fire pond, a pier, a shop, ...) is
+classified as that POI, as Nominatim ranks it 30 by that tag; it takes the
+primary slot like any POI. [NOMINATIM_REFERENCE.md](NOMINATIM_REFERENCE.md#the-primary-poi-nominatims-rank-30-lane)
+traces both to Nominatim's source.
 
 ## Three Tier Levels
 

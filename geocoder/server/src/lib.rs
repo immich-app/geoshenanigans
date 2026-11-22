@@ -511,6 +511,9 @@ pub fn poi_category_to_osm_class(cat: u8) -> Option<&'static str> {
         142..=152 => Some("landuse"),
         // office=government
         160 => Some("office"),
+        // leisure=swimming_area, emergency=fire_water_pond
+        161 => Some("leisure"),
+        162 => Some("emergency"),
         // Small-amenity sub-categories (171..=179) — toilets, clock…
         171..=179 => Some("amenity"),
         // Food / civic / health / finance / mail / transport extras
@@ -2240,7 +2243,7 @@ impl Index {
     pub fn is_area_label_category(cat: u8) -> bool {
         matches!(cat,
             // natural: large polygons
-            80 | 81 | 82 | 86 | 91 | 92 | 93 | // peak, volcano, beach, glacier, bay, cape, island
+            80 | 81 | 82 | 92 | 93 | // peak, volcano, beach, cape, island
             // boundary/leisure: parks, reserves
             60 | 61 | 62 | 63 | 64 | 65 | // park, nature_reserve, stadium, garden, water_park, golf_course
             130 | 131 | // national_park, protected_area
@@ -2254,6 +2257,24 @@ impl Index {
             100 | // aerodrome
             150   // power_plant
         )
+    }
+
+    // Water kinds, which never take the primary slot, so never set `road`
+    // or `postcode`. Nominatim's POI lane takes rank_search 30 alone
+    // (reverse.py _find_closest_street_or_pois), and it ranks
+    // natural=water, wetland, bay and glacier 22 ("natural": {"": [22, 0]})
+    // and landuse=reservoir|basin on an area 24 ("landuse": {"": [24, 0]},
+    // settings/address-levels.json), while a landuse node ranks 30
+    // (lib-sql/functions/ranking.sql compute_place_rank): a point RESERVOIR
+    // stays in the lane. A water object that also carries a POI main tag is
+    // a rank-30 POI there, and the builder classifies it by that tag
+    // (poi_classify.h), so it stays too.
+    pub fn is_below_poi_rank(cat: u8, polygon: bool) -> bool {
+        match cat {
+            86 | 91 | 97 | 99 => true, // glacier, bay, wetland, natural_water
+            148 => polygon,            // reservoir
+            _ => false,
+        }
     }
 
     // Chain-containment check for a POI primary candidate.
@@ -2298,7 +2319,7 @@ impl Index {
         let mut best_dist_sq = f64::MAX;
         let mut best_idx: Option<u32> = None;
         // Fallback tier: the closest area-label POI (national park,
-        // island, bay, campus). Only wins primary if no specific
+        // island, cape, campus). Only wins primary if no specific
         // POI qualifies — so "middle of Yosemite with no roads" can
         // surface the park, while urban queries never get "Manhattan
         // Island" as the primary feature.
@@ -2321,7 +2342,7 @@ impl Index {
                 // Need a linked parent street (for the `road` field)
                 // when this POI wins — without it we have nothing to
                 // surface as the road name.
-                if poi.parent_street_id == NO_DATA {
+                if poi.parent_street_id == NO_DATA || Self::is_below_poi_rank(poi.category, poi.is_polygon()) {
                     return;
                 }
 
@@ -2355,7 +2376,7 @@ impl Index {
                 }
 
                 if Self::is_area_label_category(poi.category) {
-                    // Split lane: area labels (islands, parks, bays,
+                    // Split lane: area labels (islands, parks, capes,
                     // campuses) only win primary when nothing more
                     // specific competes. Track them separately so a
                     // "middle-of-nowhere in Yosemite" query still has
@@ -5846,6 +5867,8 @@ mod pure_helper_tests {
         // arm precedes the 142..=152 landuse band.
         assert_eq!(poi_category_to_osm_class(150), None);
         assert_eq!(poi_category_to_osm_class(160), Some("office"));
+        assert_eq!(poi_category_to_osm_class(161), Some("leisure"));
+        assert_eq!(poi_category_to_osm_class(162), Some("emergency"));
         // NOTE: GENERIC_RANK30=170 -> None (generic filler).
         assert_eq!(poi_category_to_osm_class(170), None);
         assert_eq!(poi_category_to_osm_class(171), Some("amenity"));
@@ -5863,12 +5886,13 @@ mod pure_helper_tests {
     #[test]
     fn is_area_label_category_snapshot() {
         // A representative sample of the matched set.
-        for cat in [80u8, 81, 82, 86, 91, 92, 93, 60, 61, 62, 63, 64, 65,
+        for cat in [80u8, 81, 82, 92, 93, 60, 61, 62, 63, 64, 65,
                     130, 131, 41, 42, 43, 47, 51, 54, 3, 4, 9, 11, 25, 100, 150] {
             assert!(Index::is_area_label_category(cat), "expected {cat} to be an area label");
         }
-        // A representative sample of non-matches.
-        for cat in [0u8, 1, 2, 5, 40, 44, 50, 66, 70, 90, 120, 170, 200, 255] {
+        // A representative sample of non-matches. Bays (91) and glaciers (86) never take the
+        // primary slot at all.
+        for cat in [0u8, 1, 2, 5, 40, 44, 50, 66, 70, 86, 90, 91, 120, 170, 200, 255] {
             assert!(!Index::is_area_label_category(cat), "expected {cat} to NOT be an area label");
         }
     }
@@ -8538,19 +8562,27 @@ mod query_path_tests {
 
     /// `index` with one polygon POI, the rectangle: `name_id` its name and `parent_street_id`
     /// its parent street's, strings of the index's. The admin cell of its middle lists it.
-    fn with_polygon_poi(mut index: Index, name_id: u32, parent_street_id: u32, (s, w, n, e): Span) -> Index {
+    fn with_polygon_poi(index: Index, name_id: u32, parent_street_id: u32, span: Span) -> Index {
+        with_poi(index, 1, name_id, (parent_street_id, NO_DATA), span, true)
+    }
+
+    /// `index` with one POI of `category`: the rectangle, or a point at its middle where
+    /// `polygon` is false. `name_id` its name and `parents` its parent street's and postcode's,
+    /// strings of the index's. The admin cell of its middle lists it.
+    fn with_poi(mut index: Index, category: u8, name_id: u32, (parent_street_id, parent_postcode_id): (u32, u32), (s, w, n, e): Span,
+                polygon: bool) -> Index {
         let (low, middle) = (at(s, w), at((s + n) / 2.0, (w + e) / 2.0));
         // Its corners at 1e-7 degrees (encoding 3) from its low corner.
         let steps = |v: f32, from: f32| ((v as f64 - from as f64) / 1e-7).round() as u32;
-        let polygon = poi_files::PoiPolygon {
+        let outline = polygon.then(|| poi_files::PoiPolygon {
             encoding: 3, bmin_lat: low.lat, bmin_lng: low.lng,
             q: [at(s, w), at(s, e), at(n, e), at(n, w)].iter().map(|c| (steps(c.lat, low.lat), steps(c.lng, low.lng))).collect(),
-        };
+        });
         let record = PoiRecord {
-            lat: middle.lat, lng: middle.lng, vertex_offset: 0, name_id, category: 1, tier: 0, flags: 0, importance: 0,
-            parent_street_id, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
+            lat: middle.lat, lng: middle.lng, vertex_offset: if polygon { 0 } else { NO_DATA }, name_id, category, tier: 0, flags: 0,
+            importance: 0, parent_street_id, parent_postcode_id, parent_poly_id: NO_DATA,
         };
-        let (records, vertices) = poi_files::encode(&[(record, Some(polygon))]);
+        let (records, vertices) = poi_files::encode(&[(record, outline)]);
         let cell = cell_id_at_level(middle.lat as f64, middle.lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
         index.poi_index = Some(cell_pairs::from_pairs([(cell, 0)], cell_pairs::POI));
         index.poi_records = Some(PoiRecords::open(FileBytes::Owned(records)).unwrap());
@@ -8583,6 +8615,42 @@ mod query_path_tests {
         // The building's nearest wall is 21 m from the query: the town hall answers, on its
         // parent street.
         assert_eq!(answer(true), (None, Some("Mill Lane".to_owned())));
+    }
+
+    #[test]
+    fn a_water_poi_never_takes_the_primary_slot_nor_gives_its_road_or_postcode() {
+        // A POI 40 m by 60 m holds the query, its parent street Mill Lane and its postcode 4510;
+        // Main Street, of postcode 2020, runs 70 m south of the query. Nominatim's POI lane
+        // takes rank 30 alone (reverse.py _find_closest_street_or_pois), and it ranks
+        // natural=water, wetland, bay and glacier 22, and landuse=reservoir|basin on an area 24
+        // (address-levels.json): the street answers there, with its postcode. A landuse node
+        // ranks 30 (ranking.sql compute_place_rank), and so do a swimming area, a fire pond
+        // and a fountain: the POI answers, on its parent street with its postcode.
+        let answer = |category: u8, polygon: bool| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Main Street", &parallel(-40.0, 200.0)).way_postcode("2020");
+            let (name, lane, postcode) = (dataset.string("Water"), dataset.string("Mill Lane"), dataset.string("4510"));
+            let index = with_poi(dataset.load(), category, name, (lane, postcode), (0.0, 0.0, 40.0, 60.0), polygon);
+            let primary = primary_at(&index, 30.0, 10.0);
+            let address = address_at(&index, 30.0, 10.0);
+            (primary["poi"]["category"].as_u64(), address["road"].as_str().map(str::to_owned), address["postcode"].as_str().map(str::to_owned))
+        };
+        let street = (None, Some("Main Street".to_owned()), Some("2020".to_owned()));
+        let poi = |category: u8| (Some(category as u64), Some("Mill Lane".to_owned()), Some("4510".to_owned()));
+
+        // NATURAL_WATER, WETLAND, BAY, GLACIER and RESERVOIR, areas.
+        for category in [99, 97, 91, 86, 148] {
+            assert_eq!(answer(category, true), street, "category {category}");
+        }
+        // NATURAL_WATER, WETLAND, BAY and GLACIER nodes rank 22 too.
+        for category in [99, 97, 91, 86] {
+            assert_eq!(answer(category, false), street, "category {category}, a point");
+        }
+        // A RESERVOIR node, SWIMMING_AREA, FIRE_WATER_POND and FOUNTAIN.
+        assert_eq!(answer(148, false), poi(148));
+        for category in [161, 162, 49] {
+            assert_eq!(answer(category, true), poi(category), "category {category}");
+        }
     }
 
     #[test]
