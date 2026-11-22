@@ -31,6 +31,31 @@ TEST(continent_share_scales_each_kind_by_its_pairs) {
     CHECK((continent_share(planet, kinds(0, 0, 0, 0, 0, 0), kinds(0, 0, 0, 0, 0, 0)) == kinds(0, 0, 0, 0, 0, 0)));
 }
 
+TEST(continent_share_gives_the_waters_their_own_cells_share_and_leaves_them_out_of_the_admins) {
+    KindValues planet = kinds(1000, 2000, 300, 400, 100, 600), planet_pairs = kinds(100, 200, 30, 40, 10, 0),
+               continent = kinds(50, 20, 0, 40, 1, 0);
+    at(planet, RecordKind::Waters) = 5000;
+    // Without water cells the waters take the admins' share.
+    CHECK_EQ(at(continent_share(planet, planet_pairs, continent), RecordKind::Waters), uint64_t(1606));
+    // With them, their own (800 of 1000), with the margin; the admins' share
+    // is the other kinds' as before.
+    at(planet_pairs, RecordKind::Waters) = 1000;
+    at(continent, RecordKind::Waters) = 800;
+    const KindValues share = continent_share(planet, planet_pairs, continent);
+    CHECK_EQ(at(share, RecordKind::Waters), uint64_t(4400));
+    CHECK_EQ(at(share, RecordKind::Admins), uint64_t(600 * 1110 / 3800 * 110 / 100));
+}
+
+TEST(pair_counts_takes_the_water_cell_index_entries_for_the_waters_pairs) {
+    ParsedData d;
+    d.sorted_way_cells.resize(3);
+    d.water.cells.resize(7);
+    const KindValues n = pair_counts(d);
+    CHECK_EQ(at(n, RecordKind::Ways), uint64_t(3));
+    CHECK_EQ(at(n, RecordKind::Waters), uint64_t(7));
+    CHECK_EQ(at(n, RecordKind::Admins), uint64_t(0));
+}
+
 TEST(strategy2_cost_holds_every_kind_or_the_largest) {
     const KindValues counts = kinds(10, 30, 5, 20, 1, 2);
     CHECK_EQ(strategy2_cost(counts, RunOrder::Concurrent), 68 * kStrategy2BytesPerRecord);
@@ -72,7 +97,19 @@ TEST(filter_cost_holds_the_planet_maps_and_half_the_subset_pairs) {
     const KindValues planet_counts = kinds(80, 160, 0, 0, 0, 0);
     const KindValues pairs = kinds(10, 0, 0, 0, 0, 0);
     // 240 records: 4 B id maps and 3 bits of marks, whatever the workers.
-    CHECK_EQ(filter_cost(planet_counts, pairs), uint64_t(240 * 4 + 240 * 3 / 8 + 10 * 16 / 2));
+    CHECK_EQ(filter_cost(planet_counts, kinds(100, 0, 0, 0, 0, 0), pairs), uint64_t(240 * 4 + 240 * 3 / 8 + 10 * 16 / 2));
+}
+
+TEST(filter_cost_holds_the_water_splits_marks_over_the_planets_water_cells) {
+    const KindValues planet_counts = kinds(80, 160, 0, 0, 0, 0);
+    KindValues planet_pairs = kinds(100, 0, 0, 0, 0, 0), pairs = kinds(10, 0, 0, 0, 0, 0);
+    at(planet_pairs, RecordKind::Waters) = 1000;
+    at(pairs, RecordKind::Waters) = 40;
+    // Beside the rest, a mark a planet water cell entry and the starts and
+    // marks of its cells, and the continent's water pairs among the pairs
+    // the workers copy.
+    CHECK_EQ(filter_cost(planet_counts, planet_pairs, pairs),
+             uint64_t(240 * 4 + 240 * 3 / 8 + 50 * 16 / 2 + 1000 * kFilterWaterBytesPerPair));
 }
 
 TEST(continent_cost_runs_steps_one_at_a_time_only_past_the_budget) {

@@ -71,9 +71,10 @@ inline KindValues record_counts(const ParsedData& d) {
     return n;
 }
 
-// The cell pairs of each kind a region's records sit in (admins and waters
-// have none). The strategy-2 passes and the ordering steps never see water
-// records: record_counts leaves them out.
+// The cell pairs of each kind a region's records sit in: the waters' their
+// cell index's entries, which the continent split routes; admins have none.
+// The strategy-2 passes and the ordering steps never see water records:
+// record_counts leaves them out.
 inline KindValues pair_counts(const ParsedData& d) {
     KindValues n{};
     at(n, RecordKind::Ways) = d.sorted_way_cells.size();
@@ -81,6 +82,7 @@ inline KindValues pair_counts(const ParsedData& d) {
     at(n, RecordKind::Interps) = d.sorted_interp_cells.size();
     at(n, RecordKind::Pois) = d.sorted_poi_cells.size();
     at(n, RecordKind::Places) = d.sorted_place_cells.size();
+    at(n, RecordKind::Waters) = d.water.cells.size();
     return n;
 }
 
@@ -105,10 +107,14 @@ constexpr uint64_t kStrategy2BytesPerRecord = 56;
 // The continent split's planet-sized scratch: an id map per record (4 B)
 // and, while ids are collected, 3 bits per record (the bit every worker
 // marks, and its RankedBits blocks of 16 B per 64 records); beside it, the
-// workers' copies of a share of the subset's cell pairs.
+// workers' copies of a share of the subset's cell pairs. The water split's
+// marks each planet water cell entry (1 B) and each of its cells (the cell's
+// first entry, 8 B, and whether the continent routes it, 1 B), at most as
+// many as the entries.
 constexpr uint64_t kFilterMapBytesPerRecord = 4;
 constexpr uint64_t kFilterMarkBitsPerRecord = 3;
 constexpr uint64_t kFilterPairCopyDivisor = 2;
+constexpr uint64_t kFilterWaterBytesPerPair = 10;
 
 // Per mode dir, write_index's slices in flight, postcode centroids and admin
 // cell copies (planet: 0.8 GiB for the three). The slices are the geo
@@ -200,10 +206,12 @@ inline uint64_t ordering_cost(const ParsedData& d) {
 }
 
 // What the continent split holds beyond the subset it builds.
-inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& continent_pairs) {
+inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& planet_pairs,
+                            const KindValues& continent_pairs) {
     const uint64_t records = sum(planet_counts);
     return records * kFilterMapBytesPerRecord + records * kFilterMarkBitsPerRecord / 8
-         + sum(continent_pairs) * sizeof(CellItemPair) / kFilterPairCopyDivisor;
+         + sum(continent_pairs) * sizeof(CellItemPair) / kFilterPairCopyDivisor
+         + at(planet_pairs, RecordKind::Waters) * kFilterWaterBytesPerPair;
 }
 
 // What each write stage holds while it runs: every stage a region's write
@@ -257,8 +265,9 @@ inline RegionCost continent_cost(const KindValues& bytes, const KindValues& coun
 }
 
 // A continent's share of the planet's values, kind by kind, from its share
-// of each kind's cell pairs, with kShareMarginPercent. Admins and waters have
-// no pairs: they take the share the other kinds' values add up to.
+// of each kind's cell pairs, with kShareMarginPercent. Admins have no pairs:
+// they take the share the values of the kinds of records (all but the
+// waters) add up to, as the waters do without cells.
 inline KindValues continent_share(const KindValues& planet, const KindValues& planet_pairs,
                                   const KindValues& continent_pairs) {
     KindValues out{};
@@ -266,12 +275,15 @@ inline KindValues continent_share(const KindValues& planet, const KindValues& pl
     for (size_t k = 0; k < RECORD_KIND_COUNT; k++) {
         if (planet_pairs[k] == 0) continue;
         double share = std::min(1.0, static_cast<double>(continent_pairs[k]) / static_cast<double>(planet_pairs[k]));
+        out[k] = static_cast<uint64_t>(static_cast<double>(planet[k]) * share * kShareMarginPercent / 100);
+        if (k == static_cast<size_t>(RecordKind::Waters)) continue;
         shared += static_cast<double>(planet[k]) * share;
         total += static_cast<double>(planet[k]);
-        out[k] = static_cast<uint64_t>(static_cast<double>(planet[k]) * share * kShareMarginPercent / 100);
     }
     const double admin_share = total > 0 ? shared / total : 0;
-    for (RecordKind kind : {RecordKind::Admins, RecordKind::Waters})
+    for (RecordKind kind : {RecordKind::Admins, RecordKind::Waters}) {
+        if (kind == RecordKind::Waters && at(planet_pairs, kind) != 0) continue;
         at(out, kind) = static_cast<uint64_t>(static_cast<double>(at(planet, kind)) * admin_share * kShareMarginPercent / 100);
+    }
     return out;
 }

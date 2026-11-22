@@ -1623,11 +1623,15 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         auto interp_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_interp_cells); });
         auto poi_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_poi_cells); });
         auto place_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_place_cells); });
+        // The water cell index's, which the schedule alone reads: the split
+        // routes the water cells itself.
+        auto water_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.water.cells); });
         auto way_continent_masks = way_masks.get();
         auto addr_continent_masks = addr_masks.get();
         auto interp_continent_masks = interp_masks.get();
         auto poi_continent_masks = poi_masks.get();
         auto place_continent_masks = place_masks.get();
+        auto water_continent_masks = water_masks.get();
 
         log_phase("Pre-compute continent masks", _pct, _pcc);
 
@@ -1638,7 +1642,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         const std::pair<RecordKind, const std::vector<uint8_t>*> kind_masks[] = {
             {RecordKind::Ways, &way_continent_masks}, {RecordKind::Addrs, &addr_continent_masks},
             {RecordKind::Interps, &interp_continent_masks}, {RecordKind::Pois, &poi_continent_masks},
-            {RecordKind::Places, &place_continent_masks}};
+            {RecordKind::Places, &place_continent_masks}, {RecordKind::Waters, &water_continent_masks}};
         for (const auto& [kind, masks] : kind_masks) {
             std::vector<std::array<uint64_t, 8>> counts(parallel_threads(), std::array<uint64_t, 8>{});
             parallel_for(masks->size(), [&](size_t begin, size_t end, unsigned w) {
@@ -1648,6 +1652,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             for (const auto& per_worker : counts)
                 for (size_t c = 0; c < kContinentCount && c < 8; c++) at(continent_pairs[c], kind) += per_worker[c];
         }
+        free_storage(water_continent_masks);
         std::vector<size_t> continent_order(kContinentCount);
         std::iota(continent_order.begin(), continent_order.end(), 0u);
         std::stable_sort(continent_order.begin(), continent_order.end(), [&](size_t a, size_t b) {
@@ -1671,7 +1676,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         for (size_t c : continent_order) {
             const KindValues bytes = continent_share(planet_bytes, planet_pairs, continent_pairs[c]);
             const KindValues counts = continent_share(planet_counts, planet_pairs, continent_pairs[c]);
-            const uint64_t filter_bytes = filter_cost(planet_counts, continent_pairs[c]);
+            const uint64_t filter_bytes = filter_cost(planet_counts, planet_pairs, continent_pairs[c]);
             // Its write runs without a budget (run_continent), so its
             // reservation holds every stage, the boundary tiers and both
             // admin-minimal dirs included.
