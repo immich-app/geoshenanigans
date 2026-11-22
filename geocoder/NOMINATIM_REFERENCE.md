@@ -203,7 +203,7 @@ alone (`way_tags.h` `has_poi_tags`). Values the import drops
 (`amenity=parking_space`, `emergency=fire_hydrant`, `tourism=yes`, ...) and
 tags of a rank below 30 and no address rank (`leisure=park`,
 `historic=neighbourhood`, `place=island`, `waterway=*`) leave the water
-category. `building=*`, a fallback tag, ranks 30 beside `natural=*` (the class
+category; beside a tag the object yields to, `shop=no` makes no shop. `building=*`, a fallback tag, ranks 30 beside `natural=*` (the class
 stays `natural`) but is the class beside `landuse=*`, also a fallback tag, and
 the lane takes no class `building`.
 

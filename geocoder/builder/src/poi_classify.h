@@ -157,7 +157,8 @@ inline std::optional<PoiClassification> classify_poi(
     // rank or of no main tag in Nominatim give none: boundary=* (25, 0),
     // landuse=* on an area (24, 0; a landuse node ranks 30), leisure=park,
     // natural=wood, place=island, waterway=waterfall, man_made=dam and
-    // power=*. `yielded` is the kind that yielded.
+    // power=*, nor shop=no, which the import drops, and which the shop branch
+    // would take for a shop. `yielded` is the kind that yielded.
     const PoiCategory kind = poi_water_kind(t_natural, t_landuse);
     const bool ranks_30 = !has_lower_rank_main_tag(t_place, t_landuse, t_highway, area);
     PoiCategory yielded = PoiCategory::UNKNOWN;
@@ -175,6 +176,7 @@ inline std::optional<PoiClassification> classify_poi(
         if (t_natural && !poi_tag_is(t_natural, {"tree", "spring", "cave_entrance", "geyser", "hot_spring", "rock", "stone"}))
             t_natural = nullptr;
         if (t_man_made && !poi_man_made_is_main(t_man_made)) t_man_made = nullptr;
+        if (t_shop && std::strcmp(t_shop, "no") == 0) t_shop = nullptr;
         t_power = t_place = t_waterway = nullptr;
     }
 

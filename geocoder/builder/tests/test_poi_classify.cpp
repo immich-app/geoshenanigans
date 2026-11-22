@@ -262,6 +262,19 @@ TEST(poi_classify_a_water_object_with_a_poi_main_tag_of_no_category_is_a_generic
     }
 }
 
+TEST(poi_classify_a_water_object_that_yields_makes_no_shop_of_shop_no) {
+    // emergency=suction_point makes a water object a rank-30 POI of no
+    // category of its own, and shop=no is a value Nominatim's import drops
+    // (presets.lua MAIN_TAGS_POIS): the object is no shop, but the water it
+    // is without a wiki tag and a generic rank-30 feature with one.
+    for (const WaterKind& kind : kWaterKinds) {
+        Tags t = with(with(water(kind), "emergency", "suction_point"), "shop", "no");
+        CHECK_EQ(uint8_t(category_of(t)), uint8_t(kind.category));
+        t.wikidata = "Q1";
+        CHECK_EQ(uint8_t(category_of(t)), uint8_t(PoiCategory::GENERIC_RANK30));
+    }
+}
+
 TEST(poi_classify_a_water_object_keeps_its_category_beside_a_tag_of_no_rank_30) {
     // Values Nominatim's import drops (presets.lua), tags that are no main tag
     // there (power, man_made=dam), and ones whose rank is below 30 as well
