@@ -178,7 +178,7 @@ TEST(each_outer_ring_is_a_record_with_its_objects_name_type_and_area_and_its_hol
     CHECK_EQ(listed.size(), size_t(4));
 }
 
-TEST(the_join_credits_each_segment_to_the_area_holding_its_midpoint_and_none_outside) {
+TEST(the_join_credits_each_segment_the_length_it_has_inside_an_area) {
     Collected c = fixture();
     Build b = assemble(c, 1);
     std::vector<uint32_t> rivers;
@@ -188,15 +188,15 @@ TEST(the_join_credits_each_segment_to_the_area_holding_its_midpoint_and_none_out
     NamingCounts counts;
     std::vector<Credit> credits = credit_naming_lines(b.rings, rivers, b.object_of, b.lines, counts, 2);
     // The main line's first segment and the tributary are inside the river
-    // area; the main line's second segment ends far east of it, its
-    // midpoint outside.
+    // area; the main line's second segment ends far east of it, a quarter of
+    // it inside.
     uint64_t main_mm = 0, tributary_mm = 0;
     for (const Credit& cr : credits) {
         CHECK_EQ(b.objects[cr.object].id, int64_t(30));
         (b.lines.keys[cr.key] == "r900" ? main_mm : tributary_mm) += cr.mm;
     }
     const PackedLocation* v = b.lines.vertices.data();
-    CHECK_EQ(main_mm, segment_mm(v[0], v[1]));
+    CHECK_EQ(main_mm, segment_mm(v[0], v[1]) + share_mm(v[1], v[2], 0.25L));
     CHECK_EQ(tributary_mm, segment_mm(v[3], v[4]));
     const std::vector<NameChoice> choices = pick_names(credits, b.objects.size(), 1);
     size_t named = 0;
@@ -208,6 +208,34 @@ TEST(the_join_credits_each_segment_to_the_area_holding_its_midpoint_and_none_out
         CHECK(b.lines.displays[choices[o].display] == "Test River");
     }
     CHECK_EQ(named, size_t(1));
+}
+
+TEST(a_segment_across_an_area_with_both_ends_and_its_middle_outside_names_it) {
+    // A line across the river area nothing names, from 0.005 west of it to
+    // 0.001 east of it: a seventh of it inside.
+    Collected c = fixture();
+    LineIn across;
+    across.way = 47;
+    across.key = "nLang";
+    across.local = across.display = "Lang";
+    across.vertices = {pt(kLat + 405000, kLng - 50000), pt(kLat + 405000, kLng + 20000)};
+    c.lines.push_back(across);
+    Collected joined = c;
+    Build b = assemble(joined, 1);
+    std::vector<uint32_t> rivers;
+    for (uint32_t p = 0; p < b.rings.polygons.size(); p++)
+        if (b.objects[b.object_of[p]].tags.river_area) rivers.push_back(p);
+    NamingCounts counts;
+    std::vector<Credit> credits = credit_naming_lines(b.rings, rivers, b.object_of, b.lines, counts, 2);
+    uint64_t mm = 0;
+    for (const Credit& cr : credits)
+        if (b.objects[cr.object].id == 31) mm += cr.mm;
+    CHECK_EQ(mm, share_mm(across.vertices[0], across.vertices[1], 1.0L / 7));
+    // So the area takes its name.
+    const Layer layer = build(c);
+    std::set<std::string> names;
+    for (size_t p = 0; p < layer.size(); p++) names.insert(name_of(layer, p));
+    CHECK(names.count("Lang"));
 }
 
 TEST(a_segment_of_no_length_lends_its_line_no_wikidata_item) {

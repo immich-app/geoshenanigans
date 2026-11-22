@@ -4,14 +4,14 @@
 // type=waterway relation it belongs to (the lowest relation id, where it
 // belongs to two) or else by its own local name (the name tag, not
 // name:en), so a river whose ways vary in name:en is one key.
-// Each segment of a candidate line credits its length, in integer
-// millimetres, to the area object that holds its midpoint (an object's
-// outer rings together). The object takes the key of the largest total, a
-// tie going to the smaller key; its name is then the display name (name:en,
-// else name) with the most length among that key's lines inside it, a tie
-// going to the smaller name, and its wikidata item the lowest of the key's
-// lines that credit it. Integer sums and total orders: the same answer on
-// any number of threads.
+// Each segment of a candidate line credits each area polygon the length of
+// its stretches inside the polygon's rings, in integer millimetres, to the
+// polygon's object (SegmentClip). The object takes the key of the largest
+// total, a tie going to the smaller key; its name is then the display name
+// (name:en, else name) with the most length among that key's lines inside
+// it, a tie going to the smaller name, and its wikidata item the lowest of
+// the key's lines that credit it. Integer sums and total orders: the same
+// answer on any number of threads.
 #pragma once
 
 #include <algorithm>
@@ -48,29 +48,121 @@ struct NamingLines {
     std::vector<std::string> displays;   // what an area named by a key shows
 };
 
-// A segment's length on the sphere, in whole millimetres.
-inline uint64_t segment_mm(PackedLocation a, PackedLocation b) {
+// A segment's length on the sphere in millimetres, and in whole ones.
+inline double segment_length_mm(PackedLocation a, PackedLocation b) {
     constexpr double kEarthRadiusMm = 6371008.8 * 1000.0;
     constexpr double kRad = 3.14159265358979323846 / 180.0 / 1e7;
     const double lat1 = a.lat_e7 * kRad, lat2 = b.lat_e7 * kRad;
     const double dlat = lat2 - lat1, dlng = (double(b.lon_e7) - a.lon_e7) * kRad;
     const double h = std::sin(dlat / 2) * std::sin(dlat / 2) +
                      std::cos(lat1) * std::cos(lat2) * std::sin(dlng / 2) * std::sin(dlng / 2);
-    return static_cast<uint64_t>(std::llround(2 * kEarthRadiusMm * std::asin(std::min(1.0, std::sqrt(h)))));
+    return 2 * kEarthRadiusMm * std::asin(std::min(1.0, std::sqrt(h)));
+}
+inline uint64_t segment_mm(PackedLocation a, PackedLocation b) {
+    return static_cast<uint64_t>(std::llround(segment_length_mm(a, b)));
 }
 
-// A segment's midpoint on the e7 grid, rounded down: along the shorter way
-// round, across the antimeridian for ends more than 180 degrees of
-// longitude apart, and back on the world there.
-inline PackedLocation segment_midpoint(PackedLocation a, PackedLocation b) {
-    constexpr int64_t kHalfTurn = 1800000000, kTurn = 2 * kHalfTurn;
-    int64_t lng_b = b.lon_e7;
-    if (lng_b - a.lon_e7 > kHalfTurn) lng_b -= kTurn;
-    else if (a.lon_e7 - lng_b > kHalfTurn) lng_b += kTurn;
-    int64_t lng = (int64_t(a.lon_e7) + lng_b) >> 1;
-    if (lng > kHalfTurn) lng -= kTurn;
-    else if (lng < -kHalfTurn) lng += kTurn;
-    return {static_cast<int32_t>((int64_t(a.lat_e7) + b.lat_e7) >> 1), static_cast<int32_t>(lng)};
+// Whether a segment's ends lie more than 180 degrees of longitude apart: a
+// way across the antimeridian, which OSM splits there, whose straight line
+// in longitude runs the other way round from its length. Such a segment
+// credits nothing.
+inline bool segment_wraps(PackedLocation a, PackedLocation b) {
+    return std::abs(int64_t(b.lon_e7) - a.lon_e7) > 1800000000;
+}
+
+// The share of a segment, a straight line in (lat, lng), inside rings
+// counted even-odd, from the rings' edges: where they cross it, and whether
+// its start is inside, both in integers. Each edge is fed as add_crossing
+// takes it, and the ring's edges that can cross the ray of start_crossed_by
+// (those whose longitudes reach the start's) to it. The segment runs from
+// its end of smaller latitude, then longitude, so either way round gives the
+// same share; a stretch of it along an edge counts as inside where the side
+// to its left is (the start and the line taken just to the left of it).
+class SegmentClip {
+public:
+    SegmentClip(PackedLocation a, PackedLocation b) {
+        if (b.lat_e7 < a.lat_e7 || (b.lat_e7 == a.lat_e7 && b.lon_e7 < a.lon_e7)) std::swap(a, b);
+        ax_ = a.lon_e7;
+        ay_ = a.lat_e7;
+        dx_ = int64_t(b.lon_e7) - a.lon_e7;
+        dy_ = int64_t(b.lat_e7) - a.lat_e7;
+    }
+
+    // The end the segment runs from.
+    PackedLocation start() const { return {static_cast<int32_t>(ay_), static_cast<int32_t>(ax_)}; }
+
+    // Whether edge p-q crosses the ray towards +lat from the point just past
+    // the start along the segment and just to its left, as
+    // exact_edge_crosses takes a ray (either direction of the edge alike):
+    // an odd number of a ring's edges puts the start inside the ring.
+    bool start_crossed_by(PackedLocation p, PackedLocation q) const {
+        // East of the point: east of the start, or at its longitude and the
+        // segment (else its left) running west.
+        auto east = [&](int64_t x) { return x != ax_ ? x > ax_ : dx_ != 0 ? dx_ < 0 : dy_ > 0; };
+        if (east(p.lon_e7) == east(q.lon_e7)) return false;
+        // Which side of the edge the point is: the start's, else the side the
+        // segment leaves it to, else the side to its left.
+        const int64_t ex = int64_t(q.lon_e7) - p.lon_e7, ey = int64_t(q.lat_e7) - p.lat_e7;
+        __int128 f = static_cast<__int128>(ay_ - p.lat_e7) * ex - static_cast<__int128>(ey) * (ax_ - p.lon_e7);
+        if (f == 0) f = static_cast<__int128>(dy_) * ex - static_cast<__int128>(ey) * dx_;
+        if (f == 0) f = static_cast<__int128>(dx_) * ex + static_cast<__int128>(dy_) * ey;
+        return (f < 0) != (q.lon_e7 < p.lon_e7);
+    }
+
+    // Notes where edge p-q crosses the segment strictly between its ends,
+    // the segment's line taken just to its left: a vertex on the line is
+    // right of it.
+    void add_crossing(PackedLocation p, PackedLocation q) {
+        auto left = [&](PackedLocation v) {
+            return static_cast<__int128>(dx_) * (int64_t(v.lat_e7) - ay_) -
+                       static_cast<__int128>(dy_) * (int64_t(v.lon_e7) - ax_) > 0;
+        };
+        if (left(p) == left(q)) return;
+        const int64_t ex = int64_t(q.lon_e7) - p.lon_e7, ey = int64_t(q.lat_e7) - p.lat_e7;
+        __int128 num = static_cast<__int128>(int64_t(p.lon_e7) - ax_) * ey -
+                       static_cast<__int128>(int64_t(p.lat_e7) - ay_) * ex;
+        __int128 den = static_cast<__int128>(dx_) * ey - static_cast<__int128>(dy_) * ex;
+        if (den < 0) {
+            num = -num;
+            den = -den;
+        }
+        // Each a difference of two products under 2^63, so under 2^64.
+        if (num > 0 && num < den) crossings_.push_back({static_cast<uint64_t>(num), static_cast<uint64_t>(den)});
+    }
+
+    // The share inside, from 0 to 1: the stretches between the crossings,
+    // in order along the segment, alternately inside and out from the start
+    // (`start_inside`). Uses up the crossings.
+    long double share(bool start_inside) {
+        std::sort(crossings_.begin(), crossings_.end(), [](const Crossing& x, const Crossing& y) {
+            return static_cast<unsigned __int128>(x.num) * y.den < static_cast<unsigned __int128>(y.num) * x.den;
+        });
+        long double inside = 0, from = 0;
+        bool in = start_inside;
+        for (const Crossing& c : crossings_) {
+            const long double t = static_cast<long double>(c.num) / static_cast<long double>(c.den);
+            if (in) inside += t - from;
+            from = t;
+            in = !in;
+        }
+        if (in) inside += 1 - from;
+        crossings_.clear();
+        return inside;
+    }
+
+private:
+    struct Crossing {
+        uint64_t num, den;  // along the segment at num / den, 0 < num < den
+    };
+    int64_t ax_, ay_, dx_, dy_;
+    std::vector<Crossing> crossings_;
+};
+
+// The whole millimetres of segment a-b that `share` of it (SegmentClip)
+// holds: the segment's own (segment_mm) for all of it.
+inline uint64_t share_mm(PackedLocation a, PackedLocation b, long double share) {
+    if (share >= 1) return segment_mm(a, b);
+    return static_cast<uint64_t>(std::llround(static_cast<double>(share * segment_length_mm(a, b))));
 }
 
 // A line's length inside an area object: `mm` of a line of `key` and

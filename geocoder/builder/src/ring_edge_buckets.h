@@ -52,6 +52,21 @@ public:
         return odd;
     }
 
+    // fn(a, b) for each edge from vertex b = a - 1 to vertex a whose span
+    // can meet [lo, hi] on the axis (`axis` the constructor's), each once:
+    // the edges of the buckets the range lies in.
+    template <class Axis, class Fn>
+    void edges_meeting(double lo, double hi, Axis axis, Fn fn) const {
+        const uint32_t first = bucket_of(lo), last = bucket_of(hi);
+        for (uint32_t bucket = first; bucket <= last; bucket++)
+            for (uint32_t k = start_[bucket]; k < start_[bucket + 1]; k++) {
+                const uint32_t a = edges_[k], b = a == 0 ? cnt_ - 1 : a - 1;
+                // In the first of the range's buckets the edge lies in alone.
+                const double low = std::min<double>(axis(a), axis(b));
+                if (bucket == std::max(first, bucket_of(low))) fn(a, b);
+            }
+    }
+
 private:
     // Monotone in x; NaN goes to bucket 0, where nothing crosses it.
     uint32_t bucket_of(double x) const {
