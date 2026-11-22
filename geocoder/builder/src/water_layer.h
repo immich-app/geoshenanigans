@@ -165,6 +165,7 @@ struct Build {
     AdminExactRings rings;
     std::vector<uint32_t> object_of;  // by polygon
     std::vector<uint32_t> outer_rank;  // by polygon: its place among its object's outer rings
+    std::vector<uint64_t> piece_key;   // by polygon: its cut (water_split.h), 0 for an outer ring whole
     NamingLines lines;
     size_t relations_missing_ways = 0, relations_without_rings = 0;
 };
@@ -182,6 +183,11 @@ Build assemble(Collected& c, unsigned threads);
 // object) and drops the objects with no name and their polygons, in place;
 // sums each object's area. Returns how many objects it named.
 size_t apply_names(Build& b, const std::vector<NameChoice>& choices);
+
+// Cuts each polygon of more than kSplitMaxHoles holes into pieces along the
+// grid (water_split.h), in place: each piece a polygon of the same object
+// and outer rank, with its cut's key. Logs what it cut.
+void split_polygons(Build& b, unsigned threads);
 
 // The layer's type table: the water=* values outside the fixed table among
 // the objects, against the previous build's kinds (the planet's

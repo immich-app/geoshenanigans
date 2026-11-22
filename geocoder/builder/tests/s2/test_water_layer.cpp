@@ -18,6 +18,7 @@
 #include "scratch_dir.h"
 #include "test_framework.h"
 #include "water_names_s2.h"
+#include "water_split.h"
 
 namespace fs = std::filesystem;
 using namespace water;
@@ -209,6 +210,44 @@ TEST(the_join_credits_each_segment_to_the_area_holding_its_midpoint_and_none_out
         CHECK(b.lines.displays[choices[o].display] == "Test River");
     }
     CHECK_EQ(named, size_t(1));
+}
+
+TEST(a_lake_of_many_islands_is_cut_into_pieces_that_each_carry_the_lakes_name_type_and_area) {
+    Collected c = fixture();
+    // A lake of 0.4 x 0.4 degrees with 12 x 12 islands, one way round.
+    const int32_t lat = kLat - 10000000, side = 4000000;
+    add_geometry(c, 70, square(lat, kLng, side, 8));
+    CollectedArea isles;
+    isles.id = 600;
+    isles.tags = tags(code::kLake, "Island Lake");
+    isles.members = {{70, "outer"}};
+    for (int i = 0; i < 12; i++)
+        for (int j = 0; j < 12; j++) {
+            const int64_t way = 1000 + i * 12 + j;
+            add_geometry(c, way, square(lat + 100000 + i * 320000, kLng + 100000 + j * 320000, 20000));
+            isles.members.push_back({way, "inner"});
+        }
+    c.relations.push_back(isles);
+    const Layer layer = build(c);
+    std::vector<size_t> pieces;
+    for (size_t p = 0; p < layer.size(); p++)
+        if (name_of(layer, p) == "Island Lake") pieces.push_back(p);
+    REQUIRE(pieces.size() > 2);
+    std::set<uint64_t> ids, fallbacks;
+    size_t holes = 0;
+    for (size_t p : pieces) {
+        CHECK_EQ(layer.records[p].country_code, code::kLake);
+        CHECK_EQ(layer.records[p].area, layer.records[pieces[0]].area);
+        CHECK(layer.arcs.polygons[p].ring_count <= kSplitMaxHoles + 1);
+        holes += layer.arcs.polygons[p].ring_count - 1;
+        ids.insert(layer.identities[p]);
+        fallbacks.insert(layer.fallbacks[p]);
+    }
+    CHECK(holes > 100u && holes <= 144u);
+    CHECK_EQ(ids.size(), pieces.size());
+    CHECK_EQ(fallbacks.size(), pieces.size());
+    // The lake's area: its square less its islands, not a piece's.
+    CHECK(std::abs(layer.records[pieces[0]].area - float(0.16 - 144 * 0.000004)) < 1e-5f);
 }
 
 TEST(the_layer_is_the_same_on_one_thread_and_many) {

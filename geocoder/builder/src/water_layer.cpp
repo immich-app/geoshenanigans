@@ -20,6 +20,7 @@
 #include "string_files.h"
 #include "string_subset.h"
 #include "water_names_s2.h"
+#include "water_split.h"
 
 namespace water {
 
@@ -358,6 +359,7 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
         }
         b.object_of[polygons] = o;
         b.outer_rank[polygons] = b.outer_rank[p];
+        if (!b.piece_key.empty()) b.piece_key[polygons] = b.piece_key[p];
         polygons++;
     }
     r.polygons.resize(polygons);
@@ -369,6 +371,7 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
     }
     b.object_of.resize(polygons);
     b.outer_rank.resize(polygons);
+    if (!b.piece_key.empty()) b.piece_key.resize(polygons);
     r.polygons.shrink_to_fit();
     r.rings.shrink_to_fit();
     r.vertices.shrink_to_fit();
@@ -382,6 +385,113 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
         obj.km2 += polygon_km2(r, static_cast<uint32_t>(p));
     }
     return named;
+}
+
+void split_polygons(Build& b, unsigned threads) {
+    if (threads == 0) threads = parallel_threads();
+    AdminExactRings& r = b.rings;
+    const size_t n = r.polygons.size();
+    b.piece_key.assign(n, 0);
+    std::vector<uint32_t> heavy;
+    for (uint32_t p = 0; p < n; p++)
+        if (r.polygons[p].ring_count > kSplitMaxHoles + 1) heavy.push_back(p);
+    if (heavy.empty()) return;
+    // Each heavy polygon's pieces, on every core, the costliest first.
+    std::vector<std::vector<SplitPolygon>> pieces(heavy.size());
+    std::vector<size_t> lines(heavy.size(), 0);
+    const std::vector<uint32_t> order = costliest_first(heavy.size(), [&](size_t k) {
+        return static_cast<float>(r.occurrences(heavy[k]));
+    }, threads);
+    parallel_for_dynamic(order.size(), 1, [&](size_t begin, size_t end, unsigned) {
+        for (size_t i = begin; i < end; i++) {
+            const size_t k = order[i];
+            const uint32_t p = heavy[k];
+            SplitPolygon poly;
+            bool runs_whole = true;
+            for (uint32_t q = 0; q < r.polygons[p].ring_count && runs_whole; q++) {
+                const uint32_t ring = r.polygons[p].first_ring + q;
+                const RingSpan span = r.rings[ring];
+                SplitRing sr;
+                sr.v.assign(r.vertices.begin() + span.begin, r.vertices.begin() + span.begin + span.count - 1);
+                const auto [first, last] = r.runs_of_ring(ring);
+                for (const WayRun* run = first; run != last; ++run) {
+                    const int64_t way = run->way;  // by value: WayRun packs it to 4 bytes
+                    sr.way.insert(sr.way.end(), run->edges, way);
+                }
+                runs_whole = sr.way.size() == sr.v.size();
+                if (q == 0) poly.outer = std::move(sr);
+                else poly.holes.push_back(std::move(sr));
+            }
+            if (!runs_whole) continue;
+            pieces[k] = split_polygon(poly, kSplitMaxHoles, &lines[k]);
+            if (pieces[k].size() == 1) pieces[k].clear();
+        }
+    }, threads);
+
+    // The store again: each cut polygon's pieces in its place.
+    AdminExactRings out;
+    std::vector<uint32_t> object_of, outer_rank;
+    std::vector<uint64_t> piece_key;
+    size_t cut = 0, made = 0, cut_lines = 0, kept_whole = 0;
+    auto to_ring = [](const SplitRing& s, std::vector<PackedLocation>& v, std::vector<WayRun>& runs) {
+        v = s.v;
+        v.push_back(s.v.front());
+        runs.clear();
+        for (size_t i = 0; i < s.way.size(); i++) {
+            if (!runs.empty() && runs.back().way == s.way[i]) runs.back().edges++;
+            else runs.push_back({s.way[i], 1});
+        }
+        canonicalize_ring_rotation(v, runs);
+    };
+    size_t k = 0;
+    for (uint32_t p = 0; p < n; p++) {
+        const bool is_heavy = k < heavy.size() && heavy[k] == p;
+        const bool split = is_heavy && !pieces[k].empty();
+        if (split) {
+            cut++;
+            made += pieces[k].size();
+            cut_lines += lines[k];
+            for (const SplitPolygon& piece : pieces[k]) {
+                std::vector<PackedLocation> outer;
+                std::vector<std::vector<PackedLocation>> holes(piece.holes.size());
+                std::vector<std::vector<WayRun>> runs(1 + piece.holes.size());
+                to_ring(piece.outer, outer, runs[0]);
+                for (size_t h = 0; h < piece.holes.size(); h++) to_ring(piece.holes[h], holes[h], runs[h + 1]);
+                out.append(outer, holes, runs);
+                object_of.push_back(b.object_of[p]);
+                outer_rank.push_back(b.outer_rank[p]);
+                piece_key.push_back(piece.key);
+            }
+            std::vector<SplitPolygon>().swap(pieces[k]);
+        } else {
+            kept_whole += is_heavy;
+            const AdminExactRings::Polygon poly = r.polygons[p];
+            std::vector<PackedLocation> outer;
+            std::vector<std::vector<PackedLocation>> holes;
+            std::vector<std::vector<WayRun>> runs;
+            for (uint32_t q = 0; q < poly.ring_count; q++) {
+                const uint32_t ring = poly.first_ring + q;
+                const RingSpan span = r.rings[ring];
+                std::vector<PackedLocation> v(r.vertices.begin() + span.begin, r.vertices.begin() + span.begin + span.count);
+                const auto [first, last] = r.runs_of_ring(ring);
+                runs.emplace_back(first, last);
+                if (q == 0) outer = std::move(v);
+                else holes.push_back(std::move(v));
+            }
+            out.append(outer, holes, runs);
+            object_of.push_back(b.object_of[p]);
+            outer_rank.push_back(b.outer_rank[p]);
+            piece_key.push_back(0);
+        }
+        if (is_heavy) k++;
+    }
+    b.rings = std::move(out);
+    b.object_of = std::move(object_of);
+    b.outer_rank = std::move(outer_rank);
+    b.piece_key = std::move(piece_key);
+    std::cerr << "  Water split: " << heavy.size() << " polygons of more than " << kSplitMaxHoles << " holes; " << cut
+              << " cut along " << cut_lines << " lines into " << made << " pieces, " << kept_whole
+              << " kept whole; " << b.rings.polygons.size() << " polygons" << std::endl;
 }
 
 std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_planet_dir) {
@@ -442,7 +552,8 @@ void identities_of(const Build& b, std::vector<uint64_t>& ids, std::vector<uint6
             for (uint32_t i = 0; i < outer.count; i++)
                 smallest = std::min(smallest, vertex_key(b.rings.vertices[outer.begin + i]));
             ids[p] = relation_ring_identity(o.id, smallest);
-            fallbacks[p] = relation_ring_fallback(o.id, b.outer_rank[p]);
+            fallbacks[p] = piece_fallback(relation_ring_fallback(o.id, b.outer_rank[p]),
+                                          b.piece_key.empty() ? 0 : b.piece_key[p]);
         }
     });
 }
@@ -789,6 +900,8 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
     free_storage(b.lines.vertices);
     log_phase("      Water: names", t, cpu);
 
+    split_polygons(b, threads);
+    log_phase("      Water: split", t, cpu);
     std::shared_ptr<TypeTable> types = type_table(b, prev_planet_dir);
     AdminArcs arcs = build_arc_stage(kWaterArcStage, b.rings, {}, prev_planet_dir, threads);
     b.rings.drop_way_runs();

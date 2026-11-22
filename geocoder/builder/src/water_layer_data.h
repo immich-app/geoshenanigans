@@ -45,10 +45,11 @@ struct Layer {
 };
 
 // The slot identity of a closed way's polygon, and of a relation's outer
-// ring by the smallest vertex of the ring (vertex_key): another outer ring
-// added to the relation leaves it as it is. Its fallback key, the relation
-// and the ring's place among the relation's outer rings, keeps the slot when
-// that vertex moves.
+// ring (or a piece of one, water_split.h) by the smallest vertex of the ring
+// (vertex_key): another outer ring added to the relation leaves it as it
+// is. Its fallback key, the relation and the ring's place among the
+// relation's outer rings (and the piece's cut), keeps the slot when that
+// vertex moves.
 inline uint64_t way_identity(int64_t way) {
     return gc::id_alloc::make_key(gc::id_alloc::ObjectType::OSM_WAY, static_cast<uint64_t>(way));
 }
@@ -58,6 +59,11 @@ inline uint64_t relation_ring_identity(int64_t relation, uint64_t smallest_verte
 }
 inline uint64_t relation_ring_fallback(int64_t relation, uint32_t outer) {
     return mix64(static_cast<uint64_t>(relation) * 0x10001ull + outer + 0x52494e47ull) & 0x00FFFFFFFFFFFFFFull;
+}
+// A piece of a ring cut along the grid (water_split.h): its fallback key,
+// the ring's with the cut's.
+inline uint64_t piece_fallback(uint64_t ring_fallback, uint64_t piece) {
+    return piece == 0 ? ring_fallback : mix64(ring_fallback ^ mix64(piece)) & 0x00FFFFFFFFFFFFFFull;
 }
 
 }  // namespace water
