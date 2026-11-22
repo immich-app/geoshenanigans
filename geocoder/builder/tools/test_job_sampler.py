@@ -2,7 +2,6 @@
 """Tests for job_sampler.sh, the nightly's CPU and disk samples over the whole job, and how the nightly runs it.
 Run: python3 -m unittest discover -s geocoder/builder/tools"""
 import contextlib
-import ctypes
 import io
 import mmap
 import os
@@ -33,44 +32,6 @@ def write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         f.write(text)
-
-
-LIBC = ctypes.CDLL(None, use_errno=True)
-LIBC.mmap.restype = ctypes.c_void_p
-LIBC.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
-LIBC.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-LIBC.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
-
-
-def resident_pages(path):
-    """How many of the pages of the file at `path` are in the page cache (mincore over a mapping of it)."""
-    size = os.path.getsize(path)
-    with open(path, "rb") as f:
-        addr = LIBC.mmap(None, size, mmap.PROT_READ, mmap.MAP_SHARED, f.fileno(), 0)
-        if addr in (None, ctypes.c_void_p(-1).value):
-            raise OSError(ctypes.get_errno(), f"mmap {path}")
-        try:
-            vec = (ctypes.c_ubyte * ((size + mmap.PAGESIZE - 1) // mmap.PAGESIZE))()
-            if LIBC.mincore(addr, size, vec) != 0:
-                raise OSError(ctypes.get_errno(), f"mincore {path}")
-        finally:
-            LIBC.munmap(addr, size)
-    return sum(page & 1 for page in vec)
-
-
-def keeps_dropped_pages(path):
-    """Whether the file system at `path` keeps a file's pages in memory whatever is dropped (tmpfs and ramfs, whose
-    page cache is the file, or an overlay on one): a probe file there, synced and dropped, keeps a page cached."""
-    probe = os.path.join(path, "drop-probe")
-    with open(probe, "wb") as f:
-        f.write(b"p" * (16 * mmap.PAGESIZE))
-        f.flush()
-        os.fsync(f.fileno())
-        os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-    try:
-        return resident_pages(probe) != 0
-    finally:
-        os.remove(probe)
 
 
 class JobSamplerTest(unittest.TestCase):
@@ -251,32 +212,48 @@ class PageCacheTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         return done.stdout.strip()
 
-    def test_a_file_is_cached_once_read_and_not_once_dropped(self):
-        if keeps_dropped_pages(self.dir):
-            self.skipTest("the page cache keeps what is dropped here")
+    def cached_with(self, size, resident, chunk=None):
+        """page_cache.cached of a file of `size` bytes, mapped `chunk` bytes at a time (the script's own by
+        default), with a mincore that fills each page's vector entry with resident(page) (bit 0: cached; the others
+        reserved); and the (length, entries) of each mincore call. What the kernel keeps cached is not the test's to
+        set: a drop is a hint it may not take."""
         path = os.path.join(self.dir, "planet.osm.pbf")
-        size = 5 * (1 << 20) + 123
         write(path, "y" * size)
-        with open(path, "rb") as f:
-            os.fsync(f.fileno())
-            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-        self.assertEqual(self.page_cache(path), "planet.osm.pbf:0")
-        with open(path, "rb") as f:
-            f.read()
+        calls = []
 
-        self.assertEqual(self.page_cache(path), f"planet.osm.pbf:{size}")
+        def mincore(addr, length, vec):
+            first = sum(n for n, _ in calls) // mmap.PAGESIZE
+            calls.append((length, len(vec)))
+            for i in range(len(vec)):
+                vec[i] = resident(first + i)
+            return 0
+        with mock.patch.object(page_cache.libc, "mincore", mincore), \
+                mock.patch.object(page_cache, "CHUNK", chunk or page_cache.CHUNK):
+            return page_cache.cached(path), calls
 
-    # A last page short of the file's end counts the file's bytes in it alone, whatever else is cached.
+    # A page is cached by its entry's bit 0 alone: the reserved bits say nothing.
+    def test_a_file_with_no_page_cached_counts_none(self):
+        size = 3 * mmap.PAGESIZE + 123
+        for entry in (0, 0xFE):
+            with self.subTest(entry=entry):
+                self.assertEqual(self.cached_with(size, lambda page: entry), (0, [(size, 4)]))
+
+    # A cached last page short of the file's end counts the file's bytes in it alone.
+    def test_a_file_cached_whole_counts_its_size(self):
+        size = 3 * mmap.PAGESIZE + 123
+        for entry in (1, 0xFF):
+            with self.subTest(entry=entry):
+                self.assertEqual(self.cached_with(size, lambda page: entry), (size, [(size, 4)]))
+
+    # So does one cached alone, the file's last, in the last of the mappings the file is read in.
     def test_a_cached_last_page_counts_only_the_files_bytes_in_it(self):
-        if keeps_dropped_pages(self.dir):
-            self.skipTest("the page cache keeps what is dropped here")
-        path = os.path.join(self.dir, "planet.osm.pbf")
-        write(path, "y" * (mmap.PAGESIZE + 1))
-        with open(path, "rb") as f:
-            os.fsync(f.fileno())
-            os.posix_fadvise(f.fileno(), 0, mmap.PAGESIZE, os.POSIX_FADV_DONTNEED)
+        size = 5 * mmap.PAGESIZE + 123
+        last = size // mmap.PAGESIZE
 
-        self.assertEqual(self.page_cache(path), "planet.osm.pbf:1")
+        cached, calls = self.cached_with(size, lambda page: int(page == last), chunk=2 * mmap.PAGESIZE)
+
+        self.assertEqual(cached, 123)
+        self.assertEqual(calls, [(2 * mmap.PAGESIZE, 2), (2 * mmap.PAGESIZE, 2), (mmap.PAGESIZE + 123, 2)])
 
     # Linux reports every page of a file's mapping cached unless the caller owns the file or could open it for
     # writing: such a file prints "?" rather than a count it can't know.
