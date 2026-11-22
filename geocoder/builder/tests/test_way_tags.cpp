@@ -84,9 +84,13 @@ TEST(way_tags_poi_tags_include_protected_boundaries_only) {
     CHECK(TagBlock({{"building", "yes"}}).parse().has_poi_tags());
     CHECK(!TagBlock({{"landuse", "forest"}}).parse().has_poi_tags());
     CHECK(!TagBlock({{"shop", "bakery"}}).parse().has_poi_tags());
-    // emergency=* classifies a POI way, as landuse=* and shop=* do, but makes
-    // none on its own.
-    CHECK(!TagBlock({{"emergency", "fire_water_pond"}}).parse().has_poi_tags());
+    // emergency=fire_water_pond makes a POI way alone, a POI of its own
+    // category (poi_classify.h) as a node of it is; emergency=*'s other values
+    // classify a POI way, as landuse=* and shop=* do, but make none on their
+    // own.
+    CHECK(TagBlock({{"emergency", "fire_water_pond"}}).parse().has_poi_tags());
+    CHECK(!TagBlock({{"emergency", "suction_point"}}).parse().has_poi_tags());
+    CHECK(!TagBlock({{"emergency", "defibrillator"}}).parse().has_poi_tags());
 }
 
 TEST(way_tags_poi_tags_include_a_reservoir_or_basin_beside_a_poi_main_tag) {
@@ -94,14 +98,14 @@ TEST(way_tags_poi_tags_include_a_reservoir_or_basin_beside_a_poi_main_tag) {
     // (poi_classify.h has_poi_main_tag), whichever key it is: emergency=* and
     // shop=*, which make no POI way alone, make one beside it.
     for (const char* kind : {"reservoir", "basin"}) {
-        CHECK(TagBlock({{"landuse", kind}, {"emergency", "fire_water_pond"}}).parse().has_poi_tags());
+        CHECK(TagBlock({{"landuse", kind}, {"emergency", "suction_point"}}).parse().has_poi_tags());
         CHECK(TagBlock({{"landuse", kind}, {"shop", "bakery"}}).parse().has_poi_tags());
         // A value Nominatim's import drops makes none.
         CHECK(!TagBlock({{"landuse", kind}, {"emergency", "fire_hydrant"}}).parse().has_poi_tags());
         CHECK(!TagBlock({{"landuse", kind}, {"shop", "no"}}).parse().has_poi_tags());
         CHECK(!TagBlock({{"landuse", kind}}).parse().has_poi_tags());
     }
-    CHECK(!TagBlock({{"landuse", "forest"}, {"emergency", "fire_water_pond"}}).parse().has_poi_tags());
+    CHECK(!TagBlock({{"landuse", "forest"}, {"emergency", "suction_point"}}).parse().has_poi_tags());
 }
 
 TEST(way_needs_nodes_matches_the_way_pass_rule) {
@@ -113,6 +117,7 @@ TEST(way_needs_nodes_matches_the_way_pass_rule) {
     CHECK(needs({{"amenity", "school"}, {"name", "X"}}));
     CHECK(needs({{"waterway", "river"}, {"name", "X"}}));
     CHECK(needs({{"landuse", "basin"}, {"emergency", "fire_water_pond"}, {"name", "X"}}));
+    CHECK(needs({{"emergency", "fire_water_pond"}, {"name", "X"}}));
     CHECK(needs({}, true));
 
     CHECK(!needs({}));
@@ -124,7 +129,7 @@ TEST(way_needs_nodes_matches_the_way_pass_rule) {
     CHECK(!needs({{"highway", "footway"}, {"footway", "sidewalk"}, {"name", "X"}}));
     CHECK(!needs({{"landuse", "residential"}, {"name", "X"}}));
     CHECK(!needs({{"shop", "bakery"}, {"name", "X"}}));
-    CHECK(!needs({{"emergency", "fire_water_pond"}, {"name", "X"}}));
+    CHECK(!needs({{"emergency", "suction_point"}, {"name", "X"}}));
     CHECK(!needs({{"landuse", "basin"}, {"name", "X"}}));
     CHECK(!needs({{"amenity", "school"}}));
 }

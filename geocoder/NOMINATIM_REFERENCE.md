@@ -200,14 +200,16 @@ object stays water, so its name stays in `places` and as the `landmark`, out
 of the primary slot. Where its water kind ships in a lower POI tier than its
 category, the tiers between ship it as the water kind (`types.h`
 `poi_record_in_tier`): a bay (notable) that is a pier (all) is a `BAY` in
-`poi/notable` and a `PIER` in `poi/all`. The way pass resolves a named `landuse=reservoir|basin`
-way with a POI main tag though `emergency=*` and `shop=*` make no POI way
-alone (`way_tags.h` `has_poi_tags`). Values the import drops
+`poi/notable` and a `PIER` in `poi/all`. The way pass resolves a named
+`emergency=fire_water_pond` way, and a named `landuse=reservoir|basin` way
+with a POI main tag, though the other `emergency=*` values and `shop=*` make
+no POI way alone (`way_tags.h` `has_poi_tags`). Values the import drops
 (`amenity=parking_space`, `emergency=fire_hydrant`, `tourism=yes`, ...) and
 tags of a rank below 30 and no address rank (`leisure=park`,
 `historic=neighbourhood`, `place=island`, `waterway=*`) leave the water
-category; beside a tag the object yields to, `shop=no` makes no shop. `building=*`, a fallback tag, ranks 30 beside `natural=*` (the class
-stays `natural`) but is the class beside `landuse=*`, also a fallback tag, and
+category; beside a tag the object yields to, `shop=no` makes no shop.
+`building=*`, a fallback tag, ranks 30 beside `natural=*` (the class stays
+`natural`) but is the class beside `landuse=*`, also a fallback tag, and
 the lane takes no class `building`.
 
 **Not matched.**

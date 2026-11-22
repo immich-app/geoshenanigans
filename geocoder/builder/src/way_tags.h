@@ -44,7 +44,8 @@ struct WayTags {
     const char* ele = nullptr;
     const char* shop = nullptr;
     const char* landuse = nullptr;
-    // Classifies a POI way (poi_classify.h), but makes none on its own.
+    // Classifies a POI way (poi_classify.h), and makes one on its own where
+    // it is fire_water_pond, a category of its own, as a node of it is.
     const char* emergency = nullptr;
 
     // Prefer name:en where present (English-only mode)
@@ -56,6 +57,7 @@ struct WayTags {
             craft || power || place || waterway || office ||
             (boundary && (std::strcmp(boundary, "national_park") == 0 ||
                           std::strcmp(boundary, "protected_area") == 0)) ||
+            (emergency && std::strcmp(emergency, "fire_water_pond") == 0) ||
             // A reservoir or basin beside a POI main tag is a POI of that tag
             // (poi_classify.h), whose key (emergency, shop) may make no POI
             // way alone.
