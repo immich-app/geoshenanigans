@@ -471,25 +471,38 @@ public:
 
     // Puts the arcs of every ring of the set valid as OSM has it that the
     // tier's grid collapses with every vertex kept (collapses_whole) on the
-    // e7 grid, with their junctions (keep_arcs_on_e7_grid); then the same for
-    // the rings of the arcs that changed, which a junction on the e7 grid
-    // can collapse in turn, round after round until none does. Returns how
+    // e7 grid, with their junctions (keep_collapsing_on_e7_grid). Returns how
     // many rings.
     size_t keep_collapsing_rings_on_e7_grid() {
-        std::vector<uint32_t> suspects = rings_;
+        std::vector<uint32_t> changed;
+        return keep_collapsing_on_e7_grid(rings_, changed);
+    }
+
+    // Puts the arcs of those of `suspects` (rings, ascending) valid as OSM
+    // has it that the tier's grid collapses with every vertex kept
+    // (collapses_whole) on the e7 grid, with their junctions
+    // (keep_arcs_on_e7_grid); then the same for the rings of the arcs that
+    // changed, which a junction on the e7 grid can collapse in turn, round
+    // after round until none does. Adds the arcs it changed to `changed`
+    // (ascending, each once) and returns how many rings.
+    size_t keep_collapsing_on_e7_grid(std::vector<uint32_t> suspects, std::vector<uint32_t>& changed) {
         size_t rings = 0;
         while (!suspects.empty()) {
             const std::vector<uint32_t> collapsing = collect_in_order<uint32_t, Scratch>(suspects.size(),
                 [&](size_t k, std::vector<uint32_t>& out, Scratch& s) {
                     if (collapses_whole(suspects[k], s)) out.push_back(suspects[k]);
                 }, threads_);
+            if (collapsing.empty()) break;
+
             rings += collapsing.size();
             std::vector<uint32_t> whole;
             for (uint32_t r : collapsing)
                 for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) whole.push_back(set_.refs()[k].arc);
-            const std::vector<uint32_t> changed = keep_arcs_on_e7_grid(std::move(whole));
-            suspects = changed.empty() ? std::vector<uint32_t>() : rings_of(changed);
+            const std::vector<uint32_t> round = keep_arcs_on_e7_grid(std::move(whole));
+            changed.insert(changed.end(), round.begin(), round.end());
+            suspects = round.empty() ? std::vector<uint32_t>() : rings_of(round);
         }
+        sort_unique(changed, threads_);
         return rings;
     }
 
@@ -650,14 +663,19 @@ public:
     // (keep_on_e7_grid), round after round while that changes an arc: the
     // snap alone moved a ring onto another, with no dropped vertex to give
     // back. Once coarsened, each round keeps the rings of the arcs it
-    // changed fine where they collapse.
+    // changed fine where they collapse; on a tier that takes collapsing
+    // rings to the e7 grid, it puts those the junctions it moved collapse
+    // there (keep_collapsing_on_e7_grid).
     void keep_unnested_on_e7_grid(ArcTierCounts& counts) {
         std::vector<uint32_t> unnested = not_nesting(candidates_);
         while (!unnested.empty()) {
             std::vector<uint32_t> changed = keep_on_e7_grid(unnested);
             if (changed.empty()) break;
             counts.e7_grid_rounds++;
-            if (coarse_) with_collapsing_rings_kept_fine(changed, counts);
+            if (coarse_)
+                with_collapsing_rings_kept_fine(changed, counts);
+            else if (tier_.collapsing_rings_on_e7)
+                counts.e7_collapsing_rings += keep_collapsing_on_e7_grid(rings_of(changed), changed);
             add_conflicts(meetings_of(update(changed)));
             std::vector<uint32_t> suspects = unnested;
             for (uint32_t a : changed)

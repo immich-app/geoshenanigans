@@ -300,7 +300,7 @@ struct ArcTierCounts {
     size_t nesting_restored = 0;  // vertices given back to polygons whose rings stopped nesting
     int e7_grid_rounds = 0;
     size_t e7_grid_arcs = 0;  // arcs stored on OSM's own grid (arc_grid), some vertices only
-    size_t e7_collapsing_rings = 0;  // ArcTier::collapsing_rings_on_e7: rings the grid collapses, on the e7 grid
+    size_t e7_collapsing_rings = 0;  // collapsing_rings_on_e7: rings the tier's grid would collapse, kept on e7
     size_t crossings_left = 0;
     size_t unrepairable_segments = 0;  // in a crossing left, with no dropped vertex
     size_t raw_crossings = 0;  // segment pairs meeting whose raw spans already meet
@@ -548,8 +548,11 @@ std::vector<bool> exact_rings_nest(const AdminExactRings& store, unsigned thread
 // (`nests_exact`, exact_rings_nest) but not once stored, the farthest dropped
 // one of each span of a ring whose box holds a vertex of another ring. A
 // polygon whose rings still don't nest then keeps its arcs on the e7 grid
-// (arc_grid), round after round while that changes anything. A tier with no
-// tolerance keeps everything and counts nothing.
+// (arc_grid), round after round while that changes anything; on a tier that
+// takes collapsing rings to the e7 grid, a ring that a junction so moved
+// leaves with under 3 vertices or no area with every vertex kept has its
+// arcs and their junctions on the e7 grid too. A tier with no tolerance
+// keeps everything and counts nothing.
 //
 // A tier that coarsens does all that on its fine grid, notes the rings valid
 // there, then snaps every arc and junction to its own grid and keeps
@@ -639,7 +642,10 @@ AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>
 
 // The same for `stage`: its cuts and its tiers; a stage with no tier of the
 // minimal set has none (no slots, every ring without minimal refs), and
-// `in_minimal` is then unread.
+// `in_minimal` is then unread. The arcs point at `stage` (AdminArcs::stage),
+// as do the blocks encoded from them and every subset of those: the stage,
+// its tiers and its strings must outlive them all (kAdminArcStage and
+// kWaterArcStage are static).
 AdminArcs build_arc_stage(const ArcStage& stage, const AdminExactRings& store, const std::vector<bool>& in_minimal,
                           const std::string& prev_planet_dir, unsigned threads);
 
