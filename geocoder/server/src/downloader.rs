@@ -857,14 +857,17 @@ pub async fn download_region(
     }
     // Before the fetches, so that their room is free. Their lines go only
     // when the ledger is rewritten: a download killed before then leaves
-    // them, and the next finds their files gone.
+    // them, and the next finds their files gone. A name at which a dir is
+    // names no file: a last line a kill cut short at a sub-dir's name.
     for name in &others {
         let path = region_dir.join(name);
-        match tokio::fs::remove_file(&path).await {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(DownloadError::Io(format!("remove {}: {}", path.display(), e)));
+        if !tokio::fs::symlink_metadata(&path).await.is_ok_and(|m| m.is_dir()) {
+            match tokio::fs::remove_file(&path).await {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(DownloadError::Io(format!("remove {}: {}", path.display(), e)));
+                }
+                _ => {}
             }
-            _ => {}
         }
         ledger.held.remove(name);
     }
@@ -2239,6 +2242,32 @@ mod tests {
         assert_eq!(lines, ["admin_cells.bin -", "poi_cells.bin -"]);
         assert_eq!(bucket.files_served() - served, 3);
         assert!(held(&dir) == files_of(&bucket, &s));
+    }
+
+    // A last line a kill cut short at the water dir's name, or just past its
+    // slash, names no file: a retry, and a switch to no water, go through,
+    // the water dir left a dir, and the line goes with the ledger's rewrite.
+    // Cut inside a file's name, it names none either.
+    #[tokio::test]
+    async fn a_ledgers_last_line_cut_short_at_the_water_dirs_name_names_no_file() {
+        use std::io::Write;
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let water_all = wet("europe", "admin", "simplified", "none", "all");
+        for after in [water_all.clone(), sel("europe", "admin", "simplified", "none")] {
+            for cut in ["water", "water/", "water/arc_"] {
+                let root = ScratchDir::new();
+                let dir = root.path().join("europe");
+                download(&bucket, &water_all, root.path()).await.unwrap();
+                std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
+                write!(std::fs::OpenOptions::new().append(true).open(dir.join(FILE_LEDGER)).unwrap(), "{cut}").unwrap();
+
+                let got = download(&bucket, &after, root.path()).await.map_err(|e| e.to_string());
+
+                let case = format!("water {}, cut at {cut:?}", after.water);
+                assert_eq!(got, Ok(()), "{case}");
+                assert_eq!(differing(&held(&dir), &files_of(&bucket, &after)), Vec::<String>::new(), "{case}");
+            }
+        }
     }
 
     // A complete download leaves the ledger a line a file, each naming the
