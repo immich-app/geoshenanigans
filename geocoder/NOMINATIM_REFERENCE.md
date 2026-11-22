@@ -22,7 +22,9 @@ Country overrides change these. Format in JSON: `[search_rank, address_rank]` wh
 
 ### Verified country overrides
 
-Our `admin_levels.json` matches Nominatim's `address-levels.json` exactly (verified programmatically). Countries with overrides: au, be, br, cz, de, es, id, jp, nl, no, ru, se, sk, us.
+Our `admin_levels.json` matches the `boundary` entries of Nominatim's `address-levels.json` as the public server runs it (master: Slovakia's levels were removed on 2026-05-02, and Brazil's administrative5 to 7 rank 0 since 5.3.0). Countries with overrides: au, be, br, cz, de, es, id, jp, nl, no, ru, se, us. The builder's `admin_rank_config.h` mirrors it for place linking.
+
+A country's `place` entries (ca, de, es, id, ru, sa: CA and DE county 0, DE region 0, ES province 10, ID and RU municipality 18, SA province 12 and municipality 18) are in `place_type_to_rank`, which ranks place areas and the place types of boundaries.
 
 ## Step 2: Label determination — get_label_tag()
 
@@ -99,7 +101,24 @@ This ensures nested boundaries don't share the same address rank. Example:
 - If a level 5 boundary (rank 10) contains a level 6 boundary (also rank 12), no adjustment needed (12 > 10)
 - If a level 5 boundary (rank 12 via override) contains a level 6 boundary (rank 12), the level 6 gets bumped to 14
 
-**We implement this at query time** (`server/src/lib.rs`, before field assignment), on the polygons that contain the point: the nested-admin, linked-place and place-area promotions, repeated so a bump can cascade. Containment between those polygons is judged by admin level and area. Smallest-area-wins then settles polygons that still map to the same output field (if two polygons both map to "county", the smaller one wins).
+**We implement this at query time** (`promote_nested_ranks` in `server/src/lib.rs`, before field assignment), on the polygons that contain the point, coarsest admin level first:
+
+1. **Admin nested** (placex_triggers.sql:876-910), for boundaries of rank > 0: the parent is the boundary of the highest admin_level below the child's and above 3 that holds the point (the smallest of that level). A parent of rank >= the child's lifts it to the parent's + 2, and to 25 under a parent of 24 or more.
+2. **Place area** (:912-929), for boundaries of rank 10 or more without a place type: the place area of the highest rank from the boundary's up to 23 that is larger and holds the boundary's point on surface lifts it to that rank + 2.
+3. **Linked place** (:1109-1170): a boundary's place type (from a linked node or its own `place` tag) replaces its rank where that is higher than both its own and its parent's.
+
+A place area (class='place': `boundary=place`, a place multipolygon or closed way, a `boundary=historic` or `ceremonial` with a place tag, such as County Antrim or Essex) keeps its place type's rank: Nominatim gives it neither step 1 nor step 2. A boundary whose level ranks 0 in its country stays out of the address whatever its place type (Cairns Regional, Regierungsbezirk Köln). Areas of rank 25 are in no street's or house's address (getNearFeatures takes ranks below 25), so they fill no field and take no rank from place nodes.
+
+What the polygons at a point cannot tell, and Nominatim decides on the whole geometry at index time:
+
+- The admin-nested parent is the boundary covering the child's centroid, which need not hold the query point (Bugisa sub-region round Mbale City ranks 12 in Nominatim, 18 here).
+- A place area is lifted when another area of its rank up to 23 contains it whole (`ST_Contains`); here never.
+- A child with the parent's wikidata and an equal geometry ranks 0 (Poland's replicated boundaries, Bruxelles - Brussel at level 9).
+- A linked place or the boundary's own place tag can lower the rank; the builder keeps one place type per polygon, from either.
+- Every place type ranks a boundary (place=locality makes Northern Ireland's townlands rank 25); the builder keeps 14 types.
+- Levels 11 and 12 (level 11 holds the postal areas here), and administrative ways only at levels 8 to 12.
+
+Smallest-area-wins then settles polygons that still map to the same output field (if two polygons both map to "county", the smaller one wins).
 
 ## Step 5: Competing polygons
 
@@ -139,7 +158,7 @@ In `get_label_tag()`, DC has `category=('place', 'city')` so it hits check 5 (li
 
 Where Nominatim's rank adjustment matters:
 - Two admin levels that both map to the same rank range (e.g., level 5 and 6 both → county in some countries)
-- Nominatim bumps the inner one, and so do we. The difference left is that we only see the polygons containing the query point and judge containment between them by admin level and area, where Nominatim tests the geometry.
+- Nominatim bumps the inner one, and so do we. The difference left is that we only see the polygons containing the query point and judge containment between them by admin level, area and point on surface, where Nominatim tests the geometry (Step 4).
 
 ## How our implementation maps to Nominatim
 
@@ -150,7 +169,7 @@ Where Nominatim's rank adjustment matters:
 | get_label_tag() check 4 (ADMIN_LABELS rank//2) | rank_to_field() function | ✅ Implemented |
 | get_label_tag() check 5 (category[1] for place=* entities) | place_type_override covers this — boundary=place entities get place_type set | ✅ Implemented |
 | find_linked_place() node linking | Builder: label role member, wikidata match, the boundary's own place tag, then name match (`link_places_by_name`), in Nominatim's order; a linked place node is hidden from place results, except in admin-minimal when that set leaves its boundary out (L9-L11, place areas below rank 16): nothing there stands for the node | ✅ Implemented |
-| Rank adjustment for nested boundaries | At query time on the polygons containing the point, then smallest-area-wins per field | ✅ Implemented — containment judged by admin level and area |
+| Rank adjustment for nested boundaries | At query time on the polygons containing the point, then smallest-area-wins per field | ✅ Implemented — containment judged by admin level, area and point on surface; what that leaves out is listed under Step 4 |
 | boundary=place entities (e.g., Washington DC) | Extracted in builder with admin_level=15 + place_type_override | ✅ Implemented |
 | Place node fallback (nearest city/town/village) | place_nodes.bin + find_places() with wide search | ✅ Implemented — place nodes are indexed at the admin cell level (L10); the query cell and its 8 neighbours cover ~30 km |
 | place_addressline pre-computed relationships | Not applicable — we do spatial lookup at query time | N/A — different architecture |

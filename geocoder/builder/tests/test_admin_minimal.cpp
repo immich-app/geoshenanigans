@@ -45,3 +45,15 @@ TEST(place_area_ranks_follow_address_levels) {
     CHECK_EQ(place_area_rank_address(pt(AdminPlaceType::NEIGHBOURHOOD)), uint8_t(24));
     CHECK_EQ(place_area_rank_address(pt(AdminPlaceType::STATE)), uint8_t(0));
 }
+
+TEST(boundary_ranks_follow_the_country_levels) {
+    // Nominatim's address-levels.json: Slovakia has no levels of its own (since 2026-05-02), and
+    // Brazil's administrative5 to 7 rank 0 (since 5.3.0); Australia's administrative6 too.
+    const uint16_t sk = pack_country_code('S', 'K'), br = pack_country_code('B', 'R');
+    for (uint8_t level = 2; level <= 10; level++)
+        CHECK_EQ(admin_rank_address(sk, level), uint8_t(level * 2));
+    CHECK_EQ(admin_rank_address(br, 4), uint8_t(8));
+    for (uint8_t level = 5; level <= 7; level++) CHECK_EQ(admin_rank_address(br, level), uint8_t(0));
+    CHECK_EQ(admin_rank_address(br, 8), uint8_t(16));
+    CHECK_EQ(admin_rank_address(pack_country_code('A', 'U'), 6), uint8_t(0));
+}

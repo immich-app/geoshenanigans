@@ -25,6 +25,7 @@ inline uint8_t admin_rank_address(uint16_t cc, uint8_t admin_level) {
             case 3: return 0; case 4: return 6; case 5: return 0;
             case 6: return 8; case 7: return 12; case 8: return 14;
             case 9: return 16; case 10: return 18; default: break; } break;
+        case pack('B','R'): if (admin_level >= 5 && admin_level <= 7) return 0; break;
         case pack('C','Z'): switch (admin_level) {
             case 5: return 12; case 6: return 0; case 7: return 0;
             case 8: return 14; case 9: return 15; case 10: return 16; default: break; } break;
@@ -47,10 +48,6 @@ inline uint8_t admin_rank_address(uint16_t cc, uint8_t admin_level) {
             case 5: return 0; case 7: return 0; case 8: return 14; default: break; } break;
         case pack('S','E'): switch (admin_level) {
             case 3: return 8; case 4: return 12; default: break; } break;
-        case pack('S','K'): switch (admin_level) {
-            case 5: return 0; case 6: return 11; case 7: return 0;
-            case 8: return 12; case 9: return 16; case 10: return 18;
-            case 11: return 20; default: break; } break;
         default: break;
     }
     // Default: rank_address = admin_level * 2 for levels 2..12.
