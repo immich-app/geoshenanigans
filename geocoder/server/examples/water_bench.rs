@@ -1,29 +1,35 @@
-// Times the server's water lookup (WaterLayer::at on a water dir of the builder's water layer:
-// one cell read, then the ring tests of its entries in answering order, up to the first that
-// holds the point) against the same point's answer without water, at the cells whose
-// non-interior entries carry the most rings: the lakes and bays with thousands of islands, whose
-// holes a ring test visits one by one, and the cells of many small polygons.
+// Times the server's answer with water (MultiIndex::query_json on a dataset whose index holds a
+// water dir of the builder's water layer: the address, the water lookup and the answer's JSON
+// with its water field) against the same point's answer without water, and the water lookup
+// alone (WaterLayer::at: one cell read, then the ring tests of its entries in answering order,
+// up to the first that holds the point), at the cells whose non-interior entries carry the most
+// rings: the lakes and bays with thousands of islands, whose holes a ring test visits one by
+// one, and the cells of many small polygons.
 //
 //   cargo build --release --example water_bench
 //   ./target/release/examples/water_bench <dataset dir> <water dir> [cells] [rounds] > report.txt
 //
 // <dataset dir> is a flat dir grid_query loads (a mode's files beside a boundary tier), without
-// a water dir; <water dir> is one of {region}/water/{all,major}/{simplified,exact}. The cells: of
-// the polygons with
-// the largest ring blocks (200), the L10 cells they reach where their entry is not interior, scored
-// by the rings of every non-interior entry there; the `cells` best (default 40), each sampled at
-// 5 x 5 points. Each point is answered `rounds` times (default 200) warm, by each path, and its
-// median kept. Prints each cell, then p50 and p99 over the points of both paths, of the two
-// together, and of the two together against the answer alone, point by point and as quantiles.
+// a water dir; <water dir> is one of {region}/water/{all,major}/{simplified,exact}. The dataset
+// loads twice, as the server loads a flat dir (one world slot): without water, and with the
+// water dir's layer as its index's water. The cells: of the polygons with the largest ring
+// blocks (200), the L10 cells they reach where their entry is not interior, scored by the rings
+// of every non-interior entry there; the `cells` best (default 40), each sampled at 5 x 5
+// points. Each point's answer with water names the water the lookup finds there, and the one
+// without names none. Each point is timed `rounds` times (default 200) warm, by each of the
+// three, and its medians kept. Prints each cell, then p50 and p99 over the points of the lookup
+// and of both answers, and of the answer with water against the one without, point by point and
+// as quantiles.
 use query_server::{
-    cell_id_at_level, cell_pairs, mmap_file, AdminGeometry, AdminPolygon, CellPairs, MultiIndex, WaterLayer,
-    ADMIN_POLYGON_RECORD_BYTES, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL, ID_MASK,
-    INTERIOR_FLAG,
+    cell_id_at_level, cell_pairs, mmap_file, AdminGeometry, AdminPolygon, CellPairs, ContinentSlot, Index,
+    MultiIndex, WaterLayer, ADMIN_POLYGON_RECORD_BYTES, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE,
+    DEFAULT_STREET_CELL_LEVEL, ID_MASK, INTERIOR_FLAG,
 };
 use s2::cell::Cell;
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// The water dir's records, cells and rings, which pick the cells timed.
@@ -61,6 +67,31 @@ impl Water {
     }
 }
 
+/// The flat dataset dir `dir` as the server loads it (MultiIndex::load: one world slot), `water`
+/// its index's water layer.
+fn world(dir: &str, water: Option<WaterLayer>) -> MultiIndex {
+    let index = Index::load(dir, DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE);
+    let mut index = index.expect("dataset");
+    index.water = water;
+    MultiIndex {
+        continents: vec![ContinentSlot {
+            name: "world",
+            continent: None,
+            index: arc_swap::ArcSwapOption::from(Some(Arc::new(index))),
+        }],
+        root_dir: dir.to_string(),
+        street_cell_level: DEFAULT_STREET_CELL_LEVEL,
+        admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
+        search_distance: DEFAULT_SEARCH_DISTANCE,
+    }
+}
+
+/// The name of the water an answer's JSON holds, if it holds one.
+fn named_water(json: &str) -> Option<String> {
+    let answer: serde_json::Value = serde_json::from_str(json).expect("an answer's JSON");
+    answer.get("water").map(|w| w["name"].as_str().expect("a water name").to_string())
+}
+
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[v.len() / 2]
@@ -78,9 +109,10 @@ fn main() {
     let cells: usize = args.get(3).map_or(40, |a| a.parse().unwrap());
     let rounds: usize = args.get(4).map_or(200, |a| a.parse().unwrap());
     let water = Water::load(water_dir);
-    let layer = WaterLayer::open(water_dir, DEFAULT_ADMIN_CELL_LEVEL).expect("water dir").expect("a water dir's files");
-    let index = MultiIndex::load(dataset, DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE)
-        .expect("dataset");
+    let open =
+        || WaterLayer::open(water_dir, DEFAULT_ADMIN_CELL_LEVEL).expect("water dir").expect("a water dir's files");
+    let layer = open();
+    let (dry, wet) = (world(dataset, None), world(dataset, Some(open())));
 
     // The polygons with the largest ring blocks, by their rings.
     let mut by_bytes: Vec<u32> = (0..water.records.len() as u32).collect();
@@ -129,7 +161,7 @@ fn main() {
     best.sort_by_key(|&(cell, score)| (std::cmp::Reverse(score), cell));
     best.truncate(cells);
 
-    let (mut with, mut without, mut ratio, mut both) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut lookup, mut without, mut with, mut ratio) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for &(cell, score) in &best {
         let c = Cell::from(CellID(cell));
         let (mut lo_lat, mut hi_lat, mut lo_lng, mut hi_lng) = (90.0f64, -90.0f64, 180.0f64, -180.0f64);
@@ -142,7 +174,7 @@ fn main() {
         }
         let ids = water.index.ids(cell);
         let entries = ids.iter().filter(|&&id| id & INTERIOR_FLAG == 0).count();
-        let (mut cell_with, mut cell_without) = (Vec::new(), Vec::new());
+        let (mut cell_lookup, mut cell_without, mut cell_with) = (Vec::new(), Vec::new(), Vec::new());
         let mut held = 0;
         for i in 0..5 {
             for j in 0..5 {
@@ -151,48 +183,57 @@ fn main() {
                 if cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL) != cell {
                     continue;
                 }
-                held += usize::from(layer.at(lat, lng).is_some());
-                let mut w = Vec::new();
-                let mut a = Vec::new();
+                let water = layer.at(lat, lng).map(|w| w.name.into_owned());
+                held += usize::from(water.is_some());
+                let dry_water = named_water(&dry.query_json(lat, lng));
+                let wet_water = named_water(&wet.query_json(lat, lng));
+                assert_eq!(dry_water, None, "the water the answer without water at ({lat}, {lng}) names");
+                assert_eq!(wet_water, water, "the water the answer with water at ({lat}, {lng}) names");
+                let (mut l, mut d, mut w) = (Vec::new(), Vec::new(), Vec::new());
                 for _ in 0..rounds {
                     let t = Instant::now();
                     std::hint::black_box(layer.at(lat, lng));
-                    w.push(t.elapsed().as_secs_f64() * 1e6);
+                    l.push(t.elapsed().as_secs_f64() * 1e6);
                     let t = Instant::now();
-                    std::hint::black_box(index.query_json(lat, lng));
-                    a.push(t.elapsed().as_secs_f64() * 1e6);
+                    std::hint::black_box(dry.query_json(lat, lng));
+                    d.push(t.elapsed().as_secs_f64() * 1e6);
+                    let t = Instant::now();
+                    std::hint::black_box(wet.query_json(lat, lng));
+                    w.push(t.elapsed().as_secs_f64() * 1e6);
                 }
-                let (mw, ma) = (median(w), median(a));
+                let (ml, md, mw) = (median(l), median(d), median(w));
+                cell_lookup.push(ml);
+                cell_without.push(md);
                 cell_with.push(mw);
-                cell_without.push(ma);
+                lookup.push(ml);
+                without.push(md);
                 with.push(mw);
-                without.push(ma);
-                both.push(mw + ma);
-                ratio.push((mw + ma) / ma);
+                ratio.push(mw / md);
             }
         }
-        if cell_with.is_empty() {
+        if cell_lookup.is_empty() {
             continue;
         }
         let (lat, lng) = (LatLng::from(c.center()).lat.deg(), LatLng::from(c.center()).lng.deg());
         println!(
-            "cell {cell:016x} at {lat:.4} {lng:.4}: {} entries, {entries} not interior with {score} rings; {held} of {} points in water; water {:.1} us, answer {:.1} us (medians)",
+            "cell {cell:016x} at {lat:.4} {lng:.4}: {} entries, {entries} not interior with {score} rings; {held} of {} points in water; lookup {:.1} us, answer without water {:.1} us, with water {:.1} us (medians)",
             ids.len(),
-            cell_with.len(),
-            median(cell_with),
-            median(cell_without)
+            cell_lookup.len(),
+            median(cell_lookup),
+            median(cell_without),
+            median(cell_with)
         );
     }
     println!(
-        "WATER_BENCH points={} water_p50_us={:.1} water_p99_us={:.1} answer_p50_us={:.1} answer_p99_us={:.1} together_p50_us={:.1} together_p99_us={:.1} together_p99_over_answer_p99={:.2} pointwise_over_answer_p50={:.2} pointwise_over_answer_p99={:.2}",
-        with.len(),
-        quantile(&with, 0.5),
-        quantile(&with, 0.99),
+        "WATER_BENCH points={} lookup_p50_us={:.1} lookup_p99_us={:.1} dry_p50_us={:.1} dry_p99_us={:.1} wet_p50_us={:.1} wet_p99_us={:.1} wet_p99_over_dry_p99={:.2} pointwise_wet_over_dry_p50={:.2} pointwise_wet_over_dry_p99={:.2}",
+        lookup.len(),
+        quantile(&lookup, 0.5),
+        quantile(&lookup, 0.99),
         quantile(&without, 0.5),
         quantile(&without, 0.99),
-        quantile(&both, 0.5),
-        quantile(&both, 0.99),
-        quantile(&both, 0.99) / quantile(&without, 0.99),
+        quantile(&with, 0.5),
+        quantile(&with, 0.99),
+        quantile(&with, 0.99) / quantile(&without, 0.99),
         quantile(&ratio, 0.5),
         quantile(&ratio, 0.99)
     );
