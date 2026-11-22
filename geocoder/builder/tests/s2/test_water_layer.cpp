@@ -723,26 +723,37 @@ TEST(a_waterway_relation_of_a_local_name_alone_shows_the_name_en_most_of_its_riv
     CHECK(shown["r900"] == std::set<std::string>({"Test River"}));
 }
 
-// geocoder/testdata/water_dir: the client files of a water dir on two days,
-// which tools/test_generate_patches.py diffs, patches and verifies with the
-// real tools. Day 2 is day 1 with the pond's second vertex moved, on day 1's
-// slots. With GEOCODER_WRITE_TESTDATA set this writes them instead.
+// geocoder/testdata/water_dir: the client files of a water dir on three
+// days, which tools/test_generate_patches.py diffs, patches and verifies
+// with the real tools. Day 2 is day 1 with the pond's second vertex moved,
+// on day 1's slots. Day 3 is day 2 with a pond of a water=* value of its own
+// and a sea, on day 2's slots: its water_meta.json lists one more kind and
+// its attribution.json credits Marine Regions. With GEOCODER_WRITE_TESTDATA
+// set this writes them instead.
 TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     const ScratchDir root("water-fixture");
-    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    const std::string one = root.path() + "/one", two = root.path() + "/two", three = root.path() + "/three";
     write(build(fixture()), one);
     Collected moved = fixture();
     REQUIRE(moved.closed_ways[0].way == 20);
     moved.closed_ways[0].vertices[1].lat_e7 += 300;
     write(build(moved, one), two, one);
+    Collected more = moved;
+    ObjectTags salt = tags(0, "Salzweiher");
+    salt.verbatim = "salt_pond";
+    more.closed_ways.push_back({33, salt, square(kLat + 600000, kLng, 1000)});
+    more.marine.push_back(marine_area(2350, marine::kSea, "North Sea", {{square(kLat - 20000000, kLng, 20000, 4)}}));
+    write(build(more, two), three, two);
     const std::string fixture_dir = std::string(GEOCODER_TESTDATA_DIR) + "/water_dir";
     const bool rewrite = std::getenv("GEOCODER_WRITE_TESTDATA") != nullptr;
-    for (const auto& [day, dir] : {std::pair<std::string, std::string>{"day1", one}, {"day2", two}}) {
+    std::map<std::string, std::map<std::string, std::vector<char>>> days;
+    for (const auto& [day, dir] : {std::pair<std::string, std::string>{"day1", one}, {"day2", two}, {"day3", three}}) {
         const auto written = tree(dir + "/water/all/exact");
         size_t client = 0;
         for (const auto& [name, bytes] : written) {
             if (name.size() > 8 && name.compare(name.size() - 8, 8, ".osm_ids") == 0) continue;
             client++;
+            days[day][name] = bytes;
             const std::string path = fixture_dir + "/" + day + "/" + name;
             if (rewrite) {
                 fs::create_directories(fs::path(path).parent_path());
@@ -752,4 +763,10 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
         }
         CHECK_EQ(client, size_t(10));
     }
+    for (const char* f : {"water_meta.json", "attribution.json"}) {
+        CHECK(days["day1"][f] == days["day2"][f]);
+        CHECK(days["day2"][f] != days["day3"][f]);
+    }
+    CHECK(text_of(days["day3"]["water_meta.json"]).find("\"type\": \"salt_pond\"") != std::string::npos);
+    CHECK(text_of(days["day3"]["attribution.json"]).find("marine-regions") != std::string::npos);
 }
