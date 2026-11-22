@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -131,8 +132,9 @@ class ScratchPbfCacheTest(unittest.TestCase):
     def test_only_yesterdays_pbf_is_read_from_the_shared_key_whatever_the_prefix(self):
         paths = re.findall(r"s3://\$CACHE_BUCKET/([^\"\s]*)", nightly())
         self.assertTrue(paths)
+        # And the scratch keys, which the live run's cleanup alone prunes (a scratch run's deletes its own key only).
         self.assertEqual([p for p in paths if not p.startswith("$PBF_CACHE/")],
-                         ["geocoder-cache/planet-${YESTERDAY}.osm.pbf"] * 2)
+                         ["geocoder-cache/planet-${YESTERDAY}.osm.pbf"] * 2 + ["geocoder-scratch/*", "geocoder-scratch/$name"])
         for name in ("Download PBF and previous indexes", "Build geocoder index", "Cleanup old cache bucket"):
             self.assertIn("PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}", step(name), name)
 
@@ -189,6 +191,45 @@ class ScratchPbfCacheTest(unittest.TestCase):
                                  ABORT, "  upload ended"])
         self.assertIn("stopping it", self.output)
 
+    # A scratch run deletes its own key afterwards, but not once cancelled, when its cleanup is skipped: the live run
+    # deletes what scratch runs left there over a day ago (no run lasts one) and keeps what is newer, beside the
+    # shared key's PBFs past the days it keeps.
+    def test_a_live_run_deletes_scratch_pbfs_left_over_a_day_ago(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        bucket, bin_dir, work = (os.path.join(root, d) for d in ("bucket", "bin", "work"))
+        objects = {"geocoder-cache/planet-2026-11-21.osm.pbf": 0, "geocoder-cache/planet-2026-11-20.osm.pbf": 0,
+                   "geocoder-cache/planet-2026-11-19.osm.pbf": 0,
+                   "geocoder-scratch/cancelled/planet-2026-11-19.osm.pbf": 2 * 86400,
+                   "geocoder-scratch/recent/planet-2026-11-20.osm.pbf": 3600}
+        for key, age in objects.items():
+            path = os.path.join(bucket, "cache", key)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(b"pbf")
+            os.utime(path, (time.time() - age, time.time() - age))
+        os.makedirs(bin_dir)
+        os.makedirs(work)
+        for tool, text in (("s5cmd", FAKE_BUCKET_S5CMD.format(python=sys.executable)), ("python3", "#!/bin/sh\nexit 0\n")):
+            with open(os.path.join(bin_dir, tool), "w") as f:
+                f.write(text)
+            os.chmod(os.path.join(bin_dir, tool), 0o755)
+        calls = os.path.join(root, "calls")
+        open(calls, "w").close()
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "PBF_CACHE": "geocoder-cache", "CACHE_BUCKET": "cache",
+               "CACHE_ENDPOINT": "http://cache.invalid", "CACHE_AWS_KEY": "k", "CACHE_AWS_SECRET": "s",
+               "NEW_DATE": "2026-11-21", "KEEP_CACHE_PBF_DAYS": "2", "WORKDIR": work, "GITHUB_WORKSPACE": "/ws",
+               "FAKE_BUCKET": bucket, "FAKE_CALLS": calls}
+
+        done = subprocess.run(["bash", "-e", "-c", step_script("Cleanup old cache bucket")], env=env, capture_output=True,
+                              text=True, timeout=60)
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        left = sorted(os.path.relpath(os.path.join(d, n), os.path.join(bucket, "cache"))
+                      for d, _, names in os.walk(bucket) for n in names)
+        self.assertEqual(left, ["geocoder-cache/planet-2026-11-20.osm.pbf", "geocoder-cache/planet-2026-11-21.osm.pbf",
+                                "geocoder-scratch/recent/planet-2026-11-20.osm.pbf"])
+
     def test_a_live_run_prunes_the_shared_key_and_aborts_its_stale_uploads(self):
         calls = self.run_cleanup("geocoder-cache")
 
@@ -197,13 +238,14 @@ class ScratchPbfCacheTest(unittest.TestCase):
         self.assertEqual(calls[-1], ABORT)
 
 
-# s5cmd over a bucket of files under $FAKE_BUCKET (s3://<bucket>/<key> is $FAKE_BUCKET/<bucket>/<key>): ls, cp and
-# rm of a prefix's every object (<prefix>/*, or <prefix>/<dir>/*<suffix> for ls), and cat of an object, each call
-# logged to $FAKE_CALLS. A
-# copy fails at its object number $FAKE_COPY_FAILS_AFTER, or passes over the key $FAKE_COPY_DROPS and says nothing;
-# with $FAKE_LIST_FAILS_AFTER_COPY set, every ls after a copy fails.
+# s5cmd over a bucket of files under $FAKE_BUCKET (s3://<bucket>/<key> is $FAKE_BUCKET/<bucket>/<key>): ls and rm of
+# an object or of the objects a pattern matches (* matches any run of characters, / included), as keys from the
+# pattern's last / before its first *, each with its file's time (UTC) as its last modification; cp of a prefix's
+# every object (<prefix>/*); and cat of an object. Each call is logged to $FAKE_CALLS. A copy fails at its object
+# number $FAKE_COPY_FAILS_AFTER, or passes over the key $FAKE_COPY_DROPS and says nothing; with
+# $FAKE_LIST_FAILS_AFTER_COPY set, every ls after a copy fails.
 FAKE_BUCKET_S5CMD = r"""#!{python}
-import os, shutil, sys
+import os, re, shutil, sys, time
 args = sys.argv[1:]
 with open(os.environ["FAKE_CALLS"]) as f:
     copied = any(" cp " in line for line in f)
@@ -212,11 +254,15 @@ with open(os.environ["FAKE_CALLS"], "a") as f:
 verb = next(a for a in args if a in ("ls", "cp", "rm", "cat"))
 urls = args[args.index(verb) + 1:]
 def local(url):
-    return os.path.join(os.environ["FAKE_BUCKET"], url[len("s3://"):].rsplit("*", 1)[0])
+    path = url[len("s3://"):]
+    head = path.split("*", 1)[0]
+    return os.path.join(os.environ["FAKE_BUCKET"], head[:head.rfind("/") + 1])
 def keys(url):
-    base, suffix = local(url), url.rsplit("*", 1)[1]
-    found = sorted(os.path.relpath(os.path.join(d, n), base) for d, _, names in os.walk(base) for n in names
-                   if n.endswith(suffix))
+    base = local(url)
+    rest = url[len("s3://"):][len(os.path.relpath(base, os.environ["FAKE_BUCKET"])) + 1:]
+    pattern = re.compile(".*".join(re.escape(part) for part in rest.split("*")) + "$")
+    found = sorted(k for k in (os.path.relpath(os.path.join(d, n), base) for d, _, names in os.walk(base) for n in names)
+                   if pattern.match(k))
     if not found:
         sys.exit("ERROR no object found")
     return found
@@ -224,14 +270,14 @@ if verb == "ls":
     if copied and os.environ.get("FAKE_LIST_FAILS_AFTER_COPY"):
         sys.exit("ERROR listing failed")
     for k in keys(urls[0]):
-        print(f"2026/11/20 06:45:24 {{os.path.getsize(os.path.join(local(urls[0]), k)):>15}}  {{k}}")
+        path = os.path.join(local(urls[0]), k)
+        print(f"{{time.strftime('%Y/%m/%d %H:%M:%S', time.gmtime(os.path.getmtime(path)))}} "
+              f"{{os.path.getsize(path):>15}}  {{k}}")
 elif verb == "rm":
     for k in keys(urls[0]):
         os.remove(os.path.join(local(urls[0]), k))
 elif verb == "cat":
-    if not os.path.isfile(local(urls[0])):
-        sys.exit("ERROR no object found")
-    with open(local(urls[0]), "rb") as f:
+    with open(os.path.join(local(urls[0]), keys(urls[0])[0]), "rb") as f:
         sys.stdout.buffer.write(f.read())
 else:
     for i, k in enumerate(keys(urls[0])):

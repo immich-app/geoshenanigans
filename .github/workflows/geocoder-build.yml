@@ -1613,8 +1613,9 @@ jobs:
       # Either aborts the bucket's multipart uploads begun over a day ago (a
       # stopped upload's parts among them): no run lasts a day, so none is a
       # running upload's, and a runner only scratch runs use is cleaned too.
-      # A run cancelled before here leaves its key to the prefix's next run,
-      # which reads nothing from it.
+      # A scratch run cancelled before here leaves its key to the next live
+      # run, whose cleanup deletes what the scratch keys hold from over a day
+      # ago.
       - name: Cleanup old cache bucket
         if: ${{ !cancelled() && steps.setup.outputs.cache_bucket != '' }}
         env:
@@ -1661,6 +1662,13 @@ jobs:
                 echo "  $name: DELETE"
                 $CACHE rm "s3://$CACHE_BUCKET/$PBF_CACHE/$name" >/dev/null 2>&1 || true
               fi
+            done
+            # What scratch runs cancelled before their own cleanup left under
+            # their keys more than a day ago (no run lasts one).
+            STALE=$(date -u -d '1 day ago' '+%Y/%m/%d %H:%M:%S')
+            for name in $($CACHE ls "s3://$CACHE_BUCKET/geocoder-scratch/*" 2>/dev/null | awk -v stale="$STALE" '$1 " " $2 < stale {print $NF}'); do
+              echo "  geocoder-scratch/$name: DELETE"
+              $CACHE rm "s3://$CACHE_BUCKET/geocoder-scratch/$name" >/dev/null 2>&1 || true
             done
           fi
 
