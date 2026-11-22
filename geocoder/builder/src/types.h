@@ -316,9 +316,9 @@ inline constexpr ArcTier kWaterArcTiers[] = {
 inline constexpr size_t kWaterArcTierCount = sizeof(kWaterArcTiers) / sizeof(kWaterArcTiers[0]);
 
 // Where the arc stage cuts its rings into arcs: at their junctions, or at
-// those and at the ends of their member ways too (the first vertex of each
-// way run of a ring of more than one), so that an edit to one way changes
-// only the arcs along it.
+// those and at the ends of their member ways too (each vertex where a
+// ring's way changes), so that an edit to one way changes only the arcs
+// along it.
 enum class ArcCuts : uint8_t { Junctions, JunctionsAndWayEnds };
 
 // One run of the arc stage: the tiers it builds (the minimal set only when

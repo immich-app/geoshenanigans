@@ -437,8 +437,11 @@ private:
 // `threads` threads, with the same result on any number and in any ring
 // order. Aborts (std::logic_error) unless each ring with way runs has them
 // over all of its edges. `phase_done` is told as each step ends. With
-// ArcCuts::JunctionsAndWayEnds, the first vertex of each way run of every
-// ring of more than one is a junction too, in every ring through it.
+// ArcCuts::JunctionsAndWayEnds, a vertex where a ring's way changes (the
+// first of a way run whose run before it, round the ring, is of another
+// way) is a junction too, in every ring through it: a ring that starts
+// partway along one way, its first and last runs that way's, is not cut at
+// its start.
 AdminArcs build_arc_topology(const AdminExactRings& store, unsigned threads,
                              const std::function<void(const char*)>& phase_done = {},
                              ArcCuts cuts = ArcCuts::Junctions);

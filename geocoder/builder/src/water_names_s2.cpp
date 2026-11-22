@@ -1,6 +1,7 @@
 // The naming join (water_names.h) over the river and canal areas' exact
-// rings: their L10 covering, the admin index's (admin_polygon_cells, with
-// interior flags), then each candidate segment's midpoint in it.
+// rings: their covering at the admin cell level, the admin index's
+// (admin_polygon_cells, with interior flags), then each candidate segment's
+// midpoint in it.
 #include "water_names_s2.h"
 
 #include <algorithm>

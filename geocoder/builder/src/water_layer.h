@@ -10,8 +10,10 @@
 //                                         holes, summed, square degrees)
 //   arc_index.bin + arc_vertices.bin      the tier's arcs (kWaterArcStage:
 //                                         rings cut at member way ends)
-//   admin_cells.bin + admin_entries.bin   the L10 cell index, interior where
-//                                         both tiers' rings hold the cell
+//   admin_cells.bin + admin_entries.bin   the cell index at the admin cell
+//                                         level (--admin-level, L10 by
+//                                         default), interior where both
+//                                         tiers' rings hold the cell
 //   strings_core.bin + strings_layout.json  its own names, alphabetical
 //   water_meta.json                       each type code it uses: class,
 //                                         type and Nominatim rank
