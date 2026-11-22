@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Tests for compress_index.py. Run: python3 -m unittest discover -s geocoder/builder/tools"""
+import fnmatch
 import hashlib
 import json
 import os
@@ -98,6 +99,8 @@ class CompressIndexTest(unittest.TestCase):
             "planet/full/geo_cells.bin": content(1),
             "planet/no-addresses/geo_cells.bin": content(1),
             "planet/full/strings_layout.json": b'{"tiers": []}',
+            "planet/full/attribution.json": b'[{"id": "osm"}]',
+            "planet/admin/attribution.json": b'[{"id": "osm"}]',
             "planet/full/addr_points.bin": content(2),
             "planet/full/street_ways.bin": content(5),
             "planet/admin/postcode_centroids.bin": content(6, 1600),
@@ -268,6 +271,55 @@ class CompressIndexTest(unittest.TestCase):
         sent_rel = [f"{rel}.zst" for rel in self.files if rel not in self.members] + list(self.units)
         expected = [f"cp {self.path(rel)} s3://bucket/day/{rel}" for rel in sent_rel]
         self.assertEqual(sorted(sent), sorted(expected))
+
+
+class TemplateAttributionTest(unittest.TestCase):
+    """The template's `attribution` list credits each source of the published data, and the
+    component of each mode dir lists the attribution.json the builder writes in it."""
+
+    def setUp(self):
+        self.cfg = load_template()
+        self.entries = self.cfg["attribution"]
+        self.components = self.cfg["components"]
+
+    def applies(self, entry):
+        return sorted(c for c in self.components if any(fnmatch.fnmatchcase(c, p) for p in entry["applies_to"]))
+
+    def test_credits_osm_geonames_and_tiger_under_their_licences(self):
+        self.assertEqual([e["id"] for e in self.entries], ["osm", "geonames", "tiger"])
+        self.assertEqual([e["licence"] for e in self.entries], ["ODbL 1.0", "CC BY 4.0", "Public domain"])
+        for e in self.entries:
+            self.assertEqual(set(e) - {"licence_url"}, {"id", "text", "url", "licence", "notices", "applies_to"}, e["id"])
+            self.assertTrue(e["text"] and e["url"].startswith("https://") and e["notices"], e["id"])
+        # Public domain has no licence to link.
+        self.assertEqual(["licence_url" in e for e in self.entries], [True, True, False])
+        self.assertEqual(self.entries[0]["text"], "© OpenStreetMap contributors")
+
+    def test_osm_applies_to_every_component_and_the_others_to_the_dirs_of_postcode_centroids(self):
+        for e in self.entries:
+            for pattern in e["applies_to"]:
+                self.assertTrue(fnmatch.filter(self.components, pattern), (e["id"], pattern))
+        self.assertEqual(self.applies(self.entries[0]), sorted(self.components))
+        centroids = sorted(c for c, comp in self.components.items()
+                           if any(f.endswith("/postcode_centroids.bin") for f in comp.get("files", []) + comp.get("optional_files", [])))
+        self.assertEqual(centroids, ["mode.admin", "mode.full", "mode.no-addresses"])
+        for e in self.entries[1:]:
+            self.assertEqual(self.applies(e), centroids, e["id"])
+
+    def test_each_mode_dir_lists_its_attribution_json(self):
+        holding = {c: f for c, comp in self.components.items() for f in comp.get("files", [])
+                   if os.path.basename(f) == "attribution.json"}
+        self.assertEqual(sorted(holding), ["dir.admin-minimal", "dir.admin-minimal-poi", "mode.admin", "mode.full", "mode.no-addresses"])
+        for c, f in holding.items():
+            self.assertEqual({os.path.dirname(g) for g in self.components[c]["files"]}, {os.path.dirname(f)}, c)
+
+    def test_the_compressor_publishes_every_file_a_component_lists(self):
+        names = {os.path.basename(f) for comp in self.components.values() for f in comp.get("files", []) + comp.get("optional_files", [])}
+        with tempfile.TemporaryDirectory() as out:
+            for name in names:
+                write(os.path.join(out, "planet", "dir", name), b"x")
+            published = {os.path.basename(p) for p in sut.index_files(out)}
+        self.assertEqual(published, names)
 
 
 if __name__ == "__main__":

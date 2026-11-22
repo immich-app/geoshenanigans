@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 
 #include "admin_arcs.h"
+#include "attribution.h"
 #include "exact_pip.h"
 #include "packed_location.h"
 #include "polygon_rings.h"
@@ -492,6 +493,9 @@ struct ParsedData {
     // native coordinate precision.
     struct PostcodeAccum {
         int64_t sum_lat_e7 = 0; int64_t sum_lng_e7 = 0; uint64_t count = 0;
+        // The source of the centroid (attribution.h): OSM's addresses, or
+        // the external set that filled a pair OSM has none for.
+        uint8_t source = ATTRIBUTION_OSM;
         void add(double lat, double lng) {
             sum_lat_e7 += to_e7(lat);
             sum_lng_e7 += to_e7(lng);

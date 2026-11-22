@@ -15,7 +15,9 @@
 // server takes its distance from. A fresh build writes its streets and
 // addresses in cell order, whatever their names, and its postcode centroids
 // in cell order in each mode dir, which a chained build writes as a fresh one
-// does.
+// does. Every mode dir credits the sources of the data it holds in
+// attribution.json: OpenStreetMap, GeoNames where a postcode centroid there
+// came from it, TIGER where an interpolation or a centroid did.
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -1311,4 +1313,89 @@ TEST(postcode_centroids_keep_no_slots_and_a_region_of_no_valid_postcode_has_file
         CHECK(none.at(at + postcode_files::CENTROIDS_FILE) == std::vector<char>({0, 0, 0, 0, 'P', 'C', 'C', '1'}));
         CHECK(none.at(at + postcode_files::CELLS_FILE).empty());
     }
+}
+
+namespace {
+
+// The ids of the entries the attribution.json at `path` lists, in order;
+// "none" for no such file.
+std::vector<std::string> credited(const std::map<std::string, std::vector<char>>& files, const std::string& path) {
+    const auto it = files.find(path);
+    if (it == files.end()) return {"none"};
+    const std::string text(it->second.begin(), it->second.end());
+    const std::string key = "\"id\": \"";
+    std::vector<std::string> ids;
+    for (size_t at = text.find(key); at != std::string::npos; at = text.find(key, at + 1)) {
+        const size_t from = at + key.size();
+        ids.push_back(text.substr(from, text.find('"', from) - from));
+    }
+    return ids;
+}
+
+}  // namespace
+
+TEST(each_mode_dir_credits_the_sources_of_its_data) {
+    const ScratchDir root("attribution-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    write_test_pbf(pbf, with_postcodes(postcoded_addresses()), 1000);
+    auto write = [](const std::string& path, const std::string& text) {
+        std::ofstream f(path, std::ios::binary);
+        f << text;
+        REQUIRE(f.good());
+    };
+    // GeoNames rows in London and of a Swiss postcode the fixture's addresses
+    // have, whose centroid OSM's takes; a TIGER range in New York, with its
+    // ZIP.
+    const std::string header = "postcode,lat,lon,country_code\n", swiss = "8004,47.0313,8.0333,CH\n";
+    const std::string london = root.path() + "/london.csv", zurich = root.path() + "/zurich.csv", tiger = root.path() + "/tiger";
+    write(london, header + "SW1A 1AA,51.501,-0.142,GB\n" + swiss);
+    write(zurich, header + swiss);
+    fs::create_directories(tiger);
+    write(tiger + "/36061.csv", "from;to;interpolation;street;city;state;postcode;geometry\n"
+                                "100;198;even;West 31st Street;New York;NY;10001;LINESTRING(-73.995 40.749,-73.993 40.750)\n");
+    auto build = [&](const std::string& name, std::vector<std::string> extra) {
+        const std::string out = root.path() + "/" + name;
+        std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf};
+        words.insert(words.end(), extra.begin(), extra.end());
+        REQUIRE(gctest::run(words, log));
+        return tree(out);
+    };
+    using Ids = std::vector<std::string>;
+    const Ids osm = {"osm"};
+
+    // London's centroid is in the planet and Europe, New York's range and
+    // its ZIP's centroid in the planet and North America; the admin-minimal
+    // dirs hold no postcodes, nor do boundary tiers or POI tiers credit.
+    const auto files = build("multi", {"--continents", "--multi-output", "--multi-quality", "--external-postcodes", london,
+                                       "--tiger-data", tiger});
+    const std::map<std::string, Ids> want = {
+        {"planet", {"osm", "geonames", "tiger"}}, {"europe", {"osm", "geonames"}}, {"north-america", {"osm", "tiger"}}};
+    for (const std::string& region : kRegions) {
+        const auto it = want.find(region);
+        for (const char* mode : {"full", "no-addresses", "admin"}) {
+            const std::string at = region + "/" + mode + "/attribution.json";
+            const Ids got = credited(files, at);
+            if (got != (it == want.end() ? osm : it->second)) std::printf("    %s\n", at.c_str());
+            CHECK(got == (it == want.end() ? osm : it->second));
+        }
+        for (const char* dir : {"admin-minimal", "admin-minimal-poi"})
+            if (kRegionsHeld.count(region)) CHECK(credited(files, region + "/" + dir + "/attribution.json") == osm);
+    }
+    size_t credits = 0;
+    for (const std::string& name : names_of(files)) {
+        if (fs::path(name).filename() != "attribution.json") continue;
+        credits++;
+        CHECK(name.find("/quality/") == std::string::npos && name.find("/poi/") == std::string::npos);
+    }
+    CHECK_EQ(credits, kRegions.size() * 3 + kRegionsHeld.size() * 2);
+
+    // A GeoNames row whose pair OSM holds gives no centroid, so no credit.
+    const auto taken = build("taken", {"--continents", "--multi-output", "--multi-quality", "--external-postcodes", zurich});
+    for (const char* region : {"planet", "europe"})
+        for (const char* mode : {"full", "no-addresses", "admin"})
+            CHECK(credited(taken, std::string(region) + "/" + mode + "/attribution.json") == osm);
+
+    // A whole dir, without the multi flags, credits its sources too.
+    const auto single = build("single", {"--tiger-data", tiger});
+    CHECK(credited(single, "planet/attribution.json") == Ids({"osm", "tiger"}));
 }

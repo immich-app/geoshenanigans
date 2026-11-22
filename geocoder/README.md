@@ -223,6 +223,7 @@ to the same files ([builder/PATCHING.md](builder/PATCHING.md#transport-units)).
 | `strings_core.bin`, `strings_street.bin`, `strings_addr.bin`, `strings_postcode.bin`, `strings_poi.bin` | Deduplicated string pool, in five tiers so each variant ships only the strings it uses; each tier front-coded in buckets cut by content (FCC2, `builder/src/string_files.h`), a string's id still its offset in the tier's pool |
 | `strings_layout.json` | Start and end of each string tier, which place every string offset |
 | `poi_meta.json` | POI category names and scoring parameters |
+| `attribution.json` | In each mode dir: the credit of the data it holds, one entry per source ([PATCHING.md](PATCHING.md#attribution)) |
 
 ## Building from Source
 
@@ -320,6 +321,18 @@ The server is designed to run inside memory-constrained deployments
 |----------|-------------|---------|
 | `GEOCODER_WORKER_THREADS` | Async worker pool size | `min(cores, 8)` |
 | `GEOCODER_ALLOW_ANONYMOUS` | `true` accepts requests without an API key, configuration changes included, with no rate limit: only for a server on a private container network | (disabled) |
+
+## Data and licences
+
+The indexes are a derivative database of [OpenStreetMap](https://www.openstreetmap.org/copyright)
+(© OpenStreetMap contributors, ODbL 1.0), with GB postcode centroids from
+[GeoNames](https://www.geonames.org/) (CC BY 4.0; contains Royal Mail data)
+and US address ranges and ZIP codes from the US Census Bureau's TIGER/Line
+files (public domain). The `attribution` list of each build's
+configurations.json gives every source's credit and licence, and each mode
+dir's `attribution.json` the ones of the data it holds
+([PATCHING.md](PATCHING.md#attribution)); show those wherever the data is
+shown. The licence below is the code's.
 
 ## License
 

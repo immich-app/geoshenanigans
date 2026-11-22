@@ -191,6 +191,9 @@ POI data is patched independently — each tier directory gets its own patch fil
 | `strings_layout.json` | — | String tier layout |
 | `poi_meta.json` | — | Category names, scoring parameters |
 
+The mode dir beside a POI tier credits the data in its `attribution.json`;
+the POI dirs hold OpenStreetMap data only, which that covers.
+
 ## Test Portal
 
 A web-based test tool is included for validating results:

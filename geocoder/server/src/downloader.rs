@@ -1105,7 +1105,9 @@ mod tests {
 
     // Index::load needs strings_layout.json in every region dir and
     // PoiMeta::load reads poi_meta.json; a selection that resolves without
-    // them downloads GiBs into a dir that can never load.
+    // them downloads GiBs into a dir that can never load. Every selection
+    // takes one mode dir, and with it that dir's attribution.json, the credit
+    // of the data the dataset holds.
     #[test]
     fn template_selections_include_load_sidecars() {
         let (v, c) = template();
@@ -1115,6 +1117,7 @@ mod tests {
             assert!(has("strings_layout.json"), "{:?} lacks strings_layout.json", s);
             assert!(has("admin_cells.bin"), "{:?} lacks admin_cells.bin", s);
             assert_eq!(has("poi_meta.json"), s.poi_tier != "none", "{:?} poi_meta.json", s);
+            assert_eq!(paths.iter().filter(|p| basename(p) == "attribution.json").count(), 1, "{:?} attribution.json", s);
         }
     }
 
@@ -1137,8 +1140,8 @@ mod tests {
     fn template_admin_minimal_takes_its_poi_dir_beside_a_poi_tier() {
         let (v, c) = template();
         let files = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin",
-                     "arc_index.bin", "arc_vertices.bin", "place_cells.bin", "place_hidden.bin", "place_nodes.bin", "strings_core.bin",
-                     "strings_layout.json"];
+                     "arc_index.bin", "arc_vertices.bin", "attribution.json", "place_cells.bin", "place_hidden.bin", "place_nodes.bin",
+                     "strings_core.bin", "strings_layout.json"];
         let minimal: Vec<RegionSelection> = template_selections(&v).into_iter()
             .filter(|s| s.mode == "admin-minimal" && s.region == "europe")
             .collect();

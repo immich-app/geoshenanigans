@@ -23,6 +23,7 @@
 
 #include "admin_cover.h"
 #include "admin_rank_config.h"
+#include "attribution.h"
 #include "geometry.h"
 #include "id_allocator.h"
 #include "parallel.h"
@@ -748,7 +749,9 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     // (Nominatim's clean_postcodes sanitizer), in cell order. They were
     // summed once on the full data (collect_postcode_centroids); continents
     // carry the ones whose centroid lies inside them. A region with postcodes
-    // of which none passes gets the files of no centroid.
+    // of which none passes gets the files of no centroid. `postcode_sources`
+    // gathers the sources of the centroids written (attribution.h).
+    uint8_t postcode_sources = 0;
     if (!data.postcode_accum.empty()) {
         write_futures.push_back(std::async(std::launch::async, [&] {
             auto _pt = std::chrono::steady_clock::now();
@@ -765,6 +768,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                     rejected++;
                     continue;
                 }
+                postcode_sources |= acc.source;
                 postcode_files::LogicalCentroid c;
                 c.lat = static_cast<float>(acc.lat());
                 c.lng = static_cast<float>(acc.lng());
@@ -808,6 +812,15 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 
     admin_future.get();
     for (auto& f : write_futures) f.get();
+
+    // The credit of the data written here: OpenStreetMap's, its postcode
+    // centroids' sources, and TIGER's where an interpolation written came
+    // from it (a SYNTHETIC identity, tiger.h).
+    const bool tiger_interps = write_addresses &&
+        std::any_of(data.interp_osm_ids.begin(), data.interp_osm_ids.end(), [](uint64_t id) {
+            return id >> 56 == static_cast<uint64_t>(gc::id_alloc::ObjectType::SYNTHETIC);
+        });
+    write_attribution(output_dir, ATTRIBUTION_OSM | postcode_sources | (tiger_interps ? ATTRIBUTION_TIGER : 0));
     log_phase((label + "total").c_str(), _total_t, _total_c);
 }
 
@@ -1243,6 +1256,8 @@ void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, con
 
     string_files::write_file(dir + "/" + STR_TIER_FILENAMES[0], strings.core.data(), strings.core.size());
     write_strings_layout(dir, strings.bases);
+    // OpenStreetMap's data alone: admin-minimal holds no postcodes.
+    write_attribution(dir, ATTRIBUTION_OSM);
 
     size_t kept = 0;
     for (uint32_t p : records.polygon_of) kept += p != NO_DATA;

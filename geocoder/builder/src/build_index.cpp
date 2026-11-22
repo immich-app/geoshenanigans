@@ -338,6 +338,7 @@ static void load_external_postcodes(ParsedData& data, const std::string& path,
         auto [it, added] = data.postcode_accum.try_emplace(postcode_key(rows[i].cc, ids[i]));
         if (added) {
             it->second.add(rows[i].lat, rows[i].lng);
+            it->second.source = ATTRIBUTION_GEONAMES;
             loaded++;
         }
     }

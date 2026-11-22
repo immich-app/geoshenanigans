@@ -835,10 +835,11 @@ jobs:
 
           # The compressor writes into the volume the diffs and verifies use
           # for scratch: at most the bytes of the files it compresses (every
-          # .bin, the load sidecars, the search indexes). The patch jobs leave
+          # .bin, the JSON files, the search indexes). The patch jobs leave
           # that much of the free space alone.
           RESERVE_KIB=$(find "$WORKDIR/output" -type f \
-            \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -path '*/search/*' \) \
+            \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -name attribution.json \
+            -o -path '*/search/*' \) \
             ! -name '*.zst' -printf '%s\n' | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}')
 
           # Per variant: diff, apply to a scratch copy, verify the whole client

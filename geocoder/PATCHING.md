@@ -11,7 +11,8 @@ builds/
     planet/
       full/            *.bin.zst + places.tt.zst + street_ways.tt.zst
                        + interp_ways.tt.zst + addr_index.tt.zst
-                       + strings_layout.json(.zst) + patch.gcpatch
+                       + strings_layout.json(.zst) + attribution.json(.zst)
+                       + patch.gcpatch
       no-addresses/    ... (places, street_ways units)
       admin/           ... (places unit)
       admin-minimal/   ... (places, arcs, admin_polygons units)
@@ -46,11 +47,11 @@ A complete geocoder index for a given region and configuration consists of files
 
 | Mode | Files | Description |
 |------|-------|-------------|
-| `full/` | 23 files (+3 optional) | Streets + addresses + interpolation + admin + postcodes |
-| `no-addresses/` | 16 files (+2 optional) | Streets + admin + postcodes (no address points) |
-| `admin/` | 8 files (+2 optional) | Admin cell indexes + place nodes + postcodes |
-| `admin-minimal/` | 11 files | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified to within 37.5 m on an 11 m grid (a ring that grid would collapse keeps the 1.1 m one; takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
-| `admin-minimal-poi/` | 11 files | The same, on the shared polygon slots and core strings that a POI tier's parent polygons and names point into (a dropped polygon's slot holds a tombstone), with the same arc files. The admin-minimal mode's dir beside a POI tier |
+| `full/` | 24 files (+3 optional) | Streets + addresses + interpolation + admin + postcodes |
+| `no-addresses/` | 17 files (+2 optional) | Streets + admin + postcodes (no address points) |
+| `admin/` | 9 files (+2 optional) | Admin cell indexes + place nodes + postcodes |
+| `admin-minimal/` | 12 files | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified to within 37.5 m on an 11 m grid (a ring that grid would collapse keeps the 1.1 m one; takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
+| `admin-minimal-poi/` | 12 files | The same, on the shared polygon slots and core strings that a POI tier's parent polygons and names point into (a dropped polygon's slot holds a tombstone), with the same arc files. The admin-minimal mode's dir beside a POI tier |
 
 Optional files are written only when the data has them; see `optional_files`
 under configurations.json below. The admin-minimal mode picks its dir by the
@@ -62,6 +63,10 @@ The place nodes come as three files: `place_cells.bin` (each admin cell's
 first row), `place_nodes.bin` (the visible nodes in cell order, bit-packed)
 and `place_hidden.bin` (the ones a boundary hides), which the server reads
 as they are.
+
+Every mode dir holds `attribution.json`, the credit of the data it holds
+(Attribution, below). A selection takes one mode dir, so every dataset holds
+its credit at `<dataset>/attribution.json`.
 
 ### Quality directory (pick one)
 
@@ -218,11 +223,12 @@ The entry point for all clients:
 
 Each build date has a `configurations.json` covering both the per-build
 metadata (formerly in `manifest.json`) and the schema that drives the
-client UI — axes (region/mode/quality/poi_tier), components (which
-files belong to each axis value), constraints, presets, the flat
-`files` map keyed by relative path with `size_raw`/`sha256` and either
-`size_zst` (the file's own `.zst`) or `unit` (the transport unit that holds
-it), and the `units` map of the build's transport units:
+client UI — the credit of the data (`attribution`, below), axes
+(region/mode/quality/poi_tier), components (which files belong to each
+axis value), constraints, presets, the flat `files` map keyed by relative
+path with `size_raw`/`sha256` and either `size_zst` (the file's own `.zst`)
+or `unit` (the transport unit that holds it), and the `units` map of the
+build's transport units:
 
 ```json
 {
@@ -235,6 +241,7 @@ it), and the `units` map of the build's transport units:
     "built_at": "2026-04-10T09:00:14Z",
     "wikidata_date": "2026-04-08"
   },
+  "attribution": [ { "id": "osm", "text": "© OpenStreetMap contributors", "licence": "ODbL 1.0", ... }, ... ],
   "axes":        { "region": { ... }, "mode": { ... }, ... },
   "components":  { "mode.full": { "files": ["{region}/full/...", ... ] }, ... },
   "constraints": [ { "when": { "mode": "admin-minimal" }, "requires": { "quality": "simplified" } } ],
@@ -255,10 +262,10 @@ it), and the `units` map of the build's transport units:
 }
 ```
 
-The static portions (axes/components/constraints/presets/transport) come
-from `geocoder/builder/configurations.template.json` and are stable across
-builds. CI splices in `build.*` and the `files` and `units` tables during
-the build's compress step. `transport` lists the units a dir publishes when
+The static portions (attribution/axes/components/constraints/presets/
+transport) come from `geocoder/builder/configurations.template.json` and are
+stable across builds. CI splices in `build.*` and the `files` and `units`
+tables during the build's compress step. `transport` lists the units a dir publishes when
 it holds all of their files; `units` the ones this build has, each with its
 kind, the transport version it was written in, its bytes on the wire and its
 files. A client refuses a unit of a `transport_version` it doesn't read.
@@ -272,8 +279,39 @@ selection: the first variant whose `when` names the selection's value on
 every axis it lists (a variant without `when` takes any selection). Its
 `component` is resolved like an axis component, `files`, `optional_files`,
 `replaces` and all.
-`strings_layout.json` and `poi_meta.json` are listed and compressed like
-the `.bin` files, because the server can't load a region without them.
+`strings_layout.json`, `poi_meta.json` and `attribution.json` are listed
+and compressed like the `.bin` files: the server can't load a region without
+the first two, and the last is the credit the data is owed.
+
+## Attribution
+
+The data is owed credit, and the dataset carries it in two places:
+
+- **`attribution`** in configurations.json: a list of every source, each with
+  an `id`, the `text` to show, the source's `url`, its `licence` (and
+  `licence_url`, but for public domain), the `notices` it must travel with,
+  verbatim, and the components whose files can hold its data
+  (`applies_to`, patterns over the component names):
+
+  | `id` | Source | Licence | In |
+  |---|---|---|---|
+  | `osm` | OpenStreetMap: the dataset is a derivative database of it | ODbL 1.0 | every dir |
+  | `geonames` | GeoNames: postcode centroids where OSM has none (GB_full, which the nightly loads), with the Royal Mail notice of its readme | CC BY 4.0 | the dirs of `full`, `no-addresses` and `admin`, the ones holding postcode centroids |
+  | `tiger` | US Census Bureau TIGER/Line: US address ranges and ZIPs, and postcode centroids where OSM has none | Public domain, credited as a courtesy | the same |
+
+- **`attribution.json`** in every mode dir (`full/`, `no-addresses/`,
+  `admin/`, `admin-minimal/`, `admin-minimal-poi/`): a JSON array of the
+  entries above, without `applies_to`, of the sources of the data that dir
+  holds, in the list's order. OSM's is always there; GeoNames's where the dir
+  holds a postcode centroid that came from it, TIGER's where it holds an
+  interpolation or a centroid that did (so `europe/admin/` credits GeoNames,
+  `north-america/full/` TIGER, and the admin-minimal dirs, which hold no
+  postcodes, OSM alone). The quality and POI dirs hold OpenStreetMap data
+  only, which the mode dir's OSM entry covers.
+
+A client shows the entries of the `attribution.json` it holds wherever it
+credits map data. Every reverse answer also carries Nominatim's `licence`
+string (README.md).
 
 ## Client Decision Tree
 
@@ -292,11 +330,12 @@ the `.bin` files, because the server can't load a region without them.
      above) and each checked against its sha256; a selection takes every
      file of each unit it needs
    - any other: as <path>.zst, decompressed and checked against its sha256
-   - builds/{date}/europe/full/…                (23 files + up to 4 optional)
+   - builds/{date}/europe/full/…                (24 files + up to 3 optional)
    - builds/{date}/europe/quality/simplified/…  (4 files)
    - builds/{date}/europe/poi/notable/…         (7 files, optional)
-   The JSON files (strings_layout.json, poi_meta.json) are part of the set:
-   the server can't load a region without them.
+   The JSON files (strings_layout.json, poi_meta.json, attribution.json)
+   are part of the set: the server can't load a region without the first
+   two, and the last is the dataset's credit (Attribution, above).
 6. Store build_version, patch_version, and date locally
 ```
 
