@@ -227,10 +227,12 @@ Where Nominatim's rank adjustment matters:
   millimetres: a way of a `type=waterway` relation counts for that relation,
   any other for its own local `name`, so one river under several `name:en` stays
   one. Its name follows the dataset's name rule, `name:en` else `name`: the
-  relation's `name:en`, else the name its river ways show over the most length
-  (each its own `name:en`, else its `name`, else the relation's), a tie going to
-  the smaller name, so one way's `name:en` doesn't rename the river. A river
-  mapped only as a line has no area and gets no `water`.
+  relation's own `name:en`; else, where its river ways that carry a `name:en`
+  hold more than half of its river length (whole millimetres, none counted
+  across a missing node), the `name:en` of the most length among them, a tie
+  going to the smaller name; else the relation's `name`. So neither one way's
+  `name:en` nor a reach's local name renames the river. A river mapped only as
+  a line has no area and gets no `water`.
 - **Kinds out of scope**, as in Nominatim: unnamed water (but river and canal
   areas, above), `water=stream|ditch|drain|fish_pass`, `water=*` without
   `natural=water`, `natural=coastline`. Left out for the Marine Regions areas:
