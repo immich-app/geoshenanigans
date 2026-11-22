@@ -263,17 +263,20 @@ class TestPortalTest(unittest.TestCase):
             for notice in entry["notices"]:
                 self.assertIn(notice, source, entry["id"])
 
-    # The credit is one line until opened, a summary of the sources, and opened its notices scroll
-    # in a box of bounded height: on a short screen the results keep their room and every link of
-    # the credit stays reachable.
+    # The credit is one line until opened, a summary of the sources, and opened it scrolls in a box
+    # of bounded height that gives up room where the sidebar has none: on a short screen the results
+    # keep their room and every link of the credit stays reachable.
     def test_the_page_keeps_its_credit_behind_a_summary_that_opens_a_bounded_box(self):
         with open(os.path.join(PORTAL, "index.html"), encoding="utf-8") as f:
             page = f.read()
         credit = re.findall(r'<footer class="data-credit">(.*?)</footer>', page, re.S)
         self.assertEqual(len(credit), 1)
-        self.assertRegex(credit[0], re.compile(r'^\s*<details>\s*<summary>[^<]+</summary>\s*<div class="credit-notices">'
-                                               r'(?:(?!</?details).)*</div>\s*</details>\s*$', re.S))
-        self.assertRegex(page, r"\.data-credit \.credit-notices \{[^}]*max-height: \d+vh;[^}]*overflow-y: auto;")
+        self.assertRegex(credit[0], re.compile(r'^\s*<details>\s*<summary>[^<]+</summary>(?:(?!</?details).)*</details>\s*$',
+                                               re.S))
+        box = re.findall(r"\n  \.data-credit \{([^}]*)\}", page)
+        self.assertEqual(len(box), 1)
+        for rule in (r"flex: 0 1 auto;", r"max-height: \d+vh;", r"overflow-y: auto;"):
+            self.assertRegex(box[0], rule)
 
     def unit_of(self, name):
         """The transport unit entrypoint.sh --unit-of fetches a file through, or ""."""
