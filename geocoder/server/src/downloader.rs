@@ -736,7 +736,9 @@ thread_local! {
 /// whose ledger was lost); a file of another name stays. Their lines go when
 /// the ledger is rewritten. A file goes in the region dir by its name, or in
 /// the sub-dir its component's `dir` names (`water/`), where the ledger and
-/// the removal name it by its place (`water/admin_polygons.bin`). The dir's
+/// the removal name it by its place (`water/admin_polygons.bin`); a sub-dir
+/// that is a link or a file fails the download before it writes anything,
+/// which writes nothing through a link. The dir's
 /// stamp (BUILD_STAMP) says it holds a complete selection of the build it
 /// names and none of those files: a download that fetches or removes
 /// anything makes the ledger where the dir has none, then removes the stamp,
@@ -797,13 +799,27 @@ pub async fn download_region(
         .map_err(|e| DownloadError::Io(format!("mkdir {}: {}", region_dir.display(), e)))?;
     // Held until the download returns.
     let _lock = download_lock(&region_dir).await?;
+    // A sub-dir is a dir of the region dir's own, or not there yet: through
+    // a link (to another dataset's dir, which the lock doesn't guard) or onto
+    // a file nothing is finished, removed or fetched.
+    for sub in &sub_dirs {
+        let path = region_dir.join(sub);
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(m) if m.is_dir() => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(DownloadError::Io(format!("{} is a link or a file, not a dir: a download writes nothing through it", path.display())));
+            }
+            Err(e) => return Err(DownloadError::Io(format!("stat {}: {}", path.display(), e))),
+        }
+    }
     // The only change to the dir's files before the ledger is made and the
     // stamp removed: the leftovers are those of decodes a download ran once
     // it had done both, in a dir that holds the ledger and no stamp since,
     // which no server loads. Units decode into the sub-dirs too.
     finish_leftovers(&region_dir).await?;
     for sub in &sub_dirs {
-        if tokio::fs::metadata(region_dir.join(sub)).await.is_ok_and(|m| m.is_dir()) {
+        if there(&region_dir.join(sub)).await? {
             finish_leftovers(&region_dir.join(sub)).await?;
         }
     }
@@ -1886,6 +1902,40 @@ mod tests {
                 assert_eq!(bucket.files_served(), 0, "{component} {dir}");
                 assert!(killed.join(".earlier.notes.txt").exists(), "{component} {dir}");
                 assert!(!root.path().join("europe").join(FILE_LEDGER).exists(), "{component} {dir}");
+            }
+        }
+    }
+
+    // A download writes nothing through a link: where the region's water
+    // dir is a link (to another dataset's water dir, say) or a file, it is
+    // refused before anything is fetched, finished, removed or written, the
+    // selection taking water or not, and the other dataset's files stay as
+    // they were.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_water_dir_that_is_a_link_or_a_file_is_refused_before_anything_is_written() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let water_all = wet("europe", "admin", "simplified", "none", "all");
+        for after in [water_all.clone(), sel("europe", "admin", "simplified", "none")] {
+            for link in [true, false] {
+                let (root, other) = (ScratchDir::new(), ScratchDir::new());
+                download(&bucket, &water_all, other.path()).await.unwrap();
+                let (theirs, served) = (held(&other.path().join("europe")), bucket.files_served());
+                let dir = root.path().join("europe");
+                std::fs::create_dir(&dir).unwrap();
+                if link {
+                    std::os::unix::fs::symlink(other.path().join("europe/water"), dir.join("water")).unwrap();
+                } else {
+                    std::fs::write(dir.join("water"), "not a dir").unwrap();
+                }
+
+                let got = download(&bucket, &after, root.path()).await.map_err(|e| e.to_string());
+
+                let case = format!("water {}, link: {link}", after.water);
+                assert_eq!(got, Err(format!("I/O error: {} is a link or a file, not a dir: a download writes nothing through it", dir.join("water").display())), "{case}");
+                assert_eq!(bucket.files_served(), served, "{case}");
+                assert!(held(&other.path().join("europe")) == theirs, "{case}");
+                assert!(!dir.join(FILE_LEDGER).exists(), "{case}");
             }
         }
     }
