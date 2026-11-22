@@ -288,7 +288,9 @@ struct ArcTier {
     // Whether a ring valid as OSM has it that the tier's grid collapses with
     // every vertex kept (under 3 vertices or of no area: a pond within a
     // step or two of the grid) keeps its arcs, and their junctions, on the e7
-    // grid: areas small enough to fit between the grid's points.
+    // grid: areas small enough to fit between the grid's points. So does a
+    // ring that such a junction, on the e7 grid among its vertices on the
+    // tier's, collapses in turn.
     bool collapsing_rings_on_e7 = false;
     bool simplifies() const { return tolerance_m > 0; }
     bool coarsens() const { return grid_e7 > fine_grid_e7; }

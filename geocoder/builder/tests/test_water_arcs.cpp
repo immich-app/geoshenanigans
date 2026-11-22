@@ -237,3 +237,24 @@ TEST(a_pond_within_one_step_of_the_simplified_grid_keeps_its_shore_on_the_e7_gri
     // The boundary tiers' grid is as it was.
     CHECK_EQ(build_arc_tier(arcs, store, kArcTiers[0], nests, 1).counts.degenerate_rings, size_t(2));
 }
+
+TEST(a_ring_the_ponds_shore_on_the_e7_grid_would_flatten_keeps_its_own_shore_on_the_e7_grid) {
+    // A pond within one point of the 100 grid, and a triangle meeting its
+    // shore at a vertex. Snapped whole the triangle holds an area; with that
+    // vertex on the e7 grid, where the pond keeps it, and its others snapped,
+    // its three vertices lie on one line.
+    const int32_t lat = 470000000, lng = 80000000;
+    AdminExactRings store;
+    store.append(closed({pt(lat + 10, lng + 20), pt(lat + 10, lng + 45), pt(lat + 40, lng + 45), pt(lat + 40, lng + 20)}), {});
+    store.append(closed({pt(lat + 40, lng + 20), pt(lat + 190, lng + 510), pt(lat + 110, lng + 190)}), {});
+    const AdminArcs arcs = build_arc_topology(store, 1, {}, ArcCuts::JunctionsAndWayEnds);
+    const std::vector<bool> nests = exact_rings_nest(store, 1);
+    const ArcTierState water = build_arc_tier(arcs, store, water_simplified(), nests, 1);
+    CHECK_EQ(water.counts.degenerate_rings, size_t(0));
+    CHECK_EQ(water.counts.e7_collapsing_rings, size_t(2));
+    std::vector<PackedLocation> ring, raw;
+    std::vector<StoredVertex> stored;
+    tier_ring(arcs, store, water_simplified(), water, 1, ring, raw, stored);
+    CHECK(exact_ring_area2(ring.data(), static_cast<uint32_t>(ring.size())) != 0);
+    for (const PackedLocation& v : ring) CHECK(v.lat_e7 % 100 != 0);
+}

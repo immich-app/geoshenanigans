@@ -471,18 +471,26 @@ public:
 
     // Puts the arcs of every ring of the set valid as OSM has it that the
     // tier's grid collapses with every vertex kept (collapses_whole) on the
-    // e7 grid, with their junctions (keep_arcs_on_e7_grid). Returns how many
-    // rings.
+    // e7 grid, with their junctions (keep_arcs_on_e7_grid); then the same for
+    // the rings of the arcs that changed, which a junction on the e7 grid
+    // can collapse in turn, round after round until none does. Returns how
+    // many rings.
     size_t keep_collapsing_rings_on_e7_grid() {
-        const std::vector<uint32_t> collapsing = collect_in_order<uint32_t, Scratch>(rings_.size(),
-            [&](size_t k, std::vector<uint32_t>& out, Scratch& s) {
-                if (collapses_whole(rings_[k], s)) out.push_back(rings_[k]);
-            }, threads_);
-        std::vector<uint32_t> whole;
-        for (uint32_t r : collapsing)
-            for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) whole.push_back(set_.refs()[k].arc);
-        keep_arcs_on_e7_grid(std::move(whole));
-        return collapsing.size();
+        std::vector<uint32_t> suspects = rings_;
+        size_t rings = 0;
+        while (!suspects.empty()) {
+            const std::vector<uint32_t> collapsing = collect_in_order<uint32_t, Scratch>(suspects.size(),
+                [&](size_t k, std::vector<uint32_t>& out, Scratch& s) {
+                    if (collapses_whole(suspects[k], s)) out.push_back(suspects[k]);
+                }, threads_);
+            rings += collapsing.size();
+            std::vector<uint32_t> whole;
+            for (uint32_t r : collapsing)
+                for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) whole.push_back(set_.refs()[k].arc);
+            const std::vector<uint32_t> changed = keep_arcs_on_e7_grid(std::move(whole));
+            suspects = changed.empty() ? std::vector<uint32_t>() : rings_of(changed);
+        }
+        return rings;
     }
 
     // Gives a ring that is degenerate once snapped (under 3 vertices, or no
@@ -1090,8 +1098,8 @@ private:
         return valid(s.ring);
     }
     // Whether ring r is valid as OSM has it, under 3 vertices or of no area
-    // on the tier's grid with every vertex kept, each once where its
-    // neighbour repeats it.
+    // with every vertex kept, each on the grid its arc's marks put it on (the
+    // tier's for an arc of none), each once where its neighbour repeats it.
     bool collapses_whole(uint32_t r, Scratch& s) const {
         const RingSpan& span = store_.rings[r];
         const PackedLocation* v = store_.vertices.data() + span.begin;
@@ -1099,9 +1107,15 @@ private:
         if (s.ring.size() >= 2 && s.ring.front() == s.ring.back()) s.ring.pop_back();
         if (!valid(s.ring)) return false;
         s.ring.clear();
-        for (uint32_t i = 0; i < span.count; i++) {
-            const PackedLocation p = snapped(v[i], tier_.grid_e7);
-            if (s.ring.empty() || s.ring.back() != p) s.ring.push_back(p);
+        for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) {
+            const ArcRef ref = set_.refs()[k];
+            set_.read(ref.arc, s.raw);
+            const uint32_t n = static_cast<uint32_t>(s.raw.size());
+            for (uint32_t j = 0; j < n; j++) {
+                const uint32_t i = ref.reversed ? n - 1 - j : j;
+                const PackedLocation p = snapped(s.raw[i], vertex_grid_e7(tier_, grid_[ref.arc], i, n));
+                if (s.ring.empty() || s.ring.back() != p) s.ring.push_back(p);
+            }
         }
         if (s.ring.size() >= 2 && s.ring.front() == s.ring.back()) s.ring.pop_back();
         return !valid(s.ring);
