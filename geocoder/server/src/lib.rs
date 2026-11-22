@@ -107,6 +107,15 @@ impl FileBytes {
         }
     }
 
+    /// Hints how a mapped file is read from here on: in order, where the kernel reads ahead of
+    /// each fault, or at random (as mmap_file maps it), where it reads only the page a fault
+    /// needs. Never changes what a read returns; a no-op for owned bytes.
+    pub fn advise_in_order(&self, in_order: bool) {
+        if let Self::Mmap(m) = self {
+            let _ = m.advise(if in_order { memmap2::Advice::Sequential } else { memmap2::Advice::Random });
+        }
+    }
+
     /// Hints that the byte at `off` is read soon, so its cache miss can overlap other work. Never
     /// changes what a read returns; a no-op past the end and on targets other than x86_64.
     #[inline]

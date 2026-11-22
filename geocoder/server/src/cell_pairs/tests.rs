@@ -403,3 +403,70 @@ fn damaged_ranges_never_panic_and_stay_in_the_rows() {
     }
     assert!(opened > 0 && refused > 0);
 }
+
+/// The pages of the mapped `bytes` in the page cache, and all of its pages.
+#[cfg(target_os = "linux")]
+fn resident(bytes: &FileBytes) -> (usize, usize) {
+    let (s, page) = (bytes.as_slice(), page_size());
+    let mut held = vec![0u8; s.len().div_ceil(page)];
+    // SAFETY: the range is the mapping's, and `held` has a byte for each of its pages.
+    assert_eq!(unsafe { libc::mincore(s.as_ptr() as *mut libc::c_void, s.len(), held.as_mut_ptr()) }, 0);
+    (held.iter().filter(|&&b| b & 1 != 0).count(), held.len())
+}
+
+#[cfg(target_os = "linux")]
+fn page_size() -> usize {
+    // SAFETY: sysconf reads a constant.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+}
+
+/// The faults of this thread that read a page from its file so far.
+#[cfg(target_os = "linux")]
+fn major_faults() -> i64 {
+    // SAFETY: getrusage fills the struct it is given.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) }, 0);
+    usage.ru_majflt as i64
+}
+
+/// The flags /proc/self/smaps gives the mapping that starts where `bytes` does.
+#[cfg(target_os = "linux")]
+fn vm_flags(bytes: &FileBytes) -> String {
+    let start = format!("{:x}-", bytes.as_slice().as_ptr() as usize);
+    let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+    smaps.lines().skip_while(|l| !l.starts_with(&start)).find(|l| l.starts_with("VmFlags:")).unwrap().to_string()
+}
+
+// The open checks the whole cells file, in order: a mapped one is read ahead meanwhile, not
+// faulted in a page at a time (on a slow disk a read a page, ~800 for a planet water dir's), and
+// mapped for random reads again once open, as for the lookups. Where the file's pages can't be
+// dropped from the cache (a temp dir in memory) there is nothing to see.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_mapped_cells_file_is_read_ahead_while_its_open_checks_it() {
+    use std::os::fd::AsRawFd;
+    let lists: Vec<(u64, Vec<u32>)> = (0..6144u64).flat_map(|p| (0..64u64).map(move |c| (cell(p << 10 | c * 16), vec![p as u32]))).collect();
+    let (cells, entries) = write(&lists, ADMIN);
+    let dir = crate::scratch_dir::ScratchDir::new();
+    let path = dir.path().join("admin_cells.bin");
+    std::fs::write(&path, &cells).unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    file.sync_all().unwrap();
+    // SAFETY: an advice on a file open for reading.
+    assert_eq!(unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) }, 0);
+    let mapped = crate::mmap_file(path.to_str().unwrap()).unwrap();
+    let (held, pages) = resident(&mapped);
+    if held == pages {
+        eprintln!("{}: its pages stay in the cache, nothing to see", path.display());
+        return;
+    }
+
+    let before = major_faults();
+    let index = CellPairs::open(mapped, FileBytes::Owned(entries), ADMIN, DEFAULT_ADMIN_CELL_LEVEL).unwrap();
+    let faults = major_faults() - before;
+
+    assert!(pages > 200 && faults * 4 < pages as i64, "{faults} faults read pages of its {pages} ({held} in the cache before)");
+    let flags = vm_flags(&index.cells);
+    assert!(flags.contains(" rr") && !flags.contains(" sr"), "{flags}");
+    assert_eq!(index.with_ids(cell(6143 << 10 | 63 * 16), |ids| ids.to_vec()), [6143]);
+}
