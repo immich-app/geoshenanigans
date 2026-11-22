@@ -430,6 +430,41 @@ sut.run_logged = run_logged
 """
         self.assert_child_run_fails(plant, "planted failure holding the unit's threads")
 
+    # A file whose compression fails ends the run with its error once the zstds already running end: no job behind
+    # it starts one, neither those still queued nor the one a worker holds as it waits for its threads, though each
+    # would take its threads in turn and run its zstd, for up to its own limit, before the error got out.
+    def test_a_file_that_fails_ends_the_run_with_no_job_behind_it_starting_its_zstd(self):
+        started = os.path.join(self.tmp.name, "zstd-started")
+        write(self.path("planet/full/slow.bin"), content(20, 600_000))
+        write(self.path("planet/full/fails.bin"), content(21, 500_000))
+        # 2 CPUs, so 2 workers: slow.bin, the largest, takes both CPUs and its zstd takes 2 s; fails.bin, next, fails
+        # meanwhile, and its worker then takes the next job, which waits for slow.bin's threads.
+        plant = f"""
+import subprocess, time
+sut.cpu_budget = lambda: 2
+real_run = subprocess.run
+def run(cmd, **kw):
+    if cmd[0] == "zstd":
+        with open({started!r}, "a") as f:
+            f.write(os.path.relpath(cmd[-1], {self.out!r}) + "\\n")
+        if cmd[-1].endswith("planet/full/slow.bin"):
+            time.sleep(2)
+    return real_run(cmd, **kw)
+subprocess.run = run
+real = sut.compress
+def compress(ticket, path, threads):
+    if path.endswith("planet/full/fails.bin"):
+        raise subprocess.CalledProcessError(1, ["zstd", path])
+    return real(ticket, path, threads)
+sut.compress = compress
+"""
+        done = self.child_run(plant)
+
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("planet/full/fails.bin']' returned non-zero exit status 1", done.stderr)
+        with open(started) as f:
+            self.assertEqual(f.read().splitlines(), ["planet/full/slow.bin"])
+
     def assert_child_run_fails(self, plant, error):
         done = self.child_run(plant)
         self.assertNotEqual(done.returncode, 0, done.stdout)

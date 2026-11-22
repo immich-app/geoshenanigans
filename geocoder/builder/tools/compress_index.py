@@ -63,7 +63,8 @@ end, in seconds from the run's start, and its threads.
 A child that stalls (CHILD_SECONDS) is killed and fails its item: a unit's
 goes as .zst, and a file's ends the run with the error, for the caller to
 compress again, rather than holding its threads, and every item behind them,
-until the job's timeout.
+until the job's timeout. An error that ends the run ends it once the children
+still running end: no item still waiting for its threads starts one.
 """
 import argparse
 import hashlib
@@ -76,7 +77,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecutor, wait
 from itertools import count
 
 LEVEL = "-18"
@@ -146,26 +147,35 @@ def threads_for(size, cpus):
 class Cpus:
     """The thread slots the zstd processes share, one a CPU. Jobs queue for theirs in submission order (a ticket
     each) and take them once they are free, so no more zstd threads run than there are CPUs and a big job is never
-    passed by the smaller ones behind it."""
+    passed by the smaller ones behind it. Once stopped, a job waiting for its threads, or asking for them later, gets
+    CancelledError instead."""
 
     def __init__(self, n):
         self.free, self.turn, self.cv = n, 0, threading.Condition()
         self.numbers = count()
+        self.stopped = False
 
     def ticket(self):
         return Ticket(self, next(self.numbers))
 
     def take(self, number, n):
         with self.cv:
-            self.cv.wait_for(lambda: self.turn == number and self.free >= n)
+            self.cv.wait_for(lambda: self.stopped or self.turn == number and self.free >= n)
+            if self.stopped:
+                raise CancelledError("the run ended before this job's turn")
             self.free -= n
             self.turn += 1
             self.cv.notify_all()
 
     def skip(self, number):
         with self.cv:
-            self.cv.wait_for(lambda: self.turn == number)
+            self.cv.wait_for(lambda: self.stopped or self.turn == number)
             self.turn += 1
+            self.cv.notify_all()
+
+    def stop(self):
+        with self.cv:
+            self.stopped = True
             self.cv.notify_all()
 
     def give(self, n):
@@ -426,43 +436,50 @@ def main():
     uploader = Uploader(out, opts.upload, opts.upload_cmd)
     try:
         with ThreadPoolExecutor(max_workers=budget) as ex:
-            late = opts.late_search
-            add(ex, [os.path.relpath(p, out) for p in index_files(out, search=False if late else None)], "files")
-            deadline = time.monotonic() + opts.late_search_timeout
-            while running or late:
-                if late and (os.path.exists(late) and os.path.getsize(late) or time.monotonic() > deadline):
-                    if os.path.exists(late) and os.path.getsize(late):
-                        with open(late) as f:
-                            status = f.read().strip()
-                        print(f"Place search ended (status {status}): compressing its files", flush=True)
-                        add(ex, [os.path.relpath(p, out) for p in index_files(out, search=True)], "place search files")
-                    else:
-                        status = "none"
-                        print(f"Warning: no place search status in {late} after {opts.late_search_timeout:.0f}s; "
-                              "its files are left out", flush=True)
-                    if opts.late_search_taken:
-                        with open(opts.late_search_taken + ".part", "w") as f:
-                            f.write(status + "\n")
-                        os.replace(opts.late_search_taken + ".part", opts.late_search_taken)
-                    late = ""
-                if not running:
-                    time.sleep(LATE_SEARCH_POLL_SECONDS)
-                    continue
-                finished, _ = wait(list(running), timeout=LATE_SEARCH_POLL_SECONDS if late else None,
-                                   return_when=FIRST_COMPLETED)
-                for future in finished:
-                    done(future, uploader)
-            # The files of a unit that failed go as .zst, alike ones once.
-            for u in units:
-                if key[u.path] in failed:
-                    plain += u.files
-            more = [r for r in plain if first.setdefault(hashes[r], r) == r and r not in compressed]
-            for r in more:
-                submit(ex, compress, r, None, os.path.getsize(at(r)), at(r))
-            while running:
-                finished, _ = wait(list(running), return_when=FIRST_COMPLETED)
-                for future in finished:
-                    done(future, uploader)
+            try:
+                late = opts.late_search
+                add(ex, [os.path.relpath(p, out) for p in index_files(out, search=False if late else None)], "files")
+                deadline = time.monotonic() + opts.late_search_timeout
+                while running or late:
+                    if late and (os.path.exists(late) and os.path.getsize(late) or time.monotonic() > deadline):
+                        if os.path.exists(late) and os.path.getsize(late):
+                            with open(late) as f:
+                                status = f.read().strip()
+                            print(f"Place search ended (status {status}): compressing its files", flush=True)
+                            add(ex, [os.path.relpath(p, out) for p in index_files(out, search=True)],
+                                "place search files")
+                        else:
+                            status = "none"
+                            print(f"Warning: no place search status in {late} after {opts.late_search_timeout:.0f}s; "
+                                  "its files are left out", flush=True)
+                        if opts.late_search_taken:
+                            with open(opts.late_search_taken + ".part", "w") as f:
+                                f.write(status + "\n")
+                            os.replace(opts.late_search_taken + ".part", opts.late_search_taken)
+                        late = ""
+                    if not running:
+                        time.sleep(LATE_SEARCH_POLL_SECONDS)
+                        continue
+                    finished, _ = wait(list(running), timeout=LATE_SEARCH_POLL_SECONDS if late else None,
+                                       return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        done(future, uploader)
+                # The files of a unit that failed go as .zst, alike ones once.
+                for u in units:
+                    if key[u.path] in failed:
+                        plain += u.files
+                more = [r for r in plain if first.setdefault(hashes[r], r) == r and r not in compressed]
+                for r in more:
+                    submit(ex, compress, r, None, os.path.getsize(at(r)), at(r))
+                while running:
+                    finished, _ = wait(list(running), return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        done(future, uploader)
+            except BaseException:
+                # The run ends with this once the children running end: the jobs still queued, and those the
+                # workers hold as they wait for their threads, start none.
+                cpus.stop()
+                raise
         for r in plain:
             source = first[hashes[r]]
             if source != r:
