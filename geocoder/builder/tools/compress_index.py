@@ -32,10 +32,12 @@ only warn; the caller re-uploads whatever is missing.
 search/ dir) are still being built beside this run. Everything else is
 compressed first; the search files are taken once STATUS (the place search
 job's exit status, written last) exists, whatever it says: a failed index
-leaves no files. A status that never comes within --late-search-timeout
-seconds leaves the search files out, with a warning. configurations.json is
-written last either way, so the place search reads it as the build left it,
-and its tables are those of a run that had every file from the start.
+leaves no files. STATUS is looked for every half second and as items end;
+the first look past --late-search-timeout seconds is the last: a STATUS there
+then is taken, and none leaves the search files out, with a warning.
+configurations.json is written last either way, so the place search reads it
+as the build left it, and its tables are those of a run that had every file
+from the start.
 --late-search-taken FILE gets the status the search files were taken on, or
 "none" when they were left out: the caller goes by it, since a status the
 place search writes after the wait came too late for its files.
