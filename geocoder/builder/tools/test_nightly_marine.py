@@ -203,6 +203,33 @@ class NightlyTest(unittest.TestCase):
         self.assertEqual(output, "")
         self.assertFalse(os.path.exists(os.path.join(self.served, "calls")))
 
+    def pin_text(self, text):
+        with open(os.path.join(self.repo, "geocoder", "builder", "data", "marine.json"), "w") as f:
+            f.write(text)
+
+    def assert_fails(self, why):
+        run, output = self.run_block()
+        self.assertNotEqual(run.returncode, 0, why)
+        self.assertIn("::error::[marine]", run.stdout, why)
+        self.assertEqual(output, "", why)
+        self.assertFalse(os.path.exists(os.path.join(self.work, "marine_areas.bin")), why)
+
+    def test_a_pin_short_of_a_field_fails_the_step(self):
+        path = "marine/20261122/marine_areas.bin.zst"
+        for doc in ({"version": "", "path": path, "sha256": self.sha}, {"path": path, "sha256": self.sha},
+                    {"version": None, "path": path, "sha256": self.sha}, {"version": "20261122", "path": None,
+                                                                          "sha256": None},
+                    {"version": None, "path": None}, {}):
+            with self.subTest(pin=doc):
+                self.pin_text(json.dumps(doc))
+                self.assert_fails(json.dumps(doc))
+
+    def test_a_pin_file_of_anything_but_one_json_object_fails_the_step(self):
+        for text in ("", "\n", "null", "[]", "{", '{"version": null, "path": null, "sha256": null}\n{}'):
+            with self.subTest(pin=text):
+                self.pin_text(text)
+                self.assert_fails(repr(text))
+
     def test_the_build_takes_the_marine_areas_and_yesterdays_water_kinds(self):
         text = read(NIGHTLY)
         build = step(text, "Build geocoder index")

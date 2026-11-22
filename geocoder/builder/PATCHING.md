@@ -495,7 +495,6 @@ What keeps a day's patch small:
   objects, so that a patch always carries it inline; a value past that is
   `natural/water`.
 
-
 The simplified tier's crossing repair counts only crossings between rings of
 one polygon (`ArcTier::crossings_within_polygons`): water areas overlap
 legitimately (a lake in a wetland, a river in a bay), and repairing their
@@ -535,7 +534,8 @@ shared shore or point alone doesn't count), such as the Gulf of Oman
   downloads the version `data/marine.json` pins (a run of Update Marine
   Areas, `geocoder-marine.yml`, under `geocoder/marine/<version>/` in the
   bucket) and checks its sha256, so the same file goes into every build until
-  the pin moves. A day's water patch carries no marine bytes but where an OSM
+  the pin moves. A pin whose `version`, `path` and `sha256` are all null
+  builds without them; any other that names no file fails the step. A day's water patch carries no marine bytes but where an OSM
   water area sharing a stretch of coast with them was edited.
 - **Their own id space.** A marine object is the sea area's MRGID, typed
   `SYNTHETIC` in the build, apart from OSM's ways and relations and from the

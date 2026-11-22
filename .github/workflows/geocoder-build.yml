@@ -478,18 +478,24 @@ jobs:
           # The seas and oceans of the water dirs: the run of Update Marine
           # Areas the repo pins (geocoder/builder/data/marine.json), checked
           # against its sha256, so that every night builds them from the same
-          # file. With none pinned the water dirs hold OSM's water alone; a
-          # pinned file that doesn't come down whole fails the step, as the
-          # water dirs would lose their seas.
+          # file. With none pinned (the pin's three fields all null) the water
+          # dirs hold OSM's water alone; a pin of anything else that names no
+          # file, or a pinned file that doesn't come down whole, fails the
+          # step, as the water dirs would lose their seas.
           (
           MARINE_PIN="$GITHUB_WORKSPACE/geocoder/builder/data/marine.json"
-          MARINE_VERSION=$(jq -r '.version // ""' "$MARINE_PIN")
-          MARINE_PATH=$(jq -r '.path // ""' "$MARINE_PIN")
-          MARINE_SHA=$(jq -r '.sha256 // ""' "$MARINE_PIN")
-          if [ -z "$MARINE_VERSION" ]; then
+          MARINE_PINNED=$(jq -r -s 'if length == 1 and (.[0] | type) == "object" and (.[0] | has("version") and has("path") and has("sha256")) then .[0] | [.version, .path, .sha256] | if all(. == null) then "none" elif all(type == "string") then "file" else "neither" end else "neither" end' "$MARINE_PIN" 2> /dev/null) || MARINE_PINNED=neither
+          if [ "$MARINE_PINNED" != none ] && [ "$MARINE_PINNED" != file ]; then
+            echo "::error::[marine] $MARINE_PIN is no pin: one JSON object whose version, path and sha256 name a file, or are all null for none"
+            exit 1
+          fi
+          if [ "$MARINE_PINNED" = none ]; then
             echo "[marine] No marine areas pinned: the water dirs hold OSM's water alone"
             exit 0
           fi
+          MARINE_VERSION=$(jq -r .version "$MARINE_PIN")
+          MARINE_PATH=$(jq -r .path "$MARINE_PIN")
+          MARINE_SHA=$(jq -r .sha256 "$MARINE_PIN")
           if ! [[ "$MARINE_VERSION" =~ ^[0-9]{8}$ && "$MARINE_PATH" == "marine/$MARINE_VERSION/marine_areas.bin.zst" && "$MARINE_SHA" =~ ^[0-9a-f]{64}$ ]]; then
             echo "::error::[marine] $MARINE_PIN pins no file the build can check (version '$MARINE_VERSION', path '$MARINE_PATH', sha256 '$MARINE_SHA')"
             exit 1
