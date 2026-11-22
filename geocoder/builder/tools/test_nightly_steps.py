@@ -1240,13 +1240,14 @@ class WatchdogTest(unittest.TestCase):
                           "event": "workflow_dispatch", "head_branch": branch, "display_title": title})
         self.jobs[run_id] = [{"steps": [{"name": n, "conclusion": c} for n, c in steps]}]
 
-    def watchdog(self, shift=False):
-        """Runs the retry step against self.runs and self.jobs (with `shift`, the fixture's pages shift a run);
+    def watchdog(self, shift=False, default_branch="main"):
+        """Runs the retry step against self.runs and self.jobs, the repo's default branch `default_branch` (with
+        `shift`, the fixture's pages shift a run);
         returns its output and the dispatches it made, and keeps the created filter of each list it asked for in
         self.listed."""
         data = os.path.join(self.root, "data.json")
         with open(data, "w") as f:
-            json.dump({"default_branch": "main", "runs": self.runs, "jobs": self.jobs, "shift": shift}, f)
+            json.dump({"default_branch": default_branch, "runs": self.runs, "jobs": self.jobs, "shift": shift}, f)
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_GH_DATA": data, "FAKE_GH_CALLS": self.calls,
                "GH_TOKEN": "t", "GH_REPO": "immich-app/geoshenanigans", "MAX_RETRIES": "5"}
         done = subprocess.run(["bash", "-e", "-c", watchdog_script("Check and maybe retry today's build")], env=env,
@@ -1346,6 +1347,46 @@ class WatchdogTest(unittest.TestCase):
 
         self.assertEqual(dispatched, self.retry())
         self.assertIn("total=1  succeeded=0", out)
+
+    # Of two attempts created in the same second the later has the higher id: the retry goes by its steps.
+    def test_of_two_attempts_in_one_second_the_retry_goes_by_the_later(self):
+        self.run_at("06:17", LIVE_TITLE, "failure", LOST, run_id="7")
+        self.run_at("06:17", LIVE_DISPATCH_TITLE, "failure", [("Build tools", "success"), ("Run builder tests", "failure")],
+                    run_id="8")
+
+        out, dispatched = self.watchdog()
+
+        self.assertEqual(dispatched, [])
+        self.assertIn("Run 8 stopped at 'Run builder tests'", out)
+
+    # The default branch goes into the list's query as a value, whatever it holds.
+    def test_a_default_branch_of_any_name_is_listed(self):
+        for branch in ("release+stable", "release&stable"):
+            with self.subTest(branch=branch):
+                self.runs, self.jobs = [], {}
+                self.run_at("06:17", LIVE_TITLE, "failure", LOST, branch=branch)
+
+                _, dispatched = self.watchdog(default_branch=branch)
+
+                self.assertEqual(dispatched, [f"workflow run geocoder-build.yml --ref {branch} -f build_date={self.today}"])
+
+    # A second that fills a list (1,000 runs created in it) can't be listed in parts: the listing fails rather than
+    # leave runs out.
+    def test_a_second_that_fills_a_list_fails_the_listing(self):
+        for _ in range(1000):
+            self.run_at("05:00:00", SCRATCH_TITLE, "success")
+        data = os.path.join(self.root, "data.json")
+        with open(data, "w") as f:
+            json.dump({"default_branch": "main", "runs": self.runs, "jobs": self.jobs}, f)
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_GH_DATA": data, "FAKE_GH_CALLS": self.calls}
+
+        done = subprocess.run([os.path.join(HERE, "workflow_runs.sh"),
+                               "repos/immich-app/geoshenanigans/actions/workflows/geocoder-build.yml/runs?branch=main",
+                               f"{self.today}T00:00:00Z", f"{self.today}T23:59:59Z"],
+                              env=env, capture_output=True, text=True, timeout=120)
+
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn(f"1000 or more runs created at {self.today}T05:00:00Z..{self.today}T05:00:00Z", done.stderr)
 
     def test_a_live_run_that_succeeded_leaves_the_day_alone(self):
         self.run_at("06:17", LIVE_TITLE, "success", [("Setup", "success")])

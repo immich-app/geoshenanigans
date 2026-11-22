@@ -7,7 +7,8 @@
 # included), one JSON object a line, newest first, each once. A filtered list
 # holds at most its 1,000 newest runs, however many more match it: a time
 # range whose list is that full is listed again in halves, the later first,
-# each split the same way, down to a second. A run created while a list is
+# each split the same way, down to a second; a second whose list is that
+# full fails the listing, which can't be whole. A run created while a list is
 # paged shifts its later pages, which then repeat a run: each run is printed
 # once, by its id. The watchdog counts today's attempts of the live nightly
 # by it, and finds the latest finished one.
@@ -31,7 +32,8 @@ between() {
       between "$from" "$mid"
       return
     fi
-    echo "workflow_runs.sh: $cap or more runs created at $range: some may be left out" >&2
+    echo "workflow_runs.sh: $cap or more runs created at $range: the list can't be whole" >&2
+    exit 1
   fi
   [ -z "$runs" ] || echo "$runs"
 }

@@ -78,8 +78,10 @@ jobs:
           # under s3_prefix geocoder, matched byte for byte: a dispatch under
           # Geocoder, which Setup refuses, is titled "Build Geocoder Index
           # [Geocoder]" (an expression's == is blind to case).
+          # The branch goes into the query as a value, whatever it holds.
+          BRANCH_QUERY=$(jq -rn --arg branch "$BUILD_REF" '$branch | @uri')
           RUNS_JSON=$(geocoder/builder/tools/workflow_runs.sh \
-            "repos/$GH_REPO/actions/workflows/$WORKFLOW/runs?branch=$BUILD_REF" \
+            "repos/$GH_REPO/actions/workflows/$WORKFLOW/runs?branch=$BRANCH_QUERY" \
             "${TODAY}T00:00:00Z" "${TODAY}T23:59:59Z" | jq -s .)
 
           TODAY_RUNS=$(echo "$RUNS_JSON" \
@@ -122,7 +124,7 @@ jobs:
           # burns hours of the shared runner. A cancelled step means the
           # job hit its timeout (a rerun does the same work and times out
           # again) or someone cancelled the run by hand.
-          LAST_ID=$(echo "$TODAY_RUNS" | jq -r 'sort_by(.created_at) | last | .id')
+          LAST_ID=$(echo "$TODAY_RUNS" | jq -r 'sort_by(.created_at, .id) | last | .id')
           STOPPED_AT=$(gh run view "$LAST_ID" --json jobs --jq '
             [.jobs[].steps[]
              | select(.conclusion == "cancelled"
