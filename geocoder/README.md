@@ -10,6 +10,7 @@ Based on the open source [Traccar Geocoder](https://github.com/traccar/traccar-g
 - Address point, street name, and address interpolation lookup (TIGER ranges in the US)
 - Administrative boundary resolution (country, state, county, city, postcode)
 - Points of interest in three tiers ([POI_OVERVIEW.md](POI_OVERVIEW.md))
+- Bodies of water (seas, oceans, lakes, rivers, canals, bays, straits, wetlands, glaciers) in a `water` field beside the address, from an optional water dir
 - Sub-millisecond query latency with memory-mapped index files
 - Nightly indexes with daily patches ([PATCHING.md](PATCHING.md))
 - Automatic HTTPS with Let's Encrypt
@@ -21,7 +22,7 @@ and eight continents from the day's OSM data and publishes every index
 variant, with a patch from the previous day, to Tigris:
 `https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io/geocoder/builds/latest.json`.
 [PATCHING.md](PATCHING.md) describes the layout, the variants (mode, boundary
-quality, POI tier) and how a client downloads and patches them.
+quality, POI tier, water) and how a client downloads and patches them.
 
 ## Monitoring
 
@@ -72,24 +73,28 @@ cargo build --release --manifest-path server/Cargo.toml
 ```
 
 The server downloads a continent from the latest build the first time a query
-lands in it: `admin` mode, `simplified` boundaries and no POIs unless an admin sets
-another selection with `PUT /admin/configuration` (a JSON body of `base_url`,
-`mode`, `quality`, `poi_tier` and the regions to `preload`). A value the build
-doesn't offer fails each download, naming those it does, and the PUT is refused
-with them (400) when the server has the build's manifest at hand. A continent
-dir keeps a ledger of what each of its files holds, `.file_sha256` (a line
-`<name> <sha256>` each, `-` while unknown), and a download skips a file only
-where the ledger names the build's sha256 for it. It removes the files its
-selection doesn't take (another selection's or build's) that the ledger names,
-or whose names files of the build have, the ledger naming them or not; files of
-other names stay. The dir names its build in `.build_date` once a whole
-selection of it is in and those are gone; a download that fetches or removes
-anything removes it first, once it has made the ledger where the dir has none
-(a dir holding neither was laid out by hand, and a server loads it). Before it
-reads the dir a download finishes what a transport decode killed part way left
-there (PATCHING.md), which would otherwise put back the files the decode
-replaced once the download had listed the files to remove; one it can't finish
-fails the download.
+lands in it: `admin` mode, `simplified` boundaries, no POIs and no water unless an
+admin sets another selection with `PUT /admin/configuration` (a JSON body of
+`base_url`, `mode`, `quality`, `poi_tier`, `water` and the regions to `preload`;
+a body without `water` takes `none`). A value the build doesn't offer fails each
+download, naming those it does, and the PUT is refused with them (400) when the
+server has the build's manifest at hand. The files of a component with a `dir`
+(the water values') go in that sub-dir of the continent dir, `water/`, which the
+server loads with it. A continent dir keeps a ledger of what each of its files
+holds, `.file_sha256` (a line `<name> <sha256>` each, `-` while unknown, a water
+file's name `water/<name>`), and a download skips a file only where the ledger
+names the build's sha256 for it. It removes the files its selection doesn't
+take (another selection's or build's) that the ledger names, or whose names
+files of the build have in the dir or in the sub-dir their component names, the
+ledger naming them or not; files of other names stay. The dir names its build
+in `.build_date` once a whole selection of it is in and those are gone; a
+download that fetches or removes anything removes it first, once it has made
+the ledger where the dir has none (a dir holding neither was laid out by hand,
+and a server loads it). Before it reads the dir a download finishes what a
+transport decode killed part way left there and in `water/`, which the water
+dirs' units decode into (PATCHING.md): such a decode would otherwise put back
+the files it replaced once the download had listed the files to remove; one it
+can't finish fails the download.
 Downloads into a dir go one at a time, those of other servers on the data dir
 too: each holds a lock on the dir's `.download.lock` to its end, and runs to
 its end though the query that started it gave up. A server checks and
@@ -172,6 +177,36 @@ Response follows [Nominatim](https://nominatim.org/release-docs/latest/api/Rever
 
 Fields are omitted when not available.
 
+Where the dataset has a water dir (a `water` value other than `none`), an
+answer whose point lies in a body of water carries it last, beside the
+address, which it never changes (46.45, 6.55, in Lake Geneva):
+
+```json
+{
+  "display_name": "Thonon-les-Bains, Upper Savoy, Auvergne-Rhône-Alpes, Metropolitan France, France",
+  "address": {
+    "municipality": "Thonon-les-Bains",
+    "state": "Auvergne-Rhône-Alpes",
+    "region": "Metropolitan France",
+    "county": "Upper Savoy",
+    "country": "France",
+    "country_code": "FR"
+  },
+  "water": { "name": "Lake Geneva", "class": "water", "type": "lake" }
+}
+```
+
+`class` and `type` are the OSM category and type Nominatim gives the feature
+(`water/lake`, `water/reservoir`, `natural/bay`, `natural/wetland`,
+`place/sea`, `place/ocean`, `waterway/river`, `waterway/canal`, ...). The
+smallest body of water holding the point answers: a lake in a wetland, a river
+in an estuary, a bay in a sea. A point at sea that no address reaches answers
+`{"address": {}, "water": {...}}`. A point on an island mapped as a hole of its
+lake is in no water, unless a larger one holds the island. Nominatim's default
+answer has no water at all; [NOMINATIM_REFERENCE.md](NOMINATIM_REFERENCE.md#water-an-extension)
+gives how this field relates to its `layer=natural` lookup, the selection rule
+and how river areas are named.
+
 Status codes:
 - `200` - success
 - `401` - missing or invalid API key
@@ -187,7 +222,7 @@ The project consists of four components:
 
 - **Builder** (`builder/`, C++) - `build-index` parses OSM PBF files and creates a compact binary index using S2 geometry cells for spatial lookup. `geocoder-diff` and `geocoder-patch` make and apply the daily patches ([builder/PATCHING.md](builder/PATCHING.md)), and `pbf-apply` applies OSM replication diffs to a PBF.
 - **Server** (`server/`, Rust) - Memory-maps the index files and serves queries via HTTP/HTTPS with sub-millisecond latency. It is also the `query_server` library the binding wraps.
-- **Node binding** (`node/`) - The native module Immich uses to geocode in-process: `Geocoder.load(dir)`, then `reverseGeocode(lat, lng)` resolves to the response JSON as a string. `openPlaceSearch()` opens the place search index of the dataset (shipped with the bigger packs, else built on the device; see [builder/PATCHING.md](builder/PATCHING.md#place-search-index)), then `searchPlaces(query)` resolves to the results as a JSON string. `createTransportDecoder(dir, files)` decodes a downloading transport unit into the dataset dir ([PATCHING.md](PATCHING.md#transport-units)).
+- **Node binding** (`node/`) - The native module Immich uses to geocode in-process: `Geocoder.load(dir)` (the dataset and its `water/` dir), then `reverseGeocode(lat, lng)` resolves to the response JSON as a string, `water` among it. `openPlaceSearch()` opens the place search index of the dataset (shipped with the bigger packs, else built on the device; see [builder/PATCHING.md](builder/PATCHING.md#place-search-index)), then `searchPlaces(query)` resolves to the results as a JSON string. `createTransportDecoder(dir, files)` decodes a downloading transport unit into the dataset dir ([PATCHING.md](PATCHING.md#transport-units)).
 - **Test portal** (`test-portal/`) - The map page served at `/test`, and a compose file that runs it on the published index.
 
 ### Index Structure
@@ -217,6 +252,7 @@ to the same files ([builder/PATCHING.md](builder/PATCHING.md#transport-units)).
 | `strings_core.bin`, `strings_street.bin`, `strings_addr.bin`, `strings_postcode.bin`, `strings_poi.bin` | Deduplicated string pool, in five tiers so each variant ships only the strings it uses; each tier front-coded in buckets cut by content (FCC2, `builder/src/string_files.h`), a string's id still its offset in the tier's pool |
 | `strings_layout.json` | Start and end of each string tier, which place every string offset |
 | `poi_meta.json` | POI category names and scoring parameters |
+| `water/` | The water layer, a set of its own in the admin files' formats (`admin_polygons.bin`, `admin_rings.bin`, `arc_index.bin`, `arc_vertices.bin`, `admin_cells.bin`, `admin_entries.bin`, `strings_core.bin`, `strings_layout.json`) and `water_meta.json`, each type code's class, type and Nominatim rank: a record per polygon carrying its OSM object's name, type code and area, and nothing pointing into the other files (`server/src/water.rs`, `builder/src/water_layer.h`) |
 
 ## Building from Source
 
