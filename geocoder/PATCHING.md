@@ -115,6 +115,14 @@ precision takes any water value. The seas and oceans (Marine Regions'
 sea areas, cut to OpenStreetMap's land) are in a continent's dirs where its
 region takes in the coastal sea; only the planet's reach the open ocean.
 
+The query server and the node binding load `<dataset>/water/` with the
+dataset, a dir of all its files but `attribution.json` or of none (some
+without the rest fail the load), and answer the water holding a point in a
+`water` field beside the address, which it never changes (README.md,
+NOMINATIM_REFERENCE.md). Nothing else reads the dir: place search's index
+derives nothing from it, so a water dir added, switched or patched leaves a
+shipped search index current.
+
 ## Transport units
 
 Some files download as a transport unit: a download-only form of them, their
@@ -408,7 +416,10 @@ Quality changes don't require patching — just download the new quality files:
 
 The water dir is a set of its own, so a switch downloads the new value's
 files into `<dataset>/water/` (or removes that dir, for `none`), as a fresh
-install does, with no patch.
+install does, with no patch. The server's downloader does so when a
+configuration's `water` changes: it removes the files of `water/` the new
+value doesn't take and fetches the ones it does, its ledger naming each
+`water/<name>`.
 
 ### Switching Region
 
