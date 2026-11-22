@@ -204,8 +204,9 @@ Where Nominatim's rank adjustment matters:
   gives the feature, `type` the key its `layer=natural` address names it by.
 - **The rule.** Of the water areas whose rings hold the point (holes honoured: a
   point on an island mapped as a hole of its lake is not in the lake), the
-  smallest OSM object answers, its area that of all its outer rings, then the
-  higher `rank_search`, the lower type code and the smaller name. The order is
+  smallest OSM object answers, its area that of all its outer rings with their
+  holes taken off (the water it holds), then the higher `rank_search`, the
+  lower type code and the smaller name. The order is
   the object's, so every polygon of a multipolygon, and every piece of one the
   builder cut, answers alike.
 - **Where it differs from `layer=natural`.** Only where a larger area of higher
