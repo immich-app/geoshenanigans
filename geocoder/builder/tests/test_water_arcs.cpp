@@ -1,0 +1,203 @@
+// The arc stage as the water layer runs it (kWaterArcStage): rings cut at
+// their member ways' ends as well as at their junctions, the crossing repair
+// counting only the crossings of one polygon's own rings, no minimal set,
+// and the encoding, its subsets and slots over the stage's two tiers.
+#include "admin_arcs.h"
+
+#include <algorithm>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "parsed_data.h"
+#include "scratch_dir.h"
+#include "test_framework.h"
+
+namespace {
+
+using Ring = std::vector<PackedLocation>;
+
+PackedLocation pt(int32_t lat, int32_t lng) { return {lat, lng}; }
+
+Ring closed(Ring ring) {
+    ring.push_back(ring.front());
+    return ring;
+}
+
+// A square of side 100 from (0, 0), its first two edges one way, its last
+// two another.
+struct TwoWays {
+    Ring ring = closed({pt(0, 0), pt(0, 100), pt(100, 100), pt(100, 0)});
+    std::vector<std::vector<WayRun>> runs = {{{11, 2}, {12, 2}}};
+};
+
+std::vector<Ring> arc_vertex_lists(const AdminArcs& arcs, const AdminExactRings& store) {
+    std::vector<Ring> out;
+    for (const Arc& a : arcs.arcs) {
+        const ArcVertices av = arc_vertices(store, a.view);
+        Ring v;
+        for (uint32_t i = 0; i < av.size(); i++) v.push_back(av[i]);
+        out.push_back(v);
+    }
+    return out;
+}
+
+const ArcTier& water_simplified() { return kWaterArcTiers[0]; }
+
+}  // namespace
+
+TEST(water_rings_are_cut_where_their_member_ways_meet) {
+    const TwoWays square;
+    AdminExactRings store;
+    store.append(square.ring, {}, square.runs);
+    const AdminArcs junctions = build_arc_topology(store, 1);
+    CHECK_EQ(junctions.arcs.size(), size_t(1));
+    CHECK(junctions.arcs[0].view.closed);
+    const AdminArcs ends = build_arc_topology(store, 1, {}, ArcCuts::JunctionsAndWayEnds);
+    CHECK_EQ(ends.counts.way_ends, size_t(2));
+    CHECK_EQ(ends.counts.junctions, size_t(2));
+    REQUIRE(ends.arcs.size() == 2u);
+    for (const Ring& v : arc_vertex_lists(ends, store)) {
+        CHECK_EQ(v.size(), size_t(3));
+        CHECK(v.front() == pt(0, 0) || v.front() == pt(100, 100));
+        CHECK(v.back() == pt(0, 0) || v.back() == pt(100, 100));
+    }
+    CHECK_EQ(ends.refs.size(), size_t(2));
+}
+
+TEST(a_ring_of_one_way_and_a_way_that_wraps_its_start_are_not_cut_there) {
+    AdminExactRings store;
+    // A closed way: one run.
+    store.append(closed({pt(0, 0), pt(0, 100), pt(100, 100), pt(100, 0)}), {}, {{{7, 4}}});
+    // A ring whose first and last runs are one way round its first vertex:
+    // way 9 runs through (0, 1000), so only (1000, 1100) and (0, 1100) are
+    // its ends.
+    store.append(closed({pt(0, 1000), pt(0, 1100), pt(100, 1100), pt(100, 1000)}), {}, {{{9, 1}, {8, 2}, {9, 1}}});
+    const AdminArcs arcs = build_arc_topology(store, 1, {}, ArcCuts::JunctionsAndWayEnds);
+    CHECK_EQ(arcs.counts.way_ends, size_t(2));
+    CHECK_EQ(arcs.arcs.size(), size_t(3));
+    size_t closed_arcs = 0;
+    for (const Arc& a : arcs.arcs) closed_arcs += a.view.closed;
+    CHECK_EQ(closed_arcs, size_t(1));
+}
+
+TEST(a_way_end_cuts_every_ring_through_it_so_shared_shores_stay_one_arc) {
+    // A lake's shore of two ways that meet at (100, 50), and a river area of
+    // one closed way along its north side through that vertex: the river's
+    // ring is cut there too, so each half of the stretch both run along is
+    // one arc of both rings.
+    AdminExactRings store;
+    store.append(closed({pt(0, 0), pt(0, 100), pt(100, 100), pt(100, 50), pt(100, 0)}), {}, {{{21, 3}, {22, 2}}});
+    store.append(closed({pt(100, 0), pt(100, 50), pt(100, 100), pt(200, 100), pt(200, 0)}), {}, {{{23, 5}}});
+    auto shared_arcs = [&](ArcCuts cuts) {
+        const AdminArcs arcs = build_arc_topology(store, 1, {}, cuts);
+        std::vector<std::vector<uint32_t>> users(arcs.arcs.size());
+        for (uint32_t r = 0; r < store.rings.size(); r++)
+            for (uint32_t k = arcs.ring_refs[r]; k < arcs.ring_refs[r + 1]; k++) users[arcs.refs[k].arc].push_back(r);
+        size_t shared = 0;
+        for (const auto& u : users) shared += u.size() == 2;
+        return shared;
+    };
+    CHECK_EQ(shared_arcs(ArcCuts::Junctions), size_t(1));
+    CHECK_EQ(shared_arcs(ArcCuts::JunctionsAndWayEnds), size_t(2));
+}
+
+TEST(the_water_tier_repairs_crossings_of_a_polygons_own_rings_and_none_between_polygons) {
+    // A shore bowing 3000 (under the 37.5 m tolerance) round an island
+    // reaching 1000 past the straight line: simplified, the shore crosses it.
+    const int32_t s = 100000;
+    const Ring border = {pt(0, 0), pt(0, 40000), pt(3000, 45000), pt(3000, 55000), pt(0, 60000), pt(0, s)};
+    Ring lake = border;
+    lake.insert(lake.end(), {pt(s, s), pt(s, 0)});
+    const Ring isle = closed({pt(-1000, 48000), pt(-1000, 52000), pt(2000, 52000), pt(2000, 48000)});
+    // The island is a polygon of its own beside the lake (a wetland over the
+    // shore). A second lake, `at` east, bows its shore out (south) round a
+    // hole of its own instead: straightened, the shore leaves its hole
+    // outside.
+    const int32_t at = 1000000;
+    const Ring lake2 = {pt(0, at), pt(0, 40000 + at), pt(-3000, 45000 + at), pt(-3000, 55000 + at), pt(0, 60000 + at),
+                        pt(0, s + at), pt(s, s + at), pt(s, at)};
+    const Ring hole2 = {pt(-2000, 48000 + at), pt(-2000, 52000 + at), pt(-1000, 52000 + at), pt(-1000, 48000 + at)};
+    AdminExactRings store;
+    store.append(closed(lake), {});
+    store.append(isle, {});
+    store.append(closed(lake2), {closed(hole2)});
+    const AdminArcs arcs = build_arc_topology(store, 1, {}, ArcCuts::JunctionsAndWayEnds);
+    const std::vector<bool> nests = exact_rings_nest(store, 1);
+    const ArcTierState admin = build_arc_tier(arcs, store, kArcTiers[0], nests, 1);
+    const ArcTierState water = build_arc_tier(arcs, store, water_simplified(), nests, 1);
+    // The admin tier repairs the shore against the island; water leaves it.
+    CHECK(admin.counts.crossings_simplified >= 1);
+    CHECK_EQ(water.counts.crossings_simplified, size_t(0));
+    CHECK_EQ(water.counts.crossings_left, size_t(0));
+    // The second lake's own hole: its shore gets the bow back.
+    CHECK(water.counts.nesting_restored >= 1);
+    CHECK_EQ(water.counts.rings_nest_introduced, size_t(0));
+    auto keeps = [&](const ArcTierState& state, PackedLocation p) {
+        for (uint32_t a = 0; a < arcs.arcs.size(); a++) {
+            std::vector<StoredVertex> stored;
+            tier_vertices(arcs, store, water_simplified(), state, a, stored);
+            for (const StoredVertex& v : stored)
+                if (v.at == p) return true;
+        }
+        return false;
+    };
+    // The vertices of the bow: one comes back where the repair counts it.
+    auto keeps_bow = [&](const ArcTierState& state, int32_t lat, int32_t shift) {
+        return keeps(state, pt(lat, 45000 + shift)) || keeps(state, pt(lat, 55000 + shift));
+    };
+    CHECK(keeps_bow(admin, 3000, 0));
+    CHECK(!keeps_bow(water, 3000, 0));
+    CHECK(keeps_bow(water, -3000, at));
+}
+
+TEST(the_water_stage_builds_and_encodes_its_two_tiers_with_no_minimal_set) {
+    AdminExactRings store;
+    const TwoWays square;
+    store.append(square.ring, {}, square.runs);
+    store.append(closed({pt(0, 200), pt(0, 300), pt(100, 300), pt(100, 200)}),
+                 {closed({pt(20, 220), pt(20, 280), pt(80, 280), pt(80, 220)})}, {{{31, 4}}, {{32, 4}}});
+    std::ostringstream captured;
+    std::streambuf* was = std::cerr.rdbuf(captured.rdbuf());
+    AdminArcs arcs = build_arc_stage(kWaterArcStage, store, {}, "", 2);
+    AdminArcBlocks blocks = encode_admin_arcs(arcs, store, 2);
+    std::cerr.rdbuf(was);
+    CHECK(arcs.stage == &kWaterArcStage);
+    CHECK(blocks.stage == &kWaterArcStage);
+    CHECK_EQ(arcs.tiers.size(), kWaterArcTierCount);
+    CHECK(arcs.minimal.arcs.empty());
+    CHECK_EQ(arcs.minimal.ring_refs.size(), store.rings.size() + 1);
+    CHECK_EQ(arcs.arcs.size(), size_t(4));
+    CHECK(blocks.set(ArcSet::Minimal).ring_blocks.empty());
+    for (const AdminArcPolygon& p : blocks.polygons) {
+        CHECK(p.blocks[0].size > 0);
+        CHECK_EQ(p.blocks[1].size, 0u);
+    }
+    // The exact tier stores every raw vertex.
+    size_t raw = 0;
+    for (const Arc& a : arcs.arcs) raw += a.view.count;
+    CHECK_EQ(arcs.tiers[1].counts.stored_vertices, raw);
+    const std::string log = captured.str();
+    CHECK(log.find("ARC_CHECK set=water junctions=") != std::string::npos);
+    CHECK(log.find(" way_ends=2 ") != std::string::npos);
+    CHECK(log.find("ARC_CHECK tier=water/all/simplified set=water ") != std::string::npos);
+    CHECK(log.find("ARC_CHECK tier=water/all/exact set=water ") != std::string::npos);
+    CHECK(log.find("set=minimal") == std::string::npos);
+    CHECK(log.find("set=full") == std::string::npos);
+    CHECK(log.find("  Water arcs: ") != std::string::npos);
+
+    // A subset in slots of its own: its sidecars where the stage keeps them.
+    const ScratchDir dir("water-arcs");
+    AdminArcBlocks one = subset_admin_arcs(blocks, {1}, 1);
+    CHECK(one.stage == &kWaterArcStage);
+    captured.str("");
+    was = std::cerr.rdbuf(captured.rdbuf());
+    assign_region_arc_slots(one, "", "oceania", 1);
+    std::cerr.rdbuf(was);
+    CHECK_EQ(one.set(ArcSet::Full).arcs(), size_t(2));
+    CHECK(one.polygons[0].blocks[0].size > 0);
+    CHECK(captured.str().find("minimal") == std::string::npos);
+    CHECK(arc_sidecar_path(dir.path(), ArcSet::Full, kWaterArcStage) ==
+          dir.path() + "/water/all/exact/arc_index.osm_ids");
+    CHECK(arc_sidecar_path(dir.path(), ArcSet::Full) == dir.path() + "/quality/exact/arc_index.osm_ids");
+}

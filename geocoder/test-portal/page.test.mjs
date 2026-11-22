@@ -66,7 +66,9 @@ function catalog(edit = () => {}) {
           excluded.push({ id, selection, constraint: broken.id, message: broken.message, requires: broken.requires });
           continue;
         }
-        const preset = t.presets.find((x) => has(x.selections));
+        // A preset names the dataset of its selection but for its water,
+        // which the portal serves no dataset of.
+        const preset = t.presets.find((x) => has(Object.fromEntries(Object.entries(x.selections).filter(([axis]) => axis !== 'water'))));
         const n = datasets.length + 1;
         datasets.push({
           id,

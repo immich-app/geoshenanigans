@@ -437,6 +437,135 @@ Dirs patched on different days don't fit together: the server combines a
 mode dir with a quality or poi dir by global string offsets, so the selected
 dirs must all be patched to the same date and swapped in together.
 
+### The water dirs
+
+The water layer (`src/water_layer.h`) writes three dirs under each region:
+`water/all/simplified/`, `water/all/exact/` and `water/major/simplified/`.
+Each is made of file names the patch format already has a section for, so no
+file id, GCPATCH or transport version changes:
+
+- `admin_polygons.bin` and `admin_rings.bin`: one 16-byte record per polygon
+  (an outer ring of an OSM object, with the holes inside it), its name in the
+  dir's own `strings_core.bin`, its type code in the `country_code` field
+  (`water_meta.json` gives each code's class, type and Nominatim rank) and
+  the object's area, all its outer rings', in the `area` field. Merged by
+  slot (`ADMIN_SLOT_FAMILIES`), as the boundary tiers are.
+- `arc_index.bin` and `arc_vertices.bin`: the tier's arcs, merged by slot.
+- `admin_cells.bin` and `admin_entries.bin`: the L10 cell index, interior
+  where both tiers' rings hold the whole cell; the admin cell-index delta.
+- `strings_core.bin` and a `strings_layout.json` of that core alone, as
+  `admin-minimal/` has: the dir resolves no other dir's strings and no other
+  dir resolves its. The diff looks for the other tiers beside the dir, then
+  in `../full` and `../../full`; three levels down there are none, so they
+  are empty pools.
+- `water_meta.json` and `attribution.json`: small JSON, carried inline.
+
+The two `all` dirs hold the same records, rings, cells and strings, byte for
+byte; only their arcs differ. `major/simplified/` is a subset with slots of
+its own.
+
+What keeps a day's patch small:
+
+- **Polygon slots** come from strategy 2 (`IdAllocator`), keyed by OSM
+  identity, not by name: a closed way by its way id, a relation's outer ring
+  by the relation and the smallest vertex of the ring. A ring whose smallest
+  vertex moves keeps its slot by its fallback key, the relation and the
+  ring's place among the relation's outer rings
+  (`admin_polygons.fallback.osm_ids`). A renamed lake changes one record and
+  the strings.
+- **Arcs are cut at OSM way ends** as well as at junctions
+  (`ArcCuts::JunctionsAndWayEnds`): an arc lies within one way, so an edit to
+  a way changes only the arcs along it, and every other arc keeps its slot
+  (`arc_index.osm_ids`, with the way-set and ends fallbacks of
+  `arc_index.fallback.osm_ids`). One arc per ring would resend a whole lake
+  shore for a one-node edit.
+- **Ring blocks** are still a polygon's whole: an edit that adds or splits a
+  way of a lake with many islands resends the stretch of its ring block
+  between the first and the last ref that changed. Polygons of more than
+  `kSplitMaxHoles` holes are cut into pieces along a fixed grid
+  (`src/water_split.h`), so no block holds more than that many holes; each
+  piece carries the object's name, type and area, and keeps its slot by the
+  relation, the outer ring's place and the piece's cut.
+- **Type codes** of `water=*` values outside the fixed table
+  (`src/water_types.h`) are allocated against the previous build's
+  `water_meta.json`, so a new rare value never renumbers another.
+
+The simplified tier's crossing repair counts only crossings between rings of
+one polygon (`ArcTier::crossings_within_polygons`): water areas overlap
+legitimately (a lake in a wetland, a river in a bay), and repairing their
+crossings would give back vertices that buy nothing and tie one area's
+simplified arcs to its neighbours' edits.
+
+The sidecars (`*.osm_ids`) sit in `water/all/exact/` for the all set and in
+`water/major/simplified/` for the major tier. They are not client files. The
+nightly fetches yesterday's with every other sidecar before the build, and
+yesterday's `planet/water/all/exact/water_meta.json` beside them: the build
+reads the type codes from it before the fetch of yesterday's client files has
+brought it down. When yesterday's sidecars hold the water dirs' and that
+file doesn't come down, the step fails rather than let the codes start
+afresh; only a day before the water layer starts them so.
+
+#### The seas and oceans
+
+The marine areas (`src/marine.h`, `build-index --marine`) are objects of the
+water layer of their own: each IHO sea area of Marine Regions' EEZ-IHO
+intersect (v5, CC BY 4.0), a `place/sea` or, for the seven named "… Ocean",
+a `place/ocean`, cut to the water off a snapshot of osmdata.openstreetmap.de's
+land polygons (OpenStreetMap's coastline, ODbL) and along a 1-degree grid by
+`tools/marine_import.py`. They go into the same store, records, arcs, cells
+and dirs as OSM's water, and win nowhere a smaller area holds the point: a
+bay, harbour or lake inside a sea answers there, the sea out in open water.
+OSM's own `place=sea` areas stay out of the layer: the marine areas hold the
+seas, and Nominatim answers no `place=sea`. So does an OSM `natural=bay` or
+`strait` of a marine area's name (its `name` or `name:en`, ASCII case,
+spaces and punctuation aside) that overlaps that area, such as the Gulf of
+Oman (`drop_marine_namesakes`); every other OSM bay and strait stays.
+
+- **They don't change from day to day.** The nightly never runs the tool: it
+  downloads the version `data/marine.json` pins (a run of Update Marine
+  Areas, `geocoder-marine.yml`, under `geocoder/marine/<version>/` in the
+  bucket) and checks its sha256, so the same file goes into every build until
+  the pin moves. A day's water patch carries no marine bytes but where an OSM
+  water area sharing a stretch of coast with them was edited.
+- **Their own id space.** A marine object is the sea area's MRGID, typed
+  `SYNTHETIC` in the build, apart from OSM's ways and relations and from the
+  builder's way-id cap. A polygon's slot identity hashes the MRGID and the
+  smallest vertex of its outer ring, its fallback key the MRGID and the
+  polygon's place among the area's, as a relation's outer ring does.
+- **Arcs cut at the clip's own vertices.** A marine ring has no member ways,
+  so one vertex in `kMarineCutEvery` (256), chosen by a hash of its
+  coordinates, starts a stretch, and each stretch is a way of its own to the
+  arc stage, its id a negative hash of its end vertices. A cut so drawn falls
+  on the same vertex in every ring through it either way round, so the sea
+  either side of a shared border and an OSM bay along the same coast share
+  their arcs; and a coast is cut into arcs of a few hundred vertices, which a
+  lookup decodes only where its ray crosses. A new land snapshot moves the
+  cuts only where the coast moved.
+- **Tiles keep them local.** No marine polygon spans more than a 1-degree
+  tile, so the open ocean is cells listing one polygon each and a coast tile
+  is one polygon of its own with its islands as holes (the water split cuts
+  those of more than `kSplitMaxHoles`).
+- **Where a dataset answers them.** A continent's dataset holds the marine
+  polygons its cells reach (the Geofabrik polygons, which take in the coastal
+  sea); only the planet's covers the open ocean.
+- **Credit.** A water dir holding a marine area lists Marine Regions in its
+  `attribution.json` beside OpenStreetMap, with the changes made: as cut to
+  OpenStreetMap's land the areas are part of the dataset's ODbL derivative,
+  with the CC BY credit kept.
+
+#### Publishing
+
+`tools/compress_index.py` publishes the water dirs as any other: the `arcs`
+and `admin_polygons` transport units (every dir holding all of a unit's files
+publishes it), the other `.bin` files as `.zst`, and `water_meta.json` and
+`attribution.json` among the JSON files (compressed and kept raw). The
+template's `water` axis takes `none`, `major`, `all` or `all-exact`, each a
+component of one dir's ten client files with `"dir": "water"`: a client puts
+them in `<dataset>/water/` and patches that dir with the water dir's own
+patch (`generate_patches.sh` diffs every dir holding `.bin` files, these
+among them). `component_sizes` in configurations.json gives each region's
+components' raw and wire bytes.
+
 ## Place search index
 
 The place search index (`geocoder/search`) points into a selection's own

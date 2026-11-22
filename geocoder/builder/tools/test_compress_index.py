@@ -79,7 +79,9 @@ def load_template():
         return json.load(f)
 
 
-class CompressIndexTest(unittest.TestCase):
+class OutputTest(unittest.TestCase):
+    """An output dir of a few regions' files, its units, and the fake transport."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.out = os.path.join(self.tmp.name, "output")
@@ -151,6 +153,8 @@ class CompressIndexTest(unittest.TestCase):
         with open(self.log) as f:
             return [line.split()[1:] for line in f.read().splitlines() if line.split()[0] == verb]
 
+
+class CompressIndexTest(OutputTest):
     def test_compresses_each_content_once_and_links_its_copies(self):
         cfg = self.run_main()
 
@@ -268,6 +272,86 @@ class CompressIndexTest(unittest.TestCase):
         sent_rel = [f"{rel}.zst" for rel in self.files if rel not in self.members] + list(self.units)
         expected = [f"cp {self.path(rel)} s3://bucket/day/{rel}" for rel in sent_rel]
         self.assertEqual(sorted(sent), sorted(expected))
+
+    def test_a_water_dirs_json_files_are_published_with_its_index_files(self):
+        water = {"planet/water/all/exact/water_meta.json": b'{"types": []}',
+                 "planet/water/all/exact/attribution.json": b'[{"id": "osm"}]',
+                 "planet/water/all/exact/strings_layout.json": b'{"tiers": []}',
+                 "planet/water/all/exact/admin_cells.bin": content(20, 900)}
+        for rel, data in water.items():
+            write(self.path(rel), data)
+        write(self.path("planet/water/all/exact/admin_polygons.fallback.osm_ids"), content(21, 64))
+
+        cfg = self.run_main()
+
+        for rel, data in water.items():
+            self.assertEqual(unzstd(self.path(rel) + ".zst"), data, rel)
+            self.assertEqual(cfg["files"][rel]["sha256"], sha(data), rel)
+        self.assertNotIn("planet/water/all/exact/admin_polygons.fallback.osm_ids", cfg["files"])
+
+
+class ComponentSizesTest(OutputTest):
+    """configurations.json's component_sizes: each component's raw and wire bytes in each region."""
+
+    COMPONENTS = {
+        "mode.full": {"files": ["{region}/full/geo_cells.bin", "{region}/full/street_ways.bin", "{region}/full/place_cells.bin",
+                                "{region}/full/place_nodes.bin", "{region}/full/place_hidden.bin",
+                                "{region}/full/strings_layout.json"],
+                      "optional_files": ["{region}/full/interp_postcodes.bin"]},
+        "quality.simplified": {"files": ["{region}/quality/simplified/admin_polygons.bin",
+                                         "{region}/quality/simplified/admin_rings.bin",
+                                         "{region}/quality/simplified/arc_index.bin",
+                                         "{region}/quality/simplified/arc_vertices.bin"]},
+        "half": {"files": ["{region}/quality/exact/arc_index.bin"]},
+        "poi_tier.none": {"files": []},
+        "mode.admin-minimal": {"variants": [{"component": "half"}]},
+    }
+
+    def setUp(self):
+        super().setUp()
+        with open(self.path("configurations.json")) as f:
+            cfg = json.load(f)
+        cfg["axes"] = {"region": {"values": {"planet": {}, "europe": {}}}}
+        cfg["components"] = self.COMPONENTS
+        with open(self.path("configurations.json"), "w") as f:
+            json.dump(cfg, f)
+
+    def test_each_component_counts_its_files_raw_and_each_unit_once_on_the_wire(self):
+        cfg = self.run_main()
+        sizes = cfg["component_sizes"]["planet"]
+        files, units = cfg["files"], cfg["units"]
+
+        full = [f"planet/full/{n}" for n in ("geo_cells.bin", "street_ways.bin", "place_cells.bin", "place_nodes.bin",
+                                             "place_hidden.bin", "strings_layout.json")]
+        self.assertEqual(sizes["mode.full"], {
+            "raw": sum(files[f]["size_raw"] for f in full),
+            "wire": files["planet/full/geo_cells.bin"]["size_zst"] + files["planet/full/strings_layout.json"]["size_zst"]
+            + units["planet/full/street_ways.tt.zst"]["size"] + units["planet/full/places.tt.zst"]["size"]})
+        # The files the build has (no admin_rings.bin here), the arcs unit once for its two files.
+        simplified = [f"planet/quality/simplified/{n}" for n in ("admin_polygons.bin", "arc_index.bin", "arc_vertices.bin")]
+        self.assertEqual(sizes["quality.simplified"], {
+            "raw": sum(files[f]["size_raw"] for f in simplified),
+            "wire": units["planet/quality/simplified/admin_polygons.tt.zst"]["size"]
+            + units["planet/quality/simplified/arcs.tt.zst"]["size"]})
+        # A component of some of a unit's files: its share of the unit, by their raw bytes.
+        arcs = units["planet/quality/exact/arcs.tt.zst"]
+        index = files["planet/quality/exact/arc_index.bin"]["size_raw"]
+        vertices = files["planet/quality/exact/arc_vertices.bin"]["size_raw"]
+        self.assertEqual(sizes["half"], {"raw": index, "wire": round(arcs["size"] * index / (index + vertices))})
+        # None for a component of no files, or of none the region has.
+        self.assertEqual(sorted(sizes), ["half", "mode.full", "quality.simplified"])
+        self.assertNotIn("europe", cfg["component_sizes"])
+
+    def test_a_unit_that_failed_counts_its_files_zst(self):
+        os.environ["FAKE_VERIFY_FAILS"] = "planet/quality/simplified/arcs.tt.zst"
+
+        cfg = self.run_main()
+
+        files = cfg["files"]
+        self.assertEqual(cfg["component_sizes"]["planet"]["quality.simplified"]["wire"],
+                         cfg["units"]["planet/quality/simplified/admin_polygons.tt.zst"]["size"]
+                         + files["planet/quality/simplified/arc_index.bin"]["size_zst"]
+                         + files["planet/quality/simplified/arc_vertices.bin"]["size_zst"])
 
 
 if __name__ == "__main__":

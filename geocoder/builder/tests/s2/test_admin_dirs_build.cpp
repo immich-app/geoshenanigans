@@ -196,10 +196,13 @@ std::set<std::string> admin_dir_layout() {
     return out;
 }
 
+// An admin dir's geometry file: not the water layer's, which has files of
+// the same names (water_layer.h).
 bool admin_geometry(const std::string& name) {
     const std::string file = fs::path(name).filename().string();
-    return file == "admin_polygons.bin" || file == "admin_rings.bin" || file == "arc_index.bin" ||
-           file == "arc_vertices.bin";
+    return name.find("/water/") == std::string::npos &&
+           (file == "admin_polygons.bin" || file == "admin_rings.bin" || file == "arc_index.bin" ||
+            file == "arc_vertices.bin");
 }
 
 // An arc sidecar's slots: each live one's arc key, UINT64_MAX for a
@@ -254,7 +257,8 @@ std::map<std::string, std::vector<char>> arc_files(const std::string& out) {
     std::map<std::string, std::vector<char>> files = tree(out);
     for (auto it = files.begin(); it != files.end();) {
         const std::string file = fs::path(it->first).filename().string();
-        it = admin_geometry(it->first) || file == "arc_index.osm_ids" ? std::next(it) : files.erase(it);
+        const bool admin_sidecar = file == "arc_index.osm_ids" && it->first.find("/water/") == std::string::npos;
+        it = admin_geometry(it->first) || admin_sidecar ? std::next(it) : files.erase(it);
     }
     return files;
 }
@@ -956,7 +960,8 @@ TEST(a_chained_build_on_a_previous_build_without_arc_fallback_sidecars_takes_slo
     fs::copy(out1, prev, fs::copy_options::recursive);
     std::vector<fs::path> fallbacks;
     for (const auto& e : fs::recursive_directory_iterator(prev))
-        if (e.path().filename() == "arc_index.fallback.osm_ids") fallbacks.push_back(e.path());
+        if (e.path().filename() == "arc_index.fallback.osm_ids" && e.path().string().find("/water/") == std::string::npos)
+            fallbacks.push_back(e.path());
     REQUIRE(fallbacks.size() == kRegions.size() + kRegionsHeld.size());
     for (const fs::path& p : fallbacks) fs::remove(p);
     REQUIRE(build(day_two, out2, {"--prev-output", prev}));

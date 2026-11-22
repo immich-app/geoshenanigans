@@ -68,6 +68,7 @@
 #include "memory_limit.h"
 #include "output_dir.h"
 #include "write_schedule.h"
+#include "water_layer.h"
 
 // The POI writer reads PoiRecord as the logical record it encodes.
 static_assert(sizeof(PoiRecord) == poi_files::LOGICAL_STRIDE && offsetof(PoiRecord, vertex_offset) == poi_files::OFF_VERTEX_OFFSET &&
@@ -1222,6 +1223,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             if (!d.admin_arcs.polygons.empty())
                 timed_phase("    " + region + ": arc slots",
                             [&] { assign_region_arc_slots(d.admin_arcs, region_prev, region, 0); });
+            timed_phase("    " + region + ": water arc slots",
+                        [&] { assign_region_arc_slots(d.water.arcs, region_prev, region, 0); });
             timed_phase("    " + region + ": poi names in record order", [&] { order_poi_strings_by_record(d); });
         }
 
@@ -1429,6 +1432,15 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             }
         };
 
+        auto write_water = [&] {
+            // Written for a region without water too: every configuration of
+            // the region that takes water lists the dirs' files.
+            if (multi_output)
+                std::cerr << water::write_water_dirs(d.water, base_dir, region_prev, region);
+            else
+                water::write_water_exact(d.water, base_dir);
+        };
+
         const StageCosts costs = stage_costs(record_bytes(d));
         struct Stage {
             const char* name;
@@ -1441,6 +1453,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             {"place files", write_places, costs.places},
             {"admin-minimal", write_admin_minimal_set, costs.admin_minimal},
             {"poi tiers", write_poi_tiers, costs.poi_tiers},
+            {"water", write_water, costs.water},
         };
         auto run_stage = [&](const Stage& stage) {
             std::optional<BudgetLease> lease;
@@ -1530,9 +1543,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         const StageCosts costs = stage_costs(bytes);
         std::cerr << "Planet: stages " << (order == RunOrder::Serial ? "one at a time" : "at once") << " (admins "
                   << (at(bytes, RecordKind::Admins) >> 20) << " MiB, pois " << (at(bytes, RecordKind::Pois) >> 20)
+                  << " MiB, waters " << (at(bytes, RecordKind::Waters) >> 20)
                   << " MiB; estimates: modes " << (costs.modes >> 20) << ", boundary tiers " << (costs.admin_tiers >> 20)
                   << ", admin-minimal " << (costs.admin_minimal >> 20) << ", poi tiers " << (costs.poi_tiers >> 20)
-                  << " MiB)" << std::endl;
+                  << ", water " << (costs.water >> 20) << " MiB)" << std::endl;
         planet_future = std::async(std::launch::async, [&, order]() {
             timed_phase("    planet: write", [&] {
                 write_region(data, output_dir + "/planet", RegionRun::Planet, order, &budget);
@@ -1876,6 +1890,33 @@ static std::pair<size_t, std::future<void>> grow_beside(std::vector<T>& out, con
 
 // Whether an argument reads as the scale list --multi-quality once took
 // (0,0.2,0.5): digits, dots and commas.
+// A way's tags as the water layer reads them (water::object_tags).
+static water::ObjectTags water_way_tags(const WayTags& t) {
+    return water::object_tags([&](const char* key) -> const char* {
+        if (std::strcmp(key, "natural") == 0) return t.natural;
+        if (std::strcmp(key, "water") == 0) return t.water;
+        if (std::strcmp(key, "waterway") == 0) return t.waterway;
+        if (std::strcmp(key, "landuse") == 0) return t.landuse;
+        if (std::strcmp(key, "name") == 0) return t.name;
+        if (std::strcmp(key, "name:en") == 0) return t.name_en;
+        if (std::strcmp(key, "wikidata") == 0) return t.wikidata;
+        return nullptr;
+    });
+}
+
+// Whether the water layer reads a way: a member of a water area relation
+// (`member`), a waterway=river or canal way with a name or in a waterway
+// relation (`in_waterway`), or a closed way in scope (`closed()`, asked only
+// then). The node pre-scan and the way pass apply it alike.
+template <class Closed>
+static bool water_way_wanted(const WayTags& t, bool member, bool in_waterway, Closed closed) {
+    if (member) return true;
+    if (water::is_naming_waterway(t.waterway) &&
+        (in_waterway || (t.name && *t.name) || (t.name_en && *t.name_en)))
+        return true;
+    return (t.natural || t.landuse || t.waterway) && closed() && water::in_scope(water_way_tags(t));
+}
+
 static bool is_scale_list(const char* arg) {
     if (!*arg) return false;
     for (const char* c = arg; *c; c++)
@@ -1901,6 +1942,8 @@ static int run(int argc, char* argv[]) {
         std::cerr << "  --tiger-data <path>          Load TIGER address data (tar.gz or directory of CSVs)" << std::endl;
         std::cerr << "  --external-postcodes <path>  Load GeoNames postcode centroids (CSV or .csv.gz)" << std::endl;
         std::cerr << "  --wikidata-sitelinks <path>  Load QID→sitelinks binary for POI importance" << std::endl;
+        std::cerr << "  --marine <path>              Load the seas and oceans (tools/marine_import.py) into the water layer"
+                  << std::endl;
         return 1;
     }
 
@@ -1909,6 +1952,7 @@ static int run(int argc, char* argv[]) {
     std::string wikidata_sitelinks_path;
     std::string tiger_data_path;
     std::string external_postcodes_path;
+    std::string marine_path;
     // strategy-2: previous build's output root, used to read
     // <prev_dir>/<region>/<variant>/*.osm_ids sidecars and assign
     // the same dense IDs to records carried over from the previous
@@ -1956,6 +2000,8 @@ static int run(int argc, char* argv[]) {
             tiger_data_path = argv[++i];
         } else if (arg == "--external-postcodes" && i + 1 < argc) {
             external_postcodes_path = argv[++i];
+        } else if (arg == "--marine" && i + 1 < argc) {
+            marine_path = argv[++i];
         } else if (arg == "--prev-output" && i + 1 < argc) {
             prev_output_dir = argv[++i];
         } else {
@@ -1972,6 +2018,7 @@ static int run(int argc, char* argv[]) {
         return 1;
     }
     require_new_or_empty_output_dir(output_dir);
+    if (!marine_path.empty()) marine::check_file(marine_path);
 
     ParsedData data;
     auto _pt = std::chrono::steady_clock::now();
@@ -2031,6 +2078,8 @@ static int run(int argc, char* argv[]) {
 
         // The last input's way geometries, freed beside the admin linking.
         WayGeometries spent_geometries;
+        // What the passes collect for the water layer, over every input.
+        water::Collected water_collected;
         for (const auto& input_file : input_files) {
             std::cerr << "Processing " << input_file << "..." << std::endl;
 
@@ -2051,6 +2100,8 @@ static int run(int argc, char* argv[]) {
                     std::vector<std::string> wikidata;  // parallel to relations
                     std::vector<int64_t> label_nodes;
                     std::vector<CollectedPoiRelation> poi_relations;
+                    std::vector<water::CollectedArea> water_areas;
+                    std::vector<water::CollectedWaterway> waterways;
                     // Relations whose tags make an area kind (RelationKind)
                     // or a POI, left out for not being multipolygon/boundary.
                     std::array<size_t, 4> not_area_type{};
@@ -2324,6 +2375,38 @@ static int run(int argc, char* argv[]) {
                             }
                         }
                     }
+                    // --- Water relations (same pass): areas, and the
+                    // waterways that name river areas ---
+                    for (auto& rel : block.relations) {
+                        const char* w_type = rel.tag("type");
+                        auto tag = [&](const char* key) { return rel.tag(key); };
+                        if (is_area_relation_type(w_type)) {
+                            water::ObjectTags tags = water::object_tags(tag);
+                            if (!water::in_scope(tags)) continue;
+                            water::CollectedArea area;
+                            area.id = rel.id;
+                            area.tags = std::move(tags);
+                            for (size_t mi = 0; mi < rel.members.size(); mi++)
+                                if (rel.members[mi].type == 'w') area.members.emplace_back(rel.members[mi].ref, rel.member_role(mi));
+                            if (!area.members.empty()) mine.water_areas.push_back(std::move(area));
+                        } else if (w_type && std::strcmp(w_type, "waterway") == 0 &&
+                                   water::is_naming_waterway(rel.tag("waterway"))) {
+                            const char* w_name = rel.tag("name");
+                            const char* w_name_en = rel.tag("name:en");
+                            if (w_name && !*w_name) w_name = nullptr;
+                            if (w_name_en && !*w_name_en) w_name_en = nullptr;
+                            if (!w_name && !w_name_en) continue;
+                            water::CollectedWaterway way;
+                            way.id = rel.id;
+                            way.name = w_name_en ? w_name_en : w_name;
+                            way.local_name = w_name ? w_name : w_name_en;
+                            way.english = w_name_en != nullptr;
+                            way.qid = water::qid_of(rel.tag("wikidata"));
+                            for (const auto& m : rel.members)
+                                if (m.type == 'w') way.ways.push_back(m.ref);
+                            if (!way.ways.empty()) mine.waterways.push_back(std::move(way));
+                        }
+                    }
                 });
                 // Which thread read a block is down to timing, so this join
                 // order is as arbitrary as the shared lock's was.
@@ -2337,6 +2420,8 @@ static int run(int argc, char* argv[]) {
                     wanted_label_nodes.insert(c.label_nodes.begin(), c.label_nodes.end());
                     std::move(c.poi_relations.begin(), c.poi_relations.end(),
                               std::back_inserter(data.collected_poi_relations));
+                    std::move(c.water_areas.begin(), c.water_areas.end(), std::back_inserter(water_collected.relations));
+                    std::move(c.waterways.begin(), c.waterways.end(), std::back_inserter(water_collected.waterways));
                     for (size_t k = 0; k < not_area_type.size(); k++) not_area_type[k] += c.not_area_type[k];
                     poi_not_area_type += c.poi_not_area_type;
                     postal_without_code += c.postal_without_code;
@@ -2394,6 +2479,31 @@ static int run(int argc, char* argv[]) {
             };
             std::cerr << "  POI assembly needs " << poi_way_count << " way geometries." << std::endl;
 
+            // The water layer's relation member ways: the areas' (the
+            // waterways' are in water_collected.waterway_of_way).
+            water::index_collected(water_collected);
+            std::vector<uint8_t> water_way_bits(MAX_WAY_ID / 8 + 1, 0);
+            size_t water_way_count = 0;
+            auto mark_water_way = [&](int64_t way_id) {
+                if (way_id > 0 && static_cast<size_t>(way_id) < MAX_WAY_ID) {
+                    water_way_bits[way_id / 8] |= (1 << (way_id % 8));
+                    water_way_count++;
+                }
+            };
+            for (const auto& rel : water_collected.relations)
+                for (const auto& [way_id, role] : rel.members) mark_water_way(way_id);
+            auto is_water_way = [&](int64_t id) -> bool {
+                if (id <= 0 || static_cast<size_t>(id) >= MAX_WAY_ID) return false;
+                return water_way_bits[id / 8] & (1 << (id % 8));
+            };
+            auto in_waterway = [&](const WayTags& t, int64_t id) {
+                return water::is_naming_waterway(t.waterway) && water_collected.waterway_of_way.count(id) > 0;
+            };
+            std::cerr << "  Water: " << water_collected.relations.size() << " area relations ("
+                      << water_way_count << " member ways), " << water_collected.waterways.size()
+                      << " waterway relations (" << water_collected.waterway_of_way.size() << " member ways)."
+                      << std::endl;
+
             // --- Pass 2 pre-scan: mark the nodes the way pass looks up ---
             // Only their coordinates are kept. The way pass applies the
             // same way_needs_nodes rule to the same blobs, and a lookup of
@@ -2407,7 +2517,13 @@ static int run(int argc, char* argv[]) {
                     const std::vector<std::string>& st) {
                     if (refs.empty()) return;
                     bool relation_member = is_admin_way(way_id) || is_poi_way(way_id);
-                    if (!way_needs_nodes(parse_way_tags(tag_keys, tag_vals, ntags, st), relation_member)) return;
+                    const WayTags t = parse_way_tags(tag_keys, tag_vals, ntags, st);
+                    if (!way_needs_nodes(t, relation_member) &&
+                        !water_way_wanted(t, is_water_way(way_id), in_waterway(t, way_id), [&] {
+                            const auto& r = refs.get();
+                            return r.size() >= 4 && r.front() == r.back();
+                        }))
+                        return;
                     for (int64_t ref : refs.get()) index.mark(static_cast<uint64_t>(ref));
                 });
                 index.finalize();
@@ -2907,6 +3023,11 @@ static int run(int argc, char* argv[]) {
                     std::vector<PoiWayEntry> poi_ways;
                     // POI way geometries for relation assembly
                     std::vector<WayGeomEntry> poi_way_geoms;
+                    // The water layer's: its relations' member ways, its
+                    // closed ways and the lines that name river areas.
+                    std::vector<WayGeomEntry> water_way_geoms;
+                    std::vector<water::ClosedWayArea> water_closed;
+                    std::vector<water::LineIn> water_lines;
                 };
 
                 static thread_local ThreadLocalData* tl_way_data = nullptr;
@@ -2931,7 +3052,14 @@ static int run(int argc, char* argv[]) {
 
                     // Early exit: if no relevant tags, skip expensive node resolution
                     bool relation_member = !refs.empty() && (is_admin_way(way_id) || is_poi_way(way_id));
-                    if (!way_needs_nodes(t, relation_member)) return;
+                    const bool water_member = !refs.empty() && is_water_way(way_id);
+                    const bool water_wanted = !refs.empty() &&
+                        water_way_wanted(t, water_member, in_waterway(t, way_id), [&] {
+                            const auto& r = refs.get();
+                            return r.size() >= 4 && r.front() == r.back();
+                        });
+                    const bool other_layers = way_needs_nodes(t, relation_member);
+                    if (!other_layers && !water_wanted) return;
                     const std::vector<int64_t>& ref_list = refs.get();
                     const int64_t* refs_data = ref_list.data();
                     const size_t refs_size = ref_list.size();
@@ -2946,6 +3074,41 @@ static int run(int argc, char* argv[]) {
                         resolved_locs.push_back(loc);
                         if (!loc.valid()) all_valid = false;
                     }
+
+                    // The water layer's ways. The other layers read only the
+                    // ways way_needs_nodes resolves, as if the water layer
+                    // weren't there. A node the input lacks joins nothing: a
+                    // member way short of one is left out, so its relation
+                    // is, as for a missing member, and a line breaks there.
+                    if (water_wanted) {
+                        if (water_member && all_valid)
+                            local.water_way_geoms.push_back({way_id, std::vector<PackedLocation>(resolved_locs.begin(), resolved_locs.end()),
+                                                             refs_data[0], refs_data[refs_size-1]});
+                        if (refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
+                            water::ObjectTags wtags = water_way_tags(t);
+                            if (water::in_scope(wtags))
+                                local.water_closed.push_back({way_id, std::move(wtags),
+                                                              std::vector<PackedLocation>(resolved_locs.begin(), resolved_locs.end())});
+                        }
+                        if (water::is_naming_waterway(t.waterway)) {
+                            water::LineIn line;
+                            if (water::line_key(water_collected, way_id, t.name, t.name_en, water::qid_of(t.wikidata), line)) {
+                                uint32_t run = 0, longest = 0;
+                                for (const auto& loc : resolved_locs) {
+                                    if (loc.valid()) {
+                                        line.vertices.push_back(loc);
+                                        longest = std::max(longest, ++run);
+                                    } else if (run) {
+                                        line.runs.push_back(run);
+                                        run = 0;
+                                    }
+                                }
+                                if (run && !line.runs.empty()) line.runs.push_back(run);
+                                if (longest >= 2) local.water_lines.push_back(std::move(line));
+                            }
+                        }
+                    }
+                    if (!other_layers) return;
 
                     // Address interpolation
                     if (t.interpolation) {
@@ -3446,6 +3609,27 @@ static int run(int argc, char* argv[]) {
                     }
                 }
                 log_phase("      Way merge: way geometries", _mt, _mc);
+
+                // The water layer's ways, in a store of their own.
+                {
+                    auto& wg = water_collected.member_geometries;
+                    for (auto& local : tld) {
+                        for (auto& g : local.water_way_geoms) {
+                            const size_t at = wg.coords.size();
+                            wg.coords.insert(wg.coords.end(), g.locs.begin(), g.locs.end());
+                            wg.ways.try_emplace(g.way_id, WayGeometries::Way{at, static_cast<uint32_t>(g.locs.size()),
+                                                                             g.first_node_id, g.last_node_id});
+                        }
+                        free_storage(local.water_way_geoms);
+                        std::move(local.water_closed.begin(), local.water_closed.end(),
+                                  std::back_inserter(water_collected.closed_ways));
+                        free_storage(local.water_closed);
+                        std::move(local.water_lines.begin(), local.water_lines.end(),
+                                  std::back_inserter(water_collected.lines));
+                        free_storage(local.water_lines);
+                    }
+                    log_phase("      Way merge: water ways", _mt, _mc);
+                }
 
                 parallel_for_each(tld.size(), [&](size_t k, unsigned) {
                     auto& local = tld[k];
@@ -4136,6 +4320,34 @@ static int run(int argc, char* argv[]) {
             log_phase("    Admin: arcs", _pt, _cpu);
             compute_admin_index_cells(data, arcs, num_threads);
             log_phase("    Admin: index cells", _pt, _cpu);
+        }
+
+        // The water layer (water_layer.h): its objects and names, arcs, cells
+        // and major tier, beside nothing else of the build's.
+        {
+            auto sitelinks_of = [&sitelinks_data](uint32_t qid) -> uint32_t {
+                auto it = std::lower_bound(sitelinks_data.begin(), sitelinks_data.end(), qid,
+                                           [](const QidSitelinks& s, uint32_t q) { return s.qid < q; });
+                return it != sitelinks_data.end() && it->qid == qid ? it->count : 0;
+            };
+            if (!marine_path.empty()) {
+                auto _mt = std::chrono::steady_clock::now();
+                auto _mc = CpuTicks::now();
+                water_collected.marine = marine::read_areas(marine_path);
+                size_t polygons = 0, rings = 0, vertices = 0;
+                for (const marine::Area& a : water_collected.marine)
+                    for (const auto& p : a.polygons) {
+                        polygons++;
+                        rings += p.size();
+                        for (const auto& r : p) vertices += r.size() - 1;
+                    }
+                std::cerr << "  Marine: " << water_collected.marine.size() << " areas, " << polygons << " polygons, "
+                          << rings << " rings, " << vertices << " vertices from " << marine_path << std::endl;
+                log_phase("    Water: marine areas", _mt, _mc);
+            }
+            data.water = water::build_layer(water_collected, cfg.prev_output_dir.empty() ? "" : cfg.prev_output_dir + "/planet",
+                                            sitelinks_of, num_threads);
+            log_phase("    Water: layer", _pt, _cpu);
         }
 
         // Sort admin polygons largest-first (by their exact rings' vertex

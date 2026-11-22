@@ -433,6 +433,12 @@ public:
         std::vector<uint32_t> next(user_at_.begin(), user_at_.end() - 1);
         for (uint32_t r : rings_)
             for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) users_[next[set_.refs()[k].arc]++] = r;
+        if (tier.crossings_within_polygons) {
+            ring_polygon_.assign(store.rings.size(), UINT32_MAX);
+            for (uint32_t p = 0; p < store.polygons.size(); p++)
+                for (uint32_t r = 0; r < store.polygons[p].ring_count; r++)
+                    ring_polygon_[store.polygons[p].first_ring + r] = p;
+        }
     }
 
     // Douglas-Peucker on every arc at its tolerance.
@@ -1113,7 +1119,7 @@ private:
                 });
                 for (size_t i = 0; i < items.size(); i++)
                     for (size_t j = i + 1; j < items.size() && items[j].lng_lo <= items[i].lng_hi; j++)
-                        if (segments_conflict(segs_[items[i].s], segs_[items[j].s]))
+                        if (conflict(segs_[items[i].s], segs_[items[j].s]))
                             found[worker].push_back(std::minmax(items[i].s, items[j].s));
             }
         }, threads_);
@@ -1133,7 +1139,7 @@ private:
                         for (; it != cells->end() && entry_cell(*it) == cell; ++it) {
                             const uint32_t t = entry_segment(*it);
                             if (t == s || !alive_[t] || (t >= first && t < s)) continue;
-                            if (segments_conflict(segs_[s], segs_[t])) found[worker].push_back(std::minmax(s, t));
+                            if (conflict(segs_[s], segs_[t])) found[worker].push_back(std::minmax(s, t));
                         }
                     }
                 });
@@ -1150,6 +1156,19 @@ private:
         }
         sort_unique(all, threads_);
         return all;
+    }
+
+    // Two segments the repair counts a crossing between (segments_conflict):
+    // with crossings_within_polygons, only of arcs one polygon's rings use.
+    bool conflict(const Segment& p, const Segment& q) const {
+        if (!segments_conflict(p, q)) return false;
+        return !tier_.crossings_within_polygons || p.arc == q.arc || share_polygon(p.arc, q.arc);
+    }
+    bool share_polygon(uint32_t a, uint32_t b) const {
+        for (uint32_t u = user_at_[a]; u < user_at_[a + 1]; u++)
+            for (uint32_t v = user_at_[b]; v < user_at_[b + 1]; v++)
+                if (ring_polygon_[users_[u]] == ring_polygon_[users_[v]]) return true;
+        return false;
     }
 
     // Whether two segments' raw spans already meet: the crossing is in the
@@ -1314,6 +1333,7 @@ private:
     std::vector<uint32_t> user_at_, users_;  // arc a's rings: users_[user_at_[a], user_at_[a + 1])
     std::vector<uint32_t> candidates_;  // nesting_candidates
     std::vector<uint32_t> polygon_of_;  // a candidate's rings' polygon, by ring
+    std::vector<uint32_t> ring_polygon_;  // every ring's polygon, by ring (crossings_within_polygons)
 
     std::vector<Segment> segs_;
     std::vector<uint8_t> alive_;

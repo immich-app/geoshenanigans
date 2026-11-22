@@ -16,8 +16,8 @@
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode);
 
-// Tier t's covering of its set's polygons (kArcTiers[t], of `arcs` over the
-// store), per arc: each arc's boundary cells once (admin_arc_cells over the
+// Tier t's covering of its set's polygons (the stage's tier t, of `arcs` over
+// the store), per arc: each arc's boundary cells once (admin_arc_cells over the
 // vertices the tier stores of it), each polygon's the merge of its rings'
 // arcs' (merge_cell_lists), classified over its rings as the tier stores
 // them, the store's own for the exact tier (admin_polygon_cells, at
@@ -43,6 +43,12 @@ AdminTierCells admin_tier_cells(const AdminArcs& arcs, const AdminExactRings& st
 // carry the tables on from there. data.admin_country_cells gets the country
 // polygons' share of the exact tier's, which the builder's links read too.
 void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads = 0);
+
+// The water layer's cell index (water_layer.h) from its arc stage's tiers
+// (`arcs` of `store`, kWaterArcStage): each polygon's cells over both tiers,
+// interior only where interior in both, in canonical order.
+std::vector<CellItemPair> compute_water_index_cells(const AdminArcs& arcs, const AdminExactRings& store,
+                                                    unsigned threads = 0);
 
 // strings_layout.json: each tier's [start, end) in the dir's string-offset
 // space, tier t at [bases[t], bases[t + 1]): the build's

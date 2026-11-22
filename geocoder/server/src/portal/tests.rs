@@ -245,7 +245,7 @@ fn template_selections() -> Vec<(RegionSelection, bool)> {
     for mode in template_values("mode") {
         for quality in template_values("quality") {
             for poi_tier in template_values("poi_tier") {
-                let s = RegionSelection { region: "planet".into(), mode: mode.clone(), quality: quality.clone(), poi_tier };
+                let s = RegionSelection { region: "planet".into(), mode: mode.clone(), quality: quality.clone(), poi_tier, water: "none".into() };
                 let allowed = t["constraints"].as_array().unwrap().iter().all(|c| {
                     let has = |key: &str| c[key].as_object().unwrap().iter().all(|(axis, value)| s.axis(axis) == value.as_str());
                     !has("when") || has("requires")
@@ -898,7 +898,8 @@ async fn a_sync_killed_part_way_resumes_in_its_dir_fetching_only_what_had_not_co
     want.sort();
     assert_eq!(resumed, want);
     let (cfg, _) = manifest_of(&bucket).await;
-    for f in cfg.files.keys().filter(|f| f.starts_with("planet/")) {
+    // The water dirs' files the portal doesn't serve yet: it fetches none.
+    for f in cfg.files.keys().filter(|f| f.starts_with("planet/") && !f.contains("/water/")) {
         assert!(std::fs::read(root.join(f)).unwrap() == bucket.file(f), "{f}");
     }
 }

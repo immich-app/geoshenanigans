@@ -78,7 +78,8 @@ pub struct PlaceSearchOptions {
 
 #[napi]
 impl Geocoder {
-    /// Load an index directory (mmap; near-instant, ~3 MiB resident).
+    /// Load an index directory and its `water/` dir where it has one (mmap; near-instant, ~3 MiB
+    /// resident).
     #[napi(factory)]
     pub fn load(dir: String) -> Result<Geocoder> {
         let (idx, loaded) = dataset::load(Path::new(&dir), || {
@@ -94,7 +95,9 @@ impl Geocoder {
     }
 
     /// Lookup on the libuv worker pool — cold-cache page faults never
-    /// block the event loop. Resolves to the address JSON, `{}` for a point off the globe.
+    /// block the event loop. Resolves to the address JSON, `{}` for a point off the globe; its
+    /// `water` (last, `{name, class, type}`) names the water holding the point, where the
+    /// dataset's `water/` dir holds some.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn reverse_geocode(&self, lat: f64, lng: f64) -> AsyncTask<QueryTask> {
         AsyncTask::new(QueryTask { inner: self.inner.clone(), lat, lng })

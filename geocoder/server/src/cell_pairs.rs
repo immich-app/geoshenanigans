@@ -165,15 +165,25 @@ impl CellPairs {
         if format.kind == Kind::Ranges {
             return Err("a ranges index opens with the rows it ranges over".into());
         }
-        let layout = Self::check(cells.as_slice(), entries.as_slice(), format, level, 0)?;
+        let layout = Self::checked(&cells, entries.as_slice(), format, level, 0)?;
         Ok(CellPairs { cells, entries, layout })
     }
 
     /// The ranges index at `level` of a file of `rows` rows in cell order: its cells' ranges must
     /// tile the rows, each cell holding at least one.
     pub fn open_ranges(cells: FileBytes, level: u64, rows: u32) -> Result<CellPairs, String> {
-        let layout = Self::check(cells.as_slice(), &[], POSTCODE_CELLS, level, rows)?;
+        let layout = Self::checked(&cells, &[], POSTCODE_CELLS, level, rows)?;
         Ok(CellPairs { cells, entries: FileBytes::Owned(Vec::new()), layout })
+    }
+
+    /// `check` over the cells file, which it reads whole, in order: read ahead of it while it
+    /// does (faulted a page at a time, a file of a few MiB costs a read a page on a slow disk),
+    /// and at random again for the lookups.
+    fn checked(cells: &FileBytes, e: &[u8], format: Format, level: u64, rows: u32) -> Result<Option<Layout>, String> {
+        cells.advise_in_order(true);
+        let layout = Self::check(cells.as_slice(), e, format, level, rows);
+        cells.advise_in_order(false);
+        layout
     }
 
     /// An index of no cells.

@@ -1,0 +1,162 @@
+name: Update Marine Areas
+
+# The seas and oceans of the water dirs (geocoder/builder/tools/marine_import.py): Marine Regions' EEZ-IHO
+# intersect cut to the water off osmdata.openstreetmap.de's land polygons, published as a version of its own
+# under geocoder/marine/<version>/. Run by hand, rarely: the nightly builds from the version
+# geocoder/builder/data/marine.json pins, so the marine areas don't change from one day to the next. Once a
+# run publishes, commit the pin its summary gives.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (YYYYMMDD). Leave empty for today.'
+        required: false
+        type: string
+
+env:
+  S3_BUCKET: geoshenanigans-reverse-geocoding
+  S3_ENDPOINT: https://t3.storage.dev
+  # Marine Regions' WFS serves the whole layer with no form to fill in. The intersect of the Exclusive
+  # Economic Zones and IHO sea areas, version 5 (2024), CC BY 4.0.
+  EEZ_IHO_URL: https://geo.vliz.be/geoserver/MarineRegions/wfs?service=WFS&version=2.0.0&request=GetFeature&typeNames=MarineRegions:eez_iho&outputFormat=application/json
+  # OpenStreetMap's land polygons from its coastline, split, WGS84 (ODbL), as osmdata regenerates them.
+  LAND_URL: https://osmdata.openstreetmap.de/download/land-polygons-split-4326.zip
+
+permissions:
+  contents: read
+
+# One run at a time, the next waiting for the last to finish: a run checks that its version is new before it
+# uploads, which only holds while no other run can upload in between.
+concurrency:
+  group: geocoder-marine
+  cancel-in-progress: false
+
+jobs:
+  marine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      # The geometry's versions are pinned, so a run of the same sources gives the same file.
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq zstd unzip
+          curl -sSfL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
+            -o "$RUNNER_TEMP/s5cmd.tar.gz"
+          sudo tar xzf "$RUNNER_TEMP/s5cmd.tar.gz" -C /usr/local/bin s5cmd
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q shapely==2.2.0 pyogrio==0.13.0 numpy==2.5.5
+          "$RUNNER_TEMP/venv/bin/python" -I -c 'import shapely, pyogrio; print("shapely", shapely.__version__, "GEOS", shapely.geos_version_string, "pyogrio", pyogrio.__version__)'
+
+      - name: Configure credentials
+        run: |
+          set -euo pipefail
+          echo "AWS_ACCESS_KEY_ID=$KEY" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$SECRET" >> "$GITHUB_ENV"
+        env:
+          KEY: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+
+      - name: Version
+        env:
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION=${REQUESTED:-$(date -u +%Y%m%d)}
+          if ! [[ "$VERSION" =~ ^[0-9]{8}$ ]]; then
+            echo "::error::Version '$VERSION' is not YYYYMMDD"
+            exit 1
+          fi
+          # A version a pin names must stay as it was published. A listing that fails for any other reason than
+          # an empty prefix says nothing either way, so the run stops.
+          if LISTED=$(s5cmd --endpoint-url "$S3_ENDPOINT" ls "s3://$S3_BUCKET/geocoder/marine/$VERSION/*" 2>&1); then
+            echo "::error::Marine areas $VERSION are already published; pick another version"
+            exit 1
+          fi
+          if ! grep -q 'no object found' <<< "$LISTED"; then
+            echo "::error::Could not tell whether marine areas $VERSION are published: $LISTED"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Test the tool
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/venv/bin/python" -I -m unittest discover -s geocoder/builder/tools -p test_marine_import.py -v \
+            2>&1 | tee "$RUNNER_TEMP/tests.log"
+          # With shapely, numpy and pyogrio installed, the geometry tests run: none may be skipped.
+          if grep -q 'skipped' "$RUNNER_TEMP/tests.log"; then
+            echo "::error::marine_import.py's geometry tests were skipped"
+            exit 1
+          fi
+
+      - name: Fetch the sources
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/marine-src"
+          mkdir -p "$SRC"
+          curl -sSfL --retry 3 --retry-delay 30 --connect-timeout 30 -o "$SRC/eez_iho.geojson" "$EEZ_IHO_URL"
+          curl -sSfL --retry 3 --retry-delay 30 --connect-timeout 30 -o "$SRC/land-polygons-split-4326.zip" "$LAND_URL"
+          LAND_DATE=$(unzip -p "$SRC/land-polygons-split-4326.zip" '*/README.txt' | sed -n 's/^Date of the data used is //p' | head -1)
+          echo "LAND_DATE=$LAND_DATE" >> "$GITHUB_ENV"
+          for f in eez_iho.geojson land-polygons-split-4326.zip; do
+            echo "$f: $(stat -c%s "$SRC/$f") bytes, sha256 $(sha256sum "$SRC/$f" | cut -c1-64)"
+          done
+          echo "Land polygons of $LAND_DATE"
+
+      - name: Build the marine areas
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/marine-src"
+          OUT="$RUNNER_TEMP/marine-out"
+          mkdir -p "$OUT"
+          "$RUNNER_TEMP/venv/bin/python" -I geocoder/builder/tools/marine_import.py build \
+            --eez-iho "$SRC/eez_iho.geojson" --land "$SRC/land-polygons-split-4326.zip" \
+            -o "$OUT/marine_areas.bin" --stats "$OUT/stats.json" --workers "$(nproc)"
+          "$RUNNER_TEMP/venv/bin/python" -I geocoder/builder/tools/marine_import.py stats "$OUT/marine_areas.bin" | tail -1
+          zstd -19 -T0 -q "$OUT/marine_areas.bin" -o "$OUT/marine_areas.bin.zst"
+
+      - name: Upload to Tigris
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/marine-src"
+          OUT="$RUNNER_TEMP/marine-out"
+          S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5"
+          SHA=$(sha256sum "$OUT/marine_areas.bin.zst" | cut -c1-64)
+          jq -n \
+            --arg version "$VERSION" \
+            --arg path "marine/$VERSION/marine_areas.bin.zst" \
+            --arg sha256 "$SHA" \
+            --argjson size "$(stat -c%s "$OUT/marine_areas.bin.zst")" \
+            --arg raw_sha256 "$(sha256sum "$OUT/marine_areas.bin" | cut -c1-64)" \
+            --argjson raw_size "$(stat -c%s "$OUT/marine_areas.bin")" \
+            --arg eez_iho_url "$EEZ_IHO_URL" \
+            --arg eez_iho_sha256 "$(sha256sum "$SRC/eez_iho.geojson" | cut -c1-64)" \
+            --arg land_url "$LAND_URL" \
+            --arg land_sha256 "$(sha256sum "$SRC/land-polygons-split-4326.zip" | cut -c1-64)" \
+            --arg land_date "$LAND_DATE" \
+            --arg commit "$GITHUB_SHA" \
+            --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --slurpfile stats "$OUT/stats.json" \
+            '{version: $version, path: $path, sha256: $sha256, size: $size, raw_sha256: $raw_sha256, raw_size: $raw_size,
+              sources: {eez_iho: {url: $eez_iho_url, sha256: $eez_iho_sha256},
+                        land: {url: $land_url, sha256: $land_sha256, data_date: $land_date}},
+              stats: $stats[0], commit: $commit, built_at: $built_at}' > "$OUT/manifest.json"
+          cat "$OUT/manifest.json"
+          $S5 cp "$OUT/marine_areas.bin.zst" "s3://$S3_BUCKET/geocoder/marine/$VERSION/marine_areas.bin.zst"
+          $S5 cp "$OUT/manifest.json" "s3://$S3_BUCKET/geocoder/marine/$VERSION/manifest.json"
+          {
+            echo "## Marine areas $VERSION"
+            echo ""
+            echo "Land polygons of $LAND_DATE. To build with them, commit as geocoder/builder/data/marine.json:"
+            echo ""
+            echo '```json'
+            jq --arg version "$VERSION" --arg path "marine/$VERSION/marine_areas.bin.zst" --arg sha256 "$SHA" \
+              '.version = $version | .path = $path | .sha256 = $sha256' geocoder/builder/data/marine.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
