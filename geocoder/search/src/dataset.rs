@@ -11,7 +11,7 @@ use crate::build::{
 };
 use crate::constants::*;
 use crate::reader::SearchIndex;
-use query_server::{lower_hex, FileStamp, Index};
+use query_server::{lower_hex, FileStamp, Index, WATER_DIR, WATER_FILES};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -47,31 +47,41 @@ pub struct Stamps(BTreeMap<String, FileStamp>);
 impl Stamps {
     /// The stamps of the dataset files in `dir`.
     pub fn of(dir: &Path) -> std::io::Result<Stamps> {
-        let mut out = BTreeMap::new();
-        for name in DATASET_FILES {
-            match std::fs::metadata(dir.join(name)) {
-                Ok(m) => {
-                    out.insert(name.to_string(), FileStamp::of(&m));
-                }
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(Stamps(out))
+        stamps_of(dir, &DATASET_FILES).map(Stamps)
     }
 }
 
+/// The stat of each of the files `names` present in `dir`, by name.
+fn stamps_of(dir: &Path, names: &[&str]) -> std::io::Result<BTreeMap<String, FileStamp>> {
+    let mut out = BTreeMap::new();
+    for name in names {
+        match std::fs::metadata(dir.join(name)) {
+            Ok(m) => {
+                out.insert(name.to_string(), FileStamp::of(&m));
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
 /// Runs `load` (which loads the geocoder index of the dataset in `dir`) and returns what it
-/// loaded with the stamps of the files it read: the same before and after the load, else the
-/// files were being replaced and it fails.
+/// loaded with the stamps of the dataset files it read: those and the files of the dataset's
+/// water dir (WATER_FILES, which the geocoder index loads and an index of place search derives
+/// nothing from) the same before and after the load, else the files were being replaced and it
+/// fails.
 pub fn load<T>(dir: &Path, load: impl FnOnce() -> Result<T, String>) -> Result<(T, Stamps), String> {
-    let stamps = || Stamps::of(dir).map_err(|e| format!("{}: {e}", dir.display()));
+    let stamps = || {
+        let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+        Ok::<_, String>((Stamps::of(dir).map_err(io)?, stamps_of(&dir.join(WATER_DIR), &WATER_FILES).map_err(io)?))
+    };
     let before = stamps()?;
     let loaded = load()?;
     if stamps()? != before {
         return Err(format!("The dataset in {} changed while it was loading", dir.display()));
     }
-    Ok((loaded, before))
+    Ok((loaded, before.0))
 }
 
 /// Hashes of dataset files, each with the stat it was taken at; kept beside an index
@@ -805,6 +815,40 @@ mod tests {
         });
 
         assert!(refused.unwrap_err().contains("changed while it was loading"));
+    }
+
+    // The geocoder index loads the dataset's water dir too: a water file replaced, added or
+    // removed during the load fails it. The stamps kept are of the files place search reads,
+    // which a water dir leaves as they are.
+    #[test]
+    fn load_refuses_a_water_dir_replaced_while_loading() {
+        let ds = TempDir::new("water");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let water = ds.0.join(WATER_DIR);
+        std::fs::create_dir(&water).unwrap();
+        std::fs::write(water.join("admin_polygons.bin"), b"day 1").unwrap();
+        std::fs::write(water.join("water_meta.json"), b"day 1").unwrap();
+        let replace = |name: &str| {
+            let new = water.join(format!("{name}.new"));
+            std::fs::write(&new, b"day 2").unwrap();
+            std::fs::rename(&new, water.join(name)).unwrap();
+        };
+
+        let kept = load(&ds.0, || Ok(()));
+        let replaced = load(&ds.0, || {
+            replace("admin_polygons.bin");
+            Ok(())
+        });
+        let added = load(&ds.0, || {
+            replace("arc_index.bin");
+            Ok(())
+        });
+        let removed = load(&ds.0, || std::fs::remove_file(water.join("water_meta.json")).map_err(|e| e.to_string()));
+
+        for (what, got) in [("replaced", replaced), ("added", added), ("removed", removed)] {
+            assert!(got.unwrap_err().contains("changed while it was loading"), "{what}");
+        }
+        assert_eq!(kept.unwrap().1, Stamps::of(&ds.0).unwrap());
     }
 
     #[test]
