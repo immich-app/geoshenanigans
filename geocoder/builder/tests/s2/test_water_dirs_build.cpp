@@ -173,6 +173,50 @@ TEST(build_index_writes_every_regions_water_dirs_and_a_chained_build_writes_them
     CHECK(tree(again) == files);
 }
 
+TEST(a_way_only_the_water_layer_reads_stays_out_of_the_other_layers) {
+    // A pond named in English alone, which the way pass resolves for the
+    // water layer only (way_needs_nodes reads `name`), and a street of an
+    // English name alone that is a member of a water relation.
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    // Both builds hold a street of a local name.
+    std::vector<TestObject> base = fixture();
+    base.push_back(node(8001, lat0 + 700000, lng0));
+    base.push_back(node(8002, lat0 + 700000, lng0 + 3000));
+    base.push_back(way(8100, {8001, 8002}, {{"highway", "residential"}, {"name", "Teststrasse"}}));
+    auto sorted = [](std::vector<TestObject> objs) {
+        std::stable_sort(objs.begin(), objs.end(), [](const TestObject& a, const TestObject& b) {
+            return a.type != b.type ? a.type < b.type : a.id < b.id;
+        });
+        return objs;
+    };
+    std::vector<TestObject> objects = base;
+    for (int64_t id = 9001; id <= 9006; id++)
+        objects.push_back(node(id, lat0 + 600000 + int32_t(id - 9001) % 2 * 2000, lng0 + int32_t((id - 9001) / 2) * 2000));
+    objects.push_back(way(9100, {9001, 9003, 9004, 9002, 9001}, {{"natural", "water"}, {"name:en", "English Pond"}}));
+    objects.push_back(way(9101, {9003, 9005, 9006, 9004, 9003}, {{"highway", "residential"}, {"name:en", "English Street"}}));
+    objects.push_back(relation(9200, {{"type", "multipolygon"}, {"natural", "wetland"}, {"name", "Ried"}}, {{9101, "outer"}}));
+    const ScratchDir root("water-other-layers");
+    const std::string pbf = root.path() + "/water.osm.pbf", log = root.path() + "/build.log";
+    auto build = [&](const std::vector<TestObject>& objs, const std::string& out) {
+        write_test_pbf(pbf, objs, 1000);
+        return gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf, "--multi-output", "--multi-quality"}, log);
+    };
+    const std::string with = root.path() + "/with", without = root.path() + "/without";
+    REQUIRE(build(sorted(objects), with));
+    REQUIRE(build(sorted(base), without));
+    const auto a = tree(with), b = tree(without);
+    // The water layer holds the pond and the wetland ...
+    const std::vector<std::string> names = names_in(a.at("planet/water/all/exact/strings_core.bin"));
+    CHECK(std::find(names.begin(), names.end(), "English Pond") != names.end());
+    CHECK(std::find(names.begin(), names.end(), "Ried") != names.end());
+    // ... and no other dir has more than it has without them: the same
+    // POIs and streets.
+    for (const char* f : {"planet/poi/all/poi_records.osm_ids", "planet/full/street_ways.osm_ids"}) {
+        REQUIRE(a.count(f) && b.count(f));
+        CHECK_EQ(a.at(f).size(), b.at(f).size());
+    }
+}
+
 TEST(a_build_without_multi_output_writes_the_exact_water_tier_beside_its_modes_files) {
     const ScratchDir root("water-single-output");
     const std::string pbf = root.path() + "/water.osm.pbf", log = root.path() + "/build.log";

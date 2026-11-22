@@ -3052,7 +3052,8 @@ static int run(int argc, char* argv[]) {
                             const auto& r = refs.get();
                             return r.size() >= 4 && r.front() == r.back();
                         });
-                    if (!way_needs_nodes(t, relation_member) && !water_wanted) return;
+                    const bool other_layers = way_needs_nodes(t, relation_member);
+                    if (!other_layers && !water_wanted) return;
                     const std::vector<int64_t>& ref_list = refs.get();
                     const int64_t* refs_data = ref_list.data();
                     const size_t refs_size = ref_list.size();
@@ -3067,6 +3068,38 @@ static int run(int argc, char* argv[]) {
                         resolved_locs.push_back(loc);
                         if (!loc.valid()) all_valid = false;
                     }
+
+                    // The water layer's ways. The other layers read only the
+                    // ways way_needs_nodes resolves, as if the water layer
+                    // weren't there.
+                    if (water_wanted) {
+                        auto valid = [&] {
+                            std::vector<PackedLocation> geom;
+                            geom.reserve(refs_size);
+                            for (const auto& loc : resolved_locs)
+                                if (loc.valid()) geom.push_back(loc);
+                            return geom;
+                        };
+                        if (water_member) {
+                            auto geom = valid();
+                            if (!geom.empty())
+                                local.water_way_geoms.push_back({way_id, std::move(geom), refs_data[0], refs_data[refs_size-1]});
+                        }
+                        if (refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
+                            water::ObjectTags wtags = water_way_tags(t);
+                            if (water::in_scope(wtags))
+                                local.water_closed.push_back({way_id, std::move(wtags),
+                                                              std::vector<PackedLocation>(resolved_locs.begin(), resolved_locs.end())});
+                        }
+                        if (water::is_naming_waterway(t.waterway)) {
+                            water::LineIn line;
+                            if (water::line_key(water_collected, way_id, t.name, t.name_en, water::qid_of(t.wikidata), line)) {
+                                line.vertices = valid();
+                                if (line.vertices.size() >= 2) local.water_lines.push_back(std::move(line));
+                            }
+                        }
+                    }
+                    if (!other_layers) return;
 
                     // Address interpolation
                     if (t.interpolation) {
@@ -3183,28 +3216,6 @@ static int run(int argc, char* argv[]) {
                         auto geom = valid_locs();
                         if (!geom.empty())
                             local.poi_way_geoms.push_back({way_id, std::move(geom), refs_data[0], refs_data[refs_size-1]});
-                    }
-
-                    // The water layer's ways
-                    if (water_wanted) {
-                        if (water_member) {
-                            auto geom = valid_locs();
-                            if (!geom.empty())
-                                local.water_way_geoms.push_back({way_id, std::move(geom), refs_data[0], refs_data[refs_size-1]});
-                        }
-                        if (refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
-                            water::ObjectTags wtags = water_way_tags(t);
-                            if (water::in_scope(wtags))
-                                local.water_closed.push_back({way_id, std::move(wtags),
-                                                              std::vector<PackedLocation>(resolved_locs.begin(), resolved_locs.end())});
-                        }
-                        if (water::is_naming_waterway(t.waterway)) {
-                            water::LineIn line;
-                            if (water::line_key(water_collected, way_id, t.name, t.name_en, water::qid_of(t.wikidata), line)) {
-                                line.vertices = valid_locs();
-                                if (line.vertices.size() >= 2) local.water_lines.push_back(std::move(line));
-                            }
-                        }
                     }
 
                     // Closed way POI polygons
