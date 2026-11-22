@@ -231,6 +231,16 @@
   }
   .detail-panel.visible { display: block; }
 
+  /* The credit of the data the answers come from (configurations.template.json "attribution"). */
+  .data-credit {
+    padding: 8px 16px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--text-dim);
+  }
+  .data-credit a { color: var(--accent); }
+
   .detail-panel h3 {
     font-size: 11px;
     text-transform: uppercase;
@@ -351,6 +361,18 @@
       <h3>Detail</h3>
       <div id="detailContent"></div>
     </div>
+
+    <footer class="data-credit">
+      Answers from
+      <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a>,
+      <a href="https://opendatacommons.org/licenses/odbl/1-0/" target="_blank" rel="noopener">ODbL 1.0</a>;
+      GB postcodes from <a href="https://www.geonames.org/" target="_blank" rel="noopener">GeoNames</a>,
+      <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>
+      (contains Royal Mail data Royal Mail copyright and database right 2022);
+      US address ranges and ZIP codes from
+      <a href="https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html" target="_blank" rel="noopener">US Census Bureau TIGER/Line</a>
+      (Public domain).
+    </footer>
   </div>
 </div>
 

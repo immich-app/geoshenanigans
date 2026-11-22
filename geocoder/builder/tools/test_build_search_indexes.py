@@ -241,6 +241,16 @@ class TestPortalTest(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(run.stdout.strip(), str(load_template()["build"]["version"]))
 
+    # The page shows the answers' data, so it credits each source the template does, with its
+    # licence.
+    def test_the_page_credits_every_source_of_the_template(self):
+        with open(os.path.join(PORTAL, "index.html"), encoding="utf-8") as f:
+            page = f.read()
+        for entry in load_template()["attribution"]:
+            for field in ("text", "url", "licence", "licence_url"):
+                if field in entry:
+                    self.assertIn(entry[field], page, (entry["id"], field))
+
     def unit_of(self, name):
         """The transport unit entrypoint.sh --unit-of fetches a file through, or ""."""
         with tempfile.TemporaryDirectory() as tmp:
