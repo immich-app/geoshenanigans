@@ -12,9 +12,10 @@
 // vertex to the next as a way of its own (a negative id of the line), so
 // each stretch of cut is one arc of the two pieces beside it.
 //
-// The rings must be valid: holes inside the outer ring and apart from one
-// another. split_polygon checks its pieces against the polygon at sample
-// points and by area, and gives the polygon back whole when they disagree.
+// The rings count even-odd, as every reader of them does, so they needn't be
+// valid: a hole may cross its outer ring or another hole. split_polygon
+// checks its pieces against the polygon at sample points and gives the
+// polygon back whole when they disagree.
 #pragma once
 
 #include <algorithm>
@@ -83,20 +84,6 @@ inline __int128 area2(const std::vector<P>& v) {
     return s;
 }
 
-inline void reverse_ring(FrameRing& r) {
-    // The edge from v[i] to v[i + 1] is way[i]; reversed, the edge from the
-    // new v[j] to v[j + 1] is the old edge from v[n - 2 - j]... (mod n).
-    const size_t n = r.v.size();
-    std::vector<P> v(n);
-    std::vector<int64_t> way(n);
-    for (size_t j = 0; j < n; j++) {
-        v[j] = r.v[(n - j) % n];
-        way[j] = r.way[(2 * n - j - 1) % n];
-    }
-    r.v = std::move(v);
-    r.way = std::move(way);
-}
-
 // Where the edge a-b, which runs from one side of y = L to the other (a.y < L
 // <= b.y, or b.y < L <= a.y), meets the line: x rounded to the nearest unit,
 // half away from zero; an end on the line is itself.
@@ -130,21 +117,28 @@ inline void push(Chain& c, P p, int64_t way_on) {
     c.way.push_back(way_on);
 }
 
-// The two sides' parts of a set of rings cut by y = L (side 1 holds y >= L):
-// each side's rings, outer counterclockwise and holes clockwise, nested into
-// polygons. The cut's way is `cut_way`. False where the rings don't make
-// pieces it can tell apart: a chain left without its next, or a hole in no
-// outer ring.
-struct Side {
-    std::vector<FrameRing> outers;
-    std::vector<std::vector<FrameRing>> holes;  // by outer
-};
-
-inline bool cut(const std::vector<FrameRing>& rings, int64_t L, int64_t cut_way, Side sides[2]) {
+// The two sides' parts of a set of rings cut by y = L (side 1 holds y >= L),
+// each side's rings with their edges' ways, the cut's way `cut_way`. The
+// rings count even-odd, whatever their direction: along the line each
+// crossing of a ring turns inside to outside or back, so the stretches of
+// the line inside are those between the first crossing and the second, the
+// third and the fourth, and so on. Each side's rings are its stretches of
+// the rings, from one crossing to another, joined by those stretches of the
+// line; they hold, even-odd, what the rings hold on that side. False where
+// the crossings don't pair up.
+inline bool cut(const std::vector<FrameRing>& rings, int64_t L, int64_t cut_way, std::vector<FrameRing> sides[2]) {
+    struct Crossing {
+        P at;
+        uint32_t chain[2];   // its chain on each side
+        bool start[2];       // whether it starts that chain
+        uint32_t partner;    // the other end of its stretch of line
+    };
+    std::vector<Crossing> crossings;
     std::vector<Chain> chains[2];
-    std::vector<FrameRing> whole[2];
+    std::vector<std::pair<uint32_t, uint32_t>> chain_ends[2];  // (start crossing, end crossing)
     for (const FrameRing& r : rings) {
         const size_t n = r.v.size();
+        if (n == 0) continue;
         auto side = [&](size_t i) { return r.v[i % n].y >= L ? 1 : 0; };
         size_t s = n;
         for (size_t i = 0; i < n; i++)
@@ -153,115 +147,86 @@ inline bool cut(const std::vector<FrameRing>& rings, int64_t L, int64_t cut_way,
                 break;
             }
         if (s == n) {
-            whole[side(0)].push_back(r);
+            sides[side(0)].push_back(r);
             continue;
         }
-        // From the vertex after the first crossing, round the ring.
+        // From the first crossing round the ring: each chain from one
+        // crossing to the next.
+        const size_t prev = (s + n - 1) % n;
+        const uint32_t first = static_cast<uint32_t>(crossings.size());
+        crossings.push_back({crossing(r.v[prev], r.v[s], L), {0, 0}, {false, false}, 0});
         Chain c;
         int current = side(s);
-        const size_t prev = (s + n - 1) % n;
-        push(c, crossing(r.v[prev], r.v[s], L), r.way[prev]);
+        uint32_t from = first;
+        push(c, crossings[first].at, r.way[prev]);
         for (size_t k = 0; k < n; k++) {
             const size_t i = (s + k) % n, j = (i + 1) % n;
             push(c, r.v[i], r.way[i]);
-            if (side(j) != current) {
-                const P x = crossing(r.v[i], r.v[j], L);
-                push(c, x, cut_way);
-                if (c.v.size() >= 2) chains[current].push_back(std::move(c));
-                c = Chain{};
-                current = side(j);
-                push(c, x, r.way[i]);
-            }
+            if (side(j) == current) continue;
+            const uint32_t to = k + 1 == n ? first : static_cast<uint32_t>(crossings.size());
+            if (to != first) crossings.push_back({crossing(r.v[i], r.v[j], L), {0, 0}, {false, false}, 0});
+            push(c, crossings[to].at, cut_way);
+            const uint32_t id = static_cast<uint32_t>(chains[current].size());
+            crossings[from].chain[current] = id;
+            crossings[from].start[current] = true;
+            crossings[to].chain[current] = id;
+            crossings[to].start[current] = false;
+            chains[current].push_back(std::move(c));
+            chain_ends[current].push_back({from, to});
+            c = Chain{};
+            current = side(j);
+            from = to;
+            push(c, crossings[to].at, r.way[i]);
         }
-        if (c.v.size() > 1) return false;  // the walk ends at its first crossing
+    }
+    if (crossings.size() % 2) return false;
+    // The stretches of line inside: crossings in order along it, in pairs.
+    std::vector<uint32_t> order(crossings.size());
+    for (uint32_t k = 0; k < order.size(); k++) order[k] = k;
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        return crossings[a].at.x != crossings[b].at.x ? crossings[a].at.x < crossings[b].at.x : a < b;
+    });
+    for (size_t k = 0; k + 1 < order.size(); k += 2) {
+        crossings[order[k]].partner = order[k + 1];
+        crossings[order[k + 1]].partner = order[k];
     }
     for (int s = 0; s < 2; s++) {
-        Side& out = sides[s];
-        // Each chain's start on the line, by x: side 0 goes west along the
-        // line to the next start below its end, side 1 east to the next above.
-        std::vector<std::pair<int64_t, size_t>> starts;
-        for (size_t k = 0; k < chains[s].size(); k++) starts.push_back({chains[s][k].v.front().x, k});
-        std::sort(starts.begin(), starts.end());
         std::vector<uint8_t> used(chains[s].size(), 0);
-        for (size_t first = 0; first < chains[s].size(); first++) {
-            if (used[first]) continue;
+        for (uint32_t c0 = 0; c0 < chains[s].size(); c0++) {
+            if (used[c0]) continue;
             FrameRing ring;
-            size_t k = first;
-            while (!used[k]) {
-                used[k] = 1;
-                const Chain& c = chains[s][k];
-                for (size_t i = 0; i + 1 < c.v.size(); i++) {
-                    if (!ring.v.empty() && ring.v.back() == c.v[i]) {
-                        ring.way.back() = c.way[i];
-                        continue;
-                    }
-                    ring.v.push_back(c.v[i]);
-                    ring.way.push_back(c.way[i]);
+            auto add = [&](P p, int64_t way) {
+                if (!ring.v.empty() && ring.v.back() == p) {
+                    ring.way.back() = way;
+                    return;
                 }
-                const P end = c.v.back();
-                // The next start along the line from `end`.
-                size_t next = SIZE_MAX;
-                if (s == 0) {
-                    auto it = std::upper_bound(starts.begin(), starts.end(), std::make_pair(end.x, SIZE_MAX));
-                    if (it == starts.begin()) return false;
-                    next = std::prev(it)->second;
-                } else {
-                    auto it = std::lower_bound(starts.begin(), starts.end(), std::make_pair(end.x, size_t(0)));
-                    if (it == starts.end()) return false;
-                    next = it->second;
+                ring.v.push_back(p);
+                ring.way.push_back(way);
+            };
+            // Walk chain c from crossing `at`, forwards or backwards, then
+            // along the line to the next chain, until back at chain c0.
+            uint32_t c = c0, at = chain_ends[s][c0].first;
+            for (size_t guard = 0; !used[c]; guard++) {
+                if (guard > chains[s].size()) return false;
+                used[c] = 1;
+                const Chain& ch = chains[s][c];
+                const bool forwards = chain_ends[s][c].first == at;
+                const size_t m = ch.v.size();
+                for (size_t i = 0; i + 1 < m; i++) {
+                    const size_t from = forwards ? i : m - 1 - i, to = forwards ? i + 1 : m - 2 - i;
+                    add(ch.v[from], ch.way[forwards ? from : to]);
                 }
-                // The cut from `end` to the next chain's start.
-                if (ring.v.empty() || ring.v.back() != end) {
-                    ring.v.push_back(end);
-                    ring.way.push_back(cut_way);
-                } else {
-                    ring.way.back() = cut_way;
-                }
-                k = next;
-                if (k != first && used[k]) return false;
+                const uint32_t end = forwards ? chain_ends[s][c].second : chain_ends[s][c].first;
+                add(crossings[end].at, cut_way);
+                at = crossings[end].partner;
+                c = crossings[at].chain[s];
             }
-            // Drop a closing repeat.
+            if (c != c0) return false;
             while (ring.v.size() > 1 && ring.v.front() == ring.v.back()) {
                 ring.v.pop_back();
                 ring.way.pop_back();
             }
-            if (ring.v.size() < 3 || area2(ring.v) == 0) continue;
-            if (area2(ring.v) < 0) return false;
-            out.outers.push_back(std::move(ring));
-        }
-        std::vector<FrameRing> holes;
-        for (FrameRing& r : whole[s]) {
-            if (area2(r.v) > 0) out.outers.push_back(std::move(r));
-            else holes.push_back(std::move(r));
-        }
-        out.holes.assign(out.outers.size(), {});
-        for (FrameRing& h : holes) {
-            // A vertex of the hole on no outer ring tells which holds it.
-            size_t owner = SIZE_MAX;
-            for (const P& p : h.v) {
-                bool shared = false;
-                for (const FrameRing& o : out.outers)
-                    if (std::find(o.v.begin(), o.v.end(), p) != o.v.end()) shared = true;
-                if (shared) continue;
-                for (size_t o = 0; o < out.outers.size(); o++) {
-                    const std::vector<P>& ov = out.outers[o].v;
-                    bool in = false;
-                    for (size_t a = 0, b = ov.size() - 1; a < ov.size(); b = a++) {
-                        const P &pa = ov[b], &pb = ov[a];
-                        if ((pa.x > p.x) == (pb.x > p.x)) continue;
-                        const __int128 lhs = static_cast<__int128>(p.y - pa.y) * (pb.x - pa.x);
-                        const __int128 rhs = static_cast<__int128>(pb.y - pa.y) * (p.x - pa.x);
-                        if (lhs != rhs && ((lhs < rhs) != (pb.x < pa.x))) in = !in;
-                    }
-                    if (in) {
-                        owner = o;
-                        break;
-                    }
-                }
-                break;
-            }
-            if (owner == SIZE_MAX) return false;
-            out.holes[owner].push_back(std::move(h));
+            if (ring.v.size() >= 3 && area2(ring.v) != 0) sides[s].push_back(std::move(ring));
         }
     }
     return true;
@@ -324,14 +289,31 @@ inline __int128 polygon_area2(const SplitPolygon& poly) {
 
 }  // namespace split_detail
 
+// Why split_polygon left a polygon whole.
+enum class SplitRefusal : uint8_t { None, FewHoles, Cut, Sample };
+
+inline const char* refusal_name(SplitRefusal r) {
+    switch (r) {
+        case SplitRefusal::None: return "none";
+        case SplitRefusal::FewHoles: return "few holes";
+        case SplitRefusal::Cut: return "crossings that don't pair up";
+        case SplitRefusal::Sample: return "pieces holding other points";
+    }
+    return "";
+}
+
 // The pieces of the polygon (its rings and their edges' ways), each with at
 // most max_holes holes or as small as the grid goes; the polygon alone, key
-// 0, when it has no more than max_holes or its pieces fail the check.
-// `cut_lines` counts the lines it cut along.
+// 0, when it has no more than max_holes or its pieces fail the check, and
+// why in `refused`. `cut_lines` counts the lines it cut along.
 inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint32_t max_holes = kSplitMaxHoles,
-                                               size_t* cut_lines = nullptr) {
+                                               size_t* cut_lines = nullptr, SplitRefusal* refused = nullptr) {
+    auto refuse = [&](SplitRefusal why) {
+        if (refused) *refused = why;
+        return std::vector<SplitPolygon>{polygon};
+    };
     using namespace split_detail;
-    if (polygon.holes.size() <= max_holes) return {polygon};
+    if (polygon.holes.size() <= max_holes) return refuse(SplitRefusal::FewHoles);
     std::vector<SplitPolygon> done, todo = {polygon};
     todo[0].key = 0;
     size_t lines = 0;
@@ -359,43 +341,53 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
         // In the frame: a cut along a meridian lon = line is y = -line there.
         const int64_t L = meridian ? -line : line;
         std::vector<FrameRing> rings;
-        auto add = [&](const SplitRing& r, bool hole) {
+        auto add = [&](const SplitRing& r) {
             FrameRing f;
             for (PackedLocation p : r.v) f.v.push_back(to_frame(p, meridian));
             f.way = r.way;
-            const __int128 a = area2(f.v);
-            if ((a > 0) == hole && a != 0) reverse_ring(f);
             rings.push_back(std::move(f));
         };
-        add(piece.outer, false);
-        for (const SplitRing& h : piece.holes) add(h, true);
-        Side sides[2];
-        if (!cut(rings, L, cut_way_of(line, meridian), sides)) return {polygon};
+        add(piece.outer);
+        for (const SplitRing& h : piece.holes) add(h);
+        std::vector<FrameRing> sides[2];
+        if (!cut(rings, L, cut_way_of(line, meridian), sides)) return refuse(SplitRefusal::Cut);
         lines++;
-        for (int s = 0; s < 2; s++)
-            for (size_t o = 0; o < sides[s].outers.size(); o++) {
+        for (int s = 0; s < 2; s++) {
+            // The side's rings nested by geometry, as a relation's are: each
+            // ring at even depth an outer ring with the holes in it.
+            std::vector<std::vector<PackedLocation>> closed;
+            std::vector<std::vector<int64_t>> ways;
+            for (const FrameRing& f : sides[s]) {
+                std::vector<PackedLocation> v;
+                for (const P& p : f.v) v.push_back(from_frame(p, meridian));
+                v.push_back(v.front());
+                closed.push_back(std::move(v));
+                ways.push_back(f.way);
+            }
+            const std::vector<int> around = enclosing_rings(closed);
+            const std::vector<int> depth = ring_depths(around);
+            std::vector<NestedPolygon<PackedLocation>> polygons = nest_rings(std::move(closed), around, depth);
+            std::vector<NestedPolygon<int64_t>> polygon_ways = nest_rings(std::move(ways), around, depth);
+            for (size_t o = 0; o < polygons.size(); o++) {
                 SplitPolygon out;
-                auto back = [&](const FrameRing& f) {
+                auto back = [](std::vector<PackedLocation>& v, std::vector<int64_t>& w) {
                     SplitRing r;
-                    for (const P& p : f.v) r.v.push_back(from_frame(p, meridian));
-                    r.way = f.way;
+                    v.pop_back();
+                    r.v = std::move(v);
+                    r.way = std::move(w);
                     return r;
                 };
-                out.outer = back(sides[s].outers[o]);
-                for (const FrameRing& h : sides[s].holes[o]) out.holes.push_back(back(h));
+                out.outer = back(polygons[o].outer, polygon_ways[o].outer);
+                for (size_t h = 0; h < polygons[o].holes.size(); h++)
+                    out.holes.push_back(back(polygons[o].holes[h], polygon_ways[o].holes[h]));
                 out.key = mix_key(piece.key, static_cast<uint64_t>(line), meridian, s) + o;
                 todo.push_back(std::move(out));
             }
+        }
     }
 
-    // The check: the pieces' area is the polygon's, to the rounding of the
-    // cut vertices, and at sample points over its box exactly the pieces
-    // the polygon holds hold the point, one.
-    const __int128 whole = polygon_area2(polygon);
-    __int128 parts = 0;
-    for (const SplitPolygon& p : done) parts += polygon_area2(p);
-    const __int128 diff = whole > parts ? whole - parts : parts - whole;
-    if (diff * 100000 > (whole < 0 ? -whole : whole) + 1000000000) return {polygon};
+    // The check: at sample points over its box exactly the pieces the
+    // polygon holds hold the point, one.
     Box box;
     for (PackedLocation p : polygon.outer.v) box.add(p);
     std::vector<Box> boxes(done.size());
@@ -417,7 +409,7 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
         state = mix64(state + 0x9e3779b97f4a7c15ull);
         return lo + static_cast<int64_t>(state % static_cast<uint64_t>(hi - lo + 1));
     };
-    for (int k = 0; k < 512; k++) {
+    for (int k = 0; k < 1024; k++) {
         const PackedLocation p{static_cast<int32_t>(next(box.lat_lo, box.lat_hi)),
                                static_cast<int32_t>(next(box.lon_lo, box.lon_hi))};
         const bool in = whole_contains(p);
@@ -434,10 +426,11 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
                 for (size_t i = 0; i < done[q].outer.v.size() && !on_cut; i++)
                     on_cut = done[q].outer.way[i] < 0 &&
                              (done[q].outer.v[i].lat_e7 == p.lat_e7 || done[q].outer.v[i].lon_e7 == p.lon_e7);
-            if (!on_cut) return {polygon};
+            if (!on_cut) return refuse(SplitRefusal::Sample);
         }
     }
     if (cut_lines) *cut_lines += lines;
+    if (refused) *refused = SplitRefusal::None;
     return done;
 }
 

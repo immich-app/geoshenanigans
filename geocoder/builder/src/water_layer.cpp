@@ -396,9 +396,14 @@ void split_polygons(Build& b, unsigned threads) {
     for (uint32_t p = 0; p < n; p++)
         if (r.polygons[p].ring_count > kSplitMaxHoles + 1) heavy.push_back(p);
     if (heavy.empty()) return;
+    std::vector<uint32_t> heavy_rings;
+    for (uint32_t p : heavy) heavy_rings.push_back(r.polygons[p].ring_count);
+    std::vector<uint32_t> heavy_object;
+    for (uint32_t p : heavy) heavy_object.push_back(b.object_of[p]);
     // Each heavy polygon's pieces, on every core, the costliest first.
     std::vector<std::vector<SplitPolygon>> pieces(heavy.size());
     std::vector<size_t> lines(heavy.size(), 0);
+    std::vector<SplitRefusal> refusals(heavy.size(), SplitRefusal::None);
     const std::vector<uint32_t> order = costliest_first(heavy.size(), [&](size_t k) {
         return static_cast<float>(r.occurrences(heavy[k]));
     }, threads);
@@ -423,7 +428,7 @@ void split_polygons(Build& b, unsigned threads) {
                 else poly.holes.push_back(std::move(sr));
             }
             if (!runs_whole) continue;
-            pieces[k] = split_polygon(poly, kSplitMaxHoles, &lines[k]);
+            pieces[k] = split_polygon(poly, kSplitMaxHoles, &lines[k], &refusals[k]);
             if (pieces[k].size() == 1) pieces[k].clear();
         }
     }, threads);
@@ -489,8 +494,14 @@ void split_polygons(Build& b, unsigned threads) {
     b.object_of = std::move(object_of);
     b.outer_rank = std::move(outer_rank);
     b.piece_key = std::move(piece_key);
-    std::cerr << "  Water split: " << heavy.size() << " polygons of more than " << kSplitMaxHoles << " holes; " << cut
-              << " cut along " << cut_lines << " lines into " << made << " pieces, " << kept_whole
+    std::ostringstream whole;
+    for (size_t h = 0; h < heavy.size(); h++)
+        if (refusals[h] != SplitRefusal::None)
+            whole << "  Water split: " << (b.objects[heavy_object[h]].type == ObjectType::OSM_WAY ? "w" : "r")
+                  << b.objects[heavy_object[h]].id << " (" << b.objects[heavy_object[h]].tags.name << ", "
+                  << heavy_rings[h] - 1 << " holes) kept whole: " << refusal_name(refusals[h]) << "\n";
+    std::cerr << whole.str() << "  Water split: " << heavy.size() << " polygons of more than " << kSplitMaxHoles
+              << " holes; " << cut << " cut along " << cut_lines << " lines into " << made << " pieces, " << kept_whole
               << " kept whole; " << b.rings.polygons.size() << " polygons" << std::endl;
 }
 

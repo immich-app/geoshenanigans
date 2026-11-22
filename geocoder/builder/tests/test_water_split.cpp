@@ -120,7 +120,7 @@ TEST(an_island_a_cut_crosses_is_cut_with_its_lake_and_each_stretch_of_cut_is_sha
         CHECK_EQ(holders(pieces, q), split_detail::polygon_contains(p, q) ? 1 : 0);
     }
     // Each edge keeps its way or is a cut (a negative way), and every cut
-    // edge of one piece is a cut edge of another, walked the other way.
+    // edge of one piece is a cut edge of another.
     std::map<std::pair<uint64_t, uint64_t>, int> cut_edges;
     auto key = [](PackedLocation a) { return uint64_t(uint32_t(a.lat_e7)) << 32 | uint32_t(a.lon_e7); };
     for (const SplitPolygon& q : pieces)
@@ -133,24 +133,31 @@ TEST(an_island_a_cut_crosses_is_cut_with_its_lake_and_each_stretch_of_cut_is_sha
             for (size_t i = 0; i < r->v.size(); i++) {
                 const int64_t w = r->way[i];
                 CHECK(w < 0 || (w >= 1000 && w <= 1003) || w >= 10);
-                if (w < 0) cut_edges[{key(r->v[i]), key(r->v[(i + 1) % r->v.size()])}]++;
+                if (w < 0) cut_edges[std::minmax(key(r->v[i]), key(r->v[(i + 1) % r->v.size()]))]++;
             }
         }
     CHECK(!cut_edges.empty());
-    for (const auto& [edge, n] : cut_edges) {
-        CHECK_EQ(n, 1);
-        CHECK(cut_edges.count({edge.second, edge.first}));
-    }
+    for (const auto& [edge, n] : cut_edges) CHECK_EQ(n, 2);
 }
 
-TEST(a_hole_outside_its_outer_ring_leaves_the_polygon_whole) {
-    std::vector<SplitRing> stray = {box_ring(400000000, 80000000, 100000, 100000, 7000)};
-    std::reverse(stray[0].v.begin(), stray[0].v.end());
-    const SplitPolygon p = lake(20, 100000, stray);
+TEST(rings_that_cross_or_run_either_way_are_cut_by_what_they_hold_even_odd) {
+    // Holes across the shore and across one another, and holes and an
+    // outer ring that run the other way: the pieces hold, even-odd, what the
+    // rings hold.
+    std::vector<SplitRing> crossing = {box_ring(469900000, 84000000, 300000, 300000, 7000),
+                                       box_ring(475000000, 85000000, 400000, 400000, 7100),
+                                       box_ring(475200000, 85200000, 400000, 400000, 7200)};
+    SplitPolygon p = lake(20, 100000, crossing);
+    std::reverse(p.outer.v.begin(), p.outer.v.end());
+    for (size_t h = 0; h < p.holes.size(); h += 3) std::reverse(p.holes[h].v.begin(), p.holes[h].v.end());
     const std::vector<SplitPolygon> pieces = split_polygon(p, 64);
-    REQUIRE(pieces.size() == 1u);
-    CHECK_EQ(pieces[0].key, uint64_t(0));
-    CHECK_EQ(pieces[0].holes.size(), size_t(401));
+    REQUIRE(pieces.size() > 6);
+    std::mt19937 rng(13);
+    std::uniform_int_distribution<int32_t> lat(469000000, 487000000), lng(79000000, 97000000);
+    for (int k = 0; k < 20000; k++) {
+        const PackedLocation q = pt(lat(rng), lng(rng));
+        CHECK_EQ(holders(pieces, q), split_detail::polygon_contains(p, q) ? 1 : 0);
+    }
 }
 
 TEST(the_same_polygon_cuts_the_same_way_whatever_its_rings_start_and_run) {
