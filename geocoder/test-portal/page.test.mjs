@@ -2022,3 +2022,121 @@ test('the address shown whole is escaped', () => {
   assertEscaped(out);
   assert.ok(out.includes('&lt;b&gt;L&lt;/b&gt;, &lt;i&gt;c&lt;/i&gt;, &lt;i&gt;c&lt;/i&gt;, &lt;em&gt;X&lt;/em&gt;'), out);
 });
+
+// -- Credits --
+// The sources of the data the answers come from, their licences and their
+// notices: configurations.template.json's attribution as PR 530 adds it
+// (builder/src/attribution.h writes each dataset's attribution.json from
+// it), but for the datasets each applies to.
+const OSM = {
+  id: 'osm', text: '© OpenStreetMap contributors', url: 'https://www.openstreetmap.org/copyright',
+  licence: 'ODbL 1.0', licence_url: 'https://opendatacommons.org/licenses/odbl/1-0/',
+  notices: ['This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0.'],
+};
+const NOTICES = {
+  geonames: ['UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.',
+    'The Data is provided "as is" without warranty or any representation of accuracy, timeliness or completeness.',
+    "Changes: this dataset holds the coordinates of the GB postcodes of GB_full.csv.zip that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the file's other fields."],
+  'codepoint-open': ["GeoNames's GB_full.csv.zip is derived from Code-Point Open.",
+    'Contains Ordnance Survey data © Crown copyright and database right 2022.',
+    'Contains Royal Mail data © Royal Mail copyright and database right 2022.',
+    'Contains National Statistics data © Crown copyright and database right 2022.'],
+  tiger: ["Address ranges and ZIP codes in the United States from the US Census Bureau's TIGER/Line files, which are in the public domain."],
+};
+
+// The credit's line, outside its disclosure: the page's foot, the sources
+// in full inside.
+const footer = html.match(/<footer class="data-credit">([\s\S]*?)<\/footer>/);
+
+// The text of `out`'s markup, its entities read.
+const text = (out) => out.replace(/<[^>]*>/g, '').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+test('the page credits its data in a line: OpenStreetMap contributors and the ODbL, each linked', () => {
+  assert.ok(footer, 'index.html has no <footer class="data-credit">');
+  const line = footer[1].slice(0, footer[1].indexOf('<details'));
+  assert.equal(text(line).replace(/\s+/g, ' ').trim(), 'Data © OpenStreetMap contributors, ODbL');
+  assert.ok(line.includes('<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>'), line);
+  assert.ok(line.includes('<a href="https://opendatacommons.org/licenses/odbl/1-0/" target="_blank" rel="noopener">ODbL</a>'), line);
+  // It comes after every section of the panel, the results among them.
+  const panel = html.slice(html.indexOf('<div class="side-panel">'), html.indexOf('<dialog'));
+  assert.ok(panel.indexOf('<footer class="data-credit">') > panel.indexOf('id="detailPanel"'));
+});
+
+test('the sources in full are in a native disclosure, its body scrolling within a height of its own, the results keeping theirs', () => {
+  assert.match(footer[1], /<details class="credit-more" id="creditMore">\s*<summary>[^<]+<\/summary>\s*<div class="credit-body" id="creditBody"><\/div>\s*<\/details>/);
+  const body = style('.credit-body');
+  assert.match(body['max-height'] ?? 'none', /^min\(\d+vh, \d+px\)$/);
+  assert.equal(body['overflow-y'], 'auto');
+  // The foot never shrinks under what it holds; kept in sight at the foot
+  // while closed, it takes its place at the end of the panel open.
+  assert.equal(style('.data-credit').flex, 'none');
+  assert.equal(style('.data-credit').position, 'sticky');
+  assert.equal(style('.data-credit').bottom, '0');
+  assert.equal(style('.data-credit:has(> details[open])').position, 'static');
+  assert.match(style('.results-section')['min-height'], /\b[1-9]\d*(px|%|vh)/);
+  assert.equal(style('.side-panel')['overflow-y'], 'auto');
+});
+
+test("without the build's own credit, the disclosure holds the page's: each source, its licence and its notices", () => {
+  const { creditsHtml, DATA_CREDITS } = core();
+  assert.deepEqual(plain(DATA_CREDITS.map((e) => e.id)), ['osm', 'geonames', 'codepoint-open', 'tiger', 'wikidata']);
+  assert.deepEqual(plain(DATA_CREDITS[0]), OSM);
+  for (const [id, notices] of Object.entries(NOTICES)) {
+    assert.deepEqual(plain(DATA_CREDITS.find((e) => e.id === id).notices), notices, id);
+  }
+  for (const c of [null, catalog(), { ...catalog(), attribution: null }]) {
+    const out = creditsHtml(c);
+    assert.ok(out.startsWith('<div class="credit-group" data-from="page">'), out);
+    assert.ok(out.includes('<div class="credit-source"><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a>, '
+      + '<a href="https://opendatacommons.org/licenses/odbl/1-0/" target="_blank" rel="noopener">ODbL 1.0</a></div>'), out);
+    assert.ok(out.includes('>CC BY 4.0</a>') && out.includes('>OGL v3.0</a>'), out);
+    // A licence of no URL, the public domain, is no link.
+    assert.ok(out.includes('>US Census Bureau TIGER/Line</a>, Public domain</div>'), out);
+    for (const notice of [...OSM.notices, ...Object.values(NOTICES).flat()]) assert.ok(text(out).includes(notice), notice);
+    assert.ok(!out.includes('Immich'), out);
+  }
+});
+
+test('the Immich column credits its geodata, GeoNames cities500 and Natural Earth, where /datasets lists it', () => {
+  const { creditsHtml } = core();
+  const out = creditsHtml(withImmich());
+  const immich = out.slice(out.indexOf('<div class="credit-group" data-from="immich">'));
+  assert.ok(immich.startsWith('<div class="credit-group" data-from="immich"><div class="credit-head">The Immich column'), out);
+  assert.ok(immich.includes('<a href="https://www.geonames.org/" target="_blank" rel="noopener">GeoNames</a>, <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>'), immich);
+  assert.ok(text(immich).includes("GeoNames's cities500.txt"), immich);
+  assert.ok(text(immich).includes('The Data is provided "as is" without warranty or any representation of accuracy, timeliness or completeness.'), immich);
+  assert.ok(immich.includes('<a href="https://www.naturalearthdata.com/" target="_blank" rel="noopener">Natural Earth</a>, <a href="https://www.naturalearthdata.com/about/terms-of-use/" target="_blank" rel="noopener">Public domain</a>'), immich);
+  assert.ok(text(immich).includes('ne_10m_admin_0_countries.geojson'), immich);
+  // The build's credit comes first, the page's or its own.
+  assert.ok(out.startsWith('<div class="credit-group" data-from="page">'), out);
+  assert.ok(creditsHtml({ ...withImmich(), attribution: [OSM] }).startsWith('<div class="credit-group" data-from="build">'));
+});
+
+test("a build's own credit, as /datasets passes it on, is the one shown, escaped, and only http links are links", () => {
+  const { creditsHtml } = core();
+  const own = [
+    { ...OSM, applies_to: ['mode.*'] },
+    { id: 'x', text: '<img src=x onerror=alert(1)>', url: 'javascript:alert(2)', licence: '<b>L</b>', licence_url: '" onmouseover="alert(3)', notices: ['<script>alert(4)</script>', 5, null] },
+    { id: 'y', text: 'No licence' },
+  ];
+  const out = creditsHtml({ ...catalog(), attribution: own });
+  assert.ok(out.startsWith('<div class="credit-group" data-from="build">'), out);
+  assert.ok(text(out).includes(OSM.notices[0]), out);
+  for (const notice of Object.values(NOTICES).flat()) assert.ok(!text(out).includes(notice), notice);
+  assertEscaped(out);
+  assert.ok(!out.includes('javascript:') && !out.includes('href="&quot;'), out);
+  assert.ok(out.includes('<div class="credit-source">&lt;img src=x onerror=alert(1)&gt;, &lt;b&gt;L&lt;/b&gt;</div><ul><li>&lt;script&gt;alert(4)&lt;/script&gt;</li></ul>'), out);
+  assert.ok(out.includes('<div class="credit"><div class="credit-source">No licence</div></div>'), out);
+  // A list that doesn't read as one, empty, or of an entry of no text, is
+  // taken for none: the page's is shown.
+  for (const attribution of ['© somebody', {}, [], [OSM, { url: 'https://example.org/' }], [OSM, null], [{ ...OSM, text: '' }]]) {
+    assert.ok(creditsHtml({ ...catalog(), attribution }).startsWith('<div class="credit-group" data-from="page">'), JSON.stringify(attribution));
+  }
+});
+
+// Once the template lists the sources (PR 530), the page's credit is that
+// list but for the datasets each applies to.
+test("the page's credit is the template's attribution", { skip: !template.attribution && 'the template has no attribution yet' }, () => {
+  const { DATA_CREDITS } = core();
+  assert.deepEqual(plain(DATA_CREDITS), template.attribution.map(({ applies_to, ...entry }) => entry));
+});

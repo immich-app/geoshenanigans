@@ -484,6 +484,46 @@
   .feedback-status { margin-top: 8px; font-size: 12px; }
   .feedback-btn { margin-top: 4px; padding: 1px 8px; font-size: 11px; }
 
+  /* The credit of the data the answers come from: a line, kept in sight at
+     the panel's foot while the panel scrolls, and the sources in full in a
+     disclosure. Open, it takes its place at the end of the panel, which
+     scrolls to it, and its sources scroll within a height of their own: the
+     results keep their least height, and a window too short scrolls the
+     panel. */
+  .data-credit {
+    flex: none;
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: 10px;
+    padding: 5px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--bg);
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .data-credit:has(> details[open]) { position: static; }
+  .data-credit a { color: var(--accent); }
+  .credit-more { margin-left: auto; }
+  .credit-more[open] { flex-basis: 100%; margin-left: 0; }
+  .credit-more summary { cursor: pointer; }
+  .credit-body {
+    max-height: min(30vh, 220px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    margin-top: 4px;
+    padding-right: 4px;
+    line-height: 1.45;
+  }
+  .credit-group + .credit-group { margin-top: 8px; }
+  .credit-head { text-transform: uppercase; letter-spacing: 0.08em; font-size: 10px; }
+  .credit { margin-top: 4px; overflow-wrap: anywhere; }
+  .credit-source { color: var(--text); }
+  .credit ul { padding-left: 16px; }
+
   @media (max-width: 800px) {
     .layout { flex-direction: column; }
     .map-panel { flex: 0 0 45vh; }
@@ -545,6 +585,14 @@
       <h3>Detail</h3>
       <div id="detailContent"></div>
     </div>
+
+    <footer class="data-credit">
+      <span class="credit-line">Data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>, <a href="https://opendatacommons.org/licenses/odbl/1-0/" target="_blank" rel="noopener">ODbL</a></span>
+      <details class="credit-more" id="creditMore">
+        <summary>Sources and licences</summary>
+        <div class="credit-body" id="creditBody"></div>
+      </details>
+    </footer>
   </div>
 </div>
 
@@ -2116,6 +2164,131 @@ function feedbackError(status, body) {
   return `Not sent: HTTP ${status}${body ? `: ${String(body).slice(0, 300)}` : ''}`;
 }
 
+// -- Credits --
+// The credit of the data the datasets' answers come from where the build
+// served carries none of its own (configurations.json's "attribution", which
+// /datasets passes on; the builds before it have none): its sources as
+// configurations.template.json lists them, and builder/src/attribution.h
+// writes them into each dataset's attribution.json, but for the datasets
+// each applies to.
+const DATA_CREDITS = [
+  {
+    id: 'osm',
+    text: '© OpenStreetMap contributors',
+    url: 'https://www.openstreetmap.org/copyright',
+    licence: 'ODbL 1.0',
+    licence_url: 'https://opendatacommons.org/licenses/odbl/1-0/',
+    notices: ['This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0.'],
+  },
+  {
+    id: 'geonames',
+    text: 'GeoNames',
+    url: 'https://www.geonames.org/',
+    licence: 'CC BY 4.0',
+    licence_url: 'https://creativecommons.org/licenses/by/4.0/',
+    notices: [
+      'UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.',
+      'The Data is provided "as is" without warranty or any representation of accuracy, timeliness or completeness.',
+      "Changes: this dataset holds the coordinates of the GB postcodes of GB_full.csv.zip that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the file's other fields.",
+    ],
+  },
+  {
+    id: 'codepoint-open',
+    text: 'Ordnance Survey Code-Point Open',
+    url: 'https://www.ordnancesurvey.co.uk/products/code-point-open',
+    licence: 'OGL v3.0',
+    licence_url: 'https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/',
+    notices: [
+      "GeoNames's GB_full.csv.zip is derived from Code-Point Open.",
+      'Contains Ordnance Survey data © Crown copyright and database right 2022.',
+      'Contains Royal Mail data © Royal Mail copyright and database right 2022.',
+      'Contains National Statistics data © Crown copyright and database right 2022.',
+    ],
+  },
+  {
+    id: 'tiger',
+    text: 'US Census Bureau TIGER/Line',
+    url: 'https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html',
+    licence: 'Public domain',
+    notices: ["Address ranges and ZIP codes in the United States from the US Census Bureau's TIGER/Line files, which are in the public domain."],
+  },
+  {
+    id: 'wikidata',
+    text: 'Wikidata',
+    url: 'https://www.wikidata.org/',
+    licence: 'CC0 1.0',
+    licence_url: 'https://creativecommons.org/publicdomain/zero/1.0/',
+    notices: ["POI importance from the sitelink counts of the POIs' Wikidata items; Wikidata's structured data is available under CC0 1.0."],
+  },
+];
+
+// The credit of the Immich column's geodata: the files of Immich's release
+// image it answers from as Immich does (server/src/portal/immich.rs).
+const IMMICH_CREDITS = [
+  {
+    id: 'geonames-cities500',
+    text: 'GeoNames',
+    url: 'https://www.geonames.org/',
+    licence: 'CC BY 4.0',
+    licence_url: 'https://creativecommons.org/licenses/by/4.0/',
+    notices: [
+      "The places of GeoNames's cities500.txt, with the names of admin1CodesASCII.txt, admin2Codes.txt and countryInfo.txt, as Immich's release image holds them.",
+      'The Data is provided "as is" without warranty or any representation of accuracy, timeliness or completeness.',
+      'Changes: none; the column shows what of them Immich stores for a photo, and the place it found.',
+    ],
+  },
+  {
+    id: 'natural-earth',
+    text: 'Natural Earth',
+    url: 'https://www.naturalearthdata.com/',
+    licence: 'Public domain',
+    licence_url: 'https://www.naturalearthdata.com/about/terms-of-use/',
+    notices: [
+      "The countries of Natural Earth's ne_10m_admin_0_countries.geojson, as Immich's release image holds it, where no GeoNames place is near.",
+      'Made with Natural Earth. Free vector and raster map data @ naturalearthdata.com.',
+    ],
+  },
+];
+
+// The credit of the build served: /datasets' attribution where it is a list
+// of entries each of a text, else DATA_CREDITS.
+function dataCredits(catalog) {
+  const listed = catalog ? catalog.attribution : null;
+  const reads = Array.isArray(listed) && listed.length > 0
+    && listed.every((e) => e && typeof e === 'object' && typeof e.text === 'string' && e.text !== '');
+  return reads ? listed : DATA_CREDITS;
+}
+
+// `text` as a link to `url`, opened in a tab of its own; the text alone
+// where the URL is none of http or https.
+function creditLink(url, text) {
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return esc(text);
+  return `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(text)}</a>`;
+}
+
+// An entry of a credit: its source, its licence and its notices (those that
+// are strings).
+function creditHtml(entry) {
+  const licence = typeof entry.licence === 'string' && entry.licence ? `, ${creditLink(entry.licence_url, entry.licence)}` : '';
+  const notices = (Array.isArray(entry.notices) ? entry.notices : []).filter((n) => typeof n === 'string' && n);
+  return `<div class="credit"><div class="credit-source">${creditLink(entry.url, entry.text)}${licence}</div>`
+    + (notices.length ? `<ul>${notices.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : '')
+    + '</div>';
+}
+
+// The sources in full, as the page's disclosure holds them: the build's
+// (dataCredits; data-from says whether the build's own or the page's), then
+// the Immich column's where /datasets lists it.
+function creditsHtml(catalog) {
+  const credits = dataCredits(catalog);
+  let html = `<div class="credit-group" data-from="${credits === DATA_CREDITS ? 'page' : 'build'}">`
+    + `<div class="credit-head">The datasets' answers</div>${credits.map(creditHtml).join('')}</div>`;
+  if (((catalog && catalog.others) || []).some((o) => o && o.kind === 'immich')) {
+    html += `<div class="credit-group" data-from="immich"><div class="credit-head">The Immich column's answers</div>${IMMICH_CREDITS.map(creditHtml).join('')}</div>`;
+  }
+  return html;
+}
+
 // `obj` as JSON, escaped, its keys, strings, numbers and literals marked for
 // their colours.
 function syntaxHighlight(obj) {
@@ -2245,6 +2418,7 @@ async function loadCatalog() {
   document.getElementById('feedbackBtn').hidden = mode !== 'catalog';
   renderColumns();
   renderBanner();
+  renderCredits();
   updatePolygonsBtn();
   updateLink();
   updateSearch();
@@ -3170,9 +3344,24 @@ feedbackForm.addEventListener('submit', async (e) => {
     + '<div class="feedback-actions"><button type="button" data-action="feedback-close">Close</button></div>';
 });
 
+// -- Credits --
+const creditMore = document.getElementById('creditMore');
+
+// The sources in full of the build served, or the page's while it has none.
+function renderCredits() {
+  document.getElementById('creditBody').innerHTML = creditsHtml(catalog);
+}
+
+// Opened, the sources take their place at the end of the panel: it scrolls
+// to the whole foot.
+creditMore.addEventListener('toggle', () => {
+  if (creditMore.open) creditMore.closest('.data-credit').scrollIntoView({ block: 'nearest' });
+});
+
 // -- Start --
 updateNominatimBtn();
 updatePolygonsBtn();
+renderCredits();
 (async () => {
   await loadCatalog();
   if (mode !== 'single') pollHealth();
