@@ -240,6 +240,46 @@ fn placed(id: &str, c: &Component, name: &str) -> Result<String, DownloadError> 
     Ok(dir_of_component(id, c)?.map_or_else(|| name.to_string(), |dir| format!("{dir}/{name}")))
 }
 
+/// Whether `path` is one the component file template `template` gives, each
+/// `{placeholder}` in it standing for any run of characters but `/`.
+fn of_template(template: &str, path: &str) -> bool {
+    let Some(open) = template.find('{') else { return template == path };
+    let Some(close) = template[open..].find('}').map(|i| open + i) else { return template == path };
+    let Some(rest) = path.strip_prefix(&template[..open]) else { return false };
+    let run = rest.find('/').unwrap_or(rest.len());
+    (0..=run).filter(|&i| rest.is_char_boundary(i)).any(|i| of_template(&template[close + 1..], &rest[i..]))
+}
+
+/// The places in a region dir of the build's files, by name: each file's in
+/// the sub-dir of each component listing it that has a `dir`
+/// (`water/water_meta.json`), in the region dir itself for each that has none
+/// and for a file no component lists (a place search index's). With those,
+/// the places of the files the components with a `dir` list for `sel`, in
+/// the manifest or not.
+fn build_names(cfg: &Configurations, sel: &RegionSelection) -> Result<BTreeSet<String>, DownloadError> {
+    let mut names = BTreeSet::new();
+    for path in cfg.files.keys() {
+        let name = basename(path);
+        let mut listed = false;
+        for (id, c) in &cfg.components {
+            let lists = |t: &String| (basename(t).contains('{') || basename(t) == name) && of_template(t, path);
+            if c.files.iter().chain(&c.optional_files).any(lists) {
+                listed = true;
+                names.insert(placed(id, c, name)?);
+            }
+        }
+        if !listed {
+            names.insert(name.to_string());
+        }
+    }
+    for (id, c) in cfg.components.iter().filter(|(_, c)| c.dir.is_some()) {
+        for f in c.files.iter().chain(&c.optional_files) {
+            names.insert(placed(id, c, basename(&substitute(f, sel)))?);
+        }
+    }
+    Ok(names)
+}
+
 /// The sub-dirs of a region dir the build's components put files in; an
 /// error naming one whose `dir` is not one plain name, whether a selection
 /// takes it or not.
@@ -731,9 +771,9 @@ thread_local! {
 /// bytes checked against the manifest's sha256) names its sha256. A file the
 /// selection doesn't take (an earlier selection's or build's, which
 /// Index::load would read beside this one's) is removed before the first
-/// fetch: each the ledger names, and each of a name a file of the build has
+/// fetch: each the ledger names, and each at a place a file of the build has
 /// in any selection, the ledger naming it or not (a dir laid out by hand, or
-/// whose ledger was lost); a file of another name stays. Their lines go when
+/// whose ledger was lost); a file at another place stays. Their lines go when
 /// the ledger is rewritten. A file goes in the region dir by its name, or in
 /// the sub-dir its component's `dir` names (`water/`), where the ledger and
 /// the removal name it by its place (`water/admin_polygons.bin`); a sub-dir
@@ -837,18 +877,10 @@ pub async fn download_region(
     let to_fetch = in_place.contains(&false);
     let taken: HashSet<&str> = paths.iter().map(|p| resolved.dest(p)).collect();
     // The files the selection doesn't take: each the ledger names, and each
-    // in the dir of a name a file of the build has in any selection, the
-    // ledger naming it or not: in the region dir by its name, and in the
-    // sub-dir of each component with a `dir` for the files it lists. Other
-    // names stay.
+    // in the dir at a place a file of the build has in any selection, the
+    // ledger naming it or not (build_names). Other names stay.
     let mut others: BTreeSet<String> = ledger.held.keys().filter(|name| !taken.contains(name.as_str())).cloned().collect();
-    let mut build_names: BTreeSet<String> = cfg.files.keys().map(|p| basename(p).to_string()).collect();
-    for (id, c) in cfg.components.iter().filter(|(_, c)| c.dir.is_some()) {
-        for f in c.files.iter().chain(&c.optional_files) {
-            build_names.insert(placed(id, c, basename(&substitute(f, sel)))?);
-        }
-    }
-    for name in build_names.into_iter().filter(|name| !taken.contains(name.as_str())) {
+    for name in build_names(cfg, sel)?.into_iter().filter(|name| !taken.contains(name.as_str())) {
         if !others.contains(&name) && there(&region_dir.join(&name)).await? {
             others.insert(name);
         }
@@ -1845,6 +1877,32 @@ mod tests {
             let mut want = files_of(&bucket, &after);
             want.insert("water/notes.txt".into(), b"not the build's".to_vec());
             assert_eq!(differing(&held(&dir), &want), Vec::<String>::new(), "stamped: {stamped}");
+        }
+    }
+
+    // A file goes by its place: a name the build has only in the water dir
+    // (water_meta.json, attribution.json) is no name of the region dir's,
+    // and a file of it there stays, as one of another name does, the
+    // selection taking water or not. A dir whose ledger was lost.
+    #[tokio::test]
+    async fn a_name_the_build_has_only_in_the_water_dir_is_no_name_of_the_region_dirs() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let before = wet("europe", "admin", "simplified", "none", "all");
+        let theirs = [("water_meta.json", "the operator's"), ("attribution.json", "the operator's too")];
+        for after in [before.clone(), sel("europe", "admin", "simplified", "none")] {
+            let root = ScratchDir::new();
+            let dir = root.path().join("europe");
+            download(&bucket, &before, root.path()).await.unwrap();
+            std::fs::remove_file(dir.join(FILE_LEDGER)).unwrap();
+            for (name, bytes) in theirs {
+                std::fs::write(dir.join(name), bytes).unwrap();
+            }
+
+            download(&bucket, &after, root.path()).await.unwrap();
+
+            let mut want = files_of(&bucket, &after);
+            want.extend(theirs.map(|(name, bytes)| (name.to_string(), bytes.as_bytes().to_vec())));
+            assert_eq!(differing(&held(&dir), &want), Vec::<String>::new(), "water {}", after.water);
         }
     }
 
