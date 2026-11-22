@@ -187,12 +187,14 @@ rank beside it ranks the object instead, out of the lane: `place=*` of an
 address rank (`locality` and `plot` 25, `suburb` 20, `subdistrict` 14, ...),
 and on an area `landuse=residential` and the other admin landuse kinds (24)
 and the `highway=*` kinds (26, 27); a landuse or highway node ranks 30. Such
-an object stays water (`poi_classify.h` `has_lower_rank_main_tag`). The builder
-classifies a rank-30 one by its rank-30 tags (`has_poi_main_tag`): `FOUNTAIN`,
-`SWIMMING_AREA`, `FIRE_WATER_POND`, `PIER`, ..., or `GENERIC_RANK30` where they
-have no category of their own; a tag of a lower rank or of no main tag after
-the water kind (`leisure=park`, `natural=wood`, `place=island`,
-`waterway=waterfall`, `man_made=dam`, `power=*`) gives it none. A generic
+an object stays water (`poi_classify.h` `has_lower_rank_main_tag`), whatever
+its other tags. The builder classifies a rank-30 one by its rank-30 tags
+(`has_poi_main_tag`): `FOUNTAIN`, `SWIMMING_AREA`, `FIRE_WATER_POND`, `PIER`,
+..., or `GENERIC_RANK30` where they have no category of their own; a tag of a
+lower rank or of no main tag (`boundary=*`, `landuse=*` on an area,
+`leisure=park`, `natural=wood`, `place=island`, `waterway=waterfall`,
+`man_made=dam`, `power=*`) gives it none, though the classifier reads some of
+them before the water kind. Both rules run before any category. A generic
 rank-30 feature ships only with a wiki tag, as every one does; without one, the
 object stays water, so its name stays in `places` and as the `landmark`, out
 of the primary slot. The way pass resolves a named `landuse=reservoir|basin`

@@ -300,9 +300,11 @@ TEST(poi_classify_a_water_object_beside_a_main_tag_of_a_lower_address_rank_keeps
     // place=plot (25), place=suburb (20) and place=subdistrict (14) anywhere,
     // and on an area landuse=residential (24), highway=footway (27) and
     // highway=residential (26), rank such an object below 30, whatever POI
-    // main tag it carries too, so it stays water. A landuse or highway node
-    // ranks 30 (ranking.sql:175-180): beside those, a water node is a rank-30
-    // POI of its shop.
+    // main tag it carries too, so it stays water, a swimming area, a fire
+    // pond, a fountain or an attraction too, whose categories the classifier
+    // reads before the water kind's. A landuse or highway node ranks 30
+    // (ranking.sql:175-180): beside those, a water node is a rank-30 POI of
+    // its other tag.
     struct Lower {
         const char* key;
         const char* value;
@@ -312,18 +314,30 @@ TEST(poi_classify_a_water_object_beside_a_main_tag_of_a_lower_address_rank_keeps
                            {"place", "suburb", true},        {"place", "subdistrict", true},
                            {"landuse", "residential", false}, {"highway", "footway", false},
                            {"highway", "residential", false}};
+    struct Poi {
+        const char* key;
+        const char* value;
+        PoiCategory category;
+    };
+    const Poi pois[] = {{"shop", "bakery", PoiCategory::SHOP_BAKERY},
+                        {"leisure", "swimming_area", PoiCategory::SWIMMING_AREA},
+                        {"emergency", "fire_water_pond", PoiCategory::FIRE_WATER_POND},
+                        {"amenity", "fountain", PoiCategory::FOUNTAIN},
+                        {"tourism", "attraction", PoiCategory::ATTRACTION}};
     for (const WaterKind& kind : kWaterKinds)
         for (const Lower& l : lower) {
             if (kind.landuse && !std::strcmp(l.key, "landuse")) continue;
-            for (const bool area : {true, false}) {
-                Tags t = with(with(water(kind), "shop", "bakery"), l.key, l.value);
-                t.area = area;
-                const PoiCategory want = area || l.on_a_node ? kind.category : PoiCategory::SHOP_BAKERY;
-                if (category_of(t) != want)
-                    std::printf("    %s=%s with shop=bakery and %s=%s, %s\n", kind.natural ? "natural" : "landuse",
-                                kind.natural ? kind.natural : kind.landuse, l.key, l.value, area ? "an area" : "a node");
-                CHECK_EQ(uint8_t(category_of(t)), uint8_t(want));
-            }
+            for (const Poi& poi : pois)
+                for (const bool area : {true, false}) {
+                    Tags t = with(with(water(kind), poi.key, poi.value), l.key, l.value);
+                    t.area = area;
+                    const PoiCategory want = area || l.on_a_node ? kind.category : poi.category;
+                    if (category_of(t) != want)
+                        std::printf("    %s=%s with %s=%s and %s=%s, %s\n", kind.natural ? "natural" : "landuse",
+                                    kind.natural ? kind.natural : kind.landuse, poi.key, poi.value, l.key, l.value,
+                                    area ? "an area" : "a node");
+                    CHECK_EQ(uint8_t(category_of(t)), uint8_t(want));
+                }
         }
     // building=*, the fallback tag of rank 30, makes no rank-30 POI beside
     // one either.
@@ -356,6 +370,12 @@ TEST(poi_classify_a_water_object_that_yields_takes_its_category_from_a_rank_30_t
         {{{"natural", "bay"}, {"man_made", "dam"}, {"shop", "bakery"}}, PoiCategory::SHOP_BAKERY},
         // natural=spring ranks 30, and classifies the object still.
         {{{"landuse", "reservoir"}, {"natural", "spring"}, {"shop", "bakery"}}, PoiCategory::SPRING},
+        // Nor do the ones the classifier reads before natural=*: leisure=park,
+        // and boundary=protected_area and national_park (25, 0).
+        {{{"natural", "water"}, {"leisure", "park"}, {"emergency", "fire_water_pond"}}, PoiCategory::FIRE_WATER_POND},
+        {{{"natural", "wetland"}, {"boundary", "protected_area"}, {"leisure", "swimming_area"}}, PoiCategory::SWIMMING_AREA},
+        {{{"natural", "water"}, {"boundary", "protected_area"}, {"amenity", "fountain"}}, PoiCategory::FOUNTAIN},
+        {{{"natural", "bay"}, {"boundary", "national_park"}, {"man_made", "pier"}}, PoiCategory::PIER},
     };
     for (const Case& c : cases)
         for (const bool area : {true, false}) {

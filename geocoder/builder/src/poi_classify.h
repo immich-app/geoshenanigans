@@ -106,6 +106,19 @@ inline bool has_lower_rank_main_tag(const char* t_place, const char* t_landuse, 
                                                "pedestrian", "road", "construction"});
 }
 
+// The water kind of an object, the category its tags give it as water, or
+// UNKNOWN for none: landuse=reservoir or basin, which the classifier reads
+// before natural=*, else natural=water, wetland, bay or glacier.
+inline PoiCategory poi_water_kind(const char* t_natural, const char* t_landuse) {
+    if (t_landuse && poi_tag_is(t_landuse, {"reservoir", "basin"})) return PoiCategory::RESERVOIR;
+    if (!t_natural) return PoiCategory::UNKNOWN;
+    if (std::strcmp(t_natural, "water") == 0) return PoiCategory::NATURAL_WATER;
+    if (std::strcmp(t_natural, "wetland") == 0) return PoiCategory::WETLAND;
+    if (std::strcmp(t_natural, "bay") == 0) return PoiCategory::BAY;
+    if (std::strcmp(t_natural, "glacier") == 0) return PoiCategory::GLACIER;
+    return PoiCategory::UNKNOWN;
+}
+
 // POI classification: maps a node/way's raw OSM tag values to a
 // (category, tier, flags) triple (PoiClassification, defined in types.h),
 // or nullopt when nothing matches or no POI dir ships the tier (a generic
@@ -113,15 +126,15 @@ inline bool has_lower_rank_main_tag(const char* t_place, const char* t_landuse, 
 // tag arguments (no shared state) — lifted out of main()'s node/way passes,
 // which call it identically.
 //
-// The water kinds (natural=water, wetland, bay and glacier, landuse=
-// reservoir and basin) rank below 30 in Nominatim (address-levels.json:69-82
-// and 53-62), whose POI lane takes rank 30 alone; the server keeps them out of
-// the primary slot. An object that also carries a POI main tag
-// (has_poi_main_tag) is a rank-30 POI there, unless a main tag of a lower
-// positive rank ranks it (has_lower_rank_main_tag): it takes no water
-// category, and is classified by its rank-30 tags, or as a generic rank-30
-// feature where they have no category of their own. Where no POI dir ships
-// that, it stays water.
+// The water kinds (poi_water_kind) rank below 30 in Nominatim
+// (address-levels.json:69-82 and 53-62), whose POI lane takes rank 30 alone;
+// the server keeps them out of the primary slot. An object that also carries
+// a POI main tag (has_poi_main_tag) is a rank-30 POI there, unless a main tag
+// of a lower positive rank ranks it (has_lower_rank_main_tag): it takes no
+// water category, and is classified by its rank-30 tags, or as a generic
+// rank-30 feature where they have no category of their own. Where no POI dir
+// ships that, it stays water. An object a main tag of a lower positive rank
+// ranks is the water it is, whatever its other tags.
 inline std::optional<PoiClassification> classify_poi(
     const char* t_tourism, const char* t_historic, const char* t_boundary,
     const char* t_amenity, const char* t_leisure, const char* t_natural,
@@ -132,30 +145,41 @@ inline std::optional<PoiClassification> classify_poi(
     const char* t_shop, const char* t_landuse, const char* t_emergency, bool area) {
     PoiCategory cat = PoiCategory::UNKNOWN;
 
-    // A POI main tag takes the place of a water kind (above) where the object
-    // ranks 30: `water` gives the kind's category, or none where `yields`, and
-    // then leaves the category to the object's rank-30 main tags, so that the
-    // tags after it of a lower rank or of no main tag in Nominatim
-    // (leisure=park, natural=wood, place=island, waterway=waterfall,
-    // man_made=dam, power=*) give none. `yielded` is the first kind that did.
+    // The water rule runs before any category. A water kind is the object's
+    // category where a main tag of a lower positive rank ranks it, whatever
+    // its other tags, and yields where a POI main tag makes it a rank-30 POI
+    // (building=* is a fallback main tag, presets.lua:184-185: beside
+    // natural=* the object keeps class natural and ranks 30; beside
+    // landuse=*, also a fallback tag, building is its class, the
+    // alphabetically first, init.lua process_tags, and Nominatim's POI lane
+    // takes no class building, reverse.py:192-195). A kind that yields leaves
+    // the category to the object's rank-30 tags, so that the tags of a lower
+    // rank or of no main tag in Nominatim give none: boundary=* (25, 0),
+    // landuse=* on an area (24, 0; a landuse node ranks 30), leisure=park,
+    // natural=wood, place=island, waterway=waterfall, man_made=dam and
+    // power=*. `yielded` is the kind that yielded.
+    const PoiCategory kind = poi_water_kind(t_natural, t_landuse);
     const bool ranks_30 = !has_lower_rank_main_tag(t_place, t_landuse, t_highway, area);
-    const bool poi_main = ranks_30 && has_poi_main_tag(t_amenity, t_leisure, t_emergency, t_tourism, t_historic,
-                                                       t_shop, t_craft, t_office, t_aeroway, t_railway, t_man_made);
     PoiCategory yielded = PoiCategory::UNKNOWN;
-    auto water = [&](PoiCategory kind, bool yields) {
-        if (!yields) return kind;
-        if (yielded == PoiCategory::UNKNOWN) yielded = kind;
+    if (kind != PoiCategory::UNKNOWN && !ranks_30) {
+        cat = kind;
+    } else if (kind != PoiCategory::UNKNOWN &&
+               (has_poi_main_tag(t_amenity, t_leisure, t_emergency, t_tourism, t_historic, t_shop, t_craft, t_office,
+                                 t_aeroway, t_railway, t_man_made) ||
+                (kind != PoiCategory::RESERVOIR && t_building && std::strcmp(t_building, "no") != 0))) {
+        yielded = kind;
+        t_boundary = nullptr;
+        if (area || kind == PoiCategory::RESERVOIR) t_landuse = nullptr;
         if (t_leisure && !poi_leisure_ranks_30(t_leisure)) t_leisure = nullptr;
         // address-levels.json:69-82.
         if (t_natural && !poi_tag_is(t_natural, {"tree", "spring", "cave_entrance", "geyser", "hot_spring", "rock", "stone"}))
             t_natural = nullptr;
         if (t_man_made && !poi_man_made_is_main(t_man_made)) t_man_made = nullptr;
         t_power = t_place = t_waterway = nullptr;
-        return PoiCategory::UNKNOWN;
-    };
+    }
 
     // tourism (highest priority)
-    if (t_tourism) {
+    if (cat == PoiCategory::UNKNOWN && t_tourism) {
         if (std::strcmp(t_tourism, "museum") == 0) cat = PoiCategory::MUSEUM;
         else if (std::strcmp(t_tourism, "attraction") == 0) cat = PoiCategory::ATTRACTION;
         else if (std::strcmp(t_tourism, "viewpoint") == 0) cat = PoiCategory::VIEWPOINT;
@@ -225,8 +249,8 @@ inline std::optional<PoiClassification> classify_poi(
         else if (std::strcmp(t_landuse, "farmland") == 0) cat = PoiCategory::FARMLAND;
         else if (std::strcmp(t_landuse, "allotments") == 0) cat = PoiCategory::ALLOTMENTS;
         else if (std::strcmp(t_landuse, "quarry") == 0) cat = PoiCategory::QUARRY;
-        else if (std::strcmp(t_landuse, "reservoir") == 0) cat = water(PoiCategory::RESERVOIR, poi_main);
-        else if (std::strcmp(t_landuse, "basin") == 0) cat = water(PoiCategory::RESERVOIR, poi_main);
+        else if (std::strcmp(t_landuse, "reservoir") == 0) cat = PoiCategory::RESERVOIR;
+        else if (std::strcmp(t_landuse, "basin") == 0) cat = PoiCategory::RESERVOIR;
         else if (std::strcmp(t_landuse, "recreation_ground") == 0) cat = PoiCategory::RECREATION_GROUND;
         else if (std::strcmp(t_landuse, "military") == 0) cat = PoiCategory::MILITARY;
         else if (std::strcmp(t_landuse, "religious") == 0) cat = PoiCategory::RELIGIOUS_LANDUSE;
@@ -359,12 +383,6 @@ inline std::optional<PoiClassification> classify_poi(
     }
     // natural
     if (cat == PoiCategory::UNKNOWN && t_natural) {
-        // building=* is a fallback main tag (presets.lua:184-185): beside
-        // natural=* the object keeps class natural and ranks 30; beside
-        // landuse=*, also a fallback tag, building is its class, the
-        // alphabetically first (init.lua process_tags), and Nominatim's POI
-        // lane takes no class building (reverse.py:192-195).
-        const bool yields = poi_main || (ranks_30 && t_building && std::strcmp(t_building, "no") != 0);
         if (std::strcmp(t_natural, "peak") == 0) cat = PoiCategory::PEAK;
         else if (std::strcmp(t_natural, "volcano") == 0) cat = PoiCategory::VOLCANO;
         else if (std::strcmp(t_natural, "beach") == 0) cat = PoiCategory::BEACH;
@@ -373,9 +391,9 @@ inline std::optional<PoiClassification> classify_poi(
         else if (std::strcmp(t_natural, "wood") == 0) cat = PoiCategory::WOOD;
         else if (std::strcmp(t_natural, "heath") == 0) cat = PoiCategory::HEATH;
         else if (std::strcmp(t_natural, "scrub") == 0) cat = PoiCategory::SCRUB;
-        else if (std::strcmp(t_natural, "wetland") == 0) cat = water(PoiCategory::WETLAND, yields);
+        else if (std::strcmp(t_natural, "wetland") == 0) cat = PoiCategory::WETLAND;
         else if (std::strcmp(t_natural, "grassland") == 0) cat = PoiCategory::GRASSLAND;
-        else if (std::strcmp(t_natural, "water") == 0) cat = water(PoiCategory::NATURAL_WATER, yields);
+        else if (std::strcmp(t_natural, "water") == 0) cat = PoiCategory::NATURAL_WATER;
         else if (std::strcmp(t_natural, "valley") == 0) cat = PoiCategory::VALLEY;
         else if (std::strcmp(t_natural, "ridge") == 0) cat = PoiCategory::RIDGE;
         else if (std::strcmp(t_natural, "saddle") == 0) cat = PoiCategory::SADDLE;
@@ -385,10 +403,10 @@ inline std::optional<PoiClassification> classify_poi(
         else if (std::strcmp(t_natural, "arch") == 0) cat = PoiCategory::ARCH;
         else if (std::strcmp(t_natural, "hot_spring") == 0) cat = PoiCategory::HOT_SPRING;
         else if (std::strcmp(t_natural, "geyser") == 0) cat = PoiCategory::GEYSER;
-        else if (std::strcmp(t_natural, "bay") == 0) cat = water(PoiCategory::BAY, yields);
+        else if (std::strcmp(t_natural, "bay") == 0) cat = PoiCategory::BAY;
         else if (std::strcmp(t_natural, "cape") == 0) cat = PoiCategory::CAPE;
         else if (std::strcmp(t_natural, "island") == 0) cat = PoiCategory::ISLAND;
-        else if (std::strcmp(t_natural, "glacier") == 0) cat = water(PoiCategory::GLACIER, yields);
+        else if (std::strcmp(t_natural, "glacier") == 0) cat = PoiCategory::GLACIER;
     }
     // railway
     if (cat == PoiCategory::UNKNOWN && t_railway) {
