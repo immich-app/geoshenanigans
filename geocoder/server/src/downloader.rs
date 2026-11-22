@@ -395,9 +395,7 @@ async fn download_file(
     // network chunks plus the zstd window, regardless of file size.
     // Decode + hash + write run on a blocking thread fed through a
     // bounded channel so the async executor never blocks on disk I/O.
-    let tmp = dest.with_extension(format!(
-        "{}.tmp", dest.extension().and_then(|s| s.to_str()).unwrap_or("")
-    ));
+    let tmp = tmp_of(dest);
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(8);
     let tmp_for_writer = tmp.clone();
@@ -430,6 +428,12 @@ async fn download_file(
     tokio::fs::rename(&tmp, dest).await
         .map_err(|e| DownloadError::Io(format!("rename {}→{}: {}", tmp.display(), dest.display(), e)))?;
     Ok(())
+}
+
+/// The temp name beside `dest` that a fetch of a file writes it under
+/// (download_file), until it is renamed into place.
+fn tmp_of(dest: &Path) -> std::path::PathBuf {
+    dest.with_extension(format!("{}.tmp", dest.extension().and_then(|s| s.to_str()).unwrap_or("")))
 }
 
 /// Blocking half of the streaming download: consume compressed chunks
@@ -771,14 +775,15 @@ thread_local! {
 /// bytes checked against the manifest's sha256) names its sha256. A file the
 /// selection doesn't take (an earlier selection's or build's, which
 /// Index::load would read beside this one's) is removed before the first
-/// fetch: each the ledger names, and each at a place a file of the build has
-/// in any selection, the ledger naming it or not (a dir laid out by hand, or
-/// whose ledger was lost); a file at another place stays. Their lines go when
-/// the ledger is rewritten. A file goes in the region dir by its name, or in
-/// the sub-dir its component's `dir` names (`water/`), where the ledger and
-/// the removal name it by its place (`water/admin_polygons.bin`); a sub-dir
-/// that is a link or a file fails the download before it writes anything,
-/// which writes nothing through a link. The dir's
+/// fetch, with the temp file a fetch of it killed part way left: each the
+/// ledger names, and each at a place a file of the build has in any
+/// selection, the ledger naming it or not (a dir laid out by hand, or whose
+/// ledger was lost); a file at another place stays. Their lines go when the
+/// ledger is rewritten. A file goes in the region dir by its name, or in the
+/// sub-dir its component's `dir` names (`water/`), where the ledger and the
+/// removal name it by its place (`water/admin_polygons.bin`); a sub-dir that
+/// is a link or a file fails the download before it writes anything, which
+/// writes nothing through a link. The dir's
 /// stamp (BUILD_STAMP) says it holds a complete selection of the build it
 /// names and none of those files: a download that fetches or removes
 /// anything makes the ledger where the dir has none, then removes the stamp,
@@ -878,10 +883,12 @@ pub async fn download_region(
     let taken: HashSet<&str> = paths.iter().map(|p| resolved.dest(p)).collect();
     // The files the selection doesn't take: each the ledger names, and each
     // in the dir at a place a file of the build has in any selection, the
-    // ledger naming it or not (build_names). Other names stay.
+    // ledger naming it or not (build_names), or whose fetch a kill left
+    // under its temp name there. Other names stay.
     let mut others: BTreeSet<String> = ledger.held.keys().filter(|name| !taken.contains(name.as_str())).cloned().collect();
     for name in build_names(cfg, sel)?.into_iter().filter(|name| !taken.contains(name.as_str())) {
-        if !others.contains(&name) && there(&region_dir.join(&name)).await? {
+        let path = region_dir.join(&name);
+        if !others.contains(&name) && (there(&path).await? || there(&tmp_of(&path)).await?) {
             others.insert(name);
         }
     }
@@ -903,18 +910,21 @@ pub async fn download_region(
             _ => {}
         }
     }
-    // Before the fetches, so that their room is free. Their lines go only
-    // when the ledger is rewritten: a download killed before then leaves
-    // them, and the next finds their files gone. A name at which a dir is
-    // names no file: a last line a kill cut short at a sub-dir's name.
+    // Before the fetches, so that their room is free, each with the temp
+    // file a fetch of it a kill cut short left. Their lines go only when the
+    // ledger is rewritten: a download killed before then leaves them, and
+    // the next finds their files gone. A name at which a dir is names no
+    // file: a last line a kill cut short at a sub-dir's name.
     for name in &others {
         let path = region_dir.join(name);
         if !tokio::fs::symlink_metadata(&path).await.is_ok_and(|m| m.is_dir()) {
-            match tokio::fs::remove_file(&path).await {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(DownloadError::Io(format!("remove {}: {}", path.display(), e)));
+            for path in [tmp_of(&path), path] {
+                match tokio::fs::remove_file(&path).await {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(DownloadError::Io(format!("remove {}: {}", path.display(), e)));
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         ledger.held.remove(name);
@@ -1903,6 +1913,32 @@ mod tests {
             let mut want = files_of(&bucket, &after);
             want.extend(theirs.map(|(name, bytes)| (name.to_string(), bytes.as_bytes().to_vec())));
             assert_eq!(differing(&held(&dir), &want), Vec::<String>::new(), "water {}", after.water);
+        }
+    }
+
+    // A file's fetch killed part way leaves its temp file beside it, and the
+    // ledger naming the file unknown. A download whose selection no longer
+    // takes the file removes the temp file with it: a switch to no water
+    // after a fetch of the water dir's admin_cells.bin was killed, and one to
+    // no POIs after a fetch of poi_cells.bin was.
+    #[tokio::test]
+    async fn a_switch_removes_the_temp_file_of_a_killed_fetch_of_a_file_it_doesnt_take() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        for (before, after, killed) in [
+            (wet("europe", "admin", "simplified", "none", "all"), sel("europe", "admin", "simplified", "none"), "water/admin_cells.bin"),
+            (sel("europe", "admin", "simplified", "major"), sel("europe", "admin", "simplified", "none"), "poi_cells.bin"),
+        ] {
+            let root = ScratchDir::new();
+            let dir = root.path().join("europe");
+            download(&bucket, &before, root.path()).await.unwrap();
+            let ledger = std::fs::read_to_string(dir.join(FILE_LEDGER)).unwrap();
+            std::fs::write(dir.join(FILE_LEDGER), format!("{ledger}{killed} -\n")).unwrap();
+            std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
+            std::fs::write(dir.join(format!("{killed}.tmp")), "the first bytes of a fetch").unwrap();
+
+            download(&bucket, &after, root.path()).await.unwrap();
+
+            assert_eq!(differing(&held(&dir), &files_of(&bucket, &after)), Vec::<String>::new(), "{killed}");
         }
     }
 
