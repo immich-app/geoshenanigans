@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compresses a build's index files for publishing.
 
-Usage: compress_index.py <output dir> --transport-bin PATH [--upload DEST --upload-cmd CMD]
+Usage: compress_index.py <output dir> --transport-bin PATH [--upload DEST --upload-cmd CMD [--upload-after FILE]]
            [--late-search STATUS [--late-search-timeout SECONDS] [--late-search-taken FILE]]
 
 Writes <file>.zst next to every .bin file and load sidecar under the output
@@ -27,6 +27,12 @@ through one long-running CMD (an `s5cmd ... run` reading cp commands on
 stdin): the upload is network-bound and compression CPU-bound, so they
 overlap instead of the upload waiting for the last file. Upload failures
 only warn; the caller re-uploads whatever is missing.
+--upload-after FILE holds the upload back until FILE exists, the caller's
+word that DEST may be written: compression goes on, the commands wait (FILE
+is looked for every half second), and the run's end waits for FILE, so that
+every file still goes up. The nightly's patch step compresses before
+yesterday's files are down, and gives it once they are and DEST is cleared:
+until then a build published under DEST stays as it is.
 
 --late-search: the place search indexes (every file under a region's
 search/ dir) are still being built beside this run. Everything else is
@@ -109,7 +115,7 @@ LOAD_SIDECARS = {"strings_layout.json", "poi_meta.json"}
 # (build_search_indexes.py), published like the .bin files.
 SEARCH_DIR = "search"
 
-# How often a late search's status is looked for.
+# How often a late search's status, and the upload's --upload-after file, are looked for.
 LATE_SEARCH_POLL_SECONDS = 0.5
 
 
@@ -334,20 +340,50 @@ def link(source, path):
 
 
 class Uploader:
-    """Feeds `cp <file> <dest>/<path>` lines to a running `s5cmd run`."""
+    """Feeds `cp <file> <dest>/<path>` lines to a running `s5cmd run`; with `after`, none until that file exists:
+    the lines sent before then wait for it (a thread looks for it), and finish() waits for it too."""
 
-    def __init__(self, out, dest, cmd):
-        self.out, self.dest = out, dest.rstrip("/")
+    def __init__(self, out, dest, cmd, after=""):
+        self.out, self.dest, self.after = out, dest.rstrip("/"), after
         self.proc = subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE, text=True) if dest else None
+        self.lock, self.opened = threading.Lock(), threading.Event()
+        # The lines that wait for `after`; None once they may go.
+        self.held = [] if self.proc and after else None
+        if self.held is None:
+            self.opened.set()
+        else:
+            threading.Thread(target=self.open_after, daemon=True).start()
+
+    def open_after(self):
+        try:
+            while not os.path.exists(self.after):
+                time.sleep(LATE_SEARCH_POLL_SECONDS)
+            with self.lock:
+                held, self.held = self.held, None
+                self.write("".join(held))
+        finally:
+            self.opened.set()
+
+    def write(self, lines):
+        if lines:
+            self.proc.stdin.write(lines)
+            self.proc.stdin.flush()
 
     def send(self, path):
         if self.proc:
-            self.proc.stdin.write(f"cp {path} {self.dest}/{os.path.relpath(path, self.out)}\n")
-            self.proc.stdin.flush()
+            line = f"cp {path} {self.dest}/{os.path.relpath(path, self.out)}\n"
+            with self.lock:
+                if self.held is not None:
+                    self.held.append(line)
+                else:
+                    self.write(line)
 
     def finish(self):
         if not self.proc:
             return
+        if not self.opened.is_set():
+            print(f"Compressed: the uploads wait for {self.after}", flush=True)
+        self.opened.wait()
         self.proc.stdin.close()
         if self.proc.wait() != 0:
             print("Warning: some streamed uploads failed; the caller re-uploads them", flush=True)
@@ -367,6 +403,7 @@ def main():
     args.add_argument("--transport-bin", required=True, help="geocoder-transport, which encodes and verifies the units")
     args.add_argument("--upload", default="")
     args.add_argument("--upload-cmd", default="s5cmd run")
+    args.add_argument("--upload-after", default="", help="the upload starts once this file exists")
     args.add_argument("--late-search", default="", help="the place search job's status file: its files come late")
     args.add_argument("--late-search-timeout", type=seconds, default=3600)
     args.add_argument("--late-search-taken", default="", help="gets the status the place search files were taken on")
@@ -435,7 +472,7 @@ def main():
             print(f"  {u.path}: {why}; its files go as .zst", flush=True)
             failed.add(key[u.path])
 
-    uploader = Uploader(out, opts.upload, opts.upload_cmd)
+    uploader = Uploader(out, opts.upload, opts.upload_cmd, opts.upload_after)
     try:
         with ThreadPoolExecutor(max_workers=budget) as ex:
             try:

@@ -346,6 +346,36 @@ class CompressIndexTest(unittest.TestCase):
         expected = [f"cp {self.path(rel)} s3://bucket/day/{rel}" for rel in sent_rel]
         self.assertEqual(sorted(sent), sorted(expected))
 
+    # The nightly's patch step compresses before it may write the date's prefix (yesterday's files not down yet):
+    # with --upload-after, compression goes on, its uploads wait until the file exists, and the run's end waits for
+    # them, so every file still goes up once it does.
+    def test_the_uploads_wait_for_their_file_and_the_run_for_them(self):
+        log = os.path.join(self.tmp.name, "upload.log")
+        recorder = os.path.join(self.tmp.name, "recorder.py")
+        with open(recorder, "w") as f:
+            f.write(f"import sys\nfor line in sys.stdin:\n    with open({log!r}, 'a') as f:\n        f.write(line)\n")
+        after = os.path.join(self.tmp.name, "prefix.cleared")
+        sent_rel = [f"{rel}.zst" for rel in self.files if rel not in self.members] + list(self.units)
+
+        child = self.start_late_run("--upload", "s3://bucket/day/", "--upload-cmd", f"{sys.executable} {recorder}",
+                                    "--upload-after", after)
+        printed = os.path.join(self.tmp.name, "late-run.out")
+        deadline = time.time() + 60
+        while time.time() < deadline and child.poll() is None and not (
+                all(os.path.exists(self.path(r)) for r in sent_rel) and "wait for" in open(printed).read()):
+            time.sleep(0.05)
+        time.sleep(0.5)
+        self.assertIsNone(child.poll())
+        self.assertEqual([r for r in sent_rel if not os.path.exists(self.path(r))], [])
+        self.assertFalse(os.path.exists(log), "an upload went before its file")
+        open(after, "w").close()
+        code, _, _ = self.late_run_result(child)
+
+        self.assertEqual(code, 0)
+        with open(log) as f:
+            sent = f.read().splitlines()
+        self.assertEqual(sorted(sent), sorted(f"cp {self.path(rel)} s3://bucket/day/{rel}" for rel in sent_rel))
+
     def counted_run(self, *args, cpus=4, budget_env=None):
         """run_main with `cpus` CPUs (None: cpu_budget.sh's, under `budget_env`), a zstd thread per 64 KiB and a zstd
         that logs each call; returns the calls as (start, end, threads, output) and what the run printed."""

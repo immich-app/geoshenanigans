@@ -984,26 +984,14 @@ jobs:
           # as it reads none of yesterday's files, which the diffs wait for
           # below. It keeps the .bin files the diffs and verifies read; the
           # compress step removes them. Each .zst and transport unit streams to
-          # this date's (cleared) Tigris prefix as soon as it exists: the upload
-          # is network-bound, so it hides behind the compression. Finalize
-          # uploads whatever is still missing. The .zst are final once it ends:
-          # their checksums (checksums.sh zst) are taken then, beside the
-          # patches, for Finalize's checksums.sha256.
-          $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
-          # The strategy-2 sidecars (*.osm_ids, tomorrow's --prev-output) are
-          # final since build-index exited: up now, rather than in Finalize's
-          # first pass, which waits for sidecars.status. Its session, for
-          # Compress index files or Finalize to end should it outlast their
-          # wait for it.
-          find "$WORKDIR/output" -name '*.osm_ids' -printf "cp %p s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/%P\n" > "$WORKDIR/sidecars.run"
-          # The inner script expands its own arguments ($0 is the status file).
-          # shellcheck disable=SC2016
-          setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/sidecars.status" \
-            s5cmd --endpoint-url "$S3_ENDPOINT" --retry-count 10 --numworkers 16 run "$WORKDIR/sidecars.run" \
-            > "$WORKDIR/sidecars.log" 2>&1 < /dev/null &
-          echo "$!" > "$WORKDIR/sidecars.pid"
-          # geocoder-transport, which encodes the units, comes from the place
-          # search build (done long before, on a normal night).
+          # this date's Tigris prefix as soon as it exists and the prefix is
+          # cleared (prefix.cleared, below): the upload is network-bound, so it
+          # hides behind the compression. Finalize uploads whatever is still
+          # missing. The .zst are final once it ends: their checksums
+          # (checksums.sh zst) are taken then, beside the patches, for
+          # Finalize's checksums.sha256. geocoder-transport, which encodes the
+          # units, comes from the place search build (done long before, on a
+          # normal night).
           WAIT_START=$(date +%s)
           until [ -s "$RUNNER_TEMP/search.status" ] || [ $(( $(date +%s) - WAIT_START )) -gt 1800 ]; do sleep 5; done
           # In a session of its own, which the wait below ends should
@@ -1015,7 +1003,7 @@ jobs:
             nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
               --transport-bin "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" \
               --late-search "$WORKDIR/place-search.status" --late-search-taken "$WORKDIR/place-search.taken" \
-              --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" \
+              --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" --upload-after "$WORKDIR/prefix.cleared" \
               --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" || COMPRESS_RC=$?
             if [ "$COMPRESS_RC" = 0 ] || [ "$COMPRESS_RC" = 3 ]; then
               nice -n 10 "$GITHUB_WORKSPACE/geocoder/builder/tools/checksums.sh" zst "$WORKDIR/output" > "$WORKDIR/zst.sha256.part" \
@@ -1028,9 +1016,11 @@ jobs:
           # Yesterday's client files came down and decompressed beside the
           # build (fetch_previous_index.sh, started by the build step). Without
           # them there are no patches and the run fails: compression ends
-          # first, its session and all (its uploads too), and is gone (a
-          # zombie aside). Its launch is killed too, as a fetch that failed
-          # before build-index exited stops it before it has made its session.
+          # first, its session and all (its uploads, held back, too), and is
+          # gone (a zombie aside); this date's prefix is left as it was, a
+          # build published under it included. Its launch is killed too, as a
+          # fetch that failed before build-index exited stops it before it has
+          # made its session.
           compressing() { ps -o stat= -s "$COMPRESS_PID" | grep -q '^[^Z]'; }
           stop_compression() {
             local start
@@ -1054,6 +1044,22 @@ jobs:
             echo "::error::Fetching yesterday's index failed"; stop_compression; exit 1
           fi
           df -h "$WORKDIR"
+
+          # This date's prefix is cleared and written from here on. The
+          # strategy-2 sidecars (*.osm_ids, tomorrow's --prev-output) are final
+          # since build-index exited: up now, rather than in Finalize's first
+          # pass, which waits for sidecars.status. Its session, for Compress
+          # index files or Finalize to end should it outlast their wait for it.
+          # Then compression's uploads go, held back until now.
+          $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
+          find "$WORKDIR/output" -name '*.osm_ids' -printf "cp %p s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/%P\n" > "$WORKDIR/sidecars.run"
+          # The inner script expands its own arguments ($0 is the status file).
+          # shellcheck disable=SC2016
+          setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/sidecars.status" \
+            s5cmd --endpoint-url "$S3_ENDPOINT" --retry-count 10 --numworkers 16 run "$WORKDIR/sidecars.run" \
+            > "$WORKDIR/sidecars.log" 2>&1 < /dev/null &
+          echo "$!" > "$WORKDIR/sidecars.pid"
+          touch "$WORKDIR/prefix.cleared"
 
           # Patch generation runs against uncompressed .bin files (old was
           # decompressed as it came down, new was just built).

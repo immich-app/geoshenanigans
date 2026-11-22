@@ -274,6 +274,18 @@ echo pbf > "$d/$o"
 """
 
 
+# s5cmd as the nightly's steps run it: each call appends its arguments to $WORKDIR/s5cmd.log, and a `run` each line
+# of the commands it reads (on stdin, or from the file it names), as it reads them.
+FAKE_S5CMD = r"""#!/bin/sh
+echo "$*" >> "$WORKDIR/s5cmd.log"
+for last; do :; done
+case $last in
+  run) while IFS= read -r line; do echo "$line" >> "$WORKDIR/s5cmd.log"; done ;;
+  *.run) while IFS= read -r line; do echo "$line" >> "$WORKDIR/s5cmd.log"; done < "$last" ;;
+esac
+"""
+
+
 def written(path):
     """The line in the status file at `path` once written whole (`echo $? > path`), else ""."""
     try:
@@ -291,6 +303,31 @@ def alive(pid):
             return f.read().rsplit(")", 1)[1].split()[0] != "Z"
     except FileNotFoundError:
         return False
+
+
+def running_from(root):
+    """The processes (zombies aside) whose command line names a path under `root`."""
+    found = []
+    for pid in os.listdir("/proc"):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read()
+        except OSError:
+            continue
+        if pid.isdigit() and int(pid) != os.getpid() and root.encode() in cmdline and alive(int(pid)):
+            found.append(int(pid))
+    return found
+
+
+def kill_running_from(root):
+    """Kills the processes running_from(root); returns them."""
+    found = running_from(root)
+    for pid in found:
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            pass
+    return found
 
 
 class DownloadStepTest(unittest.TestCase):
@@ -680,22 +717,33 @@ class PostBuildTest(unittest.TestCase):
         self.assertNotIn("build_search_indexes.py", script)
 
     # Both steps that compress start compression with geocoder-transport built, the sidecars' upload after the
-    # prefix is cleared.
+    # prefix is cleared. The patch step clears it once yesterday's files are down, well after compression starts,
+    # and lets compression's uploads go after that; the compress step (after it, or on a night without patches)
+    # clears it before it compresses.
     def test_compression_waits_for_geocoder_transport_and_the_sidecars_go_up_after_the_prefix_is_cleared(self):
+        clear_cmd = "rm \"s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*\""
+        # Its session, for a later step to end should it outlast the wait for it.
+        pid_cmd = 'echo "$!" > "$WORKDIR/sidecars.pid"'
         for name in ("Generate patches and verify", "Compress index files"):
             script = step_script(name)
-            clear = script.index("rm \"s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*\"")
+            clear = script.index(clear_cmd)
             sidecars = script.index("run \"$WORKDIR/sidecars.run\"")
             wait = script.index('[ -s "$RUNNER_TEMP/search.status" ]')
             compress = script.index("compress_index.py")
-            # Its session, for a later step to end should it outlast the wait for it.
-            pid = script.index('echo "$!" > "$WORKDIR/sidecars.pid"')
+            pid = script.index(pid_cmd)
             self.assertLess(clear, sidecars, name)
             self.assertLess(sidecars, pid, name)
-            self.assertLess(pid, compress, name)
             self.assertLess(wait, compress, name)
             self.assertIn("RUNNER_TEMP: ${{ runner.temp }}", step(name), name)
+        patch = step_script("Generate patches and verify")
+        fetched = patch.index('if [ "$(cat "$WORKDIR/old-output.status")" != 0 ]; then')
+        self.assertLess(patch.index("compress_index.py"), fetched)
+        self.assertLess(fetched, patch.index(clear_cmd))
+        self.assertLess(patch.index(pid_cmd), patch.index('touch "$WORKDIR/prefix.cleared"'))
+        self.assertIn('--upload-after "$WORKDIR/prefix.cleared"', patch)
         retry = step_script("Compress index files")
+        self.assertLess(retry.index(pid_cmd), retry.index("compress_index.py"))
+        self.assertNotIn("--upload-after", retry)
         self.assertLess(retry.index('[ -s "$WORKDIR/sidecars.status" ]'), retry.index("rm \"s3://$S3_BUCKET/$S3_PREFIX"))
 
     def test_finalize_waits_for_the_sidecars_before_its_first_pass(self):
@@ -845,33 +893,44 @@ class PostBuildTest(unittest.TestCase):
                 self.assertEqual(upload.wait(timeout=10), -9)
                 self.assertIn("::warning::", done.stdout)
 
-    def run_patch_step(self, compress, fetch_status=None, slow_setsid=False):
-        """Runs Generate patches and verify as Actions runs it, on a night of no variants, with geocoder-transport
-        built and the place search done, an s5cmd, generate_patches.sh and checksums.sh that do nothing else, sleeps
-        of 10 ms, a clock that runs the seconds in $WORKDIR/clock ahead, and `compress` (Python, its argv
-        compress_index.py's) as compress_index.py; yesterday's fetch has ended with `fetch_status` (None: not yet,
-        it writes none of its own). With slow_setsid, setsid takes half a second to start. Returns the run, None when
-        the step still waited after 30 s, and the work dir."""
+    def run_patch_step(self, compress=None, fetch_status=None, slow_setsid=False, at_sleep=""):
+        """Runs Generate patches and verify as Actions runs it, with geocoder-transport built and the place search
+        done, a generate_patches.sh and checksums.sh that do nothing else, FAKE_S5CMD, sleeps of 10 ms that first run
+        `at_sleep` (shell), a clock that runs the seconds in $WORKDIR/clock ahead, and as compress_index.py
+        `compress` (Python, its argv compress_index.py's) on a night of no variants, or (None) compress_index.py
+        itself on one of a .bin file and its sidecar; yesterday's fetch has ended with `fetch_status` (None: not
+        yet, it writes none of its own). With slow_setsid, setsid takes half a second to start. Returns the run,
+        None when the step still waited after 30 s, and the work dir. What of the run's still runs when the test
+        ends is killed."""
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root)
+        self.addCleanup(kill_running_from, root)
         ws, work, bin_dir = (os.path.join(root, d) for d in ("ws", "work", "bin"))
         tools = os.path.join(ws, "geocoder", "builder", "tools")
         for d in (tools, os.path.join(work, "output"), bin_dir):
             os.makedirs(d)
-        fakes = {os.path.join(tools, "compress_index.py"): compress,
-                 os.path.join(tools, "generate_patches.sh"): "#!/bin/sh\nexit 0\n",
+        fakes = {os.path.join(tools, "generate_patches.sh"): "#!/bin/sh\nexit 0\n",
                  os.path.join(tools, "checksums.sh"): "#!/bin/sh\nexit 0\n",
-                 os.path.join(bin_dir, "s5cmd"): "#!/bin/sh\nexit 0\n",
-                 os.path.join(bin_dir, "sleep"): "#!/bin/sh\nexec /usr/bin/sleep 0.01\n",
+                 os.path.join(bin_dir, "s5cmd"): FAKE_S5CMD,
+                 os.path.join(bin_dir, "sleep"): f"#!/bin/sh\n{at_sleep}\nexec /usr/bin/sleep 0.01\n",
                  os.path.join(bin_dir, "date"): FAKE_DATE.format(date=shutil.which("date")),
                  os.path.join(work, "old-output.log"): "",
                  os.path.join(work, "place-search.status"): "0\n",
                  os.path.join(root, "search.status"): "0\n"}
+        if compress is None:
+            for name in ("compress_index.py", "cpu_budget.sh"):
+                shutil.copy(os.path.join(HERE, name), tools)
+            fakes.update({os.path.join(work, "output", "planet", "full", "geo_cells.bin"): "cells " * 1000,
+                          os.path.join(work, "output", "planet", "full", "ways.osm_ids"): "ids",
+                          os.path.join(work, "output", "configurations.json"): '{"version": 1}\n'})
+        else:
+            fakes[os.path.join(tools, "compress_index.py")] = compress
         if fetch_status is not None:
             fakes[os.path.join(work, "old-output.status")] = fetch_status
         if slow_setsid:
             fakes[os.path.join(bin_dir, "setsid")] = f'#!/bin/sh\n/usr/bin/sleep 0.5\nexec {shutil.which("setsid")} "$@"\n'
         for path, text in fakes.items():
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w") as f:
                 f.write(text)
             os.chmod(path, 0o755)
@@ -887,6 +946,13 @@ class PostBuildTest(unittest.TestCase):
         except subprocess.TimeoutExpired:
             done = None
         return done, work
+
+    def s5cmd_calls(self, work):
+        """What FAKE_S5CMD logged: each call's arguments, and each command a `run` read."""
+        if not os.path.exists(os.path.join(work, "s5cmd.log")):
+            return []
+        with open(os.path.join(work, "s5cmd.log")) as f:
+            return f.read().splitlines()
 
     # Compression reads today's files alone: it starts from build-index's exit, before the step waits for
     # yesterday's (fetch_previous_index.sh, beside the build), which a night whose fetch outlasts build-index would
@@ -937,6 +1003,44 @@ class PostBuildTest(unittest.TestCase):
             if alive(compress):
                 os.kill(compress, 9)
                 self.fail("compression started after the step")
+
+    # Until yesterday's files are down nothing deletes or writes this date's prefix, a build published under it
+    # included: a fetch that failed or timed out leaves it as it was, though compression (compress_index.py itself
+    # here) had a file to send up before the step saw the fetch end.
+    def test_a_fetch_that_failed_or_timed_out_leaves_the_dates_prefix_as_it_was(self):
+        compressed = "grep -q '] planet/full/geo_cells.bin$' \"$WORKDIR/compress.log\" 2> /dev/null && "
+        for how, ends in (("failed", compressed + 'echo 1 > "$WORKDIR/old-output.status"'),
+                          ("timed out", compressed + 'echo 4000 > "$WORKDIR/clock"')):
+            with self.subTest(how=how):
+                done, work = self.run_patch_step(at_sleep=ends)
+
+                self.assertIsNotNone(done, "the step still waited after 30 s")
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn("::error::", done.stdout)
+                with open(os.path.join(work, "compress.log")) as f:
+                    self.assertRegex(f.read(), r"\] planet/full/geo_cells\.bin\n")
+                self.assertEqual([c for c in self.s5cmd_calls(work) if "/builds/2026-11-21" in c], [])
+                self.assertEqual(kill_running_from(os.path.dirname(work)), [], "compression still ran after the step")
+
+    # Once they are down the date's prefix is cleared, and written after: the sidecars, and compression's uploads,
+    # which waited for it.
+    def test_the_dates_prefix_is_cleared_then_written_once_yesterdays_files_are_down(self):
+        done, work = self.run_patch_step(
+            at_sleep="grep -q '] planet/full/geo_cells.bin$' \"$WORKDIR/compress.log\" 2> /dev/null && "
+                     'echo 0 > "$WORKDIR/old-output.status"')
+
+        self.assertIsNotNone(done, "the step still waited after 30 s")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertTrue(os.path.exists(os.path.join(work, "compress.done")))
+        deadline = time.time() + 10
+        while time.time() < deadline and not written(os.path.join(work, "sidecars.status")):
+            time.sleep(0.05)
+        self.assertEqual(written(os.path.join(work, "sidecars.status")), "0\n")
+        out, dest = os.path.join(work, "output"), "s3://bucket/geocoder/builds/2026-11-21"
+        dated = [c for c in self.s5cmd_calls(work) if "/builds/2026-11-21" in c]
+        self.assertEqual(dated[:1], [f"--endpoint-url https://s3.invalid --retry-count 5 --numworkers 32 rm {dest}/*"])
+        self.assertEqual(sorted(dated[1:]), [f"cp {out}/planet/full/geo_cells.bin.zst {dest}/planet/full/geo_cells.bin.zst",
+                                             f"cp {out}/planet/full/ways.osm_ids {dest}/planet/full/ways.osm_ids"])
 
     # The watchdog tells a retry from a failure a rerun repeats by these steps' names.
     def test_every_step_the_watchdog_names_is_a_step_of_the_nightly(self):
