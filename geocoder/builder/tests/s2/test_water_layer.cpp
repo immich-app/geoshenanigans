@@ -1160,6 +1160,35 @@ TEST(a_previous_water_build_whose_polygon_sidecar_cant_be_read_stops_the_build) 
     CHECK(write(build(fixture(), one), two, one).find("4 polygons in 4 slots (0 kept") != std::string::npos);
 }
 
+TEST(a_previous_water_build_whose_fallback_sidecar_is_there_but_cant_be_opened_stops_the_build) {
+    const ScratchDir root("water-fallbacks");
+    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    write(build(fixture()), one);
+    // A link to itself is there, and no file can be opened through it.
+    auto unopenable = [](const std::string& path) {
+        fs::remove(path);
+        fs::create_symlink(fs::path(path).filename(), path);
+    };
+    const std::string major = one + "/water/major/simplified/admin_polygons.fallback.osm_ids";
+    const std::string all = one + "/water/all/exact/admin_polygons.fallback.osm_ids";
+    unopenable(major);
+    CHECK(refusal(fixture(), one).find(major) != std::string::npos);
+    fs::remove(major);
+    CHECK(refusal(fixture(), one).empty());
+    unopenable(all);
+    const Layer day2 = build(fixture(), one);
+    std::string why;
+    {
+        const gctest::CapturedStderr log;
+        why = gctest::refusal_of<std::runtime_error>([&] { write_water_dirs(day2, two, one, "test"); });
+    }
+    CHECK(why.find(all) != std::string::npos);
+    // Gone, the slots keep their identities without fallback keys.
+    fs::remove(all);
+    CHECK(write(build(fixture(), one), root.path() + "/three", one).find("4 polygons in 4 slots (4 kept") !=
+          std::string::npos);
+}
+
 TEST(a_way_tagged_as_the_multipolygon_whose_outer_ring_it_is_leaves_the_island_out) {
     Collected c = fixture();
     const int32_t lat = kLat - 1000000;

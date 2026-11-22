@@ -97,10 +97,12 @@ void write_fallback_sidecar(const std::string& path, const std::vector<uint64_t>
 }
 
 // The fallback keys of a sidecar of `slots` slots; none (every slot without
-// one) for a missing file. One of another slot count, or cut short, is refused.
+// one) for a missing file. One there that can't be opened, of another slot
+// count, or cut short, is refused.
 std::vector<uint64_t> read_fallback_sidecar(const std::string& path, size_t slots) {
+    if (path_absent(path)) return std::vector<uint64_t>(slots, gc::id_alloc::kNoFallbackKey);
     std::ifstream f(path, std::ios::binary);
-    if (!f) return std::vector<uint64_t>(slots, gc::id_alloc::kNoFallbackKey);
+    if (!f) throw std::runtime_error("unreadable water polygon fallback sidecar " + path);
     uint32_t head[3];
     std::vector<uint64_t> keys;
     if (f.read(reinterpret_cast<char*>(head), sizeof head) && head[0] == kFallbackSidecarMagic &&

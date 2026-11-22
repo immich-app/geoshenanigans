@@ -136,6 +136,24 @@ TEST(water_meta_json_round_trips_quotes_and_controls_and_refuses_what_it_did_not
         CHECK(!parse_meta_json(with_type(other)).has_value());
 }
 
+TEST(water_meta_json_of_a_code_twice_or_out_of_order_or_a_value_twice_is_no_table) {
+    // Kinds as meta_json writes them: each code once, ascending, each value
+    // outside the fixed table once.
+    auto meta = [](const std::vector<MetaType>& kinds) {
+        std::string out = "{\"types\": [\n";
+        for (size_t k = 0; k < kinds.size(); k++) out += (k ? ",\n" : "") + meta_entry(kinds[k]);
+        return out + "\n]}\n";
+    };
+    const MetaType lake{code::kLake, "water", "lake", 20};
+    const MetaType a{32769, "water", "a", 22}, b{32770, "water", "b", 22};
+    CHECK(parse_meta_json(meta({lake, a, b})).has_value());
+    CHECK(!parse_meta_json(meta({lake, a, {32769, "water", "b", 22}})).has_value());
+    CHECK(!parse_meta_json(meta({lake, b, a})).has_value());
+    CHECK(!parse_meta_json(meta({a, lake})).has_value());
+    CHECK(!parse_meta_json(meta({lake, lake})).has_value());
+    CHECK(!parse_meta_json(meta({lake, a, {32770, "water", "a", 22}})).has_value());
+}
+
 TEST(the_major_tier_takes_100_km2_and_wikidata_rivers_of_5_and_keeps_its_own_at_90_percent) {
     CHECK(water_major_keeps(100, false, false, false));
     CHECK(!water_major_keeps(99.9, false, false, false));
