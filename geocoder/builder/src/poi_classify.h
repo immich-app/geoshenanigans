@@ -26,6 +26,20 @@ inline bool poi_tag_is(const char* v, std::initializer_list<const char*> values)
     return false;
 }
 
+// Whether leisure=`v` is a POI main tag of rank 30 in Nominatim
+// (presets.lua:221-226): park, nature_reserve, garden and common rank 24 and
+// 25 (address-levels.json:60-65), and the import drops leisure=no.
+inline bool poi_leisure_ranks_30(const char* v) {
+    return !poi_tag_is(v, {"no", "park", "nature_reserve", "garden", "common"});
+}
+
+// Whether man_made=`v` is a POI main tag in Nominatim (presets.lua:228-237);
+// the other values are none.
+inline bool poi_man_made_is_main(const char* v) {
+    return poi_tag_is(v, {"pier", "tower", "bridge", "works", "water_tower", "dyke", "adit", "lighthouse", "watermill",
+                          "tunnel"});
+}
+
 // Whether an object carries a main tag that makes it a rank-30 POI in
 // Nominatim: a key of its import's POI main tags (lib-lua/themes/nominatim/
 // presets.lua MAIN_TAGS_POIS, which the full style takes) with a value the
@@ -44,9 +58,7 @@ inline bool has_poi_main_tag(const char* t_amenity, const char* t_leisure, const
     // presets.lua:178-183; the values the import drops.
     if (t_amenity && !poi_tag_is(t_amenity, {"no", "parking_space", "parking_entrance", "waste_disposal", "hunting_stand"}))
         return true;
-    // presets.lua:221-226; park, nature_reserve, garden and common rank 24
-    // and 25 (address-levels.json:60-65).
-    if (t_leisure && !poi_tag_is(t_leisure, {"no", "park", "nature_reserve", "garden", "common"})) return true;
+    if (t_leisure && poi_leisure_ranks_30(t_leisure)) return true;
     // presets.lua:192-195.
     if (t_emergency && !poi_tag_is(t_emergency, {"no", "yes", "fire_hydrant"})) return true;
     // presets.lua:255-259 (tourism=attraction, a fallback tag, ranks 30 too).
@@ -61,9 +73,7 @@ inline bool has_poi_main_tag(const char* t_amenity, const char* t_leisure, const
     if (t_railway && !poi_tag_is(t_railway, {"rail", "no", "abandoned", "disused", "razed", "level_crossing", "switch",
                                              "signal", "buffer_stop"}))
         return true;
-    // presets.lua:228-237.
-    return t_man_made && poi_tag_is(t_man_made, {"pier", "tower", "bridge", "works", "water_tower", "dyke", "adit",
-                                                 "lighthouse", "watermill", "tunnel"});
+    return t_man_made && poi_man_made_is_main(t_man_made);
 }
 
 // Whether an object carries a main tag of a positive address rank below 30
@@ -107,8 +117,8 @@ inline bool has_lower_rank_main_tag(const char* t_place, const char* t_landuse, 
 // the primary slot. An object that also carries a POI main tag
 // (has_poi_main_tag) is a rank-30 POI there, unless a main tag of a lower
 // positive rank ranks it (has_lower_rank_main_tag): it takes no water
-// category, and is classified by that tag, or as a generic rank-30 feature
-// where the tag has no category of its own.
+// category, and is classified by its rank-30 tags, or as a generic rank-30
+// feature where they have no category of their own.
 inline std::optional<PoiClassification> classify_poi(
     const char* t_tourism, const char* t_historic, const char* t_boundary,
     const char* t_amenity, const char* t_leisure, const char* t_natural,
@@ -120,15 +130,25 @@ inline std::optional<PoiClassification> classify_poi(
     PoiCategory cat = PoiCategory::UNKNOWN;
 
     // A POI main tag takes the place of a water kind (above) where the object
-    // ranks 30: `water` gives the kind's category, or none where `yields`,
-    // and notes that it yielded.
+    // ranks 30: `water` gives the kind's category, or none where `yields`, and
+    // then leaves the category to the object's rank-30 main tags, so that the
+    // tags after it of a lower rank or of no main tag in Nominatim
+    // (leisure=park, natural=wood, place=island, waterway=waterfall,
+    // man_made=dam, power=*) give none. `water_yielded` notes that one did.
     const bool ranks_30 = !has_lower_rank_main_tag(t_place, t_landuse, t_highway, area);
     const bool poi_main = ranks_30 && has_poi_main_tag(t_amenity, t_leisure, t_emergency, t_tourism, t_historic,
                                                        t_shop, t_craft, t_office, t_aeroway, t_railway, t_man_made);
     bool water_yielded = false;
     auto water = [&](PoiCategory kind, bool yields) {
-        water_yielded = yields;
-        return yields ? PoiCategory::UNKNOWN : kind;
+        if (!yields) return kind;
+        water_yielded = true;
+        if (t_leisure && !poi_leisure_ranks_30(t_leisure)) t_leisure = nullptr;
+        // address-levels.json:66-79.
+        if (t_natural && !poi_tag_is(t_natural, {"tree", "spring", "cave_entrance", "geyser", "hot_spring", "rock", "stone"}))
+            t_natural = nullptr;
+        if (t_man_made && !poi_man_made_is_main(t_man_made)) t_man_made = nullptr;
+        t_power = t_place = t_waterway = nullptr;
+        return PoiCategory::UNKNOWN;
     };
 
     // tourism (highest priority)

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "test_framework.h"
 
@@ -330,4 +331,38 @@ TEST(poi_classify_a_water_object_beside_a_main_tag_of_a_lower_address_rank_keeps
         t.wikidata = "Q1";
         CHECK_EQ(uint8_t(category_of(t)), uint8_t(kind.category));
     }
+}
+
+TEST(poi_classify_a_water_object_that_yields_takes_its_category_from_a_rank_30_tag) {
+    // Once a water kind yields to a POI main tag, the object's category is its
+    // rank-30 tags' to give: leisure=park and nature_reserve (24, 0),
+    // natural=wood (22, 0), place=island (17, 0) and waterway=waterfall
+    // (20, 0) rank lower (address-levels.json), and power=plant and
+    // man_made=dam are no main tags of Nominatim's (presets.lua), so none of
+    // them classifies it after the water kind.
+    struct Case {
+        std::vector<std::pair<const char*, const char*>> tags;
+        PoiCategory category;
+    };
+    const Case cases[] = {
+        {{{"landuse", "reservoir"}, {"leisure", "park"}, {"emergency", "fire_water_pond"}}, PoiCategory::FIRE_WATER_POND},
+        {{{"landuse", "basin"}, {"leisure", "nature_reserve"}, {"shop", "bakery"}}, PoiCategory::SHOP_BAKERY},
+        {{{"landuse", "reservoir"}, {"natural", "wood"}, {"craft", "winery"}}, PoiCategory::WINERY},
+        {{{"natural", "water"}, {"place", "island"}, {"shop", "bakery"}}, PoiCategory::SHOP_BAKERY},
+        {{{"natural", "water"}, {"waterway", "waterfall"}, {"office", "government"}}, PoiCategory::GOVERNMENT},
+        {{{"natural", "wetland"}, {"power", "plant"}, {"shop", "bakery"}}, PoiCategory::SHOP_BAKERY},
+        {{{"natural", "bay"}, {"man_made", "dam"}, {"shop", "bakery"}}, PoiCategory::SHOP_BAKERY},
+        // natural=spring ranks 30, and classifies the object still.
+        {{{"landuse", "reservoir"}, {"natural", "spring"}, {"shop", "bakery"}}, PoiCategory::SPRING},
+    };
+    for (const Case& c : cases)
+        for (const bool area : {true, false}) {
+            Tags t;
+            t.area = area;
+            for (const auto& [key, value] : c.tags) t = with(t, key, value);
+            if (category_of(t) != c.category)
+                std::printf("    %s=%s, %s=%s and %s=%s\n", c.tags[0].first, c.tags[0].second, c.tags[1].first,
+                            c.tags[1].second, c.tags[2].first, c.tags[2].second);
+            CHECK_EQ(uint8_t(category_of(t)), uint8_t(c.category));
+        }
 }
