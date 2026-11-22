@@ -455,3 +455,16 @@ TEST(a_water_relations_member_way_of_an_id_past_two_billion_is_read) {
     const ScratchDir root("water-high-way-id");
     CHECK(planet_water_names(objects, root.path() + "/out") == std::vector<std::string>({"Hochsee"}));
 }
+
+TEST(a_closed_water_way_tagged_area_no_is_water_as_nominatim_fills_it) {
+    // Nominatim's process_way reads `area` only to fill a highway, and its
+    // water rows never read it: a closed natural=water way is an area,
+    // area=no or not.
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    std::vector<TestObject> objects;
+    const int32_t corners[4][2] = {{0, 0}, {0, 10000}, {10000, 10000}, {10000, 0}};
+    for (int k = 0; k < 4; k++) objects.push_back(node(k + 1, lat0 + corners[k][0], lng0 + corners[k][1]));
+    objects.push_back(way(140, {1, 2, 3, 4, 1}, {{"natural", "water"}, {"area", "no"}, {"name", "Kein Gebiet"}}));
+    const ScratchDir root("water-area-no");
+    CHECK(planet_water_names(objects, root.path() + "/out") == std::vector<std::string>({"Kein Gebiet"}));
+}
