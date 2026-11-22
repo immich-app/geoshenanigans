@@ -132,6 +132,10 @@ fn the_geodata_loads_as_immichs_import_reads_it() {
     // A ring a polygon: Bigland's outer one, Enclave's, the two islands'.
     assert_eq!(geodata.rings(), 4);
     assert!(Source::at(&source.dir.join("nowhere")).is_none());
+    // The source names the countries as the geodata does, without loading
+    // it.
+    assert_eq!(source.country_names.get("TL").map(String::as_str), Some("Testland"));
+    assert!(!source.country_names.contains_key("XX"));
 }
 
 // earth_box's cube has no second test of the distance: a place in its
@@ -283,7 +287,8 @@ async fn the_immich_column_says_why_it_cant_answer() {
 }
 
 // /datasets lists the Immich column under "others", of kind immich, with its
-// release and geodata, and no search; none where the portal has no geodata.
+// release and geodata, its country names, and no search; none where the
+// portal has no geodata.
 #[tokio::test]
 async fn datasets_lists_the_immich_column_among_the_others() {
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
@@ -312,5 +317,8 @@ async fn datasets_lists_the_immich_column_among_the_others() {
         assert_eq!(other["immich"], serde_json::json!({ "release": VERSION, "commit": COMMIT, "geodata_date": GEODATA_DATE, "max_distance_m": 25000.0 }));
         assert_eq!(other["search"], serde_json::Value::Null);
         assert!(other["description"].as_str().unwrap().contains(VERSION), "{other}");
+        // countryInfo.txt's names by alpha-2 code, trimmed, those of no
+        // name left out: the page names another column's country by them.
+        assert_eq!(other["country_names"], serde_json::json!({ "AU": "Australia", "BG": "Bigland", "EN": "Enclave", "TL": "Testland" }));
     }
 }

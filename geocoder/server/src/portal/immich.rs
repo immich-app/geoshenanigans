@@ -28,8 +28,9 @@
 // Of places at one distance Postgres keeps the first its scan reads; here,
 // the first in cities500.txt.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -72,6 +73,10 @@ pub struct Source {
     pub commit: Option<String>,
     /// geodata-date.txt: when Immich's image downloaded the files.
     pub geodata_date: String,
+    /// countryInfo.txt's names by ISO alpha-2 code, which Immich stores as
+    /// the country of a place's code (none where the file doesn't read:
+    /// the column's geodata then doesn't load either).
+    pub country_names: Arc<BTreeMap<String, String>>,
 }
 
 impl Source {
@@ -82,7 +87,14 @@ impl Source {
         let value = |name: &str| {
             release.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix('=')).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
         };
-        Some(Source { dir: dir.to_path_buf(), version: value("version"), commit: value("commit"), geodata_date })
+        let names = read(dir, "countryInfo.txt").map(|text| country_names(&text).0.into_iter().collect()).unwrap_or_default();
+        Some(Source {
+            dir: dir.to_path_buf(),
+            version: value("version"),
+            commit: value("commit"),
+            geodata_date,
+            country_names: Arc::new(names),
+        })
     }
 
     /// The geodata of PORTAL_IMMICH_GEODATA (DIR by default), if it holds
@@ -97,7 +109,10 @@ impl Source {
     }
 
     /// What /datasets lists of the column (among its "others"): no
-    /// geocoder dataset, so of kind "immich", with no search.
+    /// geocoder dataset, so of kind "immich", with no search; and the
+    /// country names Immich stores by ISO alpha-2 code, with which the page
+    /// names the country our Immich integration would store from another
+    /// column's answer.
     pub fn json(&self) -> serde_json::Value {
         serde_json::json!({
             "id": ID,
@@ -109,6 +124,7 @@ impl Source {
                 self.release(), MAX_DISTANCE / 1000.0, self.geodata_date
             ),
             "immich": self.about(),
+            "country_names": self.country_names.as_ref(),
             "search": null,
         })
     }
@@ -194,6 +210,27 @@ fn lines(text: &str) -> Vec<&str> {
         out.push(&text[start..]);
     }
     out
+}
+
+/// The countries' names of countryInfo.txt's `text` by their ISO alpha-2
+/// and alpha-3 codes, as Immich's readCountryNames reads them: its first,
+/// second and fifth columns, its # lines and those of no name left out.
+fn country_names(text: &str) -> (HashMap<String, String>, HashMap<String, String>) {
+    let (mut by_alpha2, mut by_alpha3) = (HashMap::new(), HashMap::new());
+    for line in lines(text) {
+        if line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').take(5).collect();
+        let Some(name) = fields.get(4).map(|n| js_trim(n)).filter(|n| !n.is_empty()) else { continue };
+        if !fields[0].is_empty() {
+            by_alpha2.insert(fields[0].to_string(), name.to_string());
+        }
+        if !fields[1].is_empty() {
+            by_alpha3.insert(fields[1].to_string(), name.to_string());
+        }
+    }
+    (by_alpha2, by_alpha3)
 }
 
 /// JavaScript's String.prototype.trim.
@@ -410,20 +447,7 @@ impl Geodata {
         };
         let (admin1, admin2) = (admin("admin1CodesASCII.txt")?, admin("admin2Codes.txt")?);
 
-        let (mut by_alpha2, mut by_alpha3) = (HashMap::new(), HashMap::new());
-        for line in lines(&read(dir, "countryInfo.txt")?) {
-            if line.starts_with('#') {
-                continue;
-            }
-            let fields: Vec<&str> = line.split('\t').take(5).collect();
-            let Some(name) = fields.get(4).map(|n| js_trim(n)).filter(|n| !n.is_empty()) else { continue };
-            if !fields[0].is_empty() {
-                by_alpha2.insert(fields[0].to_string(), name.to_string());
-            }
-            if !fields[1].is_empty() {
-                by_alpha3.insert(fields[1].to_string(), name.to_string());
-            }
-        }
+        let (by_alpha2, by_alpha3) = country_names(&read(dir, "countryInfo.txt")?);
 
         let text = read(dir, "cities500.txt")?;
         let (mut places, mut skipped) = (Vec::new(), 0);
