@@ -2,9 +2,12 @@
 // template's entries for the sources its data came from.
 #include "attribution.h"
 
+#include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -45,24 +48,120 @@ TEST(attribution_lists_its_sources_in_the_templates_order) {
     CHECK(some.find("\"id\": \"tiger\"") != std::string::npos);
 }
 
+namespace {
+
+// The UTF-8 of code point `c`.
+std::string utf8(uint32_t c) {
+    std::string out;
+    if (c < 0x80) {
+        out += static_cast<char>(c);
+    } else if (c < 0x800) {
+        out += static_cast<char>(0xC0 | (c >> 6));
+        out += static_cast<char>(0x80 | (c & 0x3F));
+    } else {
+        out += static_cast<char>(0xE0 | (c >> 12));
+        out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (c & 0x3F));
+    }
+    return out;
+}
+
+// The JSON value at s[i] in one form whatever its layout: no space outside
+// its strings, each string as json_quote writes it, each object's members in
+// their order but those named `drop`; i past it. Throws on what is no JSON.
+std::string canonical_value(const std::string& s, size_t& i, const std::string& drop) {
+    auto space = [&] {
+        while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) i++;
+    };
+    auto expect = [&](char c) {
+        space();
+        if (i >= s.size() || s[i] != c) throw std::runtime_error(std::string("expected ") + c + " at " + std::to_string(i));
+        i++;
+    };
+    auto string = [&] {
+        expect('"');
+        std::string raw;
+        while (i < s.size() && s[i] != '"') {
+            if (s[i] != '\\') {
+                raw += s[i++];
+                continue;
+            }
+            const char e = s.at(i + 1);
+            i += 2;
+            if (e == 'u') {
+                raw += utf8(static_cast<uint32_t>(std::stoul(s.substr(i, 4), nullptr, 16)));
+                i += 4;
+            } else {
+                raw += e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e == 'b' ? '\b' : e == 'f' ? '\f' : e;
+            }
+        }
+        expect('"');
+        return json_quote(raw.c_str());
+    };
+    space();
+    if (i >= s.size()) throw std::runtime_error("no value at the end");
+    if (s[i] == '"') return string();
+    const char open = s[i];
+    if (open != '{' && open != '[') {
+        const size_t from = i;
+        while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ']' && !std::isspace(static_cast<unsigned char>(s[i]))) i++;
+        return s.substr(from, i - from);
+    }
+    const char close = open == '{' ? '}' : ']';
+    i++;
+    std::string out(1, open);
+    bool first = true;
+    for (space(); i < s.size() && s[i] != close; space()) {
+        if (!first) expect(',');
+        std::string member;
+        bool dropped = false;
+        if (open == '{') {
+            member = string();
+            dropped = !drop.empty() && member == json_quote(drop.c_str());
+            expect(':');
+            member += ':';
+        }
+        member += canonical_value(s, i, drop);
+        if (dropped) {
+            first = false;
+            continue;
+        }
+        out += (out.size() > 1 ? "," : "") + member;
+        first = false;
+    }
+    expect(close);
+    return out + close;
+}
+
+// The JSON value at s[at] in that form.
+std::string canonical(const std::string& s, size_t at = 0, const std::string& drop = "") {
+    return canonical_value(s, at, drop);
+}
+
+}  // namespace
+
+TEST(attribution_canonical_form_drops_only_the_members_named) {
+    CHECK_EQ(canonical("[ {\"a\": \"x \\\"y\\\"\", \"b\" : [1, 2],\n \"c\": \"\\u00a9\"} ]"),
+             std::string(R"([{"a":"x \"y\"","b":[1,2],"c":"©"}])"));
+    CHECK_EQ(canonical(R"({"a": 1, "b": {"a": [2]}, "c": 3})", 0, "a"), std::string(R"({"b":{},"c":3})"));
+    CHECK_EQ(canonical(R"({"b": 1, "a": 2})", 0, "b"), std::string(R"({"a":2})"));
+}
+
 TEST(attribution_entries_are_the_templates) {
-    // Each field of each entry, as configurations.template.json's top-level
-    // `attribution` list writes it.
+    // configurations.template.json's top-level `attribution` list, each entry
+    // without its `applies_to`, is what a dir of every source credits: the
+    // same entries in the same order, each with the same fields and notices,
+    // so neither can credit a licence or a notice to another source.
     std::ifstream f(GEOCODER_TEMPLATE_PATH);
     REQUIRE(f.good());
     const std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    REQUIRE(json.find("\"attribution\": [") != std::string::npos);
-    for (const AttributionEntry& e : kAttribution) {
-        for (const auto& [key, value] : {std::pair{"id", e.id}, std::pair{"text", e.text}, std::pair{"url", e.url},
-                                         std::pair{"licence", e.licence}, std::pair{"licence_url", e.licence_url}}) {
-            if (!value) continue;
-            const std::string field = "\"" + std::string(key) + "\": " + json_quote(value);
-            if (json.find(field) == std::string::npos) std::printf("    not in the template: %s\n", field.c_str());
-            CHECK(json.find(field) != std::string::npos);
-        }
-        for (const char* notice : e.notices)
-            if (notice) CHECK(json.find(json_quote(notice)) != std::string::npos);
-    }
+    const std::string key = "\"attribution\": [";
+    const size_t at = json.find(key);
+    REQUIRE(at != std::string::npos && json.find(key, at + 1) == std::string::npos);
+    const std::string all = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES | ATTRIBUTION_TIGER);
+    const std::string templates = canonical(json, at + key.size() - 1, "applies_to"), written = canonical(all);
+    if (templates != written) std::printf("    template: %s\n    written:  %s\n", templates.c_str(), written.c_str());
+    CHECK(templates == written);
 }
 
 TEST(attribution_json_quote_escapes_what_json_needs) {
