@@ -347,11 +347,19 @@ jobs:
               $S5 cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*.osm_ids" "$WORKDIR/old-output/" > /dev/null
               # The water kinds' codes (the water=* values outside the fixed
               # table keep yesterday's): the build reads them early, so they
-              # can't wait for the fetch beside it. A build before the water
-              # layer has none, and the codes start afresh.
+              # can't wait for the fetch beside it. A build that wrote water
+              # dirs (its sidecars hold theirs) has the file, and the step
+              # fails if it doesn't come down, as the codes could move; a
+              # build before the water layer has none, and they start afresh.
               WATER_META=planet/water/all/exact/water_meta.json
-              $S5 cp "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/$WATER_META" "$WORKDIR/old-output/$WATER_META" > /dev/null 2>&1 \
-                || echo "[sidecars] No $WATER_META for $YESTERDAY: the water kinds take new codes"
+              if [ -f "$WORKDIR/old-output/planet/water/all/exact/admin_polygons.osm_ids" ]; then
+                if ! $S5 cp "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/$WATER_META" "$WORKDIR/old-output/$WATER_META" > /dev/null; then
+                  echo "::error::[sidecars] $YESTERDAY wrote water dirs, but its $WATER_META did not come down"
+                  exit 1
+                fi
+              else
+                echo "[sidecars] $YESTERDAY wrote no water dirs: the water kinds take new codes"
+              fi
               COUNT=$(find "$WORKDIR/old-output" -name "*.osm_ids" | wc -l)
               SIZE=$(du -sb "$WORKDIR/old-output" | cut -f1)
               echo "[sidecars] Done: $COUNT files ($((SIZE/1024/1024)) MiB) in $(($(date +%s) - START))s"

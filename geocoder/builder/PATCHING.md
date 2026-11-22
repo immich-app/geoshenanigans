@@ -501,7 +501,9 @@ The sidecars (`*.osm_ids`) sit in `water/all/exact/` for the all set and in
 nightly fetches yesterday's with every other sidecar before the build, and
 yesterday's `planet/water/all/exact/water_meta.json` beside them: the build
 reads the type codes from it before the fetch of yesterday's client files has
-brought it down.
+brought it down. When yesterday's sidecars hold the water dirs' and that
+file doesn't come down, the step fails rather than let the codes start
+afresh; only a day before the water layer starts them so.
 
 #### The seas and oceans
 
