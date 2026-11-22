@@ -1027,6 +1027,52 @@ TEST(a_building_is_written_with_its_footprint_which_the_server_takes_its_distanc
     if (!says(answers[0], "7")) std::printf("    %s\n", answers[0].c_str());
 }
 
+namespace {
+
+// A closed way `id` of four new nodes from `first_node` on, around the
+// rectangle (south, west, north, east) in 1e-7 degrees.
+void add_rectangle(std::vector<TestObject>& objects, int64_t id, int64_t first_node, int32_t south, int32_t west,
+                   int32_t north, int32_t east, std::vector<std::pair<std::string, std::string>> tags = {}) {
+    const int32_t corners[4][2] = {{south, west}, {south, east}, {north, east}, {north, west}};
+    for (int k = 0; k < 4; k++) objects.push_back(node(first_node + k, corners[k][0], corners[k][1]));
+    objects.push_back(way(id, {first_node, first_node + 1, first_node + 2, first_node + 3, first_node}, std::move(tags)));
+}
+
+// The fixture with `extra` objects, written to `pbf` in PBF order.
+void write_fixture_with(const std::string& pbf, std::vector<TestObject> extra) {
+    std::vector<TestObject> objects = fixture();
+    objects.insert(objects.end(), extra.begin(), extra.end());
+    std::stable_sort(objects.begin(), objects.end(), [](const TestObject& a, const TestObject& b) {
+        return a.type != b.type ? a.type < b.type : a.id < b.id;
+    });
+    write_test_pbf(pbf, objects, 1000);
+}
+
+// The POI records a POI tier dir of a tree holds, as its files decode.
+std::vector<PoiRecord> poi_records_in(const std::map<std::string, std::vector<char>>& files, const std::string& dir) {
+    const std::string records = dir + "/poi_records.bin", vertices = dir + "/poi_vertices.bin";
+    REQUIRE(files.count(records) && files.count(vertices));
+    const auto& r2 = files.at(records);
+    const auto& v2 = files.at(vertices);
+    const poi_files::Logical pois = poi_files::decode(reinterpret_cast<const uint8_t*>(r2.data()), r2.size(),
+                                                      reinterpret_cast<const uint8_t*>(v2.data()), v2.size());
+    static_assert(sizeof(PoiRecord) == poi_files::LOGICAL_STRIDE, "a logical POI record is a PoiRecord");
+    REQUIRE(pois.records.size() % sizeof(PoiRecord) == 0);
+    std::vector<PoiRecord> out(pois.records.size() / sizeof(PoiRecord));
+    if (!out.empty()) std::memcpy(out.data(), pois.records.data(), pois.records.size());
+    return out;
+}
+
+// The categories of `records`, in order.
+std::vector<int> categories_of(const std::vector<PoiRecord>& records) {
+    std::vector<int> out;
+    for (const PoiRecord& pr : records) out.push_back(pr.category);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+}  // namespace
+
 // A named basin that is also a fire pond, landuse=basin with
 // emergency=fire_water_pond, is a rank-30 POI of its emergency tag in
 // Nominatim (poi_classify.h): the way pass resolves its nodes though neither
@@ -1078,6 +1124,58 @@ TEST(a_basin_that_is_a_fire_pond_is_written_as_one_and_answered) {
     CHECK(answer_string(answers[0], {"display_name"}).value_or("").rfind("Feuerweiher Testdorf, ", 0) == 0);
     CHECK(answer_string(answers[0], {"address", "road"}) == std::optional<std::string>("Teststrasse"));
     if (!says(answers[0], "Feuerweiher Testdorf")) std::printf("    %s\n", answers[0].c_str());
+}
+
+// A named bay that is also a pier, natural=bay with man_made=pier, is a
+// rank-30 POI of its man_made tag in Nominatim, a PIER here (tier 3), which
+// the notable tier doesn't ship, while it ships bays (tier 2): poi/all holds
+// the pier, poi/notable the bay, poi/major neither, each of its tier and of
+// no flag but its wiki tag's, and the slot of the way remembers tier 2, the
+// lowest that holds it, so a tombstone of it reaches poi/notable too. With a
+// wiki tag the bay is of tier 1 and the pier of tier 2: poi/major holds the
+// bay.
+TEST(a_bay_that_is_a_pier_is_a_pier_where_piers_ship_and_a_bay_where_only_bays_do) {
+    const ScratchDir root("bay-pier-build");
+    const std::string log = root.path() + "/build.log";
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    for (const bool wiki : {false, true}) {
+        const std::string pbf = root.path() + (wiki ? "/wiki.osm.pbf" : "/plain.osm.pbf");
+        std::vector<std::pair<std::string, std::string>> tags = {
+            {"man_made", "pier"}, {"name", "Hafenbucht Testdorf"}, {"natural", "bay"}};
+        if (wiki) tags.push_back({"wikidata", "Q4242"});
+        std::vector<TestObject> bay;
+        add_rectangle(bay, 4030, 990, lat0 + 1403000, lng0 + 1420000, lat0 + 1405000, lng0 + 1428000, tags);
+        write_fixture_with(pbf, bay);
+        const std::string out = root.path() + (wiki ? "/wiki" : "/plain");
+        REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
+        const auto files = tree(out);
+
+        const int pier = int(PoiCategory::PIER), bay_kind = int(PoiCategory::BAY);
+        const std::map<std::string, std::vector<int>> want = {
+            {"major", wiki ? std::vector<int>{bay_kind} : std::vector<int>{}},
+            {"notable", {wiki ? pier : bay_kind}},
+            {"all", {pier}}};
+        for (const auto& [tier, categories] : want) {
+            const std::vector<PoiRecord> pois = poi_records_in(files, "planet/poi/" + tier);
+            if (categories_of(pois) != categories) std::printf("    %s, wiki %d\n", tier.c_str(), int(wiki));
+            CHECK(categories_of(pois) == categories);
+            for (const PoiRecord& pr : pois) {
+                const int expected_tier = pr.category == pier ? (wiki ? 2 : 3) : (wiki ? 1 : 2);
+                CHECK_EQ(int(pr.tier), expected_tier);
+                CHECK_EQ(int(pr.flags), wiki ? int(POI_FLAG_WIKIDATA) : 0);
+                CHECK_EQ(pr.vertex_count, 5u);
+            }
+            // poi_meta.json lists the category the tier holds the way as.
+            const auto& meta = files.at("planet/poi/" + tier + "/poi_meta.json");
+            const std::string text(meta.begin(), meta.end());
+            for (const int category : categories) CHECK(text.find("\"" + std::to_string(category) + "\":") != std::string::npos);
+        }
+
+        gc::id_alloc::IdAllocator alloc;
+        REQUIRE(alloc.load_previous(out + "/planet/poi/all/poi_records.osm_ids"));
+        REQUIRE(alloc.slots().size() == 1);
+        CHECK_EQ(int(alloc.slots()[0].tier), wiki ? 1 : 2);
+    }
 }
 
 // A build logs, for each dir it writes with addresses and for each POI tier,

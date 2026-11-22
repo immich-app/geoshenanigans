@@ -1308,7 +1308,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                     // VertexEncoding tag, byte_offset into vertex stream).
                     // A tombstone keeps its bytes but only goes to the tiers
                     // that held its record, so a death never touches the
-                    // files that never carried it.
+                    // files that never carried it. A record goes as the tier
+                    // ships it: a water object of a category the tier
+                    // doesn't ship as its water kind (poi_record_in_tier).
                     const PoiTierSelection selection =
                         select_poi_tier(d.poi_records, d.poi_sidecar_blob, tier_var.max_tier);
                     const auto& selected = selection.indices;
@@ -1327,7 +1329,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                         [&](size_t total) { parallel_resize(filtered_vertex_bytes, total); },
                         [&](size_t k, size_t offset) -> size_t {
                             id_remap[selected[k]] = static_cast<uint32_t>(k);
-                            auto pr = d.poi_records[selected[k]];
+                            auto pr = poi_record_in_tier(d.poi_records[selected[k]], tier_var.max_tier);
                             size_t bytes = 0;
                             if (is_polygon(pr)) {
                                 bytes = pack_polygon_at(filtered_vertex_bytes.data() + offset,

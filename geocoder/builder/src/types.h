@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <stdexcept>
 #include <vector>
 #include <string>
@@ -661,6 +662,37 @@ static constexpr uint8_t POI_FLAG_WIKIDATA  = 0x02;
 // tourism=attraction, rank 30 in nominatim) — both land in our POI index
 // as PoiCategory::ATTRACTION.
 static constexpr uint8_t POI_FLAG_HIGHWAY   = 0x04;
+// While the build runs, a water object that takes its category from a
+// rank-30 tag (poi_classify.h classify_poi) carries its water kind in these
+// bits where the kind ships in a lower tier than the category: the dirs of
+// the tiers in between ship it as that kind (poi_record_in_tier), which
+// strips the bits, so no file holds them. 0 is none, else 1 + the kind's
+// index in kPoiWaterKinds.
+static constexpr uint8_t POI_FLAG_WATER_SHIFT = 3;
+static constexpr uint8_t POI_FLAG_WATER_MASK  = 0x7 << POI_FLAG_WATER_SHIFT;
+inline constexpr PoiCategory kPoiWaterKinds[] = {PoiCategory::NATURAL_WATER, PoiCategory::WETLAND, PoiCategory::BAY,
+                                                 PoiCategory::GLACIER, PoiCategory::RESERVOIR};
+
+// The tier of a POI of `cat`: its category's, one more important (lower)
+// with a wiki tag, but for tier 1.
+inline uint8_t poi_tier_of(PoiCategory cat, uint8_t flags) {
+    const uint8_t tier = poi_get_default_tier(cat);
+    return (flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) && tier > 1 ? tier - 1 : tier;
+}
+
+// The water kind `flags` carry, UNKNOWN for none.
+inline PoiCategory poi_water_of(uint8_t flags) {
+    const unsigned at = (flags & POI_FLAG_WATER_MASK) >> POI_FLAG_WATER_SHIFT;
+    return at == 0 || at > std::size(kPoiWaterKinds) ? PoiCategory::UNKNOWN : kPoiWaterKinds[at - 1];
+}
+
+// `flags` carrying the water kind `water`, one of kPoiWaterKinds.
+inline uint8_t poi_flags_with_water(uint8_t flags, PoiCategory water) {
+    for (size_t k = 0; k < std::size(kPoiWaterKinds); k++)
+        if (kPoiWaterKinds[k] == water)
+            return static_cast<uint8_t>((flags & ~POI_FLAG_WATER_MASK) | ((k + 1) << POI_FLAG_WATER_SHIFT));
+    throw std::logic_error("poi_flags_with_water: no water kind");
+}
 
 inline const char* poi_category_label(PoiCategory cat) {
     switch (cat) {
@@ -1047,6 +1079,30 @@ struct PoiRecord {
     // vertex_offset = NO_DATA; no header is written for them.
 };
 static_assert(sizeof(PoiRecord) == 36, "PoiRecord must be 36 bytes");
+
+// The lowest tier whose dir ships `pr`: its own, or its water kind's where
+// it carries one (POI_FLAG_WATER_MASK).
+inline uint8_t poi_lowest_tier(const PoiRecord& pr) {
+    const PoiCategory water = poi_water_of(pr.flags);
+    if (water == PoiCategory::UNKNOWN) return pr.tier;
+
+    const uint8_t tier = poi_tier_of(water, pr.flags);
+    return tier < pr.tier ? tier : pr.tier;
+}
+
+// `pr` as the dir of the POIs of tier <= max_tier writes it: as its water
+// kind, of that kind's tier, where the dir ships the kind but not its own
+// category, with its importance and the rest of it as they are; without the
+// water kind's bits in any dir.
+inline PoiRecord poi_record_in_tier(PoiRecord pr, uint8_t max_tier) {
+    const PoiCategory water = poi_water_of(pr.flags);
+    pr.flags &= static_cast<uint8_t>(~POI_FLAG_WATER_MASK);
+    if (water != PoiCategory::UNKNOWN && pr.tier > max_tier) {
+        pr.category = static_cast<uint8_t>(water);
+        pr.tier = poi_tier_of(water, pr.flags);
+    }
+    return pr;
+}
 
 // Collected POI relation data for parallel polygon assembly
 struct CollectedPoiRelation {

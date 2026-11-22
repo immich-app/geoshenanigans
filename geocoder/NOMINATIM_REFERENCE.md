@@ -197,7 +197,10 @@ lower rank or of no main tag (`boundary=*`, `landuse=*` on an area,
 them before the water kind. Both rules run before any category. A generic
 rank-30 feature ships only with a wiki tag, as every one does; without one, the
 object stays water, so its name stays in `places` and as the `landmark`, out
-of the primary slot. The way pass resolves a named `landuse=reservoir|basin`
+of the primary slot. Where its water kind ships in a lower POI tier than its
+category, the tiers between ship it as the water kind (`types.h`
+`poi_record_in_tier`): a bay (notable) that is a pier (all) is a `BAY` in
+`poi/notable` and a `PIER` in `poi/all`. The way pass resolves a named `landuse=reservoir|basin`
 way with a POI main tag though `emergency=*` and `shop=*` make no POI way
 alone (`way_tags.h` `has_poi_tags`). Values the import drops
 (`amenity=parking_space`, `emergency=fire_hydrant`, `tourism=yes`, ...) and

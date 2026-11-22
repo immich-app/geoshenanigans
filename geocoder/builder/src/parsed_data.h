@@ -35,12 +35,15 @@
 #include "ranked_bits.h"
 
 // The records one POI tier's files carry, in record order, and how many of
-// them are tombstones. A tombstone only goes to the tiers that held its
-// record (poi_shipped_tier). `slots` is the strategy-2 slot table, parallel
-// to `records`, or empty when strategy 2 did not run.
+// them are tombstones. A record goes to the tiers from its lowest on
+// (poi_lowest_tier), a tombstone only to the tiers that held its record
+// (poi_shipped_tier). `slots` is the strategy-2 slot table, parallel to
+// `records`, or empty when strategy 2 did not run. `max_tier` is the tier's,
+// which writes each record as poi_record_in_tier gives it.
 struct PoiTierSelection {
     std::vector<uint32_t> indices;
     size_t tombstones = 0;
+    uint8_t max_tier = POI_MAX_SHIPPED_TIER;
 };
 
 inline PoiTierSelection select_poi_tier(const std::vector<PoiRecord>& records,
@@ -51,8 +54,9 @@ inline PoiTierSelection select_poi_tier(const std::vector<PoiRecord>& records,
 
     auto slot_of = [&](size_t i) { return slots.empty() ? nullptr : &slots[i]; };
     PoiTierSelection out;
+    out.max_tier = max_tier;
     out.indices = parallel_filter(records.size(), [&](size_t i) {
-        return gc::id_alloc::poi_shipped_tier(records[i].tier, slot_of(i)) <= max_tier;
+        return gc::id_alloc::poi_shipped_tier(poi_lowest_tier(records[i]), slot_of(i)) <= max_tier;
     });
     out.tombstones = parallel_count(out.indices.size(), [&](size_t k) {
         const gc::id_alloc::SidecarSlot* slot = slot_of(out.indices[k]);
@@ -62,8 +66,9 @@ inline PoiTierSelection select_poi_tier(const std::vector<PoiRecord>& records,
 }
 
 // Categories a POI tier's poi_meta.json lists: those of the live records in
-// the tier's selection. A tombstone is memset to category 0 (MUSEUM), so
-// counting it would list museums in a tier that holds none.
+// the tier's selection, as the tier writes them (poi_record_in_tier). A
+// tombstone is memset to category 0 (MUSEUM), so counting it would list
+// museums in a tier that holds none.
 inline std::set<uint8_t> poi_meta_categories(const std::vector<PoiRecord>& records,
                                              const std::vector<gc::id_alloc::SidecarSlot>& slots,
                                              const PoiTierSelection& selection) {
@@ -74,7 +79,7 @@ inline std::set<uint8_t> poi_meta_categories(const std::vector<PoiRecord>& recor
             const uint32_t i = selection.indices[k];
             if (!slots.empty() && gc::id_alloc::is_tombstone(slots[i])) continue;
 
-            seen[b][records[i].category] = true;
+            seen[b][poi_record_in_tier(records[i], selection.max_tier).category] = true;
         }
     });
     std::set<uint8_t> cats;
@@ -824,7 +829,8 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
 
 // Lays the POI tier out in POI record order, so a reader walking the records
 // (the place search build) reads their names front to back instead of all
-// over the tier. A name's home is the lowest POI tier of a record using it;
+// over the tier. A name's home is the lowest POI tier of a record using it
+// (poi_lowest_tier);
 // the names of each home tier sit together, lowest tier first, each where the
 // first record of its home tier using it sits in the records' final order. So
 // the names of the POIs of tier <= t are the head of the tier
@@ -863,14 +869,15 @@ inline void order_poi_strings_by_record(ParsedData& data, unsigned threads = 0) 
         for (size_t i = b; i < e; i++) {
             const size_t s = name_of(records[i].name_id);
             if (s == RankedBits::npos) continue;
+            const uint8_t tier = poi_lowest_tier(records[i]);
             uint8_t seen = home[s].load(std::memory_order_relaxed);
-            while (records[i].tier < seen && !home[s].compare_exchange_weak(seen, records[i].tier, std::memory_order_relaxed)) {}
+            while (tier < seen && !home[s].compare_exchange_weak(seen, tier, std::memory_order_relaxed)) {}
         }
     }, threads);
     parallel_for(records.size(), [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) {
             const size_t s = name_of(records[i].name_id);
-            if (s == RankedBits::npos || records[i].tier != home[s].load(std::memory_order_relaxed)) continue;
+            if (s == RankedBits::npos || poi_lowest_tier(records[i]) != home[s].load(std::memory_order_relaxed)) continue;
             uint32_t seen = first[s].load(std::memory_order_relaxed);
             while (i < seen && !first[s].compare_exchange_weak(seen, static_cast<uint32_t>(i), std::memory_order_relaxed)) {}
         }

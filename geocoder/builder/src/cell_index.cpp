@@ -325,9 +325,11 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
         alloc.load_previous(prev_dir + "/poi/all/poi_records.osm_ids");
     }
 
+    // A slot remembers the lowest tier that ships its record, which a
+    // tombstone of it then reaches (select_poi_tier).
     const size_t n_old = data.poi_records.size();
     const std::vector<uint32_t> remap = alloc.allocate_all(n_old, [&](size_t i) {
-        return unpack_identity(data.poi_osm_ids[i], data.poi_records[i].tier);
+        return unpack_identity(data.poi_osm_ids[i], poi_lowest_tier(data.poi_records[i]));
     });
     const bool identity = is_identity(remap);
     const uint32_t n_new = alloc.total_slots();

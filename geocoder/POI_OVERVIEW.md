@@ -76,6 +76,10 @@ Users choose how much POI data they want:
 | **All** | 24.5M | 1.04 GiB | + every named POI: places of worship, peaks, memorials, artwork, libraries, gardens, springs |
 
 Tiers are cumulative — Notable includes all Major POIs, All includes everything.
+A water object that is a POI of a less important category than its water
+kind is that kind in the tiers between: a bay (notable) that is also a pier
+(all) is the bay in Notable and the pier in All, and a glacier (major) that
+is also an attraction (notable) the glacier in Major.
 
 ## Importance Scoring
 

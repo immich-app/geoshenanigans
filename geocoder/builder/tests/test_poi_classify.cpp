@@ -275,6 +275,52 @@ TEST(poi_classify_a_water_object_that_yields_makes_no_shop_of_shop_no) {
     }
 }
 
+TEST(poi_classify_a_water_object_that_yields_carries_its_kind_where_it_ships_in_a_lower_tier) {
+    // A bay (tier 2) that is a pier (tier 3), a glacier (tier 1) that is an
+    // attraction (tier 2), a lake of a wiki tag (tier 2) that is a generic
+    // rank-30 feature (tier 3): each carries its water kind, which the tiers
+    // between ship it as. Where the kind's tier is no lower, it carries none.
+    struct Case {
+        std::vector<std::pair<const char*, const char*>> tags;
+        bool wiki;
+        PoiCategory category;
+        int tier;
+        PoiCategory water;
+    };
+    const Case cases[] = {
+        {{{"natural", "bay"}, {"man_made", "pier"}}, false, PoiCategory::PIER, 3, PoiCategory::BAY},
+        {{{"natural", "bay"}, {"man_made", "pier"}}, true, PoiCategory::PIER, 2, PoiCategory::BAY},
+        {{{"natural", "glacier"}, {"tourism", "attraction"}}, false, PoiCategory::ATTRACTION, 2, PoiCategory::GLACIER},
+        {{{"natural", "water"}, {"emergency", "suction_point"}}, true, PoiCategory::GENERIC_RANK30, 3,
+         PoiCategory::NATURAL_WATER},
+        {{{"landuse", "reservoir"}, {"emergency", "suction_point"}}, true, PoiCategory::GENERIC_RANK30, 3,
+         PoiCategory::RESERVOIR},
+        {{{"natural", "water"}, {"amenity", "fountain"}}, false, PoiCategory::FOUNTAIN, 3, PoiCategory::UNKNOWN},
+        {{{"natural", "bay"}, {"tourism", "museum"}}, false, PoiCategory::MUSEUM, 2, PoiCategory::UNKNOWN},
+        {{{"natural", "glacier"}, {"aeroway", "aerodrome"}}, false, PoiCategory::AERODROME, 1, PoiCategory::UNKNOWN},
+        // Without a wiki tag a generic feature ships nowhere: the lake is
+        // water in every tier, and carries no kind.
+        {{{"natural", "water"}, {"emergency", "suction_point"}}, false, PoiCategory::NATURAL_WATER, 3,
+         PoiCategory::UNKNOWN},
+    };
+    for (const Case& c : cases)
+        for (const bool area : {true, false}) {
+            Tags t;
+            t.area = area;
+            for (const auto& [key, value] : c.tags) t = with(t, key, value);
+            if (c.wiki) t.wikipedia = "en:Lake";
+            const auto got = classify(t);
+            REQUIRE(got.has_value());
+            if (got->category != c.category || got->tier != c.tier || poi_water_of(got->flags) != c.water)
+                std::printf("    %s=%s and %s=%s, wiki %d\n", c.tags[0].first, c.tags[0].second, c.tags[1].first,
+                            c.tags[1].second, int(c.wiki));
+            CHECK_EQ(uint8_t(got->category), uint8_t(c.category));
+            CHECK_EQ(int(got->tier), c.tier);
+            CHECK_EQ(uint8_t(poi_water_of(got->flags)), uint8_t(c.water));
+            CHECK_EQ(int(got->flags & ~POI_FLAG_WATER_MASK), c.wiki ? int(POI_FLAG_WIKIPEDIA) : 0);
+        }
+}
+
 TEST(poi_classify_a_water_object_keeps_its_category_beside_a_tag_of_no_rank_30) {
     // Values Nominatim's import drops (presets.lua), tags that are no main tag
     // there (power, man_made=dam), and ones whose rank is below 30 as well

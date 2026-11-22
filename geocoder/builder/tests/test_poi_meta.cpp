@@ -153,6 +153,70 @@ TEST(poi_meta_categories_without_slot_table_counts_every_record) {
           std::set<uint8_t>({uint8_t(PoiCategory::HOTEL), uint8_t(PoiCategory::ZOO)}));
 }
 
+TEST(a_water_object_of_a_less_important_category_ships_as_its_water_kind_in_the_tiers_between) {
+    // A bay (tier 2) that is a pier (tier 3), and a glacier (tier 1) that is
+    // an attraction (tier 2), of the highway flag: each ships from its water
+    // kind's tier on, as that kind where its category doesn't ship, of no
+    // water bits anywhere.
+    PoiRecord pier = poi(PoiCategory::PIER, 3);
+    pier.flags = poi_flags_with_water(0, PoiCategory::BAY);
+    PoiRecord attraction = poi(PoiCategory::ATTRACTION, 2);
+    attraction.flags = poi_flags_with_water(POI_FLAG_HIGHWAY, PoiCategory::GLACIER);
+    const std::vector<PoiRecord> records = {pier, attraction, poi(PoiCategory::ZOO, 3)};
+    CHECK_EQ(int(poi_lowest_tier(pier)), 2);
+    CHECK_EQ(int(poi_lowest_tier(attraction)), 1);
+    CHECK_EQ(int(poi_lowest_tier(records[2])), 3);
+
+    const PoiTierSelection major = select_poi_tier(records, {}, MAJOR);
+    const PoiTierSelection notable = select_poi_tier(records, {}, NOTABLE);
+    const PoiTierSelection all = select_poi_tier(records, {}, ALL);
+    CHECK(major.indices == std::vector<uint32_t>({1}));
+    CHECK(notable.indices == std::vector<uint32_t>({0, 1}));
+    CHECK(all.indices == std::vector<uint32_t>({0, 1, 2}));
+    CHECK(poi_meta_categories(records, {}, major) == std::set<uint8_t>({uint8_t(PoiCategory::GLACIER)}));
+    CHECK(poi_meta_categories(records, {}, notable) ==
+          std::set<uint8_t>({uint8_t(PoiCategory::BAY), uint8_t(PoiCategory::ATTRACTION)}));
+    CHECK(poi_meta_categories(records, {}, all) ==
+          std::set<uint8_t>({uint8_t(PoiCategory::PIER), uint8_t(PoiCategory::ATTRACTION), uint8_t(PoiCategory::ZOO)}));
+
+    struct Want {
+        uint8_t max_tier;
+        PoiCategory category;
+        uint8_t tier;
+    };
+    for (const Want& w : {Want{NOTABLE, PoiCategory::BAY, 2}, Want{ALL, PoiCategory::PIER, 3}}) {
+        const PoiRecord written = poi_record_in_tier(pier, w.max_tier);
+        CHECK_EQ(int(written.category), int(w.category));
+        CHECK_EQ(int(written.tier), int(w.tier));
+        CHECK_EQ(int(written.flags), 0);
+    }
+    const PoiRecord glacier = poi_record_in_tier(attraction, MAJOR);
+    CHECK_EQ(int(glacier.category), int(PoiCategory::GLACIER));
+    CHECK_EQ(int(glacier.tier), 1);
+    CHECK_EQ(int(glacier.flags), int(POI_FLAG_HIGHWAY));
+    CHECK_EQ(int(poi_record_in_tier(attraction, NOTABLE).category), int(PoiCategory::ATTRACTION));
+    CHECK_EQ(int(poi_record_in_tier(attraction, NOTABLE).tier), 2);
+    CHECK_EQ(int(poi_record_in_tier(attraction, NOTABLE).flags), int(POI_FLAG_HIGHWAY));
+
+    // A tombstone of the pier reaches the tier its slot remembers, notable.
+    const std::vector<PoiRecord> dead = {PoiRecord{}};
+    const std::vector<SidecarSlot> slot = {tomb_slot(poi_lowest_tier(pier))};
+    CHECK(select_poi_tier(dead, slot, NOTABLE).indices == std::vector<uint32_t>({0}));
+    CHECK(select_poi_tier(dead, slot, MAJOR).indices.empty());
+}
+
+TEST(poi_flags_carry_each_water_kind_and_none) {
+    CHECK(poi_water_of(0) == PoiCategory::UNKNOWN);
+    CHECK(poi_water_of(POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA | POI_FLAG_HIGHWAY) == PoiCategory::UNKNOWN);
+    for (const PoiCategory kind : kPoiWaterKinds) {
+        const uint8_t flags = poi_flags_with_water(POI_FLAG_HIGHWAY, kind);
+        CHECK(poi_water_of(flags) == kind);
+        CHECK_EQ(int(flags & ~POI_FLAG_WATER_MASK), int(POI_FLAG_HIGHWAY));
+    }
+    CHECK_EQ(refusal_of<std::logic_error>([] { poi_flags_with_water(0, PoiCategory::PIER); }),
+             std::string("poi_flags_with_water: no water kind"));
+}
+
 TEST(select_poi_tier_and_categories_match_a_serial_walk_of_a_large_set) {
     // Past the blocks the selection splits its work into.
     std::vector<PoiRecord> records(300000);

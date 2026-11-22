@@ -133,8 +133,10 @@ inline PoiCategory poi_water_kind(const char* t_natural, const char* t_landuse) 
 // of a lower positive rank ranks it (has_lower_rank_main_tag): it takes no
 // water category, and is classified by its rank-30 tags, or as a generic
 // rank-30 feature where they have no category of their own. Where no POI dir
-// ships that, it stays water. An object a main tag of a lower positive rank
-// ranks is the water it is, whatever its other tags.
+// ships that, it stays water, and where its water kind ships in a lower tier
+// than its category, its flags carry the kind for the tiers in between
+// (POI_FLAG_WATER_MASK). An object a main tag of a lower positive rank ranks
+// is the water it is, whatever its other tags.
 inline std::optional<PoiClassification> classify_poi(
     const char* t_tourism, const char* t_historic, const char* t_boundary,
     const char* t_amenity, const char* t_leisure, const char* t_natural,
@@ -495,7 +497,6 @@ inline std::optional<PoiClassification> classify_poi(
 
     if (cat == PoiCategory::UNKNOWN) return std::optional<PoiClassification>{};
 
-    uint8_t tier = poi_get_default_tier(cat);
     uint8_t flags = 0;
     if (t_wikipedia) flags |= POI_FLAG_WIKIPEDIA;
     if (t_wikidata)  flags |= POI_FLAG_WIKIDATA;
@@ -512,13 +513,21 @@ inline std::optional<PoiClassification> classify_poi(
             std::strcmp(t_highway, "service") == 0)) {
         flags |= POI_FLAG_HIGHWAY;
     }
-    if ((flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) && tier > 1) tier--;
-    // A water object whose rank-30 tags give a category no POI dir ships (a
-    // generic rank-30 feature without a wiki tag) stays the water it is: its
-    // name stays in the POI tiers, and out of the primary slot.
-    if (tier > POI_MAX_SHIPPED_TIER && yielded != PoiCategory::UNKNOWN) {
-        cat = yielded;
-        tier = poi_get_default_tier(cat);
+    uint8_t tier = poi_tier_of(cat, flags);
+    // A water object that yields ships as the water it is in the tiers whose
+    // dirs ship its water kind but not its category: all of them where its
+    // rank-30 tags give a category no POI dir ships (a generic rank-30
+    // feature without a wiki tag), which keeps its name in the POI tiers and
+    // out of the primary slot, and those between the two tiers where its
+    // kind's is the lower (a bay, of tier 2, that is a pier, of tier 3).
+    if (yielded != PoiCategory::UNKNOWN) {
+        const uint8_t water_tier = poi_tier_of(yielded, flags);
+        if (tier > POI_MAX_SHIPPED_TIER) {
+            cat = yielded;
+            tier = water_tier;
+        } else if (water_tier < tier) {
+            flags = poi_flags_with_water(flags, yielded);
+        }
     }
     if (tier > POI_MAX_SHIPPED_TIER) return std::optional<PoiClassification>{};
 
