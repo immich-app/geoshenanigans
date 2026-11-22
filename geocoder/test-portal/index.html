@@ -232,14 +232,19 @@
   .detail-panel.visible { display: block; }
 
   /* The credit of the data the answers come from: each source of the planet's full dataset and
-     its POI tier (configurations.template.json "attribution"), its licence and its notices. */
+     its POI tier (configurations.template.json "attribution"), its licence and its notices. One
+     line until opened, then a bounded box of its own that scrolls, so the results keep their
+     room on a short screen. */
   .data-credit {
+    flex: 0 0 auto;
     padding: 8px 16px;
     border-top: 1px solid var(--border);
     font-size: 11px;
     line-height: 1.5;
     color: var(--text-dim);
   }
+  .data-credit summary { cursor: pointer; }
+  .data-credit .credit-notices { max-height: 30vh; overflow-y: auto; }
   .data-credit p { margin: 4px 0 0; }
   .data-credit a { color: var(--accent); }
 
@@ -365,6 +370,9 @@
     </div>
 
     <footer class="data-credit">
+      <details>
+      <summary>Data © OpenStreetMap contributors, GeoNames, Ordnance Survey, US Census Bureau, Wikidata</summary>
+      <div class="credit-notices">
       The answers come from the data of these sources.
       <p><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a>,
         <a href="https://opendatacommons.org/licenses/odbl/1-0/" target="_blank" rel="noopener">ODbL 1.0</a>.
@@ -386,6 +394,8 @@
       <p><a href="https://www.wikidata.org/" target="_blank" rel="noopener">Wikidata</a>,
         <a href="https://creativecommons.org/publicdomain/zero/1.0/" target="_blank" rel="noopener">CC0 1.0</a>.
         POI importance from the sitelink counts of the POIs' Wikidata items; Wikidata's structured data is available under CC0 1.0.</p>
+      </div>
+      </details>
     </footer>
   </div>
 </div>
