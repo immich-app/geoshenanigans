@@ -1082,3 +1082,33 @@ TEST(a_namesake_touching_a_marine_area_stays_and_one_crossing_it_with_no_vertex_
     const Layer layer = build(c);
     CHECK(ways_held(layer, {3001, 3002}).first == std::set<int64_t>({3001}));
 }
+
+TEST(a_namesake_cutting_a_marine_areas_corner_goes_and_one_meeting_it_along_a_side_or_at_a_point_stays) {
+    Collected c = with_marine();
+    // The North Sea, as above: its east side at east, a vertex each 0.005
+    // along it.
+    const int32_t lat = kLat - 20000000, east = kLng + 4000000;
+    // A strait of its name across its south-east corner, a band 0.0002 wide
+    // from south of it to east of it: neither holds a vertex of the other,
+    // and the parallel halfway up the latitudes the two share passes east
+    // of the sea, so only the strait's edges crossing the sea's east side
+    // show the water they share.
+    c.closed_ways.push_back({3003, tags(code::kNaturalStrait, "North Sea"),
+                             Ring{pt(lat - 30000, east - 40000), pt(lat + 40000, east + 30000), pt(lat + 38000, east + 30000),
+                                  pt(lat - 30000, east - 38000), pt(lat - 30000, east - 40000)}});
+    // Bays of its name east of it, holding no water with it: one along its
+    // east side over two of the sea's edges, one whose vertex lies on that
+    // side between two of the sea's, and one meeting a vertex of the sea at
+    // a vertex of its own.
+    c.closed_ways.push_back({3004, tags(code::kNaturalBay, "North Sea"),
+                             Ring{pt(lat + 1000000, east), pt(lat + 1000000, east + 100000), pt(lat + 1100000, east + 100000),
+                                  pt(lat + 1100000, east), pt(lat + 1000000, east)}});
+    c.closed_ways.push_back({3005, tags(code::kNaturalBay, "North Sea"),
+                             Ring{pt(lat + 1525000, east), pt(lat + 1500000, east + 100000), pt(lat + 1550000, east + 100000),
+                                  pt(lat + 1525000, east)}});
+    c.closed_ways.push_back({3006, tags(code::kNaturalBay, "North Sea"),
+                             Ring{pt(lat + 1800000, east), pt(lat + 1750000, east + 50000), pt(lat + 1800000, east + 100000),
+                                  pt(lat + 1850000, east + 50000), pt(lat + 1800000, east)}});
+    const Layer layer = build(c);
+    CHECK(ways_held(layer, {3003, 3004, 3005, 3006}).first == std::set<int64_t>({3004, 3005, 3006}));
+}
