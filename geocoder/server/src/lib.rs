@@ -33,6 +33,8 @@ pub mod postcode_files;
 pub mod side_blocks;
 pub mod strings;
 pub mod transport;
+mod water;
+pub use water::{WaterDetail, WaterKind, WaterLayer, WaterMeta, WATER_DIR, WATER_FILES};
 pub mod way_files;
 pub use addr_files::{AddrFiles, AddrRecord};
 pub use place_files::PlaceFiles;
@@ -981,6 +983,8 @@ pub struct Index {
     pub postcode_centroids: Option<PostcodeFiles>,
     pub admin_config: AdminLevelConfig,
     pub strings: StringPool,
+    /// The water layer of the dataset's water dir (water.rs); none without one.
+    pub water: Option<WaterLayer>,
     pub street_cell_level: u64,
     pub admin_cell_level: u64,
     pub max_distance_sq: f64,
@@ -1130,6 +1134,22 @@ fn with_footprint<R>(read: impl FnOnce(&mut Vec<NodeCoord>) -> R) -> R {
 // and the low 31 bits carry the polygon/POI index.
 pub const INTERIOR_FLAG: u32 = 0x80000000;
 pub const ID_MASK: u32 = 0x7FFFFFFF;
+
+/// Record `idx` of the admin_polygons.bin `polygons`, a tombstone's too, beside an
+/// admin_rings.bin of `rings_len` bytes; None past the end.
+pub(crate) fn polygon_record(polygons: &FileBytes, rings_len: u64, idx: u32) -> Option<AdminPolygon> {
+    let at = u64::from(idx) * ADMIN_POLYGON_RECORD_BYTES;
+    if at + ADMIN_POLYGON_RECORD_BYTES > polygons.len() { return None; }
+    // The record and the next one's ring offset, where its block ends.
+    let last = at + 2 * ADMIN_POLYGON_RECORD_BYTES > polygons.len();
+    let bytes = polygons.read_chunk(at, if last { 16 } else { 20 });
+    let ring_end = if last {
+        rings_len
+    } else {
+        u64::from(u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]))
+    };
+    Some(AdminPolygon::from_record(&bytes, ring_end))
+}
 
 pub fn mmap_file(path: &str) -> Result<FileBytes, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path, e))?;
@@ -1318,6 +1338,7 @@ impl Index {
             postcode_centroids,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::load(dir)?,
+            water: WaterLayer::open(&format!("{dir}/{WATER_DIR}"), admin_cell_level)?,
             street_cell_level,
             admin_cell_level,
             max_distance_sq,
@@ -1385,17 +1406,7 @@ impl Index {
 
     /// Record `idx` of admin_polygons.bin, a tombstone's too; None past the end.
     pub fn admin_polygon_record(&self, idx: u32) -> Option<AdminPolygon> {
-        let (m, at) = (&self.admin_polygons, u64::from(idx) * ADMIN_POLYGON_RECORD_BYTES);
-        if at + ADMIN_POLYGON_RECORD_BYTES > m.len() { return None; }
-        // The record and the next one's ring offset, where its block ends.
-        let last = at + 2 * ADMIN_POLYGON_RECORD_BYTES > m.len();
-        let bytes = m.read_chunk(at, if last { 16 } else { 20 });
-        let ring_end = if last {
-            self.admin_geometry.rings_len()
-        } else {
-            u64::from(u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]))
-        };
-        Some(AdminPolygon::from_record(&bytes, ring_end))
+        polygon_record(&self.admin_polygons, self.admin_geometry.rings_len(), idx)
     }
 
     pub fn admin_polygon(&self, idx: u32) -> Option<AdminPolygon> {
@@ -2958,6 +2969,9 @@ impl Index {
             return Address::default();
         }
         let max_dist = self.max_distance_sq;
+        // The water holding the point, which nothing else in the answer depends on: a point no
+        // address anchors (open sea) keeps it.
+        let water = self.water.as_ref().and_then(|w| w.at(lat, lng));
 
         // Run geo lookups first so we know the primary street
         let (addr, interp, street) = self.query_geo(lat, lng);
@@ -3281,7 +3295,7 @@ impl Index {
         let anchored = road.is_some() || admin.country.is_some() || admin.city.is_some() || admin.state.is_some();
         let place_nodes_only = admin.is_empty() && !place.is_empty();
         if !anchored && !place_nodes_only {
-            return Address::default();
+            return Address { water, ..Address::default() };
         }
 
         let (landmark_name, places) = self.collect_landmark_and_places(lat, lng);
@@ -3394,7 +3408,7 @@ impl Index {
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
         };
         let display_name = format_address(&address);
-        Address { display_name, address, places }
+        Address { display_name, address, places, water }
     }
 }
 
@@ -3779,25 +3793,34 @@ impl MultiIndex {
 
     /// Reverse-geocode dispatch. Picks the best result among matching
     /// loaded continents — "best" = the one whose Address chain has the
-    /// most populated fields (deeper admin chain wins). On the typical
-    /// non-boundary case there's only one match and this is just a
-    /// pass-through.
+    /// most populated fields (deeper admin chain wins), the first of
+    /// those that tie. On the typical non-boundary case there's only one
+    /// match and this is just a pass-through.
     ///
-    /// Returns (Vec<Arc<Index>>, JSON-serialized response). The Arcs
-    /// are returned alongside so the caller can keep them alive while
-    /// the borrowed-string Address gets serialized — borrowing across
-    /// an Arc deref is sound only while the Arc is held.
+    /// The water doesn't count towards the pick, so it never moves an
+    /// address to another continent. Where the picked answer has none, it
+    /// takes the water of the first other matching continent that has
+    /// some: a continent's water dirs hold only the water its region
+    /// takes in.
+    ///
+    /// The answers borrow their strings from the continents' indexes,
+    /// whose Arcs are held here until the chosen one is serialized.
     pub fn query_json(&self, lat: f64, lng: f64) -> String {
         let arcs = self.loaded_matches(lat, lng);
-        let mut best_json: Option<(i32, String)> = None;
-        for arc in &arcs {
-            let r = arc.query(lat, lng);
-            let s = address_score(&r);
-            if best_json.as_ref().map_or(true, |(prev, _)| s > *prev) {
-                best_json = Some((s, serde_json::to_string(&r).unwrap_or_default()));
+        let mut answers: Vec<Address<'_>> = arcs.iter().map(|arc| arc.query(lat, lng)).collect();
+        let mut best: Option<(i32, usize)> = None;
+        for (i, r) in answers.iter().enumerate() {
+            let s = address_score(r);
+            if best.map_or(true, |(prev, _)| s > prev) {
+                best = Some((s, i));
             }
         }
-        best_json.map(|(_, j)| j).unwrap_or_else(|| "{}".to_string())
+        let Some((_, chosen)) = best else { return "{}".to_string() };
+        let mut answer = answers.remove(chosen);
+        if answer.water.is_none() {
+            answer.water = answers.into_iter().find_map(|r| r.water);
+        }
+        serde_json::to_string(&answer).unwrap_or_default()
     }
 }
 
@@ -3995,6 +4018,7 @@ mod query_tests {
             postcode_centroids: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, end, end, end, end, end]),
+            water: None,
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
             admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
             max_distance_sq: (DEFAULT_SEARCH_DISTANCE / 6_371_000.0).powi(2),
@@ -4058,6 +4082,95 @@ mod query_tests {
 
         assert_eq!(village(elsewhere), None);
         assert_eq!(village(AdminPolygon { ring_bytes: 0, ..elsewhere }).as_deref(), Some("Shoals Village"));
+    }
+
+    // The water field is an extension of the answer: last, and absent where no water holds the
+    // point, so that the answer there is the one of a dataset without water, byte for byte; where
+    // water holds it, the rest of the answer is still that one.
+    #[test]
+    fn water_comes_last_and_changes_no_other_field() {
+        use crate::water::fixture::{WaterFixture, LAKE};
+        // A state (the fixture's boundaries have no country code), listed in the cell of its
+        // centre, where the point is.
+        let (testland, (lat, lng)) = (("Testland", 4, [0.0, 0.0, 2.0, 2.0]), (1.0, 1.0));
+        let with = |water: Option<WaterLayer>| {
+            let mut idx = index(&[testland], &[]);
+            idx.water = water;
+            serde_json::to_string(&idx.query(lat, lng)).unwrap()
+        };
+        let lake = |span| Some(WaterFixture::new().area("Testsee", LAKE, span, &[]).layer());
+
+        let dry = with(None);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&dry).unwrap()["address"], serde_json::json!({"state": "Testland"}));
+        assert_eq!(with(lake((0.5, 0.5, 0.9, 0.9))), dry);
+        let wet = format!("{},\"water\":{{\"name\":\"Testsee\",\"class\":\"water\",\"type\":\"lake\"}}}}", dry.strip_suffix('}').unwrap());
+        assert_eq!(with(lake((0.9, 0.9, 1.1, 1.1))), wet);
+    }
+
+    // A point no boundary, street or place node anchors (open sea) has an empty address, and
+    // keeps its water; off the globe there is none.
+    #[test]
+    fn an_open_sea_point_keeps_its_water() {
+        use crate::water::fixture::{WaterFixture, SEA};
+        let mut idx = index(&[SHOALS], &[]);
+        idx.water = Some(WaterFixture::new().area("South China Sea", SEA, (4.0, 111.0, 6.0, 114.0), &[]).layer());
+
+        let sea = serde_json::json!({"address": {}, "water": {"name": "South China Sea", "class": "place", "type": "sea"}});
+        assert_eq!(answer(&idx, 5.5, 113.5), sea);
+        assert_eq!(answer(&idx, 5.05, 112.65), sea);
+        assert_eq!(answer(&idx, 7.0, 113.5), serde_json::json!({"address": {}}));
+        assert_eq!(answer(&idx, 5.5, 473.5), serde_json::json!({"address": {}}));
+    }
+
+    /// A dispatcher over the continents named (of continents()), each with the index given, in
+    /// the order given.
+    fn multi(slots: Vec<(&'static str, Index)>) -> MultiIndex {
+        let continents = slots.into_iter()
+            .map(|(name, index)| ContinentSlot {
+                name,
+                continent: continents().iter().find(|c| c.name == name),
+                index: arc_swap::ArcSwapOption::from(Some(Arc::new(index))),
+            })
+            .collect();
+        MultiIndex {
+            continents, root_dir: String::new(),
+            street_cell_level: DEFAULT_STREET_CELL_LEVEL, admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL, search_distance: DEFAULT_SEARCH_DISTANCE,
+        }
+    }
+
+    // Where continents overlap (the Sinai: africa and asia), the answer is the continent's with the
+    // fuller address, as without water, the first of those that tie; where its continent's water
+    // dir has no water at the point, the water is that of the first other continent with some.
+    #[test]
+    fn the_answers_continent_takes_another_continents_water_where_its_own_has_none() {
+        use crate::water::fixture::{WaterFixture, BAY, SEA};
+        // South Sinai, a state, is listed in the cell of its centre, where the point is.
+        let (lat, lng) = (28.5, 33.6);
+        let egypt = ("South Sinai", 4, [27.5, 32.6, 29.5, 34.6]);
+        let water = |name: &str, code: u16| Some(WaterFixture::new().area(name, code, (28.0, 33.0, 29.0, 34.0), &[]).layer());
+        let with = |mut idx: Index, w: Option<WaterLayer>| {
+            idx.water = w;
+            idx
+        };
+        let json = |slots: Vec<(&'static str, Index)>| serde_json::from_str::<serde_json::Value>(&multi(slots).query_json(lat, lng)).unwrap();
+        let named = |name: &str, class: &str, r#type: &str| serde_json::json!({"name": name, "class": class, "type": r#type});
+
+        // Africa's answer, Asia's water, whichever comes first.
+        let mut want = serde_json::to_value(index(&[egypt], &[]).query(lat, lng)).unwrap();
+        assert_eq!(want["address"], serde_json::json!({"state": "South Sinai"}));
+        want["water"] = named("Gulf of Suez", "natural", "bay");
+        for africa_first in [true, false] {
+            let (africa, asia) = (("africa", index(&[egypt], &[])), ("asia", with(index(&[], &[]), water("Gulf of Suez", BAY))));
+            assert_eq!(json(if africa_first { vec![africa, asia] } else { vec![asia, africa] }), want);
+        }
+        // Its own water where it has some.
+        let got = json(vec![("asia", with(index(&[], &[]), water("Gulf of Suez", BAY))), ("africa", with(index(&[egypt], &[]), water("Red Sea", SEA)))]);
+        assert_eq!(got["water"], named("Red Sea", "place", "sea"));
+        // Water counts for nothing in the pick: of two empty addresses the first answers, with
+        // the water of the second.
+        let got = json(vec![("africa", index(&[], &[])), ("asia", with(index(&[], &[]), water("Gulf of Suez", BAY)))]);
+        assert_eq!(got, serde_json::json!({"address": {}, "water": named("Gulf of Suez", "natural", "bay")}));
+        assert_eq!(json(vec![("africa", index(&[], &[])), ("asia", index(&[], &[]))]), serde_json::json!({"address": {}}));
     }
 
     /// (metres north of `origin()`, metres east, name or None for a tombstone, category,
@@ -5343,6 +5456,12 @@ pub struct Address<'a> {
     pub address: AddressDetails<'a>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub places: Vec<PoiDetail>,
+    /// The body of water holding the point, from the dataset's water dir (water.rs): an
+    /// extension of Nominatim's answer, which no other field depends on. Last, and absent where
+    /// no water holds the point, so an answer without water is the answer of a dataset without
+    /// a water dir.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub water: Option<WaterDetail<'a>>,
 }
 
 // Address formatting patterns by country code
@@ -7071,6 +7190,62 @@ mod query_path_tests {
 
         assert_eq!(address_at(&index, 1_000.0, 1_100.0)["village"], "Oldtown");
         assert_eq!(address_at(&index, -20_000.0, 100.0)["hamlet"], "Lowfield");
+    }
+
+    /// A lake 1 to 3 km north and east of `origin`, with an island 1.8 to 2.2 km north and east.
+    fn lake_near(origin: (f64, f64)) -> crate::water::fixture::WaterFixture {
+        let span = |s: f64, w: f64, n: f64, e: f64| {
+            let (sw, ne) = (at_from(origin, s, w), at_from(origin, n, e));
+            (sw.lat as f64, sw.lng as f64, ne.lat as f64, ne.lng as f64)
+        };
+        let mut water = crate::water::fixture::WaterFixture::new();
+        water.area("Testsee", crate::water::fixture::LAKE, span(1_000.0, 1_000.0, 3_000.0, 3_000.0), &[span(1_800.0, 1_800.0, 2_200.0, 2_200.0)]);
+        water
+    }
+
+    // A dataset dir's water/ holds its water layer: all of its files, or none of them (a dataset
+    // without water, the dir there or not); some without the rest fail the load, naming them.
+    #[test]
+    fn a_dataset_loads_the_water_layer_of_its_water_dir() {
+        let dir = ScratchDir::new();
+        oldtown().write(dir.path());
+        let water = |idx: &Index, north: f64, east: f64| {
+            let p = at(north, east);
+            serde_json::to_value(idx.query(p.lat as f64, p.lng as f64)).unwrap()["water"].clone()
+        };
+        let load = || Index::load(dir.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE);
+
+        assert!(load().unwrap().water.is_none());
+        std::fs::create_dir(dir.path().join(WATER_DIR)).unwrap();
+        assert!(load().unwrap().water.is_none());
+        lake_near(ORIGIN).write(&dir.path().join(WATER_DIR));
+        let idx = load().unwrap();
+        assert_eq!(water(&idx, 1_500.0, 1_500.0), serde_json::json!({"name": "Testsee", "class": "water", "type": "lake"}));
+        assert_eq!((water(&idx, 2_000.0, 2_000.0), water(&idx, 500.0, 500.0)), (serde_json::Value::Null, serde_json::Value::Null));
+        assert_eq!(address_at(&idx, 1_500.0, 1_500.0), address_at(&oldtown().load(), 1_500.0, 1_500.0));
+        std::fs::remove_file(dir.path().join(WATER_DIR).join("admin_rings.bin")).unwrap();
+        assert_eq!(load().err(), Some(format!("Partial water dir {}/{WATER_DIR}: missing [admin_rings.bin]", dir.path().display())));
+    }
+
+    // A continent dir's water/ loads with it, when a server starts and when a download is in.
+    #[test]
+    fn a_continent_loads_the_water_layer_of_its_water_dir() {
+        let paris = (48.85, 2.35);
+        let root = ScratchDir::new();
+        let europe = root.path().join("europe");
+        std::fs::create_dir(&europe).unwrap();
+        TestIndex::around(paris).write(&europe);
+        lake_near(paris).write(&europe.join(WATER_DIR));
+        let p = at_from(paris, 1_500.0, 1_500.0);
+        let water = |mi: &MultiIndex| serde_json::from_str::<serde_json::Value>(&mi.query_json(p.lat as f64, p.lng as f64)).unwrap()["water"]["name"].clone();
+        let load = || MultiIndex::load(root.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+
+        assert_eq!(water(&load()), "Testsee");
+        let late = load();
+        late.continents.iter().for_each(|c| c.index.store(None));
+        assert_eq!(late.loaded_count(), 0);
+        late.install_region("europe").unwrap();
+        assert_eq!(water(&late), "Testsee");
     }
 
     #[test]
@@ -9405,6 +9580,7 @@ mod admin_scan_tests {
             postcode_centroids: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, len, len, len, len, len]),
+            water: None,
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
             admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
             max_distance_sq: 1.0,
