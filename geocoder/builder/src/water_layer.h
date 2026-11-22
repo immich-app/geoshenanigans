@@ -226,6 +226,9 @@ void split_polygons(Build& b, unsigned threads);
 // The layer's type table: the water=* values outside the fixed table among
 // the objects, against the previous build's kinds (the planet's
 // water/all/exact/water_meta.json under prev_planet_dir; none when empty).
+// A previous build that wrote water dirs (their polygon sidecar there) whose
+// water_meta.json can't be read, or is none the builder writes, stops the
+// build (std::runtime_error), as the codes its records carry would move.
 std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_planet_dir);
 
 // The major tier of the planet (water_classify.h): each object by its own

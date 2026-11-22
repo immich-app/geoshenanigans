@@ -488,7 +488,9 @@ What keeps a day's patch small:
   relation, the outer ring's place and the piece's cut.
 - **Type codes** of `water=*` values outside the fixed table
   (`src/water_types.h`) are allocated against the previous build's
-  `water_meta.json`, so a new rare value never renumbers another.
+  `water_meta.json`, so a new rare value never renumbers another. A build on
+  top of one that wrote water dirs stops when that file can't be read or is
+  none the builder writes.
 
 The simplified tier's crossing repair counts only crossings between rings of
 one polygon (`ArcTier::crossings_within_polygons`): water areas overlap

@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -63,11 +64,13 @@ std::string object_ref(const Object& o) {
     return kind + std::to_string(o.id);
 }
 
-std::string read_text(const std::string& path) {
+// The bytes of the file at `path`; none for one it can't read.
+std::optional<std::string> read_text(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) return "";
+    if (!f) return std::nullopt;
     std::ostringstream s;
     s << f.rdbuf();
+    if (f.bad()) return std::nullopt;
     return s.str();
 }
 
@@ -685,8 +688,21 @@ std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_pl
     for (const Object& o : b.objects)
         if (!o.tags.verbatim.empty()) values.insert(o.tags.verbatim);
     std::vector<MetaType> previous;
-    if (!prev_planet_dir.empty())
-        previous = parse_meta_json(read_text(prev_planet_dir + "/" + kWaterArcTiers[1].dir + "/water_meta.json"));
+    const std::string dir = prev_planet_dir.empty() ? "" : prev_planet_dir + "/" + kWaterArcTiers[1].dir;
+    // A previous build that wrote water dirs (its polygon sidecar there) has
+    // the codes its records carry in its water_meta.json.
+    if (!dir.empty() && std::ifstream(dir + "/admin_polygons.osm_ids").good()) {
+        const std::string path = dir + "/water_meta.json";
+        const std::optional<std::string> text = read_text(path);
+        if (!text)
+            throw std::runtime_error(path + " can't be read, though its build wrote water dirs: the water=* values' "
+                                            "codes would move");
+        const std::optional<std::vector<MetaType>> kinds = parse_meta_json(*text);
+        if (!kinds)
+            throw std::runtime_error(path + " is no water_meta.json the builder writes: the water=* values' codes "
+                                            "would move");
+        previous = *kinds;
+    }
     auto table = std::make_shared<TypeTable>();
     table->assign(values, previous);
     return table;

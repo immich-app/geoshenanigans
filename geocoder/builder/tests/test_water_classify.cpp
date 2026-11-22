@@ -3,6 +3,7 @@
 // fixed table, water_meta.json, and the major tier's rule.
 #include "water_classify.h"
 
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -90,8 +91,9 @@ TEST(a_verbatim_type_keeps_the_code_the_previous_build_gave_it_and_a_new_one_tak
     const uint16_t ganga = first.verbatim_code("ganga_river"), salt = first.verbatim_code("salt_lake");
     CHECK(ganga >= kVerbatimBase && salt >= kVerbatimBase && ganga != salt);
     CHECK_EQ(ganga, uint16_t(kVerbatimBase | (value_hash("ganga_river") & 0x7FFF)));
-    const std::vector<MetaType> meta = parse_meta_json(meta_json(first, {code::kLake, ganga, salt}));
-    REQUIRE(meta.size() == 3u);
+    const std::optional<std::vector<MetaType>> parsed = parse_meta_json(meta_json(first, {code::kLake, ganga, salt}));
+    REQUIRE(parsed.has_value() && parsed->size() == 3u);
+    const std::vector<MetaType>& meta = *parsed;
     CHECK(meta[0].code == code::kLake && meta[0].cls == "water" && meta[0].type == "lake" && meta[0].rank == 20);
 
     // The next build: the previous kinds keep their codes even where a new
@@ -116,12 +118,12 @@ TEST(water_meta_json_round_trips_quotes_and_controls_and_refuses_what_it_did_not
     TypeTable table;
     table.assign({"a \"quoted\" \\ value\x01"}, {});
     const uint16_t c = table.verbatim_code("a \"quoted\" \\ value\x01");
-    const std::vector<MetaType> back = parse_meta_json(meta_json(table, {c}));
-    REQUIRE(back.size() == 1u);
-    CHECK(back[0].type == "a \"quoted\" \\ value\x01");
-    CHECK(parse_meta_json(meta_json(table, {})).empty());
-    CHECK(parse_meta_json("").empty());
-    CHECK(parse_meta_json("{\"types\": [{\"code\": 2}]}").empty());
+    const std::optional<std::vector<MetaType>> back = parse_meta_json(meta_json(table, {c}));
+    REQUIRE(back.has_value() && back->size() == 1u);
+    CHECK((*back)[0].type == "a \"quoted\" \\ value\x01");
+    CHECK(parse_meta_json(meta_json(table, {}))->empty());
+    CHECK(!parse_meta_json("").has_value());
+    CHECK(!parse_meta_json("{\"types\": [{\"code\": 2}]}").has_value());
 }
 
 TEST(the_major_tier_takes_100_km2_and_wikidata_rivers_of_5_and_keeps_its_own_at_90_percent) {
@@ -149,4 +151,23 @@ TEST(a_riverbank_tagged_natural_water_too_is_a_river_area) {
     }
     CHECK(kind_of(of("water", "lake", "riverbank"), table) == "water/lake 20");
     CHECK(!of("water", "stream", "riverbank").any());
+}
+
+TEST(water_meta_json_cut_short_or_with_more_after_it_is_no_table_and_one_of_no_kinds_is_one) {
+    TypeTable table;
+    table.assign({"salt_pond"}, {});
+    const std::string whole = meta_json(table, {code::kLake, table.verbatim_code("salt_pond")});
+    REQUIRE(parse_meta_json(whole).has_value());
+    CHECK_EQ(parse_meta_json(whole)->size(), size_t(2));
+    CHECK(parse_meta_json(whole.substr(0, whole.size() - 1)).has_value());
+    for (size_t n : {size_t(0), size_t(1), whole.size() / 2, whole.find(']'), whole.size() - 2})
+        CHECK(!parse_meta_json(whole.substr(0, n)).has_value());
+    CHECK(!parse_meta_json(whole + "{}").has_value());
+    CHECK(!parse_meta_json("{\"types\": [{\"code\": 2}]}").has_value());
+    CHECK(!parse_meta_json("{\"types\": [{\"code\": 32769, \"class\": \"water\", \"type\": \"a\\uzz00\", \"rank\": 22}]}")
+               .has_value());
+    // A table of no kinds is a table.
+    const std::optional<std::vector<MetaType>> none = parse_meta_json(meta_json(table, {}));
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
 }

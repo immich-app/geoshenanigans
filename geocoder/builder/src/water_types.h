@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -203,9 +204,10 @@ inline std::string meta_json(const TypeTable& table, const std::set<uint16_t>& c
     return out;
 }
 
-// The kinds of a water_meta.json meta_json wrote; nothing from text it
-// didn't (a missing file reads as empty text).
-inline std::vector<MetaType> parse_meta_json(const std::string& text) {
+// The kinds of a water_meta.json meta_json wrote, with nothing but white
+// space after it; none (nullopt) for any other text, one cut short, and the
+// empty text of a missing file, among them.
+inline std::optional<std::vector<MetaType>> parse_meta_json(const std::string& text) {
     std::vector<MetaType> out;
     size_t at = 0;
     auto skip_space = [&] {
@@ -237,7 +239,15 @@ inline std::vector<MetaType> parse_meta_json(const std::string& text) {
                 const char e = text[at + 1];
                 if (e == 'u') {
                     if (at + 6 > text.size()) return false;
-                    v += static_cast<char>(std::stoi(text.substr(at + 2, 4), nullptr, 16));
+                    int c = 0;
+                    for (size_t k = at + 2; k < at + 6; k++) {
+                        const char h = text[k];
+                        const int d = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : -1;
+                        if (d < 0) return false;
+                        c = c * 16 + d;
+                    }
+                    if (c >= 0x20) return false;
+                    v += static_cast<char>(c);
                     at += 6;
                     continue;
                 }
@@ -251,9 +261,14 @@ inline std::vector<MetaType> parse_meta_json(const std::string& text) {
         at++;
         return true;
     };
-    if (!expect("{") || !expect("\"types\"") || !expect(":") || !expect("[")) return {};
+    auto end = [&] {
+        if (!expect("}")) return false;
+        skip_space();
+        return at == text.size();
+    };
+    if (!expect("{") || !expect("\"types\"") || !expect(":") || !expect("[")) return std::nullopt;
     skip_space();
-    if (expect("]")) return out;
+    if (expect("]")) return end() ? std::optional<std::vector<MetaType>>(out) : std::nullopt;
     while (true) {
         MetaType m;
         long code = 0, rank = 0;
@@ -261,15 +276,16 @@ inline std::vector<MetaType> parse_meta_json(const std::string& text) {
             !expect("\"class\"") || !expect(":") || !string(m.cls) || !expect(",") || !expect("\"type\"") ||
             !expect(":") || !string(m.type) || !expect(",") || !expect("\"rank\"") || !expect(":") || !number(rank) ||
             !expect("}"))
-            return {};
-        if (code <= 0 || code > 0xFFFF || rank > 255) return {};
+            return std::nullopt;
+        if (code <= 0 || code > 0xFFFF || rank > 255) return std::nullopt;
         m.code = static_cast<uint16_t>(code);
         m.rank = static_cast<uint8_t>(rank);
         out.push_back(m);
         if (expect(",")) continue;
         if (expect("]")) break;
-        return {};
+        return std::nullopt;
     }
+    if (!end()) return std::nullopt;
     return out;
 }
 

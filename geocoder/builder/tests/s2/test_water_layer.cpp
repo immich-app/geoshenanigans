@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -318,8 +319,9 @@ TEST(the_water_dirs_hold_every_file_and_keep_each_polygons_slot_the_next_day) {
     CHECK(files.at("water/all/exact/admin_polygons.bin").size() == 4 * sizeof(AdminPolygonRecord));
     CHECK(files.at("water/major/simplified/admin_polygons.bin").empty());
     const std::vector<char>& meta = files.at("water/all/exact/water_meta.json");
-    const std::vector<MetaType> kinds = parse_meta_json(std::string(meta.begin(), meta.end()));
-    REQUIRE(kinds.size() == 4u);
+    const std::optional<std::vector<MetaType>> parsed = parse_meta_json(std::string(meta.begin(), meta.end()));
+    REQUIRE(parsed.has_value() && parsed->size() == 4u);
+    const std::vector<MetaType>& kinds = *parsed;
     CHECK(kinds[0].cls == "water" && kinds[0].type == "lake" && kinds[0].rank == 20);
     CHECK(kinds[3].cls == "water" && kinds[3].type == "ganga_river" && kinds[3].code >= kVerbatimBase);
 
@@ -791,4 +793,73 @@ TEST(an_unnamed_riverbank_tagged_natural_water_too_takes_its_waterways_name) {
             CHECK_EQ(layer.records[p].country_code, code::kRiver);
         }
     CHECK(names == std::vector<std::string>({"Aare"}));
+}
+
+namespace {
+
+// Two water=* values whose hashes give one code, the smaller first.
+std::pair<std::string, std::string> colliding_values() {
+    std::map<uint16_t, std::string> seen;
+    for (int k = 0;; k++) {
+        const std::string v = "kind" + std::to_string(k);
+        auto [it, fresh] = seen.emplace(static_cast<uint16_t>(value_hash(v) & 0x7FFF), v);
+        if (!fresh) return {std::min(it->second, v), std::max(it->second, v)};
+    }
+}
+
+// The fixture with a pond of each of `values`, water=* values of their own.
+Collected with_kinds(const std::vector<std::string>& values) {
+    Collected c = fixture();
+    int64_t way = 3100;
+    for (const std::string& v : values) {
+        ObjectTags t = tags(0, "Pond " + v);
+        t.verbatim = v;
+        c.closed_ways.push_back({way, t, square(kLat + 1000000 + int32_t(way - 3100) * 10000, kLng, 1000)});
+        way++;
+    }
+    return c;
+}
+
+// Why the layer's build over the previous build at `prev` stops, empty for
+// a build that doesn't.
+std::string refusal(Collected c, const std::string& prev) {
+    std::ostringstream log;
+    std::streambuf* was = std::cerr.rdbuf(log.rdbuf());
+    const std::string why = gctest::refusal_of<std::runtime_error>([&] {
+        build_layer(c, prev, [](uint32_t) { return 0u; }, 2);
+    });
+    std::cerr.rdbuf(was);
+    return why;
+}
+
+}  // namespace
+
+TEST(a_previous_water_build_whose_water_meta_json_is_gone_or_cut_short_stops_the_build) {
+    // Two values of one hash code: the larger came first and took it, the
+    // smaller the next free one; started afresh they would swap.
+    const auto [small, large] = colliding_values();
+    const uint16_t hashed = static_cast<uint16_t>(kVerbatimBase | (value_hash(small) & 0x7FFF));
+    const ScratchDir root("water-kinds");
+    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    write(build(with_kinds({large})), one);
+    const Layer day2 = build(with_kinds({large, small}), one);
+    CHECK_EQ(day2.types->verbatim_code(large), hashed);
+    CHECK_EQ(day2.types->verbatim_code(small), uint16_t(hashed + 1));
+    write(day2, two, one);
+    CHECK_EQ(build(with_kinds({large, small}), two).types->verbatim_code(small), uint16_t(hashed + 1));
+    CHECK_EQ(build(with_kinds({large, small})).types->verbatim_code(small), hashed);
+
+    // Its water_meta.json cut short, or gone.
+    const std::string meta = two + "/water/all/exact/water_meta.json";
+    const std::vector<char> bytes = bytes_of(meta);
+    std::ofstream(meta, std::ios::binary | std::ios::trunc).write(bytes.data(), std::streamsize(bytes.size() / 2));
+    CHECK(refusal(with_kinds({large, small}), two).find("water_meta.json") != std::string::npos);
+    fs::remove(meta);
+    CHECK(refusal(with_kinds({large, small}), two).find("water_meta.json") != std::string::npos);
+    // One of no kinds is sound, and a previous build without water dirs
+    // starts the codes afresh.
+    std::ofstream(meta, std::ios::binary | std::ios::trunc) << "{\"types\": [\n\n]}\n";
+    CHECK(refusal(with_kinds({large, small}), two).empty());
+    fs::remove_all(two + "/water");
+    CHECK(refusal(with_kinds({large, small}), two).empty());
 }
