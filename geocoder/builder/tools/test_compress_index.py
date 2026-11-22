@@ -376,6 +376,48 @@ class CompressIndexTest(unittest.TestCase):
             sent = f.read().splitlines()
         self.assertEqual(sorted(sent), sorted(f"cp {self.path(rel)} s3://bucket/day/{rel}" for rel in sent_rel))
 
+    # An upload command that ends before it has read its commands (with --upload-after: before the file exists)
+    # fails the uploads alone: the run still ends well, with its warning, for the caller to send what is missing.
+    def test_an_upload_command_that_ends_first_only_warns(self):
+        after = os.path.join(self.tmp.name, "prefix.cleared")
+        for gated in (False, True):
+            with self.subTest(gated=gated):
+                for rel in list(self.zst_files()):
+                    os.remove(self.path(rel))
+                if os.path.exists(after):
+                    os.remove(after)
+                args = ["--upload", "s3://bucket/day/", "--upload-cmd", f"{sys.executable} -c \"import sys; sys.exit(1)\""]
+                child = self.start_late_run(*args, *(["--upload-after", after] if gated else []))
+                if gated:
+                    printed = os.path.join(self.tmp.name, "late-run.out")
+                    deadline = time.time() + 60
+                    while time.time() < deadline and child.poll() is None and "wait for" not in open(printed).read():
+                        time.sleep(0.05)
+                    open(after, "w").close()
+                code, cfg, printed = self.late_run_result(child)
+
+                self.assertEqual(code, 0, printed)
+                self.assertIn("Warning: some streamed uploads failed", printed)
+                self.assertEqual(sorted(cfg["files"]), sorted(self.files))
+
+    # A run that fails (its zstd here) does not wait for the file: what it held back is left for the caller.
+    def test_a_run_that_fails_does_not_wait_for_its_uploads(self):
+        after = os.path.join(self.tmp.name, "prefix.cleared")
+        log = os.path.join(self.tmp.name, "upload.log")
+        recorder = f"{sys.executable} -c \"import sys; open({log!r}, 'a').write(sys.stdin.read())\""
+        bin_dir = os.path.join(self.tmp.name, "bin")
+        write(os.path.join(bin_dir, "zstd"), b"#!/bin/sh\nexit 1\n")
+        os.chmod(os.path.join(bin_dir, "zstd"), 0o755)
+        path = mock.patch.dict(os.environ, {"PATH": f"{bin_dir}:{os.environ['PATH']}"})
+        path.start()
+        self.addCleanup(path.stop)
+
+        child = self.start_late_run("--upload", "s3://bucket/day/", "--upload-cmd", recorder, "--upload-after", after)
+        code, _, _ = self.late_run_result(child)
+
+        self.assertNotEqual(code, 0)
+        self.assertFalse(os.path.exists(log) and open(log).read(), "an upload went before its file")
+
     def counted_run(self, *args, cpus=4, budget_env=None):
         """run_main with `cpus` CPUs (None: cpu_budget.sh's, under `budget_env`), a zstd thread per 64 KiB and a zstd
         that logs each call; returns the calls as (start, end, threads, output) and what the run printed."""

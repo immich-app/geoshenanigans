@@ -896,13 +896,14 @@ class PostBuildTest(unittest.TestCase):
                 self.assertEqual(upload.wait(timeout=10), -9)
                 self.assertIn("::warning::", done.stdout)
 
-    def run_patch_step(self, compress=None, fetch_status=None, slow_setsid=False, at_sleep=""):
+    def run_patch_step(self, compress=None, fetch_status=None, slow_setsid=False, at_sleep="", fetch_log=""):
         """Runs Generate patches and verify as Actions runs it, with geocoder-transport built and the place search
         done, a generate_patches.sh and checksums.sh that do nothing else, LOGGING_S5CMD, sleeps of 10 ms that first run
         `at_sleep` (shell), a clock that runs the seconds in $WORKDIR/clock ahead, and as compress_index.py
         `compress` (Python, its argv compress_index.py's) on a night of no variants, or (None) compress_index.py
         itself on one of a .bin file and its sidecar; yesterday's fetch has ended with `fetch_status` (None: not
-        yet, it writes none of its own). With slow_setsid, setsid takes half a second to start. Returns the run,
+        yet, it writes none of its own), its log `fetch_log` (None: none). With slow_setsid, setsid takes half a
+        second to start. Returns the run,
         None when the step still waited after 30 s, and the work dir. What of the run's still runs when the test
         ends is killed."""
         root = tempfile.mkdtemp()
@@ -917,9 +918,10 @@ class PostBuildTest(unittest.TestCase):
                  os.path.join(bin_dir, "s5cmd"): LOGGING_S5CMD,
                  os.path.join(bin_dir, "sleep"): f"#!/bin/sh\n{at_sleep}\nexec /usr/bin/sleep 0.01\n",
                  os.path.join(bin_dir, "date"): FAKE_DATE.format(date=shutil.which("date")),
-                 os.path.join(work, "old-output.log"): "",
                  os.path.join(work, "place-search.status"): "0\n",
                  os.path.join(root, "search.status"): "0\n"}
+        if fetch_log is not None:
+            fakes[os.path.join(work, "old-output.log")] = fetch_log
         if compress is None:
             for name in ("compress_index.py", "cpu_budget.sh"):
                 shutil.copy(os.path.join(HERE, name), tools)
@@ -1024,6 +1026,16 @@ class PostBuildTest(unittest.TestCase):
                     self.assertRegex(f.read(), r"\] planet/full/geo_cells\.bin\n")
                 self.assertEqual([c for c in self.s5cmd_calls(work) if "/builds/2026-11-21" in c], [])
                 self.assertEqual(kill_running_from(os.path.dirname(work)), [], "compression still ran after the step")
+
+    # So does a step that ends otherwise before the prefix may be written (its read of the fetch's log fails here):
+    # compression ends with it, rather than wait on for the word to send its files.
+    def test_a_step_that_ends_before_the_prefix_is_cleared_ends_compression(self):
+        done, work = self.run_patch_step(fetch_status="0\n", fetch_log=None)
+
+        self.assertIsNotNone(done, "the step still waited after 30 s")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(kill_running_from(os.path.dirname(work)), [], "compression still ran after the step")
+        self.assertEqual([c for c in self.s5cmd_calls(work) if "/builds/2026-11-21" in c], [])
 
     # Once they are down the date's prefix is cleared, and written after: the sidecars, and compression's uploads,
     # which waited for it.

@@ -1018,9 +1018,10 @@ jobs:
           # them there are no patches and the run fails: compression ends
           # first, its session and all (its uploads, held back, too), and is
           # gone (a zombie aside); this date's prefix is left as it was, a
-          # build published under it included. Its launch is killed too, as a
-          # fetch that failed before build-index exited stops it before it has
-          # made its session.
+          # build published under it included. So does a step that ends
+          # otherwise before it lets the uploads go (the trap). Its launch is
+          # killed too, as a fetch that failed before build-index exited stops
+          # it before it has made its session.
           compressing() { ps -o stat= -s "$COMPRESS_PID" | grep -q '^[^Z]'; }
           stop_compression() {
             local start
@@ -1031,17 +1032,18 @@ jobs:
               sleep 1
             done
           }
+          trap '[ -e "$WORKDIR/prefix.cleared" ] || stop_compression' EXIT
           WAIT_START=$(date +%s)
           until [ -s "$WORKDIR/old-output.status" ]; do
             if [ $(( $(date +%s) - WAIT_START )) -gt 3600 ]; then
-              echo "::error::Yesterday's index fetch did not finish within an hour"; stop_compression; exit 1
+              echo "::error::Yesterday's index fetch did not finish within an hour"; exit 1
             fi
             sleep 10
           done
           cat "$WORKDIR/old-output.log"
           echo "[old-output] Waited $(( $(date +%s) - WAIT_START ))s for it"
           if [ "$(cat "$WORKDIR/old-output.status")" != 0 ]; then
-            echo "::error::Fetching yesterday's index failed"; stop_compression; exit 1
+            echo "::error::Fetching yesterday's index failed"; exit 1
           fi
           df -h "$WORKDIR"
 

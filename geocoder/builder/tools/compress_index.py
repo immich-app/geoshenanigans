@@ -25,14 +25,16 @@ UNIT_FAILED once all else is done, for the caller to fail the run at its end.
 --upload streams each .zst and unit to DEST/<path> as soon as it exists,
 through one long-running CMD (an `s5cmd ... run` reading cp commands on
 stdin): the upload is network-bound and compression CPU-bound, so they
-overlap instead of the upload waiting for the last file. Upload failures
-only warn; the caller re-uploads whatever is missing.
+overlap instead of the upload waiting for the last file. Upload failures,
+a CMD that ends before it has read every command among them, only warn; the
+caller re-uploads whatever is missing.
 --upload-after FILE holds the upload back until FILE exists, the caller's
 word that DEST may be written: compression goes on, the commands wait (FILE
 is looked for every half second), and the run's end waits for FILE, so that
-every file still goes up. The nightly's patch step compresses before
-yesterday's files are down, and gives it once they are and DEST is cleared:
-until then a build published under DEST stays as it is.
+every file still goes up (a run that fails sends none of them). The
+nightly's patch step compresses before yesterday's files are down, and gives
+it once they are and DEST is cleared: until then a build published under
+DEST stays as it is.
 
 --late-search: the place search indexes (every file under a region's
 search/ dir) are still being built beside this run. Everything else is
@@ -341,12 +343,13 @@ def link(source, path):
 
 class Uploader:
     """Feeds `cp <file> <dest>/<path>` lines to a running `s5cmd run`; with `after`, none until that file exists:
-    the lines sent before then wait for it (a thread looks for it), and finish() waits for it too."""
+    the lines sent before then wait for it (a thread looks for it), and finish() waits for it too, but for a run that
+    failed. A command that ended before it read them all fails the uploads alone."""
 
     def __init__(self, out, dest, cmd, after=""):
         self.out, self.dest, self.after = out, dest.rstrip("/"), after
         self.proc = subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE, text=True) if dest else None
-        self.lock, self.opened = threading.Lock(), threading.Event()
+        self.lock, self.opened, self.broken = threading.Lock(), threading.Event(), False
         # The lines that wait for `after`; None once they may go.
         self.held = [] if self.proc and after else None
         if self.held is None:
@@ -360,14 +363,18 @@ class Uploader:
                 time.sleep(LATE_SEARCH_POLL_SECONDS)
             with self.lock:
                 held, self.held = self.held, None
-                self.write("".join(held))
+                if held is not None:
+                    self.write("".join(held))
         finally:
             self.opened.set()
 
     def write(self, lines):
-        if lines:
-            self.proc.stdin.write(lines)
-            self.proc.stdin.flush()
+        if lines and not self.broken:
+            try:
+                self.proc.stdin.write(lines)
+                self.proc.stdin.flush()
+            except BrokenPipeError:
+                self.broken = True
 
     def send(self, path):
         if self.proc:
@@ -378,14 +385,23 @@ class Uploader:
                 else:
                     self.write(line)
 
-    def finish(self):
+    def finish(self, failed=False):
+        """Ends the upload once every line has gone; a run that failed sends none of those still held."""
         if not self.proc:
             return
-        if not self.opened.is_set():
+        if failed:
+            with self.lock:
+                if self.held is not None:
+                    self.held, self.broken = None, True
+        elif not self.opened.is_set():
             print(f"Compressed: the uploads wait for {self.after}", flush=True)
-        self.opened.wait()
-        self.proc.stdin.close()
-        if self.proc.wait() != 0:
+            self.opened.wait()
+        with self.lock:
+            try:
+                self.proc.stdin.close()
+            except BrokenPipeError:
+                self.broken = True
+        if self.proc.wait() != 0 or self.broken:
             print("Warning: some streamed uploads failed; the caller re-uploads them", flush=True)
 
 
@@ -473,6 +489,7 @@ def main():
             failed.add(key[u.path])
 
     uploader = Uploader(out, opts.upload, opts.upload_cmd, opts.upload_after)
+    failed_run = True
     try:
         with ThreadPoolExecutor(max_workers=budget) as ex:
             try:
@@ -537,8 +554,9 @@ def main():
             for f in u.files:
                 if os.path.exists(at(f) + ".zst"):
                     os.remove(at(f) + ".zst")
+        failed_run = False
     finally:
-        uploader.finish()
+        uploader.finish(failed=failed_run)
 
     published = [u for u in units if key[u.path] not in failed]
     unit_of = {f: u for u in published for f in u.files}
