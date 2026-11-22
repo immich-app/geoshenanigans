@@ -1452,4 +1452,23 @@ TEST(each_mode_dir_credits_the_sources_of_its_data) {
     // A whole dir, without the multi flags, credits its sources too.
     const auto single = build("single", {"--tiger-data", tiger});
     CHECK(credited(single, "planet/attribution.json") == Ids({"osm", "tiger"}));
+
+    // A TIGER range without a ZIP gives an interpolation and no centroid: the
+    // full dirs that hold it credit TIGER, and the modes without addresses
+    // don't.
+    const std::string unzipped = root.path() + "/tiger-unzipped";
+    fs::create_directories(unzipped);
+    write(unzipped + "/36061.csv", "from;to;interpolation;street;city;state;postcode;geometry\n"
+                                   "100;198;even;West 31st Street;New York;NY;;LINESTRING(-73.995 40.749,-73.993 40.750)\n");
+    const auto ranges = build("unzipped", {"--continents", "--multi-output", "--multi-quality", "--tiger-data", unzipped});
+    for (const std::string& region : kRegions) {
+        const bool holds = region == "planet" || region == "north-america";
+        CHECK_EQ(ways_of<InterpWay>(way_files::INTERPS, ranges, region + "/full/").ways.size(), size_t(holds ? 1 : 0));
+        for (const char* mode : {"full", "no-addresses", "admin"}) {
+            const std::string at = region + "/" + mode + "/attribution.json";
+            const Ids want = holds && !std::strcmp(mode, "full") ? Ids({"osm", "tiger"}) : osm;
+            if (credited(ranges, at) != want) std::printf("    %s\n", at.c_str());
+            CHECK(credited(ranges, at) == want);
+        }
+    }
 }
