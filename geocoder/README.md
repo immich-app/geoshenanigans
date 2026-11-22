@@ -86,7 +86,10 @@ file's name `water/<name>`), and a download skips a file only where the ledger
 names the build's sha256 for it. It removes the files its selection doesn't
 take (another selection's or build's) that the ledger names, or whose names
 files of the build have in the dir or in the sub-dir their component names, the
-ledger naming them or not; files of other names stay. The dir names its build
+ledger naming them or not, each with the temp file a killed fetch of it left;
+files of other names stay. A `water/` that is a link or a file fails the
+download before it writes anything: it writes nothing through a link, as the
+dir's lock guards only the continent dir. The dir names its build
 in `.build_date` once a whole selection of it is in and those are gone; a
 download that fetches or removes anything removes it first, once it has made
 the ledger where the dir has none (a dir holding neither was laid out by hand,
