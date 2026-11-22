@@ -497,7 +497,67 @@ crossings would give back vertices that buy nothing and tie one area's
 simplified arcs to its neighbours' edits.
 
 The sidecars (`*.osm_ids`) sit in `water/all/exact/` for the all set and in
-`water/major/simplified/` for the major tier. They are not client files.
+`water/major/simplified/` for the major tier. They are not client files. The
+nightly fetches yesterday's with every other sidecar before the build, and
+yesterday's `planet/water/all/exact/water_meta.json` beside them: the build
+reads the type codes from it before the fetch of yesterday's client files has
+brought it down.
+
+#### The seas and oceans
+
+The marine areas (`src/marine.h`, `build-index --marine`) are objects of the
+water layer of their own: each IHO sea area of Marine Regions' EEZ-IHO
+intersect (v5, CC BY 4.0), a `place/sea` or, for the seven named "… Ocean",
+a `place/ocean`, cut to the water off a snapshot of osmdata.openstreetmap.de's
+land polygons (OpenStreetMap's coastline, ODbL) and along a 1-degree grid by
+`tools/marine_import.py`. They go into the same store, records, arcs, cells
+and dirs as OSM's water, and win nowhere a smaller area holds the point: a
+bay, harbour or lake inside a sea answers there, the sea out in open water.
+
+- **They don't change from day to day.** The nightly never runs the tool: it
+  downloads the version `data/marine.json` pins (a run of Update Marine
+  Areas, `geocoder-marine.yml`, under `geocoder/marine/<version>/` in the
+  bucket) and checks its sha256, so the same file goes into every build until
+  the pin moves. A day's water patch carries no marine bytes but where an OSM
+  water area sharing a stretch of coast with them was edited.
+- **Their own id space.** A marine object is the sea area's MRGID, typed
+  `SYNTHETIC` in the build, apart from OSM's ways and relations and from the
+  builder's way-id cap. A polygon's slot identity hashes the MRGID and the
+  smallest vertex of its outer ring, its fallback key the MRGID and the
+  polygon's place among the area's, as a relation's outer ring does.
+- **Arcs cut at the clip's own vertices.** A marine ring has no member ways,
+  so one vertex in `kMarineCutEvery` (256), chosen by a hash of its
+  coordinates, starts a stretch, and each stretch is a way of its own to the
+  arc stage, its id a negative hash of its end vertices. A cut so drawn falls
+  on the same vertex in every ring through it either way round, so the sea
+  either side of a shared border and an OSM bay along the same coast share
+  their arcs; and a coast is cut into arcs of a few hundred vertices, which a
+  lookup decodes only where its ray crosses. A new land snapshot moves the
+  cuts only where the coast moved.
+- **Tiles keep them local.** No marine polygon spans more than a 1-degree
+  tile, so the open ocean is cells listing one polygon each and a coast tile
+  is one polygon of its own with its islands as holes (the water split cuts
+  those of more than `kSplitMaxHoles`).
+- **Where a dataset answers them.** A continent's dataset holds the marine
+  polygons its cells reach (the Geofabrik polygons, which take in the coastal
+  sea); only the planet's covers the open ocean.
+- **Credit.** A water dir holding a marine area lists Marine Regions in its
+  `attribution.json` beside OpenStreetMap, with the changes made: as cut to
+  OpenStreetMap's land the areas are part of the dataset's ODbL derivative,
+  with the CC BY credit kept.
+
+#### Publishing
+
+`tools/compress_index.py` publishes the water dirs as any other: the `arcs`
+and `admin_polygons` transport units (every dir holding all of a unit's files
+publishes it), the other `.bin` files as `.zst`, and `water_meta.json` and
+`attribution.json` among the JSON files (compressed and kept raw). The
+template's `water` axis takes `none`, `major`, `all` or `all-exact`, each a
+component of one dir's ten client files with `"dir": "water"`: a client puts
+them in `<dataset>/water/` and patches that dir with the water dir's own
+patch (`generate_patches.sh` diffs every dir holding `.bin` files, these
+among them). `component_sizes` in configurations.json gives each region's
+components' raw and wire bytes.
 
 ## Place search index
 
