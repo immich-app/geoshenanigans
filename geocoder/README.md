@@ -90,7 +90,8 @@ ledger naming them or not, and with each the ledger marks unknown the temp file
 a killed fetch of it left; files of other names stay, and so does a file at the
 temp name of one the ledger doesn't mark unknown. A `water/` that is a link or a file fails the
 download before it writes anything: it writes nothing through a link, as the
-dir's lock guards only the continent dir. The dir names its build
+dir's lock guards only the continent dir. A fetch writes its file under a temp
+name it makes new, removing a link there rather than writing through it. The dir names its build
 in `.build_date` once a whole selection of it is in and those are gone; a
 download that fetches or removes anything removes it first, once it has made
 the ledger where the dir has none (a dir holding neither was laid out by hand,

@@ -437,7 +437,8 @@ fn tmp_of(dest: &Path) -> std::path::PathBuf {
 }
 
 /// Blocking half of the streaming download: consume compressed chunks
-/// from `rx`, zstd-decode them, write the decompressed bytes to `tmp`
+/// from `rx`, zstd-decode them, write the decompressed bytes to `tmp`, a
+/// file it makes new there (writing nothing through a link at the name),
 /// and hash them incrementally. Returns the sha256 hex of the
 /// decompressed content. RAM use is bounded by the channel depth plus
 /// the zstd window regardless of file size.
@@ -461,7 +462,15 @@ fn decode_hash_write(
             self.file.flush()
         }
     }
-    let file = std::fs::File::create(tmp)
+    // A file of its own: what is at the temp name (a killed fetch's file, or
+    // a link, which goes without its file) is removed, not opened.
+    match std::fs::remove_file(tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(DownloadError::Io(format!("remove {}: {}", tmp.display(), e)));
+        }
+        _ => {}
+    }
+    let file = std::fs::File::options().write(true).create_new(true).open(tmp)
         .map_err(|e| DownloadError::Io(format!("create {}: {}", tmp.display(), e)))?;
     let hw = HashWriter { file: std::io::BufWriter::new(file), hasher: Sha256::new() };
     let mut dec = zstd::stream::write::Decoder::new(hw)
@@ -1987,6 +1996,34 @@ mod tests {
             want.insert(kept.into(), b"an operator's copy".to_vec());
             assert_eq!(differing(&held(&dir), &want), Vec::<String>::new(), "{kept}");
         }
+    }
+
+    // A file's fetch writes it under its temp name, made new: whatever is
+    // there goes first, a link (to a file outside the region dir, which the
+    // dir's lock doesn't guard) removed, not written through. The file comes
+    // down in place and the link's file stays as it was, in the region dir
+    // and in its water dir alike.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fetch_writes_nothing_through_a_link_at_its_temp_name() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let s = wet("europe", "admin", "simplified", "none", "all");
+        let (root, other) = (ScratchDir::new(), ScratchDir::new());
+        let theirs = other.path().join("notes.txt");
+        std::fs::write(&theirs, "an operator's notes").unwrap();
+        let dir = root.path().join("europe");
+        std::fs::create_dir_all(dir.join("water")).unwrap();
+        for tmp in ["admin_cells.bin.tmp", "water/admin_cells.bin.tmp"] {
+            std::os::unix::fs::symlink(&theirs, dir.join(tmp)).unwrap();
+        }
+
+        download(&bucket, &s, root.path()).await.unwrap();
+
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"an operator's notes");
+        for name in ["admin_cells.bin", "water/admin_cells.bin"] {
+            assert!(!std::fs::symlink_metadata(dir.join(name)).unwrap().file_type().is_symlink(), "{name}");
+        }
+        assert!(held(&dir) == files_of(&bucket, &s), "{:?}", held(&dir).keys().collect::<Vec<_>>());
     }
 
     // What a decode killed in the water dir left there is finished before
