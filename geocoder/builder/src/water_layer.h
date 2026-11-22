@@ -188,21 +188,24 @@ struct Build {
     std::vector<uint64_t> piece_key;   // by polygon: its cut (water_split.h), 0 for an outer ring whole
     NamingLines lines;
     size_t relations_missing_ways = 0, relations_without_rings = 0, marine_objects = 0;
+    size_t outer_twins = 0;  // closed ways left to a relation of their names whose outer ring they are
 };
 
 // Assembles every collected relation (assemble_area_rings, nested by
 // geometry as admin relations are: one polygon per outer ring with the holes
-// in it) and closed way into polygons, then takes the marine areas' as they
-// are, in object order (ways by id, relations by id, then marine areas by
-// id; of an object or line two inputs hold, the first input's copy alone),
-// each ring rotated as canonicalize_ring_rotation puts it, with its way
-// runs (a marine ring's marine::ring_runs). A relation with a member way the
-// passes didn't find is left out. Uses up the collected areas and
-// geometries; moves the lines into the build's NamingLines, keys and names
-// sorted. The names follow the dataset's (name:en, else name): the lines of
-// a waterway relation of a local name alone show the name:en most of its
-// river ways that have one carry (the smaller of a tie), else the
-// relation's name.
+// in it) and closed way into polygons, but a closed way an assembled
+// relation of its names (name and local name) takes whole as an outer ring:
+// one body tagged twice, whose islands the relation leaves out. Then takes
+// the marine areas' as they are, in object order (ways by id, relations by
+// id, then marine areas by id; of an object or line two inputs hold, the
+// first input's copy alone), each ring rotated as canonicalize_ring_rotation
+// puts it, with its way runs (a marine ring's marine::ring_runs). A relation
+// with a member way the passes didn't find is left out. Uses up the
+// collected areas and geometries; moves the lines into the build's
+// NamingLines, keys and names sorted. The names follow the dataset's
+// (name:en, else name): the lines of a waterway relation of a local name
+// alone show the name:en most of its river ways that have one carry (the
+// smaller of a tie), else the relation's name.
 Build assemble(Collected& c, unsigned threads);
 
 // Leaves out each OSM natural=bay or strait that is a marine area's

@@ -863,3 +863,48 @@ TEST(a_previous_water_build_whose_water_meta_json_is_gone_or_cut_short_stops_the
     fs::remove_all(two + "/water");
     CHECK(refusal(with_kinds({large, small}), two).empty());
 }
+
+TEST(a_way_tagged_as_the_multipolygon_whose_outer_ring_it_is_leaves_the_island_out) {
+    Collected c = fixture();
+    const int32_t lat = kLat - 1000000;
+    // A lake way tagged as the relation that takes it whole as its outer
+    // ring round an island, and the island way, tagged on its own.
+    const Ring shore = square(lat, kLng, 100000, 4), isle = square(lat + 40000, kLng + 40000, 20000);
+    add_geometry(c, 2700, shore);
+    add_geometry(c, 2701, isle);
+    c.closed_ways.push_back({2700, tags(code::kLake, "Twin Lake"), shore});
+    c.closed_ways.push_back({2701, tags(code::kWetland, "Isle Marsh"), isle});
+    CollectedArea twin;
+    twin.id = 2800;
+    twin.tags = tags(code::kLake, "Twin Lake");
+    twin.members = {{2700, "outer"}, {2701, "inner"}};
+    c.relations.push_back(twin);
+    // Kept: a way that is the outer ring of a relation of another name, and
+    // one whose relation lacks a member way.
+    const Ring other = square(lat + 200000, kLng, 100000), broken = square(lat + 400000, kLng, 100000);
+    add_geometry(c, 2710, other);
+    c.closed_ways.push_back({2710, tags(code::kLake, "Other Lake"), other});
+    CollectedArea mere;
+    mere.id = 2810;
+    mere.tags = tags(code::kLake, "Mere");
+    mere.members = {{2710, "outer"}};
+    c.relations.push_back(mere);
+    add_geometry(c, 2720, broken);
+    c.closed_ways.push_back({2720, tags(code::kLake, "Broken Lake"), broken});
+    CollectedArea lacking;
+    lacking.id = 2820;
+    lacking.tags = tags(code::kLake, "Broken Lake");
+    lacking.members = {{2720, "outer"}, {99999, "inner"}};
+    c.relations.push_back(lacking);
+    const Layer layer = build(c);
+    CHECK(ways_held(layer, {2700, 2701, 2710, 2720}).first == std::set<int64_t>({2701, 2710, 2720}));
+    // The lake is the relation's polygon, the island a hole in it.
+    size_t twins = 0;
+    for (size_t p = 0; p < layer.size(); p++)
+        if (layer.fallbacks[p] == relation_ring_fallback(2800, 0)) {
+            twins++;
+            CHECK(name_of(layer, p) == "Twin Lake");
+            CHECK_EQ(layer.arcs.polygons[p].ring_count, 2u);
+        }
+    CHECK_EQ(twins, size_t(1));
+}

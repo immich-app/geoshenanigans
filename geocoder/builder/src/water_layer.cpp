@@ -14,6 +14,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 #include "cell_index.h"
 #include "cell_index_io.h"
@@ -234,6 +235,33 @@ Build assemble(Collected& c, unsigned threads) {
     free_storage(c.member_geometries.coords);
     free_storage(c.member_geometries.ways);
 
+    // The closed ways an assembled relation takes whole as an outer ring
+    // (every way run of the ring theirs), by way: the relations' indices.
+    std::unordered_map<int64_t, std::vector<uint32_t>> outer_of;
+    for (uint32_t i = 0; i < c.relations.size(); i++) {
+        const Assembled& a = assembled[i];
+        if (a.missing) continue;
+        for (size_t k = 0; k < a.polygons.size(); k++) {
+            const std::vector<WayRun>& runs = a.runs[k].outer;
+            if (a.polygons[k].outer.size() < 4 || runs.empty()) continue;
+            const int64_t way = runs[0].way;
+            bool whole = true;
+            for (const WayRun& r : runs) whole &= r.way == way;
+            if (whole) outer_of[way].push_back(i);
+        }
+    }
+    // Whether closed way w is such an outer ring of a relation of its names:
+    // one body tagged twice, which the relation gives, its islands left out.
+    auto twin = [&](const ClosedWayArea& w) {
+        auto it = outer_of.find(w.way);
+        if (it == outer_of.end()) return false;
+        for (uint32_t i : it->second) {
+            const ObjectTags& t = c.relations[i].tags;
+            if (t.name == w.tags.name && t.local_name == w.tags.local_name) return true;
+        }
+        return false;
+    };
+
     auto add_object = [&](ObjectType type, int64_t id, ObjectTags&& tags) {
         Object o;
         o.type = type;
@@ -251,6 +279,10 @@ Build assemble(Collected& c, unsigned threads) {
     };
     for (ClosedWayArea& w : c.closed_ways) {
         if (w.vertices.size() < 4) continue;
+        if (twin(w)) {
+            b.outer_twins++;
+            continue;
+        }
         canonicalize_ring_rotation(w.vertices);
         const uint32_t object = add_object(ObjectType::OSM_WAY, w.way, std::move(w.tags));
         add_polygon(object, 0, w.vertices, {}, {{{w.way, static_cast<uint32_t>(w.vertices.size() - 1)}}});
@@ -1143,7 +1175,8 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
     Build b = assemble(c, threads);
     std::cerr << "  Water: " << b.objects.size() << " objects (" << closed_ways << " closed ways, " << relations
               << " relations, " << b.relations_missing_ways << " missing member ways, " << b.relations_without_rings
-              << " without rings, " << b.marine_objects << " marine areas), " << b.rings.polygons.size()
+              << " without rings, " << b.marine_objects << " marine areas; " << b.outer_twins
+              << " closed ways left to the relations of their names whose outer rings they are), " << b.rings.polygons.size()
               << " polygons, " << b.rings.rings.size() << " rings, "
               << b.rings.vertices.size() << " vertices; " << b.lines.lines.size() << " naming lines ("
               << b.lines.vertices.size() << " vertices, " << b.lines.keys.size() << " keys, " << waterways
