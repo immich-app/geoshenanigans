@@ -2,7 +2,8 @@
 // closed-way kinds (a pond, a land-use reservoir, which no other dir reads),
 // a river area its waterway relation names and one nothing names, in every
 // region's water dirs; the same PBF chained on its own build writes them
-// again, and a build without --multi-output writes the exact tier beside its
+// again, a build with --marine holds a marine areas file's seas and oceans
+// too, and a build without --multi-output writes the exact tier beside its
 // mode's files.
 #include <algorithm>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "marine_test_file.h"
 #include "pbf_test_objects.h"
 #include "scratch_dir.h"
 #include "string_files.h"
@@ -230,11 +232,28 @@ TEST(a_way_only_the_water_layer_reads_stays_out_of_the_other_layers) {
     CHECK(std::find(names.begin(), names.end(), "English Pond") != names.end());
     CHECK(std::find(names.begin(), names.end(), "Ried") != names.end());
     // ... and no other dir has more than it has without them: the same
-    // POIs and streets.
+    // POIs and streets, slot by slot.
     for (const char* f : {"planet/poi/all/poi_records.osm_ids", "planet/full/street_ways.osm_ids"}) {
         REQUIRE(a.count(f) && b.count(f));
-        CHECK_EQ(a.at(f).size(), b.at(f).size());
+        CHECK(a.at(f) == b.at(f));
     }
+}
+
+TEST(build_index_loads_the_marine_areas_it_is_given_into_the_water_dirs) {
+    const ScratchDir root("water-marine-build");
+    const std::string marine = root.path() + "/marine_areas.bin";
+    std::ofstream(marine, std::ios::binary) << gctest::bytes_of_hex(gctest::kTwoAreasHex);
+    // The ocean and the sea beside the fixture's water, credited to Marine
+    // Regions; without the file, neither.
+    const std::string with = root.path() + "/with", without = root.path() + "/without";
+    CHECK(planet_water_names(fixture(), with, {"--marine", marine}) ==
+          std::vector<std::string>({"Limmat", "North Atlantic Ocean", "North Sea", "Speicher", "Test Lake", "Weiher"}));
+    CHECK(planet_water_names(fixture(), without) ==
+          std::vector<std::string>({"Limmat", "Speicher", "Test Lake", "Weiher"}));
+    const std::vector<char> credited = bytes_of(with + "/planet/water/all/exact/attribution.json"),
+                            uncredited = bytes_of(without + "/planet/water/all/exact/attribution.json");
+    CHECK(std::string(credited.begin(), credited.end()).find("\"id\": \"marine-regions\"") != std::string::npos);
+    CHECK(std::string(uncredited.begin(), uncredited.end()).find("marine-regions") == std::string::npos);
 }
 
 TEST(a_build_without_multi_output_writes_the_exact_water_tier_beside_its_modes_files) {

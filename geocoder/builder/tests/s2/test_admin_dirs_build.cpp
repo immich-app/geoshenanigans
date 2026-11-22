@@ -960,7 +960,8 @@ TEST(a_chained_build_on_a_previous_build_without_arc_fallback_sidecars_takes_slo
     fs::copy(out1, prev, fs::copy_options::recursive);
     std::vector<fs::path> fallbacks;
     for (const auto& e : fs::recursive_directory_iterator(prev))
-        if (e.path().filename() == "arc_index.fallback.osm_ids" && e.path().string().find("/water/") == std::string::npos)
+        if (e.path().filename() == "arc_index.fallback.osm_ids" &&
+            fs::relative(e.path(), prev).string().find("/water/") == std::string::npos)
             fallbacks.push_back(e.path());
     REQUIRE(fallbacks.size() == kRegions.size() + kRegionsHeld.size());
     for (const fs::path& p : fallbacks) fs::remove(p);
