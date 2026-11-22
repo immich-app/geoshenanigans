@@ -157,7 +157,7 @@
     },
     "water": {
       "label": "Bodies of water",
-      "description": "Seas, oceans, lakes, rivers, canals, bays, straits, wetlands and glaciers as areas: the files of a water/ dir of their own beside the dataset's, published to download, which the server and its downloader don't read yet. Any boundary precision takes any of them.",
+      "description": "Seas, oceans, lakes, rivers, canals, bays, straits, wetlands and glaciers as areas, the files of a water/ dir of their own beside the dataset's, answered in a `water` field beside the address, which they never change. Any boundary precision takes any of them.",
       "order": 5,
       "values": {
         "none": {
