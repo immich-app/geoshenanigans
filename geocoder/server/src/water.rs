@@ -121,9 +121,18 @@ impl WaterLayer {
 
     /// The water layer in `dir` (a dataset's water dir), its cells at `cell_level`: none where
     /// the dir isn't there or holds none of WATER_FILES; an error where it holds some of them and
-    /// not all, or one that doesn't load.
+    /// not all, or one that doesn't load, and where one of them can't be looked up or isn't a
+    /// file, naming it.
     pub fn open(dir: &str, cell_level: u64) -> Result<Option<WaterLayer>, String> {
-        let held: Vec<bool> = WATER_FILES.iter().map(|name| std::path::Path::new(&format!("{dir}/{name}")).is_file()).collect();
+        let held = WATER_FILES.iter().map(|name| {
+            let path = format!("{dir}/{name}");
+            match std::fs::metadata(&path) {
+                Ok(m) if m.is_file() => Ok(true),
+                Ok(_) => Err(format!("{path}: not a file")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(format!("{path}: {e}")),
+            }
+        }).collect::<Result<Vec<bool>, String>>()?;
         if !held.contains(&true) {
             return Ok(None);
         }
@@ -564,5 +573,26 @@ mod tests {
         std::fs::write(water.join("water_meta.json"), "{\"types\": 1}").unwrap();
         std::fs::write(water.join("arc_index.bin"), []).unwrap();
         assert!(open().unwrap_err().starts_with(&format!("{}/water_meta.json: ", water.display())));
+    }
+
+    #[test]
+    fn a_water_path_that_cant_be_read_fails_the_open_naming_it() {
+        // Taken for no water, either would leave a dataset dry that holds water: a water dir
+        // that is a file (its files can't be looked up, as in a dir that can't be searched),
+        // and a name of the files that is a dir.
+        let dir = crate::scratch_dir::ScratchDir::new();
+        let water = dir.path().join(WATER_DIR);
+        let open = || WaterLayer::open(water.to_str().unwrap(), crate::DEFAULT_ADMIN_CELL_LEVEL).map(|w| w.is_some());
+
+        std::fs::write(&water, "not a dir").unwrap();
+        let got = open();
+        assert!(got.as_ref().is_err_and(|e| e.starts_with(&format!("{}/admin_cells.bin: ", water.display()))), "{got:?}");
+        std::fs::remove_file(&water).unwrap();
+        WaterFixture::new().area("Lake", LAKE, (0.0, 0.0, 1.0, 1.0), &[]).write(&water);
+        for name in ["admin_cells.bin", "water_meta.json"] {
+            std::fs::remove_file(water.join(name)).unwrap();
+            std::fs::create_dir(water.join(name)).unwrap();
+        }
+        assert_eq!(open(), Err(format!("{}/admin_cells.bin: not a file", water.display())));
     }
 }
