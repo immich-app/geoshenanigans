@@ -423,7 +423,9 @@ The water dir is a set of its own, so a switch downloads the new value's
 files into `<dataset>/water/` (or removes the water layer's files, for
 `none`), as a fresh install does, with no patch. On the server, a
 `PUT /admin/configuration` whose `water` (or another axis) changes downloads
-each loaded region again: the download removes the files of `water/` the new
+each loaded region again whose dir the downloader filled (it holds
+`.file_sha256` or `.build_date`; one laid out by hand stays as it is): the
+download removes the files of `water/` the new
 value doesn't take and fetches the ones it does, its ledger naming each
 `water/<name>`, and the region loads again once that is in, answering from the
 files it had until then (and where the download fails). Other names in

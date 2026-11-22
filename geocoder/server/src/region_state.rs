@@ -30,7 +30,7 @@ use tokio::sync::Mutex;
 use crate::downloader::{
     check_selection, download_region, Configurations, DownloadError, DownloadProgress, RegionSelection, COMPONENT_AXES,
 };
-use query_server::MultiIndex;
+use query_server::{MultiIndex, BUILD_STAMP, FILE_LEDGER};
 
 /// How long a fetched configurations.json is trusted before latest.json
 /// is re-resolved. CI keeps full builds for 3 days, so a server that
@@ -150,10 +150,11 @@ impl RegionState {
     /// Replace the active configuration. Persists to disk and kicks
     /// off background downloads: of each preload region not loaded yet,
     /// and, where the selection (mode, quality, poi_tier or water) changed,
-    /// of each loaded region again, for the new selection's files, which
-    /// load in place of the index it had once they are in. Till then, and
-    /// where the download or the load fails, the region answers as before.
-    /// Returns immediately — downloads run as tokio tasks.
+    /// of each loaded region again whose dir the downloader filled, for the
+    /// new selection's files, which load in place of the index it had once
+    /// they are in. Till then, and where the download or the load fails, the
+    /// region answers as before. Returns immediately — downloads run as
+    /// tokio tasks.
     ///
     /// Refused, changing nothing, when the manifest at hand has no
     /// component for its mode, quality, poi_tier or water.
@@ -269,8 +270,10 @@ impl RegionState {
 
     /// Downloads `region` and installs it, as ensure_loaded does, where it
     /// isn't loaded and `unloaded`, or is and `loaded`; else returns. A
-    /// region the flat layout's one slot holds is never downloaded again:
-    /// its dir was laid out by hand.
+    /// loaded region is downloaded again only where its continent dir is
+    /// the downloader's, holding its ledger or its stamp: one holding
+    /// neither was laid out by other means (by hand, by the test portal),
+    /// as the flat layout's one slot was, and is never downloaded again.
     async fn download_if(self: &Arc<Self>, region: &str, unloaded: bool, loaded: bool) -> Result<(), DownloadError> {
         // Per-region serialisation. Acquire the inner mutex so only
         // one concurrent request runs the download below; the rest
@@ -289,7 +292,11 @@ impl RegionState {
         };
         // Checked after acquiring the lock: an earlier waiter may have
         // just finished the download.
-        let wanted = if slot.index.load().is_some() { loaded && slot.continent.is_some() } else { unloaded };
+        let wanted = if slot.index.load().is_some() {
+            loaded && slot.continent.is_some() && self.downloaded_into(region).await
+        } else {
+            unloaded
+        };
         if !wanted {
             return Ok(());
         }
@@ -301,6 +308,19 @@ impl RegionState {
         })
         .await
         .map_err(|e| DownloadError::Io(format!("download task: {}", e)))?
+    }
+
+    /// Whether the continent dir of `region` is one the downloader filled:
+    /// it holds the ledger or the stamp (FILE_LEDGER, BUILD_STAMP), which no
+    /// other writer of a continent dir makes.
+    async fn downloaded_into(&self, region: &str) -> bool {
+        let dir = self.root_dir.join(region);
+        for name in [FILE_LEDGER, BUILD_STAMP] {
+            if tokio::fs::symlink_metadata(dir.join(name)).await.is_ok() {
+                return true;
+            }
+        }
+        false
     }
 
     /// Downloads `region` and installs it: the task of download_if. A region
@@ -351,7 +371,7 @@ mod tests {
     use super::*;
     use crate::scratch_dir::ScratchDir;
     use crate::test_bucket::{self, TestBucket};
-    use query_server::{BUILD_STAMP, DOWNLOAD_LOCK, FILE_LEDGER};
+    use query_server::DOWNLOAD_LOCK;
     use std::cell::RefCell;
     use std::collections::BTreeSet;
     use std::rc::Rc;
@@ -710,6 +730,41 @@ mod tests {
         assert!(Arc::ptr_eq(&was, &index("europe").unwrap()));
         assert_eq!((seen.borrow().len(), bucket.files_served()), (3, served));
         assert!(index("asia").is_none() && !root.path().join("asia").exists());
+    }
+
+    // A continent dir holding neither the ledger nor the stamp was laid out
+    // by other means (by hand, by the test portal), and a server loads it as
+    // it is: a configuration of another selection, naming it in preload or
+    // not, downloads nothing into it and leaves its index. Here europe laid
+    // out as an index of nothing, loaded as a server starts, and a switch to
+    // water all, then to the poi tier major as well with europe preloaded.
+    #[tokio::test]
+    async fn a_continent_laid_out_by_other_means_is_never_downloaded_again() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let root = ScratchDir::new();
+        let dir = root.path().join("europe");
+        std::fs::create_dir(&dir).unwrap();
+        make_loadable(&dir);
+        let mi = MultiIndex::load(root.path().to_str().unwrap(), 17, 10, 660.0).unwrap();
+        let mut state = RegionState::new(Arc::new(mi), root.path().to_path_buf());
+        state.config.get_mut().base_url = bucket.url.clone();
+        let state = Arc::new(state);
+        let slot = state.multi_index.continents.iter().find(|c| c.name == "europe").unwrap();
+        let (was, files) = (slot.index.load_full().expect("the dir laid out loads"), tree(&dir));
+        let cfg = state.get_configuration().await;
+
+        for cfg in [
+            Configuration { water: "all".into(), ..cfg.clone() },
+            Configuration { water: "all".into(), poi_tier: "major".into(), preload: vec!["europe".into()], ..cfg.clone() },
+        ] {
+            for task in state.configure(cfg.clone()).await.unwrap() {
+                task.await.unwrap();
+            }
+
+            assert_eq!(bucket.files_served(), 0, "{cfg:?}");
+            assert!(Arc::ptr_eq(&was, &slot.index.load_full().unwrap()), "{cfg:?}");
+            assert!(tree(&dir) == files, "{cfg:?}: {:?}", tree(&dir).keys().collect::<Vec<_>>());
+        }
     }
 
     // A loaded region whose download of a new selection fails answers from
