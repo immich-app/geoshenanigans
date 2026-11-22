@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include <s2/s2cell_id.h>
+
 #include "arc_blocks.h"
 #include "captured_stderr.h"
 #include "scratch_dir.h"
@@ -550,6 +552,49 @@ TEST(a_water_dir_holding_a_marine_area_credits_marine_regions) {
     write(lake, root.path() + "/lake");
     CHECK(text_of(bytes_of(root.path() + "/lake/water/all/exact/attribution.json")).find("marine-regions") ==
           std::string::npos);
+}
+
+TEST(a_regions_share_counts_the_cells_around_its_own_and_each_polygon_they_list_whole) {
+    const Layer planet = build(with_marine());
+    // Region 0 holds one cell of the ocean's big square alone, region 1
+    // every cell, region 2 none.
+    uint64_t one = 0;
+    for (const CellItemPair& c : planet.cells)
+        if ((c.item_id & ID_MASK) == 4) one = c.cell_id;
+    REQUIRE(one != 0);
+    const std::vector<uint8_t> masks = routed_cell_masks(planet.cells, 3, [&](size_t r, uint64_t cell) {
+        return r == 1 || (r == 0 && cell == one);
+    }, 2);
+    // Region 0 keeps that cell and the cells around it, as its split routes
+    // them.
+    std::vector<S2CellId> around;
+    S2CellId(one).AppendAllNeighbors(S2CellId(one).level(), &around);
+    std::set<uint64_t> routed = {one};
+    for (S2CellId c : around) routed.insert(c.id());
+    size_t near = 0;
+    for (size_t i = 0; i < planet.cells.size(); i++) {
+        CHECK_EQ(int(masks[i] >> 0 & 1), int(routed.count(planet.cells[i].cell_id)));
+        CHECK_EQ(int(masks[i] >> 1 & 1), 1);
+        CHECK_EQ(int(masks[i] >> 2 & 1), 0);
+        near += routed.count(planet.cells[i].cell_id);
+    }
+    REQUIRE(near > 0 && near < planet.cells.size());
+    // Each share's bytes: at least what its subset holds once its arc slots
+    // are made, the polygons its cells list whole, and none for a region of
+    // no cells.
+    const std::vector<uint64_t> shares = share_bytes(planet, masks, 3);
+    for (int r = 0; r < 2; r++) {
+        std::vector<uint8_t> kept(planet.cells.size());
+        for (size_t i = 0; i < kept.size(); i++) kept[i] = masks[i] >> r & 1;
+        Layer region = subset_layer(planet, kept, 2);
+        {
+            const gctest::CapturedStderr log;
+            assign_region_arc_slots(region.arcs, "", "test", 0);
+        }
+        CHECK(shares[r] >= region.bytes());
+        CHECK(shares[r] <= 2 * region.bytes());
+    }
+    CHECK_EQ(shares[2], uint64_t(0));
 }
 
 TEST(marine_areas_keep_their_slots_from_one_day_to_the_next) {

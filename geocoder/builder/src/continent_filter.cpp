@@ -51,7 +51,7 @@ static bool cell_in_bbox(uint64_t cell_id, const ContinentBBox& bbox) {
 // record classes), hand-written bbox fallback otherwise. The bbox-only test
 // dropped admin data for zones the bboxes miss but the Geofabrik polygons
 // cover (Guam, Adak, the Azores, island territories).
-static bool cell_in_continent(uint64_t cell_id, const ContinentBBox& bbox, const PolygonIndex* polygon) {
+bool cell_in_continent(uint64_t cell_id, const ContinentBBox& bbox, const PolygonIndex* polygon) {
     if (!polygon) return cell_in_bbox(cell_id, bbox);
     S2CellId cell(cell_id);
     S2LatLng center = cell.ToLatLng();

@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#include "admin_cover.h"
 #include "cell_index.h"
 #include "cell_index_io.h"
 #include "exact_pip.h"
@@ -1173,6 +1174,76 @@ Layer subset_layer(const Layer& planet, const std::vector<uint8_t>& kept, unsign
         const CellItemPair& c = planet.cells[i];
         found.push_back({c.cell_id, static_cast<uint32_t>(polygons.index(c.item_id & ID_MASK)) | (c.item_id & INTERIOR_FLAG)});
     }, threads);
+    return out;
+}
+
+std::vector<uint8_t> routed_cell_masks(const std::vector<CellItemPair>& cells, size_t regions,
+                                       const std::function<bool(size_t, uint64_t)>& holds, unsigned threads) {
+    if (regions > 8) throw std::logic_error("routed_cell_masks: more than 8 regions");
+    if (threads == 0) threads = parallel_threads();
+    std::vector<uint8_t> masks(cells.size(), 0);
+    parallel_for_runs(cells.size(), [&](size_t i) { return cells[i].cell_id == cells[i - 1].cell_id; },
+                      [&](size_t begin, size_t end, unsigned) {
+        std::vector<std::function<bool(uint64_t)>> held;
+        for (size_t r = 0; r < regions; r++) held.push_back([&holds, r](uint64_t cell) { return holds(r, cell); });
+        for (size_t i = begin; i < end;) {
+            const uint64_t cell = cells[i].cell_id;
+            uint8_t mask = 0;
+            for (size_t r = 0; r < regions; r++)
+                if (admin_cell_routed(cell, held[r])) mask |= static_cast<uint8_t>(1u << r);
+            for (; i < end && cells[i].cell_id == cell; i++) masks[i] = mask;
+        }
+    }, threads);
+    return masks;
+}
+
+std::vector<uint64_t> share_bytes(const Layer& planet, const std::vector<uint8_t>& masks, size_t regions) {
+    if (regions > 8) throw std::logic_error("share_bytes: more than 8 regions");
+    if (masks.size() != planet.cells.size()) throw std::logic_error("water cell masks out of step with the cells");
+    std::vector<uint64_t> out(regions, 0);
+    auto add = [&](uint8_t mask, uint64_t bytes) {
+        for (size_t r = 0; r < regions; r++)
+            if (mask >> r & 1) out[r] += bytes;
+    };
+    // The regions of each polygon its cells give it, and the entries.
+    std::vector<uint8_t> of_polygon(planet.size(), 0);
+    uint8_t any = 0;
+    for (size_t i = 0; i < masks.size(); i++) {
+        of_polygon[planet.cells[i].item_id & ID_MASK] |= masks[i];
+        any |= masks[i];
+        add(masks[i], sizeof(CellItemPair));
+    }
+    // The last offsets of a region's ring refs and of each tier's blocks.
+    const ArcStage& stage = *planet.arcs.stage;
+    add(any, (1 + stage.tier_count) * sizeof(uint32_t));
+    // Each polygon's: its record, identities and marks, its name, its rings'
+    // refs and its ring blocks; and the regions of each arc its rings use.
+    const ArcSetBlocks& set = planet.arcs.set(ArcSet::Full);
+    std::vector<uint8_t> of_arc(set.arcs(), 0);
+    constexpr uint64_t kPolygonBytes =
+        sizeof(AdminPolygon) + 2 * sizeof(uint64_t) + 2 * sizeof(uint8_t) + sizeof(AdminArcPolygon);
+    for (size_t p = 0; p < planet.size(); p++) {
+        const uint8_t mask = of_polygon[p];
+        if (!mask) continue;
+        const AdminArcPolygon& poly = planet.arcs.polygons[p];
+        uint64_t bytes = kPolygonBytes + poly.blocks[0].size + poly.blocks[1].size +
+                         std::strlen(planet.names.data() + planet.records[p].name_id) + 1;
+        for (uint32_t r = poly.first_ring; r < poly.first_ring + poly.ring_count; r++) {
+            bytes += sizeof(uint32_t) + (set.ring_refs[r + 1] - set.ring_refs[r]) * sizeof(ArcRef);
+            for (uint32_t k = set.ring_refs[r]; k < set.ring_refs[r + 1]; k++) of_arc[set.refs[k].arc] |= mask;
+        }
+        add(mask, bytes);
+    }
+    // Each arc's: its box, keys and slots, and its blocks in every tier.
+    constexpr uint64_t kArcBytes = sizeof(ArcBox) + sizeof(uint64_t) + sizeof(ArcFallbackKeys) + 2 * sizeof(uint32_t) +
+                                   sizeof(gc::id_alloc::SidecarSlot);
+    for (size_t a = 0; a < of_arc.size(); a++) {
+        if (!of_arc[a]) continue;
+        uint64_t bytes = kArcBytes;
+        for (size_t t = 0; t < stage.tier_count; t++)
+            if (!planet.arcs.tiers[t].at.empty()) bytes += planet.arcs.tiers[t].bytes_of(a) + sizeof(uint32_t);
+        add(of_arc[a], bytes);
+    }
     return out;
 }
 

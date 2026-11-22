@@ -31,19 +31,45 @@ TEST(continent_share_scales_each_kind_by_its_pairs) {
     CHECK((continent_share(planet, kinds(0, 0, 0, 0, 0, 0), kinds(0, 0, 0, 0, 0, 0)) == kinds(0, 0, 0, 0, 0, 0)));
 }
 
-TEST(continent_share_gives_the_waters_their_own_cells_share_and_leaves_them_out_of_the_admins) {
+TEST(continent_share_gives_the_waters_what_their_share_holds_and_leaves_them_out_of_the_admins) {
     KindValues planet = kinds(1000, 2000, 300, 400, 100, 600), planet_pairs = kinds(100, 200, 30, 40, 10, 0),
                continent = kinds(50, 20, 0, 40, 1, 0);
     at(planet, RecordKind::Waters) = 5000;
-    // Without water cells the waters take the admins' share.
-    CHECK_EQ(at(continent_share(planet, planet_pairs, continent), RecordKind::Waters), uint64_t(1606));
-    // With them, their own (800 of 1000), with the margin; the admins' share
-    // is the other kinds' as before.
+    // The waters take the bytes given them, whatever share of the water
+    // cells the continent holds (a polygon of one of its cells comes whole);
+    // none given, none.
     at(planet_pairs, RecordKind::Waters) = 1000;
-    at(continent, RecordKind::Waters) = 800;
-    const KindValues share = continent_share(planet, planet_pairs, continent);
-    CHECK_EQ(at(share, RecordKind::Waters), uint64_t(4400));
+    at(continent, RecordKind::Waters) = 10;
+    const KindValues share = continent_share(planet, planet_pairs, continent, 3000);
+    CHECK_EQ(at(share, RecordKind::Waters), uint64_t(3000));
+    CHECK_EQ(at(continent_share(planet, planet_pairs, continent), RecordKind::Waters), uint64_t(0));
+    // The admins' share is the other kinds', the waters left out.
     CHECK_EQ(at(share, RecordKind::Admins), uint64_t(600 * 1110 / 3800 * 110 / 100));
+    CHECK((continent_share(planet, planet_pairs, continent, 3000) == [&] {
+        KindValues without = continent_share(planet, kinds(100, 200, 30, 40, 10, 0), kinds(50, 20, 0, 40, 1, 0));
+        at(without, RecordKind::Waters) = 3000;
+        return without;
+    }()));
+}
+
+TEST(the_water_stage_holds_three_times_its_cells_beside_its_share_of_the_rest) {
+    // A layer of 1 GiB, a quarter of it its 32 Mi cell entries of 8 bytes.
+    KindValues bytes = kinds(0, 0, 0, 0, 0, 0);
+    at(bytes, RecordKind::Waters) = kGiB;
+    const uint64_t pairs = kGiB / 4 / sizeof(CellItemPair);
+    // The cells renumbered, collected in parts beside the copy and sorted
+    // through a buffer: three times them, on top of the share of the rest.
+    CHECK_EQ(stage_costs(bytes, pairs).water, 3 * kGiB / 4 * kWaterStageWaterTenths / 10 + 3 * (kGiB / 4));
+    CHECK_EQ(stage_costs(bytes).water, kGiB * kWaterStageWaterTenths / 10);
+    // A layer of cells alone needs three times itself, past the share alone.
+    const uint64_t all = kGiB / sizeof(CellItemPair);
+    CHECK_EQ(stage_costs(bytes, all).water, 3 * kGiB);
+    CHECK(stage_costs(bytes, all).water > stage_costs(bytes).water);
+    // The reservations carry it.
+    const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
+    CHECK_EQ(region_peak(bytes, counts, 0, RunOrder::Serial, all), kGiB + 3 * kGiB);
+    CHECK_EQ(continent_cost(bytes, counts, 0, UINT64_MAX, all).bytes,
+             region_peak(bytes, counts, 0, RunOrder::Concurrent, all));
 }
 
 TEST(pair_counts_takes_the_water_cell_index_entries_for_the_waters_pairs) {
@@ -110,6 +136,9 @@ TEST(filter_cost_holds_the_water_splits_marks_over_the_planets_water_cells) {
     // the workers copy.
     CHECK_EQ(filter_cost(planet_counts, planet_pairs, pairs),
              uint64_t(240 * 4 + 240 * 3 / 8 + 50 * 16 / 2 + 1000 * kFilterWaterBytesPerPair));
+    // An entry a cell at most: its mark, the cell's mark, and the cell's
+    // start in the output beside the workers' parts, which grow to twice it.
+    CHECK(kFilterWaterBytesPerPair >= 1 + 1 + 8 + 2 * 8);
 }
 
 TEST(continent_cost_runs_steps_one_at_a_time_only_past_the_budget) {

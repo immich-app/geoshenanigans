@@ -298,6 +298,22 @@ Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::
 // (subset_admin_arcs, no slots yet), names and those cells' entries.
 Layer subset_layer(const Layer& planet, const std::vector<uint8_t>& kept, unsigned threads = 0);
 
+// Which of `regions` regions (up to 8) keep each entry of a water cell index
+// `cells` (sorted by cell) as a continent's split does (subset_layer's
+// `kept`): bit r where region r holds the entry's cell or one around it
+// (admin_cell_routed), `holds(r, cell)` saying whether it holds a cell.
+std::vector<uint8_t> routed_cell_masks(const std::vector<CellItemPair>& cells, size_t regions,
+                                       const std::function<bool(size_t, uint64_t)>& holds, unsigned threads = 0);
+
+// About what each of `regions` regions' shares of `planet` hold (up to 8;
+// region r's share subset_layer of the cells whose masks[i] has bit r) once
+// its arc slots and ring blocks are made: every polygon those cells list,
+// whole, with its record, identities, name, rings and ring blocks, every
+// arc of its rings with that arc's keys, slots and blocks in every tier,
+// and the entries. A name a few polygons share counts for each: a little
+// over, never under.
+std::vector<uint64_t> share_bytes(const Layer& planet, const std::vector<uint8_t>& masks, size_t regions);
+
 // The rows of the fame rule the major tier could take instead: objects of
 // kMajorAreaKm2 or more, and those whose wikidata item has `min_sitelinks`
 // sitelinks or more (`sitelinks` of a QID, 0 for none), with their simplified
