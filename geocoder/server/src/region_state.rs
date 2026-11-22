@@ -6,7 +6,7 @@
 // Two flows feed this:
 //
 // 1. Configuration push (PUT /admin/configuration): full snapshot of what
-//    regions the user wants, plus mode/quality/poi_tier. Server preloads
+//    regions the user wants, plus mode/quality/poi_tier/water. Server preloads
 //    regions in the snapshot that aren't already on disk.
 //
 // 2. Lazy on-demand: a /reverse request lands on a continent we don't
@@ -43,9 +43,10 @@ thread_local! {
     static ONCE_DOWNLOADED: std::cell::Cell<Option<Box<dyn FnOnce(&std::path::Path)>>> = const { std::cell::Cell::new(None) };
 }
 
-/// The selection a server downloads. A mode, quality or poi_tier its build
-/// has no component for fails each download, naming the values the build
-/// offers; a PUT naming one is refused when the build's manifest is at hand.
+/// The selection a server downloads. A mode, quality, poi_tier or water
+/// value its build has no component for fails each download, naming the
+/// values the build offers; a PUT naming one is refused when the build's
+/// manifest is at hand.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Configuration {
     /// Base URL for the geocoder build artifacts. Latest.json + each
@@ -60,6 +61,11 @@ pub struct Configuration {
     /// POI tier ("none", "major", "notable", "all"). Must match a
     /// `poi_tier.*` component.
     pub poi_tier: String,
+    /// Bodies of water ("none", "major", "all", "all-exact"), in each
+    /// region's water/ dir. Must match a `water.*` component; "none", the
+    /// axis's default, where the configuration names none.
+    #[serde(default = "water_none")]
+    pub water: String,
     /// Regions to preload on configuration push. Anything not listed
     /// here can still be downloaded lazily on first request.
     #[serde(default)]
@@ -74,9 +80,15 @@ impl Default for Configuration {
             mode: "admin".to_string(),
             quality: "simplified".to_string(),
             poi_tier: "none".to_string(),
+            water: water_none(),
             preload: Vec::new(),
         }
     }
+}
+
+/// The water axis's default: no water.
+fn water_none() -> String {
+    "none".to_string()
 }
 
 impl Configuration {
@@ -86,6 +98,7 @@ impl Configuration {
             mode: self.mode.clone(),
             quality: self.quality.clone(),
             poi_tier: self.poi_tier.clone(),
+            water: self.water.clone(),
         }
     }
 }
@@ -138,7 +151,7 @@ impl RegionState {
     /// disk. Returns immediately — downloads run as tokio tasks.
     ///
     /// Refused, changing nothing, when the manifest at hand has no
-    /// component for its mode, quality or poi_tier.
+    /// component for its mode, quality, poi_tier or water.
     pub async fn set_configuration(self: &Arc<Self>, new_cfg: Configuration) -> Result<(), DownloadError> {
         // The manifest at hand: the cached one, when it is of this base_url
         // and within its TTL. Without one the first download reports a
@@ -394,6 +407,8 @@ mod tests {
              "this build has no quality \"q2.5\"; it offers quality: exact, simplified"),
             (Configuration { mode: "ful".into(), ..before.clone() },
              "this build has no mode \"ful\"; it offers mode: admin, admin-minimal, full, no-addresses"),
+            (Configuration { water: "lakes".into(), ..before.clone() },
+             "this build has no water \"lakes\"; it offers water: all, all-exact, major, none"),
         ] {
             let got = state.set_configuration(cfg).await.map_err(|e| e.to_string());
 
@@ -405,6 +420,22 @@ mod tests {
 
         state.set_configuration(Configuration { quality: "exact".into(), ..before.clone() }).await.unwrap();
         assert_eq!(state.get_configuration().await.quality, "exact");
+        state.set_configuration(Configuration { water: "all-exact".into(), ..before.clone() }).await.unwrap();
+        assert_eq!(state.get_configuration().await.selection("europe").water, "all-exact");
+    }
+
+    // A configuration's water is a value of the water axis, "none" where it
+    // names none: in a PUT's body as in a configuration.json kept on disk.
+    #[test]
+    fn a_configuration_naming_no_water_takes_none() {
+        let body = r#"{"base_url": "http://bucket", "mode": "full", "quality": "exact", "poi_tier": "all"}"#;
+        let named = r#"{"base_url": "http://bucket", "mode": "full", "quality": "exact", "poi_tier": "all", "water": "major"}"#;
+
+        let water = |json: &str| serde_json::from_str::<Configuration>(json).unwrap().selection("europe").water;
+
+        assert_eq!((water(body), water(named)), ("none".to_string(), "major".to_string()));
+        assert_eq!(Configuration::default().water, "none");
+        assert_eq!(serde_json::to_value(Configuration::default()).unwrap()["water"], "none");
     }
 
     // The manifest at hand is the cached one of the configuration's own
