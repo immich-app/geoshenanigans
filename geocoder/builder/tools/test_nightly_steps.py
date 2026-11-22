@@ -274,9 +274,9 @@ echo pbf > "$d/$o"
 """
 
 
-# s5cmd as the nightly's steps run it: each call appends its arguments to $WORKDIR/s5cmd.log, and a `run` each line
-# of the commands it reads (on stdin, or from the file it names), as it reads them.
-FAKE_S5CMD = r"""#!/bin/sh
+# s5cmd as the patch step runs it: each call appends its arguments to $WORKDIR/s5cmd.log, and a `run` each line of
+# the commands it reads (on stdin, or from the file it names), as it reads them.
+LOGGING_S5CMD = r"""#!/bin/sh
 echo "$*" >> "$WORKDIR/s5cmd.log"
 for last; do :; done
 case $last in
@@ -895,7 +895,7 @@ class PostBuildTest(unittest.TestCase):
 
     def run_patch_step(self, compress=None, fetch_status=None, slow_setsid=False, at_sleep=""):
         """Runs Generate patches and verify as Actions runs it, with geocoder-transport built and the place search
-        done, a generate_patches.sh and checksums.sh that do nothing else, FAKE_S5CMD, sleeps of 10 ms that first run
+        done, a generate_patches.sh and checksums.sh that do nothing else, LOGGING_S5CMD, sleeps of 10 ms that first run
         `at_sleep` (shell), a clock that runs the seconds in $WORKDIR/clock ahead, and as compress_index.py
         `compress` (Python, its argv compress_index.py's) on a night of no variants, or (None) compress_index.py
         itself on one of a .bin file and its sidecar; yesterday's fetch has ended with `fetch_status` (None: not
@@ -911,7 +911,7 @@ class PostBuildTest(unittest.TestCase):
             os.makedirs(d)
         fakes = {os.path.join(tools, "generate_patches.sh"): "#!/bin/sh\nexit 0\n",
                  os.path.join(tools, "checksums.sh"): "#!/bin/sh\nexit 0\n",
-                 os.path.join(bin_dir, "s5cmd"): FAKE_S5CMD,
+                 os.path.join(bin_dir, "s5cmd"): LOGGING_S5CMD,
                  os.path.join(bin_dir, "sleep"): f"#!/bin/sh\n{at_sleep}\nexec /usr/bin/sleep 0.01\n",
                  os.path.join(bin_dir, "date"): FAKE_DATE.format(date=shutil.which("date")),
                  os.path.join(work, "old-output.log"): "",
@@ -948,7 +948,7 @@ class PostBuildTest(unittest.TestCase):
         return done, work
 
     def s5cmd_calls(self, work):
-        """What FAKE_S5CMD logged: each call's arguments, and each command a `run` read."""
+        """What LOGGING_S5CMD logged: each call's arguments, and each command a `run` read."""
         if not os.path.exists(os.path.join(work, "s5cmd.log")):
             return []
         with open(os.path.join(work, "s5cmd.log")) as f:
