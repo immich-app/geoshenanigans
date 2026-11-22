@@ -217,7 +217,20 @@ selection's files answers, and name the dataset and build that answered in
 volume's alone).
 `/datasets` lists the datasets with their labels and sizes, and the
 combinations the constraints exclude with their messages; `/health` gives
-the build served and how its sync goes. The page asks `/datasets` anew
+the build served and how its sync goes.
+Water is no axis of the portal's datasets (each is the selection of water
+`none`): each other water value the build has files of (`major`, `all`,
+`all-exact`) is a water dir the sync links into `sets/water/<value>/` and
+the portal loads once, for every dataset. `/reverse` takes `water=` (`none`
+or one of those, `all` without one where the build has it; another value is
+a 400 naming those it has), answers the dataset's address with that water
+dir's `water` field as a dataset whose `water/` dir holds those files
+answers it (debug=all's result too), and names it in `X-Geocoder-Water`.
+`/datasets` lists them under `water` (`default`, and `values`: `none`, then
+each with its sizes), `null` for a build without; `/health`'s `water` names
+their dirs. The page's header has a toggle of them (`w=` in its URL where it
+is not the default), shows each column's water under its answer and
+compares it in a Water row of the field table; the Immich column has none. The page asks `/datasets` anew
 once `/health` names another publication ID, and cancels a polygon
 request once a newer one or a clear supersedes it.
 Its `/search` takes `dataset=` too, `q=` (what to search for, 1 to 256
