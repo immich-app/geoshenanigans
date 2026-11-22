@@ -374,9 +374,11 @@ def _valid_parts(item):
 def _read_seas(path, pool):
     """The sea areas: each MRGID's name, and its parts as (mrgid, wkb), valid and on the e7 grid."""
     import pyogrio
-    _, _, geoms, fields = pyogrio.raw.read(path, columns=["iho_mrgid", "iho_sea"])
+    # The fields come in the source's order, whatever the order asked for: each is taken by its name.
+    meta, _, geoms, fields = pyogrio.raw.read(path, columns=["iho_mrgid", "iho_sea"])
+    field = dict(zip(meta["fields"], fields))
     names, features = {}, []
-    for wkb, mrgid, name in zip(geoms, fields[0], fields[1]):
+    for wkb, mrgid, name in zip(geoms, field["iho_mrgid"], field["iho_sea"]):
         if wkb is None or not name:
             continue
         mrgid = int(mrgid)
@@ -412,16 +414,16 @@ def build(opts):
     def log(message):
         print(f"[{time.time() - started:7.1f}s] {message}", flush=True)
 
+    if opts.stats and os.path.realpath(opts.stats) == os.path.realpath(opts.output):
+        raise ValueError(f"--stats {opts.stats} is the output, -o {opts.output}")
     bbox = tuple(float(v) for v in opts.bbox.split(",")) if opts.bbox else None
     ctx = multiprocessing.get_context("fork")
     tiles = {}
     with ctx.Pool(opts.workers) as pool:
         names, parts = _read_seas(opts.eez_iho, pool)
         log(f"{len(names)} sea areas in {len(parts)} parts")
-        if bbox:
-            box = shapely.box(bbox[0] - 1, bbox[1] - 1, bbox[2] + 1, bbox[3] + 1)
-            parts = [(m, w) for m, w in parts if shapely.intersects(shapely.from_wkb(w), box)]
-        # The costliest parts first, so the last one doesn't run alone.
+        # Every part, --bbox or not: a tile's water goes by the sea areas in the tiles around it, across the
+        # antimeridian too. The costliest first, so the last one doesn't run alone.
         order = sorted(parts, key=lambda p: -len(p[1]))
         for pieces in pool.imap_unordered(_split_into_tiles, order):
             for key, mrgid, wkb in pieces:

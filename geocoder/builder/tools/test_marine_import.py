@@ -109,14 +109,15 @@ class BuildTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         d = self.dir.name
+        # Each feature's fields in the other order from the WFS's (iho_mrgid, then iho_sea).
         seas = [
             # The west sea in two EEZs, together 10.0-10.5 x 50.0-50.7: short of the coast at 50.8, and with a
             # hole round the island that's bigger than it.
-            feature({"iho_mrgid": 2350, "iho_sea": "North Sea"},
+            feature({"iho_sea": "North Sea", "iho_mrgid": 2350},
                     [square(10.0, 50.0, 10.3, 50.7), square(10.1, 50.2, 10.25, 50.35)]),
-            feature({"iho_mrgid": 2350, "iho_sea": "North Sea"}, [square(10.3, 50.0, 10.5, 50.7)]),
+            feature({"iho_sea": "North Sea", "iho_mrgid": 2350}, [square(10.3, 50.0, 10.5, 50.7)]),
             # The east sea, 10.5-11.0 x 50.0-50.7, reaching into the next tile east.
-            feature({"iho_mrgid": 1902, "iho_sea": "North Atlantic Ocean"}, [square(10.5, 50.0, 11.5, 50.7)]),
+            feature({"iho_sea": "North Atlantic Ocean", "iho_mrgid": 1902}, [square(10.5, 50.0, 11.5, 50.7)]),
         ]
         land = [
             feature({}, [square(5.0, 45.0, 15.0, 55.0), square(10.0, 50.0, 12.0, 50.8)]),
@@ -233,6 +234,44 @@ class BuildTest(unittest.TestCase):
         notch = shapely.Point(10.44, 50.03)
         self.assertTrue(objects[2].contains(notch))
         self.assertFalse(objects[1].intersects(notch))
+
+    def test_a_bounded_run_gives_its_tiles_as_the_whole_run_does(self):
+        # Water 10-12 east and 179 east to 179 west, 50-51 north; a sea area in each first tile, more than a
+        # degree from the next tile's centre (and across the antimeridian from it, for the second).
+        seas = self.write("near.geojson", [
+            feature({"iho_mrgid": 10, "iho_sea": "West Sea"}, [square(10.0, 50.0, 10.45, 51.0)]),
+            feature({"iho_mrgid": 20, "iho_sea": "Date Line Sea"}, [square(179.0, 50.0, 179.4, 51.0)]),
+        ])
+        land = self.write("bands.geojson", [
+            feature({}, [square(5.0, 45.0, 15.0, 55.0), square(10.0, 50.0, 12.0, 51.0)]),
+            feature({}, [square(170.0, 45.0, 180.0, 55.0), square(179.0, 50.0, 180.0, 51.0)]),
+            feature({}, [square(-180.0, 45.0, -170.0, 55.0), square(-180.0, 50.0, -179.0, 51.0)]),
+        ])
+        whole, _ = self.build("whole.bin", seas=seas, land=land)
+        for bbox in ("11.5,50.5,11.5,50.5", "-179.5,50.5,-179.5,50.5"):
+            with self.subTest(bbox=bbox):
+                west, south, east, north = (float(v) for v in bbox.split(","))
+
+                def in_bbox(rings):
+                    x = min(lon for lat, lon in rings[0]) // 10000000
+                    y = min(lat for lat, lon in rings[0]) // 10000000
+                    return west <= x + 0.5 <= east and south <= y + 0.5 <= north
+
+                expected = [(oid, kind, name, [p for p in polygons if in_bbox(p)])
+                            for oid, kind, name, polygons in marine_import.read_marine(whole)]
+                expected = [o for o in expected if o[3]]
+                self.assertEqual(len(expected), 1)
+                bounded, _ = self.build("bounded.bin", seas=seas, land=land, more=[f"--bbox={bbox}"])
+                self.assertEqual(marine_import.read_marine(bounded), expected)
+
+    def test_a_stats_path_that_is_the_output_is_refused(self):
+        out = os.path.join(self.dir.name, "marine_areas.bin")
+        os.symlink(self.dir.name, os.path.join(self.dir.name, "link"))
+        for stats in (out, os.path.join(self.dir.name, ".", "marine_areas.bin"),
+                      os.path.join(self.dir.name, "link", "marine_areas.bin")):
+            with self.subTest(stats=stats), self.assertRaisesRegex(ValueError, "--stats"):
+                self.run_build(out, stats)
+            self.assertFalse(os.path.exists(out))
 
 
 if __name__ == "__main__":
