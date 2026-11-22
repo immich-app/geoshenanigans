@@ -385,7 +385,8 @@ TEST(the_water_dirs_hold_every_file_and_keep_each_polygons_slot_the_next_day) {
     CHECK(!files.count("water/all/simplified/admin_polygons.osm_ids"));
     // The two tiers of the all set: one set of records, rings, cells and
     // names; their own arcs.
-    for (const char* f : {"admin_polygons.bin", "admin_rings.bin", "admin_cells.bin", "strings_core.bin", "water_meta.json"})
+    for (const char* f : {"admin_polygons.bin", "admin_rings.bin", "admin_cells.bin", "admin_entries.bin",
+                          "strings_core.bin", "strings_layout.json", "water_meta.json", "attribution.json"})
         CHECK(files.at(std::string("water/all/simplified/") + f) == files.at(std::string("water/all/exact/") + f));
     CHECK(files.at("water/all/exact/admin_polygons.bin").size() == 4 * sizeof(AdminPolygonRecord));
     CHECK(files.at("water/major/simplified/admin_polygons.bin").empty());

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -74,6 +75,13 @@ std::optional<std::string> read_text(const std::string& path) {
     s << f.rdbuf();
     if (f.bad()) return std::nullopt;
     return s.str();
+}
+
+// Copies the file written at `from` to `to`; a copy that fails is refused.
+void copy_written(const std::string& from, const std::string& to) {
+    std::error_code ec;
+    std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) throw std::runtime_error("failed to copy " + from + " to " + to + ": " + ec.message());
 }
 
 void write_text(const std::string& path, const std::string& text) {
@@ -1360,8 +1368,11 @@ std::string write_set(const Layer& layer, const std::vector<uint32_t>& ids, cons
     std::array<uint32_t, STR_TIER_COUNT + 1> bases;
     bases.fill(static_cast<uint32_t>(names.bytes().size()));
     bases[0] = 0;
+    // The cell index encoded once, its files copied to the other dirs.
+    write_cell_index_sorted(dirs[0] + "/admin_cells.bin", dirs[0] + "/admin_entries.bin", cell_pairs::ADMIN, cells);
+    for (size_t d = 1; d < dirs.size(); d++)
+        for (const char* f : {"/admin_cells.bin", "/admin_entries.bin"}) copy_written(dirs[0] + f, dirs[d] + f);
     for (const std::string& dir : dirs) {
-        write_cell_index_sorted(dir + "/admin_cells.bin", dir + "/admin_entries.bin", cell_pairs::ADMIN, cells);
         string_files::write_file(dir + "/" + STR_TIER_FILENAMES[0], names.bytes().data(), names.bytes().size());
         write_strings_layout(dir, bases);
         write_text(dir + "/water_meta.json", meta);
