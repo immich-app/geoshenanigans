@@ -38,6 +38,11 @@ pub struct Manifest {
     /// builds every index itself and only compares those with these.
     #[serde(default)]
     pub search_index: Option<serde_json::Value>,
+    /// The credit of the build's data (its sources, their licences and
+    /// notices), as it is: /datasets passes it on for the page to show,
+    /// which reads what it can of it.
+    #[serde(default)]
+    pub attribution: Option<serde_json::Value>,
 }
 
 /// The manifest's search_index: the dir of a selection's index (its axes'
@@ -224,6 +229,8 @@ pub struct Plan {
     /// The groups of datasets whose place search is one index, in the order
     /// of their first datasets.
     pub groups: Vec<Group>,
+    /// The manifest's attribution, as it is.
+    pub attribution: Option<serde_json::Value>,
 }
 
 /// The values of an axis of `manifest`, in their order (by key where two
@@ -455,6 +462,7 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
         presets,
         default,
         groups,
+        attribution: manifest.attribution.clone(),
     })
 }
 
@@ -526,7 +534,8 @@ impl Plan {
     }
 
     /// What /datasets answers while the build of the publication ID `id`
-    /// (sync::publication_id) is served from its dir `dir`.
+    /// (sync::publication_id) is served from its dir `dir`: its attribution
+    /// as the manifest has it, null where it has none.
     pub fn json(&self, id: &str, dir: &str) -> serde_json::Value {
         let selection = |s: &RegionSelection| {
             serde_json::json!({ "region": s.region, "mode": s.mode, "quality": s.quality, "poi_tier": s.poi_tier })
@@ -565,6 +574,7 @@ impl Plan {
                 "message": x.message,
                 "requires": x.requires,
             })).collect::<Vec<_>>(),
+            "attribution": self.attribution,
         })
     }
 }

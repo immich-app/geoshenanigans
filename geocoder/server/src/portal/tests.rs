@@ -1551,6 +1551,31 @@ async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_excl
         }
     }
     assert!(t["axes"]["mode"]["values"]["full"]["description"].is_string());
+    // The build's credit, as its manifest has it (the template's): null where
+    // it has none.
+    assert_eq!(json["attribution"], t["attribution"]);
+}
+
+// /datasets passes on the credit of the build's data, its manifest's
+// attribution, as it is, for the page to show: null where the manifest has
+// none.
+#[tokio::test]
+async fn datasets_passes_on_the_builds_attribution_as_it_is() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let credit = serde_json::json!([{
+        "id": "osm", "text": "© OpenStreetMap contributors", "url": "https://www.openstreetmap.org/copyright",
+        "licence": "ODbL 1.0", "licence_url": "https://opendatacommons.org/licenses/odbl/1-0/",
+        "notices": ["This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0."],
+        "applies_to": ["mode.*"],
+    }]);
+    for (given, listed) in [(credit.clone(), credit), ("no list".into(), "no list".into())] {
+        let plan = plan_edited(&bucket, |m| m["attribution"] = given).await.unwrap();
+        assert_eq!(plan.json("id", "dir")["attribution"], listed);
+    }
+    let plan = plan_edited(&bucket, |m| {
+        m.as_object_mut().unwrap().remove("attribution");
+    }).await.unwrap();
+    assert_eq!(plan.json("id", "dir")["attribution"], serde_json::Value::Null);
 }
 
 // The lookups run a few at once over every client, each on a blocking
