@@ -891,12 +891,12 @@ std::vector<uint8_t> held_before(const std::vector<uint64_t>& ids, const std::ve
     return out;
 }
 
-// Each polygon's slot identity and fallback key. Two polygons that still
-// share an identity (rings alike at their corners) are told apart by their
-// fallback keys, which no two share: the one of the smaller keeps it, the
-// other takes one of its own key mixed in, the same from day to day. Returns
-// how many took one so.
-size_t identities_of(const Build& b, std::vector<uint64_t>& ids, std::vector<uint64_t>& fallbacks) {
+}  // namespace
+
+PolygonIdentities polygon_identities(const Build& b) {
+    PolygonIdentities out;
+    std::vector<uint64_t>& ids = out.ids;
+    std::vector<uint64_t>& fallbacks = out.fallbacks;
     const size_t n = b.rings.polygons.size();
     ids.resize(n);
     fallbacks.resize(n);
@@ -925,29 +925,25 @@ size_t identities_of(const Build& b, std::vector<uint64_t>& ids, std::vector<uin
     parallel_sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) {
         return ids[x] != ids[y] ? ids[x] < ids[y] : fallbacks[x] < fallbacks[y];
     });
-    size_t told_apart = 0;
     uint64_t before = 0;
     for (size_t k = 0; k < n; k++) {
         const uint32_t p = order[k];
         const uint64_t id = ids[p];
         if (k > 0 && id == before) {
             ids[p] = gc::id_alloc::make_key(ObjectType::SYNTHETIC, mix64(id ^ mix64(fallbacks[p] + 1)));
-            told_apart++;
+            out.told_apart++;
         }
         before = id;
     }
-    return told_apart;
+    return out;
 }
 
-}  // namespace
-
-std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const std::string& prev_planet_dir) {
+std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const PolygonIdentities& identities,
+                                    const std::string& prev_planet_dir) {
     const size_t n_objects = b.objects.size(), n_polygons = b.rings.polygons.size();
-    std::vector<uint64_t> ids, fallbacks;
-    identities_of(b, ids, fallbacks);
     size_t previous = 0;
-    const std::vector<uint8_t> held =
-        held_before(ids, fallbacks, prev_planet_dir.empty() ? "" : prev_planet_dir + "/water/major/simplified", previous);
+    const std::vector<uint8_t> held = held_before(identities.ids, identities.fallbacks,
+        prev_planet_dir.empty() ? "" : prev_planet_dir + "/water/major/simplified", previous);
     std::vector<uint8_t> was_major(n_objects, 0);
     for (size_t p = 0; p < n_polygons; p++)
         if (held[p]) was_major[b.object_of[p]] = 1;
@@ -1011,6 +1007,7 @@ std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const
     for (uint32_t o = 0; o < n_objects; o++) {
         const Object& obj = b.objects[o];
         auto keeps = [&](bool margin) {
+            if (obj.type == ObjectType::SYNTHETIC) return true;
             if (water_major_keeps(obj.km2, false, false, margin && was_major[o])) return true;
             if (!obj.tags.river_area) return false;
             const uint32_t g = groups.find(o);
@@ -1034,7 +1031,7 @@ std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const
 }
 
 Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::vector<uint8_t> major,
-                   AdminArcBlocks arcs, std::vector<CellItemPair> cells) {
+                   PolygonIdentities identities, AdminArcBlocks arcs, std::vector<CellItemPair> cells) {
     Layer out;
     out.types = std::move(types);
     const size_t n = b.rings.polygons.size();
@@ -1051,10 +1048,11 @@ Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::
         out.names.push_back('\0');
     }
     if (out.names.size() >= NO_DATA) throw std::length_error("water names past 4 GiB");
-    const size_t told_apart = identities_of(b, out.identities, out.fallbacks);
-    if (told_apart)
-        std::cerr << "  Water identities: " << told_apart << " polygons that shared one told apart by their fallback keys"
-                  << std::endl;
+    if (identities.told_apart)
+        std::cerr << "  Water identities: " << identities.told_apart
+                  << " polygons that shared one told apart by their fallback keys" << std::endl;
+    out.identities = std::move(identities.ids);
+    out.fallbacks = std::move(identities.fallbacks);
     out.records.resize(n);
     for (size_t p = 0; p < n; p++) {
         const Object& o = b.objects[b.object_of[p]];
@@ -1329,8 +1327,9 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
     log_phase("      Water: arcs", t, cpu);
     std::vector<CellItemPair> cells = compute_water_index_cells(arcs, b.rings, threads);
     log_phase("      Water: cells", t, cpu);
-    std::vector<uint8_t> major = major_polygons(b, arcs, prev_planet_dir);
-    Layer layer = planet_layer(b, types, std::move(major), std::move(blocks), std::move(cells));
+    PolygonIdentities identities = polygon_identities(b);
+    std::vector<uint8_t> major = major_polygons(b, arcs, identities, prev_planet_dir);
+    Layer layer = planet_layer(b, types, std::move(major), std::move(identities), std::move(blocks), std::move(cells));
     std::cerr << sitelinks_rows(b, layer, {10, 20, 40}, sitelinks);
     std::map<uint16_t, size_t> by_code;
     for (const AdminPolygon& r : layer.records) by_code[r.country_code]++;

@@ -463,6 +463,20 @@ TEST(marine_areas_are_objects_of_their_own_as_seas_and_oceans) {
     CHECK(shared >= 1);
 }
 
+TEST(a_marine_area_under_100_km2_is_in_the_major_tier_as_every_sea_and_ocean_is) {
+    // A sea of 0.002 x 0.002 degrees, as a marine file cut to a box may hold.
+    Collected c = fixture();
+    c.marine.push_back(marine_area(2351, marine::kSea, "Small Sea", {{square(kLat - 20000000, kLng, 20000, 4)}}));
+    const Layer layer = build(c);
+    size_t marine = 0;
+    for (size_t p = 0; p < layer.size(); p++)
+        if (layer.marine[p]) {
+            marine++;
+            CHECK(layer.major[p]);
+        }
+    CHECK_EQ(marine, size_t(1));
+}
+
 TEST(a_water_dir_holding_a_marine_area_credits_marine_regions) {
     const ScratchDir root("water-marine");
     write(build(with_marine()), root.path() + "/with");

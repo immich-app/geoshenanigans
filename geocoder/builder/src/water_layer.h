@@ -256,21 +256,36 @@ void split_polygons(Build& b, unsigned threads);
 // build (std::runtime_error), as the codes its records carry would move.
 std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_planet_dir);
 
-// The major tier of the planet (water_classify.h): each object by its own
-// area, and each river object by its river's, the river objects grouped by
-// their waterway relation (a naming key of one), by wikidata item (theirs,
-// or that of a line of their key in them) and by local name along river
-// polygons that share an arc. An object or river whose polygon the previous
-// planet build's major tier held keeps it at kMajorKeepPercent: the polygon
-// matched to a slot of the sidecars under water/major/simplified/ of
-// prev_planet_dir as that dir's slots match it, by identity, else by its
-// fallback key. Logs how many it holds.
-std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const std::string& prev_planet_dir);
+// Each polygon's slot identity and fallback key, by polygon: a way's by its
+// id; a relation's outer ring, or a marine area's, by the object and the
+// ring's smallest vertex (and its cut), with a fallback key by the object
+// and the ring's place. Two polygons that still share an identity (rings
+// alike at their corners) are told apart by their fallback keys, which no
+// two share: the one of the smaller keeps it, the other takes one of its own
+// key mixed in, the same from day to day; `told_apart` counts those.
+struct PolygonIdentities {
+    std::vector<uint64_t> ids, fallbacks;
+    size_t told_apart = 0;
+};
+PolygonIdentities polygon_identities(const Build& b);
+
+// The major tier of the planet (water_classify.h): every marine area, each
+// other object by its own area, and each river object by its river's, the
+// river objects grouped by their waterway relation (a naming key of one), by
+// wikidata item (theirs, or that of a line of their key in them) and by
+// local name along river polygons that share an arc. An object or river
+// whose polygon the previous planet build's major tier held keeps it at
+// kMajorKeepPercent: the polygon (its `identities`) matched to a slot of the
+// sidecars under water/major/simplified/ of prev_planet_dir as that dir's
+// slots match it, by identity, else by its fallback key. Logs how many it
+// holds.
+std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const PolygonIdentities& identities,
+                                    const std::string& prev_planet_dir);
 
 // The records, identities and names of the planet's layer (Layer), its
-// arcs and cells moved in.
+// identities, arcs and cells moved in.
 Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::vector<uint8_t> major,
-                   AdminArcBlocks arcs, std::vector<CellItemPair> cells);
+                   PolygonIdentities identities, AdminArcBlocks arcs, std::vector<CellItemPair> cells);
 
 // A region's share of the planet's layer: the polygons listed in the cells
 // `kept` marks (parallel to planet.cells), whole, with their arcs
