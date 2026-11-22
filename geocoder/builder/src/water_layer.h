@@ -302,16 +302,18 @@ std::string sitelinks_rows(const Build& b, const Layer& planet, const std::vecto
 // Writes a region's water dirs under region_dir/water (Layer, the region's
 // arc slots assigned): the all set's two tiers and the major tier, each
 // polygon in its slot against the previous build's sidecars under
-// region_prev (none when empty), a tombstone in each slot freed. `region`
-// labels the log lines. Returns the bytes written by dir.
+// region_prev (none when empty; one there that can't be read is refused), a
+// tombstone in each slot freed. Returns its log lines, labelled `region`:
+// one for water/all and one for water/major, each with its polygons and
+// slots, ring and arc bytes, cells and entries, name bytes and types.
 std::string write_water_dirs(const Layer& layer, const std::string& region_dir, const std::string& region_prev,
                              const std::string& region);
 
 // The planet's layer from what the passes collected, step by step: the
 // assembly, the naming join (water_names_s2.h) and the names, the arc stage
 // (kWaterArcStage) against the previous planet build's sidecars under
-// prev_planet_dir (none when empty), its encoding, the cells, the major tier
-// and the records. `sitelinks` gives a wikidata item's sitelink count (0 for
+// prev_planet_dir (none when empty; a polygon sidecar there that can't be
+// read is refused), its encoding, the cells, the major tier and the records. `sitelinks` gives a wikidata item's sitelink count (0 for
 // none) for the fame rule's rows (sitelinks_rows). Logs each step and its
 // counts. Uses up `c`.
 Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::function<uint32_t(uint32_t)>& sitelinks,

@@ -112,6 +112,14 @@ std::vector<uint64_t> read_fallback_sidecar(const std::string& path, size_t slot
     throw std::runtime_error(path + " is no fallback sidecar of " + std::to_string(slots) + " slots");
 }
 
+// Loads the previous build's polygon sidecar at `path`: false for none
+// there; one there that can't be read is refused.
+bool load_polygon_sidecar(IdAllocator& alloc, const std::string& path) {
+    if (path_absent(path)) return false;
+    if (!alloc.load_previous(path)) throw std::runtime_error("unreadable water polygon sidecar " + path);
+    return true;
+}
+
 // Slots for `ids` (polygons of the layer, ascending) against the previous
 // build's sidecars at `prev` (none when empty), written to `dir`; each id's
 // slot, and the slot count.
@@ -124,7 +132,7 @@ struct PolygonSlots {
 PolygonSlots polygon_slots(const Layer& layer, const std::vector<uint32_t>& ids, const std::string& prev_dir,
                            const std::string& dir) {
     IdAllocator alloc;
-    const bool had = !prev_dir.empty() && alloc.load_previous(prev_dir + "/admin_polygons.osm_ids");
+    const bool had = !prev_dir.empty() && load_polygon_sidecar(alloc, prev_dir + "/admin_polygons.osm_ids");
     const std::vector<uint64_t> prev_fallback =
         had ? read_fallback_sidecar(prev_dir + "/admin_polygons.fallback.osm_ids", alloc.total_slots())
             : std::vector<uint64_t>();
@@ -871,14 +879,14 @@ struct Groups {
 // Which of the polygons of `ids` and `fallbacks` (their slot identities
 // and fallback keys) held a live slot of the dir's previous slots: matched
 // as polygon_slots matches them, by identity, else by a fallback key one
-// unclaimed slot alone shares. None without the dir's sidecar; `live`
-// counts its live slots.
+// unclaimed slot alone shares. None without the dir's sidecar (one there
+// that can't be read is refused); `live` counts its live slots.
 std::vector<uint8_t> held_before(const std::vector<uint64_t>& ids, const std::vector<uint64_t>& fallbacks,
                                  const std::string& dir, size_t& live) {
     std::vector<uint8_t> out(ids.size(), 0);
     live = 0;
     IdAllocator alloc;
-    if (dir.empty() || !alloc.load_previous(dir + "/admin_polygons.osm_ids")) return out;
+    if (dir.empty() || !load_polygon_sidecar(alloc, dir + "/admin_polygons.osm_ids")) return out;
     std::vector<uint8_t> was_live(alloc.total_slots());
     for (size_t s = 0; s < was_live.size(); s++) live += was_live[s] = gc::id_alloc::is_reclaimable(alloc.slots()[s]);
     const std::vector<uint64_t> prev_fallback = read_fallback_sidecar(dir + "/admin_polygons.fallback.osm_ids", was_live.size());

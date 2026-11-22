@@ -949,16 +949,10 @@ MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& sto
     return out;
 }
 
-namespace {
-
-// Whether a lookup finds nothing at `path`; one it can't make (ec set) says
-// nothing, and the read that follows refuses it.
-bool absent(const std::string& path) {
+bool path_absent(const std::string& path) {
     std::error_code ec;
     return !std::filesystem::exists(path, ec) && !ec;
 }
-
-}  // namespace
 
 ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar,
                             const std::vector<ArcFallbackKeys>& fallback, const std::string& prev_fallback_sidecar) {
@@ -966,7 +960,7 @@ ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string
     if (!fallback.empty() && fallback.size() != keys.size()) throw std::logic_error("arc fallback keys out of step with the keys");
     IdAllocator alloc;
     // Only a sidecar the lookup finds absent starts cold.
-    const bool missing = !prev_sidecar.empty() && absent(prev_sidecar);
+    const bool missing = !prev_sidecar.empty() && path_absent(prev_sidecar);
     if (!prev_sidecar.empty() && !missing && !alloc.load_previous(prev_sidecar))
         throw std::runtime_error("unreadable arc sidecar " + prev_sidecar);
     // The key each previous slot can be claimed by, none for its tombstones.
@@ -978,7 +972,7 @@ ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string
     }
     // The previous slots' fallback keys, and a pass for each: the way set, then the ends.
     const bool fallback_missing =
-        prev_slots > 0 && !fallback.empty() && (prev_fallback_sidecar.empty() || absent(prev_fallback_sidecar));
+        prev_slots > 0 && !fallback.empty() && (prev_fallback_sidecar.empty() || path_absent(prev_fallback_sidecar));
     std::vector<ArcFallbackKeys> prev_fallback;
     if (prev_slots > 0 && !fallback.empty() && !fallback_missing)
         prev_fallback = read_arc_fallback_sidecar(prev_fallback_sidecar, prev_slots);

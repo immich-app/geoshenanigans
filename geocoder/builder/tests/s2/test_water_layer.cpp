@@ -1110,6 +1110,41 @@ TEST(a_previous_water_build_whose_water_meta_json_is_gone_or_cut_short_stops_the
     CHECK(refusal(with_kinds({large, small}), two).empty());
 }
 
+TEST(a_previous_water_build_whose_polygon_sidecar_cant_be_read_stops_the_build) {
+    const ScratchDir root("water-sidecars");
+    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    write(build(fixture()), one);
+    auto cut = [](const std::string& path) {
+        const std::vector<char> bytes = bytes_of(path);
+        REQUIRE(bytes.size() >= 12);
+        std::ofstream(path, std::ios::binary | std::ios::trunc).write(bytes.data(), std::streamsize(bytes.size() - 6));
+        return bytes;
+    };
+    auto put_back = [](const std::string& path, const std::vector<char>& bytes) {
+        std::ofstream(path, std::ios::binary | std::ios::trunc).write(bytes.data(), std::streamsize(bytes.size()));
+    };
+    // The major tier's, cut short: the layer's build on it stops.
+    const std::string major = one + "/water/major/simplified/admin_polygons.osm_ids";
+    const std::vector<char> major_bytes = cut(major);
+    CHECK(refusal(fixture(), one).find(major) != std::string::npos);
+    put_back(major, major_bytes);
+    // The all set's: its dirs' write on it stops.
+    const std::string all = one + "/water/all/exact/admin_polygons.osm_ids";
+    cut(all);
+    const Layer day2 = build(fixture(), one);
+    std::ostringstream log;
+    std::streambuf* was = std::cerr.rdbuf(log.rdbuf());
+    const std::string why =
+        gctest::refusal_of<std::runtime_error>([&] { write_water_dirs(day2, two, one, "test"); });
+    std::cerr.rdbuf(was);
+    CHECK(why.find(all) != std::string::npos);
+    // Gone, they start the slots afresh.
+    fs::remove(major);
+    fs::remove(all);
+    CHECK(refusal(fixture(), one).empty());
+    CHECK(write(build(fixture(), one), two, one).find("4 polygons in 4 slots (0 kept") != std::string::npos);
+}
+
 TEST(a_way_tagged_as_the_multipolygon_whose_outer_ring_it_is_leaves_the_island_out) {
     Collected c = fixture();
     const int32_t lat = kLat - 1000000;

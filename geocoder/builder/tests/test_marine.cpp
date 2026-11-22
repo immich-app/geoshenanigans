@@ -134,6 +134,23 @@ TEST(a_marine_areas_file_of_another_shape_is_refused) {
     CHECK(refused);
 }
 
+TEST(a_marine_count_past_what_the_rest_of_the_file_can_hold_is_cut_short_where_it_stands) {
+    ScratchDir dir("marine");
+    const std::string good = bytes_of(kTwoAreasHex);
+    // Each count set to 1000, more than the bytes after it hold: the object
+    // count (at byte 12), the first area's polygon count (at 47) and its
+    // first polygon's ring count (at 51). Refused as it is read, before
+    // anything is made of it.
+    for (const auto& [at, after] : std::vector<std::pair<size_t, size_t>>{{12, 16}, {47, 51}, {51, 55}}) {
+        std::string count = good;
+        count[at] = '\xe8';
+        count[at + 1] = '\x03';
+        count[at + 2] = count[at + 3] = 0;
+        CHECK(error_of(write(dir, "count.bin", count)).find("cut short (byte " + std::to_string(after) + ")") !=
+              std::string::npos);
+    }
+}
+
 TEST(a_marine_ring_is_cut_into_stretches_by_its_own_vertices) {
     const std::vector<PackedLocation> ring = round_ring(-400000000, 1700000000, 5000);
     const std::vector<WayRun> runs = marine::ring_runs(ring);

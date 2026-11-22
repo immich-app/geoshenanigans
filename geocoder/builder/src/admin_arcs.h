@@ -443,6 +443,11 @@ AdminArcs build_arc_topology(const AdminExactRings& store, unsigned threads,
                              const std::function<void(const char*)>& phase_done = {},
                              ArcCuts cuts = ArcCuts::Junctions);
 
+// Whether a lookup finds nothing at `path`: a sidecar not there starts its
+// slots cold. One the lookup can't make says nothing, and the read that
+// follows refuses it.
+bool path_absent(const std::string& path);
+
 struct ArcSlots {
     std::vector<uint32_t> slots;  // by presentation order
     std::vector<gc::id_alloc::SidecarSlot> sidecar;

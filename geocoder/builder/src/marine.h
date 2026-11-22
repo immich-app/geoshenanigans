@@ -88,11 +88,19 @@ inline std::vector<Area> read_areas(const std::string& path) {
         take(&v, 4);
         return v;
     };
+    // A count of records of at least `least` bytes each, refused past what
+    // the rest of the file holds.
+    auto count_of = [&](size_t least) {
+        const uint32_t n = u32();
+        if ((data.size() - at) / least < n) fail("cut short");
+        return n;
+    };
+    constexpr size_t kRingBytes = 4 + 3 * 8, kPolygonBytes = 4 + kRingBytes, kAreaBytes = 8 + 1 + 2 + 1 + 4;
     char magic[8];
     take(magic, 8);
     if (std::memcmp(magic, kMagic, 8) != 0) fail("not a marine areas file");
     if (u32() != kVersion) fail("not of version " + std::to_string(kVersion));
-    const uint32_t count = u32();
+    const uint32_t count = count_of(kAreaBytes);
     std::vector<Area> out;
     out.reserve(count);
     for (uint32_t k = 0; k < count; k++) {
@@ -106,9 +114,9 @@ inline std::vector<Area> read_areas(const std::string& path) {
         take(a.name.data(), name_bytes);
         if (a.kind != kSea && a.kind != kOcean) fail("object " + std::to_string(a.id) + " of kind " + std::to_string(a.kind));
         if (!out.empty() && a.id <= out.back().id) fail("object " + std::to_string(a.id) + " out of order");
-        a.polygons.resize(u32());
+        a.polygons.resize(count_of(kPolygonBytes));
         for (auto& rings : a.polygons) {
-            rings.resize(u32());
+            rings.resize(count_of(kRingBytes));
             if (rings.empty()) fail("a polygon of no rings");
             for (auto& ring : rings) {
                 const uint32_t n = u32();
