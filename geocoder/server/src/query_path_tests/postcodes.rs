@@ -72,6 +72,19 @@ fn a_postal_area_of_no_valid_postcode_leaves_the_point_to_another_or_a_centroid(
         .centroid("10178", 0.0, 500.0)
         .load();
     assert_eq!(postcode_from(&index, berlin, 0.0, 0.0), "10179");
+    // The builder marks an area of a postcode its country's pattern rejects (POSTAL_AREA_INVALID):
+    // one tagged 1234, four digits in Germany, names nothing either.
+    let index = country_at(berlin, b"DE")
+        .boundary("1234", POSTCODE_AREA_LEVEL, POSTAL_AREA_INVALID, (-300.0, -300.0, 300.0, 300.0))
+        .centroid("10178", 0.0, 500.0)
+        .load();
+    assert_eq!(postcode_from(&index, berlin, 0.0, 0.0), "10178");
+    let index = country_at(berlin, b"DE")
+        .boundary("1234", POSTCODE_AREA_LEVEL, POSTAL_AREA_INVALID, (-300.0, -300.0, 300.0, 300.0))
+        .boundary("10179", POSTCODE_AREA_LEVEL, 0, (-2000.0, -2000.0, 2000.0, 2000.0))
+        .centroid("10178", 0.0, 500.0)
+        .load();
+    assert_eq!(postcode_from(&index, berlin, 0.0, 0.0), "10179");
 }
 
 #[test]

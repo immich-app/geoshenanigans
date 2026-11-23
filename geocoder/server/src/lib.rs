@@ -5674,8 +5674,8 @@ pub struct AdminResult<'a> {
     pub boundary_ranks: u32,
     /// The rank_address of the polygon behind each field.
     pub ranks: FieldRanks,
-    /// The postcode of the smallest postcode area (boundary=postal_code)
-    /// holding the point.
+    /// The postcode of the eligible postal area (boundary=postal_code) holding the point
+    /// whose centroid is nearest, with ties going to the smaller area.
     pub postcode_area: Option<Cow<'a, str>>,
     /// The polygons in the address that fill no field (unlabelled_rows), as
     /// (rank_address, name), the finest first: display_name lists them.
