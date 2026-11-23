@@ -531,10 +531,12 @@ impl WaterLayer {
     /// into there, but one along which it runs on, which is no shore:
     /// - a cut arc's (CutArcs), which the polygon on its other side uses too;
     /// - for a sea or ocean (`marine`), one along a line of a tenth of a degree of latitude or
-    ///   longitude, where the marine areas are cut into tiles.
+    ///   longitude with sea either side of it (`seas_beside`), where the marine areas are cut
+    ///   into tiles, their sides along it not always of the same vertices.
     ///
     /// Only the polygons the water so runs on into within the distance are read beyond `poly`:
-    /// those of the cells around the point (`object_near`) that use a cut arc met.
+    /// the object's polygons across those tile lines, and those of the cells around the point
+    /// (`object_near`) that use a cut arc met.
     fn shore_within(&self, poly: &AdminPolygon, marine: bool, lat: f64, lng: f64, metres: f64) -> bool {
         // A tenth of a degree in e7 units.
         const TILE_E7: i64 = 1_000_000;
@@ -546,6 +548,7 @@ impl WaterLayer {
         while let Some(q) = todo.pop() {
             walked.push(q);
             let met = cuts.len();
+            let mut across = Vec::new();
             let shore = self.geometry.edge_within(&q, p, metres, |slot, a, b| {
                 if self.cuts.is_cut(slot) {
                     if !cuts.contains(&slot) {
@@ -553,21 +556,59 @@ impl WaterLayer {
                     }
                     return false;
                 }
-                !(marine && tile_line(a, b))
+                if !(marine && tile_line(a, b)) {
+                    return true;
+                }
+                let Some(seas) = self.seas_beside(p.e7(), a, b) else { return true };
+                across.extend(seas.into_iter().filter(|sea| same_object(sea, poly)));
+                false
             });
             if shore {
                 return true;
             }
             if cuts.len() > met {
                 let near = near.get_or_insert_with(|| self.object_near(poly, p));
-                for r in near.iter() {
-                    if !walked.iter().chain(&todo).any(|w| same_polygon(w, r)) && self.geometry.uses_arc_near(r, p, metres, &cuts[met..]) {
-                        todo.push(*r);
-                    }
+                across.extend(near.iter().filter(|r| self.geometry.uses_arc_near(r, p, metres, &cuts[met..])));
+            }
+            for r in across {
+                if !walked.iter().chain(&todo).any(|w| same_polygon(w, &r)) {
+                    todo.push(r);
                 }
             }
         }
         false
+    }
+
+    /// The polygons of the seas or oceans either side of the edge a-b, which runs along a
+    /// parallel or a meridian: those that hold the points an e7 unit off the line each way, at
+    /// the point of the edge nearest `p` (inside its ends); none unless both sides are sea.
+    fn seas_beside(&self, p: PointE7, a: PointE7, b: PointE7) -> Option<[AdminPolygon; 2]> {
+        let along = |at: i64, x: i64, y: i64| if (x - y).abs() >= 2 { at.clamp(x.min(y) + 1, x.max(y) - 1) } else { x };
+        let sides = if a.lat == b.lat {
+            let lng = along(p.lng, a.lng, b.lng);
+            [PointE7 { lat: a.lat - 1, lng }, PointE7 { lat: a.lat + 1, lng }]
+        } else {
+            let lat = along(p.lat, a.lat, b.lat);
+            [PointE7 { lat, lng: a.lng - 1 }, PointE7 { lat, lng: a.lng + 1 }]
+        };
+        Some([self.sea_at(sides[0])?, self.sea_at(sides[1])?])
+    }
+
+    /// The polygon of a sea or ocean of the layer that holds the point, if any.
+    fn sea_at(&self, point: PointE7) -> Option<AdminPolygon> {
+        let (lat, lng) = point.degrees();
+        let point = AdminPoint::new(lat, lng);
+        let mut memo = PipMemo::new();
+        self.index.with_ids(cell_id_at_level(lat, lng, self.cell_level), |ids| {
+            ids.iter().find_map(|&id| {
+                let poly = polygon_record(&self.polygons, self.geometry.rings_len(), id & ID_MASK)?;
+                let sea = poly.name_id != NO_DATA
+                    && self.geometry.has_rings(&poly)
+                    && self.meta.kind(poly.country_code).is_some_and(|k| k.group == WaterGroup::Sea)
+                    && (id & INTERIOR_FLAG != 0 || self.geometry.contains(&poly, point, &mut memo));
+                sea.then_some(poly)
+            })
+        })
     }
 
     /// The polygons of the object of `poly` (its name, type code and area) that the cells around
@@ -584,10 +625,7 @@ impl WaterLayer {
         ids.dedup();
         ids.into_iter()
             .filter_map(|id| polygon_record(&self.polygons, self.geometry.rings_len(), id))
-            .filter(|q| {
-                (q.name_id, q.country_code, q.area.to_bits()) == (poly.name_id, poly.country_code, poly.area.to_bits())
-                    && self.geometry.has_rings(q)
-            })
+            .filter(|q| same_object(q, poly) && self.geometry.has_rings(q))
             .collect()
     }
 }
@@ -595,6 +633,11 @@ impl WaterLayer {
 /// Whether two records are one polygon: their ring blocks the same.
 fn same_polygon(a: &AdminPolygon, b: &AdminPolygon) -> bool {
     (a.ring_offset, a.ring_bytes) == (b.ring_offset, b.ring_bytes)
+}
+
+/// Whether two records are polygons of one object: of its name, type code and area.
+fn same_object(a: &AdminPolygon, b: &AdminPolygon) -> bool {
+    (a.name_id, a.country_code, a.area.to_bits()) == (b.name_id, b.country_code, b.area.to_bits())
 }
 
 /// Water dirs as the builder writes them, for the tests: rectangular areas with rectangular
@@ -1046,10 +1089,11 @@ mod tests {
         assert_eq!(at(&three, 47.06005, 8.00005), kind("Salzweiher", "water", "salt_pond"));
         assert_eq!(at(&three, 45.001, 8.001), kind("North Sea", "place", "sea"));
         // 16 m from the side the tiles share, 110 m and more from every other; 11 m from their
-        // north side, off the lines of a tenth of a degree their south and west sides lie on.
+        // north side, and from their south side, on a line of a tenth of a degree with no sea
+        // across it.
         let line = |(lat, lng): (f64, f64)| three.at(lat, lng).unwrap().takes_landmark(lat, lng, &LocationLine::default());
         assert!(line((45.001, 8.0018)));
-        assert!(line((45.0001, 8.001)));
+        assert!(!line((45.0001, 8.001)));
         assert!(!line((45.0019, 8.001)));
     }
 
@@ -1282,19 +1326,37 @@ mod tests {
     }
 
     #[test]
-    fn a_seas_lines_of_a_tenth_of_a_degree_are_no_shore_and_a_lakes_are() {
-        // The marine areas are cut into tiles along those lines: a sea's edges on them are no
-        // shore, but one off them is, and so is a lake's on them.
+    fn a_seas_line_of_a_tenth_of_a_degree_is_no_shore_where_sea_lies_across_it() {
+        // Two tiles of a sea either side of the meridian 0.1, each a ring of its own (no arc
+        // shared, none marked a cut), as the marine areas are cut along those lines: the line
+        // between them is no shore. Their south sides lie on the parallel 0, with no sea south
+        // of it: a coast, as is a sea's edge off those lines.
+        let tiles = |east: &str| {
+            WaterFixture::new().piece("North Sea", SEA, 0.02, (0.0, 0.0, 0.1, 0.1)).piece(east, SEA, 0.02, (0.0, 0.1, 0.1, 0.2)).layer()
+        };
+        let (seam, south) = ((0.05, 0.0998), (0.0002, 0.05));
+        assert!(takes(&tiles("North Sea"), seam, &bare()));
+        assert!(!takes(&tiles("North Sea"), south, &bare()));
+        // A tile of another sea across the line.
+        assert!(takes(&tiles("Norwegian Sea"), seam, &bare()));
+        // Past the line, the shore of the sea's tile there is its shore: an island 22 m east of
+        // it, 33 m from the point.
+        let island = WaterFixture::new()
+            .piece("North Sea", SEA, 0.02, (0.0, 0.0, 0.1, 0.1))
+            .piece("North Sea", SEA, 0.02, (0.0, 0.1, 0.1, 0.2))
+            .island((0.0495, 0.1002, 0.0505, 0.1005))
+            .layer();
+        assert!(!takes(&island, (0.05, 0.0999), &bare()));
+        assert!(takes(&island, (0.05, 0.0995), &bare()));
+        // A sea alone, its sides on those lines but its east one: each a coast.
         let sea = WaterFixture::new().area("North Sea", SEA, (0.0, 0.0, 0.1, 0.10005), &[]).layer();
-        let lake = WaterFixture::new().area("Testsee", LAKE, (0.0, 0.0, 0.1, 0.10005), &[]).layer();
-        let (south, west, east) = ((0.0002, 0.05), (0.05, 0.0002), (0.05, 0.1));
-
-        assert!(takes(&sea, south, &bare()));
-        assert!(takes(&sea, west, &bare()));
-        assert!(!takes(&sea, east, &bare()));
-        for p in [south, west, east] {
-            assert!(!takes(&lake, p, &bare()), "{p:?}");
+        for p in [(0.0002, 0.05), (0.05, 0.0002), (0.05, 0.1)] {
+            assert!(!takes(&sea, p, &bare()), "{p:?}");
         }
+        // A lake's edges on them are shores, whatever lies across.
+        let lakes =
+            WaterFixture::new().piece("Testsee", LAKE, 0.02, (0.0, 0.0, 0.1, 0.1)).piece("Testsee", LAKE, 0.02, (0.0, 0.1, 0.1, 0.2)).layer();
+        assert!(!takes(&lakes, seam, &bare()));
     }
 
     #[test]
