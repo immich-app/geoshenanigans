@@ -14,10 +14,12 @@
 // answer on any number of threads.
 //
 // A name so taken is weak where its key's lines run only a short way into
-// the object (weak_name): a tributary whose line ends at the middle of the
-// river it flows into names that river's unnamed area, which the location
-// line then doesn't trust (the East River as "Newtown Creek"). A river's own
-// line runs the length of its area, which is longer than it is wide.
+// the object and their waterway is short beside it (weak_name): a creek or
+// tributary whose line ends at the middle of the river it flows into names
+// that river's unnamed area, which the location line then doesn't trust (the
+// East River as "Newtown Creek"). A river's own line runs the length of its
+// area, which is longer than it is wide, or the river runs on far past a
+// piece of its delta, estuary or bank its line crosses a short way in.
 #pragma once
 
 #include <algorithm>
@@ -32,8 +34,9 @@
 namespace water {
 
 // A candidate line: `count` vertices from `first` in its set's vertices, its
-// key and display name (indices into the set's sorted key and display lists)
-// and its wikidata item (0 for none).
+// key and display name (indices into the set's sorted key and display lists),
+// its wikidata item (0 for none) and the length of its waterway
+// (measure_waterways).
 struct NamingLine {
     int64_t way;
     uint32_t key;
@@ -41,6 +44,7 @@ struct NamingLine {
     uint32_t qid;
     uint64_t first;
     uint32_t count;
+    uint64_t waterway_mm = 0;
 };
 
 // Every candidate line of a build, in way order, and its keys and names,
@@ -74,6 +78,91 @@ inline uint64_t segment_mm(PackedLocation a, PackedLocation b) {
 // credits nothing.
 inline bool segment_wraps(PackedLocation a, PackedLocation b) {
     return std::abs(int64_t(b.lon_e7) - a.lon_e7) > 1800000000;
+}
+
+// A line's length: its segments', those across the antimeridian aside, as
+// they credit areas.
+inline uint64_t naming_line_mm(const NamingLines& lines, const NamingLine& line) {
+    const PackedLocation* v = lines.vertices.data() + line.first;
+    uint64_t mm = 0;
+    for (uint32_t i = 0; i + 1 < line.count; i++)
+        if (!segment_wraps(v[i], v[i + 1])) mm += segment_mm(v[i], v[i + 1]);
+    return mm;
+}
+
+// Sets each line's waterway_mm: the length of the waterway it is part of. A
+// key of a waterway relation is one waterway, all its lines. A key of a name
+// is every waterway of that name: there the lines of the key that join the
+// line, one joining another where an end of either is a vertex of the other
+// (OSM's ways of a river meet at their end nodes), and so on along them.
+// Sums over sets, so the same on any number of threads.
+inline void measure_waterways(NamingLines& lines, unsigned threads = 0) {
+    const size_t n = lines.lines.size();
+    auto of_relation = [&](uint32_t key) {
+        return key < lines.keys.size() && !lines.keys[key].empty() && lines.keys[key][0] == 'r';
+    };
+    struct End {
+        uint32_t key;
+        int32_t lat, lon;
+        uint32_t line;
+    };
+    auto end_less = [](const End& a, const End& b) {
+        if (a.key != b.key) return a.key < b.key;
+        if (a.lat != b.lat) return a.lat < b.lat;
+        if (a.lon != b.lon) return a.lon < b.lon;
+        return a.line < b.line;
+    };
+    std::vector<End> ends;
+    ends.reserve(2 * n);
+    for (size_t l = 0; l < n; l++) {
+        const NamingLine& line = lines.lines[l];
+        if (line.count == 0 || of_relation(line.key)) continue;
+        const PackedLocation a = lines.vertices[line.first], b = lines.vertices[line.first + line.count - 1];
+        ends.push_back({line.key, a.lat_e7, a.lon_e7, static_cast<uint32_t>(l)});
+        ends.push_back({line.key, b.lat_e7, b.lon_e7, static_cast<uint32_t>(l)});
+    }
+    parallel_sort(ends.begin(), ends.end(), end_less, threads);
+    // Each (line, other line) an end of the other meets at a vertex of the
+    // line.
+    const std::vector<std::pair<uint32_t, uint32_t>> joins =
+        parallel_collect<std::pair<uint32_t, uint32_t>>(n, [&](size_t l, std::vector<std::pair<uint32_t, uint32_t>>& out) {
+            const NamingLine& line = lines.lines[l];
+            if (of_relation(line.key)) return;
+            const PackedLocation* v = lines.vertices.data() + line.first;
+            for (uint32_t i = 0; i < line.count; i++) {
+                const End probe{line.key, v[i].lat_e7, v[i].lon_e7, 0};
+                for (auto it = std::lower_bound(ends.begin(), ends.end(), probe, end_less);
+                     it != ends.end() && it->key == line.key && it->lat == v[i].lat_e7 && it->lon == v[i].lon_e7; ++it)
+                    if (it->line != l) out.push_back({static_cast<uint32_t>(l), it->line});
+            }
+        }, threads);
+    std::vector<End>().swap(ends);
+    std::vector<uint32_t> root(n);
+    for (size_t l = 0; l < n; l++) root[l] = static_cast<uint32_t>(l);
+    auto find = [&](uint32_t x) {
+        while (root[x] != x) x = root[x] = root[root[x]];
+        return x;
+    };
+    auto join = [&](uint32_t a, uint32_t b) {
+        const uint32_t ra = find(a), rb = find(b);
+        if (ra != rb) root[std::max(ra, rb)] = std::min(ra, rb);
+    };
+    for (const auto& [a, b] : joins) join(a, b);
+    std::vector<uint32_t> first_of_key(lines.keys.size(), UINT32_MAX);
+    for (size_t l = 0; l < n; l++) {
+        const uint32_t key = lines.lines[l].key;
+        if (!of_relation(key)) continue;
+        if (first_of_key[key] == UINT32_MAX)
+            first_of_key[key] = static_cast<uint32_t>(l);
+        else
+            join(first_of_key[key], static_cast<uint32_t>(l));
+    }
+    std::vector<uint64_t> own(n), mm(n, 0);
+    parallel_for_dynamic(n, 4096, [&](size_t begin, size_t end, unsigned) {
+        for (size_t l = begin; l < end; l++) own[l] = naming_line_mm(lines, lines.lines[l]);
+    }, threads);
+    for (size_t l = 0; l < n; l++) mm[find(static_cast<uint32_t>(l))] += own[l];
+    for (size_t l = 0; l < n; l++) lines.lines[l].waterway_mm = mm[find(static_cast<uint32_t>(l))];
 }
 
 // The share of a segment, a straight line in (lat, lng), inside rings
@@ -164,12 +253,28 @@ private:
     std::vector<Crossing> crossings_;
 };
 
+// A waterway is long beside an area from this many sides of a square of the
+// area. Calibrated on the planet's waterway names: of the names whose lines
+// run under half a side in, those of a waterway shorter than this mostly
+// have an end of the waterway inside the area (a tributary's mouth), and
+// those of a longer one mostly not (a river's own line past a piece of its
+// delta, estuary or bank). Rivers and canals split at the same length.
+inline constexpr double kLongWaterwaySides = 64.0;
+
 // Whether a name an object took from lines of `mm` millimetres inside it is
-// weak, the object `km2` in area: the lines' length under half the side of a
-// square of that area.
-inline bool weak_name(uint64_t mm, double km2) {
+// weak, the object `km2` in area and the waterway those lines are part of
+// `waterway_mm` long (measure_waterways; as long as its lines inside at
+// least): the lines run under half the side of a square of that area inside
+// it, and the waterway under kLongWaterwaySides sides of it all told. So a
+// creek whose line ends in the river it flows into names that river's
+// unnamed area weakly (the East River as "Newtown Creek": 424 m into
+// 6.67 km², 5.6 km long), and a river's own line through a piece of its
+// delta at its side names it as any other (the Lena's: 500 m into 537 km²,
+// 6,730 km long).
+inline bool weak_name(uint64_t mm, double km2, uint64_t waterway_mm) {
     const double km = static_cast<double>(mm) / 1e6;
-    return 4 * km * km < km2;
+    const double waterway_km = static_cast<double>(std::max(mm, waterway_mm)) / 1e6;
+    return 4 * km * km < km2 && waterway_km * waterway_km < kLongWaterwaySides * kLongWaterwaySides * km2;
 }
 
 // The whole millimetres of segment a-b that `share` of it (SegmentClip)
@@ -181,24 +286,28 @@ inline uint64_t share_mm(PackedLocation a, PackedLocation b, long double share) 
 
 // A line's length inside an area object: `mm` of a line of `key` and
 // `display`, whose wikidata item is `qid` (0 for none), credited to
-// `object`.
+// `object`, and the length of the line's waterway (the longest of the lines
+// a credit sums).
 struct Credit {
     uint32_t object;
     uint32_t key;
     uint32_t display;
     uint64_t mm;
     uint32_t qid = 0;
+    uint64_t waterway_mm = 0;
 };
 
 // The name an object takes: its winning key and display, the key's total
-// and the runner-up key's (0 for none), and the lowest wikidata item of the
-// key's lines that credit it (0 for none).
+// and the runner-up key's (0 for none), the lowest wikidata item of the
+// key's lines that credit it (0 for none) and the length of the longest
+// waterway of those lines.
 struct NameChoice {
     uint32_t key = UINT32_MAX;
     uint32_t display = UINT32_MAX;
     uint64_t mm = 0;
     uint64_t runner_up_mm = 0;
     uint32_t qid = 0;
+    uint64_t waterway_mm = 0;
 
     bool named() const { return key != UINT32_MAX; }
 };
@@ -218,7 +327,7 @@ inline std::vector<NameChoice> pick_names(std::vector<Credit>& credits, size_t o
         NameChoice& best = out.at(object);
         while (i < credits.size() && credits[i].object == object) {
             const uint32_t key = credits[i].key;
-            uint64_t total = 0, top_mm = 0;
+            uint64_t total = 0, top_mm = 0, waterway_mm = 0;
             uint32_t top_display = UINT32_MAX, qid = 0;
             while (i < credits.size() && credits[i].object == object && credits[i].key == key) {
                 const uint32_t display = credits[i].display;
@@ -226,6 +335,7 @@ inline std::vector<NameChoice> pick_names(std::vector<Credit>& credits, size_t o
                 while (i < credits.size() && credits[i].object == object && credits[i].key == key &&
                        credits[i].display == display) {
                     if (credits[i].qid && (!qid || credits[i].qid < qid)) qid = credits[i].qid;
+                    waterway_mm = std::max(waterway_mm, credits[i].waterway_mm);
                     display_mm += credits[i++].mm;
                 }
                 total += display_mm;
@@ -238,7 +348,7 @@ inline std::vector<NameChoice> pick_names(std::vector<Credit>& credits, size_t o
             // Keys arrive ascending: a later one wins only with more.
             if (total > best.mm) {
                 best.runner_up_mm = best.mm;
-                best = {key, top_display, total, best.runner_up_mm, qid};
+                best = {key, top_display, total, best.runner_up_mm, qid, waterway_mm};
             } else if (total > best.runner_up_mm) {
                 best.runner_up_mm = total;
             }

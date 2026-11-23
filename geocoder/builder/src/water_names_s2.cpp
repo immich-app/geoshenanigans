@@ -63,9 +63,10 @@ void credit(std::vector<Credit>& out, uint32_t object, const NamingLine& line, u
     if (!out.empty() && out.back().object == object && out.back().key == line.key && out.back().display == line.display &&
         out.back().qid == line.qid) {
         out.back().mm += mm;
+        out.back().waterway_mm = std::max(out.back().waterway_mm, line.waterway_mm);
         return;
     }
-    out.push_back({object, line.key, line.display, mm, line.qid});
+    out.push_back({object, line.key, line.display, mm, line.qid, line.waterway_mm});
 }
 
 }  // namespace

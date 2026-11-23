@@ -489,6 +489,7 @@ Build assemble(Collected& c, unsigned threads) {
         std::vector<PackedLocation>().swap(l.vertices);
     }
     free_storage(c.lines);
+    measure_waterways(b.lines, threads);
     return b;
 }
 
@@ -763,8 +764,9 @@ size_t drop_marine_namesakes(Build& b) {
 std::pair<size_t, size_t> apply_names(Build& b, const std::vector<NameChoice>& choices) {
     size_t named = 0;
     std::vector<uint8_t> keep(b.objects.size(), 0);
-    // The length inside of the key that named each object so, by object.
-    std::vector<uint64_t> named_mm(b.objects.size(), 0);
+    // The length inside of the key that named each object so, and the length
+    // of its waterway, by object.
+    std::vector<uint64_t> named_mm(b.objects.size(), 0), waterway_mm(b.objects.size(), 0);
     for (size_t o = 0; o < b.objects.size(); o++) {
         Object& obj = b.objects[o];
         if (o < choices.size() && choices[o].named()) {
@@ -774,6 +776,7 @@ std::pair<size_t, size_t> apply_names(Build& b, const std::vector<NameChoice>& c
                 obj.tags.name = b.lines.displays[choices[o].display];
                 obj.tags.local_name = b.lines.key_local[choices[o].key];
                 named_mm[o] = choices[o].mm;
+                waterway_mm[o] = choices[o].waterway_mm;
                 named++;
             }
         }
@@ -782,8 +785,12 @@ std::pair<size_t, size_t> apply_names(Build& b, const std::vector<NameChoice>& c
     // In the kept objects' order, as keep_objects leaves them.
     size_t kept = 0;
     for (size_t o = 0; o < b.objects.size(); o++)
-        if (keep[o]) named_mm[kept++] = named_mm[o];
+        if (keep[o]) {
+            waterway_mm[kept] = waterway_mm[o];
+            named_mm[kept++] = named_mm[o];
+        }
     named_mm.resize(kept);
+    waterway_mm.resize(kept);
     keep_objects(b, keep);
     AdminExactRings& r = b.rings;
     for (Object& obj : b.objects) obj.area_deg2 = obj.km2 = 0;
@@ -795,7 +802,7 @@ std::pair<size_t, size_t> apply_names(Build& b, const std::vector<NameChoice>& c
     size_t weak = 0;
     for (size_t o = 0; o < b.objects.size(); o++) {
         Object& obj = b.objects[o];
-        obj.weak_name = named_mm[o] != 0 && weak_name(named_mm[o], obj.km2);
+        obj.weak_name = named_mm[o] != 0 && weak_name(named_mm[o], obj.km2, waterway_mm[o]);
         weak += obj.weak_name;
     }
     return {named, weak};
@@ -1530,7 +1537,7 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
               << " objects, " << unnamed_rivers << " without a name of their own; " << counts.cover_entries
               << " cover entries, " << counts.segments_in_cover << " segments in their cells, " << counts.probes
               << " probed (" << counts.probes_inside << " inside), " << counts.credits << " credits; " << named
-              << " named by their waterway (" << weak << " weakly, by one that runs a short way in), "
+              << " named by their waterway (" << weak << " weakly, by a short one that runs a short way in), "
               << before - b.objects.size() << " left unnamed and out, " << contested
               << " with a runner-up of a quarter or more" << std::endl;
     free_storage(b.lines.lines);

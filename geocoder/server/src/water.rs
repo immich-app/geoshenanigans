@@ -45,8 +45,9 @@ pub const WATER_FILES: [&str; 10] = [
 ];
 
 /// A water record's flag, in byte 14 (a boundary's level and place type): its name is that of a
-/// waterway that runs only a short way into it, an unnamed river or canal area that a tributary
-/// named (builder/src/water_names.h), which the location line takes for no name of note.
+/// short waterway that runs only a short way into it, an unnamed river or canal area that a
+/// creek or tributary named (builder/src/water_names.h), which the location line takes for no
+/// name of note.
 pub const WEAK_NAME: u8 = 1;
 
 /// How far from the point the shore of the water the location line names must lie at least, in

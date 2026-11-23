@@ -237,8 +237,9 @@ when all of these hold, the same on every water tier:
 - **A real name**: none without a letter ("49,0"), nor a number after "No",
   "Nr", "#", "№", or a word such as "Lake" or "Glacier" alone ("№30",
   "Lake 938"); nor a river area's name taken weakly from a waterway that runs
-  only a short way into it (a tributary's, as "Newtown Creek" for the East
-  River's unnamed area).
+  only a short way into it and is short beside it (a creek's, as "Newtown
+  Creek" for the East River's unnamed area; not a long river's through a piece
+  of its delta, as the Lena's).
 - **Big enough**: still water and wetlands of 1 ha or more; rivers, canals,
   coastal water, seas and glaciers at any size.
 - **Not in the line already**: its name, lower case with letters and digits

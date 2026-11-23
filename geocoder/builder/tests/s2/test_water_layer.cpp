@@ -1374,31 +1374,39 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     CHECK(day4_cuts.lower_bound(day3_words * 32) != day4_cuts.end());
 }
 
-TEST(a_river_area_a_waterway_runs_only_a_short_way_into_takes_its_name_weakly) {
-    // Two unnamed river areas of 0.01 degrees (1.1 by 0.76 km): a creek
+TEST(a_river_area_a_short_waterway_runs_only_a_short_way_into_takes_its_name_weakly) {
+    // Three unnamed river areas of 0.01 degrees (1.1 by 0.76 km): a creek
     // runs 99 m into one, as a tributary's line ends in the river it flows
-    // into; a river runs the length of the other.
+    // into; a river runs the length of another; and a river of two ways,
+    // 99 km long, runs 99 m into the third, as a river's line through a piece
+    // of its delta at its side.
     Collected c = fixture();
     ObjectTags bank = tags(code::kRiver, "", true);
     c.closed_ways.push_back({2500, bank, square(kLat + 800000, kLng, 100000)});
     c.closed_ways.push_back({2501, bank, square(kLat + 1000000, kLng, 100000)});
-    LineIn creek;
-    creek.way = 2502;
-    creek.key = "nNewtown Creek";
-    creek.local = creek.display = "Newtown Creek";
-    creek.vertices = {pt(kLat + 850000, kLng - 20000), pt(kLat + 850000, kLng + 13000)};
-    c.lines.push_back(creek);
-    LineIn river;
-    river.way = 2503;
-    river.key = "nEast River";
-    river.local = river.display = "East River";
-    river.vertices = {pt(kLat + 990000, kLng + 50000), pt(kLat + 1110000, kLng + 50000)};
-    c.lines.push_back(river);
+    c.closed_ways.push_back({2504, bank, square(kLat + 1200000, kLng, 100000)});
+    auto line = [&](int64_t way, const std::string& name, std::vector<PackedLocation> vertices) {
+        LineIn l;
+        l.way = way;
+        l.key = "n" + name;
+        l.local = l.display = name;
+        l.vertices = std::move(vertices);
+        c.lines.push_back(l);
+    };
+    line(2502, "Newtown Creek", {pt(kLat + 850000, kLng - 20000), pt(kLat + 850000, kLng + 13000)});
+    line(2503, "East River", {pt(kLat + 990000, kLng + 50000), pt(kLat + 1110000, kLng + 50000)});
+    // The long river's ways meet at an end node; the second alone, 45 km,
+    // would be short beside the area (64 sides of its square, 59 km).
+    line(2505, "Lena", {pt(kLat + 1250000, kLng - 13000000), pt(kLat + 1250000, kLng - 6000000)});
+    line(2506, "Lena", {pt(kLat + 1250000, kLng - 6000000), pt(kLat + 1250000, kLng + 13000)});
+    // A creek of the same name 99 km long far off lends the creek nothing.
+    line(2507, "Newtown Creek", {pt(kLat + 2000000, kLng), pt(kLat + 2000000, kLng + 13000000)});
     const Layer layer = build(c);
     std::map<std::string, uint8_t> flags;
     for (size_t p = 0; p < layer.size(); p++) flags[name_of(layer, p)] = layer.records[p].place_type_override;
     CHECK_EQ(int(flags.at("Newtown Creek")), int(kWeakName));
     CHECK_EQ(int(flags.at("East River")), 0);
+    CHECK_EQ(int(flags.at("Lena")), 0);
     // Names of their own, and the fixture's river its waterway names along
     // its length, are not weak.
     for (const char* name : {"Pond", "Test Lake", "Ganga", "Test River"}) CHECK_EQ(int(flags.at(name)), 0);

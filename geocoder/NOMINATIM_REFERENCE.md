@@ -246,9 +246,11 @@ Where Nominatim's rank adjustment matters:
   `name:en` nor a reach's local name renames the river. A river mapped only as
   a line has no area and gets no `water`. A name so taken is weak where the
   river's lines run under half the side of a square of the area's size inside
-  it, as a tributary's line ends in the river it flows into (the East River's
-  unnamed area takes "Newtown Creek"): the record says so, and the location
-  line (below) doesn't name it.
+  it and the river itself, its relation or the lines of its name joined up, is
+  under 64 such sides long, as a creek's line ends in the river it flows into
+  (the East River's unnamed area takes "Newtown Creek"): the record says so,
+  and the location line (below) doesn't name it. A river's own line through a
+  piece of its delta or estuary, a long river beside the piece, is not weak.
 - **Kinds out of scope**, as in Nominatim: unnamed water (but river and canal
   areas a waterway names, above), `water=stream|ditch|drain|fish_pass`, `water=*` without
   `natural=water`, `natural=coastline`. Left out for the Marine Regions areas:

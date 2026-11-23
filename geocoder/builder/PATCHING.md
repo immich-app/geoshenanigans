@@ -451,7 +451,8 @@ geometry's and one of its own (file id 39, GCPATCH v23):
   object's area, its polygons' exact areas less their holes, summed, in the
   `area` field, and its flags in byte 14's place type: `kWeakName` where a
   river area's name is a waterway's that runs under half the side of a square
-  of its area inside it (`weak_name`, `src/water_names.h`), a tributary's.
+  of its area inside it and is under 64 sides long all told (`weak_name`,
+  `src/water_names.h`), a creek's or tributary's.
   Merged by slot (`ADMIN_SLOT_FAMILIES`), as the boundary tiers are.
 - `arc_index.bin` and `arc_vertices.bin`: the tier's arcs, merged by slot.
 - `water_cut_arcs.bin`: a bit per arc slot, in u32 words (bit `s % 32` of

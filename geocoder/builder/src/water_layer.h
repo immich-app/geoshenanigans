@@ -257,8 +257,9 @@ size_t drop_marine_namesakes(Build& b);
 // Names each unnamed river or canal object by `choices` (pick_names, by
 // object) and drops the objects with no name and their polygons, in place;
 // sums each object's area, then marks each name so taken that is weak
-// (weak_name: its key's length inside the object against the object's
-// area). Returns how many objects it named and, of those, how many weakly.
+// (weak_name: its key's length inside the object and its waterway's length
+// against the object's area). Returns how many objects it named and, of
+// those, how many weakly.
 std::pair<size_t, size_t> apply_names(Build& b, const std::vector<NameChoice>& choices);
 
 // Cuts each polygon of more than kSplitMaxHoles holes into pieces along the
