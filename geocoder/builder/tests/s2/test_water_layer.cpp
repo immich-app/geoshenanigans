@@ -20,6 +20,7 @@
 #include "arc_blocks.h"
 #include "captured_stderr.h"
 #include "scratch_dir.h"
+#include "string_files.h"
 #include "test_framework.h"
 #include "water_names_s2.h"
 #include "water_split.h"
@@ -132,6 +133,23 @@ std::map<std::string, std::vector<char>> tree(const std::string& dir) {
     for (const auto& e : fs::recursive_directory_iterator(dir))
         if (e.is_regular_file()) files[fs::relative(e.path(), dir).string()] = bytes_of(e.path());
     return files;
+}
+
+// The name of each slot of the dir `dir` of `files`, from its
+// strings_core.bin: "" for a tombstone.
+std::vector<std::string> slot_names(const std::map<std::string, std::vector<char>>& files, const std::string& dir) {
+    const std::vector<char>& core = files.at(dir + "/strings_core.bin");
+    const std::vector<char>& records = files.at(dir + "/admin_polygons.bin");
+    string_files::Decoder d(reinterpret_cast<const uint8_t*>(core.data()), core.size());
+    std::vector<char> pool;
+    while (d.next()) pool.insert(pool.end(), d.data(), d.data() + d.size());
+    std::vector<std::string> out;
+    for (size_t at = 0; at + sizeof(AdminPolygonRecord) <= records.size(); at += sizeof(AdminPolygonRecord)) {
+        AdminPolygonRecord r;
+        std::memcpy(&r, records.data() + at, sizeof r);
+        out.push_back(r.name_id == NO_DATA ? "" : r.name_id < pool.size() ? pool.data() + r.name_id : "(out of the pool)");
+    }
+    return out;
 }
 
 std::string write(const Layer& layer, const std::string& dir, const std::string& prev = "") {
@@ -389,7 +407,12 @@ TEST(the_water_dirs_hold_every_file_and_keep_each_polygons_slot_the_next_day) {
     for (const char* f : {"admin_polygons.bin", "admin_rings.bin", "admin_cells.bin", "admin_entries.bin",
                           "strings_core.bin", "strings_layout.json", "water_meta.json", "attribution.json"})
         CHECK(files.at(std::string("water/all/simplified/") + f) == files.at(std::string("water/all/exact/") + f));
+    // The simplified tier drops the vertices along the lake's sides that the
+    // exact tier keeps.
+    CHECK(files.at("water/all/simplified/arc_vertices.bin").size() < files.at("water/all/exact/arc_vertices.bin").size());
     CHECK(files.at("water/all/exact/admin_polygons.bin").size() == 4 * sizeof(AdminPolygonRecord));
+    const std::vector<std::string> day1_slots = slot_names(files, "water/all/exact");
+    CHECK(day1_slots == std::vector<std::string>({"Pond", "Test River", "Ganga", "Test Lake"}));
     CHECK(files.at("water/major/simplified/admin_polygons.bin").empty());
     const std::vector<char>& meta = files.at("water/all/exact/water_meta.json");
     const std::optional<std::vector<MetaType>> parsed = parse_meta_json(std::string(meta.begin(), meta.end()));
@@ -423,6 +446,8 @@ TEST(the_water_dirs_hold_every_file_and_keep_each_polygons_slot_the_next_day) {
     AdminPolygonRecord pond;
     std::memcpy(&pond, records.data(), sizeof pond);
     CHECK_EQ(pond.name_id, NO_DATA);
+    for (const char* dir : {"water/all/simplified", "water/all/exact"})
+        CHECK(slot_names(after, dir) == std::vector<std::string>({"", day1_slots[1], day1_slots[2], day1_slots[3]}));
 
     // A pond of another way the day after takes the freed slot: recycled,
     // not kept.

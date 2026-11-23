@@ -123,6 +123,22 @@ std::vector<std::string> names_in(const std::vector<char>& file) {
     return out;
 }
 
+// The name of each slot of a water dir's admin_polygons.bin, from its
+// strings_core.bin: "" for a tombstone.
+std::vector<std::string> slot_names(const std::string& dir) {
+    const std::vector<char> core = bytes_of(dir + "/strings_core.bin"), records = bytes_of(dir + "/admin_polygons.bin");
+    string_files::Decoder d(reinterpret_cast<const uint8_t*>(core.data()), core.size());
+    std::vector<char> pool;
+    while (d.next()) pool.insert(pool.end(), d.data(), d.data() + d.size());
+    std::vector<std::string> out;
+    for (size_t at = 0; at + sizeof(AdminPolygonRecord) <= records.size(); at += sizeof(AdminPolygonRecord)) {
+        AdminPolygonRecord r;
+        std::memcpy(&r, records.data() + at, sizeof r);
+        out.push_back(r.name_id == NO_DATA ? "" : r.name_id < pool.size() ? pool.data() + r.name_id : "(out of the pool)");
+    }
+    return out;
+}
+
 const std::vector<std::string> kRegions = {"planet", "africa", "asia", "europe", "north-america", "south-america",
                                            "oceania", "central-america", "antarctica"};
 
@@ -193,6 +209,23 @@ TEST(build_index_writes_every_regions_water_dirs_and_a_chained_build_writes_them
     const std::string again = root.path() + "/again";
     REQUIRE(build(again, {"--prev-output", first}));
     CHECK(tree(again) == files);
+
+    // The pond gone, on top of the first build: its slot is a tombstone and
+    // the others keep theirs, where a build of its own holds three records.
+    std::vector<TestObject> drained;
+    for (const TestObject& o : fixture())
+        if (o.type != OsmType::Way || o.id != 110) drained.push_back(o);
+    const std::string drained_pbf = root.path() + "/drained.osm.pbf", after = root.path() + "/drained";
+    write_test_pbf(drained_pbf, drained, 1000);
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, after, drained_pbf, "--continents", "--multi-output", "--multi-quality",
+                         "--prev-output", first},
+                        log));
+    std::vector<std::string> slots = slot_names(first + "/planet/water/all/exact");
+    REQUIRE(slots.size() == 4u);
+    const auto pond = std::find(slots.begin(), slots.end(), "Weiher");
+    REQUIRE(pond != slots.end());
+    *pond = "";
+    CHECK(slot_names(after + "/planet/water/all/exact") == slots);
 }
 
 TEST(a_way_only_the_water_layer_reads_stays_out_of_the_other_layers) {
