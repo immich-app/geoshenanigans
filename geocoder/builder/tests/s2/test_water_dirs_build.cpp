@@ -502,3 +502,31 @@ TEST(a_closed_water_way_tagged_area_no_is_water_as_nominatim_fills_it) {
     const ScratchDir root("water-area-no");
     CHECK(planet_water_names(objects, root.path() + "/out") == std::vector<std::string>({"Kein Gebiet"}));
 }
+
+TEST(a_member_way_of_a_river_relation_tagged_as_a_stream_names_the_area_it_runs_through) {
+    // The Rhine's relation takes a reach tagged waterway=stream as its main
+    // stream, the only line through an unnamed river area: the area is the
+    // relation's river. A stream of its own name in no relation names
+    // nothing.
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    std::vector<TestObject> objects;
+    int64_t next = 1;
+    auto at = [&](int32_t lat, int32_t lng) {
+        objects.push_back(node(next, lat, lng));
+        return next++;
+    };
+    auto square = [&](int32_t lat, int32_t lng, int32_t side) {
+        const int64_t a = at(lat, lng), b = at(lat, lng + side), c = at(lat + side, lng + side), d = at(lat + side, lng);
+        return std::vector<int64_t>{a, b, c, d, a};
+    };
+    objects.push_back(way(100, square(lat0, lng0, 10000), {{"natural", "water"}, {"water", "river"}}));
+    objects.push_back(way(101, {at(lat0 + 2000, lng0 + 2000), at(lat0 + 6000, lng0 + 6000)},
+                          {{"waterway", "stream"}, {"name", "Rhein"}}));
+    objects.push_back(relation(900, {{"type", "waterway"}, {"waterway", "river"}, {"name", "Rhein"}, {"name:en", "Rhine"}},
+                               {{101, "main_stream"}}));
+    objects.push_back(way(110, square(lat0 + 100000, lng0, 10000), {{"natural", "water"}, {"water", "river"}}));
+    objects.push_back(way(111, {at(lat0 + 102000, lng0 + 2000), at(lat0 + 106000, lng0 + 6000)},
+                          {{"waterway", "stream"}, {"name", "Dorfbach"}}));
+    const ScratchDir root("water-stream-member");
+    CHECK(planet_water_names(objects, root.path() + "/out") == std::vector<std::string>({"Rhine"}));
+}

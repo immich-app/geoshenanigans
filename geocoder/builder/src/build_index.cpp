@@ -1922,16 +1922,15 @@ static water::ObjectTags water_way_tags(const WayTags& t) {
 }
 
 // Whether the water layer reads a way: a member of a water area relation
-// (`member`), a waterway=river or canal way with a name or in a waterway
-// relation (`in_waterway`), or a closed way in scope (`closed()`, asked only
-// then). The node pre-scan and the way pass apply it alike.
+// (`member`), a member of a waterway relation whatever its own waterway tag
+// (`in_waterway`), a waterway=river or canal way with a name, or a closed
+// way in scope (`closed()`, which decodes its refs, asked only then). The
+// node pre-scan and the way pass apply it alike.
 template <class Closed>
 static bool water_way_wanted(const WayTags& t, bool member, bool in_waterway, Closed closed) {
-    if (member) return true;
-    if (water::is_naming_waterway(t.waterway) &&
-        (in_waterway || (t.name && *t.name) || (t.name_en && *t.name_en)))
-        return true;
-    return (t.natural || t.landuse || t.waterway) && closed() && water::in_scope(water_way_tags(t));
+    if (member || in_waterway) return true;
+    if (water::is_naming_waterway(t.waterway) && ((t.name && *t.name) || (t.name_en && *t.name_en))) return true;
+    return (t.natural || t.landuse || t.waterway) && water::in_scope(water_way_tags(t)) && closed();
 }
 
 // The water layer's relations of a block: the areas in scope, and the named
@@ -2553,9 +2552,7 @@ static int run(int argc, char* argv[]) {
                 if (id <= 0 || static_cast<size_t>(id) >= MAX_WAY_ID) return water_ways_past.count(id) > 0;
                 return water_way_bits.test(static_cast<uint64_t>(id));
             };
-            auto in_waterway = [&](const WayTags& t, int64_t id) {
-                return water::is_naming_waterway(t.waterway) && water_collected.waterway_of_way.count(id) > 0;
-            };
+            auto in_waterway = [&](int64_t id) { return water_collected.waterway_of_way.count(id) > 0; };
             std::cerr << "  Water: " << water_collected.relations.size() << " area relations ("
                       << water_way_count << " member ways), " << water_collected.waterways.size()
                       << " waterway relations (" << water_collected.waterway_of_way.size() << " member ways)."
@@ -2576,7 +2573,7 @@ static int run(int argc, char* argv[]) {
                     bool relation_member = is_admin_way(way_id) || is_poi_way(way_id);
                     const WayTags t = parse_way_tags(tag_keys, tag_vals, ntags, st);
                     if (!way_needs_nodes(t, relation_member) &&
-                        !water_way_wanted(t, is_water_way(way_id), in_waterway(t, way_id), [&] {
+                        !water_way_wanted(t, is_water_way(way_id), in_waterway(way_id), [&] {
                             const auto& r = refs.get();
                             return r.size() >= 4 && r.front() == r.back();
                         }))
@@ -3110,8 +3107,9 @@ static int run(int argc, char* argv[]) {
                     // Early exit: if no relevant tags, skip expensive node resolution
                     bool relation_member = !refs.empty() && (is_admin_way(way_id) || is_poi_way(way_id));
                     const bool water_member = !refs.empty() && is_water_way(way_id);
+                    const bool waterway_member = !refs.empty() && in_waterway(way_id);
                     const bool water_wanted = !refs.empty() &&
-                        water_way_wanted(t, water_member, in_waterway(t, way_id), [&] {
+                        water_way_wanted(t, water_member, waterway_member, [&] {
                             const auto& r = refs.get();
                             return r.size() >= 4 && r.front() == r.back();
                         });
@@ -3148,8 +3146,10 @@ static int run(int argc, char* argv[]) {
                                                               std::vector<PackedLocation>(resolved_locs.begin(), resolved_locs.end())});
                         }
                         // A line's way tags; key_lines keys it once every
-                        // input's waterway relations are in.
-                        if (water::is_naming_waterway(t.waterway)) {
+                        // input's waterway relations are in. A waterway
+                        // relation's member is its river's line whatever
+                        // its own waterway tag (a reach tagged as a stream).
+                        if (waterway_member || water::is_naming_waterway(t.waterway)) {
                             water::LineIn line;
                             line.way = way_id;
                             if (t.name) line.name = t.name;

@@ -172,12 +172,12 @@ struct Collected {
 // (Collected::waterway_of_way).
 void index_collected(Collected& c);
 
-// The key and display name of a waterway=river or canal way, given its
-// tags: its waterway relation's id and name (a member of one), else its
-// local name and its name:en (else name); false for neither. Its wikidata
-// item is its relation's, else its own. A member of a relation of a local
-// name alone keeps its own name:en (LineIn::way_en), which assemble may show
-// in the relation's place.
+// The key and display name of a waterway=river or canal way or a waterway
+// relation's member way, given its tags: its waterway relation's id and
+// name (a member of one), else its local name and its name:en (else name);
+// false for neither. Its wikidata item is its relation's, else its own. A
+// member of a relation of a local name alone keeps its own name:en
+// (LineIn::way_en), which assemble may show in the relation's place.
 bool line_key(const Collected& c, int64_t way, const char* name, const char* name_en, uint32_t way_qid, LineIn& line);
 
 // Keys every line by its way's tags (line_key) against the waterway
