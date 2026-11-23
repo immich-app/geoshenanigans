@@ -182,10 +182,6 @@ impl SurfaceMemo {
     }
 }
 
-/// How far apart, in degrees, the centroids of one outline can lie (`AdminGeometry::same_outline`):
-/// a tenth of a millimetre.
-const OUTLINE_SLACK_DEG: f64 = 1e-9;
-
 /// The files `AdminGeometry::load` maps, by name.
 pub const ADMIN_GEOMETRY_FILES: [&str; 3] = ["admin_rings.bin", "arc_index.bin", "arc_vertices.bin"];
 
@@ -270,9 +266,10 @@ impl AdminGeometry {
         (c.sums.area > 0.0).then(|| (lat0 + c.sums.y / c.sums.area, lng0 + c.sums.x / c.sums.area))
     }
 
-    /// Whether `a` and `b` have one outline: the same area, and the same ring block or centroids
-    /// within OUTLINE_SLACK_DEG of each other, the most the sums' rounding moves one when its
-    /// rings start at another vertex. False when either has no rings.
+    /// Whether `a` and `b` have one outline: the same area, and the same ring block or the same
+    /// edges, each taken either way round, whatever vertex their rings start at and whichever
+    /// arcs hold them. False when either has no rings or a malformed ring block, and where one
+    /// cuts an edge that the other doesn't.
     pub fn same_outline(&self, a: &AdminPolygon, b: &AdminPolygon) -> bool {
         if a.area != b.area {
             return false;
@@ -281,8 +278,17 @@ impl AdminGeometry {
         if block_a == block_b {
             return true;
         }
-        let near = |p: f64, q: f64| (p - q).abs() <= OUTLINE_SLACK_DEG;
-        matches!((self.centroid(a), self.centroid(b)), (Some(p), Some(q)) if near(p.0, q.0) && near(p.1, q.1))
+        let edges = |block: &[u8]| {
+            let mut read = EdgeReader { arcs: self.arcs(), edges: Vec::new(), vertices: Vec::new() };
+            walk_rings(block, &mut read)?;
+            let mut edges: Vec<_> = read.edges.into_iter()
+                .map(|(p, q)| if (p.lng, p.lat) <= (q.lng, q.lat) { (p, q) } else { (q, p) })
+                .map(|(p, q)| (p.lng, p.lat, q.lng, q.lat))
+                .collect();
+            edges.sort_unstable();
+            Some(edges)
+        };
+        matches!((edges(block_a), edges(block_b)), (Some(e), Some(f)) if e == f)
     }
 
     /// `poly`'s point on surface (the builder's interior_point) as (lat, lng); none without rings.

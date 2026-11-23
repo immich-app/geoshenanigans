@@ -604,22 +604,24 @@ fn a_centroid_is_the_outer_ring_s_less_its_holes_whichever_way_the_arcs_run() {
 
 #[test]
 fn one_outline_is_the_same_whichever_vertex_and_way_round_its_ring_starts() {
-    // A square, the same written from another vertex the other way round, and squares of its
-    // size beside it and a hair off, each with the area the builder stores: only the first two
-    // have one outline.
+    // A rectangle, the same written from another vertex the other way round, and rectangles of
+    // its size beside it, a hair off and turned round its centre, each with the area the builder
+    // stores: only the first two have one outline.
     let mut s = Shapes::default();
     let square = ring_polygon(&mut s, vec![box_deg(47.1, 8.3, 47.4, 8.7)]);
     let again = ring_polygon(&mut s, vec![ring_deg(&[(47.4, 8.7), (47.1, 8.7), (47.1, 8.3), (47.4, 8.3), (47.4, 8.7)])]);
     let beside = ring_polygon(&mut s, vec![box_deg(47.2, 8.3, 47.5, 8.7)]);
     let off = ring_polygon(&mut s, vec![box_deg(47.1, 8.3000001, 47.4, 8.7000001)]);
+    let turned = ring_polygon(&mut s, vec![box_deg(47.05, 8.35, 47.45, 8.65)]);
     let ringless = s.polygon(8, &[], vec![]);
     let (geom, mut polys) = s.geometry();
     for id in [beside, off] {
         polys[id as usize].area = polys[square as usize].area;
     }
+    assert_eq!(polys[turned as usize].area, polys[square as usize].area);
     let same = |a: u32, b: u32| geom.same_outline(&polys[a as usize], &polys[b as usize]);
     assert!(same(square, square) && same(square, again) && same(again, square));
-    assert!(!same(square, beside) && !same(square, off) && !same(ringless, ringless));
+    assert!(!same(square, beside) && !same(square, off) && !same(square, turned) && !same(ringless, ringless));
     // Of another area, the same ring is another outline.
     polys[again as usize].area *= 2.0;
     assert!(!geom.same_outline(&polys[square as usize], &polys[again as usize]));
