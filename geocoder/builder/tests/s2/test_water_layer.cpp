@@ -1313,27 +1313,44 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
             }
         REQUIRE(names == client);
     }
+    // The kinds and credits the patch tests rely on, before any fixture dir
+    // is written.
+    for (const char* f : {"water_meta.json", "attribution.json"}) {
+        REQUIRE(days["day1"][f] == days["day2"][f]);
+        REQUIRE(days["day2"][f] != days["day3"][f]);
+    }
+    REQUIRE(text_of(days["day3"]["water_meta.json"]).find("\"type\": \"salt_pond\"") != std::string::npos);
+    REQUIRE(text_of(days["day3"]["attribution.json"]).find("marine-regions") != std::string::npos);
+    if (rewrite) {
+        // Every day written whole beside its dir first, then each swapped in:
+        // a write that fails leaves the fixture as it was.
+        for (const auto& [day, files] : days) {
+            const std::string staged = fixture_dir + "/" + day + ".staged";
+            fs::remove_all(staged);
+            for (const auto& [name, bytes] : files) {
+                const std::string path = staged + "/" + name;
+                fs::create_directories(fs::path(path).parent_path());
+                std::ofstream out(path, std::ios::binary);
+                out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                out.close();
+                REQUIRE(out.good());
+            }
+        }
+        for (const auto& [day, files] : days) {
+            const std::string day_dir = fixture_dir + "/" + day, old = day_dir + ".old";
+            fs::remove_all(old);
+            if (fs::exists(day_dir)) fs::rename(day_dir, old);
+            fs::rename(day_dir + ".staged", day_dir);
+            fs::remove_all(old);
+        }
+    }
     for (const auto& [day, files] : days) {
         // The day's fixture dir is those files and no other: the patch tests
         // copy it whole.
         const std::string day_dir = fixture_dir + "/" + day;
-        if (rewrite) {
-            fs::remove_all(day_dir);
-            for (const auto& [name, bytes] : files) {
-                const std::string path = day_dir + "/" + name;
-                fs::create_directories(fs::path(path).parent_path());
-                std::ofstream(path, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-            }
-        }
         REQUIRE(fs::is_directory(day_dir));
         CHECK(tree(day_dir) == files);
     }
-    for (const char* f : {"water_meta.json", "attribution.json"}) {
-        CHECK(days["day1"][f] == days["day2"][f]);
-        CHECK(days["day2"][f] != days["day3"][f]);
-    }
-    CHECK(text_of(days["day3"]["water_meta.json"]).find("\"type\": \"salt_pond\"") != std::string::npos);
-    CHECK(text_of(days["day3"]["attribution.json"]).find("marine-regions") != std::string::npos);
 }
 
 TEST(an_unnamed_riverbank_tagged_natural_water_too_takes_its_waterways_name) {
