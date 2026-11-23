@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::downloader::{
-    check_selection, download_region, Configurations, DownloadError, DownloadProgress, RegionSelection,
+    check_selection, client_error, download_region, Configurations, DownloadError, DownloadProgress, RegionSelection,
 };
 use query_server::MultiIndex;
 
@@ -139,15 +139,7 @@ impl RegionState {
     async fn http(&self) -> Result<&reqwest::Client, DownloadError> {
         self.http
             .get_or_try_init(|| async {
-                reqwest::Client::builder().user_agent("geocoder-server/0.1").build().map_err(|e| {
-                    let mut why = e.to_string();
-                    let mut source = std::error::Error::source(&e);
-                    while let Some(s) = source {
-                        why += &format!(": {s}");
-                        source = s.source();
-                    }
-                    DownloadError::Http(format!("building the client: {why}"))
-                })
+                reqwest::Client::builder().user_agent("geocoder-server/0.1").build().map_err(client_error)
             })
             .await
     }
