@@ -25,11 +25,13 @@ fn a_place_area_keeps_its_place_rank_round_smaller_boundaries() {
 }
 
 #[test]
-fn a_place_area_lifts_a_boundary_only_from_rank_23_down_and_round_its_surface_point() {
-    // Prairie Township (R7238290, admin_level 7, rank 14) and Westland, a place=neighbourhood area
-    // (rank 24) a little larger, round the point but not round the township's middle. Nominatim
-    // lifts a boundary only into a place area of rank 1 to 23 that contains it (:912-929), so the
-    // township keeps 14 under either. A place=quarter area (22) round it lifts it to 24.
+fn a_place_area_lifts_a_boundary_only_from_rank_23_down_and_holding_all_of_it() {
+    // Prairie Township (R7238290, admin_level 7, rank 14) under Westland, a place=neighbourhood
+    // area (rank 24) a little larger round it, and under Lincoln Village, a place=quarter area
+    // (22) larger than it round its middle and the point, but not round its southern strip.
+    // Nominatim lifts a boundary only into a place area of rank 1 to 23 that contains it whole
+    // (:912-929, ST_Contains), so the township keeps 14 under either. A place=quarter area round
+    // it lifts it to 24.
     let township = |area: (&str, u8, Span)| {
         TestIndex::in_country(b"US")
             .boundary("Ohio", 4, 7, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
@@ -38,13 +40,13 @@ fn a_place_area_lifts_a_boundary_only_from_rank_23_down_and_round_its_surface_po
             .boundary(area.0, 15, area.1, area.2)
             .load()
     };
-    // Round the township's middle, rank 24.
+    // Round all of the township, rank 24.
     let index = township(("Westland", 5, (-3500.0, -3500.0, 3500.0, 3500.0)));
     let address = address_at(&index, 1000.0, 1000.0);
     assert_eq!(address["municipality"], "Prairie Township");
     assert_eq!(address["neighbourhood"], "Westland");
-    // Rank 22, larger, round the point but not round the township's middle.
-    let index = township(("Lincoln Village", 6, (500.0, 500.0, 7000.0, 7000.0)));
+    // Rank 22, larger, round the point and the township's middle, the strip south of 2,500 m out.
+    let index = township(("Lincoln Village", 6, (-2500.0, -4000.0, 3500.0, 3500.0)));
     let address = address_at(&index, 1000.0, 1000.0);
     assert_eq!(address["municipality"], "Prairie Township");
     assert_eq!(address["quarter"], "Lincoln Village");

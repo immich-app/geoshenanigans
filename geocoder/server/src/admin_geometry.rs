@@ -4,7 +4,7 @@
 //! the neighbours along a border share (arc_blocks.rs).
 
 use crate::arc_blocks::{
-    arc_box_max_lat, arc_vertices, ring_block_contains, walk_rings, ArcFiles, ArcMemo, ArcRef, ChunkBox, RingVisitor,
+    arc_box, arc_vertices, ring_block_contains, walk_rings, ArcFiles, ArcMemo, ArcRef, ChunkBox, RingVisitor,
     CHUNK_BOX_SLACK_E7,
 };
 use crate::exact_pip::{edge_crosses, on_edge, to_e7, PointE7};
@@ -297,8 +297,12 @@ impl AdminGeometry {
     }
 
     /// Whether `poly` lies within `other`, as Nominatim's ST_Contains(other, poly) of a place
-    /// area or a boundary: every vertex of its rings inside `other` or on its edges, the edges
-    /// between them taken to stay inside, as they do between areas nested along shared ways.
+    /// area or a boundary: every vertex of its rings inside `other` or on its edges, none of its
+    /// edges crossing one of `other`'s, no vertex of `other`'s rings inside it off its edges (as
+    /// one of a hole of `other` that it lies round, or of a notch in `other` that it spans), and
+    /// its point on surface inside `other` off its edges (not so for one filling a hole of
+    /// `other`). Areas nested along shared ways meet on edges alone. `poly`'s rings are read once
+    /// and held, and `other`'s once, but for the chunks and arcs south of `poly` or beside it.
     /// False when either has no rings.
     pub fn polygon_within(&self, poly: &AdminPolygon, other: &AdminPolygon) -> bool {
         let (Some(block), Some(other_block)) = (self.ring_block(poly), self.ring_block(other)) else { return false };
@@ -308,8 +312,9 @@ impl AdminGeometry {
         if let Some(within) = memo().get(poly_key, other_key) {
             return within;
         }
-        let mut test = VerticesWithin { arcs: self.arcs(), other: other_block, outside: false };
-        let within = walk_rings(block, &mut test).is_some() && !test.outside;
+        let within = self.memo_surface_point(poly, block)
+            .and_then(|(lat, lng)| HeldRings::of(block, self.arcs(), AdminPoint::new(lat, lng).e7()))
+            .is_some_and(|held| held.within(self.arcs(), other_block));
         memo().insert(poly_key, other_key, within);
         within
     }
@@ -567,7 +572,7 @@ impl RingVisitor for NearCentre<'_, '_> {
 
     fn arc(&mut self, r: ArcRef) -> Option<()> {
         let block = self.arcs.block(r.slot)?;
-        if arc_box_max_lat(block).is_some_and(|max| deg(max) <= self.lo) {
+        if arc_box(block).is_some_and(|[_, _, max_lat]| deg(max_lat) <= self.lo) {
             return Some(());
         }
         let NearCentre { centre, lo, hi, edges, .. } = self;
@@ -591,35 +596,226 @@ impl RingVisitor for NearCentre<'_, '_> {
     }
 }
 
-/// Whether the ray from `p` crosses a ring block's edges an odd number of times, and whether `p`
-/// lies on one of them.
-/// AdminGeometry::polygon_within's walk: each vertex tested against the other polygon's rings,
-/// the walk stopped at the first outside them.
-struct VerticesWithin<'a> {
-    arcs: ArcFiles<'a>,
-    other: &'a [u8],
-    outside: bool,
+/// What the edges of another polygon read so far do at a point: whether the ray from it towards
+/// +lat crosses an odd number of them, and whether it lies on one.
+#[derive(Clone, Copy)]
+struct Probe {
+    p: PointE7,
+    odd: bool,
+    on_edge: bool,
 }
 
-impl RingVisitor for VerticesWithin<'_> {
+impl Probe {
+    fn at(p: PointE7) -> Self {
+        Probe { p, odd: false, on_edge: false }
+    }
+
+    fn read(&mut self, a: PointE7, b: PointE7) {
+        self.odd ^= edge_crosses(a, b, self.p);
+        self.on_edge |= on_edge(a, b, self.p);
+    }
+}
+
+/// Whether the edges a-b and c-d cross at a point inside both: each one's ends lie on either
+/// side of the other's line, off it.
+fn cross_inside(a: PointE7, b: PointE7, c: PointE7, d: PointE7) -> bool {
+    // The ends are within i32, as the arc decoder gives them: a difference takes 33 bits.
+    let side = |p: PointE7, q: PointE7, r: PointE7| {
+        ((q.lng - p.lng) as i128 * (r.lat - p.lat) as i128 - (q.lat - p.lat) as i128 * (r.lng - p.lng) as i128).signum()
+    };
+    side(a, b, c) * side(a, b, d) < 0 && side(c, d, a) * side(c, d, b) < 0
+}
+
+/// A polygon's rings held whole for AdminGeometry::polygon_within: its vertices, each once and by
+/// longitude, and its point on surface, as probes of the other polygon's edges; and its edges,
+/// each listed in every strip of longitude its own longitudes meet, so that a point or an edge
+/// of the other polygon is tested against the edges of its strips alone.
+struct HeldRings {
+    probes: Vec<Probe>,
+    surface: Probe,
+    edges: Vec<(PointE7, PointE7)>,
+    /// The edges meeting strip s are edges[listed[k]] for k in starts[s]..starts[s + 1].
+    starts: Vec<u32>,
+    listed: Vec<u32>,
+    /// The corners of the box of the vertices and the point on surface.
+    lo: PointE7,
+    hi: PointE7,
+    strip_width: i64,
+}
+
+impl HeldRings {
+    /// The strips: one for about EDGES_PER_STRIP edges, at most MAX_STRIPS, and fewer where the
+    /// lists would hold more than LISTED_PER_EDGE entries an edge, as long edges make them.
+    const EDGES_PER_STRIP: usize = 4;
+    const MAX_STRIPS: usize = 1 << 14;
+    const LISTED_PER_EDGE: usize = 8;
+
+    /// The rings of ring block `block`, with `surface` its point on surface; none for a malformed
+    /// block or one without vertices.
+    fn of(block: &[u8], arcs: ArcFiles<'_>, surface: PointE7) -> Option<HeldRings> {
+        let mut read = EdgeReader { arcs, edges: Vec::new(), vertices: Vec::new() };
+        walk_rings(block, &mut read)?;
+        let EdgeReader { edges, mut vertices, .. } = read;
+        vertices.sort_unstable_by_key(|v| (v.lng, v.lat));
+        vertices.dedup();
+        let (mut lo, mut hi) = (surface, surface);
+        for v in &vertices {
+            (lo.lat, lo.lng, hi.lat, hi.lng) = (lo.lat.min(v.lat), lo.lng.min(v.lng), hi.lat.max(v.lat), hi.lng.max(v.lng));
+        }
+        if vertices.is_empty() {
+            return None;
+        }
+
+        let mut strips = (edges.len() / Self::EDGES_PER_STRIP).clamp(1, Self::MAX_STRIPS);
+        let (strip_width, spans) = loop {
+            let width = (hi.lng - lo.lng) / strips as i64 + 1;
+            let strip = |lng: i64| ((lng - lo.lng) / width) as usize;
+            let spans: Vec<(usize, usize)> = edges.iter().map(|(a, b)| (strip(a.lng.min(b.lng)), strip(a.lng.max(b.lng)))).collect();
+            let listed: usize = spans.iter().map(|&(s0, s1)| s1 - s0 + 1).sum();
+            if strips == 1 || listed <= Self::LISTED_PER_EDGE * edges.len() {
+                break (width, spans);
+            }
+            strips /= 2;
+        };
+        let mut starts = vec![0u32; strips + 1];
+        for &(s0, s1) in &spans {
+            for s in s0..=s1 {
+                starts[s + 1] += 1;
+            }
+        }
+        for s in 0..strips {
+            starts[s + 1] += starts[s];
+        }
+        let mut next = starts.clone();
+        let mut listed = vec![0u32; starts[strips] as usize];
+        for (k, &(s0, s1)) in spans.iter().enumerate() {
+            for s in s0..=s1 {
+                listed[next[s] as usize] = k as u32;
+                next[s] += 1;
+            }
+        }
+        let probes = vertices.into_iter().map(Probe::at).collect();
+        Some(HeldRings { probes, surface: Probe::at(surface), edges, starts, listed, lo, hi, strip_width })
+    }
+
+    /// The edges listed in the strips from the one of longitude `lng0` to the one of `lng1`
+    /// (lng0 <= lng1), an edge once a strip.
+    fn edges_between(&self, lng0: i64, lng1: i64) -> impl Iterator<Item = (PointE7, PointE7)> + '_ {
+        let strip = |lng: i64| ((lng.clamp(self.lo.lng, self.hi.lng) - self.lo.lng) / self.strip_width) as usize;
+        let (first, end) = (self.starts[strip(lng0)] as usize, self.starts[strip(lng1) + 1] as usize);
+        self.listed[first..end].iter().map(|&k| self.edges[k as usize])
+    }
+
+    /// Whether every point of a box from longitude `min_lng` to `max_lng` and up to latitude
+    /// `max_lat` lies south of the held probes or east or west of them: none of its edges
+    /// crosses the ray from a probe, holds one, or meets an edge of the rings.
+    fn keeps_off(&self, min_lng: i64, max_lng: i64, max_lat: i64) -> bool {
+        max_lat < self.lo.lat || min_lng > self.hi.lng || max_lng < self.lo.lng
+    }
+
+    /// Whether `p` lies inside the rings, off their edges.
+    fn holds_off_edges(&self, p: PointE7) -> bool {
+        if !(self.lo.lat < p.lat && p.lat < self.hi.lat && self.lo.lng < p.lng && p.lng < self.hi.lng) {
+            return false;
+        }
+        let mut odd = false;
+        for (a, b) in self.edges_between(p.lng, p.lng) {
+            if on_edge(a, b, p) {
+                return false;
+            }
+            odd ^= edge_crosses(a, b, p);
+        }
+        odd
+    }
+
+    /// Reads the other polygon's edge a-b into every probe whose longitude it spans; whether it
+    /// crosses an edge of the rings at a point inside both.
+    fn read_edge(&mut self, a: PointE7, b: PointE7) -> bool {
+        let (lng0, lng1) = (a.lng.min(b.lng), a.lng.max(b.lng));
+        let first = self.probes.partition_point(|q| q.p.lng < lng0);
+        for q in self.probes[first..].iter_mut().take_while(|q| q.p.lng <= lng1) {
+            q.read(a, b);
+        }
+        self.surface.read(a, b);
+        if a.lat.max(b.lat) <= self.lo.lat || a.lat.min(b.lat) >= self.hi.lat || lng1 <= self.lo.lng || lng0 >= self.hi.lng {
+            return false;
+        }
+        self.edges_between(lng0, lng1).any(|(c, d)| cross_inside(a, b, c, d))
+    }
+
+    /// Whether the rings lie within the polygon whose ring block is `other`, read through `arcs`.
+    fn within(self, arcs: ArcFiles<'_>, other: &[u8]) -> bool {
+        let mut walk = WithinWalk { arcs, held: self, outside: false };
+        if walk_rings(other, &mut walk).is_none() || walk.outside {
+            return false;
+        }
+        let HeldRings { probes, surface, .. } = &walk.held;
+        probes.iter().all(|q| q.odd || q.on_edge) && surface.odd && !surface.on_edge
+    }
+}
+
+/// A ring block's edges, each arc's in the order it stores them, and their vertices.
+struct EdgeReader<'a> {
+    arcs: ArcFiles<'a>,
+    edges: Vec<(PointE7, PointE7)>,
+    vertices: Vec<PointE7>,
+}
+
+impl RingVisitor for EdgeReader<'_> {
     fn wants_chunk(&mut self, _: &ChunkBox) -> bool {
         true
     }
 
     fn arc(&mut self, r: ArcRef) -> Option<()> {
-        let (arcs, other) = (self.arcs, self.other);
-        let mut outside = false;
+        let EdgeReader { arcs, edges, vertices } = self;
+        let mut prev: Option<PointE7> = None;
         arc_vertices(arcs.block(r.slot)?, |v| {
+            if let Some(a) = prev.filter(|&a| a != v) {
+                edges.push((a, v));
+            }
+            vertices.push(v);
+            prev = Some(v);
+        })?;
+        Some(())
+    }
+}
+
+/// AdminGeometry::polygon_within's walk of the other polygon's rings: each edge read into the
+/// held rings, the walk stopped at the first edge crossing one of theirs or vertex inside them
+/// off their edges.
+struct WithinWalk<'a> {
+    arcs: ArcFiles<'a>,
+    held: HeldRings,
+    outside: bool,
+}
+
+impl RingVisitor for WithinWalk<'_> {
+    fn wants_chunk(&mut self, bbox: &ChunkBox) -> bool {
+        let slack = CHUNK_BOX_SLACK_E7;
+        !self.held.keeps_off(bbox.min_lng as i64 - slack, bbox.max_lng as i64 + slack, bbox.max_lat as i64 + slack)
+    }
+
+    fn arc(&mut self, r: ArcRef) -> Option<()> {
+        let block = self.arcs.block(r.slot)?;
+        if arc_box(block).is_some_and(|[min_lng, max_lng, max_lat]| self.held.keeps_off(min_lng, max_lng, max_lat)) {
+            return Some(());
+        }
+        let held = &mut self.held;
+        let (mut prev, mut outside) = (None::<PointE7>, false);
+        arc_vertices(block, |v| {
             if outside { return; }
-            let mut test = InsideOffEdges { arcs, p: v, odd: false, on_edge: false };
-            outside = walk_rings(other, &mut test).is_none() || !(test.odd || test.on_edge);
+            outside = held.holds_off_edges(v) || prev.is_some_and(|a| held.read_edge(a, v));
+            prev = Some(v);
         })?;
         self.outside |= outside;
-        // An outside vertex ends the walk, which then reads as malformed.
+        // An edge or a vertex that leaves the rings outside ends the walk, which then reads as
+        // malformed.
         (!outside).then_some(())
     }
 }
 
+/// Whether the ray from `p` crosses a ring block's edges an odd number of times, and whether `p`
+/// lies on one of them.
 struct InsideOffEdges<'a> {
     arcs: ArcFiles<'a>,
     p: PointE7,

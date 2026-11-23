@@ -611,6 +611,120 @@ fn current_boundaries_test_the_point_on_surface_of_larger_and_equal_boundaries()
     }
 }
 
+/// Whether the edges a-b and c-d cross at a point inside both: the ends of each on either side
+/// of the other's line, by the signs of their cross products.
+fn cross_inside_brute(a: PointE7, b: PointE7, c: PointE7, d: PointE7) -> bool {
+    let cross = |p: PointE7, q: PointE7, r: PointE7| (q.lng - p.lng) as i128 * (r.lat - p.lat) as i128 - (q.lat - p.lat) as i128 * (r.lng - p.lng) as i128;
+    let apart = |x: i128, y: i128| (x < 0 && y > 0) || (x > 0 && y < 0);
+    apart(cross(a, b, c), cross(a, b, d)) && apart(cross(c, d, a), cross(c, d, b))
+}
+
+/// polygon_within over rings as given, every edge against every edge: each vertex of `rings`
+/// inside `other` or on its edges, no edge of theirs crossing one of `other`'s inside both, no
+/// vertex of `other` inside them off their edges, and `surface` inside `other` off its edges.
+fn within_brute(rings: &[Vec<PointE7>], other: &[Vec<PointE7>], surface: PointE7) -> bool {
+    let edges = |rings: &[Vec<PointE7>]| -> Vec<(PointE7, PointE7)> { rings.iter().flat_map(|r| r.windows(2).map(|e| (e[0], e[1]))).collect() };
+    let (own, others) = (edges(rings), edges(other));
+    let on = |edges: &[(PointE7, PointE7)], p: PointE7| edges.iter().any(|&(a, b)| on_edge(a, b, p));
+    rings.iter().flatten().all(|&v| brute(other, v) || on(&others, v))
+        && !own.iter().any(|&(a, b)| others.iter().any(|&(c, d)| cross_inside_brute(a, b, c, d)))
+        && !other.iter().flatten().any(|&v| brute(rings, v) && !on(&own, v))
+        && brute(other, surface) && !on(&others, surface)
+}
+
+#[test]
+fn a_polygon_is_within_another_only_where_no_part_of_it_is_outside() {
+    // ST_Contains: no point of the polygon outside the other. Round a 0..10 square in degrees:
+    // the square, with a hole from 4 to 6, and notched from its top edge down to (5, 5).
+    let mut s = Shapes::default();
+    let outer = box_deg(0.0, 0.0, 10.0, 10.0);
+    let square = ring_polygon(&mut s, vec![outer.clone()]);
+    let holed = ring_polygon(&mut s, vec![outer.clone(), box_deg(4.0, 4.0, 6.0, 6.0)]);
+    let notched = ring_polygon(&mut s, vec![ring_deg(&[(0.0, 0.0), (0.0, 10.0), (10.0, 10.0), (10.0, 6.0), (5.0, 5.0), (10.0, 4.0), (10.0, 0.0), (0.0, 0.0)])]);
+    // Round the hole and the notch's tip; beside both.
+    let inner = ring_polygon(&mut s, vec![box_deg(2.0, 2.0, 8.0, 8.0)]);
+    let corner = ring_polygon(&mut s, vec![box_deg(1.0, 1.0, 3.0, 3.0)]);
+    // Across the notch above its tip: every vertex inside the notched square and none of its
+    // inside this, but the edges cross.
+    let across = ring_polygon(&mut s, vec![box_deg(7.0, 1.0, 9.0, 9.0)]);
+    // Along the square's edges, the western half; the hole's outline, which fills it.
+    let half = ring_polygon(&mut s, vec![box_deg(0.0, 0.0, 10.0, 5.0)]);
+    let enclave = ring_polygon(&mut s, vec![box_deg(4.0, 4.0, 6.0, 6.0)]);
+    let past = ring_polygon(&mut s, vec![box_deg(5.0, 5.0, 15.0, 15.0)]);
+    let ringless = s.polygon(8, &[], vec![]);
+    let (geom, polys) = s.geometry();
+    let within = |a: u32, b: u32| geom.polygon_within(&polys[a as usize], &polys[b as usize]);
+    for (a, b, want) in [
+        (inner, square, true), (inner, holed, false), (inner, notched, false),
+        (corner, square, true), (corner, holed, true), (corner, notched, true),
+        (across, square, true), (across, notched, false),
+        (half, square, true), (half, holed, false), (half, notched, false),
+        (enclave, square, true), (enclave, holed, false),
+        (holed, square, true), (square, holed, false), (notched, square, true), (square, notched, false),
+        (square, square, true), (past, square, false), (square, inner, false),
+        (ringless, square, false), (square, ringless, false),
+    ] {
+        assert_eq!(within(a, b), want, "{a} in {b}");
+        let surface = geom.ring_block(&polys[a as usize]).and_then(|block| geom.surface_point(block, &mut Vec::new()));
+        if let Some((lat, lng)) = surface.filter(|_| b != ringless) {
+            assert_eq!(within_brute(&s.rings[a as usize], &s.rings[b as usize], AdminPoint::new(lat, lng).e7()), want, "{a} in {b}");
+        }
+    }
+}
+
+#[test]
+fn polygon_within_answers_as_testing_every_edge_against_every_edge() {
+    // Lattices of cells sharing their edges' arcs with their blocks and the whole, some cells
+    // with a hole an island fills, edges of every grid read either way round.
+    let mut rng = Rng::new(20261123);
+    for (dims, vertices, grids) in [((3, 3), 40, &[0u8][..]), ((2, 2), 3, &[0, 2, 3][..]), ((4, 4), 12, &[2][..])] {
+        let l = lattice(&mut rng, dims, 200_000, vertices, grids, true);
+        let (geom, polys) = l.shapes.geometry();
+        let ids: Vec<u32> = l.polygons().collect();
+        let within = |a: u32, b: u32| geom.polygon_within(&polys[a as usize], &polys[b as usize]);
+        let mut held = 0;
+        for &a in &ids {
+            let (lat, lng) = geom.surface_point(geom.ring_block(&polys[a as usize]).unwrap(), &mut Vec::new()).unwrap();
+            let surface = AdminPoint::new(lat, lng).e7();
+            for &b in &ids {
+                let want = within_brute(&l.shapes.rings[a as usize], &l.shapes.rings[b as usize], surface);
+                held += want as usize;
+                assert_eq!(within(a, b), want, "{dims:?} {grids:?} {a} in {b}");
+            }
+        }
+        // Each within itself and the whole, the cells of a block within it, and no island
+        // within a cell, as the one round it has the island's outline as a hole.
+        assert!(ids.iter().all(|&a| within(a, a) && within(a, l.whole)), "{dims:?}");
+        let cols = dims.1;
+        let corners = (0..dims.0.saturating_sub(1)).step_by(2).flat_map(|i| (0..cols.saturating_sub(1)).step_by(2).map(move |j| (i, j)));
+        for (&block, (i, j)) in l.blocks.iter().zip(corners) {
+            for (di, dj) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                assert!(within(l.cells[(i + di) * cols + j + dj], block), "{dims:?} cell ({}, {}) in its block", i + di, j + dj);
+            }
+        }
+        assert!(l.islands.iter().all(|&island| l.cells.iter().all(|&cell| !within(island, cell))), "{dims:?}");
+        assert!(!l.islands.is_empty() && held > ids.len() * 2, "{dims:?}");
+    }
+}
+
+#[test]
+fn polygon_within_reads_each_arc_once_then_answers_from_its_memo() {
+    // A square of 8 arcs and 393 vertices inside a square of one arc: its arcs are read for its
+    // rings and its point on surface, the other's once, not once a vertex.
+    let mut s = Shapes::default();
+    let (refs, ring) = square_of_arcs(&mut s.fx, 0, 1_000_000, 2, 50);
+    let inner = s.polygon(8, &[refs], vec![ring]);
+    let outer = ring_polygon(&mut s, vec![ring_deg(&[(-0.01, -0.01), (-0.01, 0.11), (0.11, 0.11), (0.11, -0.01), (-0.01, -0.01)])]);
+    let (geom, polys) = s.geometry();
+    let decodes = || crate::arc_blocks::ARC_DECODES.with(|n| n.get());
+    let before = decodes();
+    assert!(geom.polygon_within(&polys[inner as usize], &polys[outer as usize]));
+    assert!(decodes() - before <= 3 * 8 + 1, "{} arcs read", decodes() - before);
+    let before = decodes();
+    assert!(geom.polygon_within(&polys[inner as usize], &polys[outer as usize]));
+    assert_eq!(decodes(), before);
+}
+
 /// An index of `fx`'s polygons, each listed in the admin cells `cells` gives (cell, entry),
 /// written as files into `dir`, with `names` its strings.
 fn write_index(dir: &std::path::Path, fx: &ArcFixture, cells: &[(u64, u32)], names: &[u8]) {
