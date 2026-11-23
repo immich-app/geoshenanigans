@@ -1083,6 +1083,20 @@ std::vector<int> categories_of(const std::vector<PoiRecord>& records) {
     return out;
 }
 
+// The categories a poi_meta.json lists, its top-level keys, in order.
+std::vector<int> meta_categories(const std::vector<char>& meta) {
+    const std::string text(meta.begin(), meta.end());
+    std::vector<int> out;
+    // Each top-level member is a line `  "<id>": {...}`.
+    for (size_t at = text.find("\n  \""); at != std::string::npos; at = text.find("\n  \"", at + 1)) {
+        const size_t from = at + 4, to = text.find('"', from);
+        REQUIRE(to != std::string::npos && text.compare(to, 4, "\": {") == 0);
+        out.push_back(std::stoi(text.substr(from, to - from)));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 // The dataset of a client of POI tier `tier` of a build's whole dir `out`:
 // the planet dir's files and poi/<tier>'s beside them, at `at`.
 std::string poi_dataset(const std::string& out, const std::string& tier, const std::string& at) {
@@ -1176,10 +1190,9 @@ TEST(a_bay_that_is_a_pier_is_a_pier_where_piers_ship_and_a_bay_where_only_bays_d
                 CHECK_EQ(int(pr.flags), wiki ? int(POI_FLAG_WIKIDATA) : 0);
                 CHECK_EQ(pr.vertex_count, 5u);
             }
-            // poi_meta.json lists the category the tier holds the way as.
-            const auto& meta = files.at("planet/poi/" + tier + "/poi_meta.json");
-            const std::string text(meta.begin(), meta.end());
-            for (const int category : categories) CHECK(text.find("\"" + std::to_string(category) + "\":") != std::string::npos);
+            // poi_meta.json lists the category the tier holds the way as,
+            // and no other; none for the tier that holds nothing.
+            CHECK(meta_categories(files.at("planet/poi/" + tier + "/poi_meta.json")) == categories);
         }
 
         gc::id_alloc::IdAllocator alloc;
