@@ -27,6 +27,10 @@ TEST(admin_minimal_keeps_place_areas_down_to_rank_16) {
     CHECK(!admin_minimal_keeps(15, pt(AdminPlaceType::NEIGHBOURHOOD)));
     CHECK(!admin_minimal_keeps(15, pt(AdminPlaceType::REGION)));  // rank 0
     CHECK(!admin_minimal_keeps(15, pt(AdminPlaceType::NONE)));
+    // place=province ranks 10 in Spain and 12 in Saudi Arabia, 0 elsewhere,
+    // where the server leaves it out of addresses.
+    CHECK(admin_minimal_keeps(15, pt(AdminPlaceType::PROVINCE)));
+    CHECK(!admin_minimal_keeps(15, pt(AdminPlaceType::STATE)));
 }
 
 TEST(place_areas_of_rank_0_everywhere_are_no_address_areas) {
