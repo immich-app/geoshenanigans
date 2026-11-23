@@ -423,8 +423,10 @@ def patch_water_days(test, old_day, new_day):
         write_file(os.path.join(day, "r", "full", "strings_street.bin"), 4 << 20)
     test.results, test.logs = os.path.join(test.root, "results"), os.path.join(test.root, "logs")
     os.makedirs(os.path.join(test.root, "scratch"))
+    # Scratch space the scheduler takes as ample, whatever the volume holds and the environment reserves.
     env = dict(os.environ, GEOCODER_DIFF=real_tool("geocoder-diff", "GEOCODER_DIFF"),
-               GEOCODER_PATCH=real_tool("geocoder-patch", "GEOCODER_PATCH"), TMPDIR=os.path.join(test.root, "scratch"))
+               GEOCODER_PATCH=real_tool("geocoder-patch", "GEOCODER_PATCH"), TMPDIR=os.path.join(test.root, "scratch"),
+               GEOCODER_PATCH_SCRATCH_FREE_KIB=str(AMPLE_SCRATCH_KIB), GEOCODER_PATCH_SCRATCH_RESERVE_KIB="0")
     test.run_ = subprocess.run(["bash", os.path.join(HERE, "generate_patches.sh"), test.old, test.new, test.results,
                                 test.logs], env=env, capture_output=True, text=True, timeout=300)
 

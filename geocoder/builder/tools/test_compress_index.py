@@ -281,13 +281,21 @@ class CompressIndexTest(OutputTest):
         for rel, data in water.items():
             write(self.path(rel), data)
         write(self.path("planet/water/all/exact/admin_polygons.fallback.osm_ids"), content(21, 64))
+        log = os.path.join(self.tmp.name, "upload.log")
+        recorder = f"{sys.executable} -c \"import sys; open({log!r}, 'a').write(sys.stdin.read())\""
 
-        cfg = self.run_main()
+        cfg = self.run_main("--upload", "s3://bucket/day/", "--upload-cmd", recorder)
 
         for rel, data in water.items():
             self.assertEqual(unzstd(self.path(rel) + ".zst"), data, rel)
             self.assertEqual(cfg["files"][rel]["sha256"], sha(data), rel)
         self.assertNotIn("planet/water/all/exact/admin_polygons.fallback.osm_ids", cfg["files"])
+        # And each goes up with the rest.
+        with open(log) as f:
+            sent = f.read().splitlines()
+        for rel in water:
+            self.assertIn(f"cp {self.path(rel)}.zst s3://bucket/day/{rel}.zst", sent, rel)
+        self.assertFalse([line for line in sent if "fallback.osm_ids" in line], sent)
 
 
 class ComponentSizesTest(OutputTest):
