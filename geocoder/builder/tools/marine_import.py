@@ -458,6 +458,9 @@ def build(opts):
                                       bbox=(bbox[0] - 1, bbox[1] - 1, bbox[2] + 1, bbox[3] + 1) if bbox else None)
     _LAND = shapely.from_wkb(geoms)
     del geoms
+    # Without land every tile by a sea area is water. A bounded run's tiles can all lie offshore.
+    if not bbox and not (np.isin(shapely.get_type_id(_LAND), (3, 6)) & ~shapely.is_empty(_LAND)).any():
+        raise ValueError(f"{opts.land}: no land polygons")
     _LAND_TREE = shapely.STRtree(_LAND)
     log(f"{len(_LAND)} land polygons, {shapely.get_num_coordinates(_LAND).sum()} vertices")
 

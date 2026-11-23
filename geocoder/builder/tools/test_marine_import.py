@@ -314,6 +314,20 @@ class BuildTest(unittest.TestCase):
                 bounded, _ = self.build("bounded.bin", seas=seas, land=land, more=[f"--bbox={bbox}"])
                 self.assertEqual(marine_import.read_marine(bounded), expected)
 
+    def test_a_run_of_the_world_without_land_is_refused_and_a_bounded_one_may_find_none(self):
+        out = os.path.join(self.dir.name, "marine_areas.bin")
+        line = {"type": "Feature", "properties": {},
+                "geometry": {"type": "LineString", "coordinates": [[10.0, 50.0], [11.0, 51.0]]}}
+        for why, features in [("no features", []), ("a line alone", [line])]:
+            land = self.write("no-land.geojson", features)
+            with self.subTest(why):
+                with self.assertRaisesRegex(ValueError, "no land polygons"):
+                    self.run_build(out, out + ".json", land=land)
+                self.assertFalse(os.path.exists(out))
+                # A bounded run's tiles can all lie offshore.
+                _, summary = self.build("offshore.bin", land=land, more=["--bbox=10.5,50.5,10.5,50.5"])
+                self.assertGreater(summary["polygons"], 0)
+
     def test_a_stats_path_that_is_the_output_is_refused(self):
         out = os.path.join(self.dir.name, "marine_areas.bin")
         os.symlink(self.dir.name, os.path.join(self.dir.name, "link"))
