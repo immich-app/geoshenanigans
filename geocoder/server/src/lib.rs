@@ -2912,6 +2912,12 @@ impl Index {
     /// POI that answers, `interp` the TIGER line near a street that answers, `postcode_area` the
     /// postal area's postcode at the query point and `country_code` the answer's country.
     pub fn resolve_postcode<'a>(&'a self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, postcode_area: Option<Cow<'a, str>>, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
+        self.resolve_postcode_in(lat, lng, street, addr, poi, interp, postcode_area, country_code).map(|(postcode, _)| postcode)
+    }
+
+    /// `resolve_postcode`'s postcode, with the country it is of: the one get_nearest_postcode
+    /// takes it in at a street's middle, and a house of the street, else `country_code`.
+    fn resolve_postcode_in<'a>(&'a self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, postcode_area: Option<Cow<'a, str>>, country_code: Option<[u8; 2]>) -> Option<(Cow<'a, str>, Option<[u8; 2]>)> {
         // 0. The house's own postcode (from addr_postcodes.bin)
         // Matches Nominatim's token_get_postcode — the feature's own
         // addr:postcode tag is the highest-priority source. The
@@ -2923,7 +2929,7 @@ impl Index {
             if let Some(pid) = Self::sidecar_u32(apc, addr_id as u64) {
                 let own = self.get_string(pid);
                 if country_code.is_none_or(|cc| !country_has_no_postcode(&cc) && postcode_looks_valid(&cc, &own)) {
-                    return Some(own);
+                    return Some((own, country_code));
                 }
             }
         }
@@ -2931,7 +2937,7 @@ impl Index {
         // 1. way_postcodes[street.way_id] — street's computed postcode
         if let (Some(wpc), Some((way_id, _))) = (self.way_postcodes.as_ref(), street) {
             if let Some(pid) = Self::sidecar_u32(wpc, way_id as u64) {
-                return Some(self.get_string(pid));
+                return Some((self.get_string(pid), country_code));
             }
         }
 
@@ -2941,7 +2947,7 @@ impl Index {
         // memory locality.
         if let Some(p) = poi {
             if p.parent_postcode_id != NO_DATA {
-                return Some(self.get_string(p.parent_postcode_id));
+                return Some((self.get_string(p.parent_postcode_id), country_code));
             }
         }
 
@@ -2970,7 +2976,7 @@ impl Index {
                         && street_tokens_overlap(seg_street, &self.get_string(way.name))
                     {
                         if let Some(pid) = Self::sidecar_u32(ipc, iw_idx as u64) {
-                            return Some(self.get_string(pid));
+                            return Some((self.get_string(pid), country_code));
                         }
                     }
                 }
@@ -2989,21 +2995,19 @@ impl Index {
                 let found = self.postal_area_postcode(&areas, &upper_country(country_code), point)
                     .or_else(|| self.centroid_postcode(m_lat, m_lng, country_code));
                 if found.is_some() || addr.is_none() {
-                    return found;
+                    return found.map(|postcode| (postcode, country_code));
                 }
             }
         }
         if let Some((_, house)) = addr {
             let (h_lat, h_lng) = (house.lat as f64, house.lng as f64);
             return self.postal_area_at(h_lat, h_lng, country_code)
-                .or_else(|| self.centroid_postcode(h_lat, h_lng, country_code));
+                .or_else(|| self.centroid_postcode(h_lat, h_lng, country_code))
+                .map(|postcode| (postcode, country_code));
         }
         // The postcode area covering the point: get_nearest_postcode takes
         // one before any centroid (ORDER BY osm_id is null).
-        if postcode_area.is_some() {
-            return postcode_area;
-        }
-        self.centroid_postcode(lat, lng, country_code)
+        postcode_area.or_else(|| self.centroid_postcode(lat, lng, country_code)).map(|postcode| (postcode, country_code))
     }
 
     /// The postcode of the postcode centroid nearest the point (lat, lng) whose box holds it,
@@ -3564,7 +3568,7 @@ impl Index {
         } else {
             street.as_ref().map(|(_, w, idx)| (*idx, *w))
         };
-        let resolved_postcode = self.resolve_postcode(
+        let resolved_postcode = self.resolve_postcode_in(
             lat, lng,
             postcode_street.as_ref().map(|(idx, w)| (*idx as usize, w)),
             if addr_won_primary {
@@ -3699,11 +3703,11 @@ impl Index {
             city_block: admin.city_block,
             // Postcode from resolve_postcode(): 3-tier chain
             // (own → inherited → postal area or nearest centroid).
-            // Reject if the country has no postal-code system or if
+            // Reject if its country has no postal-code system or if
             // the string doesn't match the country's pattern, then
             // normalise whitespace/separators per country.
             postcode: match resolved_postcode {
-                Some(pc) => match admin.country_code {
+                Some((pc, postcode_country)) => match postcode_country {
                     Some(cc) => {
                         if country_has_no_postcode(&cc) || !postcode_looks_valid(&cc, &pc) {
                             None

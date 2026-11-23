@@ -257,11 +257,11 @@ fn a_house_takes_the_postcode_its_street_has_at_its_middle() {
     assert_eq!(address["postcode"], "NG4 4AF");
 }
 
-/// Germany west of `origin` and Switzerland east of it, each 50 km across.
-fn border_at(origin: (f64, f64)) -> TestIndex {
+/// The country `west` west of `origin` and `east` east of it, each 50 km across.
+fn border_at(origin: (f64, f64), west: &[u8; 2], east: &[u8; 2]) -> TestIndex {
     let mut index = TestIndex { origin, ..TestIndex::default() };
-    for (name, code, span) in [("Deutschland", b"DE", (-50_000.0, -50_000.0, 50_000.0, 0.0)), ("Schweiz", b"CH", (-50_000.0, 0.0, 50_000.0, 50_000.0))] {
-        index.boundary(name, 2, 0, span);
+    for (code, span) in [(west, (-50_000.0, -50_000.0, 50_000.0, 0.0)), (east, (-50_000.0, 0.0, 50_000.0, 50_000.0))] {
+        index.boundary(&String::from_utf8_lossy(code), 2, 0, span);
         index.polygons.last_mut().unwrap().0.country_code = u16::from_be_bytes(*code);
     }
     index
@@ -276,7 +276,7 @@ fn a_street_across_a_border_takes_a_postcode_of_its_middle_s_country() {
     // reaches the middle too.
     let origin = (47.69, 8.6);
     let ch = u16::from_be_bytes(*b"CH");
-    let mut dataset = border_at(origin);
+    let mut dataset = border_at(origin, b"DE", b"CH");
     dataset.boundary("8238", POSTCODE_AREA_LEVEL, 0, (-500.0, 1000.0, 500.0, 2000.0));
     dataset.polygons.last_mut().unwrap().0.country_code = ch;
     dataset.street("Rheinweg", &[(0.0, -500.0), (0.0, 3500.0)]).centroid("78266", 0.0, -300.0);
@@ -288,7 +288,7 @@ fn a_street_across_a_border_takes_a_postcode_of_its_middle_s_country() {
     // middle, get_nearest_postcode of that country at the house. Here Rheinweg runs 16 km east,
     // and the box of the Swiss centroid 8200, 1.4 km from the house, reaches the house but not
     // the middle: it names the German house, not the German centroid beside it.
-    let mut dataset = border_at(origin);
+    let mut dataset = border_at(origin, b"DE", b"CH");
     dataset.street("Rheinweg", &[(0.0, -500.0), (0.0, 15_500.0)])
         .address("7", 20.0, -400.0)
         .centroid("78266", 20.0, -450.0)
@@ -297,6 +297,17 @@ fn a_street_across_a_border_takes_a_postcode_of_its_middle_s_country() {
     let address = address_from(&dataset.load(), origin, 5.0, -400.0);
     assert_eq!(address["house_number"], "7");
     assert_eq!(address["postcode"], "8200");
+
+    // The postcode is of the middle's country: from a point in the United Arab Emirates, which
+    // have no postcodes, a street whose middle is in Oman has Oman's 112.
+    let al_ain = (24.2, 55.8);
+    let mut dataset = border_at(al_ain, b"AE", b"OM");
+    dataset.boundary("112", POSTCODE_AREA_LEVEL, 0, (-500.0, 1000.0, 500.0, 2000.0));
+    dataset.polygons.last_mut().unwrap().0.country_code = u16::from_be_bytes(*b"OM");
+    dataset.street("Border Road", &[(0.0, -500.0), (0.0, 3500.0)]);
+    let address = address_from(&dataset.load(), al_ain, 5.0, -400.0);
+    assert_eq!(address["road"], "Border Road");
+    assert_eq!(address["postcode"], "112");
 }
 
 #[test]
