@@ -13,6 +13,7 @@ import struct
 import sys
 import tempfile
 import time
+import tracemalloc
 import unittest
 from unittest import mock
 
@@ -77,8 +78,34 @@ class FileTest(unittest.TestCase):
                           ("not a marine areas file", b"GCMARINX" + good[8:])]:
             with open(self.path, "wb") as f:
                 f.write(data)
-            with self.subTest(why), self.assertRaisesRegex(ValueError, why):
-                marine_import.read_marine(self.path)
+            for read in (marine_import.read_marine, marine_import.stats):
+                with self.subTest(why, read=read.__name__), contextlib.redirect_stdout(io.StringIO()), \
+                        self.assertRaisesRegex(ValueError, why):
+                    read(self.path)
+
+    def test_stats_counts_each_objects_polygons_rings_and_vertices_and_their_total(self):
+        marine_import.write_marine(self.path, TWO_AREAS)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            marine_import.stats(self.path)
+        self.assertEqual(out.getvalue().splitlines(), [
+            "1902\tocean\tNorth Atlantic Ocean\t2 polygons\t3 rings\t10 vertices",
+            "2350\tsea\tNorth Sea\t1 polygons\t1 rings\t3 vertices",
+            "total\t2 objects\t3 polygons\t4 rings\t13 vertices",
+        ])
+
+    def test_stats_holds_a_ring_at_a_time_not_the_file(self):
+        # 200 rings of 2,000 vertices, 3.2 MB of them: stats holds a ring's at most.
+        ring = [(k, k) for k in range(2000)]
+        marine_import.write_marine(self.path, [(1, marine_import.KIND_SEA, "North Sea", [[ring]] * 200)])
+        tracemalloc.start()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                marine_import.stats(self.path)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, os.path.getsize(self.path) // 10)
 
     def test_the_oceans_are_the_areas_named_ocean(self):
         self.assertEqual(marine_import.kind_of("North Atlantic Ocean"), marine_import.KIND_OCEAN)
