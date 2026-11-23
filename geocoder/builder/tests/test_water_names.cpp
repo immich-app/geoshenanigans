@@ -159,3 +159,16 @@ TEST(a_choice_carries_the_lowest_wikidata_item_of_its_keys_lines_in_the_object) 
     CHECK_EQ(choices[0].qid, 4u);
     CHECK_EQ(choices[1].qid, 0u);
 }
+
+TEST(a_name_is_weak_where_its_lines_run_under_half_the_side_of_a_square_of_the_objects_area) {
+    // A river area of 6.7 km² (the East River's): a tributary's 300 m into it
+    // is weak, its own river's 1.3 km and more is not.
+    CHECK(weak_name(300000, 6.7));
+    CHECK(weak_name(1290000, 6.7));
+    CHECK(!weak_name(1300000, 6.7));
+    CHECK(!weak_name(20000000, 6.7));
+    // A riverbank of 100 m by 3 km, its river along it; a wide reach of 1.5
+    // by 2 km, its river through it.
+    CHECK(!weak_name(3000000, 0.3));
+    CHECK(!weak_name(2000000, 3.0));
+}

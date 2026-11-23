@@ -8,10 +8,11 @@
 //                                         piece of either, water_split.h),
 //                                         with its holes, carrying the
 //                                         object's name, type code (in
-//                                         country_code) and whole area (its
+//                                         country_code), whole area (its
 //                                         polygons' exact areas less their
 //                                         holes, summed, square degrees), so
-//                                         records' areas don't add up
+//                                         records' areas don't add up, and
+//                                         flags (kWeakName, in the place type)
 //   arc_index.bin + arc_vertices.bin      the tier's arcs (kWaterArcStage:
 //                                         rings cut at member way ends)
 //   water_cut_arcs.bin                    a bit per arc slot, set for a cut:
@@ -203,6 +204,7 @@ struct Object {
     double km2 = 0;
     uint32_t name_key = UINT32_MAX;  // the naming key it took (NamingLines::keys), UINT32_MAX for none
     uint32_t key_qid = 0;            // the lowest wikidata item of that key's lines in it, 0 for none
+    bool weak_name = false;          // its name is its key's, taken weakly (water_names.h's weak_name)
 };
 
 // The layer's build over the planet's objects, step by step (build_index.cpp
@@ -253,8 +255,10 @@ size_t drop_marine_namesakes(Build& b);
 
 // Names each unnamed river or canal object by `choices` (pick_names, by
 // object) and drops the objects with no name and their polygons, in place;
-// sums each object's area. Returns how many objects it named.
-size_t apply_names(Build& b, const std::vector<NameChoice>& choices);
+// sums each object's area, then marks each name so taken that is weak
+// (weak_name: its key's length inside the object against the object's
+// area). Returns how many objects it named and, of those, how many weakly.
+std::pair<size_t, size_t> apply_names(Build& b, const std::vector<NameChoice>& choices);
 
 // Cuts each polygon of more than kSplitMaxHoles holes into pieces along the
 // grid (water_split.h), in place: each piece a polygon of the same object

@@ -752,9 +752,11 @@ size_t drop_marine_namesakes(Build& b) {
     return dropped;
 }
 
-size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
+std::pair<size_t, size_t> apply_names(Build& b, const std::vector<NameChoice>& choices) {
     size_t named = 0;
     std::vector<uint8_t> keep(b.objects.size(), 0);
+    // The length inside of the key that named each object so, by object.
+    std::vector<uint64_t> named_mm(b.objects.size(), 0);
     for (size_t o = 0; o < b.objects.size(); o++) {
         Object& obj = b.objects[o];
         if (o < choices.size() && choices[o].named()) {
@@ -763,11 +765,17 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
             if (obj.tags.name.empty()) {
                 obj.tags.name = b.lines.displays[choices[o].display];
                 obj.tags.local_name = b.lines.key_local[choices[o].key];
+                named_mm[o] = choices[o].mm;
                 named++;
             }
         }
         keep[o] = !obj.tags.name.empty();
     }
+    // In the kept objects' order, as keep_objects leaves them.
+    size_t kept = 0;
+    for (size_t o = 0; o < b.objects.size(); o++)
+        if (keep[o]) named_mm[kept++] = named_mm[o];
+    named_mm.resize(kept);
     keep_objects(b, keep);
     AdminExactRings& r = b.rings;
     for (Object& obj : b.objects) obj.area_deg2 = obj.km2 = 0;
@@ -776,7 +784,13 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
         obj.area_deg2 += r.area(static_cast<uint32_t>(p));
         obj.km2 += polygon_km2(r, static_cast<uint32_t>(p));
     }
-    return named;
+    size_t weak = 0;
+    for (size_t o = 0; o < b.objects.size(); o++) {
+        Object& obj = b.objects[o];
+        obj.weak_name = named_mm[o] != 0 && weak_name(named_mm[o], obj.km2);
+        weak += obj.weak_name;
+    }
+    return {named, weak};
 }
 
 void split_polygons(Build& b, unsigned threads) {
@@ -1137,6 +1151,7 @@ Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::
         rec.ring_offset = 0;
         rec.name_id = offset[static_cast<size_t>(std::lower_bound(names.begin(), names.end(), o.tags.name) - names.begin())];
         rec.admin_level = 0;
+        rec.place_type_override = o.weak_name ? kWeakName : 0;
         rec.area = static_cast<float>(o.area_deg2);
         rec.country_code = o.tags.code ? o.tags.code : out.types->verbatim_code(o.tags.verbatim);
         out.records[p] = rec;
@@ -1501,12 +1516,13 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
         contested += choices[o].named() && choices[o].runner_up_mm * 4 >= choices[o].mm;
     }
     const size_t before = b.objects.size();
-    const size_t named = apply_names(b, choices);
+    const auto [named, weak] = apply_names(b, choices);
     std::cerr << "  Water names: " << river_polygons.size() << " river and canal polygons of " << river_objects
               << " objects, " << unnamed_rivers << " without a name of their own; " << counts.cover_entries
               << " cover entries, " << counts.segments_in_cover << " segments in their cells, " << counts.probes
               << " probed (" << counts.probes_inside << " inside), " << counts.credits << " credits; " << named
-              << " named by their waterway, " << before - b.objects.size() << " left unnamed and out, " << contested
+              << " named by their waterway (" << weak << " weakly, by one that runs a short way in), "
+              << before - b.objects.size() << " left unnamed and out, " << contested
               << " with a runner-up of a quarter or more" << std::endl;
     free_storage(b.lines.lines);
     free_storage(b.lines.vertices);

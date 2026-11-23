@@ -1281,6 +1281,47 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     CHECK(cuts("day3") >= 1u);
 }
 
+TEST(a_river_area_a_waterway_runs_only_a_short_way_into_takes_its_name_weakly) {
+    // Two unnamed river areas of 0.01 degrees (1.1 by 0.76 km): a creek
+    // runs 99 m into one, as a tributary's line ends in the river it flows
+    // into; a river runs the length of the other.
+    Collected c = fixture();
+    ObjectTags bank = tags(code::kRiver, "", true);
+    c.closed_ways.push_back({2500, bank, square(kLat + 800000, kLng, 100000)});
+    c.closed_ways.push_back({2501, bank, square(kLat + 1000000, kLng, 100000)});
+    LineIn creek;
+    creek.way = 2502;
+    creek.key = "nNewtown Creek";
+    creek.local = creek.display = "Newtown Creek";
+    creek.vertices = {pt(kLat + 850000, kLng - 20000), pt(kLat + 850000, kLng + 13000)};
+    c.lines.push_back(creek);
+    LineIn river;
+    river.way = 2503;
+    river.key = "nEast River";
+    river.local = river.display = "East River";
+    river.vertices = {pt(kLat + 990000, kLng + 50000), pt(kLat + 1110000, kLng + 50000)};
+    c.lines.push_back(river);
+    const Layer layer = build(c);
+    std::map<std::string, uint8_t> flags;
+    for (size_t p = 0; p < layer.size(); p++) flags[name_of(layer, p)] = layer.records[p].place_type_override;
+    CHECK_EQ(int(flags.at("Newtown Creek")), int(kWeakName));
+    CHECK_EQ(int(flags.at("East River")), 0);
+    // Names of their own, and the fixture's river its waterway names along
+    // its length, are not weak.
+    for (const char* name : {"Pond", "Test Lake", "Ganga", "Test River"}) CHECK_EQ(int(flags.at(name)), 0);
+    // The records carry it in byte 14's place type.
+    const ScratchDir root("water-weak");
+    write(layer, root.path());
+    const auto files = tree(root.path());
+    const std::vector<std::string> names = slot_names(files, "water/all/exact");
+    const std::vector<char>& records = files.at("water/all/exact/admin_polygons.bin");
+    for (size_t i = 0; i < names.size(); i++) {
+        AdminPolygonRecord r;
+        std::memcpy(&r, records.data() + i * sizeof r, sizeof r);
+        CHECK_EQ(int(r.level_override), names[i] == "Newtown Creek" ? int(kWeakName) : 0);
+    }
+}
+
 TEST(an_unnamed_riverbank_tagged_natural_water_too_takes_its_waterways_name) {
     Collected c = fixture();
     const ObjectTags bank = tags_from({{"natural", "water"}, {"waterway", "riverbank"}});

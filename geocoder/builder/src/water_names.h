@@ -12,6 +12,12 @@
 // it, a tie going to the smaller name, and its wikidata item the lowest of
 // the key's lines that credit it. Integer sums and total orders: the same
 // answer on any number of threads.
+//
+// A name so taken is weak where its key's lines run only a short way into
+// the object (weak_name): a tributary whose line ends at the middle of the
+// river it flows into names that river's unnamed area, which the location
+// line then doesn't trust (the East River as "Newtown Creek"). A river's own
+// line runs the length of its area, which is longer than it is wide.
 #pragma once
 
 #include <algorithm>
@@ -157,6 +163,14 @@ private:
     int64_t ax_, ay_, dx_, dy_;
     std::vector<Crossing> crossings_;
 };
+
+// Whether a name an object took from lines of `mm` millimetres inside it is
+// weak, the object `km2` in area: the lines' length under half the side of a
+// square of that area.
+inline bool weak_name(uint64_t mm, double km2) {
+    const double km = static_cast<double>(mm) / 1e6;
+    return 4 * km * km < km2;
+}
 
 // The whole millimetres of segment a-b that `share` of it (SegmentClip)
 // holds: the segment's own (segment_mm) for all of it.
