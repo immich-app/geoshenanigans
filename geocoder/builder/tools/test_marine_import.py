@@ -328,6 +328,26 @@ class BuildTest(unittest.TestCase):
                 _, summary = self.build("offshore.bin", land=land, more=["--bbox=10.5,50.5,10.5,50.5"])
                 self.assertGreater(summary["polygons"], 0)
 
+    def test_an_output_or_stats_path_that_is_a_source_is_refused(self):
+        out = os.path.join(self.dir.name, "marine_areas.bin")
+        os.symlink(self.dir.name, os.path.join(self.dir.name, "link"))
+        held = {}
+        for source in (self.seas, self.land):
+            with open(source, "rb") as f:
+                held[source] = f.read()
+        for flag, source in (("--eez-iho", self.seas), ("--land", self.land)):
+            alias = os.path.join(self.dir.name, "link", os.path.basename(source))
+            for written, stats in ((alias, out + ".json"), (out, alias)):
+                for path, data in held.items():
+                    with open(path, "wb") as f:
+                        f.write(data)
+                with self.subTest(source=flag, output=written, stats=stats):
+                    with self.assertRaisesRegex(ValueError, f"is a source, {flag} "):
+                        self.run_build(written, stats)
+                    with open(source, "rb") as f:
+                        self.assertEqual(f.read(), held[source])
+                    self.assertFalse(os.path.exists(out))
+
     def test_a_stats_path_that_is_the_output_is_refused(self):
         out = os.path.join(self.dir.name, "marine_areas.bin")
         os.symlink(self.dir.name, os.path.join(self.dir.name, "link"))

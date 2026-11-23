@@ -438,6 +438,11 @@ def build(opts):
 
     if opts.stats and os.path.realpath(opts.stats) == os.path.realpath(opts.output):
         raise ValueError(f"--stats {opts.stats} is the output, -o {opts.output}")
+    # Both are written once the sources are read: either over a source would replace it.
+    for flag, path in (("-o", opts.output), ("--stats", opts.stats)):
+        for source_flag, source in (("--eez-iho", opts.eez_iho), ("--land", opts.land)):
+            if path and os.path.realpath(path) == os.path.realpath(source):
+                raise ValueError(f"{flag} {path} is a source, {source_flag} {source}")
     bbox = opts.bbox
     ctx = multiprocessing.get_context("fork")
     tiles = {}
