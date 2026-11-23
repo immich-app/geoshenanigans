@@ -788,14 +788,46 @@ static LatLng outer_vertex_average(const ParsedData& data, uint32_t i) {
 }
 
 // The country polygon i lies in, as Nominatim takes a place's at its centroid
-// (get_country_code): its own code where it has one (a country's), else the
-// country at its outer ring's vertex average; 0 where none is known.
+// (get_country_code): its own code where it has one (a country, a postal
+// area), else the country at its outer ring's vertex average; 0 where none
+// is known.
 static uint16_t polygon_country(const ParsedData& data, const AdminRings& countries, uint32_t i) {
     const AdminPolygon& poly = data.admin_polygons[i];
     if (poly.country_code != 0) return poly.country_code;
     if (data.admin_exact_rings.polygons[i].ring_count == 0) return 0;
     const LatLng c = outer_vertex_average(data, i);
     return country_code_at_point(data, countries, c.first, c.second);
+}
+
+// Gives each postal area (admin_level 11) the country its centroid lies in,
+// as Nominatim gives a place_postcode row the country of its centroid
+// (postcodes.py update_postcodes, get_country_code), and marks the ones of a
+// postcode the country's pattern rejects POSTAL_AREA_INVALID: Nominatim makes
+// no postcode area of those (_update_postcode_areas), so they name nothing.
+static void assign_postal_area_countries(ParsedData& data, const AdminRings& countries, unsigned int threads) {
+    const auto& pool = data.string_pool.data();
+    std::atomic<size_t> areas{0}, invalid{0};
+    parallel_for(data.admin_polygons.size(), [&](size_t begin, size_t end, unsigned) {
+        for (size_t i = begin; i < end; i++) {
+            AdminPolygon& poly = data.admin_polygons[i];
+            if (poly.admin_level != 11 || poly.name_id == NO_DATA) continue;
+            const auto& rings = data.admin_exact_rings;
+            if (rings.polygons[i].ring_count == 0) continue;
+            const LatLng c = exact_polygon_centroid(rings.vertices.data(), rings.rings_of(static_cast<uint32_t>(i)),
+                                                    rings.polygons[i].ring_count);
+            poly.country_code = country_code_at_point(data, countries, c.first, c.second);
+            areas.fetch_add(1);
+            if (poly.country_code == 0) continue;
+            const char cc[3] = {static_cast<char>(std::tolower(poly.country_code >> 8)),
+                                static_cast<char>(std::tolower(poly.country_code & 0xFF)), 0};
+            if (!validate_postcode_for_country(cc, pool.data() + poly.name_id)) {
+                poly.place_type_override = POSTAL_AREA_INVALID;
+                invalid.fetch_add(1);
+            }
+        }
+    }, threads);
+    std::cerr << "Postal areas: " << areas.load() << " given their centroid's country, " << invalid.load()
+              << " of a postcode their country's pattern rejects" << std::endl;
 }
 
 // find_linked_place step 4: name-based linking of admin boundaries to place nodes
@@ -805,6 +837,7 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
     unsigned int num_threads = cfg.num_threads;
     if (data.admin_polygons.empty()) return;
     const AdminRings countries = border_country_rings(data, num_threads);
+    assign_postal_area_countries(data, countries, num_threads);
     if (!data.place_nodes.empty()) {
         auto _nl_t = std::chrono::steady_clock::now();
 

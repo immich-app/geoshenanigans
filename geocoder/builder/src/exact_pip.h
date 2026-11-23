@@ -116,3 +116,34 @@ inline float exact_polygon_area(const PackedLocation* v, const RingSpan* rings, 
     if (area2 < 0) area2 = 0;
     return static_cast<float>(static_cast<double>(area2) * 0.5e-14);
 }
+
+// The centroid (lat, lng) of a polygon's rings (the outer, then its holes) in
+// degrees: the outer ring's area-weighted centre less its holes', as PostGIS's
+// ST_Centroid of a lon/lat polygon. A polygon of no area gives its outer
+// ring's first vertex.
+inline LatLng exact_polygon_centroid(const PackedLocation* v, const RingSpan* rings, uint32_t ring_count) {
+    if (ring_count == 0 || rings[0].count == 0) return {0, 0};
+    const PackedLocation origin = v[rings[0].begin];
+    double area = 0, lat = 0, lng = 0;
+    for (uint32_t r = 0; r < ring_count; r++) {
+        const PackedLocation* ring = v + rings[r].begin;
+        const uint32_t n = rings[r].count;
+        double a2 = 0, sum_lat = 0, sum_lng = 0;
+        for (uint32_t a = 0, b = n - 1; a < n; b = a++) {
+            const double y0 = (ring[b].lat_e7 - origin.lat_e7) * 1e-7, x0 = (ring[b].lon_e7 - origin.lon_e7) * 1e-7;
+            const double y1 = (ring[a].lat_e7 - origin.lat_e7) * 1e-7, x1 = (ring[a].lon_e7 - origin.lon_e7) * 1e-7;
+            const double cross = x0 * y1 - x1 * y0;
+            a2 += cross;
+            sum_lat += (y0 + y1) * cross;
+            sum_lng += (x0 + x1) * cross;
+        }
+        if (a2 == 0) continue;
+        // The ring's centre is its sums over 3 times a2; it weighs |a2|, a hole against.
+        const double weight = (r == 0 ? 1.0 : -1.0) * std::fabs(a2);
+        area += weight;
+        lat += weight * sum_lat / (3 * a2);
+        lng += weight * sum_lng / (3 * a2);
+    }
+    if (!(area > 0)) return {origin.lat_e7 * 1e-7, origin.lon_e7 * 1e-7};
+    return {origin.lat_e7 * 1e-7 + lat / area, origin.lon_e7 * 1e-7 + lng / area};
+}

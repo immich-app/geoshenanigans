@@ -68,6 +68,11 @@ enum class AdminPlaceType : uint8_t {
     MUNICIPALITY = 14,  // place=municipality (e.g. Sydney Council L6)
 };
 
+// The place type of a postal area (admin_level 11) whose postcode its
+// country's pattern rejects: Nominatim makes no postcode area of it, and it
+// names no street, POI or point.
+constexpr uint8_t POSTAL_AREA_INVALID = 15;
+
 // Vertex encoding tag: picks the bytes-per-vertex / precision tradeoff
 // for this polygon.  Stored as a 1-byte tag in the per-polygon header
 // at the start of the polygon's vertex slice.

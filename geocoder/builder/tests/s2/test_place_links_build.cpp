@@ -1,7 +1,9 @@
-// build-index's place links, from a PBF to the server's answers: a boundary
-// of rank 0 in its country links no place node, a boundary links a place node
-// of its wikidata only where it holds it, and a place=province area is an
-// address area where its country ranks it.
+// build-index's place links and postal areas, from a PBF to the server's
+// answers: a boundary of rank 0 in its country links no place node, a
+// boundary links a place node of its wikidata only where it holds it, a
+// place=province area is an address area where its country ranks it, and a
+// postal area names a point only of its own country and of a postcode its
+// country takes.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -180,5 +182,25 @@ TEST(a_province_area_is_an_address_area_where_its_country_ranks_it) {
     REQUIRE(answers.size() == 2);
     CHECK(names(answers[0], "province", "Provincia de Prueba"));
     CHECK(answers[1].find("Outback Province") == std::string::npos);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_postal_area_names_a_point_only_of_its_country_and_of_a_postcode_its_country_takes) {
+    // Nominatim makes a postcode area only of a postcode its country's pattern takes
+    // (postcodes.py _update_postcode_areas), and gives it the country of its centroid:
+    // get_nearest_postcode takes the point's country's. A German postal area of 1234 (Germany's
+    // postcodes have five digits) leaves the point to the centroid of the address 2 km off, and a
+    // Swiss one of 8000 over the border names no German point.
+    Fixture f;
+    f.country(50, 8, 51, 9, "Germany", "DE");
+    f.country(51, 8, 52, 9, "Switzerland", "CH");
+    f.area(50.4, 8.4, 50.6, 8.6, {{"type", "boundary"}, {"boundary", "postal_code"}, {"postal_code", "1234"}});
+    f.node(50.52, 8.5, {{"addr:postcode", "60311"}, {"addr:housenumber", "1"}, {"addr:street", "Zeil"}});
+    f.area(50.95, 8.4, 51.5, 8.6, {{"type", "boundary"}, {"boundary", "postal_code"}, {"postal_code", "8000"}});
+    const std::vector<std::string> answers = answers_of(f, "postal-areas", {{50.5, 8.5}, {50.97, 8.5}, {51.2, 8.5}});
+    REQUIRE(answers.size() == 3);
+    CHECK(names(answers[0], "postcode", "60311"));
+    CHECK(answers[1].find("8000") == std::string::npos);
+    CHECK(names(answers[2], "postcode", "8000"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }

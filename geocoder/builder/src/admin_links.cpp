@@ -222,7 +222,7 @@ void compute_way_parent_polygons(ParsedData& data, unsigned int num_threads) {
         };
         auto add_postals = [&](S2CellId cell, std::vector<uint32_t>& postals) {
             for_each_admin_candidate(data, cell, [&](uint32_t id, const AdminPolygon& p) {
-                if (p.admin_level == 11) postals.push_back(id & ID_MASK);
+                if (p.admin_level == 11 && p.place_type_override != POSTAL_AREA_INVALID) postals.push_back(id & ID_MASK);
             });
         };
         walk_items_by_cell<Candidates>(order, num_threads,
@@ -357,7 +357,9 @@ void compute_poi_parent_polygons(ParsedData& data, unsigned int num_threads, std
                 c.postal.clear();
                 c.admin.clear();
                 for_each_admin_candidate(data, cell, [&](uint32_t id, const AdminPolygon& p) {
-                    if (p.admin_level == 11) c.postal.push_back(id);
+                    if (p.admin_level == 11) {
+                        if (p.place_type_override != POSTAL_AREA_INVALID) c.postal.push_back(id);
+                    }
                     else if (p.admin_level >= 2 && p.admin_level <= 10) c.admin.push_back(id);
                 });
                 rank_candidates(c.postal, smaller, c.scratch);
