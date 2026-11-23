@@ -1552,6 +1552,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "getrandom 0.4.3",
+ "http-body",
  "libc",
  "memmap2",
  "reqwest",
