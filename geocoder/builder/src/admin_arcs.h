@@ -376,7 +376,7 @@ struct AdminArcs {
     std::vector<ArcRef> refs;
     // Arc a's member ways (its way set), ascending, each once:
     // ways[way_at[a], way_at[a + 1]). The minimal set's way sets are its
-    // parts'; build_admin_arcs frees them once it has those.
+    // parts'; build_minimal_admin_arcs frees them once it has those.
     std::vector<uint32_t> way_at;
     std::vector<int64_t> ways;
     // The planet slots' IdAllocator table, its arc_index.osm_ids sidecar.
@@ -387,6 +387,9 @@ struct AdminArcs {
     // Parallel to kArcTiers.
     std::vector<ArcTierState> tiers;
     size_t rings_nest_raw = 0;  // polygons whose exact rings don't nest (rings_nest)
+    // Whether each polygon's exact rings nest, from the full set's stage to
+    // the minimal set's, which frees it.
+    std::vector<bool> nests_exact;
 };
 
 // A minimal arc's vertices in its order, read through its parts' views.
@@ -606,10 +609,18 @@ void tier_ring(const AdminArcs& arcs, const AdminExactRings& store, const ArcTie
                uint32_t ring, std::vector<PackedLocation>& out, std::vector<PackedLocation>& raw,
                std::vector<StoredVertex>& stored);
 
-// The arc stage over the planet's polygons: the topology, then the full set's
-// planet slots against the sidecar under `prev_planet_dir` (a cold start when
-// empty), every polygon's rings, the minimal set of the polygons `in_minimal`
-// marks and its planet slots, and every tier. Logs its steps and counts.
+// The arc stage over the planet's polygons, in two halves. The full set's:
+// the topology, then its planet slots against the sidecar under
+// `prev_planet_dir` (a cold start when empty), every polygon's rings, and
+// the full set's tiers. The arcs' way sets stay for the minimal set's half,
+// which nothing the full set's holds depends on: the minimal set of the
+// polygons `in_minimal` marks, its planet slots and its tier, the way sets
+// freed. Each logs its steps and counts.
+AdminArcs build_full_admin_arcs(const AdminExactRings& store, const std::string& prev_planet_dir, unsigned threads);
+void build_minimal_admin_arcs(AdminArcs& arcs, const AdminExactRings& store, const std::vector<bool>& in_minimal,
+                              const std::string& prev_planet_dir, unsigned threads);
+
+// Both halves of the arc stage, one after the other.
 AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>& in_minimal,
                            const std::string& prev_planet_dir, unsigned threads);
 

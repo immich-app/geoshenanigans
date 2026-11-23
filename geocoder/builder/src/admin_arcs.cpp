@@ -1113,8 +1113,22 @@ std::string tier_summary(const ArcTier& tier, const ArcTierCounts& c) {
 
 }  // namespace
 
-AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>& in_minimal,
-                           const std::string& prev_planet_dir, unsigned threads) {
+// Builds the tiers of `set` in kArcTiers' order onto arcs.tiers, which holds every tier before
+// them: the full set's come first.
+static void build_set_tiers(AdminArcs& arcs, const AdminExactRings& store, ArcSet set, unsigned threads,
+                            std::chrono::steady_clock::time_point& t, CpuTicks& cpu) {
+    for (size_t k = 0; k < kArcTierCount; k++) {
+        const ArcTier& tier = kArcTiers[k];
+        if (tier.set != set) continue;
+        if (arcs.tiers.size() != k) throw std::logic_error("the full set's arc tiers must precede the minimal set's");
+        arcs.tiers.push_back(build_arc_tier(arcs, store, tier, arcs.nests_exact, threads, [&](const char* step) {
+            log_phase((std::string("      Admin arcs: ") + tier.dir + " " + step).c_str(), t, cpu);
+        }));
+        log_phase((std::string("      Admin arcs: ") + tier.dir).c_str(), t, cpu);
+    }
+}
+
+AdminArcs build_full_admin_arcs(const AdminExactRings& store, const std::string& prev_planet_dir, unsigned threads) {
     threads = std::min(threads ? threads : parallel_threads(), kArcTopologyMaxThreads);
     auto t = std::chrono::steady_clock::now();
     auto cpu = CpuTicks::now();
@@ -1127,29 +1141,12 @@ AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>
     arcs.slot_counts = slots.counts;
     log_phase("      Admin arcs: planet slots", t, cpu);
 
-    arcs.minimal = build_minimal_arcs(arcs, store, in_minimal, threads);
-    free_storage(arcs.way_at);
-    free_storage(arcs.ways);
-    MinimalArcs& minimal = arcs.minimal;
-    slots = planet_slots(minimal.arcs.size(), [&](size_t a) { return minimal.arcs[a].key; },
-                         [&](size_t a) { return minimal.arcs[a].fallback; }, prev_planet_dir, ArcSet::Minimal);
-    for (size_t a = 0; a < minimal.arcs.size(); a++) minimal.arcs[a].planet_slot = slots.slots[a];
-    minimal.planet_sidecar = std::move(slots.sidecar);
-    minimal.slot_counts = slots.counts;
-    log_phase("      Admin arcs: minimal set", t, cpu);
-
-    const std::vector<bool> nests_exact = exact_rings_nest(store, threads);
-    arcs.rings_nest_raw = static_cast<size_t>(std::count(nests_exact.begin(), nests_exact.end(), false));
+    arcs.nests_exact = exact_rings_nest(store, threads);
+    arcs.rings_nest_raw = static_cast<size_t>(std::count(arcs.nests_exact.begin(), arcs.nests_exact.end(), false));
     log_phase("      Admin arcs: exact nesting", t, cpu);
-    for (const ArcTier& tier : kArcTiers) {
-        arcs.tiers.push_back(build_arc_tier(arcs, store, tier, nests_exact, threads, [&](const char* step) {
-            log_phase((std::string("      Admin arcs: ") + tier.dir + " " + step).c_str(), t, cpu);
-        }));
-        log_phase((std::string("      Admin arcs: ") + tier.dir).c_str(), t, cpu);
-    }
+    build_set_tiers(arcs, store, ArcSet::Full, threads, t, cpu);
 
     const AdminArcCounts& c = arcs.counts;
-    const MinimalArcCounts& m = minimal.counts;
     std::ostringstream line;
     line << "  Admin arcs: " << c.junctions << " junctions, " << c.arcs << " arcs (" << c.closed_arcs << " closed, "
          << c.arc_vertices << " vertices), " << c.refs << " refs over " << store.rings.size() << " rings; largest partition "
@@ -1157,15 +1154,49 @@ AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>
          << " duplicate keys, " << c.arcs_without_ways << " arcs without way runs, " << c.shared_way_sets
          << " shared way sets, " << c.shared_ends << " shared ends; "
          << slot_summary(arcs.slot_counts, arcs.planet_sidecar.size()) << " on " << threads << " threads\n";
+    line << "  Admin arcs rings_nest raw: " << arcs.rings_nest_raw << " polygons whose exact rings don't nest\n";
+    for (size_t k = 0; k < arcs.tiers.size(); k++) line << tier_summary(kArcTiers[k], arcs.tiers[k].counts);
+    std::cerr << line.str();
+    return arcs;
+}
+
+void build_minimal_admin_arcs(AdminArcs& arcs, const AdminExactRings& store, const std::vector<bool>& in_minimal,
+                              const std::string& prev_planet_dir, unsigned threads) {
+    threads = std::min(threads ? threads : parallel_threads(), kArcTopologyMaxThreads);
+    auto t = std::chrono::steady_clock::now();
+    auto cpu = CpuTicks::now();
+    arcs.minimal = build_minimal_arcs(arcs, store, in_minimal, threads);
+    free_storage(arcs.way_at);
+    free_storage(arcs.ways);
+    MinimalArcs& minimal = arcs.minimal;
+    ArcSlots slots = planet_slots(minimal.arcs.size(), [&](size_t a) { return minimal.arcs[a].key; },
+                                  [&](size_t a) { return minimal.arcs[a].fallback; }, prev_planet_dir, ArcSet::Minimal);
+    for (size_t a = 0; a < minimal.arcs.size(); a++) minimal.arcs[a].planet_slot = slots.slots[a];
+    minimal.planet_sidecar = std::move(slots.sidecar);
+    minimal.slot_counts = slots.counts;
+    log_phase("      Admin arcs: minimal set", t, cpu);
+
+    const size_t first_tier = arcs.tiers.size();
+    build_set_tiers(arcs, store, ArcSet::Minimal, threads, t, cpu);
+    if (arcs.tiers.size() != kArcTierCount) throw std::logic_error("an arc tier of neither set");
+    std::vector<bool>().swap(arcs.nests_exact);
+
+    const MinimalArcCounts& m = minimal.counts;
+    std::ostringstream line;
     line << "  Admin arcs minimal set: " << m.arcs << " arcs (" << m.closed_arcs << " closed, " << m.arc_vertices
          << " vertices), " << m.refs << " refs over " << m.rings << " rings of " << m.polygons << " polygons; "
          << m.core_arcs << " full arcs in " << m.joined_junctions << " full junctions joined ("
          << m.turnback_junctions << " kept where a ring turns back), " << m.duplicate_keys << " duplicate keys, "
          << m.shared_way_sets << " shared way sets, " << m.shared_ends << " shared ends; "
          << slot_summary(minimal.slot_counts, minimal.planet_sidecar.size()) << "\n";
-    line << "  Admin arcs rings_nest raw: " << arcs.rings_nest_raw << " polygons whose exact rings don't nest\n";
-    for (size_t k = 0; k < kArcTierCount; k++) line << tier_summary(kArcTiers[k], arcs.tiers[k].counts);
+    for (size_t k = first_tier; k < kArcTierCount; k++) line << tier_summary(kArcTiers[k], arcs.tiers[k].counts);
     std::cerr << line.str();
+}
+
+AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>& in_minimal,
+                           const std::string& prev_planet_dir, unsigned threads) {
+    AdminArcs arcs = build_full_admin_arcs(store, prev_planet_dir, threads);
+    build_minimal_admin_arcs(arcs, store, in_minimal, prev_planet_dir, threads);
     return arcs;
 }
 

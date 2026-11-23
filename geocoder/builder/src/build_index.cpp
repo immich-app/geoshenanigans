@@ -4308,20 +4308,26 @@ static int run(int argc, char* argv[]) {
         log_phase("    Release + shrink parsed data", _pt, _cpu);
 
         // The arcs, which every admin dir's geometry is, and the admin cell
-        // index over their tiers, which the links read too.
+        // index over their tiers, which the links read too: the full set's
+        // first, then admin-minimal's, which keeps place areas by the type
+        // that labels them.
         if (!data.admin_polygons.empty()) {
+            const std::string prev_planet = cfg.prev_output_dir.empty() ? "" : cfg.prev_output_dir + "/planet";
+            AdminArcs arcs = build_full_admin_arcs(data.admin_exact_rings, prev_planet, num_threads);
+            data.admin_exact_rings.drop_way_runs();  // the topology was their last use
+            log_phase("    Admin: full arcs", _pt, _cpu);
+            compute_full_admin_index_cells(data, arcs, num_threads);
+            log_phase("    Admin: full index cells", _pt, _cpu);
+
             std::vector<bool> in_minimal(data.admin_polygons.size());
             for (size_t p = 0; p < in_minimal.size(); p++)
                 in_minimal[p] = admin_minimal_keeps(data.admin_polygons[p].admin_level,
                                                     data.admin_polygons[p].place_type_override);
-            const AdminArcs arcs = build_admin_arcs(data.admin_exact_rings, in_minimal,
-                                                    cfg.prev_output_dir.empty() ? "" : cfg.prev_output_dir + "/planet",
-                                                    num_threads);
-            data.admin_exact_rings.drop_way_runs();  // the arcs' way sets were their last use
+            build_minimal_admin_arcs(arcs, data.admin_exact_rings, in_minimal, prev_planet, num_threads);
             data.admin_arcs = encode_admin_arcs(arcs, data.admin_exact_rings, num_threads);
-            log_phase("    Admin: arcs", _pt, _cpu);
-            compute_admin_index_cells(data, arcs, num_threads);
-            log_phase("    Admin: index cells", _pt, _cpu);
+            log_phase("    Admin: minimal arcs", _pt, _cpu);
+            compute_minimal_admin_index_cells(data, arcs, num_threads);
+            log_phase("    Admin: minimal index cells", _pt, _cpu);
         }
 
         // Sort admin polygons largest-first (by their exact rings' vertex

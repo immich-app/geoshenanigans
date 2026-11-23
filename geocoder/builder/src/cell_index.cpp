@@ -989,15 +989,20 @@ std::vector<CellItemPair> union_of_tiers(std::vector<std::vector<CellItemPair>> 
 
 }  // namespace
 
-void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads) {
+namespace {
+
+// The cell index over the tiers of `set` (union_of_tiers), logged; the full set's exact tier's
+// country polygons' share into data.admin_country_cells.
+std::vector<CellItemPair> set_index_cells(ParsedData& data, const AdminArcs& arcs, ArcSet set, unsigned threads) {
     if (threads == 0) threads = parallel_threads();
     const AdminExactRings& store = data.admin_exact_rings;
     auto clock = std::chrono::steady_clock::now();
     auto cpu = CpuTicks::now();
     std::ostringstream counts;
-    std::vector<std::vector<CellItemPair>> sets[2];
+    std::vector<std::vector<CellItemPair>> tiers;
     for (size_t t = 0; t < kArcTierCount; t++) {
         const ArcTier& tier = kArcTiers[t];
+        if (tier.set != set) continue;
         AdminTierCells covered = admin_tier_cells(arcs, store, t, threads, [&](const char* step) {
             log_phase((std::string("      Admin cells: ") + tier.dir + " " + step).c_str(), clock, cpu);
         });
@@ -1018,21 +1023,32 @@ void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned
                 threads);
             parallel_sort(data.admin_country_cells.begin(), data.admin_country_cells.end(), cell_item_less, threads);
         }
-        sets[static_cast<size_t>(tier.set)].push_back(std::move(covered.cells));
+        tiers.push_back(std::move(covered.cells));
     }
-    data.admin_index_cells = union_of_tiers(std::move(sets[static_cast<size_t>(ArcSet::Full)]), threads);
-    data.admin_minimal_index_cells = union_of_tiers(std::move(sets[static_cast<size_t>(ArcSet::Minimal)]), threads);
+    std::vector<CellItemPair> cells = union_of_tiers(std::move(tiers), threads);
     log_phase("      Admin cells: unions", clock, cpu);
     std::cerr << counts.str();
+    const size_t interior =
+        parallel_count(cells.size(), [&](size_t k) { return (cells[k].item_id & INTERIOR_FLAG) != 0; }, threads);
+    std::cerr << "Admin index cells " << (set == ArcSet::Full ? "over the full set's tiers" : "of admin-minimal") << ": "
+              << count_cells(cells) << " cells, " << cells.size() << " entries (" << interior << " interior)"
+              << std::endl;
+    return cells;
+}
 
-    auto interior = [&](const std::vector<CellItemPair>& pairs) {
-        return parallel_count(pairs.size(), [&](size_t k) { return (pairs[k].item_id & INTERIOR_FLAG) != 0; }, threads);
-    };
-    std::cerr << "Admin index cells: " << count_cells(data.admin_index_cells) << " cells, "
-              << data.admin_index_cells.size() << " entries (" << interior(data.admin_index_cells)
-              << " interior) over the full set's tiers; admin-minimal " << count_cells(data.admin_minimal_index_cells)
-              << " cells, " << data.admin_minimal_index_cells.size() << " entries ("
-              << interior(data.admin_minimal_index_cells) << " interior)" << std::endl;
+}  // namespace
+
+void compute_full_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads) {
+    data.admin_index_cells = set_index_cells(data, arcs, ArcSet::Full, threads);
+}
+
+void compute_minimal_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads) {
+    data.admin_minimal_index_cells = set_index_cells(data, arcs, ArcSet::Minimal, threads);
+}
+
+void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads) {
+    compute_full_admin_index_cells(data, arcs, threads);
+    compute_minimal_admin_index_cells(data, arcs, threads);
 }
 
 // --- The admin dirs ---

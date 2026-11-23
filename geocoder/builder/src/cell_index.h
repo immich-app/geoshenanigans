@@ -43,6 +43,11 @@ AdminTierCells admin_tier_cells(const AdminArcs& arcs, const AdminExactRings& st
 // carry the tables on from there. data.admin_country_cells gets the country
 // polygons' share of the exact tier's, which the builder's links read too.
 void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads = 0);
+// Its two halves, as the arc stage's (build_full_admin_arcs,
+// build_minimal_admin_arcs): the full set's index and the country cells,
+// from the full set's tiers alone, then admin-minimal's.
+void compute_full_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads = 0);
+void compute_minimal_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads = 0);
 
 // strings_layout.json: each tier's [start, end) in the dir's string-offset
 // space, tier t at [bases[t], bases[t + 1]): the build's
