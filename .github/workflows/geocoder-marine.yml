@@ -36,7 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -48,6 +48,8 @@ jobs:
           sudo apt-get install -y -qq jq zstd unzip
           curl -sSfL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
             -o "$RUNNER_TEMP/s5cmd.tar.gz"
+          # The tarball's sha256, from the release's s5cmd_checksums.txt.
+          echo "de0fdbfa3aceae55e069ba81a0fc17b2026567637603734a387b2fca06c299b4  $RUNNER_TEMP/s5cmd.tar.gz" | sha256sum -c --quiet -
           sudo tar xzf "$RUNNER_TEMP/s5cmd.tar.gz" -C /usr/local/bin s5cmd
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install -q shapely==2.2.0 pyogrio==0.13.0 numpy==2.5.5
