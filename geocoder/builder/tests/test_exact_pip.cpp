@@ -1,8 +1,8 @@
 // exact_pip.h: the e7 ray cast against the shared vectors in geocoder/testdata
 // (which the reader is held to as well), its edge index and box against the
-// plain scan, the covers test that takes the edges in, and the exact area. In
-// the sanitized suite: the products reach 6.5e18 at the poles and the
-// antimeridian.
+// plain scan, the covers test that takes the edges in, and the exact area and
+// centroid. In the sanitized suite: the products reach 6.5e18 at the poles
+// and the antimeridian.
 #include "exact_pip.h"
 
 #include <algorithm>
@@ -231,6 +231,18 @@ TEST(exact_polygon_area_takes_the_holes_off_whatever_the_rotation) {
     // Holes larger than their ring leave no negative area.
     const std::vector<RingSpan> swapped = {{5, 5}, {0, 5}};
     CHECK_EQ(exact_polygon_area(v.data(), swapped.data(), 2), 0.0f);
+}
+
+TEST(exact_polygon_centroid_of_a_ring_wider_than_the_int32_e7_range) {
+    // 300 degrees of longitude from its first vertex: past 2^31 e7 units
+    // apart, which an int32_t difference doesn't hold.
+    const int32_t d = 10000000;
+    const std::vector<PackedLocation> v = {{0, -150 * d}, {0, 150 * d}, {10 * d, 150 * d}, {10 * d, -150 * d},
+                                           {0, -150 * d}};
+    const std::vector<RingSpan> rings = {{0, 5}};
+    const LatLng c = exact_polygon_centroid(v.data(), rings.data(), 1);
+    CHECK_NEAR(c.first, 5.0, 1e-9);
+    CHECK_NEAR(c.second, 0.0, 1e-9);
 }
 
 TEST(exact_ring_covers_its_edges_and_vertices_as_well_as_its_inside) {

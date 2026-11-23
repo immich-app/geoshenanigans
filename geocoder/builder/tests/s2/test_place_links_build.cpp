@@ -3,9 +3,9 @@
 // country taken at a point inside it, a boundary or a place area links a
 // place node of its wikidata only where it covers it, its edges included, a
 // place=province area is an address area where its country ranks it, a
-// postal area names a point only of its own country and of a postcode its
-// country takes, and a place area linked to a place node of another type
-// ranks by its own place tag.
+// postal area names a point only of its own country, one for a relation, and
+// of a postcode its country takes, a US ZIP+4 its ZIP, and a place area
+// linked to a place node of another type ranks by its own place tag.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -328,5 +328,37 @@ TEST(a_concave_boundary_takes_the_country_at_a_point_inside_it) {
     const std::vector<std::string> answers = answers_of(f, "concave-claimant", {{-26.8, 146.45}});
     REQUIRE(answers.size() == 1);
     CHECK(names(answers[0], "city", "Gold Coast"));
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_postal_relation_takes_one_country_at_its_whole_centroid) {
+    // Nominatim makes one place_postcode row of a postal relation, its centroid the whole
+    // multipolygon's, and gives it that point's country (postcodes.py). 12345 is a large part in
+    // Switzerland and a small one in Germany: Swiss, of a postcode Switzerland can't have, it
+    // names no point, the German part's included, which takes the address's 1 km off.
+    Fixture f;
+    f.country(50, 8, 51, 9, "Germany", "DE");
+    f.country(51, 8, 52, 9, "Switzerland", "CH");
+    f.relation({{"type", "boundary"}, {"boundary", "postal_code"}, {"postal_code", "12345"}},
+               {f.square(51.1, 8.2, 51.9, 8.8), f.square(50.8, 8.4, 50.9, 8.6)});
+    f.node(50.86, 8.5, {{"addr:postcode", "60311"}, {"addr:housenumber", "1"}, {"addr:street", "Zeil"}});
+    const std::vector<std::string> answers = answers_of(f, "postal-relation-country", {{50.85, 8.5}});
+    REQUIRE(answers.size() == 1);
+    CHECK(answers[0].find("12345") == std::string::npos);
+    CHECK(names(answers[0], "postcode", "60311"));
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_us_postal_area_of_a_zip_plus_4_names_its_zip) {
+    // The US pattern is (ddddd)(?:-dddd)? with output \1 (country_settings.yaml), and Nominatim
+    // stores a postcode area's normalised postcode: a postal relation tagged 10001-2062 is the
+    // area of 10001.
+    Fixture f;
+    f.country(40, -75, 41, -73, "United States", "US");
+    f.area(40.7, -74.1, 40.8, -73.9, {{"type", "boundary"}, {"boundary", "postal_code"}, {"postal_code", "10001-2062"}});
+    const std::vector<std::string> answers = answers_of(f, "zip-plus-4", {{40.75, -74.0}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "postcode", "10001"));
+    CHECK(answers[0].find("2062") == std::string::npos);
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }

@@ -193,7 +193,7 @@ Nominatim has THREE sources for postcodes, combined into the `location_postcodes
 - OSM `boundary=postal_code` relations with admin_level=11
 - These have actual polygon geometry
 - Stored with `osm_id IS NOT NULL` in location_postcodes
-- **We use these at build time**: a street (way_postcodes.bin) and a POI (`parent_postcode_id`) inherit the postcode of the postal boundary containing them. They are admin polygons of level 11, so the server also finds the ones holding the query point, for `get_nearest_postcode()` below. Each has the country its centroid lies in (`get_country_code`, as `update_postcodes` gives `place_postcode` its country), and one of a postcode its country's pattern rejects carries place type 15 (`POSTAL_AREA_INVALID`): Nominatim makes no postcode area of it (`_update_postcode_areas`), and it names nothing
+- **We use these at build time**: a street (way_postcodes.bin) and a POI (`parent_postcode_id`) inherit the postcode of the postal boundary containing them. They are admin polygons of level 11, so the server also finds the ones holding the query point, for `get_nearest_postcode()` below. Each has the country its centroid lies in (`get_country_code`, as `update_postcodes` gives `place_postcode` its country), one for all the rings of a relation, at the whole multipolygon's centroid. A US one of a ZIP+4 is its ZIP's (the US pattern's output is `\1`), and one of a postcode its country's pattern rejects carries place type 15 (`POSTAL_AREA_INVALID`): Nominatim makes no postcode area of it (`_update_postcode_areas`), and it names nothing
 
 ### Source 2: addr:postcode tags on places (`placex` table)
 - Any OSM object with an `address->'postcode'` hstore entry

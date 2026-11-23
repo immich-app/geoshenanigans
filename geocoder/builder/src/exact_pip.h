@@ -166,14 +166,18 @@ inline float exact_polygon_area(const PackedLocation* v, const RingSpan* rings, 
 inline LatLng exact_polygon_centroid(const PackedLocation* v, const RingSpan* rings, uint32_t ring_count) {
     if (ring_count == 0 || rings[0].count == 0) return {0, 0};
     const PackedLocation origin = v[rings[0].begin];
+    // A vertex's degrees from the origin, widened first: two longitudes lie up
+    // to 3.6e9 e7 units apart.
+    auto lat_of = [&](const PackedLocation& p) { return (int64_t(p.lat_e7) - origin.lat_e7) * 1e-7; };
+    auto lng_of = [&](const PackedLocation& p) { return (int64_t(p.lon_e7) - origin.lon_e7) * 1e-7; };
     double area = 0, lat = 0, lng = 0;
     for (uint32_t r = 0; r < ring_count; r++) {
         const PackedLocation* ring = v + rings[r].begin;
         const uint32_t n = rings[r].count;
         double a2 = 0, sum_lat = 0, sum_lng = 0;
         for (uint32_t a = 0, b = n - 1; a < n; b = a++) {
-            const double y0 = (ring[b].lat_e7 - origin.lat_e7) * 1e-7, x0 = (ring[b].lon_e7 - origin.lon_e7) * 1e-7;
-            const double y1 = (ring[a].lat_e7 - origin.lat_e7) * 1e-7, x1 = (ring[a].lon_e7 - origin.lon_e7) * 1e-7;
+            const double y0 = lat_of(ring[b]), x0 = lng_of(ring[b]);
+            const double y1 = lat_of(ring[a]), x1 = lng_of(ring[a]);
             const double cross = x0 * y1 - x1 * y0;
             a2 += cross;
             sum_lat += (y0 + y1) * cross;
