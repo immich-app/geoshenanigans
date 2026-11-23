@@ -410,7 +410,7 @@ class NightlyReserveTest(unittest.TestCase):
             out = os.path.join(workdir, "output")
             sizes = {"planet/full/street_ways.bin": 300 * 1024, "planet/full/strings_layout.json": 700,
                      "planet/full/poi_meta.json": 900, "planet/full/attribution.json": 600,
-                     "planet/poi/all/poi_records.bin": 5000,
+                     "planet/poi/all/poi_records.bin": 5000, "planet/poi/all/poi_attribution.json": 2048,
                      "planet/search/places.fst": 40 * 1024 + 1, "planet/search/packs/europe.pack": 3000,
                      # What the compressor leaves alone, or has written already.
                      "planet/full/street_ways.bin.osm_ids": 64 * 1024, "planet/full/street_ways.bin.zst": 100 * 1024,
@@ -423,7 +423,7 @@ class NightlyReserveTest(unittest.TestCase):
             printed = subprocess.run(["bash", "-c", reserve + '\necho "$RESERVE_KIB"'], env=dict(os.environ, WORKDIR=workdir),
                                      check=True, capture_output=True, text=True).stdout
 
-        self.assertEqual(compressed, 300 * 1024 + 700 + 900 + 600 + 5000 + 40 * 1024 + 1 + 3000)
+        self.assertEqual(compressed, 300 * 1024 + 700 + 900 + 600 + 5000 + 2048 + 40 * 1024 + 1 + 3000)
         self.assertEqual(printed, "%d\n" % -(-compressed // 1024))
         self.assertEqual(assignments, ['GEOCODER_PATCH_SCRATCH_RESERVE_KIB="$RESERVE_KIB"'])
 
