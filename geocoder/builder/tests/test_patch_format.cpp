@@ -413,24 +413,26 @@ TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread_or_copies
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v20 = the postcode grid's logical stream (v19: the
-    // postcode centroids'). The patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(20));
+    // diff/patch tools. v21 = the postal cities' logical stream (v20: the
+    // postcode grid's). The patcher accepts this version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(21));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
 
 TEST(patch_format_fileid_count_and_names_aligned) {
     // The names table must have exactly COUNT entries (one per PatchFileId).
-    CHECK_EQ(static_cast<uint32_t>(PatchFileId::COUNT), uint32_t(37));
+    CHECK_EQ(static_cast<uint32_t>(PatchFileId::COUNT), uint32_t(38));
     const size_t n_names = sizeof(patch_file_names) / sizeof(patch_file_names[0]);
-    CHECK_EQ(n_names, size_t(37));
+    CHECK_EQ(n_names, size_t(38));
     // Spot-check that index lines up with the enum value.
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::STRINGS)]) == "strings.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::POI_RECORDS)]) == "poi_records.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::STRINGS_POI)]) == "strings_poi.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::INTERP_POSTCODES)]) == "interp_postcodes.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::POSTCODE_GRID)]) == "postcode_grid.bin");
+    CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::POSTAL_CITIES)]) == "postal_cities.bin");
+    CHECK_EQ(static_cast<uint32_t>(PatchFileId::POSTAL_CITIES), uint32_t(37));
     // The geo index's two files; its lists by table are no files.
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::GEO_CELLS)]) == "geo_cells.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::GEO_ENTRIES)]) == "geo_entries.bin");

@@ -49,6 +49,14 @@ TEST(way_tags_parse_picks_known_keys) {
     CHECK(t.landuse == nullptr);
 }
 
+TEST(way_tags_parse_reads_a_building_addresss_city) {
+    TagBlock b({{"building", "house"}, {"addr:housenumber", "2"}, {"addr:postcode", "19026"}, {"addr:city", "Drexel Hill"}});
+    WayTags t = b.parse();
+    REQUIRE(t.city && t.postcode && t.housenumber);
+    CHECK_EQ(std::string(t.city), "Drexel Hill");
+    CHECK(TagBlock({{"building", "house"}}).parse().city == nullptr);
+}
+
 TEST(way_tags_parse_ignores_out_of_range_indices) {
     TagBlock b({{"name", "Kept"}});
     uint32_t bad = static_cast<uint32_t>(b.st.size() + 5);

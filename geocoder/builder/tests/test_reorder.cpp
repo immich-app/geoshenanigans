@@ -91,6 +91,7 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
         d.addr_points.push_back(a);
         if (s.osm_ids) d.addr_osm_ids.push_back(s.unique_osm_ids ? i + 1 : r.one_in(5) ? 0 : r.below(static_cast<uint32_t>(n / 3)));
         if (s.side_arrays) d.addr_postcode_ids.push_back(small_id(r, 5));
+        if (s.side_arrays) d.addr_city_ids.push_back(small_id(r, 4));
     }
     d.sorted_addr_cells = new_cell_pairs(r, n, static_cast<uint32_t>(n), false);
 
@@ -284,6 +285,7 @@ void check_same_records(const ParsedData& a, const ParsedData& b) {
     CHECK(same_bytes(a.addr_points, b.addr_points));
     CHECK(same_bytes(a.addr_osm_ids, b.addr_osm_ids));
     CHECK(same_bytes(a.addr_postcode_ids, b.addr_postcode_ids));
+    CHECK(same_bytes(a.addr_city_ids, b.addr_city_ids));
     CHECK(same_bytes(a.addr_vertices, b.addr_vertices));
     CHECK(same_pairs(a.sorted_addr_cells, b.sorted_addr_cells));
     CHECK(same_bytes(a.ways, b.ways));
@@ -714,6 +716,8 @@ TEST(reorder_addr_points_puts_folded_copies_under_the_least_cell_of_either) {
         d.addr_vertices = {{7.0f, 7.5f}, {8.0f, 8.5f}, {9.0f, 9.5f}, {8.0f, 8.5f}, {9.0f, 9.75f}};
         d.addr_osm_ids = {50, 61, 60};
         d.addr_postcode_ids = {70, NO_DATA, 81};
+        // Only the copy that does not survive has a city.
+        d.addr_city_ids = {90, 91, NO_DATA};
         // The copies' exact points lie in two cells, one each side of b's:
         // the least is the cell of the copy that does not survive.
         d.sorted_addr_cells = {{5, 1}, {7, 0}, {9, 2}};
@@ -731,6 +735,8 @@ TEST(reorder_addr_points_puts_folded_copies_under_the_least_cell_of_either) {
                                                                     {9.0f, 9.5f}, {7.0f, 7.5f}})));
         CHECK(d.addr_osm_ids == std::vector<uint64_t>({60, 50}));
         CHECK(d.addr_postcode_ids == std::vector<uint32_t>({81, 70}));
+        // The record takes the city one of its copies set.
+        CHECK(d.addr_city_ids == std::vector<uint32_t>({91, 90}));
         CHECK(same_pairs(d.sorted_addr_cells, {{5, 0}, {7, 1}, {9, 0}}));
     }
 }

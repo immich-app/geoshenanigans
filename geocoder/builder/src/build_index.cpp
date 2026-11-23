@@ -315,6 +315,35 @@ static ExternalPostcodes read_external_postcodes(const std::string& path) {
     return out;
 }
 
+// GeoNames' postal places (--postal-places, postal_cities_build.h's
+// parse_places: our TSV, or GeoNames' own files, plain or gzipped), by
+// their ZIP as the postcode grid's pattern takes it.
+static postal_cities::Places read_postal_places(const std::string& path) {
+    std::optional<ScratchDir> scratch;
+    std::string tsv = path;
+    if (path.size() > 3 && path.compare(path.size() - 3, 3, ".gz") == 0) {
+        scratch.emplace("postal-places");
+        tsv = scratch->path() + "/postal_places.tsv";
+        const std::string cmd = "gunzip -c '" + path + "' > '" + tsv + "'";
+        if (system(cmd.c_str()) != 0) throw std::runtime_error("--postal-places: failed to gunzip " + path);
+    }
+    std::ifstream f(tsv);
+    if (!f) throw std::runtime_error("--postal-places: failed to open " + path);
+    postal_cities::Places places = postal_cities::parse_places(f, postcode_grid::grid_postcode);
+    if (f.bad()) throw std::runtime_error("--postal-places: failed to read " + path);
+    return places;
+}
+
+// Yesterday's postal cities (--prev-postal-cities): any mode dir's
+// postal_cities.bin of yesterday's planet, whose names keep their margin.
+static postal_cities::Names read_prev_postal_cities(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("--prev-postal-cities: failed to open " + path);
+    const std::vector<uint8_t> file((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (f.bad()) throw std::runtime_error("--prev-postal-cities: failed to read " + path);
+    return postal_cities::names_of(file);
+}
+
 static void load_external_postcodes(ParsedData& data, const std::string& path,
                 std::future<ExternalPostcodes> pending) {
     std::cerr << "Loading external postcode centroids from " << path << "..." << std::endl;
@@ -1998,6 +2027,9 @@ static int run(int argc, char* argv[]) {
         std::cerr << "  --tiger-data <path>          Load TIGER address data (tar.gz or directory of CSVs)" << std::endl;
         std::cerr << "  --external-postcodes <path>  Load GeoNames postcode centroids (CSV or .csv.gz)" << std::endl;
         std::cerr << "  --wikidata-sitelinks <path>  Load QID→sitelinks binary for POI importance" << std::endl;
+        std::cerr << "  --postal-places <path>       GeoNames' US postal place names for postal_cities.bin (TSV or .gz)" << std::endl;
+        std::cerr << "  --prev-postal-cities <path>  Yesterday's postal_cities.bin, whose names keep a margin" << std::endl;
+        std::cerr << "  --dump-postal-votes <path>   Write each ZIP's postal city votes as TSV" << std::endl;
         return 1;
     }
 
@@ -2006,6 +2038,7 @@ static int run(int argc, char* argv[]) {
     std::string wikidata_sitelinks_path;
     std::string tiger_data_path;
     std::string external_postcodes_path;
+    std::string postal_places_path, prev_postal_cities_path, postal_votes_dump_path;
     // strategy-2: previous build's output root, used to read
     // <prev_dir>/<region>/<variant>/*.osm_ids sidecars and assign
     // the same dense IDs to records carried over from the previous
@@ -2055,6 +2088,12 @@ static int run(int argc, char* argv[]) {
             external_postcodes_path = argv[++i];
         } else if (arg == "--prev-output" && i + 1 < argc) {
             prev_output_dir = argv[++i];
+        } else if (arg == "--postal-places" && i + 1 < argc) {
+            postal_places_path = argv[++i];
+        } else if (arg == "--prev-postal-cities" && i + 1 < argc) {
+            prev_postal_cities_path = argv[++i];
+        } else if (arg == "--dump-postal-votes" && i + 1 < argc) {
+            postal_votes_dump_path = argv[++i];
         } else {
             input_files.push_back(arg);
         }
@@ -2071,6 +2110,17 @@ static int run(int argc, char* argv[]) {
     require_new_or_empty_output_dir(output_dir);
 
     ParsedData data;
+    // The postal cities' inputs, small and read before the parse, so a bad
+    // one fails the build at once.
+    if (!postal_places_path.empty()) {
+        data.postal_places = read_postal_places(postal_places_path);
+        std::cerr << "Loaded " << data.postal_places.size() << " postal places from " << postal_places_path << std::endl;
+    }
+    if (!prev_postal_cities_path.empty()) {
+        data.prev_postal_names = read_prev_postal_cities(prev_postal_cities_path);
+        std::cerr << "Loaded " << data.prev_postal_names.size() << " postal cities from " << prev_postal_cities_path << std::endl;
+    }
+    data.postal_votes_dump = postal_votes_dump_path;
     auto _pt = std::chrono::steady_clock::now();
     auto _cpu = CpuTicks::now();
 
@@ -2409,6 +2459,8 @@ static int run(int argc, char* argv[]) {
                                     if (r_st) cpr.addr_street = r_st;
                                     const char* r_pc = rel.tag("addr:postcode");
                                     if (r_pc) cpr.addr_postcode = r_pc;
+                                    const char* r_city = rel.tag("addr:city");
+                                    if (r_city) cpr.addr_city = r_city;
                                 }
 
                                 for (size_t mi = 0; mi < rel.members.size(); mi++) {
@@ -2534,6 +2586,9 @@ static int run(int argc, char* argv[]) {
                     std::vector<uint64_t> addr_cells;
                     std::vector<std::pair<uint32_t, uint32_t>> addr_strings; // {hn, street}
                     std::vector<uint32_t> addr_postcodes; // parallel to addr_strings
+                    // addr:city, parallel to addr_strings: the postal cities'
+                    // votes, interned apart from the pool.
+                    std::vector<uint32_t> addr_cities;
                     std::vector<int64_t> addr_osm_node_ids; // parallel to addr_coords; strategy-2 stable identity
                     uint64_t count = 0;
                     uint64_t nodes = 0;
@@ -2578,6 +2633,7 @@ static int run(int argc, char* argv[]) {
                         const char* housenumber = nullptr;
                         const char* street = nullptr;
                         const char* postcode = nullptr;
+                        const char* city = nullptr;
                         const char* n_tourism = nullptr;
                         const char* n_historic = nullptr;
                         const char* n_amenity = nullptr;
@@ -2611,6 +2667,7 @@ static int run(int argc, char* argv[]) {
                                     if (k == "addr:housenumber") housenumber = v;
                                     else if (k == "addr:street") street = v;
                                     else if (k == "addr:postcode") postcode = v;
+                                    else if (k == "addr:city") city = v;
                                     else if (k == "amenity") n_amenity = v;
                                     else if (k == "aeroway") n_aeroway = v;
                                     break;
@@ -2670,6 +2727,7 @@ static int run(int argc, char* argv[]) {
                                 (street && street[0]) ? strs.add(street) : StringDict::kNone});
                             tl_node_data->addr_postcodes.push_back(
                                 (postcode && postcode[0]) ? strs.add(postcode) : StringDict::kNone);
+                            tl_node_data->addr_cities.push_back((city && city[0]) ? strs.add(city) : StringDict::kNone);
                             tl_node_data->addr_osm_node_ids.push_back(id);
                             tl_node_data->count++;
                         }
@@ -2827,6 +2885,13 @@ static int run(int argc, char* argv[]) {
                         for (uint32_t code : r < 2 * n_tl ? local.poi_names : local.place_names) emit(code);
                     }
                 }, data.string_pool);
+                // The addresses' addr:city values go to a pool of their own,
+                // which no file holds: the string tiers stay as they were.
+                std::vector<uint32_t> city_runs(n_tl);
+                for (size_t r = 0; r < n_tl; r++) city_runs[r] = static_cast<uint32_t>(r);
+                const auto city_ids = intern_dicts(dicts, city_runs, [&](uint32_t r, auto&& emit) {
+                    for (uint32_t code : ntld[r].addr_cities) emit(code);
+                }, data.postal_vote_pool);
                 log_phase("      Node merge: strings", _mt, _mc);
 
                 // Merge address points
@@ -2839,7 +2904,8 @@ static int run(int argc, char* argv[]) {
                         put_addr_point(data, addr_base + at, local.addr_coords[j].lat, local.addr_coords[j].lng,
                                        ids(local.addr_strings[j].first), ids(local.addr_strings[j].second),
                                        ids(local.addr_postcodes[j]), local.addr_cells[j],
-                                       pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, node_id));
+                                       pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, node_id), NO_DATA, 0,
+                                       city_ids[k](local.addr_cities[j]));
                     }
                 });
                 uint64_t total_addrs = 0;
@@ -2965,6 +3031,7 @@ static int run(int argc, char* argv[]) {
                     std::vector<uint32_t> way_orig_names;   // way original name (always name tag)
                     std::vector<std::pair<uint32_t, uint32_t>> addr_strings; // building addr {hn, street}
                     std::vector<uint32_t> addr_postcodes; // parallel to addr_strings
+                    std::vector<uint32_t> addr_cities;    // addr:city, parallel to addr_strings
                     std::vector<uint32_t> interp_strings;   // interp street name strings
                     uint64_t way_count = 0;
                     uint64_t building_addr_count = 0;
@@ -3088,6 +3155,7 @@ static int run(int argc, char* argv[]) {
                                 (street && street[0]) ? local.strings.add(street) : StringDict::kNone});
                             local.addr_postcodes.push_back(
                                 (t.postcode && t.postcode[0]) ? local.strings.add(t.postcode) : StringDict::kNone);
+                            local.addr_cities.push_back((t.city && t.city[0]) ? local.strings.add(t.city) : StringDict::kNone);
                             // Polygon vertices for closed ways (buildings).
                             // Lets the server compute exact distance-to-
                             // polygon for Nominatim parity instead of the
@@ -3347,6 +3415,13 @@ static int run(int argc, char* argv[]) {
                         break;
                     }
                 }, data.string_pool);
+                // The building addresses' addr:city values, to the postal
+                // cities' own pool (the node merge's).
+                std::vector<uint32_t> city_runs(tld.size());
+                for (size_t r = 0; r < tld.size(); r++) city_runs[r] = static_cast<uint32_t>(r);
+                const auto city_ids = intern_dicts(dicts, city_runs, [&](uint32_t r, auto&& emit) {
+                    for (uint32_t code : tld[r].addr_cities) emit(code);
+                }, data.postal_vote_pool);
                 log_phase("      Way merge: strings", _mt, _mc);
                 parallel_for_each(tld.size(), [&](size_t k, unsigned) { free_storage(tld[k].strings); });
                 uint64_t total_ways = 0, total_building_addrs = 0, total_interps = 0;
@@ -3427,7 +3502,7 @@ static int run(int argc, char* argv[]) {
                                        name_id(local.addr_postcodes[i]), local.building_addr_cells[i],
                                        pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, bldg_way_id),
                                        has_poly ? static_cast<uint32_t>(bldg_vert_base + bldg_vert_at[k] + poly_off) : NO_DATA,
-                                       has_poly ? poly_cnt : 0);
+                                       has_poly ? poly_cnt : 0, city_ids[k](local.addr_cities[i]));
                     }
                 });
                 parallel_for_each(tld.size(), [&](size_t k, unsigned) {
@@ -3439,6 +3514,7 @@ static int run(int argc, char* argv[]) {
                     free_storage(local.building_addr_osm_way_ids);
                     free_storage(local.addr_strings);
                     free_storage(local.addr_postcodes);
+                    free_storage(local.addr_cities);
                 });
                 addr_vertices_grown.second.get();
                 copy_locals(data.addr_vertices, bldg_vert_base, tld, building_vertex_buffer);
@@ -3984,6 +4060,7 @@ static int run(int argc, char* argv[]) {
                             std::string addr_housenumber;
                             std::string addr_street;
                             std::string addr_postcode;
+                            std::string addr_city;
                             // Strategy-2 stable identity: relation_id +
                             // ring_index. A multi-ring POI relation produces
                             // one PoiResult per ring; ring_index makes them
@@ -4054,6 +4131,7 @@ static int run(int argc, char* argv[]) {
                                                 pr.addr_housenumber = rel.addr_housenumber;
                                                 pr.addr_street = rel.addr_street;
                                                 pr.addr_postcode = rel.addr_postcode;
+                                                pr.addr_city = rel.addr_city;
                                                 pr.relation_id = rel.id;
                                                 pr.ring_index = poi_ring_idx;
                                                 local_results.push_back(std::move(pr));
@@ -4144,7 +4222,8 @@ static int run(int argc, char* argv[]) {
                                                    pack_osm_id(gc::id_alloc::ObjectType::OSM_RELATION,
                                                                static_cast<int64_t>(rel_payload)),
                                                    poly_verts.data(),
-                                                   static_cast<uint32_t>(poly_verts.size()));
+                                                   static_cast<uint32_t>(poly_verts.size()),
+                                                   pr.addr_city.c_str());
                                 }
                             }
                             local_results.clear();
@@ -4197,6 +4276,7 @@ static int run(int argc, char* argv[]) {
         log_mem("data.addr_osm_ids",                 vec_bytes(data.addr_osm_ids));
         log_mem("data.addr_vertices",                vec_bytes(data.addr_vertices));
         log_mem("data.addr_postcode_ids",            vec_bytes(data.addr_postcode_ids));
+        log_mem("data.addr_city_ids",                vec_bytes(data.addr_city_ids));
         log_mem("data.addr_cells",                   vec_bytes(data.addr_cells));
         log_mem("data.admin_polygons",               vec_bytes(data.admin_polygons));
         log_mem("data.admin_osm_ids",                vec_bytes(data.admin_osm_ids));

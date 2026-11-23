@@ -101,6 +101,10 @@ static constexpr const char* POSTCODE_SIDE_FILES[] = {"postcode_centroid_cells.b
 // replays the grid's runs, which its codec (gcs_codec.h grid) writes as
 // postcode_grid.bin. No string field: the grid holds its postcodes as text.
 static constexpr size_t POSTCODE_GRID_STRIDE = 24;
+// postal_cities.bin's logical rows (postal_cities.h LogicalRow): its section
+// replays the table's rows, which its codec (gcs_codec.h postal) writes as
+// postal_cities.bin. No string field: the table holds its names as text.
+static constexpr size_t POSTAL_CITY_STRIDE = 64;
 // The client file addr_points.bin's and addr_vertices.bin's sections write
 // besides them (addr_files.h).
 static constexpr const char* ADDR_SIDE_FILES[] = {"addr_index.bin"};
@@ -279,7 +283,12 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // 24-byte rows in cell order under file id 36, postcode_grid.bin, which the
 // patcher encodes again; a section of it right after the postcode
 // centroids', in every patch (an empty merge where neither day has it).
-static constexpr uint32_t GCPATCH_VERSION = 20;
+// v21: the postal cities (postal_cities.h) merge as one logical stream of
+// 64-byte rows in (country, code) order under file id 37,
+// postal_cities.bin, which the patcher encodes again; a section of it right
+// after the postcode grid's, in every patch (an empty merge where neither
+// day has it).
+static constexpr uint32_t GCPATCH_VERSION = 21;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -338,7 +347,9 @@ enum class PatchFileId : uint32_t {
     GEO_ENTRIES = 35,
     // The postcode grid's logical rows (v20).
     POSTCODE_GRID = 36,
-    COUNT = 37
+    // The postal cities' logical rows (v21).
+    POSTAL_CITIES = 37,
+    COUNT = 38
 };
 
 static const char* patch_file_names[] = {
@@ -356,7 +367,8 @@ static const char* patch_file_names[] = {
     "strings_postcode.bin", "strings_poi.bin",
     "interp_postcodes.bin",
     "geo_entries.bin",
-    "postcode_grid.bin"
+    "postcode_grid.bin",
+    "postal_cities.bin"
 };
 
 // The string offset fields of a record file the patch merges, as byte

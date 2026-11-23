@@ -14,6 +14,9 @@ struct WayTags {
     const char* housenumber = nullptr;
     const char* street = nullptr;
     const char* postcode = nullptr;
+    // A building address's addr:city, which only the postal cities' votes
+    // read (postal_cities_build.h).
+    const char* city = nullptr;
     const char* highway = nullptr;
     const char* footway = nullptr;
     const char* name = nullptr;
@@ -72,6 +75,7 @@ inline WayTags parse_way_tags(const uint32_t* tag_keys, const uint32_t* tag_vals
                 else if (k == "addr:housenumber") t.housenumber = v;
                 else if (k == "addr:street") t.street = v;
                 else if (k == "addr:postcode") t.postcode = v;
+                else if (k == "addr:city") t.city = v;
                 else if (k == "admin_level") t.admin_level = v;
                 else if (k == "amenity") t.amenity = v;
                 else if (k == "aeroway") t.aeroway = v;

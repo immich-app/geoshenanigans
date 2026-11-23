@@ -1074,5 +1074,7 @@ struct CollectedPoiRelation {
     std::string addr_housenumber;
     std::string addr_street;
     std::string addr_postcode;
+    // Its addr:city, for the postal cities' votes alone.
+    std::string addr_city;
     std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
 };

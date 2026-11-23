@@ -22,6 +22,7 @@
 #include "patch_decompress.h"
 #include "patch_format.h"
 #include "place_test_files.h"
+#include "postal_cities.h"
 #include "postcode_grid.h"
 #include "postcode_test_files.h"
 #include "scratch_dir.h"
@@ -1351,6 +1352,84 @@ TEST(patch_round_trip_merges_the_postcode_grid_as_logical_rows) {
     CHECK(!logged(same, "encode grid:"));
 
     // A dir's first grid, and its last.
+    const BuildDir without = with_pool(OLD_POOL);
+    CHECK(round_trip(without, new_d).mismatches.empty());
+    CHECK(round_trip(old_d, without).mismatches.empty());
+    CHECK(round_trip(without, without).mismatches.empty());
+}
+
+// The postal cities (postal_cities.h) of rows into d, as the builder writes
+// them.
+static void put_postal(BuildDir& d, const std::vector<postal_cities::LogicalRow>& rows) {
+    const std::vector<uint8_t> file = postal_cities::encode_file(rows);
+    d[postal_cities::FILE_NAME].assign(file.begin(), file.end());
+}
+
+// --decode-logical writes a dir's postal cities as their 64-byte rows, and
+// none for a dir without them; a table the encoder would not write is
+// refused.
+TEST(decode_logical_writes_the_postal_cities_rows) {
+    ScratchDir dir("decode-logical-postal");
+    const std::string log = dir.path() + "/tools.log";
+    const uint16_t US = uint16_t('U' << 8 | 'S');
+    const std::vector<postal_cities::LogicalRow> rows = {postal_cities::row_of(US, "19026", "Drexel Hill"),
+                                                         postal_cities::row_of(US, "19073", "Newtown Square")};
+    BuildDir d = with_pool(OLD_POOL);
+    put_postal(d, rows);
+    const std::string in = dir.path() + "/in", out = in + ".logical";
+    REQUIRE(write_dir(in, d));
+    REQUIRE(run({GEOCODER_DIFF_BIN, "--decode-logical", in, out}, log));
+    const char* p = reinterpret_cast<const char*>(rows.data());
+    CHECK(gctest::read_dir(out) == BuildDir({{postal_cities::FILE_NAME, std::vector<char>(p, p + rows.size() * 64)}}));
+    const std::vector<char> text = read_file(log);
+    CHECK(std::string(text.begin(), text.end()).find("  postal: 128 logical bytes") != std::string::npos);
+
+    const std::string bare = dir.path() + "/bare";
+    REQUIRE(write_dir(bare, with_pool(OLD_POOL)));
+    REQUIRE(run({GEOCODER_DIFF_BIN, "--decode-logical", bare, bare + ".logical"}, log));
+    CHECK(gctest::read_dir(bare + ".logical").empty());
+
+    BuildDir bad = d;
+    bad[postal_cities::FILE_NAME][0] ^= 0x10;  // its first row shares a byte with no row before it
+    const std::string broken = dir.path() + "/broken";
+    REQUIRE(write_dir(broken, bad));
+    CHECK(!run({GEOCODER_DIFF_BIN, "--decode-logical", broken, broken + ".logical"}, log));
+    const std::vector<char> refused = read_file(log);
+    CHECK(std::string(refused.begin(), refused.end()).find("Malformed postal cities") != std::string::npos);
+}
+
+// A table's rows over three blocks and two countries on both days: a ZIP
+// whose name changes, a ZIP new today, one gone. The content merge sends each
+// changed row as a delete and an insert, and the rest MATCH; a dir that gets
+// its table or loses it merges as any other day; a day that changes no row
+// sends the file unchanged, and the patcher copies it from the old dir as it
+// sits.
+TEST(patch_round_trip_merges_the_postal_cities_as_logical_rows) {
+    const uint16_t US = uint16_t('U' << 8 | 'S'), PR = uint16_t('P' << 8 | 'R');
+    std::vector<postal_cities::LogicalRow> old_rows, new_rows;
+    for (int i = 0; i < 20; i++) old_rows.push_back(postal_cities::row_of(PR, std::to_string(600 + i), "Ponce"));
+    for (int i = 0; i < 200; i++)
+        old_rows.push_back(postal_cities::row_of(US, std::to_string(19000 + 2 * i), i % 3 ? "Media" : "Drexel Hill"));
+    for (size_t i = 0; i < old_rows.size(); i++) {
+        if (i == 150) continue;  // gone
+        new_rows.push_back(old_rows[i]);
+        if (i == 30) new_rows.back() = postal_cities::row_of(US, "19020", "Bensalem");  // renamed
+        if (i == 100) new_rows.push_back(postal_cities::row_of(US, "19161", "Fox Chase"));  // new
+    }
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(OLD_POOL);
+    put_postal(old_d, old_rows);
+    put_postal(new_d, new_rows);
+    const RoundTrip changed = round_trip(old_d, new_d);
+    CHECK(changed.mismatches.empty());
+    CHECK(logged(changed, "postal_cities.bin: seq="));
+    CHECK(logged(changed, "recs m/i/d/r=218/2/2/0"));
+
+    const RoundTrip same = round_trip(old_d, old_d);
+    CHECK(same.mismatches.empty());
+    CHECK(logged(same, "postal_cities.bin: unchanged"));
+    CHECK(!logged(same, "encode postal:"));
+
+    // A dir's first table, and its last.
     const BuildDir without = with_pool(OLD_POOL);
     CHECK(round_trip(without, new_d).mismatches.empty());
     CHECK(round_trip(old_d, without).mismatches.empty());

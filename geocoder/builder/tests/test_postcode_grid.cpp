@@ -93,6 +93,50 @@ TEST(a_cell_takes_the_postcode_most_of_its_votes_name_the_least_of_a_tie) {
     CHECK(cells == std::vector<uint64_t>({vote(3, 4), vote(7, 2), vote(9, 0)}));
 }
 
+TEST(a_cells_other_postcodes_are_listed_once_each_beside_its_own) {
+    using postcode_grid::vote;
+    std::vector<uint64_t> votes = {vote(7, 2), vote(7, 1), vote(7, 2), vote(7, 3), vote(7, 1), vote(7, 2),
+                                   vote(3, 5), vote(3, 4), vote(9, 0)};
+    std::vector<uint64_t> others;
+    const std::vector<uint64_t> cells = postcode_grid::cell_postcodes(votes, 0, &others);
+    CHECK(cells == std::vector<uint64_t>({vote(3, 4), vote(7, 2), vote(9, 0)}));
+    CHECK(others == std::vector<uint64_t>({vote(3, 5), vote(7, 1), vote(7, 3)}));
+}
+
+TEST(an_address_with_a_city_casts_a_city_vote_for_its_grid_postcode) {
+    // Strings: 0 "19026", 1 "19073-0001", 2 "K1A 0B1"; cities are ids of
+    // their own. The US is east of 0.
+    const std::vector<std::string> strings = {"19026", "19073-0001", "K1A 0B1"};
+    auto string_of = [&](uint32_t id) { return std::string_view(strings[id]); };
+    auto country_at = [](double, double lng) { return lng > 0 ? US : CA; };
+    auto pos_at = [](double lat, double lng) { return uint64_t(lat * 10) * 1000 + uint64_t(lng * 10); };
+    const std::vector<AddrPoint> addrs = {{1.01f, 1.01f, 0, 0, 0, NO_DATA, 0}, {1.02f, 1.02f, 0, 0, 0, NO_DATA, 0},
+                                          {1.03f, 1.03f, 0, 0, 0, NO_DATA, 0}, {1.04f, -1.04f, 0, 0, 0, NO_DATA, 0},
+                                          {2.05f, 2.05f, 0, 0, 0, NO_DATA, 0}, {2.06f, 2.06f, 0, 0, 0, NO_DATA, 0}};
+    const std::vector<uint32_t> addr_postcodes = {0, 1, 0, 0, 2, NO_DATA};
+    const std::vector<uint32_t> addr_cities = {40, 41, NO_DATA, 42, 43, 44};
+    // A TIGER line casts no city vote.
+    const std::vector<NodeCoord> nodes = {{3.01f, 3.01f}};
+    std::vector<InterpWay> interps(1);
+    interps[0].node_offset = 0, interps[0].node_count = 1;
+    const std::vector<uint32_t> interp_postcodes = {1};
+    const postcode_grid::GridCells got = postcode_grid::grid_cells(addrs, addr_postcodes, addr_cities, interps, nodes,
+                                                                   interp_postcodes, string_of, country_at, pos_at);
+    REQUIRE(got.codes.size() == 2);
+    using postcode_grid::city_vote;
+    // The Canadian point's US ZIP, a postcode no pattern takes and an address
+    // of no postcode cast none.
+    CHECK(got.city_votes == std::vector<uint64_t>({city_vote(0, 40), city_vote(1, 41)}));
+    // Cell (1.0, 1.0): 19026 twice, 19073 once.
+    CHECK(got.cells == std::vector<uint64_t>({postcode_grid::vote(10010, 0), postcode_grid::vote(30030, 1)}));
+    CHECK(got.other_votes == std::vector<uint64_t>({postcode_grid::vote(10010, 1)}));
+    // Without the cities, none of either.
+    const postcode_grid::GridCells bare =
+        postcode_grid::grid_cells(addrs, addr_postcodes, interps, nodes, interp_postcodes, string_of, country_at, pos_at);
+    CHECK(bare.cells == got.cells);
+    CHECK(bare.city_votes.empty() && bare.other_votes.empty());
+}
+
 TEST(a_build_votes_with_its_grid_countries_addresses_and_tiger_lines) {
     // Strings: 0 "19026", 1 "19073-0001", 2 "PA 19026", 3 "K1A 0B1"; the
     // cells are a tenth of a degree, the US east of 0.

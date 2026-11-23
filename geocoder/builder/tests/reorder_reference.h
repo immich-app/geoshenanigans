@@ -286,6 +286,7 @@ inline void reorder_addr_points(ParsedData& data) {
         }
         const bool cell_order_osm = data.addr_osm_ids.size() == n;
         const bool cell_order_postcodes = data.addr_postcode_ids.size() == n;
+        const bool cell_order_cities = data.addr_city_ids.size() == n;
         std::vector<uint32_t> old_to_new(n);
         for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
         std::vector<AddrPoint> sorted(n);
@@ -363,6 +364,15 @@ inline void reorder_addr_points(ParsedData& data) {
             }
             data.addr_postcode_ids = std::move(deduped_pc);
         }
+        // And addr_city_ids: the first occurrence's city.
+        if (data.addr_city_ids.size() == n) {
+            std::vector<uint32_t> deduped_city(write_pos, NO_DATA);
+            for (size_t i = 0; i < n; i++) {
+                uint32_t new_idx = dedup_remap[i];
+                if (deduped_city[new_idx] == NO_DATA) deduped_city[new_idx] = data.addr_city_ids[order[i]];
+            }
+            data.addr_city_ids = std::move(deduped_city);
+        }
         if (write_pos < n)
             std::cerr << "  Deduped addr_points: " << n << " → " << write_pos
                       << " (-" << (n - write_pos) << ")" << std::endl;
@@ -391,6 +401,7 @@ inline void reorder_addr_points(ParsedData& data) {
             data.addr_vertices = std::move(vertices);
             if (cell_order_osm) move_to(data.addr_osm_ids, by_cell);
             if (cell_order_postcodes) move_to(data.addr_postcode_ids, by_cell);
+            if (cell_order_cities) move_to(data.addr_city_ids, by_cell);
             renumber_cells(data.sorted_addr_cells, by_cell);
         }
         std::cerr << "  Addr points sorted: " << n << std::endl;

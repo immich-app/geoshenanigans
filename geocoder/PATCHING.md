@@ -46,11 +46,11 @@ A complete geocoder index for a given region and configuration consists of files
 
 | Mode | Files | Description |
 |------|-------|-------------|
-| `full/` | 23 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
-| `no-addresses/` | 16 files (+3 optional) | Streets + admin + postcodes (no address points) |
-| `admin/` | 8 files (+3 optional) | Admin cell indexes + place nodes + postcodes |
-| `admin-minimal/` | 11 files (+1 optional) | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified to within 37.5 m on an 11 m grid (a ring that grid would collapse keeps the 1.1 m one; takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
-| `admin-minimal-poi/` | 11 files (+1 optional) | The same, on the shared polygon slots and core strings that a POI tier's parent polygons and names point into (a dropped polygon's slot holds a tombstone), with the same arc files. The admin-minimal mode's dir beside a POI tier |
+| `full/` | 23 files (+5 optional) | Streets + addresses + interpolation + admin + postcodes |
+| `no-addresses/` | 16 files (+4 optional) | Streets + admin + postcodes (no address points) |
+| `admin/` | 8 files (+4 optional) | Admin cell indexes + place nodes + postcodes |
+| `admin-minimal/` | 11 files (+2 optional) | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified to within 37.5 m on an 11 m grid (a ring that grid would collapse keeps the 1.1 m one; takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
+| `admin-minimal-poi/` | 11 files (+2 optional) | The same, on the shared polygon slots and core strings that a POI tier's parent polygons and names point into (a dropped polygon's slot holds a tombstone), with the same arc files. The admin-minimal mode's dir beside a POI tier |
 
 Optional files are written only when the data has them; see `optional_files`
 under configurations.json below. The admin-minimal mode picks its dir by the
@@ -265,8 +265,9 @@ files. A client refuses a unit of a `transport_version` it doesn't read.
 
 A component's `optional_files` are written only when the data has them
 (`interp_postcodes.bin` in TIGER regions, the postcode centroids where a
-region has postcodes, `postcode_grid.bin` in the mode dirs of a region holding
-the United States); a client skips any that are absent from `files`.
+region has postcodes, `postcode_grid.bin` and `postal_cities.bin` in the mode
+dirs of a region holding the United States); a client skips any that are
+absent from `files`.
 
 A component's `variants` add one more component, picked by the whole
 selection: the first variant whose `when` names the selection's value on
@@ -293,7 +294,7 @@ the `.bin` files, because the server can't load a region without them.
      above) and each checked against its sha256; a selection takes every
      file of each unit it needs
    - any other: as <path>.zst, decompressed and checked against its sha256
-   - builds/{date}/europe/full/…                (23 files + up to 4 optional)
+   - builds/{date}/europe/full/…                (23 files + up to 5 optional)
    - builds/{date}/europe/quality/simplified/…  (4 files)
    - builds/{date}/europe/poi/notable/…         (7 files, optional)
    The JSON files (strings_layout.json, poi_meta.json) are part of the set:

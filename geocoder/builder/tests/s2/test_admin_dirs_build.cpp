@@ -39,6 +39,7 @@
 #include "country_code.h"
 #include "id_allocator.h"
 #include "pbf_test_objects.h"
+#include "postal_cities.h"
 #include "postcode_files.h"
 #include "postcode_grid.h"
 #include "scratch_dir.h"
@@ -577,12 +578,12 @@ TEST(build_index_writes_every_regions_admin_dirs_as_arcs_and_a_chained_build_wri
     const auto files = tree(first);
 
     // Admin geometry in the four admin dirs of every region and nowhere else:
-    // no quality ladder, no keyhole vertices, no postal files.
+    // no quality ladder, no keyhole vertices, no postal geometry files.
     std::set<std::string> geometry;
     for (const std::string& name : names_of(files)) {
         if (admin_geometry(name)) geometry.insert(name);
         const std::string file = fs::path(name).filename().string();
-        CHECK(file != "admin_vertices.bin" && file.rfind("postal_", 0) != 0);
+        CHECK(file != "admin_vertices.bin" && file != "postal_polygons.bin" && file != "postal_vertices.bin");
         CHECK(name.find("/quality/q") == std::string::npos && name.find("/quality/uncapped") == std::string::npos);
     }
     CHECK(geometry == admin_dir_layout());
@@ -1389,4 +1390,123 @@ TEST(a_build_writes_the_postcode_grid_of_its_us_addresses_in_every_mode_dir_and_
             if (postcode != want[i]) std::printf("    %s: %s\n", dir.c_str(), answers[i].c_str());
         }
     }
+}
+
+namespace {
+
+// The postal cities' fixture: Testland as the United States, the grid test's
+// 19026 and 19018 houses, each with its addr:city (19026: Drexel Hill but two
+// of Upper Darby and one of none; 19018: Clifton Heights, 4 votes), a house of
+// 19099 among 19026's, 11 houses of 19050 at 47.1 N from 8.03 E (Lansdowne
+// 6, Yeadon 5),
+// and a Testreich (DE) house of 19026 in Drexel Hill, which casts no vote.
+std::vector<TestObject> postal_city_fixture() {
+    std::vector<Postcoded> houses;
+    for (int i = 0; i <= 20; i++) houses.push_back({8100 + i, 470500000, 80200000 + 50000 * i, "19026"});
+    for (int i = 0; i < 4; i++) houses.push_back({8200 + i, 470500000, 81350000 + 50000 * i, "19018-0002"});
+    houses.push_back({8300, 468500000, 80500000, "19026"});
+    houses.push_back({8400, 470500000, 80200100, "19099"});
+    for (int i = 0; i < 11; i++) houses.push_back({8500 + i, 471000000, 80300000 + 4000 * i, "19050"});
+    std::vector<TestObject> objects = with_postcodes(houses);
+    for (TestObject& o : objects) {
+        if (o.type == OsmType::Relation && o.id == 40)
+            for (auto& [key, value] : o.tags)
+                if (key == "ISO3166-1" || key == "ISO3166-1:alpha2") value = "US";
+        if (o.type != OsmType::Node) continue;
+        const char* city = nullptr;
+        if (o.id >= 8100 && o.id <= 8120) city = o.id == 8103 || o.id == 8107 ? "Upper Darby" : o.id == 8111 ? nullptr : "Drexel Hill";
+        if (o.id >= 8200 && o.id < 8204) city = "Clifton Heights";
+        if (o.id == 8300) city = "Drexel Hill";
+        if (o.id == 8400) city = "Testville";
+        if (o.id >= 8500 && o.id < 8511) city = o.id < 8506 ? "Lansdowne" : "Yeadon";
+        if (city) o.tags.push_back({"addr:city", city});
+    }
+    return objects;
+}
+
+}  // namespace
+
+TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_chained_build_keeps_a_near_tie) {
+    const ScratchDir root("postal-cities-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    write_test_pbf(pbf, postal_city_fixture(), 1000);
+    // GeoNames' names of 19026, 19018 and 19099, and of 19500, which no
+    // address names.
+    const std::string places = root.path() + "/postal_places.tsv";
+    {
+        std::ofstream f(places);
+        f << "US\t19026\tDrexel Hill\tPA\nUS\t19018\tClifton Heights\tPA\nUS\t19099\tMinorityville\tPA\n"
+             "US\t19500\tNowhere\tPA\n";
+    }
+    auto build = [&](const std::string& name, std::vector<std::string> extra) {
+        const std::string out = root.path() + "/" + name;
+        std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output", "--multi-quality",
+                                          "--postal-places", places};
+        words.insert(words.end(), extra.begin(), extra.end());
+        REQUIRE(gctest::run(words, log));
+        return out;
+    };
+    const std::string dump = root.path() + "/votes.tsv";
+    const std::string out = build("out", {"--dump-postal-votes", dump});
+    const auto files = tree(out);
+
+    // Every mode dir of the planet and of Europe holds it, the same bytes;
+    // no other region does.
+    const std::string name = postal_cities::FILE_NAME;
+    REQUIRE(files.count("planet/admin/" + name));
+    const std::vector<char>& table = files.at("planet/admin/" + name);
+    for (const char* region : {"planet", "europe"})
+        for (const char* mode : {"admin", "no-addresses", "full", "admin-minimal", "admin-minimal-poi"}) {
+            const std::string at = std::string(region) + "/" + mode + "/" + name;
+            REQUIRE(files.count(at));
+            CHECK(files.at(at) == table);
+        }
+    for (const std::string& file : names_of(files))
+        if (fs::path(file).filename() == name) CHECK(file.rfind("planet/", 0) == 0 || file.rfind("europe/", 0) == 0);
+
+    // Its rows: 19026 by its votes, 19018 and 19099 (whose one house votes
+    // among 19026's) by GeoNames, 19050 by its votes; 19500 has no vote.
+    auto rows_of = [](const std::vector<char>& file) {
+        std::vector<std::string> rows;
+        postal_cities::decode(reinterpret_cast<const uint8_t*>(file.data()), file.size(), [&](const postal_cities::LogicalRow& r) {
+            const char country[3] = {char(r.country_code >> 8), char(r.country_code & 0xFF), 0};
+            rows.push_back(std::string(country) + " " + std::string(postal_cities::code_of(r)) + " " +
+                           std::string(postal_cities::name_of(r)));
+        });
+        return rows;
+    };
+    CHECK(rows_of(table) == std::vector<std::string>({"US 19018 Clifton Heights", "US 19026 Drexel Hill",
+                                                      "US 19050 Lansdowne", "US 19099 Minorityville"}));
+    // The votes, a line per value.
+    std::ifstream votes(dump);
+    const std::string text((std::istreambuf_iterator<char>(votes)), std::istreambuf_iterator<char>());
+    CHECK(text.find("US\t19026\tDrexel Hill\t\tvotes\tDrexel Hill\tvote\tDREXEL HILL\tDrexel Hill\t18\n") != std::string::npos);
+    CHECK(text.find("US\t19026\tDrexel Hill\t\tvotes\tDrexel Hill\tvote\tUPPER DARBY\tUpper Darby\t2\n") != std::string::npos);
+    CHECK(text.find("US\t19018\tClifton Heights\t\tgeonames\tClifton Heights\tvote\tCLIFTON HEIGHTS\tClifton Heights\t4\n") !=
+          std::string::npos);
+    CHECK(text.find("19500") == std::string::npos);
+
+    // Yesterday's Yeadon keeps 19050 by its margin (5 + 2 against 6); a
+    // chained build on top of the first build keeps its Lansdowne.
+    const std::string yesterday = root.path() + "/yesterday.bin";
+    {
+        const std::vector<uint8_t> prev = postal_cities::encode_file(
+            {postal_cities::row_of(pack_country_code('U', 'S'), "19050", "Yeadon"),
+             postal_cities::row_of(pack_country_code('U', 'S'), "19099", "Testville")});
+        std::ofstream f(yesterday, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(prev.data()), std::streamsize(prev.size()));
+    }
+    const auto held = tree(build("held", {"--prev-postal-cities", yesterday}));
+    CHECK(rows_of(held.at("planet/full/" + name)) == std::vector<std::string>({"US 19018 Clifton Heights", "US 19026 Drexel Hill",
+                                                                               "US 19050 Yeadon", "US 19099 Minorityville"}));
+    const auto chained = tree(build("chained", {"--prev-output", out, "--prev-postal-cities", out + "/planet/admin/" + name}));
+    CHECK(chained.at("planet/admin/" + name) == table);
+    // A malformed table of yesterday's fails the build.
+    {
+        std::ofstream f(yesterday, std::ios::binary | std::ios::trunc);
+        f << "not a table";
+    }
+    CHECK(!gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/bad", pbf, "--postal-places", places, "--prev-postal-cities",
+                        yesterday},
+                       log));
 }

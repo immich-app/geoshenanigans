@@ -1137,8 +1137,8 @@ mod tests {
     fn template_admin_minimal_takes_its_poi_dir_beside_a_poi_tier() {
         let (v, c) = template();
         let files = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin",
-                     "arc_index.bin", "arc_vertices.bin", "place_cells.bin", "place_hidden.bin", "place_nodes.bin", "postcode_grid.bin",
-                     "strings_core.bin", "strings_layout.json"];
+                     "arc_index.bin", "arc_vertices.bin", "place_cells.bin", "place_hidden.bin", "place_nodes.bin", "postal_cities.bin",
+                     "postcode_grid.bin", "strings_core.bin", "strings_layout.json"];
         let minimal: Vec<RegionSelection> = template_selections(&v).into_iter()
             .filter(|s| s.mode == "admin-minimal" && s.region == "europe")
             .collect();
@@ -1180,8 +1180,9 @@ mod tests {
             bins.sort_unstable();
             bins.dedup();
             assert_eq!(bins.len(), count, "{:?}: {:?}", s, paths);
+            // The keyhole geometry files arcs replaced.
             let stale: Vec<&String> = paths.iter()
-                .filter(|p| basename(p) == "admin_vertices.bin" || basename(p).starts_with("postal_"))
+                .filter(|p| ["admin_vertices.bin", "postal_polygons.bin", "postal_vertices.bin"].contains(&basename(p)))
                 .collect();
             assert!(stale.is_empty(), "{:?}: {:?}", s, stale);
         }

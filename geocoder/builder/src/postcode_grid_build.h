@@ -149,11 +149,15 @@ inline constexpr uint32_t code_index(uint64_t v) { return uint32_t(v & (MAX_CODE
 
 // The cells holding votes, ascending, each with its postcode: the one most
 // of its votes name, the least index of those named most. Sorts `votes`.
-inline std::vector<uint64_t> cell_postcodes(std::vector<uint64_t>& votes, unsigned threads = 0) {
+// `others`, where given, gets each cell's other postcodes it holds votes
+// for, as votes, ascending.
+inline std::vector<uint64_t> cell_postcodes(std::vector<uint64_t>& votes, unsigned threads = 0,
+                                            std::vector<uint64_t>* others = nullptr) {
     parallel_sort(votes.begin(), votes.end(), [](uint64_t a, uint64_t b) { return a < b; }, threads);
     std::vector<uint64_t> cells;
     for (size_t i = 0; i < votes.size();) {
         const uint64_t pos = pos_of(votes[i]);
+        const size_t first = i;
         uint64_t best = votes[i];
         size_t best_n = 0;
         while (i < votes.size() && pos_of(votes[i]) == pos) {
@@ -163,6 +167,9 @@ inline std::vector<uint64_t> cell_postcodes(std::vector<uint64_t>& votes, unsign
             i = j;
         }
         cells.push_back(best);
+        if (others)
+            for (size_t k = first; k < i; k++)
+                if (votes[k] != best && (k == first || votes[k] != votes[k - 1])) others->push_back(votes[k]);
     }
     return cells;
 }
@@ -212,11 +219,22 @@ inline std::vector<LogicalRow> grid_rows(const std::vector<uint64_t>& cells, con
 
 // The grid's postcodes, (country, code) ascending, and its cells holding
 // votes (cell_postcodes, of those codes), with the votes of each kind.
+// Where the addresses' cities are given, the postal cities' votes
+// (postal_cities_build.h): a city vote, city_vote(code index, city), an
+// address vote's of an address with a city, ascending; and each cell's
+// votes for its other postcodes (cell_postcodes' `others`).
 struct GridCells {
     std::vector<GridCode> codes;
     std::vector<uint64_t> cells;
     size_t address_votes = 0, tiger_votes = 0;
+    std::vector<uint64_t> city_votes, other_votes;
 };
+
+// A city vote: the index of the postcode among the build's codes and the
+// city's id (an offset in the cities' pool), as code << 32 | city.
+inline constexpr uint64_t city_vote(uint32_t code, uint32_t city) { return uint64_t(code) << 32 | city; }
+inline constexpr uint32_t city_vote_code(uint64_t v) { return uint32_t(v >> 32); }
+inline constexpr uint32_t city_vote_city(uint64_t v) { return uint32_t(v); }
 
 // The cells of a build's votes: each address point with a postcode string
 // (addr_postcodes, parallel to addrs) and each line of a ZIP
@@ -225,11 +243,14 @@ struct GridCells {
 // a grid country that takes the string as a postcode (grid_postcode), in the
 // cell pos_at(lat, lng) gives the position of. string_of(id) gives a postcode
 // string's text. The same whatever `threads` runs it.
+// addr_cities, parallel to addrs (NO_DATA for none; empty for no cities),
+// gives each address point's city, whose votes and the cells' other votes
+// it collects too.
 template <class StringOf, class CountryAt, class PosAt>
 GridCells grid_cells(const std::vector<AddrPoint>& addrs, const std::vector<uint32_t>& addr_postcodes,
-                     const std::vector<InterpWay>& interps, const std::vector<NodeCoord>& interp_nodes,
-                     const std::vector<uint32_t>& interp_postcodes, StringOf string_of, CountryAt country_at, PosAt pos_at,
-                     unsigned threads = 0) {
+                     const std::vector<uint32_t>& addr_cities, const std::vector<InterpWay>& interps,
+                     const std::vector<NodeCoord>& interp_nodes, const std::vector<uint32_t>& interp_postcodes,
+                     StringOf string_of, CountryAt country_at, PosAt pos_at, unsigned threads = 0) {
     constexpr size_t COUNTRIES = std::size(GRID_COUNTRIES);
     constexpr uint32_t NONE = UINT32_MAX;
     const size_t n_addrs = std::min(addrs.size(), addr_postcodes.size()), n_interps = std::min(interps.size(), interp_postcodes.size());
@@ -268,20 +289,39 @@ GridCells grid_cells(const std::vector<AddrPoint>& addrs, const std::vector<uint
         }
         code_at[at] = uint32_t(out.codes.size() - 1);
     }
-    // A point's vote, or none.
-    auto vote_at = [&](double lat, double lng, uint32_t id, std::vector<uint64_t>& votes) {
+    // A point's vote, or none; and its city's, where it has a city.
+    auto vote_at = [&](double lat, double lng, uint32_t id, std::vector<uint64_t>& votes, uint32_t city = NO_DATA,
+                       std::vector<uint64_t>* city_votes = nullptr) {
         const size_t k = size_t(std::lower_bound(ids.begin(), ids.end(), id) - ids.begin());
         bool any = false;
         for (size_t c = 0; c < COUNTRIES; c++) any |= code_at[k * COUNTRIES + c] != NONE;
         if (!any) return;
         const uint16_t cc = country_at(lat, lng);
         for (size_t c = 0; c < COUNTRIES; c++)
-            if (GRID_COUNTRIES[c].code == cc && code_at[k * COUNTRIES + c] != NONE)
+            if (GRID_COUNTRIES[c].code == cc && code_at[k * COUNTRIES + c] != NONE) {
                 votes.push_back(vote(pos_at(lat, lng), code_at[k * COUNTRIES + c]));
+                if (city != NO_DATA && city_votes) city_votes->push_back(city_vote(code_at[k * COUNTRIES + c], city));
+            }
     };
-    std::vector<uint64_t> votes = parallel_collect<uint64_t>(n_addrs, [&](size_t i, std::vector<uint64_t>& v) {
-        if (addr_postcodes[i] != NO_DATA) vote_at(addrs[i].lat, addrs[i].lng, addr_postcodes[i], v);
-    }, threads);
+    const bool cities = addr_cities.size() >= n_addrs;
+    std::vector<std::vector<uint64_t>> vote_parts(workers), city_parts(workers);
+    const size_t blocks = parallel_blocks(n_addrs, [&](size_t b, size_t begin, size_t end) {
+        for (size_t i = begin; i < end; i++)
+            if (addr_postcodes[i] != NO_DATA)
+                vote_at(addrs[i].lat, addrs[i].lng, addr_postcodes[i], vote_parts[b], cities ? addr_cities[i] : NO_DATA,
+                        &city_parts[b]);
+    }, workers);
+    auto joined = [&](std::vector<std::vector<uint64_t>>& parts) {
+        std::vector<uint64_t> all;
+        size_t n = 0;
+        for (size_t b = 0; b < blocks; b++) n += parts[b].size();
+        all.reserve(n);
+        for (size_t b = 0; b < blocks; b++) all.insert(all.end(), parts[b].begin(), parts[b].end()), std::vector<uint64_t>().swap(parts[b]);
+        return all;
+    };
+    std::vector<uint64_t> votes = joined(vote_parts);
+    out.city_votes = joined(city_parts);
+    parallel_sort(out.city_votes.begin(), out.city_votes.end(), [](uint64_t a, uint64_t b) { return a < b; }, threads);
     out.address_votes = votes.size();
     std::vector<uint64_t> lines = parallel_collect<uint64_t>(n_interps, [&](size_t i, std::vector<uint64_t>& v) {
         const InterpWay& w = interps[i];
@@ -292,8 +332,18 @@ GridCells grid_cells(const std::vector<AddrPoint>& addrs, const std::vector<uint
     out.tiger_votes = lines.size();
     votes.insert(votes.end(), lines.begin(), lines.end());
     std::vector<uint64_t>().swap(lines);
-    out.cells = cell_postcodes(votes, threads);
+    out.cells = cell_postcodes(votes, threads, cities ? &out.other_votes : nullptr);
     return out;
+}
+
+// The cells of a build's votes without the cities' (grid_cells above).
+template <class StringOf, class CountryAt, class PosAt>
+GridCells grid_cells(const std::vector<AddrPoint>& addrs, const std::vector<uint32_t>& addr_postcodes,
+                     const std::vector<InterpWay>& interps, const std::vector<NodeCoord>& interp_nodes,
+                     const std::vector<uint32_t>& interp_postcodes, StringOf string_of, CountryAt country_at, PosAt pos_at,
+                     unsigned threads = 0) {
+    return grid_cells(addrs, addr_postcodes, std::vector<uint32_t>(), interps, interp_nodes, interp_postcodes, string_of,
+                      country_at, pos_at, threads);
 }
 
 }  // namespace postcode_grid
