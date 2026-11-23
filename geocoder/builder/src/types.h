@@ -674,9 +674,9 @@ inline constexpr PoiCategory kPoiWaterKinds[] = {PoiCategory::NATURAL_WATER, Poi
                                                  PoiCategory::GLACIER, PoiCategory::RESERVOIR};
 // While the build runs, too: a POI that never takes the primary slot, a
 // water multipolygon the relation scan takes by its own categories, or one
-// whose holes its polygon leaves out (build_index.cpp), which the build
-// links no parent street, so that the server's primary lane, which needs
-// one, takes none of it (compute_poi_parent_streets).
+// that could whose holes its polygon leaves out (build_index.cpp), which
+// the build links no parent street, so that the server's primary lane,
+// which needs one, takes none of it (compute_poi_parent_streets).
 static constexpr uint8_t POI_FLAG_PLACES_ONLY = 0x40;
 // A POI whose importance took the sitelink count of its Wikidata item
 // (reorder_pois), which the tier dirs holding one credit.

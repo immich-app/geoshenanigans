@@ -1270,7 +1270,8 @@ TEST(a_water_object_written_as_its_kind_takes_the_importance_of_that_kind) {
 // tier ships, and a reservoir that is a building and an attraction, whose
 // class (building, the first of its fallback tags) Nominatim's POI lane
 // takes none of. Nor does a lake that is a swimming area, whose island, a
-// hole of it, the POI's polygon of its outer ring leaves out.
+// hole of it, the POI's polygon of its outer ring leaves out; a bay of a hole
+// never takes the slot anyway, and keeps its parent street.
 TEST(a_water_multipolygon_that_is_a_rank_30_poi_is_written_as_that_poi_and_answered) {
     const ScratchDir root("water-relation-build");
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
@@ -1287,6 +1288,8 @@ TEST(a_water_multipolygon_that_is_a_rank_30_poi_is_written_as_that_poi_and_answe
     add_rectangle(water, 4046, 1014, south, lng0 + 1535000, north, lng0 + 1543000);
     add_rectangle(water, 4047, 1018, lat0 + 1403200, lng0 + 1537000, lat0 + 1403800, lng0 + 1541000);
     add_rectangle(water, 4048, 1022, south, lng0 + 1550000, north, lng0 + 1558000);
+    add_rectangle(water, 4049, 1026, south, lng0 + 1565000, north, lng0 + 1573000);
+    add_rectangle(water, 4050, 1030, lat0 + 1403200, lng0 + 1567000, lat0 + 1403800, lng0 + 1571000);
     water.push_back(node(1100, lat0 + 1407000, lng0 + 1449000));
     water.push_back(node(1101, lat0 + 1407000, lng0 + 1560000));
     water.push_back(way(4060, {1100, 1101}, {{"highway", "residential"}, {"name", "Seeweg"}}));
@@ -1305,13 +1308,16 @@ TEST(a_water_multipolygon_that_is_a_rank_30_poi_is_written_as_that_poi_and_answe
     water.push_back(island_lake);
     water.push_back(multipolygon(5048, 4048, {{"building", "yes"}, {"landuse", "reservoir"}, {"name", "Stausee Testdorf"},
                                               {"tourism", "attraction"}}));
+    TestObject island_bay = multipolygon(5049, 4049, {{"name", "Inselbucht Testdorf"}, {"natural", "bay"}});
+    island_bay.members.emplace_back(OsmType::Way, 4050, "inner");
+    water.push_back(island_bay);
     write_fixture_with(pbf, water);
     const std::string out = root.path() + "/single";
     REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
 
     const std::vector<PoiRecord> pois = poi_records_in(tree(out), "planet/poi/all");
     const int bay = int(PoiCategory::BAY), swimming = int(PoiCategory::SWIMMING_AREA);
-    const std::vector<int> want = {int(PoiCategory::ATTRACTION), int(PoiCategory::NATURE_RESERVE), bay, bay, bay,
+    const std::vector<int> want = {int(PoiCategory::ATTRACTION), int(PoiCategory::NATURE_RESERVE), bay, bay, bay, bay,
                                    swimming, swimming, swimming};
     if (categories_of(pois) != want)
         for (const PoiRecord& pr : pois) std::printf("    category %d at %.4f\n", int(pr.category), pr.lng);
@@ -1331,7 +1337,7 @@ TEST(a_water_multipolygon_that_is_a_rank_30_poi_is_written_as_that_poi_and_answe
     for (const Want& w : {Want{8.1424, swimming, true, 0}, Want{8.1439, swimming, true, 0}, Want{8.1454, bay, true, 0},
                           Want{8.1469, bay, true, 0}, Want{8.1484, bay, true, POI_FLAG_HIGHWAY},
                           Want{8.1524, int(PoiCategory::NATURE_RESERVE), false, 0}, Want{8.1539, swimming, false, 0},
-                          Want{8.1554, int(PoiCategory::ATTRACTION), false, 0}}) {
+                          Want{8.1554, int(PoiCategory::ATTRACTION), false, 0}, Want{8.1569, bay, true, 0}}) {
         const PoiRecord* pr = at(w.lng);
         REQUIRE(pr != nullptr);
         if (pr->category != w.category || (pr->parent_street_id != NO_DATA) != w.parent || pr->flags != w.flags)
