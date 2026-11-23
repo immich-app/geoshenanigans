@@ -353,6 +353,7 @@ inline void reorder_addr_points(ParsedData& data) {
             data.addr_osm_ids = std::move(deduped_osm);
         }
         // Reorder + dedup addr_postcode_ids in parallel
+        const std::vector<uint32_t> pc_before = data.addr_postcode_ids;
         if (data.addr_postcode_ids.size() == n) {
             std::vector<uint32_t> sorted_pc(n);
             for (uint32_t i = 0; i < n; i++) sorted_pc[i] = data.addr_postcode_ids[order[i]];
@@ -364,12 +365,15 @@ inline void reorder_addr_points(ParsedData& data) {
             }
             data.addr_postcode_ids = std::move(deduped_pc);
         }
-        // And addr_city_ids: the first occurrence's city.
+        // And addr_city_ids: the first city of an occurrence of the kept
+        // postcode.
         if (data.addr_city_ids.size() == n) {
             std::vector<uint32_t> deduped_city(write_pos, NO_DATA);
             for (size_t i = 0; i < n; i++) {
                 uint32_t new_idx = dedup_remap[i];
-                if (deduped_city[new_idx] == NO_DATA) deduped_city[new_idx] = data.addr_city_ids[order[i]];
+                const uint32_t pc = data.addr_postcode_ids.size() == write_pos ? data.addr_postcode_ids[new_idx] : NO_DATA;
+                if (deduped_city[new_idx] == NO_DATA && pc != NO_DATA && pc == pc_before[order[i]])
+                    deduped_city[new_idx] = data.addr_city_ids[order[i]];
             }
             data.addr_city_ids = std::move(deduped_city);
         }

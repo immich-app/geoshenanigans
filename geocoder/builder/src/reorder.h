@@ -94,6 +94,32 @@ std::vector<T> first_set_per_run(const std::vector<T>& values, const std::vector
     return out;
 }
 
+// Per run, the first value (in sorted order) that isn't `none` of a record
+// whose key is the run's key, the first key that isn't `no_key`
+// (first_set_per_run's); none for a run of no key. A record's value goes
+// only with the key it was tagged beside. `out` as for first_set_per_run.
+template <class T>
+std::vector<T> first_set_beside_key(const std::vector<T>& values, const std::vector<uint32_t>& keys,
+                                    const std::vector<uint32_t>& order, const std::vector<uint32_t>& starts, T none,
+                                    uint32_t no_key, unsigned threads, std::vector<T> out = {}) {
+    if (out.size() != starts.size()) {
+        out.clear();
+        parallel_resize(out, starts.size(), none);
+    }
+    parallel_for(starts.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++) {
+            out[k] = none;
+            const size_t end = run_end(starts, k, order.size());
+            uint32_t key = no_key;
+            for (size_t i = starts[k]; i < end && key == no_key; i++) key = keys[order[i]];
+            if (key == no_key) continue;
+            for (size_t i = starts[k]; i < end && out[k] == none; i++)
+                if (keys[order[i]] == key) out[k] = values[order[i]];
+        }
+    }, threads);
+    return out;
+}
+
 // Each item's least cell among the pairs that list it (their item ids are
 // below n), UINT64_MAX for an item none lists. Threads race only to lower a
 // cell, so the least wins whatever their timing.
@@ -401,12 +427,16 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t
     // silently early-returns.
     if (have_osm)
         data.addr_osm_ids = first_set_per_run(data.addr_osm_ids, order, starts, uint64_t(0), threads, osm_buffer.get());
+    // A survivor's addr:city: the first a copy of its postcode sets (a city
+    // votes for the postcode it was tagged beside), none without one.
+    if (have_cities)
+        data.addr_city_ids = have_postcodes
+            ? first_set_beside_key(data.addr_city_ids, data.addr_postcode_ids, order, starts, NO_DATA, NO_DATA, threads,
+                                   city_buffer.get())
+            : std::vector<uint32_t>(kept, NO_DATA);
     if (have_postcodes)
         data.addr_postcode_ids =
             first_set_per_run(data.addr_postcode_ids, order, starts, NO_DATA, threads, postcode_buffer.get());
-    // A survivor's addr:city, as its postcode: the first its copies set.
-    if (have_cities)
-        data.addr_city_ids = first_set_per_run(data.addr_city_ids, order, starts, NO_DATA, threads, city_buffer.get());
     if (kept < n)
         std::cerr << "  Deduped addr_points: " << n << " → " << kept
                   << " (-" << (n - kept) << ")" << std::endl;
