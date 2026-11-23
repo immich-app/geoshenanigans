@@ -1107,7 +1107,8 @@ mod tests {
     // PoiMeta::load reads poi_meta.json; a selection that resolves without
     // them downloads GiBs into a dir that can never load. Every selection
     // takes one mode dir, and with it that dir's attribution.json, the credit
-    // of the data the dataset holds; one with a POI tier takes the tier dir's
+    // of the data the dataset holds (admin-minimal-poi's beside a POI tier,
+    // the dir that mode takes there); one with a POI tier takes the tier dir's
     // poi_attribution.json too where the build wrote one (an optional file),
     // the credit of the sitelinks that rank its POIs, by a name of its own,
     // as downloads land flat by name.
@@ -1122,7 +1123,9 @@ mod tests {
             assert!(has("admin_cells.bin"), "{:?} lacks admin_cells.bin", s);
             assert_eq!(has("poi_meta.json"), s.poi_tier != "none", "{:?} poi_meta.json", s);
             let credits: Vec<&String> = paths.iter().filter(|p| basename(p) == "attribution.json").collect();
-            assert_eq!(credits.len(), 1, "{:?} attribution.json", s);
+            let mode_dir = if s.mode == "admin-minimal" && s.poi_tier != "none" { "admin-minimal-poi" } else { s.mode.as_str() };
+            let credit = format!("{}/{}/attribution.json", s.region, mode_dir);
+            assert_eq!(credits, [&credit], "{:?}", s);
             assert!(!resolved.optional.contains(credits[0].as_str()), "{:?}", s);
             let poi_credits: Vec<&String> = paths.iter().filter(|p| basename(p) == "poi_attribution.json").collect();
             let poi_credit = format!("{}/poi/{}/poi_attribution.json", s.region, s.poi_tier);
