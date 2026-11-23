@@ -2351,7 +2351,7 @@ impl Index {
         let (accepted, written) = place_node_walk(&nodes, held_ranks, |k| node_inside_boundary(&candidates[k].0, nodes[k].1), rows);
         result.named_rows = written.into_iter()
             .filter(|&k| Some(candidates[k].0.name_id) == named)
-            .map(|k| (nodes[k].1, PLACE_NODE_FIELDS[nodes[k].0], nodes[k].2.sqrt()))
+            .map(|k| NamedRow { rank: nodes[k].1, field: PLACE_NODE_FIELDS[nodes[k].0], distance: nodes[k].2.sqrt(), node: candidates[k].0 })
             .collect();
         for (pt, slot) in [&mut result.city, &mut result.town, &mut result.village, &mut result.suburb,
                            &mut result.hamlet, &mut result.neighbourhood, &mut result.quarter].into_iter().enumerate() {
@@ -3723,12 +3723,13 @@ impl Index {
     /// rank (results.py:617-621: fromarea, then distance, descending): the polygons named so, by
     /// their own name or by a place node's they link, the farthest from `feature` first
     /// (area_row_distance), then the place nodes of `nodes` (PlaceResult::named_rows), the
-    /// farthest first. The polygons are those of `areas`, the address's ranked polygons (found by
-    /// `scan`), and those of the scan's others that are rows of `feature` as getNearFeatures
-    /// takes them (partition-functions.sql:39-44): a polygon holding the point where the feature
-    /// is one, such as a larger boundary of a level `areas` holds it by, else one the street runs
-    /// through, each at area_row_rank's rank; `country` is the point's, upper case.
-    fn crosscheck_rows(&self, name: u32, areas: &[RankedPoly], scan: &mut AdminScan, nodes: &[(u8, &'static str, f64)],
+    /// farthest first, but those a place area links (links_by_name). The polygons are those of
+    /// `areas`, the address's ranked polygons (found by `scan`), and those of the scan's others
+    /// that are rows of `feature` as getNearFeatures takes them (partition-functions.sql:39-44):
+    /// a polygon holding the point where the feature is one, such as a larger boundary of a level
+    /// `areas` holds it by, else one the street runs through, each at area_row_rank's rank;
+    /// `country` is the point's, upper case.
+    fn crosscheck_rows(&self, name: u32, areas: &[RankedPoly], scan: &mut AdminScan, nodes: &[NamedRow],
                        feature: PlaceFeature<'_>, country: &str) -> Vec<CrosscheckRow<'_>> {
         let named = |poly: &AdminPolygon| poly.name_id == name || self.links_name(poly, name);
         let same = |a: &AdminPolygon, b: &AdminPolygon| a.ring_offset == b.ring_offset && a.ring_bytes == b.ring_bytes;
@@ -3759,11 +3760,16 @@ impl Index {
             far.sort_by(|a, b| b.0.total_cmp(&a.0));
             polygons = far.into_iter().map(|(_, r)| r).collect();
         }
-        let mut nodes = nodes.to_vec();
-        nodes.sort_by(|a, b| b.2.total_cmp(&a.2));
+        let place_area = |poly: &AdminPolygon| poly.admin_level == 15 && poly.name_id == name;
+        let place_areas: Vec<RankedPoly> = areas.iter().filter(|r| place_area(&r.poly)).copied()
+            .chain(scan.rings.iter().filter(|(_, poly)| place_area(poly) && !areas.iter().any(|r| same(&r.poly, poly)))
+                .map(|&(_, poly)| RankedPoly { poly, rank_address: self.area_row_rank(&poly, areas, country) }))
+            .collect();
+        let mut nodes: Vec<NamedRow> = nodes.iter().filter(|row| !place_areas.iter().any(|r| self.links_by_name(r, &row.node))).copied().collect();
+        nodes.sort_by(|a, b| b.distance.total_cmp(&a.distance));
         let mut rows: Vec<CrosscheckRow> = polygons.iter()
             .map(|r| self.area_row(r))
-            .chain(nodes.iter().map(|&(rank, field, _)| CrosscheckRow { rank, name: self.get_string(name), field: Some(field) }))
+            .chain(nodes.iter().map(|row| CrosscheckRow { rank: row.rank, name: self.get_string(name), field: Some(row.field) }))
             .collect();
         // Stable: within a rank the polygons stay ahead of the nodes.
         rows.sort_by_key(|row| row.rank);
@@ -3811,6 +3817,27 @@ impl Index {
     /// name (linked_names).
     fn links_name(&self, poly: &AdminPolygon, name: u32) -> bool {
         self.linked_names.get_or_init(|| self.read_linked_names()).binary_search(&(boundary_key(poly), name)).is_ok()
+    }
+
+    /// Whether the ranked place area `area` (admin_level 15) links the place node `node` by
+    /// find_linked_place's name match, which runs for ways as well as relations and which the
+    /// builder runs for boundaries only (placex_triggers.sql:359-385): the area has the node's
+    /// name, its rank_address is the one the node's type has (compute_place_rank), which an area
+    /// lifted by one round it no longer has, and it holds the node, where it links no node by its
+    /// label or wikidata, one of another type or name.
+    fn links_by_name(&self, area: &RankedPoly, node: &PlaceNode) -> bool {
+        let (poly, geometry) = (&area.poly, &self.admin_geometry);
+        poly.admin_level == 15 && poly.name_id == node.name_id && poly.own_place_type == 0
+            && PLACE_NODE_RANK.get(usize::from(node.place_type)) == Some(&area.rank_address)
+            && geometry.has_rings(poly) && geometry.contains_once(poly, AdminPoint::new(f64::from(node.lat), f64::from(node.lng)))
+            && !self.links_any(poly)
+    }
+
+    /// Whether the boundary of polygon `poly` links a place node of another name (linked_names).
+    fn links_any(&self, poly: &AdminPolygon) -> bool {
+        let key = boundary_key(poly);
+        let linked = self.linked_names.get_or_init(|| self.read_linked_names());
+        linked.get(linked.partition_point(|&(k, _)| k < key)).is_some_and(|&(k, _)| k == key)
     }
 
     /// linked_names from place_hidden.bin: each label's boundary and name where the boundary has
@@ -5819,8 +5846,18 @@ pub struct PlaceResult<'a> {
     /// The rank_address of the node behind each field.
     pub ranks: FieldRanks,
     /// The address rows of the nodes of the name find_places was asked for
-    /// (place_node_walk), as (rank_address, field, distance in degrees).
-    pub named_rows: Vec<(u8, &'static str, f64)>,
+    /// (place_node_walk).
+    pub named_rows: Vec<NamedRow>,
+}
+
+/// A place node's address row: its rank_address, its field, its distance from
+/// the feature in degrees, and the node.
+#[derive(Clone, Copy)]
+pub struct NamedRow {
+    pub rank: u8,
+    pub field: &'static str,
+    pub distance: f64,
+    pub node: PlaceNode,
 }
 
 impl PlaceResult<'_> {
