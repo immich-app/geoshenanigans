@@ -268,10 +268,10 @@ Where Nominatim's rank adjustment matters:
   protected area to a notable lake, glacier, coastal water or river smaller than
   it; a natural feature to smaller water; never a sea, ocean or wetland over a
   park), and no shore of the water within 40 m of the point, a cut between
-  pieces of one water and the marine tile lines aside. It is decided in the
-  multi-continent answer once the water and the address are final, the same on
-  every tier; `display_name`, `address` and `places` don't change. README.md
-  gives each rule.
+  pieces of one water and a marine tile line with sea across it aside. It is
+  decided in the multi-continent answer once the water and the address are
+  final, the same on every tier; `display_name`, `address` and `places` don't
+  change. README.md gives each rule.
 
 The server's lookup is `server/src/water.rs`; the builder's kinds, ranks and
 naming are `builder/src/water_classify.h`, `water_types.h` and `water_names.h`.

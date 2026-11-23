@@ -254,9 +254,10 @@ when all of these hold, the same on every water tier:
   than the water. A sea, an ocean or a wetland never displaces a park, and
   every other landmark (a bridge, a pier, a marina, a park, a building) stays.
 - **On the water, not at its edge**: no shore of that water within 40 m of the
-  point, in the dir's own geometry; a cut between two pieces of the same water
-  (`water_cut_arcs.bin`) and the marine areas' tenth-of-a-degree tile lines
-  are no shore.
+  point, in the dir's own geometry, its pieces past a cut included; a cut
+  between two pieces of the same water (`water_cut_arcs.bin`) is no shore, nor
+  is a marine area's edge along a tenth-of-a-degree tile line with sea on both
+  sides of it.
 
 Status codes:
 - `200` - success
