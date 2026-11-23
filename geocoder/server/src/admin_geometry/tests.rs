@@ -875,16 +875,23 @@ fn an_edge_nearer_than_the_distance_is_found_and_one_past_it_is_not() {
     let (geom, polys) = s.geometry();
     let poly = &polys[id as usize];
     let p = AdminPoint::new(0.0003, 0.005);
-    let within = |metres: f64, arc: &dyn Fn(u32) -> bool, edge: &dyn Fn(PointE7, PointE7) -> bool| geom.edge_within(poly, p, metres, arc, edge);
+    let within = |metres: f64, counts: &dyn Fn(u32, PointE7, PointE7) -> bool| geom.edge_within(poly, p, metres, counts);
 
-    assert!(within(40.0, &|_| false, &|_, _| false));
-    assert!(!within(30.0, &|_| false, &|_, _| false));
+    assert!(within(40.0, &|_, _, _| true));
+    assert!(!within(30.0, &|_, _, _| true));
     // Without the south side: the other sides lie 555 m off and more.
-    assert!(!within(40.0, &|slot| slot == south, &|_, _| false));
-    assert!(!within(40.0, &|_| false, &|a, b| a.lat == 0 && b.lat == 0));
-    assert!(within(600.0, &|slot| slot == south, &|_, _| false));
+    assert!(!within(40.0, &|slot, _, _| slot != south));
+    assert!(!within(40.0, &|_, a, b| a.lat != 0 || b.lat != 0));
+    assert!(within(600.0, &|slot, _, _| slot != south));
+    // Only the edges within the distance are offered, each by its arc and ends.
+    let mut offered = Vec::new();
+    assert!(!geom.edge_within(poly, p, 40.0, |slot, a, b| {
+        offered.push((slot, a, b));
+        false
+    }));
+    assert_eq!(offered, [(south, e7(0.0, 0.0), e7(0.0, 0.01))]);
     // No rings: nothing near.
-    assert!(!geom.edge_within(&AdminPolygon { ring_bytes: 0, ..*poly }, p, 1e9, |_| false, |_, _| false));
+    assert!(!geom.edge_within(&AdminPolygon { ring_bytes: 0, ..*poly }, p, 1e9, |_, _, _| true));
 }
 
 #[test]
@@ -899,10 +906,28 @@ fn the_edge_walk_reads_only_the_arcs_whose_boxes_reach_the_point() {
     let mut read = 0;
     for &q in &points {
         for metres in [5.0, 40.0, 300.0] {
-            let (within, arcs) = geom.edge_walk(&polys[id as usize], AdminPoint(q), metres, |_| false, |_, _| false);
+            let (within, arcs) = geom.edge_walk(&polys[id as usize], AdminPoint(q), metres, |_, _, _| true);
             assert_eq!(within, brute_edge_within(&[ring.clone()], q, metres), "{q:?} {metres} m");
             read += arcs as usize;
         }
     }
     assert!(read < points.len() * 3 * 8, "{read} arcs read at {} points", points.len());
+}
+
+#[test]
+fn the_arcs_a_ring_block_uses_near_a_point_are_found_by_its_refs_alone() {
+    // 100 arcs of 25 vertices round a square of 0.1 degrees, in chunks with boxes; the point 33 m
+    // north of its south side, by its first arc.
+    let mut s = Shapes::default();
+    let (refs, ring) = square_of_arcs(&mut s.fx, 0, 1_000_000, 25, 25);
+    let id = s.polygon(8, &[refs.clone()], vec![ring]);
+    let (geom, polys) = s.geometry();
+    let (poly, p) = (&polys[id as usize], AdminPoint::new(0.0003, 0.002));
+
+    assert!(geom.uses_arc_near(poly, p, 40.0, &[refs[0].slot]));
+    assert!(geom.uses_arc_near(poly, p, 40.0, &[refs[60].slot, refs[0].slot]));
+    // Arcs of the north and west sides, in chunks whose boxes miss the point.
+    assert!(!geom.uses_arc_near(poly, p, 40.0, &[refs[60].slot, refs[99].slot]));
+    // No rings: no arc.
+    assert!(!geom.uses_arc_near(&AdminPolygon { ring_bytes: 0, ..*poly }, p, 40.0, &[refs[0].slot]));
 }

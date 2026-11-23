@@ -19,9 +19,9 @@
 //! location line names it in its landmark's place, it says so (`WaterDetail::takes_landmark`).
 
 use crate::{
-    cell_id_at_level, coords_in_range, mmap_file, poi_category_to_osm_class, polygon_record, AdminGeometry,
-    AdminPoint, AdminPolygon, CellPairs, FileBytes, PipMemo, PointE7, StringPool, ADMIN_POLYGON_RECORD_BYTES, ID_MASK,
-    INTERIOR_FLAG, NO_DATA,
+    cell_id_at_level, cell_neighbors_at_level, coords_in_range, mmap_file, poi_category_to_osm_class, polygon_record,
+    AdminGeometry, AdminPoint, AdminPolygon, CellPairs, FileBytes, PipMemo, PointE7, StringPool, ADMIN_POLYGON_RECORD_BYTES,
+    ID_MASK, INTERIOR_FLAG, NO_DATA,
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -238,9 +238,8 @@ impl WaterDetail<'_> {
     /// 5. a landmark that stays: every one but a nature reserve, national park or protected area
     ///    (a UNESCO zone among them), which gives way to a notable body smaller than its polygon,
     ///    and a natural feature, which gives way to a smaller body;
-    /// 6. a shore within LANDMARK_SHORE_M of the point, in the tier's own geometry: an edge of the
-    ///    polygon's rings but a cut arc's (CutArcs) and, for a sea or ocean, one along a line of
-    ///    a tenth of a degree (the tiles of the marine areas).
+    /// 6. a shore of its object within LANDMARK_SHORE_M of the point, in the tier's own geometry
+    ///    (`WaterLayer::shore_within`).
     pub(crate) fn takes_landmark(&self, lat: f64, lng: f64, line: &LocationLine<'_>) -> bool {
         let Source { layer, poly, group, weak } = self.source;
         if group == WaterGroup::Other || catalogue_name(&self.name) {
@@ -339,7 +338,7 @@ struct Source<'a> {
 
 impl PartialEq for Source<'_> {
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self.layer, other.layer) && (self.poly.ring_offset, self.poly.ring_bytes) == (other.poly.ring_offset, other.poly.ring_bytes)
+        std::ptr::eq(self.layer, other.layer) && same_polygon(&self.poly, &other.poly)
     }
 }
 
@@ -527,19 +526,79 @@ impl WaterLayer {
         })
     }
 
-    /// Whether a shore of `poly` lies nearer than `metres` to (lat, lng): an edge of its rings
-    /// but a cut arc's and, for a sea or ocean (`marine`), one along a line of a tenth of a degree
-    /// of latitude or longitude, where the marine areas are cut into tiles.
+    /// Whether a shore of the object of `poly` (a polygon holding (lat, lng)) lies nearer than
+    /// `metres` to the point: an edge of its rings, or of the object's polygons its water runs on
+    /// into there, but one along which it runs on, which is no shore:
+    /// - a cut arc's (CutArcs), which the polygon on its other side uses too;
+    /// - for a sea or ocean (`marine`), one along a line of a tenth of a degree of latitude or
+    ///   longitude, where the marine areas are cut into tiles.
+    ///
+    /// Only the polygons the water so runs on into within the distance are read beyond `poly`:
+    /// those of the cells around the point (`object_near`) that use a cut arc met.
     fn shore_within(&self, poly: &AdminPolygon, marine: bool, lat: f64, lng: f64, metres: f64) -> bool {
         // A tenth of a degree in e7 units.
         const TILE_E7: i64 = 1_000_000;
+        let p = AdminPoint::new(lat, lng);
         let tile_line = |a: PointE7, b: PointE7| (a.lat == b.lat && a.lat % TILE_E7 == 0) || (a.lng == b.lng && a.lng % TILE_E7 == 0);
-        self.geometry.edge_within(poly, AdminPoint::new(lat, lng), metres, |slot| self.cuts.is_cut(slot), |a, b| marine && tile_line(a, b))
+        // The polygons walked and to walk, the cut arcs met, and the object's polygons near.
+        let (mut walked, mut todo, mut cuts) = (Vec::new(), vec![*poly], Vec::new());
+        let mut near: Option<Vec<AdminPolygon>> = None;
+        while let Some(q) = todo.pop() {
+            walked.push(q);
+            let met = cuts.len();
+            let shore = self.geometry.edge_within(&q, p, metres, |slot, a, b| {
+                if self.cuts.is_cut(slot) {
+                    if !cuts.contains(&slot) {
+                        cuts.push(slot);
+                    }
+                    return false;
+                }
+                !(marine && tile_line(a, b))
+            });
+            if shore {
+                return true;
+            }
+            if cuts.len() > met {
+                let near = near.get_or_insert_with(|| self.object_near(poly, p));
+                for r in near.iter() {
+                    if !walked.iter().chain(&todo).any(|w| same_polygon(w, r)) && self.geometry.uses_arc_near(r, p, metres, &cuts[met..]) {
+                        todo.push(*r);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// The polygons of the object of `poly` (its name, type code and area) that the cells around
+    /// `p` list: those of the cell holding it and of the cells beside that one, which hold every
+    /// point within a cell's width of it. `poly` among them.
+    fn object_near(&self, poly: &AdminPolygon, p: AdminPoint) -> Vec<AdminPolygon> {
+        let (lat, lng) = p.degrees();
+        let cell = cell_id_at_level(lat, lng, self.cell_level);
+        let mut ids = Vec::new();
+        for c in std::iter::once(cell).chain(cell_neighbors_at_level(cell, self.cell_level)) {
+            self.index.with_ids(c, |listed| ids.extend(listed.iter().map(|&id| id & ID_MASK)));
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter()
+            .filter_map(|id| polygon_record(&self.polygons, self.geometry.rings_len(), id))
+            .filter(|q| {
+                (q.name_id, q.country_code, q.area.to_bits()) == (poly.name_id, poly.country_code, poly.area.to_bits())
+                    && self.geometry.has_rings(q)
+            })
+            .collect()
     }
 }
 
+/// Whether two records are one polygon: their ring blocks the same.
+fn same_polygon(a: &AdminPolygon, b: &AdminPolygon) -> bool {
+    (a.ring_offset, a.ring_bytes) == (b.ring_offset, b.ring_bytes)
+}
+
 /// Water dirs as the builder writes them, for the tests: rectangular areas with rectangular
-/// holes, each ring one arc, and objects split into two pieces along a meridian.
+/// holes, each ring one arc, and objects of two pieces either side of a cut along a meridian.
 #[cfg(test)]
 pub(crate) mod fixture {
     use super::*;
@@ -584,12 +643,15 @@ pub(crate) mod fixture {
     pub const CANAL: u16 = 30;
     pub const VERBATIM: u16 = 32768;
 
-    /// How an area's polygons lie: one, its holes in it; or two pieces of its outer ring either
-    /// side of the meridian `at`, sharing the arc along it, a cut water_cut_arcs.bin marks where
-    /// `marked`.
+    /// How an area's polygons lie: one, `outer` with its holes; or two pieces either side of a
+    /// cut along a meridian (its south end, then its north end), sharing the arc along it, which
+    /// water_cut_arcs.bin marks where `marked`. `sides` hold the west piece's other vertices from
+    /// the cut's north end round to its south end and the east piece's from its south end round
+    /// to its north end, `holes` each piece's holes; a cell inside a piece is interior only
+    /// where the piece is a rectangle (`rect`).
     enum Shape {
-        Whole(Vec<Span>),
-        Split { at: f64, marked: bool },
+        Whole { outer: Span, holes: Vec<Span> },
+        Pieces { cut: [(f64, f64); 2], sides: [Vec<(f64, f64)>; 2], holes: [Vec<Span>; 2], marked: bool, rect: bool },
     }
 
     struct Area {
@@ -597,7 +659,6 @@ pub(crate) mod fixture {
         code: u16,
         area: Option<f32>,
         flags: u8,
-        outer: Span,
         shape: Shape,
     }
 
@@ -635,6 +696,12 @@ pub(crate) mod fixture {
         b.lat_lo().deg() < n && b.lat_hi().deg() > s && b.lng_lo().deg() < e && b.lng_hi().deg() > w
     }
 
+    /// The span of the points.
+    fn span_of(points: &[(f64, f64)]) -> Span {
+        let start = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        points.iter().fold(start, |(s, w, n, e), &(lat, lng)| (s.min(lat), w.min(lng), n.max(lat), e.max(lng)))
+    }
+
     impl WaterFixture {
         pub fn new() -> Self {
             Self::default()
@@ -642,22 +709,49 @@ pub(crate) mod fixture {
 
         /// An area of its own: its record's area that of its rings.
         pub fn area(&mut self, name: &str, code: u16, outer: Span, holes: &[Span]) -> &mut Self {
-            self.areas.push(Area { name: name.into(), code, area: None, flags: 0, outer, shape: Shape::Whole(holes.to_vec()) });
+            self.areas.push(Area { name: name.into(), code, area: None, flags: 0, shape: Shape::Whole { outer, holes: holes.to_vec() } });
             self
         }
 
         /// A polygon of an object of `area` square degrees (a piece of one the builder cut, or
         /// one of its outer rings): its record's area the object's.
         pub fn piece(&mut self, name: &str, code: u16, area: f32, outer: Span) -> &mut Self {
-            self.areas.push(Area { name: name.into(), code, area: Some(area), flags: 0, outer, shape: Shape::Whole(Vec::new()) });
+            self.areas.push(Area { name: name.into(), code, area: Some(area), flags: 0, shape: Shape::Whole { outer, holes: Vec::new() } });
             self
         }
 
         /// An object of two polygons, `outer` cut along the meridian `at`, the west piece first,
         /// each record's area that of the whole; the arc along the cut is marked a cut where
         /// `marked`.
-        pub fn split(&mut self, name: &str, code: u16, outer: Span, at: f64, marked: bool) -> &mut Self {
-            self.areas.push(Area { name: name.into(), code, area: None, flags: 0, outer, shape: Shape::Split { at, marked } });
+        pub fn split(&mut self, name: &str, code: u16, (s, w, n, e): Span, at: f64, marked: bool) -> &mut Self {
+            let sides = [vec![(n, w), (s, w)], vec![(s, e), (n, e)]];
+            let shape = Shape::Pieces { cut: [(s, at), (n, at)], sides, holes: [Vec::new(), Vec::new()], marked, rect: true };
+            self.areas.push(Area { name: name.into(), code, area: None, flags: 0, shape });
+            self
+        }
+
+        /// An object of two polygons either side of the cut along a meridian from `cut[0]` north
+        /// to `cut[1]`, the west piece first: `west` its other vertices from the cut's north end
+        /// round to its south end, `east` the east piece's from its south end round to its north
+        /// end; each record's area that of the whole, and the cut marked where `marked`.
+        pub fn pieces(&mut self, name: &str, code: u16, cut: [(f64, f64); 2], west: &[(f64, f64)], east: &[(f64, f64)], marked: bool)
+                      -> &mut Self {
+            assert_eq!(cut[0].1, cut[1].1, "a cut along a meridian");
+            let shape = Shape::Pieces { cut, sides: [west.to_vec(), east.to_vec()], holes: [Vec::new(), Vec::new()], marked, rect: false };
+            self.areas.push(Area { name: name.into(), code, area: None, flags: 0, shape });
+            self
+        }
+
+        /// A hole in the last area: in the piece on its side of the cut, where it has two.
+        pub fn island(&mut self, hole: Span) -> &mut Self {
+            match &mut self.areas.last_mut().expect("an area for the island").shape {
+                Shape::Whole { holes, .. } => holes.push(hole),
+                Shape::Pieces { cut, holes, .. } => {
+                    let (_, w, _, e) = hole;
+                    assert!(e < cut[0].1 || w > cut[0].1, "an island on one side of the cut");
+                    holes[usize::from(w > cut[0].1)].push(hole);
+                }
+            }
             self
         }
 
@@ -673,9 +767,9 @@ pub(crate) mod fixture {
             self
         }
 
-        /// The files, by name. Each polygon is listed in every cell meeting its outer ring,
-        /// flagged interior where the cell lies inside it and meets none of its holes; the
-        /// names are the strings of a core tier.
+        /// The files, by name. Each polygon is listed in every cell meeting its outer ring's
+        /// span, flagged interior where the cell lies inside a rectangle of it and meets none of
+        /// its holes; the names are the strings of a core tier.
         pub fn files(&self) -> Vec<(&'static str, Vec<u8>)> {
             let (mut pool, mut offsets) = (Vec::new(), BTreeMap::new());
             for a in &self.areas {
@@ -689,9 +783,9 @@ pub(crate) mod fixture {
             let mut arcs = ArcFixture::new();
             let mut cut = Vec::new();
             let mut listed: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-            let mut list = |id: u32, span: Span, holes: &[Span]| {
+            let mut list = |id: u32, span: Span, holes: &[Span], rect: bool| {
                 for cell in cells(span) {
-                    let interior = inside(cell, span) && !holes.iter().any(|&h| meets(cell, h));
+                    let interior = rect && inside(cell, span) && !holes.iter().any(|&h| meets(cell, h));
                     listed.entry(cell).or_default().push(id | if interior { INTERIOR_FLAG } else { 0 });
                 }
             };
@@ -702,24 +796,30 @@ pub(crate) mod fixture {
                     ..arc_fixture::record(offsets[&a.name], 0, area)
                 };
                 match &a.shape {
-                    Shape::Whole(holes) => {
-                        let rings: Vec<Vec<crate::PointE7>> = std::iter::once(a.outer).chain(holes.iter().copied()).map(ring).collect();
+                    Shape::Whole { outer, holes } => {
+                        let rings: Vec<Vec<crate::PointE7>> = std::iter::once(*outer).chain(holes.iter().copied()).map(ring).collect();
                         let id = arcs.ring_polygon(record(a.area.unwrap_or_else(|| arc_fixture::exact_area(&rings))), 0, &rings);
-                        list(id, a.outer, holes);
+                        list(id, *outer, holes, true);
                     }
-                    &Shape::Split { at, marked } => {
-                        let (s, w, n, e) = a.outer;
-                        let area = a.area.unwrap_or_else(|| arc_fixture::exact_area(&[ring(a.outer)]));
-                        let along = arcs.arc(0, &line(&[(s, at), (n, at)]));
-                        if marked {
+                    Shape::Pieces { cut: [south, north], sides, holes, marked, rect } => {
+                        // Each piece's outer ring, from the cut's end it leaves round to the other.
+                        let outers = [[&[*north][..], &sides[0], &[*south]].concat(), [&[*south][..], &sides[1], &[*north]].concat()];
+                        let rings = |k: usize| -> Vec<Vec<crate::PointE7>> {
+                            let closed = [&outers[k][..], &outers[k][..1]].concat();
+                            std::iter::once(line(&closed)).chain(holes[k].iter().map(|&h| ring(h))).collect()
+                        };
+                        let area = a.area.unwrap_or_else(|| arc_fixture::exact_area(&rings(0)) + arc_fixture::exact_area(&rings(1)));
+                        let along = arcs.arc(0, &line(&[*south, *north]));
+                        if *marked {
                             cut.push(along);
                         }
-                        let west = arcs.arc(0, &line(&[(n, at), (n, w), (s, w), (s, at)]));
-                        let east = arcs.arc(0, &line(&[(s, at), (s, e), (n, e), (n, at)]));
-                        let id = arcs.polygon(record(area), &[vec![Ref::fwd(west), Ref::fwd(along)]]);
-                        list(id, (s, w, n, at), &[]);
-                        let id = arcs.polygon(record(area), &[vec![Ref::fwd(east), Ref::rev(along)]]);
-                        list(id, (s, at, n, e), &[]);
+                        for (k, way) in [(0, Ref::fwd(along)), (1, Ref::rev(along))] {
+                            let side = arcs.arc(0, &line(&outers[k]));
+                            let mut refs = vec![vec![Ref::fwd(side), way]];
+                            refs.extend(holes[k].iter().map(|&h| vec![Ref::fwd(arcs.arc(0, &ring(h)))]));
+                            let id = arcs.polygon(record(area), &refs);
+                            list(id, span_of(&outers[k]), &holes[k], *rect);
+                        }
                     }
                 }
             }
@@ -1157,6 +1257,28 @@ mod tests {
         assert!(!takes(&split(false), east, &bare()));
         // Its other shores are shores still.
         assert!(!takes(&split(true), (0.0002, 0.0098), &bare()));
+    }
+
+    #[test]
+    fn a_shore_of_another_piece_of_the_object_past_a_cut_is_a_shore() {
+        // A lake cut along the meridian 0.01, an island in its east piece 22 m past the cut: 11 m
+        // west of the cut, the point is 33 m from the island's shore, and 550 m and more from
+        // every shore of the piece that holds it.
+        let island =
+            WaterFixture::new().split("Testsee", LAKE, (0.0, 0.0, 0.01, 0.02), 0.01, true).island((0.0045, 0.0102, 0.0055, 0.0105)).layer();
+        assert!(!takes(&island, (0.005, 0.0099), &bare()));
+        assert!(takes(&island, (0.005, 0.0095), &bare()));
+
+        // The lake's north shore runs north-west from the cut's north end in the west piece and
+        // falls steeply to the south-east from it in the east piece: 20 m west of the cut and
+        // 40 m south of its end, the point is 45 m from the end and 36 m from the east piece's
+        // shore; 60 m south of the end, 45 m from it.
+        let m = 1.0 / crate::METRES_PER_DEGREE;
+        let bank = WaterFixture::new()
+            .pieces("Testsee", LAKE, [(0.0, 0.01), (0.01, 0.01)], &[(0.011, 0.009), (0.011, 0.0), (0.0, 0.0)], &[(0.0, 0.015)], true)
+            .layer();
+        assert!(!takes(&bank, (0.01 - 40.0 * m, 0.01 - 20.0 * m), &bare()));
+        assert!(takes(&bank, (0.01 - 60.0 * m, 0.01 - 20.0 * m), &bare()));
     }
 
     #[test]
