@@ -4690,8 +4690,9 @@ mod query_tests {
     #[test]
     fn poi_lookups_answer_as_the_old_reader_did() {
         // The answers today's 36-byte records and vertex stream gave for the jumble (the reader
-        // before R2 and V2, at 447a8a3), match for match and bit for bit.
-        assert_eq!(poi_jumble_answers(), (1593, 122, 4_340_307_441_197_094_589));
+        // before R2 and V2, at 447a8a3), match for match and bit for bit, with a polygon as far
+        // as its edges' points nearest in metres (point_to_segment_distance).
+        assert_eq!(poi_jumble_answers(), (1593, 122, 375_056_972_952_063_247));
     }
 
     #[test]
@@ -5048,13 +5049,17 @@ pub fn line_middle(nodes: &[NodeCoord]) -> Option<(f64, f64)> {
     Some((reduce(middle.0), reduce(middle.1)))
 }
 
+/// Squared distance (radians²) from the point (px, py) to the segment from
+/// (ax, ay) to (bx, by), latitudes and longitudes in degrees, on the plane
+/// where a degree of longitude is `cos_lat` of a degree of latitude: to the
+/// segment's point nearest in metres, at any latitude.
 pub fn point_to_segment_distance(
     px: f64, py: f64,
     ax: f64, ay: f64,
     bx: f64, by: f64,
     cos_lat: f64,
 ) -> f64 {
-    point_to_segment_with_t(px, py, ax, ay, bx, by, cos_lat).0
+    point_to_segment_with_t(px, py * cos_lat, ax, ay * cos_lat, bx, by * cos_lat, PLANAR).0
 }
 
 // Squared distance (radians²) from query point to nearest polygon edge,
@@ -6894,6 +6899,23 @@ mod pure_helper_tests {
         // Point past the end clamps t to 1.
         let (_, t1) = point_to_segment_with_t(0.0, 50.0, 0.0, 0.0, 0.0, 10.0, 1.0);
         assert_eq!(t1, 1.0);
+    }
+
+    #[test]
+    fn a_segment_is_as_far_as_its_point_nearest_in_metres_at_any_latitude() {
+        // A line running north-east whose nearest point lies 100 m south-east of the point. A
+        // degree of longitude is cos(lat) of a degree of latitude long, so away from the
+        // equator the line's point nearest in degrees is not the one nearest in metres: at 60°
+        // north it is 117 m away.
+        let metres_per_degree = 6_371_000.0_f64.to_radians();
+        let (half, foot) = (300.0 / 2f64.sqrt(), 100.0 / 2f64.sqrt());
+        for lat in [0.0_f64, 30.0, 52.0, 60.0, 75.0] {
+            let cos_lat = lat.to_radians().cos();
+            let at = |north: f64, east: f64| (lat + north / metres_per_degree, 10.0 + east / (metres_per_degree * cos_lat));
+            let (a, b) = (at(-foot - half, foot - half), at(-foot + half, foot + half));
+            let metres = point_to_segment_distance(lat, 10.0, a.0, a.1, b.0, b.1, cos_lat).sqrt() * 6_371_000.0;
+            assert!((metres - 100.0).abs() < 1e-6, "{lat}°: {metres} m");
+        }
     }
 
     #[test]
