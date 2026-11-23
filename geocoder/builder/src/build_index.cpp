@@ -1624,9 +1624,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         auto interp_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_interp_cells); });
         auto poi_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_poi_cells); });
         auto place_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_place_cells); });
-        // The water cell index's, which the schedule alone reads: the split
-        // routes the water cells itself, keeping a cell the continent holds
-        // or one around (copy_water), by its polygon or else its box.
+        // The water cell index's: a continent's bit where it holds the
+        // entry's cell or one around it, by its polygon or else its box, as
+        // the admin cell indexes' split routes them (admin_cell_routed). The
+        // schedule sizes each share by it and the split keeps those entries.
         auto water_masks = std::async(std::launch::async, [&] {
             return water::routed_cell_masks(data.water.cells, std::min<size_t>(kContinentCount, 8),
                                             [&](size_t c, uint64_t cell) {
@@ -1664,7 +1665,6 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         // its cells comes whole, with its arcs.
         const std::vector<uint64_t> water_shares =
             water::share_bytes(data.water, water_continent_masks, std::min<size_t>(kContinentCount, 8));
-        free_storage(water_continent_masks);
         std::vector<size_t> continent_order(kContinentCount);
         std::iota(continent_order.begin(), continent_order.end(), 0u);
         std::stable_sort(continent_order.begin(), continent_order.end(), [&](size_t a, size_t b) {
@@ -1689,7 +1689,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             const KindValues bytes = continent_share(planet_bytes, planet_pairs, continent_pairs[c],
                                                      c < water_shares.size() ? water_shares[c] : 0);
             const KindValues counts = continent_share(planet_counts, planet_pairs, continent_pairs[c]);
-            const uint64_t filter_bytes = filter_cost(planet_counts, planet_pairs, continent_pairs[c]);
+            const uint64_t filter_bytes = filter_cost(planet_counts, continent_pairs[c]);
             // Its write runs without a budget (run_continent), so its
             // reservation holds every stage, the boundary tiers and both
             // admin-minimal dirs included.
@@ -1728,7 +1728,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                 ? &continent_polys[run.continent].vertices : nullptr;
             auto subset = filter_by_bbox_masked(data, continent, cbit,
                 way_continent_masks, addr_continent_masks, interp_continent_masks,
-                poi_continent_masks, place_continent_masks, poly, records);
+                poi_continent_masks, place_continent_masks, water_continent_masks, poly, records);
             done_reading();
             log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
             write_region(subset, output_dir + "/" + continent.name, RegionRun::Continent, run.cost.order, nullptr);

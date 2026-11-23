@@ -77,6 +77,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     const std::vector<uint8_t>& interp_masks,
     const std::vector<uint8_t>& poi_masks,
     const std::vector<uint8_t>& place_masks,
+    const std::vector<uint8_t>& water_masks,
     const std::vector<std::pair<double,double>>* boundary,
     PlanetRecords records) {
 
@@ -268,16 +269,12 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     };
 
     // Water: the polygons the continent's cells of the water cell index list,
-    // or the ring of cells around them, whole, with their arcs.
+    // or the ring of cells around them (its bit of water_masks), whole, with
+    // their arcs.
     auto copy_water = [&]() {
-        const IndexCells cells = routed_cells(full.water.cells);
-        std::vector<uint8_t> kept(full.water.cells.size(), 0);
-        parallel_for(cells.starts.size(), [&](size_t begin, size_t end, unsigned) {
-            for (size_t c = begin; c < end; c++)
-                if (cells.kept[c])
-                    for (size_t i = cells.starts[c]; i < cells.end(full.water.cells, c); i++) kept[i] = 1;
-        });
-        out.water = water::subset_layer(full.water, kept);
+        if (water_masks.size() != full.water.cells.size())
+            throw std::logic_error("water continent masks out of step with the water cells");
+        out.water = water::subset_layer(full.water, water_masks, continent_bit);
         if (consume) full.water = water::Layer();
     };
 

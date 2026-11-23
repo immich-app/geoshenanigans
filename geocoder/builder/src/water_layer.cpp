@@ -1203,15 +1203,15 @@ Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::
     return out;
 }
 
-Layer subset_layer(const Layer& planet, const std::vector<uint8_t>& kept, unsigned threads) {
+Layer subset_layer(const Layer& planet, const std::vector<uint8_t>& masks, uint8_t bit, unsigned threads) {
     if (threads == 0) threads = parallel_threads();
-    if (kept.size() != planet.cells.size()) throw std::logic_error("water cell marks out of step with the cells");
+    if (masks.size() != planet.cells.size()) throw std::logic_error("water cell marks out of step with the cells");
     Layer out;
     out.types = planet.types;
     std::vector<std::atomic<uint64_t>> used(planet.size() / 64 + 1);
-    parallel_for(kept.size(), [&](size_t begin, size_t end, unsigned) {
+    parallel_for(masks.size(), [&](size_t begin, size_t end, unsigned) {
         for (size_t i = begin; i < end; i++)
-            if (kept[i]) mark_bit(used, planet.cells[i].item_id & ID_MASK);
+            if (masks[i] & bit) mark_bit(used, planet.cells[i].item_id & ID_MASK);
     }, threads);
     const RankedBits polygons(planet.size(), used, threads);
     const std::vector<uint32_t> ids = polygons.ones(threads);
@@ -1225,12 +1225,12 @@ Layer subset_layer(const Layer& planet, const std::vector<uint8_t>& kept, unsign
         out.marine.push_back(planet.marine[id]);
         mark_bit(name_used, planet.records[id].name_id);
     }
-    const StringSubset names(planet.names, name_used);
+    StringSubset names(planet.names, name_used);
     for (AdminPolygon& r : out.records) r.name_id = names.offset_of(r.name_id);
-    out.names = names.bytes();
+    out.names = names.take_bytes();
     out.arcs = subset_admin_arcs(planet.arcs, ids, threads);
-    out.cells = parallel_collect<CellItemPair>(kept.size(), [&](size_t i, std::vector<CellItemPair>& found) {
-        if (!kept[i]) return;
+    out.cells = parallel_collect<CellItemPair>(masks.size(), [&](size_t i, std::vector<CellItemPair>& found) {
+        if (!(masks[i] & bit)) return;
         const CellItemPair& c = planet.cells[i];
         found.push_back({c.cell_id, static_cast<uint32_t>(polygons.index(c.item_id & ID_MASK)) | (c.item_id & INTERIOR_FLAG)});
     }, threads);

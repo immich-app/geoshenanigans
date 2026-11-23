@@ -448,7 +448,7 @@ TEST(a_regions_share_holds_the_polygons_its_cells_list_whole_with_their_names) {
     // The cells of the lake alone.
     std::vector<uint8_t> kept(planet.cells.size(), 0);
     for (size_t i = 0; i < planet.cells.size(); i++) kept[i] = (planet.cells[i].item_id & ID_MASK) == 3;
-    const Layer region = subset_layer(planet, kept, 2);
+    const Layer region = subset_layer(planet, kept, 1, 2);
     REQUIRE(region.size() == 1u);
     CHECK(name_of(region, 0) == "Test Lake");
     CHECK(region.names == std::vector<char>({'T', 'e', 's', 't', ' ', 'L', 'a', 'k', 'e', '\0'}));
@@ -652,7 +652,7 @@ TEST(a_water_dir_holding_a_marine_area_credits_marine_regions) {
     const Layer planet = build(with_marine());
     std::vector<uint8_t> kept(planet.cells.size(), 0);
     for (size_t i = 0; i < planet.cells.size(); i++) kept[i] = (planet.cells[i].item_id & ID_MASK) == 3;
-    Layer lake = subset_layer(planet, kept, 2);
+    Layer lake = subset_layer(planet, kept, 1, 2);
     REQUIRE(lake.size() == 1u);
     CHECK_EQ(int(lake.marine[0]), 0);
     {
@@ -695,9 +695,15 @@ TEST(a_regions_share_counts_the_cells_around_its_own_and_each_polygon_they_list_
     // no cells.
     const std::vector<uint64_t> shares = share_bytes(planet, masks, 3);
     for (int r = 0; r < 2; r++) {
+        // Its bit of the masks, as a continent's split reads them: the
+        // share of the entries that bit marks.
         std::vector<uint8_t> kept(planet.cells.size());
         for (size_t i = 0; i < kept.size(); i++) kept[i] = masks[i] >> r & 1;
-        Layer region = subset_layer(planet, kept, 2);
+        Layer region = subset_layer(planet, masks, uint8_t(1u << r), 2);
+        const Layer marked = subset_layer(planet, kept, 1, 2);
+        CHECK(region.identities == marked.identities);
+        CHECK(region.cells.size() == marked.cells.size());
+        CHECK(region.names == marked.names);
         {
             const gctest::CapturedStderr log;
             assign_region_arc_slots(region.arcs, "", "test", 0);

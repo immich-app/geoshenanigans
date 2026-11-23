@@ -123,22 +123,18 @@ TEST(filter_cost_holds_the_planet_maps_and_half_the_subset_pairs) {
     const KindValues planet_counts = kinds(80, 160, 0, 0, 0, 0);
     const KindValues pairs = kinds(10, 0, 0, 0, 0, 0);
     // 240 records: 4 B id maps and 3 bits of marks, whatever the workers.
-    CHECK_EQ(filter_cost(planet_counts, kinds(100, 0, 0, 0, 0, 0), pairs), uint64_t(240 * 4 + 240 * 3 / 8 + 10 * 16 / 2));
+    CHECK_EQ(filter_cost(planet_counts, pairs), uint64_t(240 * 4 + 240 * 3 / 8 + 10 * 16 / 2));
 }
 
-TEST(filter_cost_holds_the_water_splits_marks_over_the_planets_water_cells) {
+TEST(filter_cost_holds_the_continents_water_pairs_among_the_pairs_the_workers_copy_and_no_marks_of_its_own) {
+    // The water split reads the planet's water masks, which the build holds
+    // with the other kinds' while the continents run: of the planet's water
+    // cells, nothing of its own.
     const KindValues planet_counts = kinds(80, 160, 0, 0, 0, 0);
     KindValues planet_pairs = kinds(100, 0, 0, 0, 0, 0), pairs = kinds(10, 0, 0, 0, 0, 0);
     at(planet_pairs, RecordKind::Waters) = 1000;
     at(pairs, RecordKind::Waters) = 40;
-    // Beside the rest, a planet water cell entry's mark (1 B), its cell's
-    // mark (1 B) and the cell's start at the peak (24 B), and the
-    // continent's water pairs among the pairs the workers copy.
-    CHECK_EQ(filter_cost(planet_counts, planet_pairs, pairs),
-             uint64_t(240 * 4 + 240 * 3 / 8 + 50 * 16 / 2 + 1000 * (1 + 1 + 3 * 8)));
-    // An entry a cell at most: its mark, the cell's mark, and the cell's
-    // start in the output beside the workers' parts, which grow to twice it.
-    CHECK(kFilterWaterBytesPerPair >= 1 + 1 + 8 + 2 * 8);
+    CHECK_EQ(filter_cost(planet_counts, pairs), uint64_t(240 * 4 + 240 * 3 / 8 + 50 * 16 / 2));
 }
 
 TEST(continent_cost_runs_steps_one_at_a_time_only_past_the_budget) {

@@ -107,16 +107,13 @@ constexpr uint64_t kStrategy2BytesPerRecord = 56;
 // The continent split's planet-sized scratch: an id map per record (4 B)
 // and, while ids are collected, 3 bits per record (the bit every worker
 // marks, and its RankedBits blocks of 16 B per 64 records); beside it, the
-// workers' copies of a share of the subset's cell pairs. The water split's
-// marks each planet water cell entry (1 B) and each of its cells, at most as
-// many as the entries: whether the continent routes it (1 B) and its first
-// entry (8 B), which the workers collect in parts of their own (8 B a cell,
-// up to twice that while they grow) beside the starts they make (24 B at
-// the peak).
+// workers' copies of a share of the subset's cell pairs. The water split
+// reads the planet's water masks (a byte a water cell entry, held with the
+// other kinds' masks while the continents run), and marks no entry or cell
+// of its own.
 constexpr uint64_t kFilterMapBytesPerRecord = 4;
 constexpr uint64_t kFilterMarkBitsPerRecord = 3;
 constexpr uint64_t kFilterPairCopyDivisor = 2;
-constexpr uint64_t kFilterWaterBytesPerPair = 1 + 1 + 3 * 8;
 
 // Per mode dir, write_index's slices in flight, postcode centroids and admin
 // cell copies (planet: 0.8 GiB for the three). The slices are the geo
@@ -211,12 +208,10 @@ inline uint64_t ordering_cost(const ParsedData& d) {
 }
 
 // What the continent split holds beyond the subset it builds.
-inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& planet_pairs,
-                            const KindValues& continent_pairs) {
+inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& continent_pairs) {
     const uint64_t records = sum(planet_counts);
     return records * kFilterMapBytesPerRecord + records * kFilterMarkBitsPerRecord / 8
-         + sum(continent_pairs) * sizeof(CellItemPair) / kFilterPairCopyDivisor
-         + at(planet_pairs, RecordKind::Waters) * kFilterWaterBytesPerPair;
+         + sum(continent_pairs) * sizeof(CellItemPair) / kFilterPairCopyDivisor;
 }
 
 // What each write stage holds while it runs: every stage a region's write
