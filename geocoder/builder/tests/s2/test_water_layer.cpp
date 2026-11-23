@@ -1282,17 +1282,20 @@ TEST(the_local_names_of_a_rivers_reaches_dont_rename_it) {
                        {24, "Aller", nullptr, 4000}})) == Names({"Aller"}));
 }
 
-// geocoder/testdata/water_dir: the client files of a water dir on three
+// geocoder/testdata/water_dir: the client files of a water dir on four
 // days, which tools/test_generate_patches.py diffs, patches and verifies
 // with the real tools. Day 2 is day 1 with the pond's second vertex moved,
 // on day 1's slots. Day 3 is day 2 with a pond of a water=* value of its own
 // and a sea of two tiles side by side, on day 2's slots: its water_meta.json
 // lists one more kind, its attribution.json credits Marine Regions and its
-// water_cut_arcs.bin marks the side the tiles share. With
-// GEOCODER_WRITE_TESTDATA set this writes them instead.
+// water_cut_arcs.bin marks the side the tiles share. Day 4 is day 3 with
+// Island Lake, which the split cuts into pieces, on day 3's slots: its cut
+// arcs run on in words past day 3's. With GEOCODER_WRITE_TESTDATA set this
+// writes them instead.
 TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     const ScratchDir root("water-fixture");
-    const std::string one = root.path() + "/one", two = root.path() + "/two", three = root.path() + "/three";
+    const std::string one = root.path() + "/one", two = root.path() + "/two", three = root.path() + "/three",
+                      four = root.path() + "/four";
     write(build(fixture()), one);
     Collected moved = fixture();
     REQUIRE(moved.closed_ways[0].way == 20);
@@ -1306,6 +1309,9 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
                                       {{square(kLat - 20000000, kLng, 20000, 4)},
                                        {square(kLat - 20000000, kLng + 20000, 20000, 4)}}));
     write(build(more, two), three, two);
+    Collected isles = more;
+    add_island_lake(isles);
+    write(build(isles, three), four, three);
     const std::string fixture_dir = std::string(GEOCODER_TESTDATA_DIR) + "/water_dir";
     const bool rewrite = std::getenv("GEOCODER_WRITE_TESTDATA") != nullptr;
     // Every day's client files, each day all eleven, before any fixture dir
@@ -1315,7 +1321,8 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
                                           "strings_layout.json", "water_cut_arcs.bin", "water_meta.json",
                                           "attribution.json"};
     std::map<std::string, std::map<std::string, std::vector<char>>> days;
-    for (const auto& [day, dir] : {std::pair<std::string, std::string>{"day1", one}, {"day2", two}, {"day3", three}}) {
+    for (const auto& [day, dir] :
+         {std::pair<std::string, std::string>{"day1", one}, {"day2", two}, {"day3", three}, {"day4", four}}) {
         std::set<std::string> names;
         for (const auto& [name, bytes] : tree(dir + "/water/all/exact"))
             if (name.size() <= 8 || name.compare(name.size() - 8, 8, ".osm_ids") != 0) {
@@ -1342,6 +1349,7 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     for (const char* f : {"water_meta.json", "attribution.json"}) {
         CHECK(days["day1"][f] == days["day2"][f]);
         CHECK(days["day2"][f] != days["day3"][f]);
+        CHECK(days["day3"][f] == days["day4"][f]);
     }
     CHECK(text_of(days["day3"]["water_meta.json"]).find("\"type\": \"salt_pond\"") != std::string::npos);
     CHECK(text_of(days["day3"]["attribution.json"]).find("marine-regions") != std::string::npos);
@@ -1351,11 +1359,19 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
         for (const auto& [name, bytes] : days[day]) files["d/" + name] = bytes;
         std::set<uint32_t> out;
         REQUIRE(cut_slots(files, "d", out));
-        return out.size();
+        return out;
     };
-    CHECK_EQ(cuts("day1"), size_t(0));
-    CHECK_EQ(cuts("day2"), size_t(0));
-    CHECK(cuts("day3") >= 1u);
+    CHECK(cuts("day1").empty());
+    CHECK(cuts("day2").empty());
+    CHECK(!cuts("day3").empty());
+    // Day 4's: day 3's, on the slots it kept, and Island Lake's, some of
+    // them in words past day 3's.
+    const std::set<uint32_t> day3_cuts = cuts("day3"), day4_cuts = cuts("day4");
+    const uint32_t day3_slots = static_cast<uint32_t>(days["day3"]["arc_index.bin"].size() / 4);
+    const uint32_t day3_words = static_cast<uint32_t>(days["day3"]["water_cut_arcs.bin"].size() / 4);
+    CHECK(std::set<uint32_t>(day4_cuts.begin(), day4_cuts.lower_bound(day3_slots)) == day3_cuts);
+    CHECK(days["day4"]["water_cut_arcs.bin"].size() > days["day3"]["water_cut_arcs.bin"].size());
+    CHECK(day4_cuts.lower_bound(day3_words * 32) != day4_cuts.end());
 }
 
 TEST(a_river_area_a_waterway_runs_only_a_short_way_into_takes_its_name_weakly) {

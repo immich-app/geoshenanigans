@@ -1062,11 +1062,12 @@ mod tests {
         assert_eq!(arcs_read(&fixture(true, true), 0.25, 0.18).0.as_deref(), Some("Sea"));
     }
 
-    // geocoder/testdata/water_dir holds the files the builder's water layer writes on three days
+    // geocoder/testdata/water_dir holds the files the builder's water layer writes on four days
     // (builder/tests/s2/test_water_layer.cpp): a lake relation with an island, a pond, a river
-    // area its waterway names and one none names, a lake of a water=* value of its own, and from
-    // day 3 a salt pond of another and a marine sea of two tiles. Each answers as the builder
-    // made it, and the side the tiles share is a cut, no shore.
+    // area its waterway names and one none names, a lake of a water=* value of its own, from
+    // day 3 a salt pond of another and a marine sea of two tiles, and on day 4 a lake of many
+    // islands in pieces. Each answers as the builder made it, and the side the tiles share is a
+    // cut, no shore.
     #[test]
     fn the_builders_water_dirs_answer_as_it_wrote_them() {
         let day = |d: &str| {
