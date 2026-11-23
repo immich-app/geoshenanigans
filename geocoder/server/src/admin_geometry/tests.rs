@@ -645,7 +645,7 @@ fn index_load_reads_the_arc_files_and_names_a_missing_one() {
     let (fx, cells, names) = testland();
     let dir = ScratchDir::new();
     write_index(dir.path(), &fx, &cells, &names);
-    assert_eq!(load(dir.path()).unwrap().find_admin(10.0, 20.0).country.as_deref(), Some("Testland"));
+    assert_eq!(load(dir.path()).unwrap().find_admin(10.0, 20.0).row("country").map(|row| row.name.to_string()).as_deref(), Some("Testland"));
     for name in ADMIN_GEOMETRY_FILES {
         let dir = ScratchDir::new();
         write_index(dir.path(), &fx, &cells, &names);

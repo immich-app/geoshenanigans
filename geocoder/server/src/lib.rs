@@ -575,24 +575,6 @@ pub fn admin_field_index(field: &str) -> Option<usize> {
 /// The address fields a place node fills, by PlaceNode type.
 pub const PLACE_NODE_FIELDS: [&str; 7] = ["city", "town", "village", "suburb", "hamlet", "neighbourhood", "quarter"];
 
-/// The rank_address of the polygon or the place node behind each field of an
-/// address (ADMIN_FIELDS), 0 where none is known: display_name lists the
-/// place parts by it, as Nominatim lists its address rows.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct FieldRanks([u8; ADMIN_FIELDS.len()]);
-
-impl FieldRanks {
-    pub fn get(&self, field: &str) -> u8 {
-        admin_field_index(field).map_or(0, |i| self.0[i])
-    }
-
-    pub fn set(&mut self, field: &str, rank: u8) {
-        if let Some(i) = admin_field_index(field) {
-            self.0[i] = rank;
-        }
-    }
-}
-
 /// Whether a place area (class=place polygon) only repeats an address entry
 /// already found: a polygon of the same name and rank_address, no larger.
 /// Nominatim keeps one entry per rank (address_havelevel); a namesake of
@@ -1898,11 +1880,9 @@ impl Index {
         });
 
         serde_json::json!({
-            "result": {
-                "city": place.city, "town": place.town, "village": place.village,
-                "suburb": place.suburb, "hamlet": place.hamlet,
-                "neighbourhood": place.neighbourhood, "quarter": place.quarter,
-            },
+            "result": place.rows.iter()
+                .map(|row| serde_json::json!({"rank": row.rank, "name": row.name, "label": row.label}))
+                .collect::<Vec<_>>(),
             "current_boundary": CurrentBoundaries::RANKS.iter().zip(current_boundaries.gates.iter())
                 .map(|(rank, p)| (rank.to_string(), p.as_ref().map(|p| self.get_string(p.name_id)).into()))
                 .collect::<serde_json::Map<String, serde_json::Value>>(),
@@ -2103,17 +2083,9 @@ impl Index {
         result.postcode_area = self.postal_area_postcode(&postal_areas, &country_code_str, scan.pip.point.degrees());
 
         // Map admin levels to address fields using country-specific config
-        // Track best (smallest area) polygon per output field
-        struct FieldCandidate<'b> {
-            area: f32,
-            name: Cow<'b, str>,
-            country_code: u16,
-            rank: u8,
-            /// The polygon's place in `ranked`.
-            index: usize,
-        }
-        // A slot per field of ADMIN_FIELDS.
-        let mut best_by_field: [Option<FieldCandidate<'_>>; ADMIN_FIELDS.len()] = Default::default();
+        // Track best (smallest area) polygon per output field, by its place
+        // in `ranked`: a slot per field of ADMIN_FIELDS.
+        let mut best_by_field: [Option<usize>; ADMIN_FIELDS.len()] = [None; ADMIN_FIELDS.len()];
 
         // Collect polygons at this point with their initial rank_address;
         // promote_nested_ranks then gives them their effective one.
@@ -2179,68 +2151,40 @@ impl Index {
         // "suburb" in the address dict, so they don't suppress the actual
         // place=neighbourhood nodes found by find_places.
         let field_for = polygon_field;
-        let candidate = |r: &RankedPoly, index: usize| FieldCandidate {
-            area: r.poly.area, name: self.get_string(r.poly.name_id), country_code: r.poly.country_code, rank: r.rank_address,
-            index,
-        };
         let slots: Vec<Option<usize>> = ranked.iter().map(|r| field_for(r).and_then(admin_field_index)).collect();
 
         for (k, r) in ranked.iter().enumerate() {
             if r.poly.admin_level == 15 { continue; } // skip place-area in first pass
             if let Some(idx) = slots[k] {
-                if let Some(ref existing) = best_by_field[idx] {
-                    if r.poly.area >= existing.area { continue; }
-                }
-                best_by_field[idx] = Some(candidate(r, k));
+                if best_by_field[idx].is_some_and(|best| r.poly.area >= ranked[best].poly.area) { continue; }
+                best_by_field[idx] = Some(k);
             }
         }
         // Second pass: place-area polygons fill only empty fields.
         for (k, r) in ranked.iter().enumerate() {
             if r.poly.admin_level != 15 { continue; }
             if let Some(idx) = slots[k] {
-                if best_by_field[idx].is_none() {
-                    best_by_field[idx] = Some(candidate(r, k));
-                }
+                best_by_field[idx].get_or_insert(k);
             }
         }
 
-        // Fill result
-        for (field, c) in ADMIN_FIELDS.iter().zip(&best_by_field) {
-            if let Some(c) = c { result.ranks.set(field, c.rank); }
-        }
-        let winners = best_by_field.each_ref().map(|c| c.as_ref().map(|c| c.index));
-        result.unlabelled = unlabelled_rows(&ranked, &slots, &winners).into_iter()
-            .map(|k| (ranked[k].rank_address, self.get_string(ranked[k].poly.name_id)))
-            .collect();
-        if let Some(c) = best_by_field[0].take() {
-            result.country = Some(c.name);
-            if c.country_code != 0 {
-                result.country_code = Some([
-                    (c.country_code >> 8) as u8,
-                    (c.country_code & 0xFF) as u8,
-                ]);
-            }
-        }
-        result.state          = best_by_field[1].take().map(|c| c.name);
-        result.province       = best_by_field[2].take().map(|c| c.name);
-        result.region         = best_by_field[3].take().map(|c| c.name);
-        result.state_district = best_by_field[4].take().map(|c| c.name);
-        result.county         = best_by_field[5].take().map(|c| c.name);
-        result.district       = best_by_field[6].take().map(|c| c.name);
-        result.municipality   = best_by_field[7].take().map(|c| c.name);
-        result.city           = best_by_field[8].take().map(|c| c.name);
-        result.town           = best_by_field[9].take().map(|c| c.name);
-        result.village        = best_by_field[10].take().map(|c| c.name);
-        result.hamlet         = best_by_field[11].take().map(|c| c.name);
-        result.city_district  = best_by_field[12].take().map(|c| c.name);
-        result.borough        = best_by_field[13].take().map(|c| c.name);
-        result.suburb         = best_by_field[14].take().map(|c| c.name);
-        result.quarter        = best_by_field[15].take().map(|c| c.name);
-        result.neighbourhood  = best_by_field[16].take().map(|c| c.name);
-        result.city_block     = best_by_field[17].take().map(|c| c.name);
-        result.rows = ranked;
+        // The rows: each field's polygon, then those that lost their field at a rank no field's
+        // polygon has.
+        let winners = best_by_field;
+        result.country_code = winners[0].and_then(|k| country_code_bytes(ranked[k].poly.country_code));
+        let shown = winners.iter().flatten().copied().chain(unlabelled_rows(&ranked, &slots, &winners));
+        result.rows = self.polygon_rows(&ranked, shown);
+        result.ranked = ranked;
 
         result
+    }
+
+    /// The address rows of polygons `shown` of `ranked`, each labelled by its field
+    /// (polygon_field), the finest first.
+    fn polygon_rows(&self, ranked: &[RankedPoly], shown: impl Iterator<Item = usize>) -> Vec<AddressRow<'_>> {
+        let mut rows: Vec<AddressRow> = shown.map(|k| self.area_row(&ranked[k])).collect();
+        rows.sort_by(|a, b| b.rank.cmp(&a.rank));
+        rows
     }
 
     // --- Place node lookup (nearest city/town/village/suburb) ---
@@ -2353,13 +2297,12 @@ impl Index {
             .filter(|&k| Some(candidates[k].0.name_id) == named)
             .map(|k| NamedRow { rank: nodes[k].1, field: PLACE_NODE_FIELDS[nodes[k].0], distance: nodes[k].2.sqrt(), node: candidates[k].0 })
             .collect();
-        for (pt, slot) in [&mut result.city, &mut result.town, &mut result.village, &mut result.suburb,
-                           &mut result.hamlet, &mut result.neighbourhood, &mut result.quarter].into_iter().enumerate() {
-            if let Some(k) = accepted[pt] {
-                *slot = Some(self.get_string(candidates[k].0.name_id));
-                result.ranks.set(PLACE_NODE_FIELDS[pt], nodes[k].1);
-            }
-        }
+        result.rows = accepted.iter().enumerate()
+            .filter_map(|(pt, k)| k.map(|k| AddressRow {
+                rank: nodes[k].1, name: self.get_string(candidates[k].0.name_id), label: Some(PLACE_NODE_FIELDS[pt]),
+            }))
+            .collect();
+        result.rows.sort_by(|a, b| b.rank.cmp(&a.rank));
 
         result
     }
@@ -2755,9 +2698,8 @@ impl Index {
         ranked.retain(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address));
         result.boundary_ranks = rank_bits(&ranked);
 
-        // Map to fields, a slot per field of ADMIN_FIELDS.
-        struct FC<'b> { area: f32, name: Cow<'b, str>, country_code: u16, rank: u8, index: usize }
-        let mut best_by_field: [Option<FC<'_>>; ADMIN_FIELDS.len()] = Default::default();
+        // Map to fields, a slot per field of ADMIN_FIELDS, each the polygon's place in `ranked`.
+        let mut best_by_field: [Option<usize>; ADMIN_FIELDS.len()] = [None; ADMIN_FIELDS.len()];
         let slots: Vec<Option<usize>> = ranked.iter()
             .map(|r| if r.poly.place_type_override > 0 {
                 place_type_to_field(r.poly.place_type_override)
@@ -2769,46 +2711,16 @@ impl Index {
 
         for (k, r) in ranked.iter().enumerate() {
             if let Some(idx) = slots[k] {
-                if let Some(ref existing) = best_by_field[idx] {
-                    if r.poly.area >= existing.area { continue; }
-                }
-                best_by_field[idx] = Some(FC { area: r.poly.area, name: self.get_string(r.poly.name_id), country_code: r.poly.country_code, rank: r.rank_address, index: k });
+                if best_by_field[idx].is_some_and(|best| r.poly.area >= ranked[best].poly.area) { continue; }
+                best_by_field[idx] = Some(k);
             }
         }
 
-        for (field, c) in ADMIN_FIELDS.iter().zip(&best_by_field) {
-            if let Some(c) = c { result.ranks.set(field, c.rank); }
-        }
-        let winners = best_by_field.each_ref().map(|c| c.as_ref().map(|c| c.index));
-        result.unlabelled = unlabelled_rows(&ranked, &slots, &winners).into_iter()
-            .map(|k| (ranked[k].rank_address, self.get_string(ranked[k].poly.name_id)))
-            .collect();
-        if let Some(c) = best_by_field[0].take() {
-            result.country = Some(c.name);
-            if c.country_code != 0 {
-                result.country_code = Some([
-                    (c.country_code >> 8) as u8,
-                    (c.country_code & 0xFF) as u8,
-                ]);
-            }
-        }
-        result.state          = best_by_field[1].take().map(|c| c.name);
-        result.province       = best_by_field[2].take().map(|c| c.name);
-        result.region         = best_by_field[3].take().map(|c| c.name);
-        result.state_district = best_by_field[4].take().map(|c| c.name);
-        result.county         = best_by_field[5].take().map(|c| c.name);
-        result.district       = best_by_field[6].take().map(|c| c.name);
-        result.municipality   = best_by_field[7].take().map(|c| c.name);
-        result.city           = best_by_field[8].take().map(|c| c.name);
-        result.town           = best_by_field[9].take().map(|c| c.name);
-        result.village        = best_by_field[10].take().map(|c| c.name);
-        result.hamlet         = best_by_field[11].take().map(|c| c.name);
-        result.city_district  = best_by_field[12].take().map(|c| c.name);
-        result.borough        = best_by_field[13].take().map(|c| c.name);
-        result.suburb         = best_by_field[14].take().map(|c| c.name);
-        result.quarter        = best_by_field[15].take().map(|c| c.name);
-        result.neighbourhood  = best_by_field[16].take().map(|c| c.name);
-        result.city_block     = best_by_field[17].take().map(|c| c.name);
+        let winners = best_by_field;
+        result.country_code = winners[0].and_then(|k| country_code_bytes(ranked[k].poly.country_code));
+        let shown = winners.iter().flatten().copied().chain(unlabelled_rows(&ranked, &slots, &winners));
+        result.rows = self.polygon_rows(&ranked, shown);
+        result.ranked = ranked;
 
         result
     }
@@ -3058,7 +2970,7 @@ impl Index {
 
     // --- Combined query ---
 
-    fn resolve_admin(&self, scan: &mut AdminScan, lat: f64, lng: f64, street: Option<&(f64, WayRow, u32)>) -> AdminResult<'_> {
+    fn resolve_admin<'a>(&'a self, scan: &mut AdminScan, lat: f64, lng: f64, street: Option<&(f64, WayRow, u32)>) -> AdminResult<'a> {
         // Hybrid admin resolution: when the primary is a street with a
         // pre-computed parent polygon, walk its admin_parents chain for
         // coarse ranks (country → city) and use PIP for finer ranks
@@ -3084,76 +2996,31 @@ impl Index {
         // region or province, the boundaries at that point decide: a path
         // along the Bern-Valais ridge is Kandersteg's in Nominatim, but
         // its point nearest Leukerbad answers Valais.
-        let admin_chain = admin_chain.map(|chain| {
-            let mut street_ranks = None;
-            let [state, region, province] = coarse_fields(
-                [chain.state, chain.region, chain.province],
-                [admin_pip.state.clone(), admin_pip.region.clone(), admin_pip.province.clone()],
-                || {
-                    let (_, _, way_idx) = street?;
-                    let (plat, plng) = self.closest_point_on_way(*way_idx, lat, lng)?;
-                    let at = self.find_admin(plat, plng);
-                    street_ranks = Some(at.ranks);
-                    Some([at.state, at.region, at.province])
-                },
-            );
-            // A field the street's point names has the rank it has there.
-            let mut ranks = chain.ranks;
-            if let Some(at) = street_ranks {
-                for field in ["state", "region", "province"] {
-                    if at.get(field) != 0 { ranks.set(field, at.get(field)); }
-                }
-            }
-            AdminResult { state, region, province, ranks, ..chain }
+        let Some(chain) = admin_chain else { return admin_pip };
+        // The rows the chain gives the state, region and province, or those at the street's point
+        // where the query point names others (coarse_fields), and its country: each in place of the
+        // query point's row of its label, at its own rank. Only these replace the query point's
+        // rows: at those ranks PIP false positives are rare and the chain walk rarely drifts from
+        // the query. For finer ranks (state_district, county, municipality, city and below) the
+        // chain walk picks the polygon holding the street's centroid, which regresses where that
+        // lies in another fine-grained polygon than the query (Buenos Aires Comuna 14 against
+        // Comuna 1, Chicago's West Chicago Township leaking as municipality).
+        const COARSE: [&str; 3] = ["state", "region", "province"];
+        let coarse = |admin: &AdminResult<'a>| COARSE.map(|label| admin.row(label).cloned());
+        let [state, region, province] = coarse_fields(coarse(&chain), coarse(&admin_pip), |row| row.name.clone(), || {
+            let (_, _, way_idx) = street?;
+            let (plat, plng) = self.closest_point_on_way(*way_idx, lat, lng)?;
+            Some(coarse(&self.find_admin(plat, plng)))
         });
-        match admin_chain {
-            Some(chain) => AdminResult {
-                // Each field's rank is that of the polygon it came from.
-                ranks: {
-                    let mut ranks = admin_pip.ranks;
-                    for (field, named) in [("country", chain.country.is_some()), ("state", chain.state.is_some()),
-                                           ("province", chain.province.is_some()), ("region", chain.region.is_some())] {
-                        if named { ranks.set(field, chain.ranks.get(field)); }
-                    }
-                    ranks
-                },
-                // Only country/state/region/province replace PIP from
-                // chain — at those ranks PIP false-positives are rare
-                // and chain walk rarely drifts vs query. For finer
-                // ranks (state_district / county / municipality / city
-                // and below) chain walk picks the centroid-containing
-                // admin, which regresses when the street's centroid
-                // sits in a different fine-grain polygon than the
-                // query (Buenos Aires Comuna 14 vs Comuna 1, Chicago
-                // 'West Chicago Township' leaking as municipality).
-                country: chain.country.or(admin_pip.country),
-                country_code: chain.country_code.or(admin_pip.country_code),
-                state: chain.state.or(admin_pip.state),
-                province: chain.province.or(admin_pip.province),
-                region: chain.region.or(admin_pip.region),
-                // Everything else: PIP is authoritative.
-                state_district: admin_pip.state_district,
-                county: admin_pip.county,
-                district: admin_pip.district,
-                municipality: admin_pip.municipality,
-                city: admin_pip.city,
-                town: admin_pip.town,
-                village: admin_pip.village,
-                hamlet: admin_pip.hamlet,
-                city_district: admin_pip.city_district,
-                borough: admin_pip.borough,
-                suburb: admin_pip.suburb,
-                quarter: admin_pip.quarter,
-                neighbourhood: admin_pip.neighbourhood,
-                city_block: admin_pip.city_block,
-                // The place-node ranks (16 and up) are PIP's.
-                boundary_ranks: admin_pip.boundary_ranks,
-                postcode_area: admin_pip.postcode_area,
-                unlabelled: admin_pip.unlabelled,
-                rows: admin_pip.rows,
-            },
-            None => admin_pip,
+        let mut rows = admin_pip.rows;
+        for row in [chain.row("country").cloned(), state, region, province].into_iter().flatten() {
+            if let Some(k) = rows.iter().position(|r| r.label == row.label) {
+                rows.remove(k);
+            }
+            let at = rows.partition_point(|r| r.rank >= row.rank);
+            rows.insert(at, row);
         }
+        AdminResult { country_code: chain.country_code.or(admin_pip.country_code), rows, ..admin_pip }
     }
 
     /// Street way `id`'s nodes, owned; None for NO_DATA, an id past the last way and a way
@@ -3238,7 +3105,7 @@ impl Index {
         // admin_level gives 20. The place type here need not be the one
         // Nominatim links, so promote_nested_ranks only raises, and the hold
         // stands in for that rank.
-        let rank16 = admin.city.is_some() || admin.town.is_some() || admin.village.is_some();
+        let rank16 = ["city", "town", "village"].iter().any(|label| admin.row(label).is_some());
         let held_ranks = admin.boundary_ranks | if rank16 { 1 << CurrentBoundaries::CITY } else { 0 };
 
         // Primary-feature selection: match Nominatim's reverse flow —
@@ -3575,8 +3442,8 @@ impl Index {
         // place nodes alone. Boundaries without a country, city or state
         // still give no answer: they are mostly a coast or border our
         // country polygon misses.
-        let anchored = road.is_some() || admin.country.is_some() || admin.city.is_some() || admin.state.is_some();
-        let place_nodes_only = admin.is_empty() && !place.is_empty();
+        let anchored = road.is_some() || ["country", "city", "state"].iter().any(|label| admin.row(label).is_some());
+        let place_nodes_only = admin.is_empty() && !place.rows.is_empty();
         if !anchored && !place_nodes_only {
             return Address::default();
         }
@@ -3599,90 +3466,31 @@ impl Index {
         // stripper on our side would diverge from Nominatim without
         // improving parity, so Option 6 is a no-op by design.
         //
-        // Merge admin + place results (admin authoritative, place as fallback).
-        // No post-hoc dedup: Nominatim's rank-based address-row build lets
-        // the same name appear in multiple fields (e.g. Paris city + Paris
-        // city_district), and the find_admin rank pipeline already enforces
-        // first-label-wins for same-rank collisions.
-        //
-        // Nominatim's reverse response does NOT inject place-node neighbourhoods
-        // when the admin chain already covers the sub-city range densely.
-        // Specifically, `complete_address_details` walks `addressline` which
-        // comes from `placex_triggers.sql` — the chain links each feature to
-        // parents by parent_place_id, not by spatial containment. If the
-        // admin chain jumps from suburb (rank 20) straight to city_block
-        // (rank 24) the intermediate rank 22 stays empty; Nominatim does NOT
-        // fill it from a place=neighbourhood node that happens to contain
-        // the query point. Approximate this: when admin has BOTH a suburb
-        // and a city_block (so the chain is dense at the sub-city range),
-        // suppress the place-node neighbourhood/quarter overrides. Paris
-        // 4th Arrondissement has suburb=4th Arrondissement + city_block=
-        // Quartier Saint-Merri and Nominatim emits no neighbourhood —
-        // before this rule we'd inject `neighbourhood=Beaubourg` from a
-        // nearby place node.
-        let admin_chain_dense = admin.suburb.is_some() && admin.city_block.is_some();
-        let allow_place_quarter = !admin_chain_dense;
-        let allow_place_neighbourhood = !admin_chain_dense;
-        // Nominatim's insert_addresslines orders candidates by
-        // `rank_address, isguess asc, distance` (placex_triggers.sql
-        // :590). `isguess asc` puts admin boundaries (isguess=false)
-        // ahead of place nodes (isguess=true) at the same rank, so
-        // admin wins the address slot within a rank tie. Mirror that
-        // here for suburb / quarter / neighbourhood — earlier we did
-        // place-first, which surfaced "Tverskoy" (place=suburb node)
-        // instead of "Tverskoy District" (AL8 boundary), and similar
-        // for Beijing "Donghuamen" vs "Donghuamen Subdistrict".
-        // NYC still resolves as before because admin.suburb=Manhattan
-        // and place.suburb=Manhattan carry the same name.
-        // Each field's rank_address is that of the polygon or the place node it
-        // came from.
-        let mut ranks = admin.ranks;
-        for (field, from_node) in [
-            ("city", admin.city.is_none() && place.city.is_some()),
-            ("town", admin.town.is_none() && place.town.is_some()),
-            ("village", admin.village.is_none() && place.village.is_some()),
-            ("hamlet", admin.hamlet.is_none() && place.hamlet.is_some()),
-            ("suburb", admin.suburb.is_none() && place.suburb.is_some()),
-            ("quarter", allow_place_quarter && admin.quarter.is_none() && place.quarter.is_some()),
-            ("neighbourhood", allow_place_neighbourhood && admin.neighbourhood.is_none() && place.neighbourhood.is_some()),
-        ] {
-            if from_node { ranks.set(field, place.ranks.get(field)); }
+        // The address's rows: a polygon's at each rank one holds, else the place node's the walk
+        // takes there (a rank a boundary holds takes no node), each a part of display_name, and the
+        // address keeps the first of each label, finest first. A label so goes to a place node
+        // finer than the polygon of that label: Brentwood's town node, promoted to 18 in the Town
+        // of Islip (a town of rank 16), is the town, the Town of Islip a part of display_name only.
+        let (area_rows, node_rows) = (admin.ranked, place.named_rows);
+        let mut rows = admin.rows;
+        for row in place.rows {
+            if !rows.iter().any(|r| r.rank == row.rank) {
+                rows.push(row);
+            }
         }
-        // Same-name suppression, observed Nominatim behaviour: the Kingdom
-        // of the Netherlands (AL2) and the constituent country (AL3) are both
-        // named "Nederland"; Nominatim's address keeps one row per label and
-        // drops the duplicate, which would be region=Netherlands here. Its
-        // display_name joins every row, the region's too.
-        let (region, country_region) = match (admin.region, &admin.country) {
-            (Some(r), Some(c)) if r == *c => (None, Some((ranks.get("region"), r))),
-            (r, _) => (r, None),
-        };
-        let (area_rows, node_rows) = (admin.rows, place.named_rows);
+        rows.sort_by(|a, b| b.rank.cmp(&a.rank));
+        let country_code = admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned());
+        if let Some(city) = city {
+            let country = country_code.as_deref().unwrap_or_default().to_ascii_uppercase();
+            let named = self.crosscheck_rows(city, &area_rows, &mut admin_scan, &node_rows, feature, &country);
+            crosscheck(&mut rows, &named);
+        }
         let mut address = AddressDetails {
-            ranks,
-            unlabelled: admin.unlabelled.into_iter().chain(country_region).collect(),
             landmark: landmark_name,
             // A string in a tier this mode doesn't ship (admin mode has no
             // street or addr strings) resolves to "" — omit the field.
             house_number: house_number.filter(|s| !s.is_empty()),
             road: road.filter(|s| !s.is_empty()),
-            city: admin.city.or(place.city),
-            town: admin.town.or(place.town),
-            village: admin.village.or(place.village),
-            hamlet: admin.hamlet.or(place.hamlet),
-            municipality: admin.municipality,
-            state: admin.state,
-            province: admin.province,
-            region,
-            state_district: admin.state_district,
-            county: admin.county,
-            district: admin.district,
-            borough: admin.borough,
-            suburb: admin.suburb.or(place.suburb),
-            quarter: if allow_place_quarter { admin.quarter.or(place.quarter) } else { admin.quarter },
-            city_district: admin.city_district,
-            neighbourhood: if allow_place_neighbourhood { admin.neighbourhood.or(place.neighbourhood) } else { admin.neighbourhood },
-            city_block: admin.city_block,
             // Postcode from resolve_postcode(): 3-tier chain
             // (own → inherited → postal area or nearest centroid).
             // Reject if the country has no postal-code system or if
@@ -3706,15 +3514,10 @@ impl Index {
                 },
                 None => None,
             },
-            country: admin.country,
-            country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
+            country_code,
+            ..AddressDetails::default()
         };
-        if let Some(city) = city {
-            let country = address.country_code.as_deref().unwrap_or_default().to_ascii_uppercase();
-            let rows = self.crosscheck_rows(city, &area_rows, &mut admin_scan, &node_rows, feature, &country);
-            let areas: Vec<CrosscheckRow> = area_rows.iter().map(|r| self.area_row(r)).collect();
-            address.crosscheck(&rows, &areas);
-        }
+        address.label(rows);
         let display_name = format_address(&address);
         Address { display_name, address, places }
     }
@@ -3730,7 +3533,7 @@ impl Index {
     /// `areas` holds it by, else one the street runs through, each at area_row_rank's rank;
     /// `country` is the point's, upper case.
     fn crosscheck_rows(&self, name: u32, areas: &[RankedPoly], scan: &mut AdminScan, nodes: &[NamedRow],
-                       feature: PlaceFeature<'_>, country: &str) -> Vec<CrosscheckRow<'_>> {
+                       feature: PlaceFeature<'_>, country: &str) -> Vec<AddressRow<'_>> {
         let named = |poly: &AdminPolygon| poly.name_id == name || self.links_name(poly, name);
         let same = |a: &AdminPolygon, b: &AdminPolygon| a.ring_offset == b.ring_offset && a.ring_bytes == b.ring_bytes;
         let mut polygons: Vec<RankedPoly> = areas.iter().filter(|r| named(&r.poly)).copied().collect();
@@ -3767,9 +3570,9 @@ impl Index {
             .collect();
         let mut nodes: Vec<NamedRow> = nodes.iter().filter(|row| !place_areas.iter().any(|r| self.links_by_name(r, &row.node))).copied().collect();
         nodes.sort_by(|a, b| b.distance.total_cmp(&a.distance));
-        let mut rows: Vec<CrosscheckRow> = polygons.iter()
+        let mut rows: Vec<AddressRow> = polygons.iter()
             .map(|r| self.area_row(r))
-            .chain(nodes.iter().map(|row| CrosscheckRow { rank: row.rank, name: self.get_string(name), field: Some(row.field) }))
+            .chain(nodes.iter().map(|row| AddressRow { rank: row.rank, name: self.get_string(name), label: Some(row.field) }))
             .collect();
         // Stable: within a rank the polygons stay ahead of the nodes.
         rows.sort_by_key(|row| row.rank);
@@ -3777,8 +3580,8 @@ impl Index {
     }
 
     /// The address row of a ranked polygon: its rank, its own name and its field.
-    fn area_row(&self, r: &RankedPoly) -> CrosscheckRow<'_> {
-        CrosscheckRow { rank: r.rank_address, name: self.get_string(r.poly.name_id), field: polygon_field(r) }
+    fn area_row(&self, r: &RankedPoly) -> AddressRow<'_> {
+        AddressRow { rank: r.rank_address, name: self.get_string(r.poly.name_id), label: polygon_field(r) }
     }
 
     /// The rank_address of `poly`, a row of an address that is none of the address's ranked
@@ -4581,7 +4384,8 @@ mod query_tests {
         let elsewhere = idx.admin_polygon(1).unwrap();
         let village = |gate: AdminPolygon| {
             let gates = CurrentBoundaries::walk([(CurrentBoundaries::CITY, gate)], |_, _| true);
-            idx.find_places(PlaceFeature::Point(5.05, 112.65), &gates, 0, None).village
+            idx.find_places(PlaceFeature::Point(5.05, 112.65), &gates, 0, None).rows.into_iter()
+                .find(|row| row.label == Some("village")).map(|row| row.name)
         };
 
         assert_eq!(village(elsewhere), None);
@@ -5564,11 +5368,13 @@ pub fn fuzzy_area_holds(centre_lat: f32, centre_lng: f32, half_m: f64, lat: f64,
 }
 
 /// A street answer's [state, region, province]: the parent chain's, unless
-/// the query point names others; then the boundaries at the street's point
-/// nearest the query (`at_street`), the chain's where those have none.
-pub fn coarse_fields<T: PartialEq>(chain: [Option<T>; 3], query: [Option<T>; 3],
-                                   at_street: impl FnOnce() -> Option<[Option<T>; 3]>) -> [Option<T>; 3] {
-    if chain == query {
+/// the query point names others (by `name`); then the boundaries at the
+/// street's point nearest the query (`at_street`), the chain's where those
+/// have none.
+pub fn coarse_fields<T, N: PartialEq>(chain: [Option<T>; 3], query: [Option<T>; 3], name: impl Fn(&T) -> N,
+                                      at_street: impl FnOnce() -> Option<[Option<T>; 3]>) -> [Option<T>; 3] {
+    let names = |fields: &[Option<T>; 3]| fields.each_ref().map(|f| f.as_ref().map(&name));
+    if names(&chain) == names(&query) {
         return chain;
     }
     let Some([a0, a1, a2]) = at_street() else { return chain; };
@@ -5836,15 +5642,9 @@ impl CurrentBoundaries {
 
 #[derive(Default)]
 pub struct PlaceResult<'a> {
-    pub city: Option<Cow<'a, str>>,
-    pub town: Option<Cow<'a, str>>,
-    pub village: Option<Cow<'a, str>>,
-    pub hamlet: Option<Cow<'a, str>>,
-    pub suburb: Option<Cow<'a, str>>,
-    pub quarter: Option<Cow<'a, str>>,
-    pub neighbourhood: Option<Cow<'a, str>>,
-    /// The rank_address of the node behind each field.
-    pub ranks: FieldRanks,
+    /// The rows of the place nodes the walk takes, each labelled by its type
+    /// (PLACE_NODE_FIELDS), the finest first.
+    pub rows: Vec<AddressRow<'a>>,
     /// The address rows of the nodes of the name find_places was asked for
     /// (place_node_walk).
     pub named_rows: Vec<NamedRow>,
@@ -5860,60 +5660,56 @@ pub struct NamedRow {
     pub node: PlaceNode,
 }
 
-impl PlaceResult<'_> {
-    /// Whether no place node fills a field.
-    pub fn is_empty(&self) -> bool {
-        [&self.city, &self.town, &self.village, &self.hamlet, &self.suburb, &self.quarter, &self.neighbourhood]
-            .iter().all(|f| f.is_none())
-    }
-}
-
 #[derive(Default)]
 pub struct AdminResult<'a> {
-    pub country: Option<Cow<'a, str>>,
+    /// The country code of the country row.
     pub country_code: Option<[u8; 2]>,
-    pub state: Option<Cow<'a, str>>,
-    pub province: Option<Cow<'a, str>>,
-    pub region: Option<Cow<'a, str>>,
-    pub state_district: Option<Cow<'a, str>>,
-    pub county: Option<Cow<'a, str>>,
-    pub district: Option<Cow<'a, str>>,
-    pub municipality: Option<Cow<'a, str>>,
-    pub city: Option<Cow<'a, str>>,
-    pub town: Option<Cow<'a, str>>,
-    pub village: Option<Cow<'a, str>>,
-    pub hamlet: Option<Cow<'a, str>>,
-    pub city_district: Option<Cow<'a, str>>,
-    pub borough: Option<Cow<'a, str>>,
-    pub suburb: Option<Cow<'a, str>>,
-    pub quarter: Option<Cow<'a, str>>,
-    pub neighbourhood: Option<Cow<'a, str>>,
-    pub city_block: Option<Cow<'a, str>>,
     /// rank_address of the boundaries in the address, a bit per rank: the
     /// ranks they take before any place node (address_havelevel).
     pub boundary_ranks: u32,
-    /// The rank_address of the polygon behind each field.
-    pub ranks: FieldRanks,
     /// The postcode of the smallest postcode area (boundary=postal_code)
     /// holding the point.
     pub postcode_area: Option<Cow<'a, str>>,
-    /// The polygons in the address that fill no field (unlabelled_rows), as
-    /// (rank_address, name), the finest first: display_name lists them.
-    pub unlabelled: Vec<(u8, Cow<'a, str>)>,
-    /// The polygons of the address's rows with their rank_address
-    /// (find_admin_in's ranked polygons), those that fill no field or part of
-    /// display_name among them.
-    pub rows: Vec<RankedPoly>,
+    /// The address's rows of polygons, the finest first.
+    pub rows: Vec<AddressRow<'a>>,
+    /// The polygons of the address with their rank_address (find_admin_in's
+    /// ranked polygons), those that are no row among them.
+    pub ranked: Vec<RankedPoly>,
 }
 
-impl AdminResult<'_> {
-    /// Whether no polygon fills a field.
-    pub fn is_empty(&self) -> bool {
-        [&self.country, &self.state, &self.province, &self.region, &self.state_district, &self.county,
-         &self.district, &self.municipality, &self.city, &self.town, &self.village, &self.hamlet,
-         &self.city_district, &self.borough, &self.suburb, &self.quarter, &self.neighbourhood, &self.city_block]
-            .iter().all(|f| f.is_none())
+impl<'a> AdminResult<'a> {
+    /// The first row labelled `label`, finest first: the address's.
+    pub fn row(&self, label: &str) -> Option<&AddressRow<'a>> {
+        self.rows.iter().find(|row| row.label == Some(label))
     }
+
+    /// The name of the first row labelled `label`, finest first.
+    pub fn name(&self, label: &str) -> Option<&str> {
+        self.row(label).map(|row| &*row.name)
+    }
+
+    /// Whether no row has a label.
+    pub fn is_empty(&self) -> bool {
+        self.rows.iter().all(|row| row.label.is_none())
+    }
+}
+
+/// A row of an address as Nominatim's complete_address_details shows it
+/// (results.py:610-632): its rank_address, its name, and its label
+/// (classtypes.get_label_tag), a place node's type (PLACE_NODE_FIELDS) or a
+/// polygon's field (polygon_field), none for a polygon of neither. The
+/// address keeps the first row of each label, finest first
+/// (v1/format_json.py:29-34), and display_name joins every row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AddressRow<'a> {
+    pub rank: u8,
+    pub name: Cow<'a, str>,
+    pub label: Option<&'static str>,
+}
+
+/// The two letters of a polygon's country code; none for a polygon without one.
+pub fn country_code_bytes(code: u16) -> Option<[u8; 2]> {
+    (code != 0).then(|| [(code >> 8) as u8, (code & 0xFF) as u8])
 }
 
 /// The field a polygon of an address fills: its place type's, else its
@@ -5957,15 +5753,10 @@ pub fn unlabelled_rows(ranked: &[RankedPoly], slots: &[Option<usize>], winners: 
 
 #[derive(Serialize, Default)]
 pub struct AddressDetails<'a> {
-    /// The rank_address of the polygon or the place node behind each place
-    /// field, which display_name lists the parts by.
+    /// The address's rows of polygons and place nodes, the finest first,
+    /// which display_name joins (AddressDetails::label).
     #[serde(skip)]
-    pub ranks: FieldRanks,
-    /// Parts of display_name that fill no field, with their rank_address: a
-    /// region of the country's own name (Nominatim's address keeps one row
-    /// per label, its display_name every row).
-    #[serde(skip)]
-    pub unlabelled: Vec<(u8, Cow<'a, str>)>,
+    pub rows: Vec<AddressRow<'a>>,
     // Landmark field: set to the name of the smallest-area
     // polygon POI that contains the query point. Category details
     // (specific type, distance, …) live in places[], so a single
@@ -6020,17 +5811,8 @@ pub struct AddressDetails<'a> {
     pub country_code: Option<String>,
 }
 
-/// The place parts of display_name, each field with the rank_address of its
-/// label in Nominatim's settings/address-levels.json, which a part without a
-/// known rank takes (format_address), finest first.
-const PLACE_PARTS: [(&str, u8); 17] = [
-    ("city_block", 25), ("neighbourhood", 24), ("quarter", 22), ("hamlet", 20), ("suburb", 20), ("borough", 18),
-    ("city", 16), ("city_district", 16), ("town", 16), ("village", 16), ("municipality", 14), ("district", 12),
-    ("county", 12), ("state", 8), ("state_district", 6), ("region", 6), ("province", 6),
-];
-
 impl<'a> AddressDetails<'a> {
-    /// The place part `field` of PLACE_PARTS; None for another field.
+    /// The field of place label `field`; None for another label (the country's).
     fn place_part(&mut self, field: &str) -> Option<&mut Option<Cow<'a, str>>> {
         Some(match field {
             "city_block" => &mut self.city_block,
@@ -6054,116 +5836,45 @@ impl<'a> AddressDetails<'a> {
         })
     }
 
-    /// The rank of place part `field` as display_name lists it: its polygon's
-    /// or its node's, else its label's.
-    fn part_rank(&self, field: &str) -> u8 {
-        match self.ranks.get(field) {
-            0 => PLACE_PARTS.iter().find(|(f, _)| *f == field).map_or(0, |&(_, rank)| rank),
-            rank => rank,
-        }
-    }
-
-    /// The place parts that fill a field, as (rank, name), in PLACE_PARTS' order.
-    fn place_parts(&self) -> impl Iterator<Item = (u8, &str)> + '_ {
-        self.labelled_parts().map(|(_, rank, name)| (rank, name))
-    }
-
-    /// The place parts that fill a field, as (field, rank, name), in PLACE_PARTS' order.
-    fn labelled_parts(&self) -> impl Iterator<Item = (&'static str, u8, &str)> + '_ {
-        let value = |field: &str| match field {
-            "city_block" => &self.city_block,
-            "neighbourhood" => &self.neighbourhood,
-            "quarter" => &self.quarter,
-            "hamlet" => &self.hamlet,
-            "suburb" => &self.suburb,
-            "borough" => &self.borough,
-            "city" => &self.city,
-            "city_district" => &self.city_district,
-            "town" => &self.town,
-            "village" => &self.village,
-            "municipality" => &self.municipality,
-            "district" => &self.district,
-            "county" => &self.county,
-            "state" => &self.state,
-            "state_district" => &self.state_district,
-            "region" => &self.region,
-            _ => &self.province,
-        };
-        PLACE_PARTS.iter().filter_map(move |&(field, _)| value(field).as_deref().map(|v| (field, self.part_rank(field), v)))
-    }
-
-    /// Nominatim's crosscheck of an answer's address values (results.py:610-632):
-    /// CrosscheckNames puts a row named by one of them first in its rank, and
-    /// only a rank's first row is a part. The first of each rank's rows of
-    /// `rows`, the rows named by a value in Nominatim's order within a rank,
-    /// takes the place of the rank's parts unless it is one of them (a part
-    /// of its rank, name and field, or of no field): in its field (rank and
-    /// all) where that is free or holds a coarser part, which then names no
-    /// field, else as a part of no field. A field the rank's parts leave goes
-    /// to the finest part of no field that fills it, one of `areas` (the
-    /// address's polygons as rows) of a rank no field's part has, as a label's
-    /// first row is its field (v1/format_json.py:31-34). A row of another
-    /// field (the country) is left out.
-    pub fn crosscheck(&mut self, rows: &[CrosscheckRow<'a>], areas: &[CrosscheckRow<'a>]) {
-        let mut done = 0u32;
-        for row in rows {
-            if row.field.is_some_and(|field| !PLACE_PARTS.iter().any(|(part, _)| *part == field)) { continue; }
-            let bit = 1u32.checked_shl(u32::from(row.rank)).unwrap_or(0);
-            if done & bit != 0 { continue; }
-            done |= bit;
-            let shown = self.labelled_parts().any(|(field, rank, name)| rank == row.rank && name == row.name && row.field == Some(field))
-                || self.unlabelled.iter().any(|(rank, name)| *rank == row.rank && *name == row.name);
-            if shown { continue; }
-            let mut freed = Vec::new();
-            for (field, _) in PLACE_PARTS {
-                if self.part_rank(field) == row.rank {
-                    if let Some(part) = self.place_part(field) {
-                        if part.take().is_some() { freed.push(field); }
-                    }
-                    self.ranks.set(field, 0);
-                }
-            }
-            self.unlabelled.retain(|(rank, _)| *rank != row.rank);
-            let name = row.name.clone();
-            match row.field {
-                Some(field) => {
-                    let rank = self.part_rank(field);
-                    let Some(part) = self.place_part(field) else { continue };
-                    if part.is_none() || rank < row.rank {
-                        let coarser = part.replace(name);
-                        self.ranks.set(field, row.rank);
-                        if let Some(coarser) = coarser { self.unlabelled.push((rank, coarser)); }
-                    } else {
-                        self.unlabelled.push((row.rank, name));
-                    }
-                }
-                None => self.unlabelled.push((row.rank, name)),
-            }
-            for field in freed {
-                if self.place_part(field).is_some_and(|part| part.is_some()) { continue; }
-                let labelled: Vec<u8> = self.labelled_parts().map(|(_, rank, _)| rank).collect();
-                let finest = self.unlabelled.iter().enumerate()
-                    .filter(|(_, (rank, name))| !labelled.contains(rank)
-                        && areas.iter().any(|a| a.rank == *rank && a.name == *name && a.field == Some(field)))
-                    .max_by_key(|(_, (rank, _))| *rank)
-                    .map(|(k, _)| k);
-                if let Some(k) = finest {
-                    let (rank, name) = self.unlabelled.remove(k);
-                    if let Some(part) = self.place_part(field) { *part = Some(name); }
-                    self.ranks.set(field, rank);
-                }
+    /// The address of `rows` (one or more a rank, the finest first): each label's first row,
+    /// as Nominatim's address keeps (v1/format_json.py:29-34), but a region of the country's own
+    /// name, and the rows for display_name. Observed Nominatim behaviour: the Kingdom of the
+    /// Netherlands (admin_level 2) and the constituent country (3) are both named "Nederland",
+    /// and the address names it once, as the country; display_name joins every row, the
+    /// region's too.
+    pub fn label(&mut self, rows: Vec<AddressRow<'a>>) {
+        self.country = rows.iter().find(|row| row.label == Some("country")).map(|row| row.name.clone());
+        let mut seen: Vec<&str> = Vec::new();
+        for row in &rows {
+            let Some(label) = row.label else { continue };
+            if seen.contains(&label) { continue; }
+            seen.push(label);
+            if label == "region" && self.country.as_ref() == Some(&row.name) { continue; }
+            if let Some(part) = self.place_part(label) {
+                *part = Some(row.name.clone());
             }
         }
+        self.rows = rows;
     }
 }
 
-/// A row of an address that a crosscheck may make its rank's part (AddressDetails::crosscheck):
-/// its rank_address, its name (a polygon's own, where a node it links has the value's) and the
-/// field it fills, none for a polygon that fills none.
-pub struct CrosscheckRow<'a> {
-    pub rank: u8,
-    pub name: Cow<'a, str>,
-    pub field: Option<&'static str>,
+/// Nominatim's crosscheck of an answer's address values (results.py:610-632): CrosscheckNames
+/// puts a row named by one of them first in its rank, and only a rank's first row is shown. The
+/// first of each rank's rows of `named`, the rows named by a value in Nominatim's order within a
+/// rank, is that rank's row of `rows` (the address's, the finest first), but a row of the
+/// country.
+pub fn crosscheck<'a>(rows: &mut Vec<AddressRow<'a>>, named: &[AddressRow<'a>]) {
+    let mut done = 0u32;
+    for row in named {
+        if row.label == Some("country") { continue; }
+        let bit = 1u32.checked_shl(u32::from(row.rank)).unwrap_or(0);
+        if done & bit != 0 { continue; }
+        done |= bit;
+        if rows.contains(row) { continue; }
+        rows.retain(|r| r.rank != row.rank);
+        let at = rows.partition_point(|r| r.rank > row.rank);
+        rows.insert(at, row.clone());
+    }
 }
 
 #[derive(Serialize)]
@@ -6207,31 +5918,15 @@ pub fn format_rules(country_code: Option<&str>) -> (bool, bool, bool) {
 // leads, then the house number and road; the postcode (rank 5) and the
 // country (rank 4) close it, as _finalize_entry adds them.
 //
-// A place part's rank is the rank_address of the polygon or the place node
-// behind its field (AddressDetails::ranks): a village node inside a township
-// of its own rank is promoted to 18 and comes before the township's 16. A
-// field without a known rank takes that of its label in Nominatim's
-// settings/address-levels.json, and parts of one rank keep this order:
-//
-//   25 = city_block
-//   24 = neighbourhood
-//   22 = quarter
-//   20 = hamlet, suburb
-//   18 = borough
-//   16 = city, city_district, town, village
-//   14 = municipality
-//   12 = district, county
-//    8 = state
-//    6 = state_district, region, province
+// The place parts are the address's rows (AddressDetails::rows), each at
+// the rank_address of its polygon or place node: a village node inside a
+// township of its own rank is promoted to 18 and comes before the
+// township's 16.
 //
 // Notes:
 // - place=state/province/region all have rank_address=0 in Nominatim
 //   (excluded from the address chain at the place-tag level). State
 //   comes from boundary=administrative4, which is rank 8.
-// - Our AddressDetails fields `region`, `province`, `state_district`
-//   are populated by our rank_to_field fallback for admin levels that
-//   don't map to a canonical Nominatim field; without a rank they sit
-//   between state and country, as Nominatim's admin_level=3 (rank 6).
 // - Every answer with a part has a display_name, as every one of
 //   Nominatim's with an address row: a state and a county without a
 //   locality, a road or a country too.
@@ -6245,22 +5940,14 @@ pub fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
         None => road.to_string(),
     });
 
-    // The place parts, finest first: a stable sort keeps PLACE_PARTS' order
-    // (the one above) among parts of one rank.
-    let mut places: Vec<(u8, &str)> = addr.place_parts().collect();
-    // A part without a field is a row of a rank no field's part has: an address has a row a rank.
-    let labelled = places.len();
-    for (rank, v) in &addr.unlabelled {
-        if !places[..labelled].iter().any(|&(r, _)| r == *rank) {
-            places.push((*rank, v));
-        }
-    }
-    places.sort_by(|a, b| b.0.cmp(&a.0));
+    // The place parts, finest first: every row but the country's.
+    let country = addr.rows.iter().position(|row| row.label == Some("country"));
+    let places = addr.rows.iter().enumerate().filter(|&(k, _)| Some(k) != country).map(|(_, row)| &*row.name);
 
     let mut parts: Vec<&str> = Vec::new();
     let line = addr.landmark.as_deref().into_iter()
         .chain(road.as_deref())
-        .chain(places.iter().map(|&(_, v)| v))
+        .chain(places)
         .chain(addr.postcode.as_deref())
         .chain(addr.country.as_deref());
     for part in line {
@@ -6922,12 +6609,12 @@ mod pure_helper_tests {
         // Leukerbad: the chain says Bern, the query and the street point Valais.
         let chain = [Some("Bern"), None, None];
         let query = [Some("Valais"), None, None];
-        assert_eq!(coarse_fields(chain, query, || Some([Some("Valais"), None, None])), query);
+        assert_eq!(coarse_fields(chain, query, |s| *s, || Some([Some("Valais"), None, None])), query);
         // The street point outside every state keeps the chain's.
-        assert_eq!(coarse_fields(chain, query, || Some([None, None, None])), chain);
-        assert_eq!(coarse_fields(chain, query, || None), chain);
+        assert_eq!(coarse_fields(chain, query, |s| *s, || Some([None, None, None])), chain);
+        assert_eq!(coarse_fields(chain, query, |s| *s, || None), chain);
         // Agreement never looks at the street.
-        assert_eq!(coarse_fields(chain, chain, || panic!("looked")), chain);
+        assert_eq!(coarse_fields(chain, chain, |s| *s, || panic!("looked")), chain);
     }
 
     #[test]
@@ -7415,6 +7102,7 @@ mod query_path_tests {
     mod display_name;
     mod postcodes;
     mod ranks;
+    mod rows;
 
     /// The fixtures' origin unless one is given: everything sits metres
     /// north and east of it.
@@ -10329,14 +10017,14 @@ mod admin_scan_tests {
             ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(5, false)]),
         ]);
         let a = idx.find_admin(Q.0, Q.1);
-        assert_eq!((a.country, a.state), (None, None));
+        assert_eq!((a.name("country"), a.name("state")), (None, None));
         let idx = admin_index(&[
             Ring { country: b"sd", ..ring("Sudan", 2, 190.0, SUDAN, &[(0, false), (3, true)]) },
             ring("Egypt", 2, 97.0, EGYPT, &[(0, false), (5, false)]),
             ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, false)]),
         ]);
         let a = idx.find_admin(Q.0, Q.1);
-        assert_eq!((a.country.as_deref(), a.state.as_deref()), (Some("Egypt"), Some("New Valley")));
+        assert_eq!((a.name("country"), a.name("state")), (Some("Egypt"), Some("New Valley")));
     }
 
     #[test]
@@ -10349,9 +10037,9 @@ mod admin_scan_tests {
             ring("Egypt", 2, 97.0, EGYPT, &[(0, false)]),
             ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, false)]),
         ]);
-        assert_eq!(idx.find_admin(Q.0, Q.1).country.as_deref(), Some("Egypt"));
+        assert_eq!(idx.find_admin(Q.0, Q.1).name("country"), Some("Egypt"));
         let a = idx.find_admin(Q.0, far);
-        assert_eq!((a.country, a.state), (None, None));
+        assert_eq!((a.name("country"), a.name("state")), (None, None));
         let egypt = idx.admin_polygon(0).unwrap();
         assert!(!idx.admin_geometry.contains_once(&egypt, AdminPoint::new(Q.0, far)));
     }
@@ -10367,21 +10055,21 @@ mod admin_scan_tests {
             Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(0, true)]) },
         ]);
         let a = idx.find_admin(Q.0, Q.1);
-        assert_eq!((a.country.as_deref(), a.state.as_deref(), a.neighbourhood.as_deref()), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
+        assert_eq!((a.name("country"), a.name("state"), a.name("neighbourhood")), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
         for (lat, lng) in [(Q.0, Q.1 + 360.0), (Q.0, Q.1 - 360.0), (180.0 - Q.0, Q.1 - 180.0), (-180.0 - Q.0, Q.1 + 180.0)] {
             let (rlat, rlng) = AdminPoint::new(lat, lng).degrees();
             assert_eq!(cell_id_at_level(rlat, rlng, DEFAULT_ADMIN_CELL_LEVEL), cells()[0], "({lat}, {lng})");
             let a = idx.find_admin(lat, lng);
-            assert_eq!((a.country, a.state, a.neighbourhood), (None, None, None), "({lat}, {lng})");
+            assert_eq!((a.name("country"), a.name("state"), a.name("neighbourhood")), (None, None, None), "({lat}, {lng})");
             let mut scan = AdminScan::new(&idx, lat, lng);
             assert!(scan.rings.is_empty(), "({lat}, {lng})");
             let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"));
             assert!(gates.gates.iter().all(Option::is_none) && gates.promoting.is_empty(), "({lat}, {lng})");
-            assert_eq!(idx.find_admin_from_chain(0, lat, lng).neighbourhood, None, "({lat}, {lng})");
+            assert_eq!(idx.find_admin_from_chain(0, lat, lng).name("neighbourhood"), None, "({lat}, {lng})");
         }
         for (lat, lng) in [(f64::NAN, Q.1), (Q.0, f64::NAN), (Q.0, f64::INFINITY), (f64::NEG_INFINITY, Q.1)] {
             assert!(AdminScan::new(&idx, lat, lng).rings.is_empty(), "({lat}, {lng})");
-            assert_eq!(idx.find_admin(lat, lng).country, None, "({lat}, {lng})");
+            assert_eq!(idx.find_admin(lat, lng).name("country"), None, "({lat}, {lng})");
         }
     }
 
@@ -10400,8 +10088,8 @@ mod admin_scan_tests {
                 cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL)
             };
             let idx = admin_index_in(&[ring("Edge", 2, 1.0, around, &[(0, true), (1, true)])], &[cell((lat, lng)), cell(past)]);
-            assert_eq!(idx.find_admin(lat, lng).country.as_deref(), Some("Edge"), "({lat}, {lng})");
-            assert_eq!(idx.find_admin(past.0, past.1).country, None, "{past:?}");
+            assert_eq!(idx.find_admin(lat, lng).name("country"), Some("Edge"), "({lat}, {lng})");
+            assert_eq!(idx.find_admin(past.0, past.1).name("country"), None, "{past:?}");
         }
     }
 
@@ -10411,7 +10099,7 @@ mod admin_scan_tests {
             ring("Egypt", 2, 97.0, EGYPT, &[(0, false)]),
             Ring { country: b"sd", ..ring("Sudan", 2, 9.0, SUDAN, &[(1, true), (2, true)]) },
         ]);
-        assert_eq!(idx.find_admin(Q.0, Q.1).country.as_deref(), Some("Egypt"));
+        assert_eq!(idx.find_admin(Q.0, Q.1).name("country"), Some("Egypt"));
     }
 
     #[test]
@@ -10432,7 +10120,7 @@ mod admin_scan_tests {
         idx.admin_parents = Some(FileBytes::Owned(parents.iter().flat_map(|p| p.to_le_bytes()).collect()));
         let mut scan = AdminScan::new(&idx, Q.0, Q.1);
         let a = idx.find_admin_in(&mut scan);
-        assert_eq!((a.country.as_deref(), a.state.as_deref(), a.city.as_deref(), a.neighbourhood.as_deref()), (Some("Egypt"), Some("Kharga"), Some("Paris"), Some("Bir Tarfawi")));
+        assert_eq!((a.name("country"), a.name("state"), a.name("city"), a.name("neighbourhood")), (Some("Egypt"), Some("Kharga"), Some("Paris"), Some("Bir Tarfawi")));
         let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"));
         assert_eq!(gates.for_rank(CurrentBoundaries::CITY).map(|p| idx.get_string(p.name_id)).as_deref(), Some("Paris"));
         assert_eq!(scan.pip.memo.arcs_read(), 0);
@@ -10441,7 +10129,7 @@ mod admin_scan_tests {
         // scan's interior entry.
         let mut scan = AdminScan::new(&idx, Q.0, Q.1);
         let c = idx.find_admin_from_chain_in(2, &mut scan);
-        assert_eq!((c.country.as_deref(), c.state.as_deref(), c.city.as_deref(), c.neighbourhood.as_deref()), (Some("Egypt"), Some("New Valley"), Some("Paris"), Some("Bir Tarfawi")));
+        assert_eq!((c.name("country"), c.name("state"), c.name("city"), c.name("neighbourhood")), (Some("Egypt"), Some("New Valley"), Some("Paris"), Some("Bir Tarfawi")));
         assert_eq!(scan.pip.memo.arcs_read(), 0);
         // The same rings listed not interior are tested.
         let idx = admin_index(&[
@@ -10449,7 +10137,7 @@ mod admin_scan_tests {
             ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, false)]),
         ]);
         let mut scan = AdminScan::new(&idx, Q.0, Q.1);
-        assert_eq!(idx.find_admin_in(&mut scan).state.as_deref(), Some("New Valley"));
+        assert_eq!(idx.find_admin_in(&mut scan).name("state"), Some("New Valley"));
         assert!(scan.pip.memo.arcs_read() > 0);
     }
 
@@ -10459,7 +10147,7 @@ mod admin_scan_tests {
             ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
             Ring { place_type: 4, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(0, false), (7, false)]) },
         ]);
-        assert_eq!(idx.find_admin(Q.0, Q.1).suburb.as_deref(), Some("Bir Tarfawi"));
+        assert_eq!(idx.find_admin(Q.0, Q.1).name("suburb"), Some("Bir Tarfawi"));
     }
 
     #[test]
@@ -10471,14 +10159,14 @@ mod admin_scan_tests {
             ring("First", 4, 1.0, around_q, &[(0, false)]),
             ring("Second", 4, 1.0, around_q, &[(0, false)]),
         ]);
-        assert_eq!(idx.find_admin(Q.0, Q.1).state.as_deref(), Some("First"));
+        assert_eq!(idx.find_admin(Q.0, Q.1).name("state"), Some("First"));
         // The interior flag is the entry's high bit.
         let idx = admin_index(&[
             ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
             ring("First, interior", 4, 1.0, around_q, &[(0, true)]),
             ring("Second", 4, 1.0, around_q, &[(0, false)]),
         ]);
-        assert_eq!(idx.find_admin(Q.0, Q.1).state.as_deref(), Some("Second"));
+        assert_eq!(idx.find_admin(Q.0, Q.1).name("state"), Some("Second"));
     }
 
     #[test]
@@ -10488,7 +10176,7 @@ mod admin_scan_tests {
         let arcs_read = |rings: &[Ring]| {
             let idx = admin_index(rings);
             let mut scan = AdminScan::new(&idx, Q.0, Q.1);
-            let state = idx.find_admin_in(&mut scan).state.map(Cow::into_owned);
+            let state = idx.find_admin_in(&mut scan).name("state").map(str::to_owned);
             (state, scan.pip.memo.arcs_read())
         };
         // Listed first, so visited first in a walk down the list.
@@ -10539,9 +10227,9 @@ mod admin_scan_tests {
             };
             let idx = admin_index(&rings);
             let a = idx.find_admin(Q.0, Q.1);
-            assert_eq!(a.state.as_deref(), want(4), "case {case} state");
-            assert_eq!(a.county.as_deref(), want(6), "case {case} county");
-            assert_eq!(a.city.as_deref(), want(8), "case {case} city");
+            assert_eq!(a.name("state"), want(4), "case {case} state");
+            assert_eq!(a.name("county"), want(6), "case {case} county");
+            assert_eq!(a.name("city"), want(8), "case {case} city");
         }
     }
 
@@ -10553,7 +10241,7 @@ mod admin_scan_tests {
             ring("Aswan", 4, 6.0, (22.0, 31.0, 24.5, 33.6), &[(1, false), (0, false)]),
             ring("Red Sea", 4, 12.0, (22.0, 33.6, 28.0, 36.9), &[(2, false)]),
         ]);
-        assert_eq!(idx.find_admin(Q.0, Q.1).state.as_deref(), Some("New Valley"));
+        assert_eq!(idx.find_admin(Q.0, Q.1).name("state"), Some("New Valley"));
     }
 
     #[test]
@@ -10585,10 +10273,10 @@ mod admin_scan_tests {
         assert_eq!(name(CurrentBoundaries::CITY).as_deref(), Some("Paris"));
         assert_eq!(name(CurrentBoundaries::SUBURB).as_deref(), Some("Mut"));
         let a = idx.find_admin_in(&mut scan);
-        assert_eq!((a.country.as_deref(), a.state.as_deref(), a.neighbourhood.as_deref()), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
+        assert_eq!((a.name("country"), a.name("state"), a.name("neighbourhood")), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
         // No admin_parents: the chain lookup falls back to find_admin over the same scan.
         let c = idx.find_admin_from_chain_in(0, &mut scan);
-        assert_eq!((c.country.as_deref(), c.state.as_deref(), c.neighbourhood.as_deref()), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
+        assert_eq!((c.name("country"), c.name("state"), c.name("neighbourhood")), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
     }
 
     #[test]

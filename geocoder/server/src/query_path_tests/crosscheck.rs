@@ -325,8 +325,8 @@ fn a_place_area_an_area_round_it_lifts_links_no_place_node_of_its_name() {
     // Newton Aycliffe, a place=town area, lies in the parish of Great Aycliffe (rank 20), which
     // lifts it to rank 22. find_linked_place reads the area's rank_address, no longer the town
     // node's, so the name match links no node, and the town node of its name, in Durham's rank 16
-    // boundary, is a row of rank 18. The house's addr:city makes the node the rank's part, after
-    // the parish: Nominatim repeats Newton Aycliffe.
+    // boundary, is a row of rank 18, the rank's part, after the parish: Nominatim repeats Newton
+    // Aycliffe, and the house's addr:city names that row. The town is the area, the finer row.
     let index = |city: Option<&str>| {
         let mut index = united_states();
         index
@@ -341,9 +341,9 @@ fn a_place_area_an_area_round_it_lifts_links_no_place_node_of_its_name() {
         }
         index.load()
     };
-    let (display, _) = answer_at(&index(None), 10.0, 0.0);
-    assert_eq!(display, "20 Stanfield Road, Newton Aycliffe, Great Aycliffe, Durham, United States");
-    let (display, address) = answer_at(&index(Some("Newton Aycliffe")), 10.0, 0.0);
-    assert_eq!(display, "20 Stanfield Road, Newton Aycliffe, Great Aycliffe, Newton Aycliffe, Durham, United States");
-    assert_eq!(address["town"], "Newton Aycliffe");
+    for city in [None, Some("Newton Aycliffe")] {
+        let (display, address) = answer_at(&index(city), 10.0, 0.0);
+        assert_eq!(display, "20 Stanfield Road, Newton Aycliffe, Great Aycliffe, Newton Aycliffe, Durham, United States", "{city:?}");
+        assert_eq!(address["town"], "Newton Aycliffe", "{city:?}");
+    }
 }
