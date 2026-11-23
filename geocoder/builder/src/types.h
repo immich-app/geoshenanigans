@@ -1103,15 +1103,17 @@ inline uint8_t poi_lowest_tier(const PoiRecord& pr) {
 }
 
 // `pr` as the dir of the POIs of tier <= max_tier writes it: as its water
-// kind, of that kind's tier, where the dir ships the kind but not its own
-// category, with its importance and the rest of it as they are; without the
-// flags of the build alone (POI_FLAG_BUILD_MASK) in any dir.
-inline PoiRecord poi_record_in_tier(PoiRecord pr, uint8_t max_tier) {
+// kind, of that kind's tier and of `water_importance`, its importance as
+// that kind (ParsedData::poi_water_importance), where the dir ships the kind
+// but not its own category, with the rest of it as it is; without the flags
+// of the build alone (POI_FLAG_BUILD_MASK) in any dir.
+inline PoiRecord poi_record_in_tier(PoiRecord pr, uint8_t max_tier, uint8_t water_importance = 0) {
     const PoiCategory water = poi_water_of(pr.flags);
     pr.flags &= static_cast<uint8_t>(~POI_FLAG_BUILD_MASK);
     if (water != PoiCategory::UNKNOWN && pr.tier > max_tier) {
         pr.category = static_cast<uint8_t>(water);
         pr.tier = poi_tier_of(water, pr.flags);
+        if (water_importance) pr.importance = water_importance;
     }
     return pr;
 }

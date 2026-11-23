@@ -1334,7 +1334,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                         [&](size_t total) { parallel_resize(filtered_vertex_bytes, total); },
                         [&](size_t k, size_t offset) -> size_t {
                             id_remap[selected[k]] = static_cast<uint32_t>(k);
-                            auto pr = poi_record_in_tier(d.poi_records[selected[k]], tier_var.max_tier);
+                            auto pr = poi_record_in_tier(d.poi_records[selected[k]], tier_var.max_tier,
+                                                         d.poi_water_importance.empty() ? 0 : d.poi_water_importance[selected[k]]);
                             size_t bytes = 0;
                             if (is_polygon(pr)) {
                                 bytes = pack_polygon_at(filtered_vertex_bytes.data() + offset,

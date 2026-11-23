@@ -471,6 +471,11 @@ struct ParsedData {
     // OSM_WAY, OSM_RELATION} since POIs come from any of three OSM
     // entity kinds. Strategy-2 IdAllocator uses this.
     std::vector<uint64_t> poi_osm_ids;
+    // Parallel once reorder_pois has run, where a record carries a water
+    // kind (POI_FLAG_WATER_MASK), else empty: each record's importance as
+    // that kind, which the tiers writing it as the kind give it
+    // (poi_record_in_tier), 0 for one of none. The build alone holds it.
+    std::vector<uint8_t> poi_water_importance;
     std::vector<NodeCoord> poi_vertices;
     std::vector<CellItemPair> sorted_poi_cells;
     std::vector<CollectedPoiRelation> collected_poi_relations;

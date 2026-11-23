@@ -348,6 +348,7 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
     tomb_pr.parent_poly_id = NO_DATA;
     reorder_by_remap(data.poi_records, remap, n_new, tomb_pr);
     reorder_by_remap(data.poi_osm_ids, remap, n_new, uint64_t(0));
+    if (!data.poi_water_importance.empty()) reorder_by_remap(data.poi_water_importance, remap, n_new, uint8_t(0));
 
     // sorted_poi_cells item_ids carry the high-bit
     // INTERIOR_FLAG (set during POI cell covering at build_index.cpp). A

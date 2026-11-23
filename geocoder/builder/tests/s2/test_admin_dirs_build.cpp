@@ -1189,6 +1189,55 @@ TEST(a_bay_that_is_a_pier_is_a_pier_where_piers_ship_and_a_bay_where_only_bays_d
     }
 }
 
+// A glacier that is also an attraction, natural=glacier with
+// tourism=attraction, is an ATTRACTION (tier 2) where attractions ship, of an
+// attraction's importance (20), and a GLACIER (tier 1) in poi/major, of a
+// glacier's (40), as the plain glacier of its size beside it is: in the
+// planet's dir and Europe's, and in a chained build whose new museum, of a
+// category sorting first, moves the slots of a fresh build's order.
+TEST(a_water_object_written_as_its_kind_takes_the_importance_of_that_kind) {
+    const ScratchDir root("water-importance-build");
+    const std::string log = root.path() + "/build.log";
+    const int32_t lat0 = 470000000, lng0 = 80000000, south = lat0 + 1403000, north = lat0 + 1405000;
+    std::vector<TestObject> ice;
+    add_rectangle(ice, 4040, 990, south, lng0 + 1420000, north, lng0 + 1428000,
+                  {{"name", "Gletscher Testdorf"}, {"natural", "glacier"}});
+    add_rectangle(ice, 4041, 994, south, lng0 + 1435000, north, lng0 + 1443000,
+                  {{"name", "Eisgrotte Testdorf"}, {"natural", "glacier"}, {"tourism", "attraction"}});
+    const std::string day_one = root.path() + "/one.osm.pbf", day_two = root.path() + "/two.osm.pbf";
+    write_fixture_with(day_one, ice);
+    ice.push_back(node(998, lat0 + 1404000, lng0 + 1450000, {{"name", "Museum Testdorf"}, {"tourism", "museum"}}));
+    write_fixture_with(day_two, ice);
+    const std::string out1 = root.path() + "/one", out2 = root.path() + "/two";
+    const std::vector<std::string> multi = {"--continents", "--multi-output", "--multi-quality"};
+    std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out1, day_one};
+    words.insert(words.end(), multi.begin(), multi.end());
+    REQUIRE(gctest::run(words, log));
+    words = {GEOCODER_BUILD_INDEX_BIN, out2, day_two, "--prev-output", out1};
+    words.insert(words.end(), multi.begin(), multi.end());
+    REQUIRE(gctest::run(words, log));
+
+    const int glacier = int(PoiCategory::GLACIER), attraction = int(PoiCategory::ATTRACTION);
+    for (const std::string& out : {out1, out2}) {
+        const auto files = tree(out);
+        for (const char* region : {"planet", "europe"}) {
+            // The glaciers in poi/major, the attraction and the plain one in
+            // poi/notable.
+            const std::string major = std::string(region) + "/poi/major", notable = std::string(region) + "/poi/notable";
+            const std::vector<PoiRecord> glaciers = poi_records_in(files, major);
+            REQUIRE(categories_of(glaciers) == std::vector<int>({glacier, glacier}));
+            for (const PoiRecord& pr : glaciers) {
+                if (pr.importance != 40) std::printf("    %s %s: importance %d\n", out.c_str(), major.c_str(), int(pr.importance));
+                CHECK_EQ(int(pr.importance), 40);
+            }
+            for (const PoiRecord& pr : poi_records_in(files, notable)) {
+                if (pr.category == glacier) CHECK_EQ(int(pr.importance), 40);
+                if (pr.category == attraction) CHECK_EQ(int(pr.importance), 20);
+            }
+        }
+    }
+}
+
 // A named multipolygon of water that is also a rank-30 POI, natural=bay or
 // natural=water with leisure=swimming_area, is that POI in Nominatim, which
 // imports a multipolygon as a closed way: the build writes both as

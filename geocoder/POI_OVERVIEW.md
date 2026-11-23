@@ -80,9 +80,10 @@ Users choose how much POI data they want:
 
 Tiers are cumulative — Notable includes all Major POIs, All includes everything.
 A water object that is a POI of a less important category than its water
-kind is that kind in the tiers between: a bay (notable) that is also a pier
-(all) is the bay in Notable and the pier in All, and a glacier (major) that
-is also an attraction (notable) the glacier in Major.
+kind is that kind in the tiers between, of that kind's importance: a bay
+(notable) that is also a pier (all) is the bay in Notable and the pier in
+All, and a glacier (major) that is also an attraction (notable) the glacier
+in Major, of a glacier's importance.
 
 ## Importance Scoring
 
