@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""Tests for the nightly's postal cities inputs: GeoNames' postal places come from our cache, which
+Update GeoNames Postal Places fills and a missing or bad copy of fails the night; yesterday's
+postal_cities.bin comes from the newest build latest.json names before today's, whatever its
+version, so a fresh night keeps its names; the build takes both.
+Run: python3 -m unittest discover -s geocoder/builder/tools"""
+import hashlib
+import json
+import os
+import re
+import subprocess
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+WORKFLOWS = os.path.join(HERE, "..", "..", "..", ".github", "workflows")
+DOWNLOAD = "Download PBF and previous indexes"
+BUILD = "Build geocoder index"
+
+
+def workflow(name):
+    with open(os.path.join(WORKFLOWS, name)) as f:
+        return f.read()
+
+
+def step_script(text, name):
+    """The `run:` script of the step `name` of a workflow's text, dedented."""
+    block = re.search(rf"^      - name: {re.escape(name)}\n((?:(?: {{8}}.*)?\n)*)", text, re.M)
+    run = re.search(r"^        run: \|\n((?:(?: {10}.*)?\n)*)", block.group(1), re.M) if block else None
+    return "".join(line[10:] + "\n" for line in run.group(1).splitlines()) if run else None
+
+
+def postal_block():
+    """The download's postal lines: the postal places, then yesterday's postal cities."""
+    script = step_script(workflow("geocoder-build.yml"), DOWNLOAD)
+    block = re.search(r"^# ── Postal places.*?(?=^\) &$)", script, re.M | re.S)
+    return block.group(0) if block else None
+
+
+def build_args_block():
+    """The build step's postal lines, which add to BUILD_ARGS."""
+    script = step_script(workflow("geocoder-build.yml"), BUILD)
+    block = re.search(r"^# GeoNames' postal places.*?--prev-postal-cities.*?\nfi\n", script, re.M | re.S)
+    return block.group(0) if block else None
+
+
+# A curl that serves $SERVED/<url path> (after the host), and an s5cmd whose `cat` serves
+# $SERVED/s3/<bucket path>: what the cache and the bucket hold.
+CURL = r"""#!/bin/bash
+out=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in -o) out=$2; shift 2 ;; --connect-timeout|--max-time|--retry) shift 2 ;; -*) shift ;; *) url=$1; shift ;; esac
+done
+path="$SERVED/${url#*://*/}"
+[ -f "$path" ] || exit 22
+if [ -n "$out" ]; then cp "$path" "$out"; else cat "$path"; fi
+"""
+S5CMD = r"""#!/bin/bash
+while [ $# -gt 0 ]; do case "$1" in cat) shift; break ;; *) shift ;; esac; done
+path="$SERVED/s3/${1#s3://}"
+[ -f "$path" ] || exit 1
+cat "$path"
+"""
+
+
+class NightlyPostalCitiesTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.root = self.dir.name
+        self.served = os.path.join(self.root, "served")
+        self.work = os.path.join(self.root, "work")
+        self.bin = os.path.join(self.root, "bin")
+        for d in (self.served, self.work, self.bin):
+            os.makedirs(d)
+        for name, text in (("curl", CURL), ("s5cmd", S5CMD)):
+            with open(os.path.join(self.bin, name), "w") as f:
+                f.write(text)
+            os.chmod(os.path.join(self.bin, name), 0o755)
+
+    def serve(self, path, data):
+        at = os.path.join(self.served, path)
+        os.makedirs(os.path.dirname(at), exist_ok=True)
+        with open(at, "wb") as f:
+            f.write(data if isinstance(data, bytes) else data.encode())
+
+    def cache(self, data=b"US\t19026\tDrexel Hill\tPA\n", sha=None, path="geonames/20261123/77-1/postal_places.tsv.gz"):
+        self.serve(f"geocoder/{path}", data)
+        self.serve("geocoder/geonames/latest.json", json.dumps(
+            {"path": path, "size": len(data), "sha256": sha or hashlib.sha256(data).hexdigest(), "rows": 1}))
+
+    def build(self, date, table=None, listed=True):
+        """A published build of `date`: its configurations.json, and its postal table (zstd)."""
+        files = {}
+        if table is not None:
+            self.serve(f"s3/bucket/geocoder/builds/{date}/planet/admin/postal_cities.bin.zst",
+                       subprocess.run(["zstd", "-q", "-c"], input=table, capture_output=True, check=True).stdout)
+            if listed:
+                files["planet/admin/postal_cities.bin"] = {"sha256": hashlib.sha256(table).hexdigest()}
+        self.serve(f"s3/bucket/geocoder/builds/{date}/configurations.json", json.dumps({"files": files}))
+
+    def run_block(self, script):
+        out = os.path.join(self.root, "github_output")
+        open(out, "w").close()
+        env = {"PATH": self.bin + os.pathsep + os.environ["PATH"], "SERVED": self.served, "WORKDIR": self.work,
+               "GITHUB_OUTPUT": out, "S3_PUBLIC_URL": "https://cache.example", "S3_BUCKET": "bucket",
+               "S3_PREFIX": "geocoder", "S5": "s5cmd", "TODAY": "2026-11-23"}
+        r = subprocess.run(["bash", "-eo", "pipefail", "-c", script], env=env, capture_output=True, text=True)
+        with open(out) as f:
+            outputs = dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
+        return r, outputs
+
+    def test_the_download_reads_the_postal_places_from_the_cache_and_fails_without_them(self):
+        block = postal_block()
+        self.assertIsNotNone(block)
+        self.assertNotRegex(block, r"https?://[^\s\"']*geonames\.org")
+        r, outputs = self.run_block(block)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("::error::[postal] No postal places", r.stdout)
+        self.cache(sha="0" * 64)
+        r, outputs = self.run_block(block)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not the file latest.json names", r.stdout)
+        self.cache(path="geonames/latest/postal_places.tsv.gz")
+        self.assertEqual(self.run_block(block)[0].returncode, 1)
+        self.cache()
+        r, outputs = self.run_block(block)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(outputs["postal_places"], os.path.join(self.work, "postal_places.tsv.gz"))
+        with open(outputs["postal_places"], "rb") as f:
+            self.assertEqual(f.read(), b"US\t19026\tDrexel Hill\tPA\n")
+
+    def test_yesterdays_postal_cities_come_from_the_newest_build_before_today_whatever_its_version(self):
+        block = postal_block()
+        self.assertNotIn("HAS_PREVIOUS", block)
+        self.cache()
+        # No build yet: none, and the night goes on.
+        r, outputs = self.run_block(block)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("prev_postal_cities", outputs)
+        # The newest build before today's: latest, or its previous where latest is today's.
+        self.build("2026-11-21", b"day 21")
+        self.build("2026-11-22", b"day 22")
+        self.build("2026-11-23", b"day 23")
+        for latest, previous, want in [("2026-11-22", "2026-11-21", b"day 22"), ("2026-11-23", "2026-11-22", b"day 22"),
+                                       ("2026-11-21", None, b"day 21")]:
+            self.serve("s3/bucket/geocoder/builds/latest.json", json.dumps({"latest": latest, "previous": previous}))
+            r, outputs = self.run_block(block)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            with open(outputs["prev_postal_cities"], "rb") as f:
+                self.assertEqual(f.read(), want, latest)
+        # A build that published none.
+        self.build("2026-11-22", b"day 22", listed=False)
+        self.serve("s3/bucket/geocoder/builds/latest.json", json.dumps({"latest": "2026-11-22", "previous": None}))
+        r, outputs = self.run_block(block)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("prev_postal_cities", outputs)
+        # One that did, whose table isn't the one it names, fails the night.
+        self.build("2026-11-22", b"day 22")
+        self.serve("s3/bucket/geocoder/builds/2026-11-22/planet/admin/postal_cities.bin.zst", b"not zstd")
+        r, _ = self.run_block(block)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("::error::[postal] The postal cities of 2026-11-22", r.stdout)
+
+    def test_the_build_takes_the_postal_places_and_yesterdays_postal_cities(self):
+        block = build_args_block()
+        self.assertIsNotNone(block)
+        places, prev = os.path.join(self.root, "places.tsv.gz"), os.path.join(self.root, "prev.bin")
+        for path in (places, prev):
+            with open(path, "wb") as f:
+                f.write(b"x")
+        script = 'BUILD_ARGS="--continents"\n' + block + 'echo "ARGS $BUILD_ARGS"\n'
+
+        def args(env):
+            r = subprocess.run(["bash", "-eo", "pipefail", "-c", script], env={"PATH": os.environ["PATH"], **env},
+                               capture_output=True, text=True)
+            return r.returncode, re.search(r"^ARGS (.*)$", r.stdout, re.M).group(1) if r.returncode == 0 else r.stdout
+
+        self.assertEqual(args({"POSTAL_PLACES_FILE": places, "PREV_POSTAL_CITIES": prev}),
+                         (0, f"--continents --postal-places {places} --prev-postal-cities {prev}"))
+        self.assertEqual(args({"POSTAL_PLACES_FILE": places, "PREV_POSTAL_CITIES": ""}), (0, f"--continents --postal-places {places}"))
+        rc, stdout = args({"POSTAL_PLACES_FILE": "", "PREV_POSTAL_CITIES": prev})
+        self.assertEqual(rc, 1)
+        self.assertIn("::error::No GeoNames postal places", stdout)
+
+    def test_the_cache_refreshes_weekly_from_geonames_and_never_overwrites_a_file(self):
+        text = workflow("geocoder-geonames.yml")
+        self.assertRegex(text, r"(?m)^  schedule:\n    - cron: '[^']+'")
+        self.assertIn("workflow_dispatch:", text)
+        script = step_script(text, "Build and upload postal_places.tsv.gz")
+        self.assertIsNotNone(script)
+        self.assertIn("postal_places.py", script)
+        self.assertIn("--previous-rows", script)
+        # A run's own key, as the nightly's check of the path expects.
+        self.assertIn('KEY="geonames/$DATE/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"', script)
+        downloads = step_script(text, "Download GeoNames postal code files")
+        self.assertIn("for CC in US PR VI GU AS MP; do", downloads)
+        self.assertIn("readme.txt", downloads)
+
+    def test_a_change_to_the_cache_workflow_runs_these_tests(self):
+        paths = re.search(r"(?ms)^  pull_request:\n    paths:\n(.*?)^\S", workflow("geocoder-tests.yml")).group(1)
+        self.assertIn('".github/workflows/geocoder-geonames.yml"', paths)
+
+
+if __name__ == "__main__":
+    unittest.main()

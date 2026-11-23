@@ -353,7 +353,8 @@ jobs:
             IDX_PID=$!
           fi
 
-          # ── Background: wikidata sitelinks, GeoNames postcodes, TIGER ──
+          # ── Background: wikidata sitelinks, GeoNames postcodes, TIGER,
+          # GeoNames' postal places and yesterday's postal cities ──
           # Small and independent of the PBF, so they come down beside it
           # (~2 min one after another, against ~3 for the PBF).
           (
@@ -455,6 +456,62 @@ jobs:
           else
             echo "::error::[tiger] No TIGER data available at $S3_PUBLIC_URL/geocoder/tiger/latest.json — refusing to build a US-less planet index"
             exit 1
+          fi
+
+          # ── Postal places: GeoNames' US place names, from our cache ──
+          # postal_cities.bin names a ZIP its addresses name too few cities
+          # for with GeoNames' name, which Update GeoNames Postal Places
+          # caches weekly: the night never reads geonames.org, and a missing
+          # or bad cache fails it, as TIGER's does.
+          echo "[postal] Checking for GeoNames postal places..."
+          PP_LATEST=$(curl -sL --fail --connect-timeout 30 --max-time 60 "$S3_PUBLIC_URL/geocoder/geonames/latest.json" 2>/dev/null || echo '{}')
+          PP_PATH=$(echo "$PP_LATEST" | jq -r '.path // ""' 2>/dev/null || echo "")
+          PP_SIZE=$(echo "$PP_LATEST" | jq -r '.size // 0' 2>/dev/null || echo 0)
+          PP_SHA=$(echo "$PP_LATEST" | jq -r '.sha256 // ""' 2>/dev/null || echo "")
+          if ! [[ "$PP_PATH" =~ ^geonames/[0-9]{8}/[0-9]+-[0-9]+/postal_places\.tsv\.gz$ && "$PP_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::[postal] No postal places named by $S3_PUBLIC_URL/geocoder/geonames/latest.json (path '$PP_PATH') — refusing to build US postal cities without GeoNames' names; run Update GeoNames Postal Places"
+            exit 1
+          fi
+          curl -sL --fail --connect-timeout 30 --max-time 300 --retry 3 -o "$WORKDIR/postal_places.tsv.gz" \
+            "$S3_PUBLIC_URL/geocoder/$PP_PATH" || true
+          PP_GOT=$(stat -c%s "$WORKDIR/postal_places.tsv.gz" 2>/dev/null || echo 0)
+          PP_GOT_SHA=$(sha256sum "$WORKDIR/postal_places.tsv.gz" 2>/dev/null | cut -d' ' -f1 || true)
+          if [ "$PP_GOT" != "$PP_SIZE" ] || [ "$PP_GOT_SHA" != "$PP_SHA" ]; then
+            echo "::error::[postal] Postal places $PP_PATH missing or not the file latest.json names: got $PP_GOT bytes, sha256 '$PP_GOT_SHA'; latest.json says $PP_SIZE, $PP_SHA"
+            exit 1
+          fi
+          echo "[postal] Downloaded $PP_PATH: $(echo "$PP_LATEST" | jq -r '.rows // 0') rows"
+          echo "postal_places=$WORKDIR/postal_places.tsv.gz" >> "$GITHUB_OUTPUT"
+
+          # ── Yesterday's postal cities, whose names keep their margin ──
+          # The table of the newest build latest.json names before today's,
+          # whatever its build version, so a fresh night keeps the names a
+          # near tie would flip (postal_cities_build.h). It goes to
+          # prev-state/, apart from old-output/, which fetch_previous_index.sh
+          # fills beside the build. A build that published none (the first
+          # night) leaves none; one that did and can't be read fails the night.
+          LATEST_BUILDS=$($S5 cat "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.json" 2>/dev/null || echo '{}')
+          PREV_TABLE_DATE=$(echo "$LATEST_BUILDS" | jq -r --arg today "$TODAY" \
+            'if (.latest // "") != "" and .latest < $today then .latest elif (.previous // "") != "" and .previous < $today then .previous else "" end' \
+            2>/dev/null || echo "")
+          if [ -n "$PREV_TABLE_DATE" ]; then
+            PREV_TABLE_SHA=$($S5 cat "s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_TABLE_DATE/configurations.json" 2>/dev/null \
+              | jq -r '.files["planet/admin/postal_cities.bin"].sha256 // ""' 2>/dev/null || echo "")
+            if [ -n "$PREV_TABLE_SHA" ]; then
+              mkdir -p "$WORKDIR/prev-state"
+              $S5 cat "s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_TABLE_DATE/planet/admin/postal_cities.bin.zst" 2>/dev/null \
+                | zstd -d -q -c > "$WORKDIR/prev-state/postal_cities.bin" || true
+              if [ "$(sha256sum "$WORKDIR/prev-state/postal_cities.bin" | cut -d' ' -f1)" != "$PREV_TABLE_SHA" ]; then
+                echo "::error::[postal] The postal cities of $PREV_TABLE_DATE are not the file its configurations.json names — refusing to build without their names, which a near tie would flip"
+                exit 1
+              fi
+              echo "[postal] Previous postal cities from $PREV_TABLE_DATE"
+              echo "prev_postal_cities=$WORKDIR/prev-state/postal_cities.bin" >> "$GITHUB_OUTPUT"
+            else
+              echo "[postal] The build of $PREV_TABLE_DATE published no postal cities: building without a margin"
+            fi
+          else
+            echo "[postal] No build before $TODAY in latest.json: building without a margin"
           fi
           ) &
           EXTRAS_PID=$!
@@ -636,6 +693,8 @@ jobs:
           WIKIDATA_DATE: ${{ steps.download.outputs.wikidata_date }}
           TIGER_FILE: ${{ steps.download.outputs.tiger_data }}
           GEONAMES_FILE: ${{ steps.download.outputs.postcode_centroids_external }}
+          POSTAL_PLACES_FILE: ${{ steps.download.outputs.postal_places }}
+          PREV_POSTAL_CITIES: ${{ steps.download.outputs.prev_postal_cities }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
@@ -679,6 +738,18 @@ jobs:
           if [ -n "$GEONAMES_FILE" ] && [ -f "$GEONAMES_FILE" ]; then
             BUILD_ARGS="$BUILD_ARGS --external-postcodes $GEONAMES_FILE"
             echo "Using GeoNames postcode data"
+          fi
+          # GeoNames' postal places (the download fails without them) and
+          # yesterday's postal cities, where a build before today published
+          # them.
+          if ! [ -s "$POSTAL_PLACES_FILE" ]; then
+            echo "::error::No GeoNames postal places for postal_cities.bin"
+            exit 1
+          fi
+          BUILD_ARGS="$BUILD_ARGS --postal-places $POSTAL_PLACES_FILE"
+          if [ -n "$PREV_POSTAL_CITIES" ] && [ -f "$PREV_POSTAL_CITIES" ]; then
+            BUILD_ARGS="$BUILD_ARGS --prev-postal-cities $PREV_POSTAL_CITIES"
+            echo "Using the previous postal cities"
           fi
           # Strategy-2: pass the previous build's output root so the
           # IdAllocator can stabilize dense IDs against yesterday's

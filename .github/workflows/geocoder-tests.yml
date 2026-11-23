@@ -9,8 +9,10 @@ on:
       - "geocoder/server/**"
       - "geocoder/test-portal/**"
       - ".github/workflows/geocoder-tests.yml"
-      # The tool tests read the nightly's package list.
+      # The tool tests read the nightly's package list and its postal
+      # inputs, and the postal places' cache.
       - ".github/workflows/geocoder-build.yml"
+      - ".github/workflows/geocoder-geonames.yml"
 
 permissions:
   contents: read
