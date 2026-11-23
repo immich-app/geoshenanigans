@@ -865,6 +865,24 @@ void split_polygons(Build& b, unsigned threads) {
         }
     }, threads);
 
+    // The polygons kept whole and why, and what it cut.
+    auto report = [&](size_t cut, size_t cut_lines, size_t made, size_t kept_whole) {
+        std::ostringstream whole;
+        for (size_t h = 0; h < heavy.size(); h++)
+            if (refusals[h] != SplitRefusal::None)
+                whole << "  Water split: " << object_ref(b.objects[heavy_object[h]]) << " ("
+                      << b.objects[heavy_object[h]].tags.name << ", "
+                      << heavy_rings[h] - 1 << " holes) kept whole: " << refusal_name(refusals[h]) << "\n";
+        std::cerr << whole.str() << "  Water split: " << heavy.size() << " polygons of more than " << kSplitMaxHoles
+                  << " holes; " << cut << " cut along " << cut_lines << " lines into " << made << " pieces, "
+                  << kept_whole << " kept whole; " << b.rings.polygons.size() << " polygons" << std::endl;
+    };
+    // None cut: the store stays as it is, every piece key 0.
+    if (std::all_of(pieces.begin(), pieces.end(), [](const std::vector<SplitPolygon>& p) { return p.empty(); })) {
+        report(0, 0, 0, heavy.size());
+        return;
+    }
+
     // The store again: each cut polygon's pieces in its place.
     AdminExactRings out;
     std::vector<uint32_t> object_of, outer_rank;
@@ -926,15 +944,7 @@ void split_polygons(Build& b, unsigned threads) {
     b.object_of = std::move(object_of);
     b.outer_rank = std::move(outer_rank);
     b.piece_key = std::move(piece_key);
-    std::ostringstream whole;
-    for (size_t h = 0; h < heavy.size(); h++)
-        if (refusals[h] != SplitRefusal::None)
-            whole << "  Water split: " << object_ref(b.objects[heavy_object[h]]) << " ("
-                  << b.objects[heavy_object[h]].tags.name << ", "
-                  << heavy_rings[h] - 1 << " holes) kept whole: " << refusal_name(refusals[h]) << "\n";
-    std::cerr << whole.str() << "  Water split: " << heavy.size() << " polygons of more than " << kSplitMaxHoles
-              << " holes; " << cut << " cut along " << cut_lines << " lines into " << made << " pieces, " << kept_whole
-              << " kept whole; " << b.rings.polygons.size() << " polygons" << std::endl;
+    report(cut, cut_lines, made, kept_whole);
 }
 
 std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_planet_dir) {

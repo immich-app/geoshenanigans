@@ -381,6 +381,40 @@ TEST(a_lake_of_many_islands_is_cut_into_pieces_that_each_carry_the_lakes_name_ty
     CHECK(std::abs(layer.records[pieces[0]].area - float(0.16 - 144 * 0.000004)) < 1e-5f);
 }
 
+TEST(a_lake_of_many_islands_the_grid_cant_cut_keeps_its_store_as_it_was) {
+    // A lake of 0.0019 x 0.0019 degrees with 9 x 8 islands, between the
+    // lines of the finest grid a cut takes (2^16 e7 units: 7171 and 7172 of
+    // them in latitude, 1220 and 1221 in longitude).
+    Collected c;
+    add_geometry(c, 70, square(kLat, kLng, 19000));
+    CollectedArea isles;
+    isles.id = 600;
+    isles.tags = tags(code::kLake, "Tiny Isles Lake");
+    isles.members = {{70, "outer"}};
+    for (int i = 0; i < 9; i++)
+        for (int j = 0; j < 8; j++) {
+            const int64_t way = 1000 + i * 8 + j;
+            add_geometry(c, way, square(kLat + 1000 + i * 2000, kLng + 1000 + j * 2000, 500));
+            isles.members.push_back({way, "inner"});
+        }
+    c.relations.push_back(isles);
+    Build b = assemble(c, 1);
+    REQUIRE(b.rings.polygons.size() == 1u);
+    REQUIRE(b.rings.polygons[0].ring_count == 73u);
+    const PackedLocation* vertices = b.rings.vertices.data();
+    const std::vector<RingSpan> rings = b.rings.rings;
+    const gctest::CapturedStderr log;
+    split_polygons(b, 1);
+    CHECK(log.str().find("Tiny Isles Lake, 72 holes) kept whole: no cut leaves it in more than one piece") !=
+          std::string::npos);
+    CHECK(log.str().find("0 cut along 0 lines into 0 pieces, 1 kept whole; 1 polygons") != std::string::npos);
+    // Not copied: the store's vertices where they were.
+    CHECK(b.rings.vertices.data() == vertices);
+    CHECK_EQ(b.rings.rings.size(), rings.size());
+    CHECK(b.piece_key == std::vector<uint64_t>({0}));
+    CHECK(b.object_of == std::vector<uint32_t>({0}));
+}
+
 TEST(the_layer_is_the_same_on_one_thread_and_many) {
     const Layer one = build(fixture(), "", 1), many = build(fixture(), "", 8);
     const ScratchDir a("water-one"), b("water-many");
