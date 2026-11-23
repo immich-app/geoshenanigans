@@ -2873,20 +2873,21 @@ impl Index {
     /// The postcode get_nearest_postcode takes from the postal areas holding the point (lat, lng)
     /// in the country `country_code` (postal_area_postcode), scanned there.
     fn postal_area_at<'a>(&'a self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
-        let (areas, point, _) = self.postal_areas_at(lat, lng);
+        let (areas, point, _) = self.postal_areas_at(lat, lng, true);
         self.postal_area_postcode(&areas, &upper_country(country_code), point)
     }
 
-    /// The postal areas holding the point (lat, lng), the smallest first, the point as the scan
-    /// rounds it, and the country there (get_country_code): that of the smallest country polygon
-    /// holding it, the lower code of two as large; none where none holds it.
-    fn postal_areas_at(&self, lat: f64, lng: f64) -> (Vec<AdminPolygon>, (f64, f64), Option<[u8; 2]>) {
+    /// The postal areas holding the point (lat, lng), the smallest first (none unless `postal`),
+    /// the point as the scan rounds it, and the country there (get_country_code): that of the
+    /// smallest country polygon holding it, the lower code of two as large; none where none
+    /// holds it.
+    fn postal_areas_at(&self, lat: f64, lng: f64, postal: bool) -> (Vec<AdminPolygon>, (f64, f64), Option<[u8; 2]>) {
         let mut scan = AdminScan::new(self, lat, lng);
         let mut areas: Vec<AdminPolygon> = Vec::new();
         let mut country: Option<(f32, u16)> = None;
         scan.for_each_entry(|pip, id, poly| {
             let is_country = poly.admin_level == 2 && poly.country_code != 0;
-            if !(is_country || poly.admin_level == POSTCODE_AREA_LEVEL && poly.area > 0.0) || !pip.holds(self, id, &poly) {
+            if !(is_country || postal && poly.admin_level == POSTCODE_AREA_LEVEL && poly.area > 0.0) || !pip.holds(self, id, &poly) {
                 return;
             }
             if !is_country {
@@ -2934,10 +2935,13 @@ impl Index {
             }
         }
 
-        // 1. way_postcodes[street.way_id] — street's computed postcode
+        // 1. way_postcodes[street.way_id] — street's computed postcode,
+        // which the builder takes at its middle, of the country there.
         if let (Some(wpc), Some((way_id, _))) = (self.way_postcodes.as_ref(), street) {
             if let Some(pid) = Self::sidecar_u32(wpc, way_id as u64) {
-                return Some((self.get_string(pid), country_code));
+                let middle = u32::try_from(way_id).ok().and_then(|id| self.street_middle(id));
+                let country = middle.and_then(|(m_lat, m_lng)| self.postal_areas_at(m_lat, m_lng, false).2);
+                return Some((self.get_string(pid), country.or(country_code)));
             }
         }
 
@@ -2990,7 +2994,7 @@ impl Index {
         let mut country_code = country_code;
         if let Some((way_id, _)) = street {
             if let Some((m_lat, m_lng)) = u32::try_from(way_id).ok().and_then(|id| self.street_middle(id)) {
-                let (areas, point, country_there) = self.postal_areas_at(m_lat, m_lng);
+                let (areas, point, country_there) = self.postal_areas_at(m_lat, m_lng, true);
                 country_code = country_there.or(country_code);
                 let found = self.postal_area_postcode(&areas, &upper_country(country_code), point)
                     .or_else(|| self.centroid_postcode(m_lat, m_lng, country_code));

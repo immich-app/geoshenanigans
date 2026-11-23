@@ -308,6 +308,11 @@ fn a_street_across_a_border_takes_a_postcode_of_its_middle_s_country() {
     let address = address_from(&dataset.load(), al_ain, 5.0, -400.0);
     assert_eq!(address["road"], "Border Road");
     assert_eq!(address["postcode"], "112");
+    // As is the one the builder stores for it, which it takes at the middle too.
+    let mut dataset = border_at(al_ain, b"AE", b"OM");
+    dataset.street("Border Road", &[(0.0, -500.0), (0.0, 3500.0)]).way_postcode("112");
+    let address = address_from(&dataset.load(), al_ain, 5.0, -400.0);
+    assert_eq!(address["postcode"], "112");
 }
 
 #[test]
