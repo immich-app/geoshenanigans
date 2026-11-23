@@ -2319,6 +2319,16 @@ impl Index {
     // the polygon, otherwise the distance to the nearest edge. None for
     // a point off the globe (see find_pois).
     pub fn find_nearest_poi_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, PoiRecord)> {
+        self.nearest_linked_poi(lat, lng, false)
+    }
+
+    /// The nearest water POI of a linked parent street that the primary lanes leave out
+    /// (is_out_of_the_primary_lanes), as find_nearest_poi_with_parent finds the others.
+    pub fn find_nearest_water_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, PoiRecord)> {
+        self.nearest_linked_poi(lat, lng, true)
+    }
+
+    fn nearest_linked_poi(&self, lat: f64, lng: f64, water: bool) -> Option<(f64, PoiRecord)> {
         let poi_index = self.poi_index.as_ref()?;
         if self.poi_records.is_none() || !coords_in_range(lat, lng) { return None; }
 
@@ -2352,7 +2362,7 @@ impl Index {
                 // Need a linked parent street (for the `road` field)
                 // when this POI wins — without it we have nothing to
                 // surface as the road name.
-                if poi.parent_street_id == NO_DATA || Self::is_out_of_the_primary_lanes(&poi) {
+                if poi.parent_street_id == NO_DATA || Self::is_out_of_the_primary_lanes(&poi) != water {
                     return;
                 }
 
@@ -3311,7 +3321,16 @@ impl Index {
         // country polygon misses.
         let anchored = road.is_some() || admin.country.is_some() || admin.city.is_some() || admin.state.is_some();
         let place_nodes_only = admin.is_empty() && !place.is_empty();
-        if !anchored && !place_nodes_only {
+        // Water the primary lanes leave out gives no road nor postcode, but a
+        // point where it would win the slot keeps its landmark and `places`
+        // where nothing else anchors the address (a glacier on a coast no
+        // boundary holds).
+        let water_holds = || {
+            self.find_nearest_water_with_parent(lat, lng)
+                .filter(|(d, p)| *d <= poi_max_sq && self.poi_chain_contains_query(p, lat, lng))
+                .is_some()
+        };
+        if !anchored && !place_nodes_only && !water_holds() {
             return Address::default();
         }
 
@@ -8728,6 +8747,27 @@ mod query_path_tests {
         }
     }
 
+    #[test]
+    fn water_no_address_anchors_keeps_its_landmark_and_places_but_gives_no_road_nor_postcode() {
+        // A glacier 60 km north, outside Testland, holds the query, its parent street Coast
+        // Road and its postcode 4510; no boundary holds the point and no street is near. Water
+        // never takes the primary slot, so its road and postcode don't answer, but where it
+        // would have taken the slot its name answers as the landmark and in `places`. One of
+        // no linked parent street never could, and the point finds nothing, as one in no POI.
+        let answer = |linked: bool| {
+            let mut dataset = TestIndex::new();
+            let (name, road, postcode) = (dataset.string("Coast Glacier"), dataset.string("Coast Road"), dataset.string("4510"));
+            let parents = if linked { (road, postcode) } else { (NO_DATA, NO_DATA) };
+            let index = with_poi(dataset.load(), (86, 0), name, parents, (60_000.0, 0.0, 60_040.0, 60.0), true);
+            let (lat, lng) = query_point(60_030.0, 10.0);
+            serde_json::to_string(&index.query(lat, lng)).unwrap()
+        };
+        let linked: serde_json::Value = serde_json::from_str(&answer(true)).unwrap();
+        assert_eq!(linked["address"], serde_json::json!({"landmark": "Coast Glacier"}), "{linked}");
+        assert_eq!(linked["places"][0]["name"], "Coast Glacier", "{linked}");
+        assert_eq!(linked["licence"], OSM_LICENCE);
+        assert_eq!(answer(false), NOTHING_FOUND);
+    }
 
     #[test]
     fn interpolation_files_of_no_ways_load_and_give_no_interpolation() {

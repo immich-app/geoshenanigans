@@ -246,6 +246,10 @@ with `amenity=fountain`).
   unless a highway kind ranks it a street. A POI polygon of a multipolygon is
   its outer rings, without its holes, so a water multipolygon the classifier
   makes a POI of, with an `inner` member, never takes the slot either.
+- Where no boundary and no street anchors the address (a coast no boundary
+  covers), Nominatim finds nothing; a water POI that would have won the slot
+  but for the lane still gives the answer its `landmark` and `places`,
+  without a `road` or `postcode` (`Index::query`).
 - A water object of a generic rank-30 tag without a wiki tag stays water,
   out of the primary slot, where Nominatim's lane holds it as a POI.
 - The lower rank leaves out `boundary=administrative`, which ranks by an
