@@ -2322,9 +2322,10 @@ impl Index {
         self.nearest_linked_poi(lat, lng, false)
     }
 
-    /// The nearest water POI of a linked parent street that the primary lanes leave out
-    /// (is_out_of_the_primary_lanes), as find_nearest_poi_with_parent finds the others.
-    pub fn find_nearest_water_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, PoiRecord)> {
+    /// The POI find_nearest_poi_with_parent would find if the primary lanes took the water they
+    /// leave out (is_out_of_the_primary_lanes) too. A glacier or bay labels an area there, as an
+    /// island does: it wins only where no specific POI is found, however far.
+    pub fn find_nearest_poi_or_water_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, PoiRecord)> {
         self.nearest_linked_poi(lat, lng, true)
     }
 
@@ -2362,7 +2363,7 @@ impl Index {
                 // Need a linked parent street (for the `road` field)
                 // when this POI wins — without it we have nothing to
                 // surface as the road name.
-                if poi.parent_street_id == NO_DATA || Self::is_out_of_the_primary_lanes(&poi) != water {
+                if poi.parent_street_id == NO_DATA || (!water && Self::is_out_of_the_primary_lanes(&poi)) {
                     return;
                 }
 
@@ -2395,7 +2396,9 @@ impl Index {
                     dist_sq_val = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
                 }
 
-                if Self::is_area_label_category(poi.category) {
+                // Glaciers and bays (86, 91) label an area too where
+                // the lanes take water.
+                if Self::is_area_label_category(poi.category) || (water && matches!(poi.category, 86 | 91)) {
                     // Split lane: area labels (islands, parks, capes,
                     // campuses) only win primary when nothing more
                     // specific competes. Track them separately so a
@@ -3324,10 +3327,15 @@ impl Index {
         // Water the primary lanes leave out gives no road nor postcode, but a
         // point where it would win the slot keeps its landmark and `places`
         // where nothing else anchors the address (a glacier on a coast no
-        // boundary holds).
+        // boundary holds): where it is the POI the lanes would find if they
+        // took it too, within reach of the slot as poi_primary is. A glacier
+        // or bay is an area label there: a specific POI found near takes the
+        // lane from it, and one too far for the slot leaves the point nothing.
         let water_holds = || {
-            self.find_nearest_water_with_parent(lat, lng)
-                .filter(|(d, p)| *d <= poi_max_sq && self.poi_chain_contains_query(p, lat, lng))
+            self.find_nearest_poi_or_water_with_parent(lat, lng)
+                .filter(|(d, p)| {
+                    Self::is_out_of_the_primary_lanes(p) && *d <= poi_max_sq && self.poi_chain_contains_query(p, lat, lng)
+                })
                 .is_some()
         };
         if !anchored && !place_nodes_only && !water_holds() {
@@ -8842,22 +8850,31 @@ mod query_path_tests {
     /// `index` with one POI of `category` and `flags`: the rectangle, or a point at its middle
     /// where `polygon` is false. `name_id` its name and `parents` its parent street's and
     /// postcode's, strings of the index's. The admin cell of its middle lists it.
-    fn with_poi(mut index: Index, (category, flags): (u8, u8), name_id: u32, (parent_street_id, parent_postcode_id): (u32, u32),
-                (s, w, n, e): Span, polygon: bool) -> Index {
-        let (low, middle) = (at(s, w), at((s + n) / 2.0, (w + e) / 2.0));
-        // Its corners at 1e-7 degrees (encoding 3) from its low corner.
-        let steps = |v: f32, from: f32| ((v as f64 - from as f64) / 1e-7).round() as u32;
-        let outline = polygon.then(|| poi_files::PoiPolygon {
-            encoding: 3, bmin_lat: low.lat, bmin_lng: low.lng,
-            q: [at(s, w), at(s, e), at(n, e), at(n, w)].iter().map(|c| (steps(c.lat, low.lat), steps(c.lng, low.lng))).collect(),
-        });
-        let record = PoiRecord {
-            lat: middle.lat, lng: middle.lng, vertex_offset: if polygon { 0 } else { NO_DATA }, name_id, category, tier: 0, flags,
-            importance: 0, parent_street_id, parent_postcode_id, parent_poly_id: NO_DATA,
-        };
-        let (records, vertices) = poi_files::encode(&[(record, outline)]);
-        let cell = cell_id_at_level(middle.lat as f64, middle.lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
-        index.poi_index = Some(cell_pairs::from_pairs([(cell, 0)], cell_pairs::POI));
+    fn with_poi(index: Index, kind: (u8, u8), name_id: u32, parents: (u32, u32), span: Span, polygon: bool) -> Index {
+        with_pois(index, &[(kind, name_id, parents, span, polygon)])
+    }
+
+    /// `index` with `pois`, each as with_poi takes one, record i the i-th.
+    fn with_pois(mut index: Index, pois: &[((u8, u8), u32, (u32, u32), Span, bool)]) -> Index {
+        let mut records = Vec::new();
+        let mut cells = Vec::new();
+        for (i, &((category, flags), name_id, (parent_street_id, parent_postcode_id), (s, w, n, e), polygon)) in pois.iter().enumerate() {
+            let (low, middle) = (at(s, w), at((s + n) / 2.0, (w + e) / 2.0));
+            // Its corners at 1e-7 degrees (encoding 3) from its low corner.
+            let steps = |v: f32, from: f32| ((v as f64 - from as f64) / 1e-7).round() as u32;
+            let outline = polygon.then(|| poi_files::PoiPolygon {
+                encoding: 3, bmin_lat: low.lat, bmin_lng: low.lng,
+                q: [at(s, w), at(s, e), at(n, e), at(n, w)].iter().map(|c| (steps(c.lat, low.lat), steps(c.lng, low.lng))).collect(),
+            });
+            let record = PoiRecord {
+                lat: middle.lat, lng: middle.lng, vertex_offset: if polygon { 0 } else { NO_DATA }, name_id, category, tier: 0, flags,
+                importance: 0, parent_street_id, parent_postcode_id, parent_poly_id: NO_DATA,
+            };
+            records.push((record, outline));
+            cells.push((cell_id_at_level(middle.lat as f64, middle.lng as f64, DEFAULT_ADMIN_CELL_LEVEL), i as u32));
+        }
+        let (records, vertices) = poi_files::encode(&records);
+        index.poi_index = Some(cell_pairs::from_pairs(cells, cell_pairs::POI));
         index.poi_records = Some(PoiRecords::open(FileBytes::Owned(records)).unwrap());
         index.poi_vertices = Some(FileBytes::Owned(vertices));
         index
@@ -8975,6 +8992,41 @@ mod query_path_tests {
         assert_eq!(linked["places"][0]["name"], "Coast Glacier", "{linked}");
         assert_eq!(linked["licence"], OSM_LICENCE);
         assert_eq!(answer(false), NOTHING_FOUND);
+    }
+
+    #[test]
+    fn a_bay_or_glacier_no_address_anchors_answers_nothing_where_a_specific_poi_is_found() {
+        // A bay or glacier 60 km north, outside Testland, holds the query, its parent street
+        // Coast Road; no boundary holds the point and no street is near. 150 m east of the
+        // query, past the 100 m a POI takes the primary slot within, is a POI of Hill Road.
+        // Were water in the lanes, a bay or glacier would be an area label there, as an island
+        // is, and win the slot only where no specific POI is found: a school or a lake takes
+        // the lane from it, too far to take the slot, and the point finds nothing, as one in
+        // no water. An area label (a protected area) or a school of no linked parent street
+        // leaves it the lane, and a lake, itself specific, keeps the lane from the farther
+        // school: the water's name answers as the landmark.
+        let answer = |water: u8, (category, linked): (u8, bool)| {
+            let mut dataset = TestIndex::new();
+            let (name, road) = (dataset.string("Coast Water"), dataset.string("Coast Road"));
+            let (other, hill_road) = (dataset.string("Hilltop"), dataset.string("Hill Road"));
+            let pois = [
+                ((water, 0), name, (road, NO_DATA), (60_000.0, 0.0, 60_040.0, 60.0), true),
+                ((category, 0), other, (if linked { hill_road } else { NO_DATA }, NO_DATA), (60_030.0, 160.0, 60_030.0, 160.0), false),
+            ];
+            let index = with_pois(dataset.load(), &pois);
+            let (lat, lng) = query_point(60_030.0, 10.0);
+            serde_json::to_value(index.query(lat, lng)).unwrap()
+        };
+        let nothing: serde_json::Value = serde_json::from_str(NOTHING_FOUND).unwrap();
+        let (bay, glacier, lake, school, protected_area) = (91, 86, 99, 56, 131);
+        for water in [bay, glacier] {
+            assert_eq!(answer(water, (school, true)), nothing, "category {water}, a school");
+            assert_eq!(answer(water, (lake, true)), nothing, "category {water}, a lake");
+        }
+        for (water, other) in [(glacier, (protected_area, true)), (glacier, (school, false)), (lake, (school, true))] {
+            let held = answer(water, other);
+            assert_eq!(held["address"], serde_json::json!({"landmark": "Coast Water"}), "category {water}, {other:?}: {held}");
+        }
     }
 
     #[test]

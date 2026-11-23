@@ -250,7 +250,8 @@ with `amenity=fountain`).
 - Where no boundary and no street anchors the address (a coast no boundary
   covers), Nominatim finds nothing; a water POI that would have won the slot
   but for the lane still gives the answer its `landmark` and `places`,
-  without a `road` or `postcode` (`Index::query`).
+  without a `road` or `postcode` (`Index::query`). A bay or glacier would
+  have won it as an area label (below), only where no other POI is near.
 - A water object of a generic rank-30 tag without a wiki tag stays water,
   out of the primary slot, where Nominatim's lane holds it as a POI.
 - The lower rank leaves out `boundary=administrative`, which ranks by an
