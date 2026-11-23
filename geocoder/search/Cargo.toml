@@ -51,7 +51,7 @@ zstd = "0.14"
 query-server = { path = "../server" }
 axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-tls", "stream", "json"], optional = true }
 arc-swap = { version = "1", optional = true }
 bcrypt = { version = "0.19", optional = true }
 getrandom = { version = "0.4", optional = true }
