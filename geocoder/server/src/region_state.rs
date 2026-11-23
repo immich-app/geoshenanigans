@@ -399,35 +399,22 @@ mod tests {
         assert!(!root.path().join("europe").exists());
     }
 
-    /// Set for the process `a_host_without_ca_certificates_starts_and_its_downloads_fail_naming_why`
-    /// starts, which runs `without_ca_certificates` with no CA store.
-    const NO_CA_STORE: &str = "GEOCODER_TEST_NO_CA_STORE";
-
     // A host without CA certificates (an image without a CA bundle) builds
     // no HTTP client. A server there still starts and serves the regions on
     // its disk; each download fails naming why, fetching nothing, and the
     // first once the certificates are there builds it. The case runs in a
-    // process of its own, for SSL_CERT_FILE and SSL_CERT_DIR, which name the
-    // CA store in place of the system's, are the process's.
+    // process of its own (test_bucket::without_ca_store).
+    #[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
     #[test]
     fn a_host_without_ca_certificates_starts_and_its_downloads_fail_naming_why() {
-        let empty = ScratchDir::new();
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["region_state::tests::without_ca_certificates", "--exact", "--ignored", "--test-threads=1"])
-            .env("SSL_CERT_FILE", empty.path().join("none.pem"))
-            .env("SSL_CERT_DIR", empty.path())
-            .env(NO_CA_STORE, "1")
-            .output()
-            .unwrap();
-
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success() && stdout.contains(" 1 passed;"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+        test_bucket::without_ca_store("region_state::tests::without_ca_certificates");
     }
 
+    #[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
     #[tokio::test]
     #[ignore = "run by a_host_without_ca_certificates_starts_and_its_downloads_fail_naming_why"]
     async fn without_ca_certificates() {
-        if std::env::var_os(NO_CA_STORE).is_none() {
+        if std::env::var_os(test_bucket::NO_CA_STORE).is_none() {
             return;
         }
         let bucket = test_bucket::serve(test_bucket::template_components()).await;
@@ -443,9 +430,8 @@ mod tests {
         assert_eq!(bucket.files_served(), 0);
         assert!(!root.path().join("europe").exists());
 
-        // Safe to change: the process runs this case alone, on a runtime of one thread.
-        std::env::remove_var("SSL_CERT_FILE");
-        std::env::remove_var("SSL_CERT_DIR");
+        let certificates = ScratchDir::new();
+        test_bucket::with_test_ca(certificates.path());
         state.ensure_configurations().await.unwrap();
     }
 
