@@ -3028,8 +3028,8 @@ impl Index {
             // the most expand_by_meters' box reaches, but for a box across the antimeridian (read
             // below).
             let reach_m = country_code.map_or(MAX_POSTCODE_EXTENT_M, |cc| postcode_extent_m(cc, "")) * geography_box::BOX_REACH_FACTOR;
+            let dlat = reach_m / METRES_PER_DEGREE;
             let (max_dist_sq, dlng) = {
-                let dlat = reach_m / METRES_PER_DEGREE;
                 let metres_per_lng = METRES_PER_DEGREE * (lat.abs() + dlat).min(90.0).to_radians().cos();
                 let dlng = if metres_per_lng > reach_m / 360.0 { reach_m / metres_per_lng } else { 360.0 };
                 (postcode_files::distance(0.0, 0.0, dlat, dlng) * (1.0 + 1e-9), dlng)
@@ -3076,9 +3076,14 @@ impl Index {
             // the point's latitude can hold the point however far off it lies, past the cells
             // within reach. Those are read, at any distance, unless no centroid of the
             // antimeridian's cells can be as near as the best so far: none lies closer to the
-            // point's longitude than `dlng` short of the antimeridian.
-            let gap = (180.0 - dlng - lng.abs()).max(0.0);
-            if best.as_ref().is_none_or(|&(best_d, _)| postcode_files::distance(0.0, 0.0, 0.0, gap) <= best_d) {
+            // point's longitude than `dlng` and a cell's diagonal (S2's kMaxDiag, 2.438 / 2^level
+            // radians) short of the antimeridian. Past 70° the polar projection's boxes and the
+            // cells reach farther round the pole than that, and the cells are always read.
+            let near_pole = lat.abs() + dlat > geography_box::POLAR_LAT;
+            let diagonal = (2.438 / (1u64 << self.admin_cell_level) as f64).to_degrees();
+            let cell_lng = diagonal / (lat.abs() + dlat + diagonal).min(90.0).to_radians().cos();
+            let gap = (180.0 - dlng - cell_lng - lng.abs()).max(0.0);
+            if near_pole || best.as_ref().is_none_or(|&(best_d, _)| postcode_files::distance(0.0, 0.0, 0.0, gap) <= best_d) {
                 let cells: Vec<u64> = [180.0, -180.0].into_iter()
                     .flat_map(|edge| cells_near_point(lat, edge, reach_m, self.admin_cell_level))
                     .collect();
@@ -4662,6 +4667,14 @@ mod query_tests {
         assert_eq!(nearest_centroid(&centroids[..1], 0.0, 179.69, Some(*b"us")), Some("96801"));
         assert_eq!(nearest_centroid(&centroids, 0.0, 179.69, Some(*b"us")), Some("96802"));
         assert_eq!(centroids_at(&centroids).resolve_postcode(0.0, 179.69, None, None, None, None, None, Some(*b"us")).as_deref(), Some("96802"));
+
+        // Near a pole the cells read reach far past the reach in longitude, and the boxes of the
+        // polar projection farther still: at (-89.614, 4.095) two boxes hold the point, and the
+        // nearer centroid's cell is one of the antimeridian's.
+        let centroids = [(-89.803123, 91.400845, "AQ1", *b"us"), (-89.780914, -84.83687, "AQ2", *b"us")];
+        assert_eq!(nearest_centroid(&centroids[1..], -89.614027, 4.095063, None), Some("AQ2"));
+        assert_eq!(nearest_centroid(&centroids, -89.614027, 4.095063, None), Some("AQ1"));
+        assert_eq!(centroids_at(&centroids).resolve_postcode(-89.614027, 4.095063, None, None, None, None, None, None).as_deref(), Some("AQ1"));
     }
 
     #[test]

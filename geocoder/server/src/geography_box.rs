@@ -15,7 +15,7 @@ const F: f64 = 1.0 / 298.257_223_563;
 const UTM_K0: f64 = 0.9996;
 
 /// The latitude beyond which _ST_BestSRID takes the polar projection.
-const POLAR_LAT: f64 = 70.0;
+pub const POLAR_LAT: f64 = 70.0;
 
 /// The longitude of origin of the north polar projection (PostGIS SRID_NORTH_LAMBERT,
 /// `+proj=laea +lat_0=90 +lon_0=-40`); the south polar one's is 0.
