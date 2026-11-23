@@ -2769,24 +2769,29 @@ impl Index {
     // --- Postcode resolution ---
     //
     // Nominatim answers with the winning feature's stored `placex.postcode`,
-    // which placex_triggers.sql resolves at index time. Tiers 0 and 1 read
-    // postcodes the builder stored; tier 2 searches around the query point:
-    //   0. addr:postcode on the primary feature itself (token_get_postcode)
-    //   1. Primary feature's calculated_postcode (inherited from containing
-    //      boundary=postal_code at build time):
-    //        - street → way_postcodes.bin
-    //        - POI    → poi.parent_postcode_id (in-PoiRecord field)
-    //      then, for a US street, the ZIP of a TIGER line of that street
-    //      within ~100 m of the query (interp_postcodes.bin)
+    // which placex_update (placex_triggers.sql) resolves at index time. Tiers
+    // 0 and 1 read postcodes the builder stored; tier 2 searches around the
+    // feature:
+    //   0. A house's (rank 30) addr:postcode (token_get_postcode)
+    //   1. The postcode of the street: a house's parent street, else the
+    //      street that answers (way_postcodes.bin, the postal area the builder
+    //      finds the street in); a POI's parent_postcode_id (in-PoiRecord
+    //      field); then, for a US street, the ZIP of a TIGER line of that
+    //      street within ~100 m of the query (interp_postcodes.bin)
     //   2. get_nearest_postcode's rule for a point (utils.sql:168-178,
     //      Nominatim 5.3), which Nominatim runs on the feature at index
-    //      time: here at the query point, a feature without a postcode of
-    //      its own. The postcode area covering it (a boundary=postal_code
-    //      polygon, the level-11 admin polygons: the smallest holding the
-    //      point, `postcode_area`), else the postcode centroid of the
-    //      country nearest it in plain degrees among those whose box holds
-    //      it. A centroid's box reaches its country's postcode extent north,
-    //      south, east and west of it (postcode_extent_m, expand_by_meters).
+    //      time: the postcode area covering the point (a boundary=postal_code
+    //      polygon, the level-11 admin polygons), else the postcode centroid
+    //      of the country nearest it in plain degrees among those whose box
+    //      holds it. A centroid's box reaches its country's postcode extent
+    //      north, south, east and west of it (postcode_extent_m,
+    //      expand_by_meters). The point is the street's centroid, halfway
+    //      along it (get_center_point), for the street and a house of it:
+    //      placex_update takes a house's postcode from its own tag, then its
+    //      parent street's, then get_nearest_postcode at the house. A street
+    //      none reaches has no postcode, nor has its answer. Without a street
+    //      the point is the house's, else the query point (postcode_area,
+    //      the postal area there).
     //
     // The postal areas feed tier 1 at BUILD time too (way_postcodes.bin,
     // PoiRecord.parent_postcode_id inheritance).
@@ -2831,8 +2836,35 @@ impl Index {
         f.get(u32::try_from(idx).ok()?).filter(|&v| v != NO_DATA)
     }
 
+    /// The postcode get_nearest_postcode takes from the postal areas holding the point (lat, lng)
+    /// in the country `country_code` (postal_area_postcode), scanned there.
+    fn postal_area_at<'a>(&'a self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
+        let mut scan = AdminScan::new(self, lat, lng);
+        let mut areas: Vec<AdminPolygon> = Vec::new();
+        scan.for_each_entry(|pip, id, poly| {
+            if poly.admin_level == POSTCODE_AREA_LEVEL && poly.area > 0.0 && pip.holds(self, id, &poly) {
+                areas.push(poly);
+            }
+        });
+        areas.sort_by(|a, b| a.area.total_cmp(&b.area));
+        let country: String = country_code.map_or_else(String::new, |c| c.iter().map(|b| b.to_ascii_uppercase() as char).collect());
+        self.postal_area_postcode(&areas, &country, scan.pip.point.degrees())
+    }
+
+    /// The point halfway along street way `id`, Nominatim's centroid of a street (line_middle);
+    /// None for a way whose nodes can't be read.
+    fn street_middle(&self, id: u32) -> Option<(f64, f64)> {
+        let streets = self.streets.as_ref()?;
+        with_way_nodes(|nodes| if streets.way(id, nodes) { line_middle(nodes) } else { None })
+    }
+
+    /// The postcode of the answer at (lat, lng), as Nominatim stores it on the feature that
+    /// answers (the tiers above): `addr` the house that answers, `street` the street the
+    /// postcode comes from (a house's parent street, else the street that answers), `poi` the
+    /// POI that answers, `interp` the TIGER line near a street that answers, `postcode_area` the
+    /// postal area's postcode at the query point and `country_code` the answer's country.
     pub fn resolve_postcode<'a>(&'a self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, postcode_area: Option<Cow<'a, str>>, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
-        // 0. Nearest addr_point's own postcode (from addr_postcodes.bin)
+        // 0. The house's own postcode (from addr_postcodes.bin)
         // Matches Nominatim's token_get_postcode — the feature's own
         // addr:postcode tag is the highest-priority source.
         if let (Some(apc), Some((addr_id, _))) = (self.addr_postcodes.as_ref(), addr) {
@@ -2890,21 +2922,37 @@ impl Index {
             }
         }
 
-        // 2a. The postcode area covering the point: get_nearest_postcode
-        // takes one before any centroid (ORDER BY osm_id is null). Of two,
-        // Nominatim takes the one whose centroid is nearest, here the smaller.
+        // 2. get_nearest_postcode at the street's centroid, for the street
+        // and a house of it; a street none reaches has no postcode. Then at
+        // the house; else at the query point, of its postcode area.
+        if let Some((way_id, _)) = street {
+            if let Some((m_lat, m_lng)) = u32::try_from(way_id).ok().and_then(|id| self.street_middle(id)) {
+                let found = self.postal_area_at(m_lat, m_lng, country_code)
+                    .or_else(|| self.centroid_postcode(m_lat, m_lng, country_code));
+                if found.is_some() || addr.is_none() {
+                    return found;
+                }
+            }
+        }
+        if let Some((_, house)) = addr {
+            let (h_lat, h_lng) = (house.lat as f64, house.lng as f64);
+            return self.postal_area_at(h_lat, h_lng, country_code)
+                .or_else(|| self.centroid_postcode(h_lat, h_lng, country_code));
+        }
+        // The postcode area covering the point: get_nearest_postcode takes
+        // one before any centroid (ORDER BY osm_id is null).
         if postcode_area.is_some() {
             return postcode_area;
         }
+        self.centroid_postcode(lat, lng, country_code)
+    }
 
-        // 2b. The centroid nearest the point whose box holds it. Like
-        // get_nearest_postcode, filter by country_code: without it, a
-        // French "90012" can win over a US "90012" near the Maine/
-        // Quebec border or vice-versa — and the same digits often
-        // collide across countries. We use the country resolved by
-        // find_admin as the gate; if no country is known (ocean,
-        // Antarctica), fall back to unfiltered lookup so we still
-        // return something.
+    /// The postcode of the postcode centroid nearest the point (lat, lng) whose box holds it,
+    /// get_nearest_postcode's after the postal areas. Like get_nearest_postcode, of the country
+    /// `country_code` only: without it, a French "90012" can win over a US "90012" near the
+    /// Maine/Quebec border or vice-versa — and the same digits often collide across countries.
+    /// Where no country is known (ocean, Antarctica), of any, so the point still has one.
+    fn centroid_postcode<'a>(&'a self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
         let country_gate: Option<u16> = country_code.map(|cc| {
             (cc[0] as u16) << 8 | (cc[1] as u16)
         });
@@ -3422,19 +3470,33 @@ impl Index {
         let place = self.find_places(feature, &current_boundaries, held_ranks);
 
         // Resolve postcode: mirror Nominatim's stored placex.postcode chain
-        // (Tier 0 addr / Tier 1 primary feature's calculated_postcode /
-        // Tier 2 get_nearest_postcode at the point: the postal area round it,
-        // else the nearest centroid). Build-time postal-boundary inheritance
-        // feeds Tier 1 (way_postcodes.bin for streets, parent_postcode_id
-        // for POIs); Tier 2 takes the postal area find_admin found at the
-        // point. Tier 0 and Tier 1 are primary-feature-driven — only the
-        // winning feature's inherited postcode is consulted (poi_won_primary
-        // is set by the SAME cascade branch that picked the road above), so
-        // a POI win no longer leaks the street's inherited ZIP (Mexico City
-        // Zócalo 06060 leak).
+        // (Tier 0 the house's own / Tier 1 its street's or the primary
+        // feature's calculated_postcode / Tier 2 get_nearest_postcode at the
+        // street's centroid, the house or the point: the postal area round
+        // it, else the nearest centroid). Build-time postal-boundary
+        // inheritance feeds Tier 1 (way_postcodes.bin for streets,
+        // parent_postcode_id for POIs); at the query point Tier 2 takes the
+        // postal area find_admin found there. Tier 0 and Tier 1 are
+        // primary-feature-driven — only the winning feature's inherited
+        // postcode is consulted (poi_won_primary is set by the SAME cascade
+        // branch that picked the road above), so a POI win no longer leaks
+        // the street's inherited ZIP (Mexico City Zócalo 06060 leak).
+        // The street the postcode comes from: a house's parent street (placex_update takes the
+        // parent's postcode, find_parent_for_poi's street, else the nearest), else the street that
+        // won.
+        let postcode_street: Option<(u32, WayRow)> = if poi_won_primary {
+            None
+        } else if addr_won_primary {
+            addr.as_ref()
+                .and_then(|(_, point, _)| (point.parent_way_id != NO_DATA).then_some(point.parent_way_id))
+                .and_then(|id| Some((id, self.streets.as_ref()?.row(id)?)))
+                .or_else(|| street.as_ref().map(|(_, w, idx)| (*idx, *w)))
+        } else {
+            street.as_ref().map(|(_, w, idx)| (*idx, *w))
+        };
         let resolved_postcode = self.resolve_postcode(
             lat, lng,
-            if poi_won_primary { None } else { street.as_ref().map(|(_, w, idx)| (*idx as usize, w)) },
+            postcode_street.as_ref().map(|(idx, w)| (*idx as usize, w)),
             if addr_won_primary {
                 addr.as_ref().map(|(_, a, id)| (*id as usize, a))
             } else {
@@ -4928,6 +4990,32 @@ pub fn closest_point_on_line(nodes: &[NodeCoord], lat: f64, lng: f64) -> Option<
         }
     }
     best.map(|(_, plat, plng)| (plat, plng))
+}
+
+/// The point halfway along a line, as (lat, lng): Nominatim's centroid of a line
+/// (get_center_point, utils.sql), ST_LineInterpolatePoint(geometry, 0.5) on placex's lon/lat
+/// geometry, planar in degrees, and ST_ReducePrecision to 1e-7 degrees. A line of no length is
+/// its first point; None for one without nodes.
+pub fn line_middle(nodes: &[NodeCoord]) -> Option<(f64, f64)> {
+    let first = nodes.first()?;
+    let point = |n: &NodeCoord| (n.lat as f64, n.lng as f64);
+    let length = |a: (f64, f64), b: (f64, f64)| (b.0 - a.0).hypot(b.1 - a.1);
+    let total: f64 = nodes.windows(2).map(|w| length(point(&w[0]), point(&w[1]))).sum();
+    let mut left = total / 2.0;
+    let mut middle = point(first);
+    for w in nodes.windows(2) {
+        let (a, b) = (point(&w[0]), point(&w[1]));
+        let step = length(a, b);
+        if step > 0.0 && left <= step {
+            let t = left / step;
+            middle = (a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1));
+            break;
+        }
+        left -= step;
+        middle = b;
+    }
+    let reduce = |v: f64| (v * 1e7).round() / 1e7;
+    Some((reduce(middle.0), reduce(middle.1)))
 }
 
 pub fn point_to_segment_distance(
@@ -8405,7 +8493,7 @@ mod query_path_tests {
     }
 
     #[test]
-    fn query_reads_the_postcode_of_the_address_that_won_then_of_the_nearest_street() {
+    fn query_reads_the_postcode_of_the_address_that_won_then_of_its_street() {
         let index = TestIndex::new()
             .street("Mill Lane", &parallel(-1000.0, 200.0)).way_postcode("2000")
             .street("Main Street", &parallel(0.0, 200.0)).way_postcode("2020")
@@ -8423,10 +8511,10 @@ mod query_path_tests {
 
         // On house 7: its own postcode.
         assert_eq!(answer(29.0, 0.0), (some("Main Street"), some("7"), some("1010")));
-        // On house 5, which has none: the nearest street's.
+        // On house 5, which has none: its street's.
         assert_eq!(answer(29.0, -40.0), (some("Main Street"), some("5"), some("2020")));
-        // House 9 has none either and Side Street runs nearer it than its own street does.
-        assert_eq!(answer(59.0, 80.0), (some("Main Street"), some("9"), some("2121")));
+        // House 9 has none either: its street's, though Side Street runs nearer it.
+        assert_eq!(answer(59.0, 80.0), (some("Main Street"), some("9"), some("2020")));
         // On the street: house 7's, which gives the house number, as Nominatim answers with the
         // house (reverse.py lookup_street_poi); on house 5's side, the street's.
         assert_eq!(answer(1.0, 0.0), (some("Main Street"), some("7"), some("1010")));
