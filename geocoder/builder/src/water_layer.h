@@ -250,7 +250,11 @@ size_t drop_marine_namesakes(Build& b);
 
 // Names each unnamed river or canal object by `choices` (pick_names, by
 // object) and drops the objects with no name and their polygons, in place;
-// sums each object's area. Returns how many objects it named.
+// sums each object's area. Each object takes its choice's key and wikidata
+// item, by which the major tier joins it to its river, but one of a name of
+// its own only where they are its own: the choice's item its own item where
+// it has one, else the key's local name its local name. Returns how many
+// objects it named.
 size_t apply_names(Build& b, const std::vector<NameChoice>& choices);
 
 // Cuts each polygon of more than kSplitMaxHoles holes into pieces along the

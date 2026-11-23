@@ -860,6 +860,36 @@ TEST(namesakes_apart_are_rivers_of_their_own_and_a_line_lends_its_wikidata_item_
     CHECK(major == std::set<int64_t>({2103}));
 }
 
+TEST(a_named_river_area_takes_only_its_own_rivers_identity_from_the_line_of_most_length_in_it) {
+    // Two river areas of about 3 km2 far apart, each with a line of the
+    // Beta's relation (Q202) in it: one the Beta names, and the Alpha (Q101)
+    // of its own name. Joined, the two would be a wikidata river of 6 km2
+    // in the major tier; the Alpha is a river of its own, under 5 km2.
+    Collected c = fixture();
+    const int32_t side = 190000;
+    auto add_line = [&](int64_t way, int32_t lat) {
+        LineIn line;
+        line.way = way;
+        line.key = "r950";
+        line.local = line.display = "Beta";
+        line.qid = 202;
+        line.vertices = {pt(lat + side / 2, kLng + side / 10), pt(lat + side / 2, kLng + side * 9 / 10)};
+        c.lines.push_back(line);
+    };
+    c.closed_ways.push_back({2301, tags(code::kRiver, "Alpha", true, 101), square(kLat - 3000000, kLng, side)});
+    add_line(2311, kLat - 3000000);
+    c.closed_ways.push_back({2302, tags(code::kRiver, "", true), square(kLat - 4000000, kLng, side)});
+    add_line(2312, kLat - 4000000);
+    const auto [held, major] = ways_held(build(c), {2301, 2302});
+    CHECK(held == std::set<int64_t>({2301, 2302}));
+    CHECK(major.empty());
+    // An area of the Beta's own name, and no item, is the Beta's: the two
+    // Beta areas make 6 km2 together.
+    c.closed_ways.push_back({2303, tags(code::kRiver, "Beta", true), square(kLat - 5000000, kLng, side)});
+    add_line(2313, kLat - 5000000);
+    CHECK(ways_held(build(c), {2301, 2302, 2303}).second == std::set<int64_t>({2302, 2303}));
+}
+
 TEST(a_lake_the_major_tier_held_stays_in_it_at_95_km2_once_its_smallest_vertex_moves) {
     // A lake relation of one way round a square of about 105 km2; the next
     // day its south-west corner, the smallest vertex, moves in, and it holds

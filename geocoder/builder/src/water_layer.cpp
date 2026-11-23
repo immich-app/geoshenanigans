@@ -758,8 +758,16 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
     for (size_t o = 0; o < b.objects.size(); o++) {
         Object& obj = b.objects[o];
         if (o < choices.size() && choices[o].named()) {
-            obj.name_key = choices[o].key;
-            obj.key_qid = choices[o].qid;
+            // An area of a name of its own takes its line's river only where
+            // that is its own: of its wikidata item where it has one, else of
+            // its local name.
+            const NameChoice& c = choices[o];
+            const bool own = obj.tags.name.empty() ||
+                             (obj.tags.qid ? c.qid == obj.tags.qid : b.lines.key_local[c.key] == obj.tags.local_name);
+            if (own) {
+                obj.name_key = c.key;
+                obj.key_qid = c.qid;
+            }
             if (obj.tags.name.empty()) {
                 obj.tags.name = b.lines.displays[choices[o].display];
                 obj.tags.local_name = b.lines.key_local[choices[o].key];
