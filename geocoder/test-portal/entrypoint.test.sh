@@ -274,6 +274,14 @@ start "$d"
 check "a dataset without an optional file is not fetched again" eval '! fetched'
 BUCKET=$bucket
 
+# A region without address points has no addr_cities.bin.
+d="$work/optional-cities"
+BUCKET=$(bucket_without full/addr_cities.bin)
+start "$d"
+check "a build without the addresses' cities still serves" served "$d"
+check "a build without the addresses' cities leaves the rest of the selection" holds "$d"
+BUCKET=$bucket
+
 # A file the server needs that the build lacks fails the download, naming it,
 # and the next start tries again.
 d="$work/required"
