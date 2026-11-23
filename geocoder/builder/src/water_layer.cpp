@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -16,6 +17,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#include "admin_cover.h"
 #include "cell_index.h"
 #include "cell_index_io.h"
 #include "exact_pip.h"
@@ -75,6 +77,13 @@ std::optional<std::string> read_text(const std::string& path) {
     return s.str();
 }
 
+// Copies the file written at `from` to `to`; a copy that fails is refused.
+void copy_written(const std::string& from, const std::string& to) {
+    std::error_code ec;
+    std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) throw std::runtime_error("failed to copy " + from + " to " + to + ": " + ec.message());
+}
+
 void write_text(const std::string& path, const std::string& text) {
     std::ofstream f(path, std::ios::binary);
     f << text;
@@ -97,10 +106,12 @@ void write_fallback_sidecar(const std::string& path, const std::vector<uint64_t>
 }
 
 // The fallback keys of a sidecar of `slots` slots; none (every slot without
-// one) for a missing file. One of another slot count, or cut short, is refused.
+// one) for a missing file. One there that can't be opened, of another slot
+// count, or cut short, is refused.
 std::vector<uint64_t> read_fallback_sidecar(const std::string& path, size_t slots) {
+    if (path_absent(path)) return std::vector<uint64_t>(slots, gc::id_alloc::kNoFallbackKey);
     std::ifstream f(path, std::ios::binary);
-    if (!f) return std::vector<uint64_t>(slots, gc::id_alloc::kNoFallbackKey);
+    if (!f) throw std::runtime_error("unreadable water polygon fallback sidecar " + path);
     uint32_t head[3];
     std::vector<uint64_t> keys;
     if (f.read(reinterpret_cast<char*>(head), sizeof head) && head[0] == kFallbackSidecarMagic &&
@@ -126,7 +137,9 @@ bool load_polygon_sidecar(IdAllocator& alloc, const std::string& path) {
 struct PolygonSlots {
     std::vector<uint32_t> slot_of;  // parallel to the layer's records, NO_DATA for a polygon not here
     uint32_t count = 0;
-    size_t kept = 0, by_fallback = 0;
+    // The polygons that kept a live slot of the previous build's (by_fallback
+    // of them by their fallback keys), and those that took a freed one.
+    size_t kept = 0, by_fallback = 0, recycled = 0;
 };
 
 PolygonSlots polygon_slots(const Layer& layer, const std::vector<uint32_t>& ids, const std::string& prev_dir,
@@ -139,7 +152,10 @@ PolygonSlots polygon_slots(const Layer& layer, const std::vector<uint32_t>& ids,
     std::vector<gc::id_alloc::FallbackPass> passes;
     passes.push_back({[&](size_t k) { return layer.fallbacks[ids[k]]; },
                       [&](uint32_t s) { return s < prev_fallback.size() ? prev_fallback[s] : gc::id_alloc::kNoFallbackKey; }});
-    const uint32_t previous_slots = alloc.total_slots();
+    // The previous slots a polygon kept: those it can claim, live ones
+    // (IdAllocator recycles the others).
+    std::vector<uint8_t> was_live(alloc.total_slots());
+    for (size_t s = 0; s < was_live.size(); s++) was_live[s] = gc::id_alloc::is_reclaimable(alloc.slots()[s]);
     const std::vector<uint32_t> slots = alloc.allocate_all(ids.size(), [&](size_t k) {
         const uint64_t key = layer.identities[ids[k]];
         return gc::id_alloc::SlotIdentity{static_cast<ObjectType>(key >> 56), key & 0x00FFFFFFFFFFFFFFull, 0};
@@ -152,7 +168,9 @@ PolygonSlots polygon_slots(const Layer& layer, const std::vector<uint32_t>& ids,
     out.slot_of.assign(layer.size(), NO_DATA);
     for (size_t k = 0; k < ids.size(); k++) {
         out.slot_of[ids[k]] = slots[k];
-        out.kept += slots[k] < previous_slots;
+        if (slots[k] >= was_live.size()) continue;
+        out.kept += was_live[slots[k]];
+        out.recycled += !was_live[slots[k]];
     }
     std::vector<uint64_t> at_slot(out.count, gc::id_alloc::kNoFallbackKey);
     for (size_t k = 0; k < ids.size(); k++) at_slot[slots[k]] = layer.fallbacks[ids[k]];
@@ -272,9 +290,10 @@ Build assemble(Collected& c, unsigned threads) {
     free_storage(c.member_geometries.coords);
     free_storage(c.member_geometries.ways);
 
-    // The closed ways an assembled relation takes whole as an outer ring
-    // (every way run of the ring theirs), by way: the relations' indices.
-    std::unordered_map<int64_t, std::vector<uint32_t>> outer_of;
+    // The outer rings of assembled relations that are one closed way's
+    // (every way run of the ring theirs), by way: the relation's index and
+    // the polygon's.
+    std::unordered_map<int64_t, std::vector<std::pair<uint32_t, uint32_t>>> outer_of;
     for (uint32_t i = 0; i < c.relations.size(); i++) {
         const Assembled& a = assembled[i];
         if (a.missing) continue;
@@ -284,22 +303,39 @@ Build assemble(Collected& c, unsigned threads) {
             const int64_t way = runs[0].way;
             bool whole = true;
             for (const WayRun& r : runs) whole &= r.way == way;
-            if (whole) outer_of[way].push_back(i);
+            if (whole) outer_of[way].push_back({i, static_cast<uint32_t>(k)});
         }
     }
-    // Whether closed way w is such an outer ring of a relation of its kind
+    // The lowest wikidata item of the closed ways left to each relation, by
+    // relation index (0 for none).
+    std::vector<uint32_t> twin_qid(c.relations.size(), 0);
+    // Whether closed way w is the whole outer ring of a relation of its kind
     // and names: one body tagged twice, which the relation gives, its
-    // islands left out.
+    // islands left out. Its ring as the assembly reads it (each run of
+    // vertices at one place one vertex) must be that outer ring, from any
+    // vertex and either way round: an outer ring the assembly cut a stretch
+    // of the way out of is less than the way. Notes w's wikidata item for
+    // each such relation.
     auto twin = [&](const ClosedWayArea& w) {
         auto it = outer_of.find(w.way);
         if (it == outer_of.end()) return false;
-        for (uint32_t i : it->second) {
+        std::vector<PackedLocation> ring;
+        ring.reserve(w.vertices.size());
+        for (const PackedLocation& p : w.vertices)
+            if (ring.empty() || ring.back() != p) ring.push_back(p);
+        bool found = false;
+        for (const auto& [i, k] : it->second) {
             const ObjectTags& t = c.relations[i].tags;
-            if (t.code == w.tags.code && t.verbatim == w.tags.verbatim && t.name == w.tags.name &&
-                t.local_name == w.tags.local_name)
-                return true;
+            const std::vector<PackedLocation>& outer = assembled[i].polygons[k].outer;
+            if (t.code != w.tags.code || t.verbatim != w.tags.verbatim || t.name != w.tags.name ||
+                t.local_name != w.tags.local_name ||
+                !same_closed_ring(outer.data(), static_cast<uint32_t>(outer.size()), ring.data(),
+                                  static_cast<uint32_t>(ring.size())))
+                continue;
+            found = true;
+            if (w.tags.qid && (!twin_qid[i] || w.tags.qid < twin_qid[i])) twin_qid[i] = w.tags.qid;
         }
-        return false;
+        return found;
     };
 
     auto add_object = [&](ObjectType type, int64_t id, ObjectTags&& tags) {
@@ -339,7 +375,13 @@ Build assemble(Collected& c, unsigned threads) {
         for (size_t k = 0; k < a.polygons.size(); k++) {
             NestedPolygon<PackedLocation>& p = a.polygons[k];
             if (p.outer.size() < 4) continue;
-            if (object == UINT32_MAX) object = add_object(ObjectType::OSM_RELATION, c.relations[i].id, std::move(c.relations[i].tags));
+            if (object == UINT32_MAX) {
+                // A relation of no wikidata item of its own takes that of
+                // the ways left to it.
+                ObjectTags& t = c.relations[i].tags;
+                if (!t.qid) t.qid = twin_qid[i];
+                object = add_object(ObjectType::OSM_RELATION, c.relations[i].id, std::move(t));
+            }
             std::vector<std::vector<WayRun>> runs;
             runs.push_back(std::move(a.runs[k].outer));
             for (auto& h : a.runs[k].holes) runs.push_back(std::move(h));
@@ -540,40 +582,58 @@ struct Frac {
 
 bool frac_less(const Frac& a, const Frac& b) { return a.num * b.den < b.num * a.den; }
 
-// Whether polygons a and b, their rings counted even-odd, hold water
-// together: an open stretch of a parallel that both hold. Between two
-// latitudes a vertex of either lies on, each edge spans the band or misses
-// it. An edge of one that crosses an edge of the other inside a band (the
-// two in one order at its foot, the other at its top) has water of both
-// beside it; with none, the edges keep their order across the band, which
-// holds water of both just where its middle parallel does. A shared side
-// or a vertex on the other's side holds none. Every value is exact: a
-// longitude's numerator is under 2^65, its denominator 2^32.
-bool polygons_overlap(const AdminExactRings& rings, uint32_t a, uint32_t b) {
+// Whether the polygons `cover` (their rings together counted even-odd:
+// polygons that don't overlap, so their union) hold all the water of the
+// polygons `area` (theirs together, likewise): no open stretch of a
+// parallel that `area` holds and `cover` doesn't. Between two latitudes a
+// vertex of either lies on, each edge spans the band or misses it, and an
+// edge of `cover` and one of `area` along one line across it (a shared
+// shore), or two of `cover` (the side two of its polygons share), are taken
+// once each or cancel. An edge of `area` crossing one of `cover` (in one
+// order at the band's foot, the other at its top) has water of `area`
+// beside it that `cover` doesn't hold; two edges of one side crossing (rings
+// that aren't valid) are taken as alike. With no crossing, the edges keep
+// their order across the band, which holds just what its middle parallel
+// does. Edges east of the area's box hold nothing
+// of it, and those wholly west of it only whether its west side starts in
+// `cover`. Every value is exact: a longitude's numerator is under 2^65, its
+// denominator 2^32.
+bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& cover, const std::vector<uint32_t>& area) {
     struct Edge {
         int64_t lat0, lat1, lng0, lng1;  // lat0 < lat1
-        int of;                          // 0 for a, 1 for b
+        int of;                          // 0 for the area, 1 for the cover
+        bool west;                       // wholly west of the area's box
     };
     std::vector<Edge> edges;
     std::vector<int64_t> lats;
-    int64_t lo[2] = {INT64_MAX, INT64_MAX}, hi[2] = {INT64_MIN, INT64_MIN};
-    for (int of = 0; of < 2; of++) {
-        const uint32_t p = of ? b : a;
+    int64_t lat_lo = INT64_MAX, lat_hi = INT64_MIN, lng_lo = INT64_MAX, lng_hi = INT64_MIN;
+    auto each_edge = [&](uint32_t p, auto fn) {
         const RingSpan* span = rings.rings_of(p);
         for (uint32_t k = 0; k < rings.polygons[p].ring_count; k++) {
             const PackedLocation* v = rings.vertices.data() + span[k].begin;
-            for (uint32_t i = 0; i + 1 < span[k].count; i++) {
-                const PackedLocation s = v[i], t = v[i + 1];
-                lats.push_back(s.lat_e7);
-                lo[of] = std::min<int64_t>(lo[of], s.lat_e7);
-                hi[of] = std::max<int64_t>(hi[of], s.lat_e7);
-                if (s.lat_e7 < t.lat_e7) edges.push_back({s.lat_e7, t.lat_e7, s.lon_e7, t.lon_e7, of});
-                if (t.lat_e7 < s.lat_e7) edges.push_back({t.lat_e7, s.lat_e7, t.lon_e7, s.lon_e7, of});
-            }
+            for (uint32_t i = 0; i + 1 < span[k].count; i++) fn(v[i], v[i + 1]);
         }
-    }
-    const int64_t lat_lo = std::max(lo[0], lo[1]), lat_hi = std::min(hi[0], hi[1]);
-    if (lat_lo >= lat_hi) return false;
+    };
+    for (uint32_t p : area)
+        each_edge(p, [&](PackedLocation s, PackedLocation t) {
+            lat_lo = std::min<int64_t>(lat_lo, s.lat_e7), lat_hi = std::max<int64_t>(lat_hi, s.lat_e7);
+            lng_lo = std::min<int64_t>(lng_lo, s.lon_e7), lng_hi = std::max<int64_t>(lng_hi, s.lon_e7);
+            lats.push_back(s.lat_e7);
+            if (s.lat_e7 < t.lat_e7) edges.push_back({s.lat_e7, t.lat_e7, s.lon_e7, t.lon_e7, 0, false});
+            if (t.lat_e7 < s.lat_e7) edges.push_back({t.lat_e7, s.lat_e7, t.lon_e7, s.lon_e7, 0, false});
+        });
+    if (lat_lo >= lat_hi) return true;
+    for (uint32_t p : cover)
+        each_edge(p, [&](PackedLocation s, PackedLocation t) {
+            if (s.lat_e7 == t.lat_e7 || std::max(s.lat_e7, t.lat_e7) <= lat_lo || std::min(s.lat_e7, t.lat_e7) >= lat_hi ||
+                std::min(s.lon_e7, t.lon_e7) > lng_hi)
+                return;
+            const bool west = std::max(s.lon_e7, t.lon_e7) < lng_lo;
+            for (const int32_t lat : {s.lat_e7, t.lat_e7})
+                if (lat > lat_lo && lat < lat_hi) lats.push_back(lat);
+            if (s.lat_e7 < t.lat_e7) edges.push_back({s.lat_e7, t.lat_e7, s.lon_e7, t.lon_e7, 1, west});
+            else edges.push_back({t.lat_e7, s.lat_e7, t.lon_e7, s.lon_e7, 1, west});
+        });
     std::sort(lats.begin(), lats.end());
     lats.erase(std::unique(lats.begin(), lats.end()), lats.end());
     std::sort(edges.begin(), edges.end(), [](const Edge& x, const Edge& y) { return x.lat0 < y.lat0; });
@@ -587,9 +647,14 @@ bool polygons_overlap(const AdminExactRings& rings, uint32_t a, uint32_t b) {
         Frac foot, top;
         int of;
     };
+    auto less = [](const Ends& x, const Ends& y) {
+        if (frac_less(x.foot, y.foot)) return true;
+        if (frac_less(y.foot, x.foot)) return false;
+        return frac_less(x.top, y.top);
+    };
+    auto same = [&](const Ends& x, const Ends& y) { return !less(x, y) && !less(y, x); };
     std::vector<uint32_t> active;
-    std::vector<Ends> band;
-    std::vector<Frac> middle[2];
+    std::vector<Ends> band, once;
     size_t next = 0;
     for (size_t k = 0; k + 1 < lats.size() && lats[k] < lat_hi; k++) {
         const int64_t foot = lats[k], top = lats[k + 1];
@@ -597,36 +662,32 @@ bool polygons_overlap(const AdminExactRings& rings, uint32_t a, uint32_t b) {
         active.erase(std::remove_if(active.begin(), active.end(), [&](uint32_t e) { return edges[e].lat1 <= foot; }),
                      active.end());
         if (top <= lat_lo) continue;
+        // In the cover west of the area's box, and the other edges, each
+        // line of one side across the band taken as often as it is, mod 2.
+        bool in_cover = false;
         band.clear();
-        bool has[2] = {false, false};
         for (uint32_t e : active) {
-            band.push_back({at(edges[e], foot, 1), at(edges[e], top, 1), edges[e].of});
-            has[edges[e].of] = true;
+            if (edges[e].west) in_cover = !in_cover;
+            else band.push_back({at(edges[e], foot, 1), at(edges[e], top, 1), edges[e].of});
         }
-        if (!has[0] || !has[1]) continue;
-        std::sort(band.begin(), band.end(), [](const Ends& x, const Ends& y) {
-            if (frac_less(x.foot, y.foot)) return true;
-            if (frac_less(y.foot, x.foot)) return false;
-            return frac_less(x.top, y.top);
-        });
-        int highest[2] = {-1, -1};  // of each, the edge so far of the highest top
-        for (size_t j = 0; j < band.size(); j++) {
-            const int other = highest[1 - band[j].of];
-            if (other >= 0 && frac_less(band[j].top, band[other].top)) return true;
-            int& mine = highest[band[j].of];
-            if (mine < 0 || frac_less(band[mine].top, band[j].top)) mine = static_cast<int>(j);
+        std::sort(band.begin(), band.end(),
+                  [&](const Ends& x, const Ends& y) { return x.of != y.of ? x.of < y.of : less(x, y); });
+        once.clear();
+        for (size_t i = 0; i < band.size();) {
+            size_t j = i + 1;
+            while (j < band.size() && band[j].of == band[i].of && same(band[j], band[i])) j++;
+            if ((j - i) % 2) once.push_back(band[i]);
+            i = j;
         }
-        for (auto& m : middle) m.clear();
-        for (uint32_t e : active) middle[edges[e].of].push_back(at(edges[e], foot + top, 2));
-        for (auto& m : middle) std::sort(m.begin(), m.end(), frac_less);
-        for (size_t i = 0, j = 0; i + 1 < middle[0].size() && j + 1 < middle[1].size();) {
-            const Frac &a0 = middle[0][i], &a1 = middle[0][i + 1], &b0 = middle[1][j], &b1 = middle[1][j + 1];
-            if (frac_less(a0, a1) && frac_less(b0, b1) && frac_less(a0, b1) && frac_less(b0, a1)) return true;
-            if (frac_less(a1, b1)) i += 2;
-            else j += 2;
+        std::sort(once.begin(), once.end(), less);
+        bool in_area = false;
+        for (size_t i = 0; i < once.size(); i++) {
+            if (i + 1 < once.size() && frac_less(once[i + 1].top, once[i].top)) return false;
+            (once[i].of ? in_cover : in_area) ^= true;
+            if (i + 1 < once.size() && !same(once[i], once[i + 1]) && in_area && !in_cover) return false;
         }
     }
-    return false;
+    return true;
 }
 
 }  // namespace
@@ -651,12 +712,6 @@ size_t drop_marine_namesakes(Build& b) {
     auto boxes_meet = [](const ExactRingBox& x, const ExactRingBox& y) {
         return x.lat_lo <= y.lat_hi && y.lat_lo <= x.lat_hi && x.lng_lo <= y.lng_hi && y.lng_lo <= x.lng_hi;
     };
-    auto overlap = [&](uint32_t x, uint32_t y) {
-        for (uint32_t p = first[x]; p < first[x + 1]; p++)
-            for (uint32_t q = first[y]; q < first[y + 1]; q++)
-                if (boxes_meet(box_of(p), box_of(q)) && polygons_overlap(b.rings, p, q)) return true;
-        return false;
-    };
     std::vector<uint8_t> keep(b.objects.size(), 1);
     std::ostringstream log;
     size_t dropped = 0;
@@ -669,14 +724,28 @@ size_t drop_marine_namesakes(Build& b) {
             auto it = marine.find(namesake_key(*name));
             if (it != marine.end()) namesakes.insert(it->second.begin(), it->second.end());
         }
+        if (namesakes.empty() || first[o] == first[o + 1]) continue;
+        // Its polygons, and its namesakes' that meet their box.
+        std::vector<uint32_t> area, cover;
+        ExactRingBox box = box_of(first[o]);
+        for (uint32_t p = first[o]; p < first[o + 1]; p++) {
+            area.push_back(p);
+            const ExactRingBox q = box_of(p);
+            box = {std::min(box.lat_lo, q.lat_lo), std::max(box.lat_hi, q.lat_hi), std::min(box.lng_lo, q.lng_lo),
+                   std::max(box.lng_hi, q.lng_hi)};
+        }
+        uint32_t named = UINT32_MAX;
         for (uint32_t m : namesakes)
-            if (overlap(o, m)) {
-                keep[o] = 0;
-                dropped++;
-                log << "  Water: " << object_ref(obj) << " (" << obj.tags.name << ") left out as the namesake of marine area "
-                    << object_ref(b.objects[m]) << "\n";
-                break;
-            }
+            for (uint32_t q = first[m]; q < first[m + 1]; q++)
+                if (boxes_meet(box, box_of(q))) {
+                    cover.push_back(q);
+                    named = std::min(named, m);
+                }
+        if (cover.empty() || !polygons_cover(b.rings, cover, area)) continue;
+        keep[o] = 0;
+        dropped++;
+        log << "  Water: " << object_ref(obj) << " (" << obj.tags.name << ") left out as the namesake of marine area "
+            << object_ref(b.objects[named]) << ": the marine areas of its name hold all of it\n";
     }
     if (dropped) keep_objects(b, keep);
     std::cerr << log.str();
@@ -1116,6 +1185,76 @@ Layer subset_layer(const Layer& planet, const std::vector<uint8_t>& kept, unsign
     return out;
 }
 
+std::vector<uint8_t> routed_cell_masks(const std::vector<CellItemPair>& cells, size_t regions,
+                                       const std::function<bool(size_t, uint64_t)>& holds, unsigned threads) {
+    if (regions > 8) throw std::logic_error("routed_cell_masks: more than 8 regions");
+    if (threads == 0) threads = parallel_threads();
+    std::vector<uint8_t> masks(cells.size(), 0);
+    parallel_for_runs(cells.size(), [&](size_t i) { return cells[i].cell_id == cells[i - 1].cell_id; },
+                      [&](size_t begin, size_t end, unsigned) {
+        std::vector<std::function<bool(uint64_t)>> held;
+        for (size_t r = 0; r < regions; r++) held.push_back([&holds, r](uint64_t cell) { return holds(r, cell); });
+        for (size_t i = begin; i < end;) {
+            const uint64_t cell = cells[i].cell_id;
+            uint8_t mask = 0;
+            for (size_t r = 0; r < regions; r++)
+                if (admin_cell_routed(cell, held[r])) mask |= static_cast<uint8_t>(1u << r);
+            for (; i < end && cells[i].cell_id == cell; i++) masks[i] = mask;
+        }
+    }, threads);
+    return masks;
+}
+
+std::vector<uint64_t> share_bytes(const Layer& planet, const std::vector<uint8_t>& masks, size_t regions) {
+    if (regions > 8) throw std::logic_error("share_bytes: more than 8 regions");
+    if (masks.size() != planet.cells.size()) throw std::logic_error("water cell masks out of step with the cells");
+    std::vector<uint64_t> out(regions, 0);
+    auto add = [&](uint8_t mask, uint64_t bytes) {
+        for (size_t r = 0; r < regions; r++)
+            if (mask >> r & 1) out[r] += bytes;
+    };
+    // The regions of each polygon its cells give it, and the entries.
+    std::vector<uint8_t> of_polygon(planet.size(), 0);
+    uint8_t any = 0;
+    for (size_t i = 0; i < masks.size(); i++) {
+        of_polygon[planet.cells[i].item_id & ID_MASK] |= masks[i];
+        any |= masks[i];
+        add(masks[i], sizeof(CellItemPair));
+    }
+    // The last offsets of a region's ring refs and of each tier's blocks.
+    const ArcStage& stage = *planet.arcs.stage;
+    add(any, (1 + stage.tier_count) * sizeof(uint32_t));
+    // Each polygon's: its record, identities and marks, its name, its rings'
+    // refs and its ring blocks; and the regions of each arc its rings use.
+    const ArcSetBlocks& set = planet.arcs.set(ArcSet::Full);
+    std::vector<uint8_t> of_arc(set.arcs(), 0);
+    constexpr uint64_t kPolygonBytes =
+        sizeof(AdminPolygon) + 2 * sizeof(uint64_t) + 2 * sizeof(uint8_t) + sizeof(AdminArcPolygon);
+    for (size_t p = 0; p < planet.size(); p++) {
+        const uint8_t mask = of_polygon[p];
+        if (!mask) continue;
+        const AdminArcPolygon& poly = planet.arcs.polygons[p];
+        uint64_t bytes = kPolygonBytes + poly.blocks[0].size + poly.blocks[1].size +
+                         std::strlen(planet.names.data() + planet.records[p].name_id) + 1;
+        for (uint32_t r = poly.first_ring; r < poly.first_ring + poly.ring_count; r++) {
+            bytes += sizeof(uint32_t) + (set.ring_refs[r + 1] - set.ring_refs[r]) * sizeof(ArcRef);
+            for (uint32_t k = set.ring_refs[r]; k < set.ring_refs[r + 1]; k++) of_arc[set.refs[k].arc] |= mask;
+        }
+        add(mask, bytes);
+    }
+    // Each arc's: its box, keys and slots, and its blocks in every tier.
+    constexpr uint64_t kArcBytes = sizeof(ArcBox) + sizeof(uint64_t) + sizeof(ArcFallbackKeys) + 2 * sizeof(uint32_t) +
+                                   sizeof(gc::id_alloc::SidecarSlot);
+    for (size_t a = 0; a < of_arc.size(); a++) {
+        if (!of_arc[a]) continue;
+        uint64_t bytes = kArcBytes;
+        for (size_t t = 0; t < stage.tier_count; t++)
+            if (!planet.arcs.tiers[t].at.empty()) bytes += planet.arcs.tiers[t].bytes_of(a) + sizeof(uint32_t);
+        add(of_arc[a], bytes);
+    }
+    return out;
+}
+
 std::string sitelinks_rows(const Build& b, const Layer& planet, const std::vector<int>& min_sitelinks,
                            const std::function<uint32_t(uint32_t)>& sitelinks) {
     std::ostringstream out;
@@ -1180,8 +1319,9 @@ std::string attribution_json(bool marine) {
             "    \"licence_url\": \"https://creativecommons.org/licenses/by/4.0/\",\n"
             "    \"notices\": [\n"
             "      \"Changes: each IHO sea area's parts in every EEZ dissolved into one, cut to the water off "
-            "OpenStreetMap's land polygons and along a 1-degree grid, and simplified in the simplified tiers. Cut "
-            "to OpenStreetMap's land, the areas are part of this dataset's ODbL derivative database.\"\n"
+            "OpenStreetMap's land polygons and along a 1-degree grid, the coastal water the sea areas leave out "
+            "given to the nearest sea area, and simplified in the simplified tiers. Cut to OpenStreetMap's land, "
+            "the areas are part of this dataset's ODbL derivative database.\"\n"
             "    ]\n"
             "  }";
     return out + "\n]\n";
@@ -1229,8 +1369,11 @@ std::string write_set(const Layer& layer, const std::vector<uint32_t>& ids, cons
     std::array<uint32_t, STR_TIER_COUNT + 1> bases;
     bases.fill(static_cast<uint32_t>(names.bytes().size()));
     bases[0] = 0;
+    // The cell index encoded once, its files copied to the other dirs.
+    write_cell_index_sorted(dirs[0] + "/admin_cells.bin", dirs[0] + "/admin_entries.bin", cell_pairs::ADMIN, cells);
+    for (size_t d = 1; d < dirs.size(); d++)
+        for (const char* f : {"/admin_cells.bin", "/admin_entries.bin"}) copy_written(dirs[0] + f, dirs[d] + f);
     for (const std::string& dir : dirs) {
-        write_cell_index_sorted(dir + "/admin_cells.bin", dir + "/admin_entries.bin", cell_pairs::ADMIN, cells);
         string_files::write_file(dir + "/" + STR_TIER_FILENAMES[0], names.bytes().data(), names.bytes().size());
         write_strings_layout(dir, bases);
         write_text(dir + "/water_meta.json", meta);
@@ -1240,9 +1383,9 @@ std::string write_set(const Layer& layer, const std::vector<uint32_t>& ids, cons
     for (const auto& [t, dir] : tier_dirs) arc_bytes += blocks.tiers[t].bytes.size();
     std::ostringstream line;
     line << ids.size() << " polygons in " << slots.count << " slots (" << slots.kept << " kept, " << slots.by_fallback
-         << " by fallback), " << ring_bytes << " ring bytes, " << arc_bytes << " arc bytes, " << count_cells(cells)
-         << " cells, " << cells.size() << " entries, " << names.bytes().size() << " name bytes, " << codes.size()
-         << " types";
+         << " by fallback, " << slots.recycled << " recycled), " << ring_bytes << " ring bytes, " << arc_bytes
+         << " arc bytes, " << count_cells(cells) << " cells, " << cells.size() << " entries, " << names.bytes().size()
+         << " name bytes, " << codes.size() << " types";
     return line.str();
 }
 

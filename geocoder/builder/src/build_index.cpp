@@ -63,6 +63,7 @@
 #include "tiger.h"
 #include "way_tags.h"
 #include "node_index.h"
+#include "paged_bits.h"
 #include "string_dict.h"
 #include "vertex_pack.h"
 #include "memory_limit.h"
@@ -1441,7 +1442,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                 water::write_water_exact(d.water, base_dir);
         };
 
-        const StageCosts costs = stage_costs(record_bytes(d));
+        const StageCosts costs = stage_costs(record_bytes(d), d.water.cells.size());
         struct Stage {
             const char* name;
             std::function<void()> write;
@@ -1524,7 +1525,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
     // when the budget holds them beside the costliest continents that can
     // run together; else one after another, to hold memory down while
     // continent subsets build alongside.
-    const uint64_t planet_stages = stage_costs(record_bytes(data)).total();
+    const uint64_t planet_stages = stage_costs(record_bytes(data), data.water.cells.size()).total();
 
     // The planet's own write and each continent's split read the planet
     // records; the last of them to finish frees them beside the work left,
@@ -1540,7 +1541,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
     auto write_planet = [&](uint64_t beside) {
         const RunOrder order = planet_stages + beside <= budget.capacity() ? RunOrder::Concurrent : RunOrder::Serial;
         const KindValues bytes = record_bytes(data);
-        const StageCosts costs = stage_costs(bytes);
+        const StageCosts costs = stage_costs(bytes, data.water.cells.size());
         std::cerr << "Planet: stages " << (order == RunOrder::Serial ? "one at a time" : "at once") << " (admins "
                   << (at(bytes, RecordKind::Admins) >> 20) << " MiB, pois " << (at(bytes, RecordKind::Pois) >> 20)
                   << " MiB, waters " << (at(bytes, RecordKind::Waters) >> 20)
@@ -1624,8 +1625,15 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         auto poi_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_poi_cells); });
         auto place_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_place_cells); });
         // The water cell index's, which the schedule alone reads: the split
-        // routes the water cells itself.
-        auto water_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.water.cells); });
+        // routes the water cells itself, keeping a cell the continent holds
+        // or one around (copy_water), by its polygon or else its box.
+        auto water_masks = std::async(std::launch::async, [&] {
+            return water::routed_cell_masks(data.water.cells, std::min<size_t>(kContinentCount, 8),
+                                            [&](size_t c, uint64_t cell) {
+                const PolygonIndex* polygon = c < indexes.size() && indexes[c] ? &*indexes[c] : nullptr;
+                return cell_in_continent(cell, kContinents[c], polygon);
+            });
+        });
         auto way_continent_masks = way_masks.get();
         auto addr_continent_masks = addr_masks.get();
         auto interp_continent_masks = interp_masks.get();
@@ -1652,6 +1660,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             for (const auto& per_worker : counts)
                 for (size_t c = 0; c < kContinentCount && c < 8; c++) at(continent_pairs[c], kind) += per_worker[c];
         }
+        // What each continent's share of the water layer holds: a polygon of
+        // its cells comes whole, with its arcs.
+        const std::vector<uint64_t> water_shares =
+            water::share_bytes(data.water, water_continent_masks, std::min<size_t>(kContinentCount, 8));
         free_storage(water_continent_masks);
         std::vector<size_t> continent_order(kContinentCount);
         std::iota(continent_order.begin(), continent_order.end(), 0u);
@@ -1674,13 +1686,15 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         };
         std::vector<ContinentRun> pending;
         for (size_t c : continent_order) {
-            const KindValues bytes = continent_share(planet_bytes, planet_pairs, continent_pairs[c]);
+            const KindValues bytes = continent_share(planet_bytes, planet_pairs, continent_pairs[c],
+                                                     c < water_shares.size() ? water_shares[c] : 0);
             const KindValues counts = continent_share(planet_counts, planet_pairs, continent_pairs[c]);
             const uint64_t filter_bytes = filter_cost(planet_counts, planet_pairs, continent_pairs[c]);
             // Its write runs without a budget (run_continent), so its
             // reservation holds every stage, the boundary tiers and both
             // admin-minimal dirs included.
-            pending.push_back({c, continent_cost(bytes, counts, filter_bytes, budget.capacity())});
+            pending.push_back({c, continent_cost(bytes, counts, filter_bytes, budget.capacity(),
+                                                 at(continent_pairs[c], RecordKind::Waters))});
         }
         // A continent past the budget even with its steps one after another
         // goes last, once nothing else reads the planet records: its split
@@ -1969,8 +1983,9 @@ static int run(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
         std::cerr << "  <output-dir> must be new or empty" << std::endl;
-        std::cerr << "  Without --multi-output each region's dir is one whole index: the mode's files" << std::endl;
-        std::cerr << "  and the admin geometry at the exact tier" << std::endl;
+        std::cerr << "  Without --multi-output each region's dir is one whole index: the mode's files," << std::endl;
+        std::cerr << "  the admin geometry at the exact tier and <region>/water/ (the water layer's exact tier)"
+                  << std::endl;
         std::cerr << std::endl;
         std::cerr << "Options:" << std::endl;
         std::cerr << "  --street-level N       S2 cell level for streets (default: 17)" << std::endl;
@@ -2519,13 +2534,15 @@ static int run(int argc, char* argv[]) {
             // The water layer's relation member ways: the areas' (the
             // waterways' are in water_collected.waterway_of_way).
             water::index_collected(water_collected);
-            std::vector<uint8_t> water_way_bits(MAX_WAY_ID / 8 + 1, 0);
+            // In pages, which only the member ways' ids allocate: an extract
+            // without water relations holds none.
+            PagedBits water_way_bits(MAX_WAY_ID);
             // The member ways of ids the bits don't reach.
             std::unordered_set<int64_t> water_ways_past;
             size_t water_way_count = 0;
             auto mark_water_way = [&](int64_t way_id) {
                 if (way_id > 0 && static_cast<size_t>(way_id) < MAX_WAY_ID)
-                    water_way_bits[way_id / 8] |= (1 << (way_id % 8));
+                    water_way_bits.set(static_cast<uint64_t>(way_id));
                 else
                     water_ways_past.insert(way_id);
                 water_way_count++;
@@ -2534,7 +2551,7 @@ static int run(int argc, char* argv[]) {
                 for (const auto& [way_id, role] : rel.members) mark_water_way(way_id);
             auto is_water_way = [&](int64_t id) -> bool {
                 if (id <= 0 || static_cast<size_t>(id) >= MAX_WAY_ID) return water_ways_past.count(id) > 0;
-                return water_way_bits[id / 8] & (1 << (id % 8));
+                return water_way_bits.test(static_cast<uint64_t>(id));
             };
             auto in_waterway = [&](const WayTags& t, int64_t id) {
                 return water::is_naming_waterway(t.waterway) && water_collected.waterway_of_way.count(id) > 0;

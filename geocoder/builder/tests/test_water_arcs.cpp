@@ -52,7 +52,7 @@ TEST(water_rings_are_cut_where_their_member_ways_meet) {
     AdminExactRings store;
     store.append(square.ring, {}, square.runs);
     const AdminArcs junctions = build_arc_topology(store, 1);
-    CHECK_EQ(junctions.arcs.size(), size_t(1));
+    REQUIRE(junctions.arcs.size() == 1u);
     CHECK(junctions.arcs[0].view.closed);
     const AdminArcs ends = build_arc_topology(store, 1, {}, ArcCuts::JunctionsAndWayEnds);
     CHECK_EQ(ends.counts.way_ends, size_t(2));
@@ -183,7 +183,7 @@ TEST(the_water_stage_builds_and_encodes_its_two_tiers_with_no_minimal_set) {
     }
     CHECK(arcs.stage == &kWaterArcStage);
     CHECK(blocks.stage == &kWaterArcStage);
-    CHECK_EQ(arcs.tiers.size(), kWaterArcTierCount);
+    REQUIRE(arcs.tiers.size() == kWaterArcTierCount);
     CHECK(arcs.minimal.arcs.empty());
     CHECK(arcs.minimal.ring_refs.empty());
     CHECK_EQ(arcs.arcs.size(), size_t(4));
@@ -282,6 +282,39 @@ TEST(a_ring_the_ponds_shore_on_the_e7_grid_would_flatten_keeps_its_own_shore_on_
     std::vector<PackedLocation> ring, raw;
     std::vector<StoredVertex> stored;
     tier_ring(arcs, store, water_simplified(), water, 1, ring, raw, stored);
+    CHECK(exact_ring_area2(ring.data(), static_cast<uint32_t>(ring.size())) != 0);
+    for (const PackedLocation& v : ring) CHECK(v.lat_e7 % 100 != 0);
+}
+
+TEST(a_ring_the_nesting_pass_flattens_at_a_junction_it_moves_keeps_its_own_shore_on_the_e7_grid) {
+    // A lake whose island the 100 grid moves across its shore, and a
+    // triangle meeting the lake's shore at a vertex. Snapped whole every
+    // ring holds an area; on the grid the island crosses the shore, with no
+    // vertex to give back, so the nesting pass puts the lake and that vertex
+    // on the e7 grid, where the triangle's three vertices lie on one line.
+    const int32_t lat = 470000000, lng = 80000000;
+    AdminExactRings store;
+    // The lake's west shore runs along lng = lat / 2 from (40, 20); the
+    // island's corner (1149, 551) is just west of it, and snaps east of it.
+    store.append(closed({pt(lat + 40, lng + 20), pt(lat + 100000, lng + 50000), pt(lat + 100000, lng - 50000),
+                         pt(lat, lng - 50000)}),
+                 {closed({pt(lat + 1149, lng + 551), pt(lat + 1149, lng + 351), pt(lat + 1349, lng + 351),
+                          pt(lat + 1349, lng + 551)})});
+    store.append(closed({pt(lat + 40, lng + 20), pt(lat + 110, lng + 190), pt(lat + 190, lng + 510)}), {});
+    const AdminArcs arcs = build_arc_topology(store, 1, {}, ArcCuts::JunctionsAndWayEnds);
+    const std::vector<bool> nests = exact_rings_nest(store, 1);
+    REQUIRE(nests[0] && nests[1]);
+    const ArcTierState water = build_arc_tier(arcs, store, water_simplified(), nests, 1);
+    CHECK(water.counts.e7_grid_rounds >= 1);
+    CHECK_EQ(water.counts.rings_nest_introduced, size_t(0));
+    CHECK_EQ(water.counts.e7_collapsing_rings, size_t(1));
+    std::vector<PackedLocation> ring, raw;
+    std::vector<StoredVertex> stored;
+    // The lake's shore holds its raw vertex where the two meet.
+    tier_ring(arcs, store, water_simplified(), water, 0, ring, raw, stored);
+    CHECK(std::find(ring.begin(), ring.end(), pt(lat + 40, lng + 20)) != ring.end());
+    // The triangle holds an area, on its raw vertices.
+    tier_ring(arcs, store, water_simplified(), water, 2, ring, raw, stored);
     CHECK(exact_ring_area2(ring.data(), static_cast<uint32_t>(ring.size())) != 0);
     for (const PackedLocation& v : ring) CHECK(v.lat_e7 % 100 != 0);
 }

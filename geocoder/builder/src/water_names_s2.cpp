@@ -1,7 +1,7 @@
 // The naming join (water_names.h) over the river and canal areas' exact
 // rings: their covering at the admin cell level, the admin index's
-// (admin_polygon_cells, with interior flags), then each candidate segment's
-// midpoint in it.
+// (admin_polygon_cells, with interior flags), then each candidate segment
+// against the polygons of the cells it passes near.
 #include "water_names_s2.h"
 
 #include <algorithm>
@@ -9,39 +9,51 @@
 #include <iostream>
 #include <memory>
 
-#include <s2/s2cell_id.h>
-#include <s2/s2latlng.h>
-
 #include "admin_cover.h"
 #include "exact_pip.h"
 #include "parallel.h"
+#include "ring_edge_buckets.h"
 #include "s2_helpers.h"
 
 namespace water {
 
 namespace {
 
-uint64_t cell_of(PackedLocation p) {
-    return S2CellId(S2LatLng::FromE7(p.lat_e7, p.lon_e7)).parent(kAdminCellLevel).id();
-}
-
-// A segment whose midpoint lies in a covered cell, and that cell.
+// A segment near a covered cell: that cell, the segment (its line and its
+// first vertex in the line), and how many cells it passes near.
 #pragma pack(push, 4)
-struct Midpoint {
+struct Near {
     uint64_t cell;
     uint32_t line;
-    uint32_t index;  // its first vertex in the line
+    uint32_t index;
+    uint32_t cells;
 };
 #pragma pack(pop)
 
-// A segment to test against a polygon of a boundary cell.
-#pragma pack(push, 4)
-struct Probe {
+// A polygon a cell near a segment lists: the polygon, the segment, and the
+// segment's cell count, kInterior set for a cell all inside the polygon.
+struct Pair {
     uint32_t polygon;
     uint32_t line;
     uint32_t index;
+    uint32_t cells;
 };
-#pragma pack(pop)
+constexpr uint32_t kInterior = 1u << 31;
+
+bool pair_less(const Pair& a, const Pair& b) {
+    if (a.polygon != b.polygon) return a.polygon < b.polygon;
+    if (a.line != b.line) return a.line < b.line;
+    return a.index < b.index;
+}
+bool same_segment(const Pair& a, const Pair& b) {
+    return a.polygon == b.polygon && a.line == b.line && a.index == b.index;
+}
+
+// Whether the box of segment a-b misses `box`.
+bool box_misses(const ExactRingBox& box, PackedLocation a, PackedLocation b) {
+    return std::max(a.lat_e7, b.lat_e7) < box.lat_lo || std::min(a.lat_e7, b.lat_e7) > box.lat_hi ||
+           std::max(a.lon_e7, b.lon_e7) < box.lng_lo || std::min(a.lon_e7, b.lon_e7) > box.lng_hi;
+}
 
 // Adds a credit, onto the last one where that is of the same object, key,
 // display and wikidata item (a line's segments in a row); none of no
@@ -65,14 +77,15 @@ std::vector<Credit> credit_naming_lines(const AdminExactRings& rings, const std:
     const PackedLocation* v = rings.vertices.data();
 
     // The polygons' covering: (cell, polygon | INTERIOR_FLAG), by cell; and
-    // the box of each one's rings, which a probe outside needn't test.
+    // the box of each one's rings, which a segment that misses it can't
+    // cross or start in.
     std::vector<std::vector<CellItemPair>> found(threads);
     std::vector<ExactRingBox> boxes(rings.polygons.size());
     const std::vector<uint32_t> largest_first = costliest_first(polygons.size(), [&](size_t k) {
         return static_cast<float>(rings.occurrences(polygons[k]));
     }, threads);
     parallel_for_dynamic(largest_first.size(), 1, [&](size_t begin, size_t end, unsigned worker) {
-        std::vector<uint64_t> cells, boundary;
+        std::vector<uint64_t> boundary;
         std::vector<CellList> lists;
         std::vector<std::vector<uint64_t>> per_ring;
         for (size_t k = begin; k < end; k++) {
@@ -108,104 +121,160 @@ std::vector<Credit> credit_naming_lines(const AdminExactRings& rings, const std:
     for (size_t i = 0; i < cover.size(); i++) covered[i] = cover[i].cell_id;
     covered.erase(std::unique(covered.begin(), covered.end()), covered.end());
 
-    // The segments whose midpoints lie in a covered cell, by cell.
-    std::vector<Midpoint> mids = parallel_collect<Midpoint>(lines.lines.size(), [&](size_t l, std::vector<Midpoint>& out) {
+    // Each segment's covered cells among those it passes near, as the
+    // covering finds a ring's (admin_arc_cells), by cell. A polygon that
+    // meets the segment is in one of them.
+    std::vector<Near> near = parallel_collect<Near>(lines.lines.size(), [&](size_t l, std::vector<Near>& out) {
+        thread_local std::vector<uint64_t> cells;
         const NamingLine& line = lines.lines[l];
         const PackedLocation* lv = lines.vertices.data() + line.first;
         for (uint32_t i = 0; i + 1 < line.count; i++) {
-            const uint64_t cell = cell_of(segment_midpoint(lv[i], lv[i + 1]));
-            if (std::binary_search(covered.begin(), covered.end(), cell))
-                out.push_back({cell, static_cast<uint32_t>(l), i});
+            if (lv[i] == lv[i + 1] || segment_wraps(lv[i], lv[i + 1])) continue;
+            cells.clear();
+            admin_arc_cells(lv + i, 2, kAdminCellLevel, ADMIN_COVER_REACH_RAD, cells);
+            for (uint64_t cell : cells)
+                if (std::binary_search(covered.begin(), covered.end(), cell))
+                    out.push_back({cell, static_cast<uint32_t>(l), i, static_cast<uint32_t>(cells.size())});
         }
     }, threads);
     std::vector<uint64_t>().swap(covered);
-    parallel_sort(mids.begin(), mids.end(), [](const Midpoint& a, const Midpoint& b) {
+    parallel_sort(near.begin(), near.end(), [](const Near& a, const Near& b) {
         if (a.cell != b.cell) return a.cell < b.cell;
         if (a.line != b.line) return a.line < b.line;
         return a.index < b.index;
     }, threads);
-    counts.segments_in_cover = mids.size();
+    counts.segments_in_cover = near.size();
 
-    // Each cell's segments against its polygons: an interior entry holds
-    // them, the others are probed.
-    std::vector<size_t> starts = parallel_filter<size_t>(mids.size(), [&](size_t i) {
-        return i == 0 || mids[i].cell != mids[i - 1].cell;
+    // Each cell's segments against its polygons whose box the segment's
+    // meets, then each segment and polygon once: all inside where every cell
+    // the segment passes near is all inside the polygon, else clipped to its
+    // rings.
+    std::vector<size_t> starts = parallel_filter<size_t>(near.size(), [&](size_t i) {
+        return i == 0 || near[i].cell != near[i - 1].cell;
     }, threads);
-    std::vector<std::vector<Credit>> credits(threads);
-    std::vector<std::vector<Probe>> probes(threads);
+    std::vector<std::vector<Pair>> per_worker(threads);
     parallel_for_dynamic(starts.size(), 64, [&](size_t begin, size_t end, unsigned worker) {
         for (size_t c = begin; c < end; c++) {
-            const size_t from = starts[c], to = c + 1 < starts.size() ? starts[c + 1] : mids.size();
-            const uint64_t cell = mids[from].cell;
+            const size_t from = starts[c], to = c + 1 < starts.size() ? starts[c + 1] : near.size();
+            const uint64_t cell = near[from].cell;
             auto it = std::lower_bound(cover.begin(), cover.end(), cell,
                                        [](const CellItemPair& e, uint64_t id) { return e.cell_id < id; });
             for (; it != cover.end() && it->cell_id == cell; ++it) {
                 const uint32_t p = it->item_id & ID_MASK;
-                const bool interior = (it->item_id & INTERIOR_FLAG) != 0;
+                const uint32_t interior = (it->item_id & INTERIOR_FLAG) ? kInterior : 0;
+                const ExactRingBox& box = boxes[p];
                 for (size_t i = from; i < to; i++) {
-                    const NamingLine& line = lines.lines[mids[i].line];
-                    const PackedLocation* lv = lines.vertices.data() + line.first + mids[i].index;
-                    if (interior) {
-                        credit(credits[worker], object_of[p], line, segment_mm(lv[0], lv[1]));
-                    } else if (!exact_ring_box_excludes(boxes[p], segment_midpoint(lv[0], lv[1]))) {
-                        probes[worker].push_back({p, mids[i].line, mids[i].index});
-                    }
+                    const PackedLocation* lv = lines.vertices.data() + lines.lines[near[i].line].first + near[i].index;
+                    if (box_misses(box, lv[0], lv[1])) continue;
+                    per_worker[worker].push_back({p, near[i].line, near[i].index, near[i].cells | interior});
                 }
             }
         }
     }, threads);
-    std::vector<Midpoint>().swap(mids);
+    std::vector<Near>().swap(near);
     std::vector<CellItemPair>().swap(cover);
-    std::vector<Probe> all;
-    for (auto& p : probes) {
-        all.insert(all.end(), p.begin(), p.end());
-        std::vector<Probe>().swap(p);
+    std::vector<size_t>().swap(starts);
+    std::vector<Pair> pairs;
+    for (auto& w : per_worker) {
+        pairs.insert(pairs.end(), w.begin(), w.end());
+        std::vector<Pair>().swap(w);
     }
-    parallel_sort(all.begin(), all.end(), [](const Probe& a, const Probe& b) {
-        if (a.polygon != b.polygon) return a.polygon < b.polygon;
-        if (a.line != b.line) return a.line < b.line;
-        return a.index < b.index;
+    parallel_sort(pairs.begin(), pairs.end(), pair_less, threads);
+    std::vector<size_t> groups = parallel_filter<size_t>(pairs.size(), [&](size_t i) {
+        return i == 0 || !same_segment(pairs[i], pairs[i - 1]);
     }, threads);
-    counts.probes = all.size();
+    // Whether group g's polygon holds its segment whole: every cell it
+    // passes near an interior one of the polygon's.
+    auto whole = [&](size_t g) {
+        const size_t from = groups[g], to = g + 1 < groups.size() ? groups[g + 1] : pairs.size();
+        size_t interior = 0;
+        for (size_t i = from; i < to; i++) interior += (pairs[i].cells & kInterior) != 0;
+        return interior == (pairs[from].cells & ~kInterior);
+    };
+    std::vector<std::vector<Credit>> credits(threads);
+    parallel_for_dynamic(groups.size(), 256, [&](size_t begin, size_t end, unsigned worker) {
+        for (size_t g = begin; g < end; g++) {
+            if (!whole(g)) continue;
+            const Pair& pair = pairs[groups[g]];
+            const NamingLine& line = lines.lines[pair.line];
+            const PackedLocation* lv = lines.vertices.data() + line.first + pair.index;
+            credit(credits[worker], object_of[pair.polygon], line, segment_mm(lv[0], lv[1]));
+        }
+    }, threads);
+    // The pairs left to clip, a segment and polygon each, by polygon.
+    std::vector<Pair> clips = parallel_collect<Pair>(groups.size(), [&](size_t g, std::vector<Pair>& out) {
+        if (!whole(g)) out.push_back(pairs[groups[g]]);
+    }, threads);
+    std::vector<Pair>().swap(pairs);
+    std::vector<size_t>().swap(groups);
+    counts.probes = clips.size();
 
-    // The probes polygon by polygon, the costliest first, each big ring's
-    // edges indexed once (ExactRingEdgeIndex).
-    std::vector<size_t> runs = parallel_filter<size_t>(all.size(), [&](size_t i) {
-        return i == 0 || all[i].polygon != all[i - 1].polygon;
+    // The clips polygon by polygon, the costliest first: a segment's
+    // crossings with its rings' edges near it, and whether its start is in
+    // them, each big ring's edges bucketed by longitude once.
+    std::vector<size_t> runs = parallel_filter<size_t>(clips.size(), [&](size_t i) {
+        return i == 0 || clips[i].polygon != clips[i - 1].polygon;
     }, threads);
     const std::vector<uint32_t> run_order = costliest_first(runs.size(), [&](size_t k) {
-        const size_t to = k + 1 < runs.size() ? runs[k + 1] : all.size();
-        return static_cast<float>(to - runs[k]) * 0.001f + static_cast<float>(rings.occurrences(all[runs[k]].polygon)) * 0.01f;
+        const size_t to = k + 1 < runs.size() ? runs[k + 1] : clips.size();
+        return static_cast<float>(to - runs[k]) * 0.001f +
+               static_cast<float>(rings.occurrences(clips[runs[k]].polygon)) * 0.01f;
     }, threads);
     std::atomic<size_t> held{0};
     parallel_for_dynamic(run_order.size(), 1, [&](size_t begin, size_t end, unsigned worker) {
         for (size_t k = begin; k < end; k++) {
             const size_t r = run_order[k];
-            const size_t from = runs[r], to = r + 1 < runs.size() ? runs[r + 1] : all.size();
-            const uint32_t p = all[from].polygon;
+            const size_t from = runs[r], to = r + 1 < runs.size() ? runs[r + 1] : clips.size();
+            const uint32_t p = clips[from].polygon;
             const uint32_t n = rings.polygons[p].ring_count;
             const RingSpan* spans = rings.rings_of(p);
             constexpr uint32_t kIndexedRing = 256;
-            std::vector<std::unique_ptr<ExactRingEdgeIndex>> index(n);
+            std::vector<std::unique_ptr<RingEdgeBuckets>> index(n);
             std::vector<ExactRingBox> boxes(n);
             for (uint32_t q = 0; q < n; q++) {
-                boxes[q] = exact_ring_box(v + spans[q].begin, spans[q].count);
+                const PackedLocation* rv = v + spans[q].begin;
+                boxes[q] = exact_ring_box(rv, spans[q].count);
                 if (spans[q].count > kIndexedRing && to - from > 8)
-                    index[q] = std::make_unique<ExactRingEdgeIndex>(v + spans[q].begin, spans[q].count);
+                    index[q] = std::make_unique<RingEdgeBuckets>(spans[q].count,
+                        std::min<uint32_t>(spans[q].count / 16, 1u << 20), [rv](uint32_t i) { return rv[i].lon_e7; });
             }
             for (size_t i = from; i < to; i++) {
-                const NamingLine& line = lines.lines[all[i].line];
-                const PackedLocation* lv = lines.vertices.data() + line.first + all[i].index;
-                const PackedLocation mid = segment_midpoint(lv[0], lv[1]);
+                const NamingLine& line = lines.lines[clips[i].line];
+                const PackedLocation* lv = lines.vertices.data() + line.first + clips[i].index;
+                SegmentClip clip(lv[0], lv[1]);
+                const int32_t start = clip.start().lon_e7;
+                const int32_t lng_lo = std::min(lv[0].lon_e7, lv[1].lon_e7);
+                const int32_t lng_hi = std::max(lv[0].lon_e7, lv[1].lon_e7);
+                const int32_t lat_lo = std::min(lv[0].lat_e7, lv[1].lat_e7);
+                const int32_t lat_hi = std::max(lv[0].lat_e7, lv[1].lat_e7);
                 bool inside = false;
                 for (uint32_t q = 0; q < n; q++) {
-                    if (exact_ring_box_excludes(boxes[q], mid)) continue;
-                    const bool in = index[q] ? index[q]->contains(mid)
-                                             : exact_ring_contains(v + spans[q].begin, spans[q].count, mid);
-                    inside = inside != in;
+                    const ExactRingBox& box = boxes[q];
+                    // A ring west, south or east of the segment neither
+                    // crosses it nor its start's ray; one north of it holds
+                    // the ray alone.
+                    if (box.lng_hi < lng_lo || box.lng_lo > lng_hi || box.lat_hi < lat_lo) continue;
+                    const PackedLocation* rv = v + spans[q].begin;
+                    const uint32_t count = spans[q].count;
+                    bool odd = false;
+                    if (index[q]) {
+                        odd = index[q]->odd_crossings(start, [&](uint32_t a, uint32_t b) {
+                            return clip.start_crossed_by(rv[b], rv[a]);
+                        });
+                        if (box.lat_lo <= lat_hi)
+                            index[q]->edges_meeting(lng_lo, lng_hi, [rv](uint32_t e) { return rv[e].lon_e7; },
+                                                    [&](uint32_t a, uint32_t b) { clip.add_crossing(rv[b], rv[a]); });
+                    } else {
+                        for (uint32_t a = 1; a < count; a++) {
+                            odd ^= clip.start_crossed_by(rv[a - 1], rv[a]);
+                            clip.add_crossing(rv[a - 1], rv[a]);
+                        }
+                    }
+                    inside ^= odd;
                 }
-                if (!inside) continue;
-                credit(credits[worker], object_of[p], line, segment_mm(lv[0], lv[1]));
+                const uint64_t mm = share_mm(lv[0], lv[1], clip.share(inside));
+                if (mm == 0) continue;
+                credit(credits[worker], object_of[p], line, mm);
                 held.fetch_add(1, std::memory_order_relaxed);
             }
         }

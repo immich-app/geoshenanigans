@@ -2,12 +2,16 @@
 // their own, in dirs of their own under each region,
 // {region}/water/{all,major}/simplified/ and water/all/exact/, made of the
 // admin geometry's file names. Each holds:
-//   admin_polygons.bin + admin_rings.bin  one record per outer ring of an OSM
-//                                         object, with its holes, carrying
-//                                         the object's name, type code (in
-//                                         country_code) and area (its
+//   admin_polygons.bin + admin_rings.bin  one record per polygon it holds
+//                                         (an OSM object's outer ring, a
+//                                         marine area's polygon, or a grid
+//                                         piece of either, water_split.h),
+//                                         with its holes, carrying the
+//                                         object's name, type code (in
+//                                         country_code) and whole area (its
 //                                         polygons' exact areas less their
-//                                         holes, summed, square degrees)
+//                                         holes, summed, square degrees), so
+//                                         records' areas don't add up
 //   arc_index.bin + arc_vertices.bin      the tier's arcs (kWaterArcStage:
 //                                         rings cut at member way ends)
 //   admin_cells.bin + admin_entries.bin   the cell index at the admin cell
@@ -216,7 +220,9 @@ struct Build {
 // geometry as admin relations are: one polygon per outer ring with the holes
 // in it) and closed way into polygons, but a closed way an assembled
 // relation of its kind and names (name and local name) takes whole as an
-// outer ring: one body tagged twice, whose islands the relation leaves out. Then takes
+// outer ring, that ring the way's own: one body tagged twice, whose islands
+// the relation leaves out, and whose wikidata item (the lowest of such ways')
+// the relation takes where it has none of its own. Then takes
 // the marine areas' as they are, in object order (ways by id, relations by
 // id, then marine areas by id; of an object or line two inputs hold, the
 // first input's copy alone), each ring rotated as canonicalize_ring_rotation
@@ -234,10 +240,12 @@ Build assemble(Collected& c, unsigned threads);
 
 // Leaves out each OSM natural=bay or strait that is a marine area's
 // namesake, in place: its name or local name (name:en or name) is the
-// marine area's, ASCII case, spaces and punctuation aside, and they hold
-// water together (a polygon of each, rings even-odd, share an area, not a
-// side or a point alone). The marine area holds that water; every other bay
-// and strait stays. Logs each it leaves out and returns how many.
+// marine area's, ASCII case, spaces and punctuation aside, and the polygons
+// of the marine areas of its name hold all its water (polygons_cover: its
+// polygons' rings even-odd, its holes left out, within theirs, a shared
+// shore aside). Those marine areas answer there; every other bay and strait
+// stays, the water of one that reaches past them, or round an island they
+// leave out, among them. Logs each it leaves out and returns how many.
 size_t drop_marine_namesakes(Build& b);
 
 // Names each unnamed river or canal object by `choices` (pick_names, by
@@ -293,6 +301,22 @@ Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::
 // `kept` marks (parallel to planet.cells), whole, with their arcs
 // (subset_admin_arcs, no slots yet), names and those cells' entries.
 Layer subset_layer(const Layer& planet, const std::vector<uint8_t>& kept, unsigned threads = 0);
+
+// Which of `regions` regions (up to 8) keep each entry of a water cell index
+// `cells` (sorted by cell) as a continent's split does (subset_layer's
+// `kept`): bit r where region r holds the entry's cell or one around it
+// (admin_cell_routed), `holds(r, cell)` saying whether it holds a cell.
+std::vector<uint8_t> routed_cell_masks(const std::vector<CellItemPair>& cells, size_t regions,
+                                       const std::function<bool(size_t, uint64_t)>& holds, unsigned threads = 0);
+
+// About what each of `regions` regions' shares of `planet` hold (up to 8;
+// region r's share subset_layer of the cells whose masks[i] has bit r) once
+// its arc slots and ring blocks are made: every polygon those cells list,
+// whole, with its record, identities, name, rings and ring blocks, every
+// arc of its rings with that arc's keys, slots and blocks in every tier,
+// and the entries. A name a few polygons share counts for each: a little
+// over, never under.
+std::vector<uint64_t> share_bytes(const Layer& planet, const std::vector<uint8_t>& masks, size_t regions);
 
 // The rows of the fame rule the major tier could take instead: objects of
 // kMajorAreaKm2 or more, and those whose wikidata item has `min_sitelinks`

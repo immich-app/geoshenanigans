@@ -21,6 +21,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <utility>
@@ -233,6 +234,24 @@ inline bool cut(const std::vector<FrameRing>& rings, int64_t L, int64_t cut_way,
         }
     }
     return true;
+}
+
+// A closed ring's corner: its smallest vertex (by latitude, then longitude)
+// and the two beside it, the smaller first. Two outer rings of one side of
+// a cut share no corner: rings meeting at their smallest vertex leave it
+// along other edges.
+using Corner = std::array<int32_t, 6>;
+inline Corner corner_of(const std::vector<PackedLocation>& closed) {
+    const size_t n = closed.size() - 1;
+    auto less = [](PackedLocation a, PackedLocation b) {
+        return a.lat_e7 != b.lat_e7 ? a.lat_e7 < b.lat_e7 : a.lon_e7 < b.lon_e7;
+    };
+    size_t s = 0;
+    for (size_t i = 1; i < n; i++)
+        if (less(closed[i], closed[s])) s = i;
+    PackedLocation before = closed[(s + n - 1) % n], after = closed[(s + 1) % n];
+    if (less(after, before)) std::swap(before, after);
+    return {closed[s].lat_e7, closed[s].lon_e7, before.lat_e7, before.lon_e7, after.lat_e7, after.lon_e7};
 }
 
 inline uint64_t mix_key(uint64_t key, uint64_t line, bool meridian, int side) {
@@ -503,7 +522,17 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
             const std::vector<int> depth = ring_depths(around);
             std::vector<NestedPolygon<PackedLocation>> polygons = nest_rings(std::move(closed), around, depth);
             std::vector<NestedPolygon<int64_t>> polygon_ways = nest_rings(std::move(ways), around, depth);
-            for (size_t o = 0; o < polygons.size(); o++) {
+            // The side's polygons in the order of their outer rings'
+            // corners, which neither the rings' start nor their direction
+            // moves: a piece's key is its own whichever order the cut met
+            // them in.
+            std::vector<Corner> corners;
+            for (const NestedPolygon<PackedLocation>& q : polygons) corners.push_back(corner_of(q.outer));
+            std::vector<size_t> order(polygons.size());
+            for (size_t o = 0; o < order.size(); o++) order[o] = o;
+            std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return corners[x] < corners[y]; });
+            for (size_t rank = 0; rank < order.size(); rank++) {
+                const size_t o = order[rank];
                 SplitPolygon out;
                 auto back = [](std::vector<PackedLocation>& v, std::vector<int64_t>& w) {
                     SplitRing r;
@@ -515,7 +544,7 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
                 out.outer = back(polygons[o].outer, polygon_ways[o].outer);
                 for (size_t h = 0; h < polygons[o].holes.size(); h++)
                     out.holes.push_back(back(polygons[o].holes[h], polygon_ways[o].holes[h]));
-                out.key = mix_key(piece.key, static_cast<uint64_t>(line), meridian, s) + o;
+                out.key = mix_key(piece.key, static_cast<uint64_t>(line), meridian, s) + rank;
                 todo.push_back(std::move(out));
             }
         }

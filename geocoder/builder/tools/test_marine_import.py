@@ -4,13 +4,17 @@
 The file format's tests need nothing past the standard library. The geometry's need shapely, numpy and
 pyogrio, as `build` does: they run where those are (the marine workflow installs them before it builds),
 and are skipped elsewhere."""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import struct
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -84,12 +88,42 @@ class FileTest(unittest.TestCase):
         self.assertEqual(marine_import.kind_of("Bay of Biscay"), marine_import.KIND_SEA)
 
 
+class BoundsTest(unittest.TestCase):
+    def test_a_bbox_that_is_not_four_edges_in_order_is_refused_before_the_build(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "marine_areas.bin")
+            for bbox, said in [("10,50,12", "four"), ("10,50,12,51,13", "four"), ("10,50,east,51", "four"),
+                               ("10,50,nan,51", "four"), ("12,50,10,51", "antimeridian"),
+                               ("170,50,-170,51", "antimeridian"), ("-181,50,12,51", "antimeridian"),
+                               ("10,51,12,50", "south"), ("10,-91,12,50", "south")]:
+                with self.subTest(bbox=bbox):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                        marine_import.main(["build", "--eez-iho", os.path.join(d, "eez_iho.geojson"), "--land",
+                                            os.path.join(d, "land.zip"), "-o", out, f"--bbox={bbox}"])
+                    self.assertIn("--bbox", err.getvalue())
+                    self.assertIn(said, err.getvalue())
+                    self.assertFalse(os.path.exists(out))
+
+
 def feature(props, rings):
     return {"type": "Feature", "properties": props, "geometry": {"type": "Polygon", "coordinates": rings}}
 
 
 def square(x0, y0, x1, y1):
     return [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]
+
+
+def split_holed_parts_last(item):
+    """marine_import's split of a sea area part into tiles, a part with a hole held back long enough that the
+    workers finish the others first."""
+    import shapely
+    if shapely.get_num_interior_rings(shapely.from_wkb(item[1])):
+        time.sleep(0.5)
+    return SPLIT_INTO_TILES(item)
+
+
+SPLIT_INTO_TILES = marine_import._split_into_tiles
 
 
 def geometry(polygons):
@@ -200,6 +234,22 @@ class BuildTest(unittest.TestCase):
     def test_the_file_is_the_same_on_one_worker_and_many(self):
         one, _ = self.build("one.bin", workers=1)
         many, _ = self.build("many.bin", workers=3)
+        with open(one, "rb") as a, open(many, "rb") as b:
+            self.assertEqual(a.read(), b.read())
+
+    def test_each_tiles_pieces_keep_the_parts_order_whatever_order_the_workers_finish_in(self):
+        import shapely
+
+        def pieces():
+            return [(key, mrgid, [shapely.to_wkb(g) for g in geoms])
+                    for key, by_mrgid in marine_import._SEA_TILES.items() for mrgid, geoms in by_mrgid.items()]
+
+        one, _ = self.build("one.bin", workers=1)
+        in_order = pieces()
+        # The west sea's holed part, the costliest, goes first and finishes last.
+        with mock.patch.object(marine_import, "_split_into_tiles", split_holed_parts_last):
+            many, _ = self.build("many.bin", workers=3)
+        self.assertEqual(pieces(), in_order)
         with open(one, "rb") as a, open(many, "rb") as b:
             self.assertEqual(a.read(), b.read())
 

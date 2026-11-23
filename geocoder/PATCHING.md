@@ -435,7 +435,9 @@ files has no water.
 
 ### Switching Region
 
-Regions are independent. Download the new region's mode + quality directories.
+Regions are independent. Download the new region's mode + quality directories,
+and its dirs of the selected POI tier and water value (none for `none`); its
+water dir goes into `<dataset>/water/`, replacing the old region's.
 
 ## Retention Policy
 

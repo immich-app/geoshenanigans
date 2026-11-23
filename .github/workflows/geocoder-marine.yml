@@ -125,8 +125,9 @@ jobs:
             --eez-iho "$SRC/eez_iho.geojson" --land "$SRC/land-polygons-split-4326.zip" \
             -o "$OUT/marine_areas.bin" --stats "$OUT/stats.json" --workers "$(nproc)"
           "$RUNNER_TEMP/venv/bin/python" -I geocoder/builder/tools/marine_import.py stats "$OUT/marine_areas.bin" | tail -1
-          # A source that parses but holds no sea areas gives a file of none, which no version may publish.
-          if ! jq -e '.objects > 0 and .oceans > 0 and .polygons > 0' "$OUT/stats.json" > /dev/null; then
+          # A source that parses but holds no sea areas gives a file of none, which no version may publish. The
+          # oceans are some of the objects: a sea is an object more than the oceans.
+          if ! jq -e '.objects > .oceans and .oceans > 0 and .polygons > 0' "$OUT/stats.json" > /dev/null; then
             echo "::error::The marine areas came out without a sea, an ocean or a polygon: $(jq -c . "$OUT/stats.json")"
             exit 1
           fi

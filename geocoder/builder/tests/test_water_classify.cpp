@@ -123,7 +123,6 @@ TEST(water_meta_json_round_trips_quotes_and_controls_and_refuses_what_it_did_not
     const std::optional<std::vector<MetaType>> back = parse_meta_json(meta_json(table, {c}));
     REQUIRE(back.has_value() && back->size() == 1u);
     CHECK((*back)[0].type == "a \"quoted\" \\ value\x01");
-    CHECK(parse_meta_json(meta_json(table, {}))->empty());
     CHECK(!parse_meta_json("").has_value());
     CHECK(!parse_meta_json("{\"types\": [{\"code\": 2}]}").has_value());
     // Of a string, the writer's escapes alone: \", \\ and \u00xx below 0x20,
@@ -134,6 +133,24 @@ TEST(water_meta_json_round_trips_quotes_and_controls_and_refuses_what_it_did_not
     CHECK(parse_meta_json(with_type("a\\\"b\\\\c\\u001f")).has_value());
     for (const char* other : {"a\\nb", "a\\/b", "a\\tb", "a\\xb", "a\nb", "a\x01" "b"})
         CHECK(!parse_meta_json(with_type(other)).has_value());
+}
+
+TEST(water_meta_json_of_a_code_twice_or_out_of_order_or_a_value_twice_is_no_table) {
+    // Kinds as meta_json writes them: each code once, ascending, each value
+    // outside the fixed table once.
+    auto meta = [](const std::vector<MetaType>& kinds) {
+        std::string out = "{\"types\": [\n";
+        for (size_t k = 0; k < kinds.size(); k++) out += (k ? ",\n" : "") + meta_entry(kinds[k]);
+        return out + "\n]}\n";
+    };
+    const MetaType lake{code::kLake, "water", "lake", 20};
+    const MetaType a{32769, "water", "a", 22}, b{32770, "water", "b", 22};
+    CHECK(parse_meta_json(meta({lake, a, b})).has_value());
+    CHECK(!parse_meta_json(meta({lake, a, {32769, "water", "b", 22}})).has_value());
+    CHECK(!parse_meta_json(meta({lake, b, a})).has_value());
+    CHECK(!parse_meta_json(meta({a, lake})).has_value());
+    CHECK(!parse_meta_json(meta({lake, lake})).has_value());
+    CHECK(!parse_meta_json(meta({lake, a, {32770, "water", "a", 22}})).has_value());
 }
 
 TEST(the_major_tier_takes_100_km2_and_wikidata_rivers_of_5_and_keeps_its_own_at_90_percent) {

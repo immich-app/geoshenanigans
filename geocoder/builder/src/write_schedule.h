@@ -108,13 +108,15 @@ constexpr uint64_t kStrategy2BytesPerRecord = 56;
 // and, while ids are collected, 3 bits per record (the bit every worker
 // marks, and its RankedBits blocks of 16 B per 64 records); beside it, the
 // workers' copies of a share of the subset's cell pairs. The water split's
-// marks each planet water cell entry (1 B) and each of its cells (the cell's
-// first entry, 8 B, and whether the continent routes it, 1 B), at most as
-// many as the entries.
+// marks each planet water cell entry (1 B) and each of its cells, at most as
+// many as the entries: whether the continent routes it (1 B) and its first
+// entry (8 B), which the workers collect in parts of their own (8 B a cell,
+// up to twice that while they grow) beside the starts they make (24 B at
+// the peak).
 constexpr uint64_t kFilterMapBytesPerRecord = 4;
 constexpr uint64_t kFilterMarkBitsPerRecord = 3;
 constexpr uint64_t kFilterPairCopyDivisor = 2;
-constexpr uint64_t kFilterWaterBytesPerPair = 10;
+constexpr uint64_t kFilterWaterBytesPerPair = 1 + 1 + 3 * 8;
 
 // Per mode dir, write_index's slices in flight, postcode centroids and admin
 // cell copies (planet: 0.8 GiB for the three). The slices are the geo
@@ -137,10 +139,13 @@ constexpr uint64_t kAdminMinimalAdminDivisor = 3;
 constexpr uint64_t kPoiTierPoiTenths = 4;
 
 // The water stage's working set against the layer it reads: the records in
-// their slots for each set, the cells renumbered to them, the names a set
-// uses, and the major tier's share of the arcs and ring blocks, its slots
-// and the sidecars (planet 261020: about half of it).
+// their slots for each set, the names a set uses, and the major tier's
+// share of the arcs and ring blocks, its slots and the sidecars (planet
+// 261020: about half of it); and beside the layer's cells, the copy of them
+// renumbered to a set's slots, collected in the workers' parts beside it and
+// sorted through a buffer as large (three times the cells).
 constexpr uint64_t kWaterStageWaterTenths = 6;
+constexpr uint64_t kWaterStageCellTimes = 3;
 
 // What write_place_files holds beside the nodes it is given, as a multiple
 // of their bytes (20 a node): each node's cell key, the order and the sort's
@@ -226,8 +231,9 @@ struct StageCosts {
 
 // The place stage writes its dirs one after another, each through the place
 // writer; an admin-minimal dir writes the nodes it keeps, a copy of at most
-// all of them, through the same writer.
-inline StageCosts stage_costs(const KindValues& bytes) {
+// all of them, through the same writer. `water_pairs` are the water cell
+// index's entries, among the waters' bytes.
+inline StageCosts stage_costs(const KindValues& bytes, uint64_t water_pairs = 0) {
     StageCosts c;
     const uint64_t admins = at(bytes, RecordKind::Admins), places = at(bytes, RecordKind::Places);
     c.modes = 3 * kModeBytes;
@@ -235,7 +241,9 @@ inline StageCosts stage_costs(const KindValues& bytes) {
     c.places = places * kPlaceWriterTimes;
     c.admin_minimal = admins / kAdminMinimalAdminDivisor + places * (1 + kPlaceWriterTimes);
     c.poi_tiers = at(bytes, RecordKind::Pois) * kPoiTierPoiTenths / 10;
-    c.water = at(bytes, RecordKind::Waters) * kWaterStageWaterTenths / 10;
+    const uint64_t waters = at(bytes, RecordKind::Waters);
+    const uint64_t cells = std::min<uint64_t>(waters, water_pairs * sizeof(CellItemPair));
+    c.water = (waters - cells) * kWaterStageWaterTenths / 10 + cells * kWaterStageCellTimes;
     return c;
 }
 
@@ -247,8 +255,8 @@ struct RegionCost {
 };
 
 inline uint64_t region_peak(const KindValues& bytes, const KindValues& counts, uint64_t filter_bytes,
-                            RunOrder order) {
-    const StageCosts stages = stage_costs(bytes);
+                            RunOrder order, uint64_t water_pairs = 0) {
+    const StageCosts stages = stage_costs(bytes, water_pairs);
     const uint64_t steps = order == RunOrder::Serial ? stages.largest() : stages.total();
     return sum(bytes) + std::max({filter_bytes, strategy2_cost(counts, order), steps});
 }
@@ -257,33 +265,33 @@ inline uint64_t region_peak(const KindValues& bytes, const KindValues& counts, u
 // after another. It holds its whole reservation: its write takes no stage
 // leases of its own.
 inline RegionCost continent_cost(const KindValues& bytes, const KindValues& counts, uint64_t filter_bytes,
-                                 uint64_t capacity) {
-    const uint64_t at_once = region_peak(bytes, counts, filter_bytes, RunOrder::Concurrent);
+                                 uint64_t capacity, uint64_t water_pairs = 0) {
+    const uint64_t at_once = region_peak(bytes, counts, filter_bytes, RunOrder::Concurrent, water_pairs);
     if (at_once <= capacity) return {at_once, RunOrder::Concurrent};
 
-    return {region_peak(bytes, counts, filter_bytes, RunOrder::Serial), RunOrder::Serial};
+    return {region_peak(bytes, counts, filter_bytes, RunOrder::Serial, water_pairs), RunOrder::Serial};
 }
 
 // A continent's share of the planet's values, kind by kind, from its share
 // of each kind's cell pairs, with kShareMarginPercent. Admins have no pairs:
 // they take the share the values of the kinds of records (all but the
-// waters) add up to, as the waters do without cells.
+// waters) add up to. The waters take `waters`: a polygon its cells list
+// comes whole, with its arcs, however few of its cells those are, so the
+// split's share of them is counted polygon by polygon (water::share_bytes).
 inline KindValues continent_share(const KindValues& planet, const KindValues& planet_pairs,
-                                  const KindValues& continent_pairs) {
+                                  const KindValues& continent_pairs, uint64_t waters = 0) {
     KindValues out{};
     double shared = 0, total = 0;
     for (size_t k = 0; k < RECORD_KIND_COUNT; k++) {
-        if (planet_pairs[k] == 0) continue;
+        if (planet_pairs[k] == 0 || k == static_cast<size_t>(RecordKind::Waters)) continue;
         double share = std::min(1.0, static_cast<double>(continent_pairs[k]) / static_cast<double>(planet_pairs[k]));
         out[k] = static_cast<uint64_t>(static_cast<double>(planet[k]) * share * kShareMarginPercent / 100);
-        if (k == static_cast<size_t>(RecordKind::Waters)) continue;
         shared += static_cast<double>(planet[k]) * share;
         total += static_cast<double>(planet[k]);
     }
     const double admin_share = total > 0 ? shared / total : 0;
-    for (RecordKind kind : {RecordKind::Admins, RecordKind::Waters}) {
-        if (kind == RecordKind::Waters && at(planet_pairs, kind) != 0) continue;
-        at(out, kind) = static_cast<uint64_t>(static_cast<double>(at(planet, kind)) * admin_share * kShareMarginPercent / 100);
-    }
+    const double admins = static_cast<double>(at(planet, RecordKind::Admins));
+    at(out, RecordKind::Admins) = static_cast<uint64_t>(admins * admin_share * kShareMarginPercent / 100);
+    at(out, RecordKind::Waters) = waters;
     return out;
 }

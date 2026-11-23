@@ -10,6 +10,14 @@ struct ContinentBBox {
 extern const ContinentBBox kContinents[];
 extern const size_t kContinentCount;
 
+class PolygonIndex;
+
+// Whether a continent holds a cell of the admin and water cell indexes, as
+// its split takes them: the cell's centre in its boundary polygon (`polygon`)
+// where it has one, else in its box. The split keeps a cell it or one around
+// it holds (admin_cell_routed).
+bool cell_in_continent(uint64_t cell_id, const ContinentBBox& bbox, const PolygonIndex* polygon);
+
 // What a split leaves of the planet records it copies from: all of them, or
 // (for the last region to read them) none: each kind is freed once copied, so
 // the planet's records and the continent's never stand whole at once.

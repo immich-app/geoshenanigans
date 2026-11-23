@@ -41,6 +41,7 @@ Output, little-endian:
 """
 import argparse
 import json
+import math
 import os
 import struct
 import sys
@@ -403,6 +404,27 @@ def _land_path(path):
     return f"/vsizip/{path}/{shp[0]}"
 
 
+def _bbox(text):
+    """--bbox's WEST,SOUTH,EAST,NORTH in degrees, or None for none: four finite numbers, west to east and
+    south to north."""
+    if not text:
+        return None
+    try:
+        box = tuple(float(v) for v in text.split(","))
+    except ValueError:
+        box = ()
+    if len(box) != 4 or not all(math.isfinite(v) for v in box):
+        raise argparse.ArgumentTypeError(f"{text!r} is not four numbers, WEST,SOUTH,EAST,NORTH")
+    west, south, east, north = box
+    if not -180 <= west <= east <= 180:
+        raise argparse.ArgumentTypeError(f"{text!r}: west and east lie from -180 to 180, west no further east than "
+                                         "east (a box across the antimeridian is not supported)")
+    if not -90 <= south <= north <= 90:
+        raise argparse.ArgumentTypeError(f"{text!r}: south and north lie from -90 to 90, south no further north "
+                                         "than north")
+    return box
+
+
 def build(opts):
     import multiprocessing
     import numpy as np
@@ -416,16 +438,17 @@ def build(opts):
 
     if opts.stats and os.path.realpath(opts.stats) == os.path.realpath(opts.output):
         raise ValueError(f"--stats {opts.stats} is the output, -o {opts.output}")
-    bbox = tuple(float(v) for v in opts.bbox.split(",")) if opts.bbox else None
+    bbox = opts.bbox
     ctx = multiprocessing.get_context("fork")
     tiles = {}
     with ctx.Pool(opts.workers) as pool:
         names, parts = _read_seas(opts.eez_iho, pool)
         log(f"{len(names)} sea areas in {len(parts)} parts")
         # Every part, --bbox or not: a tile's water goes by the sea areas in the tiles around it, across the
-        # antimeridian too. The costliest first, so the last one doesn't run alone.
+        # antimeridian too. The costliest first, so the last one doesn't run alone; their pieces taken in that
+        # order, whichever worker finishes first, as a tile's overlays and so the file go by their order.
         order = sorted(parts, key=lambda p: -len(p[1]))
-        for pieces in pool.imap_unordered(_split_into_tiles, order):
+        for pieces in pool.imap(_split_into_tiles, order):
             for key, mrgid, wkb in pieces:
                 tiles.setdefault(key, {}).setdefault(mrgid, []).append(wkb)
     _SEA_TILES = {k: {m: list(shapely.from_wkb(w)) for m, w in v.items()} for k, v in tiles.items()}
@@ -493,7 +516,8 @@ def main(argv=None):
     b.add_argument("-o", "--output", required=True)
     b.add_argument("--stats", default="")
     b.add_argument("--workers", type=int, default=os.cpu_count())
-    b.add_argument("--bbox", default="", help="only the tiles whose centres are in WEST,SOUTH,EAST,NORTH")
+    b.add_argument("--bbox", default="", type=_bbox,
+                   help="only the tiles whose centres are in WEST,SOUTH,EAST,NORTH")
     s = sub.add_parser("stats")
     s.add_argument("path")
     opts = p.parse_args(argv)

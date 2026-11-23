@@ -158,11 +158,21 @@ def fake_s5cmd(bin_dir):
 
 
 def sidecar_block():
-    """The Download step's fetch of yesterday's sidecars, as bash, with its $S5 and a wait for it."""
+    """The Download step's fetch of yesterday's sidecars, as bash, with its $S5, up to its pid."""
     text = script(read(NIGHTLY), "Download PBF and previous indexes")
     s5 = re.search(r'^S5=".*"\n', text, re.M).group(0)
     block = re.search(r'^if \[ "\$HAS_PREVIOUS" = "true" \]; then\n  \(\n.*?^  IDX_PID=\$!\nfi\n', text, re.M | re.S)
-    return s5 + block.group(0) + 'wait "$IDX_PID"\n' if block else None
+    return s5 + block.group(0) if block else None
+
+
+def sidecar_wait():
+    """The Download step's wait for yesterday's sidecars, a block of the step's own after the fetch starts
+    (not inside another block), on a day with a previous build, which fails the step with the fetch."""
+    text = script(read(NIGHTLY), "Download PBF and previous indexes")
+    started = text.find("  IDX_PID=$!\n")
+    wait = re.compile(r'^if \[ "\$HAS_PREVIOUS" = "true" \]; then\n(?:  .*\n)*?  wait "?\$IDX_PID"?\nfi\n',
+                      re.M).search(text, started) if started >= 0 else None
+    return wait.group(0) if wait else None
 
 
 class PinTest(unittest.TestCase):
@@ -312,10 +322,13 @@ class SidecarFetchTest(unittest.TestCase):
             f.write(data)
 
     def run_block(self, fail=""):
+        block, wait = sidecar_block(), sidecar_wait()
+        self.assertIsNotNone(block)
+        self.assertIsNotNone(wait, "the Download step doesn't wait for yesterday's sidecars")
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "WORKDIR": self.work, "S3_ENDPOINT": "https://s3.example",
                "S3_BUCKET": "bucket", "S3_PREFIX": "geocoder", "YESTERDAY": "2026-11-21", "HAS_PREVIOUS": "true",
                "FAKE_S3": self.s3, "FAKE_S3_FAIL": fail}
-        return subprocess.run(["bash", "-e", "-c", sidecar_block()], env=env, capture_output=True, text=True, timeout=60)
+        return subprocess.run(["bash", "-e", "-c", block + wait], env=env, capture_output=True, text=True, timeout=60)
 
     def held(self, path):
         full = os.path.join(self.work, "old-output", path)
@@ -450,8 +463,9 @@ class MarineWorkflowTest(unittest.TestCase):
         run, compressed = self.run_build(good)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertTrue(compressed)
-        for summary in ({"objects": 0, "oceans": 0, "polygons": 0}, {**good, "objects": 0}, {**good, "oceans": 0},
-                        {**good, "polygons": 0}):
+        # Its oceans are some of its objects: objects no more than its oceans are oceans alone, without a sea.
+        for summary in ({"objects": 0, "oceans": 0, "polygons": 0}, {**good, "objects": 0}, {**good, "objects": 7},
+                        {**good, "oceans": 0}, {**good, "polygons": 0}):
             with self.subTest(summary=summary):
                 run, compressed = self.run_build(summary)
                 self.assertNotEqual(run.returncode, 0)
