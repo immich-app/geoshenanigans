@@ -141,11 +141,11 @@ impl FileBytes {
 
 pub const DEFAULT_STREET_CELL_LEVEL: u64 = 17;
 pub const DEFAULT_ADMIN_CELL_LEVEL: u64 = 10;
-// Default primary-feature search radius. Matches Nominatim's
-// lookup_street_poi default of 0.006 degrees ≈ 660m. This is the
-// radius inside which we'll accept a street/addr/interp/POI as the
-// primary feature for the reverse result.
-pub const DEFAULT_SEARCH_DISTANCE: f64 = 660.0;
+/// How far the street, address and interpolation lookups reach from the point, in metres: the
+/// nearest street within it, measured to the way's segments, wherever the point lies in its
+/// cell, and none past it. Nominatim's _find_closest_street_or_poi reaches 0.006° (about
+/// 660 m), but a road that far off is no longer the road the point is on (NOMINATIM_REFERENCE.md).
+pub const DEFAULT_SEARCH_DISTANCE: f64 = 130.0;
 
 // Matches POI_FLAG_HIGHWAY in builder/src/types.h — feature is a
 // highway-class polygon (highway=pedestrian/footway/etc.). Nominatim
@@ -167,6 +167,144 @@ pub fn cell_id_at_level(lat: f64, lng: f64, level: u64) -> u64 {
 pub fn cell_neighbors_at_level(cell_id: u64, level: u64) -> Vec<u64> {
     let cell = CellID(cell_id);
     cell.all_neighbors(level).into_iter().map(|c| c.0).collect()
+}
+
+/// How far the scans' distances (planar, a degree of longitude cos(lat) of one of latitude at the
+/// point) may stray from the sphere's within the search distance, relatively: well under 0.1 %,
+/// but within a degree of a pole. The cells round a point are read that much past the reach, and
+/// each counts that much nearer.
+const CELL_REACH_SLACK: f64 = 1e-3;
+
+/// The cells a lookup round a point reads (cells_within), nearest first: their ids, and the
+/// squared distance (radians², as the scans measure one) that nothing in each comes nearer than.
+struct NearCells {
+    ids: Vec<u64>,
+    near: Vec<f64>,
+}
+
+/// The cells of `level` that come within `reach` radians of (lat, lng), nearest first, equally
+/// near ones by id. On each face of S2's cube the reach meets, the cells of the box of (u, v)
+/// holding every point within reach are measured on the gnomonic projection about the point,
+/// where a cell is the quadrilateral of its corners and distances from the point keep their
+/// order.
+fn cells_within(lat: f64, lng: f64, level: u64, reach: f64) -> NearCells {
+    let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
+    let (sin_lng, cos_lng) = lng.to_radians().sin_cos();
+    let p = [cos_lat * cos_lng, cos_lat * sin_lng, sin_lat];
+    let (east, north) = ([-sin_lng, cos_lng, 0.0], [-sin_lat * cos_lng, -sin_lat * sin_lng, cos_lat]);
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    // A point of the sphere (any length) on the projection: the tangent of its distance from p,
+    // split east and north.
+    let project = |q: [f64; 3]| {
+        let t = dot(q, p);
+        (dot(q, east) / t, dot(q, north) / t)
+    };
+    let cover = reach * (1.0 + CELL_REACH_SLACK);
+    let (sin_cover, tan_cover) = (cover.sin(), cover.tan());
+    let (size, shift) = (1u64 << level, 30 - level);
+    let mut found: Vec<(f64, u64)> = Vec::new();
+    let (mut us, mut vs, mut corners) = (Vec::new(), Vec::new(), Vec::new());
+    for face in 0..6u8 {
+        // Every point of a face lies within 55° of its middle, so p lies within 60° of the middle
+        // of a face that holds a point within a reach of a few degrees.
+        let toward = p[usize::from(face % 3)] * if face < 3 { 1.0 } else { -1.0 };
+        if toward <= 0.5 {
+            continue;
+        }
+        let (u, v) = face_xyz_to_uv(face, p);
+        let (u_lo, u_hi) = (expand_uv(u, v.abs(), -sin_cover), expand_uv(u, v.abs(), sin_cover));
+        let (v_lo, v_hi) = (expand_uv(v, u.abs(), -sin_cover), expand_uv(v, u.abs(), sin_cover));
+        if u_hi < -1.0 || u_lo > 1.0 || v_hi < -1.0 || v_lo > 1.0 {
+            continue;
+        }
+        let index = |uv: f64| ((uv_to_st(uv.clamp(-1.0, 1.0)) * size as f64) as u64).min(size - 1);
+        let (i_lo, i_hi, j_lo, j_hi) = (index(u_lo), index(u_hi), index(v_lo), index(v_hi));
+        let side = |k: u64| st_to_uv(k as f64 / size as f64);
+        us.clear();
+        us.extend((i_lo..=i_hi + 1).map(side));
+        vs.clear();
+        vs.extend((j_lo..=j_hi + 1).map(side));
+        corners.clear();
+        for &v in &vs {
+            corners.extend(us.iter().map(|&u| project(face_uv_to_xyz(face, u, v))));
+        }
+        let row = us.len();
+        for (b, j) in (j_lo..=j_hi).enumerate() {
+            for (a, i) in (i_lo..=i_hi).enumerate() {
+                let at = b * row + a;
+                let tan_sq = origin_to_quad_sq([corners[at], corners[at + 1], corners[at + row + 1], corners[at + row]]);
+                if tan_sq <= tan_cover * tan_cover {
+                    let id = CellID::from_face_ij(face, (i << shift) as i32, (j << shift) as i32).parent(level);
+                    found.push((tan_sq.sqrt().atan(), id.0));
+                }
+            }
+        }
+    }
+    found.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let near = |angle: f64| (angle * (1.0 - CELL_REACH_SLACK)).powi(2);
+    NearCells { ids: found.iter().map(|&(_, id)| id).collect(), near: found.iter().map(|&(angle, _)| near(angle)).collect() }
+}
+
+/// The point (of any length) at (u, v) on the plane of face `face` of S2's cube: S2's
+/// FaceUVtoXYZ.
+fn face_uv_to_xyz(face: u8, u: f64, v: f64) -> [f64; 3] {
+    match face {
+        0 => [1.0, u, v],
+        1 => [-u, 1.0, v],
+        2 => [-u, -v, 1.0],
+        3 => [-1.0, -v, -u],
+        4 => [v, -1.0, -u],
+        _ => [v, u, -1.0],
+    }
+}
+
+/// (u, v) of a point in the half of the sphere round face `face`, on the face's plane: S2's
+/// ValidFaceXYZtoUV.
+fn face_xyz_to_uv(face: u8, [x, y, z]: [f64; 3]) -> (f64, f64) {
+    match face {
+        0 => (y / x, z / x),
+        1 => (-x / y, z / y),
+        2 => (-x / z, -y / z),
+        3 => (z / x, y / x),
+        4 => (z / y, -x / y),
+        _ => (-y / z, -x / z),
+    }
+}
+
+/// S2's quadratic projection of s (or t) in [0, 1] on u (or v) in [-1, 1], and back: STtoUV
+/// and UVtoST.
+fn st_to_uv(s: f64) -> f64 {
+    if s >= 0.5 { (4.0 * s * s - 1.0) / 3.0 } else { (1.0 - 4.0 * (1.0 - s) * (1.0 - s)) / 3.0 }
+}
+
+fn uv_to_st(u: f64) -> f64 {
+    if u >= 0.0 { 0.5 * (1.0 + 3.0 * u).sqrt() } else { 1.0 - 0.5 * (1.0 - 3.0 * u).sqrt() }
+}
+
+/// Where the side at `u` of a box of (u, v) whose largest |v| is `max_v` moves to for the box to
+/// hold every point within the distance whose sine is `sin_dist` of it (negative for the low
+/// side): S2's ExpandEndpoint (s2cell_id.cc), tan(atan(u) + the side's turn).
+fn expand_uv(u: f64, max_v: f64, sin_dist: f64) -> f64 {
+    let sin_turn = sin_dist * ((1.0 + u * u + max_v * max_v) / (1.0 + u * u)).sqrt();
+    let cos_turn = (1.0 - sin_turn * sin_turn).sqrt();
+    (cos_turn * u + sin_turn) / (cos_turn - sin_turn * u)
+}
+
+/// The squared distance from the origin to the convex quadrilateral through `corners` in order:
+/// 0 for the origin inside it or on a side.
+fn origin_to_quad_sq(corners: [(f64, f64); 4]) -> f64 {
+    let (mut turns, mut nearest) = ([0.0; 4], f64::MAX);
+    for k in 0..4 {
+        let ((ax, ay), (bx, by)) = (corners[k], corners[(k + 1) % 4]);
+        turns[k] = ax * by - ay * bx;
+        let (dx, dy) = (bx - ax, by - ay);
+        let length_sq = dx * dx + dy * dy;
+        let t = if length_sq > 0.0 { (-(ax * dx + ay * dy) / length_sq).clamp(0.0, 1.0) } else { 0.0 };
+        let (x, y) = (ax + t * dx, ay + t * dy);
+        nearest = nearest.min(x * x + y * y);
+    }
+    let inside = turns.iter().all(|&turn| turn >= 0.0) || turns.iter().all(|&turn| turn <= 0.0);
+    if inside { 0.0 } else { nearest }
 }
 
 // --- Binary format structs (must match C++ build pipeline) ---
@@ -1347,8 +1485,8 @@ thread_local! {
 
 impl Index {
     pub fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
-        // Distance budget used by the primary-feature selection. The
-        // internal distances are stored in radians² (via `to_radians()`
+        // The reach of the geo lookups and the primary-feature selection.
+        // The internal distances are stored in radians² (via `to_radians()`
         // before squaring), so convert metres → radians → radians².
         // Earth radius is 6 371 000 m.
         let radians = search_distance / 6_371_000.0;
@@ -1525,10 +1663,10 @@ impl Index {
 
     // --- Geo lookup (streets, addresses, interpolation from merged index) ---
 
-    /// The point's street-level cell and its neighbours, in the order the geo lookups read them.
-    fn geo_cells_around(&self, lat: f64, lng: f64) -> Vec<u64> {
-        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
-        std::iter::once(cell).chain(cell_neighbors_at_level(cell, self.street_cell_level)).collect()
+    /// The street-level cells within the search distance of the point, nearest first: the
+    /// cells every geo lookup reads, whose lists GEO_LISTS keeps for the lookups after the first.
+    fn geo_cells_around(&self, lat: f64, lng: f64) -> NearCells {
+        cells_within(lat, lng, self.street_cell_level, self.max_distance_sq.sqrt())
     }
 
     /// What decides between two address points at one exact distance (see
@@ -1559,9 +1697,9 @@ impl Index {
         (self.get_string(iw.name), iw.start_number, iw.end_number, iw.interpolation, nodes)
     }
 
-    /// The address point, the interpolation and the street way nearest (lat, lng), each with
-    /// its squared distance and its id: the address's record, the interpolation's street and
-    /// the house number at the point, the street's row.
+    /// The address point, the interpolation and the street way nearest (lat, lng) within the
+    /// search distance, each with its squared distance and its id: the address's record, the
+    /// interpolation's street and the house number at the point, the street's row.
     pub fn query_geo(&self, lat: f64, lng: f64)
         -> (Option<(f64, AddrRecord, u32)>, Option<(f64, Cow<'_, str>, u32, u32)>, Option<(f64, WayRow, u32)>)
     {
@@ -1577,34 +1715,35 @@ impl Index {
         };
         let cells = self.geo_cells_around(lat, lng);
         let mut lists = GEO_LISTS.with(std::cell::Cell::take);
-        self.geo_index.lookup_many(&cells, geo_index::ALL_TABLES, &mut lists);
+        self.geo_index.lookup_many(&cells.ids, geo_index::ALL_TABLES, &mut lists);
 
         let cos_lat = lat.to_radians().cos();
-        let addr_result = self.nearest_addr(&lists, cells.len(), lat, lng, cos_lat);
-        let street_result = self.nearest_street(streets, &lists, cells.len(), lat, lng, cos_lat);
-        let interp_result = self.nearest_interp(&lists, cells.len(), lat, lng, cos_lat);
+        let addr_result = self.nearest_addr(&lists, &cells, lat, lng, cos_lat);
+        let street_result = self.nearest_street(streets, &lists, &cells, lat, lng, cos_lat);
+        let interp_result = self.nearest_interp(&lists, &cells, lat, lng, cos_lat);
 
         GEO_LISTS.with(|g| g.set(lists));
 
         (addr_result, interp_result, street_result)
     }
 
-    /// The address point nearest (lat, lng) in `lists`, a lookup's lists of `cells` cells: its
-    /// squared distance, its record and its id. An exact tie goes by `addr_tie_key`, then to the
-    /// point read first: cells are read in the order the lookup asked for them, a cell's ids in
-    /// its list's.
-    fn nearest_addr(&self, lists: &GeoLists, cells: usize, lat: f64, lng: f64, cos_lat: f64)
+    /// The address point nearest (lat, lng) within the search distance in `lists`, a lookup's
+    /// lists of `cells`: its squared distance, its record and its id. An exact tie goes by
+    /// `addr_tie_key`, then to the point read first: cells are read in the order the lookup
+    /// asked for them, a cell's ids in its list's.
+    fn nearest_addr(&self, lists: &GeoLists, cells: &NearCells, lat: f64, lng: f64, cos_lat: f64)
         -> Option<(f64, AddrRecord, u32)>
     {
         let addrs = self.addrs.as_ref()?;
         let addr_key = |a: &AddrRecord| self.addr_tie_key(a, lat, lng, cos_lat);
 
-        let mut best_addr_dist = f64::MAX;
+        let mut best_addr_dist = self.max_distance_sq;
         let mut best_addr: Option<AddrRecord> = None;
         let mut best_addr_id: u32 = NO_DATA;
-        // One run over the cells' lists. A corrupt cell entry reads as no record: an id past
-        // the last address, a record whose block can't be read.
-        let ids = (0..cells).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
+        // One run over every cell's list: a building is listed in the cell of its point but is
+        // as far as its outline, which can come nearer than that cell. A corrupt cell entry
+        // reads as no record: an id past the last address, a record whose block can't be read.
+        let ids = (0..cells.ids.len()).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
         with_footprint(|footprint| {
             addrs.for_ids(ids, |id, point| {
                 let dlat = (point.lat as f64 - lat).to_radians();
@@ -1625,20 +1764,23 @@ impl Index {
         best_addr.map(|p| (best_addr_dist, p, best_addr_id))
     }
 
-    /// The street way nearest (lat, lng) in `lists`, read in `nearest_addr`'s order: its squared
-    /// distance, its row and its id. An exact tie goes by `street_tie_key`, then to the way
-    /// read first.
-    fn nearest_street(&self, streets: &WayFiles, lists: &GeoLists, cells: usize, lat: f64, lng: f64, cos_lat: f64)
+    /// The street way nearest (lat, lng) within the search distance in `lists`, read in
+    /// `nearest_addr`'s order: its squared distance, its row and its id. An exact tie goes by
+    /// `street_tie_key`, then to the way read first.
+    fn nearest_street(&self, streets: &WayFiles, lists: &GeoLists, cells: &NearCells, lat: f64, lng: f64, cos_lat: f64)
         -> Option<(f64, WayRow, u32)>
     {
-        let mut best_street_dist = f64::MAX;
+        let mut best_street_dist = self.max_distance_sq;
         let mut best_street: Option<u32> = None;
 
         // Fixed-size hash set on stack to skip duplicate street IDs across cells
         let mut seen_streets: [u32; 64] = [u32::MAX; 64];
 
         with_way_nodes(|nodes| {
-            for i in 0..cells {
+            for (i, &near) in cells.near.iter().enumerate() {
+                // A way is listed in every cell it crosses: one nearer than the best crosses a
+                // cell nearer than it, which comes before.
+                if best_street_dist < near { break; }
                 for &id in lists.list(i, geo_index::STREETS) {
                     let slot = (id as usize) & 0x3F;
                     if seen_streets[slot] == id { continue; }
@@ -1669,18 +1811,21 @@ impl Index {
         Some((best_street_dist, streets.row(id)?, id))
     }
 
-    /// The interpolation way nearest (lat, lng) in `lists`, read in `nearest_addr`'s order: its
-    /// squared distance, its street, the house number at the point of its line nearest
-    /// (lat, lng), and its id. Equally near ways go to the lesser `interp_tie_key`.
-    fn nearest_interp(&self, lists: &GeoLists, cells: usize, lat: f64, lng: f64, cos_lat: f64)
+    /// The interpolation way nearest (lat, lng) within the search distance in `lists`, read in
+    /// `nearest_addr`'s order: its squared distance, its street, the house number at the point
+    /// of its line nearest (lat, lng), and its id. Equally near ways go to the lesser
+    /// `interp_tie_key`.
+    fn nearest_interp(&self, lists: &GeoLists, cells: &NearCells, lat: f64, lng: f64, cos_lat: f64)
         -> Option<(f64, Cow<'_, str>, u32, u32)>
     {
         let interps = self.interps.as_ref()?;
 
-        let mut best_interp_dist = f64::MAX;
+        let mut best_interp_dist = self.max_distance_sq;
         let mut best_interp: Option<(u32, WayRow)> = None;
         let mut best_interp_t: f64 = 0.0;
-        for i in 0..cells {
+        for (i, &near) in cells.near.iter().enumerate() {
+            // Listed in every cell it crosses, as a street is.
+            if best_interp_dist < near { break; }
             for &id in lists.list(i, geo_index::INTERPOLATIONS) {
                 // A corrupt cell entry reads as no way. The row comes first: a way without
                 // numbers costs no node.
@@ -1708,6 +1853,8 @@ impl Index {
     // nearest address whose parent_way_id matches that street's
     // index, gated by `ST_DWithin(query, 0.001)` (~100m). Returns the
     // address whose housenumber should refine the result, with its record id.
+    // Like every geo lookup it reaches no farther than the search distance,
+    // in the cells query_geo read.
     pub fn find_addr_on_way(&self, lat: f64, lng: f64, parent_way_idx: u32, max_dist_sq: f64)
         -> Option<(u32, AddrRecord)>
     {
@@ -1715,14 +1862,15 @@ impl Index {
 
         let cells = self.geo_cells_around(lat, lng);
         let mut lists = GEO_LISTS.with(std::cell::Cell::take);
-        self.geo_index.lookup_many(&cells, 1 << geo_index::ADDRESSES, &mut lists);
+        self.geo_index.lookup_many(&cells.ids, 1 << geo_index::ADDRESSES, &mut lists);
         let cos_lat = lat.to_radians().cos();
         let addr_key = |a: &AddrRecord| self.addr_tie_key(a, lat, lng, cos_lat);
 
-        let mut best_dist = max_dist_sq;
+        let mut best_dist = max_dist_sq.min(self.max_distance_sq);
         let mut best: Option<(u32, AddrRecord)> = None;
-        // Of an address under another way no more than its street and its parent is read.
-        let ids = (0..cells.len()).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
+        // Every cell's list, as nearest_addr reads them. Of an address under another way no
+        // more than its street and its parent is read.
+        let ids = (0..cells.ids.len()).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
         with_footprint(|footprint| {
             addrs.for_ids_on_way(ids, parent_way_idx, |id, point| {
                 let dlat = (point.lat as f64 - lat).to_radians();
@@ -1754,17 +1902,21 @@ impl Index {
     /// street" is the name-token gate the TIGER postcode tier uses.
     /// Equally near lines (TIGER's odd and even sides share the street
     /// centreline) go to the lower start number and type, then to the lesser
-    /// interp_tie_key, never to record order.
+    /// interp_tie_key, never to record order. Like every geo lookup it reaches
+    /// no farther than the search distance.
     pub fn find_interp_on_way(&self, lat: f64, lng: f64, street_name: &str, max_dist_sq: f64) -> Option<u32> {
         let interps = self.interps.as_ref()?;
 
         let cells = self.geo_cells_around(lat, lng);
         let mut lists = GEO_LISTS.with(std::cell::Cell::take);
-        self.geo_index.lookup_many(&cells, 1 << geo_index::INTERPOLATIONS, &mut lists);
+        self.geo_index.lookup_many(&cells.ids, 1 << geo_index::INTERPOLATIONS, &mut lists);
         let cos_lat = lat.to_radians().cos();
+        let max_dist_sq = max_dist_sq.min(self.max_distance_sq);
 
         let mut best: Option<(f64, u32, WayRow, f64)> = None;
-        for i in 0..cells.len() {
+        for (i, &near) in cells.near.iter().enumerate() {
+            // Listed in every cell it crosses, as in nearest_interp.
+            if near >= max_dist_sq || best.as_ref().is_some_and(|(d, ..)| *d < near) { break; }
             for &id in lists.list(i, geo_index::INTERPOLATIONS) {
                 // The row comes first: only a line of the street's name costs its nodes.
                 let Some(iw) = interps.row(id) else { continue };
@@ -6977,6 +7129,7 @@ mod query_path_tests {
     mod display_name;
     mod postcodes;
     mod ranks;
+    mod reach;
 
     /// The fixtures' origin unless one is given: everything sits metres
     /// north and east of it.

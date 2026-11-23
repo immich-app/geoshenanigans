@@ -136,7 +136,7 @@ fn every_row_reads_back_one_cell_at_a_time() {
     }
 }
 
-/// Nine cells at a time, in any order, as a query asks for its cell and its neighbours: some in
+/// Nine cells at a time, in any order, as a query asks for the cells round its point: some in
 /// one block, some in blocks apart, some twice, some without rows. Each gets what a lookup of it
 /// alone gets.
 #[test]
