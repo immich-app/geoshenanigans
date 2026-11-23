@@ -5843,7 +5843,7 @@ impl<'a> AddressDetails<'a> {
         })
     }
 
-    /// The address of `rows` (one or more a rank, the finest first): each label's first row,
+    /// The address of `rows` (one a rank, the finest first): each label's first row,
     /// as Nominatim's address keeps (v1/format_json.py:29-34), but a region of the country's own
     /// name, and the rows for display_name. Observed Nominatim behaviour: the Kingdom of the
     /// Netherlands (admin_level 2) and the constituent country (3) are both named "Nederland",
