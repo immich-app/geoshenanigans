@@ -12,7 +12,8 @@
 #           planned=true when it did, so the job's Plan All can skip the module.
 #
 # Both do nothing once the entries are gone, so they're safe on every run, and a run whose apply failed after forget
-# recovers by running again. Run it like the terragrunt jobs: ENVIRONMENT set, under op run --env-file=deployment/.env.
+# recovers by running again. The module's MIGRATION.md has the whole sequence and how to go back to v4. Run it like the
+# terragrunt jobs: ENVIRONMENT set, under op run --env-file=deployment/.env.
 #
 #   tiles-worker-v4-state.sh forget|plan
 set -euo pipefail
@@ -69,7 +70,9 @@ case "$mode" in
     echo "$env: removing ${#entries[@]} provider v4 entries from tiles-worker state; the apply imports the live objects"
     printf '  %s\n' "${entries[@]}"
     tg state rm -lock-timeout=1m "${entries[@]}"
-    if [ -n "$(v4_entries)" ]; then
+    # Its own assignment, so a failed read fails the run rather than passing as no entries.
+    remaining=$(v4_entries)
+    if [ -n "$remaining" ]; then
       echo "::error::$env tiles-worker state still has provider v4 entries after state rm" >&2
       exit 1
     fi

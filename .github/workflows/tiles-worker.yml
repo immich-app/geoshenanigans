@@ -50,6 +50,11 @@ jobs:
         run: deployment/scripts/tiles-cleanup.test.sh
         if: ${{ !cancelled() }}
 
+      - name: Test tiles-worker v4 state script
+        working-directory: .
+        run: deployment/scripts/tiles-worker-v4-state.test.sh
+        if: ${{ !cancelled() }}
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -299,6 +304,14 @@ jobs:
         with:
           name: tiles-build-output
           path: "${{ github.workspace }}/dist"
+
+      # As in the job above.
+      - name: Forget tiles-worker's provider v4 state
+        if: steps.key.outputs.current == 'true'
+        working-directory: ${{ github.workspace }}/deployment
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_DEV_ENV }}
+        run: op run --env-file=".env" -- scripts/tiles-worker-v4-state.sh forget
 
       - name: Deploy dev worker
         if: steps.key.outputs.current == 'true'

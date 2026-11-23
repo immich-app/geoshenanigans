@@ -66,7 +66,7 @@ resource "cloudflare_workers_custom_domain" "tiles" {
 # Provider v4 left the cron trigger and the domains in state in a form v5 can't read (a cloudflare_workers_domain type
 # v5 doesn't have, and v4's cron schedules, which v5's state upgrader rejects), and v5 can't move either. The deploy
 # removes those entries from state (deployment/scripts/tiles-worker-v4-state.sh), and these blocks adopt the live
-# objects without changing them. An import whose target is already in state does nothing. Remove the blocks, the data
+# objects; see MIGRATION.md. An import whose target is already in state does nothing. Remove the blocks, the data
 # source and the script once prod and dev have applied.
 data "cloudflare_workers_custom_domains" "attached" {
   account_id = var.cloudflare_account_id
@@ -82,6 +82,8 @@ import {
   id = "${var.cloudflare_account_id}/${each.value}"
 }
 
+# v5 never reads a cron trigger's schedules back from the API, so the import comes without them and the first apply
+# sends the worker's schedule list again: the same single "* * * * *" in prod, its first schedule in dev.
 import {
   to = cloudflare_workers_cron_trigger.heartbeat
   id = "${var.cloudflare_account_id}/${local.script_name}"
