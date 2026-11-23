@@ -2270,17 +2270,16 @@ impl Index {
         // The walk tests every node's boundary for its rows, so it lists them only where a node
         // has the name asked for.
         let rows = named.is_some_and(|name| candidates.iter().any(|(pn, _)| pn.name_id == name));
-        let (accepted, written) = place_node_walk(&nodes, held_ranks, |k| node_inside_boundary(&candidates[k].0, nodes[k].1), rows);
+        let (shown, written) = place_node_walk(&nodes, held_ranks, |k| node_inside_boundary(&candidates[k].0, nodes[k].1), rows);
         result.named_rows = written.into_iter()
             .filter(|&k| Some(candidates[k].0.name_id) == named)
             .map(|k| NamedRow { rank: nodes[k].1, field: PLACE_NODE_FIELDS[nodes[k].0], distance: nodes[k].2.sqrt(), node: candidates[k].0 })
             .collect();
-        result.rows = accepted.iter().enumerate()
-            .filter_map(|(pt, k)| k.map(|k| AddressRow {
-                rank: nodes[k].1, name: self.get_string(candidates[k].0.name_id), label: Some(PLACE_NODE_FIELDS[pt]),
-            }))
+        result.rows = shown.into_iter().rev()
+            .map(|(rank, k, _)| AddressRow {
+                rank, name: self.get_string(candidates[k].0.name_id), label: Some(PLACE_NODE_FIELDS[nodes[k].0]),
+            })
             .collect();
-        result.rows.sort_by(|a, b| b.rank.cmp(&a.rank));
 
         result
     }
@@ -5428,52 +5427,58 @@ pub fn place_node_covering(pn: &PlaceNode, feature: PlaceFeature<'_>) -> Option<
 }
 
 /// Nominatim's address walk over place nodes (insert_addresslines,
-/// placex_triggers.sql:596-670). `nodes` holds every place node covering the
-/// point as (PlaceNode type, rank_address, squared distance, lat, lng). The
-/// walk takes them by rank_address, then by distance times
-/// PLACE_NODE_DISTANCE_WEIGHT at rank 16, and passes over a node outside the
-/// current boundary of its rank (`in_boundary(index)`) or outside the last
-/// accepted node's place_node_fuzzy_area; the first that passes is its
-/// rank's one entry (address_havelevel). Without the fuzzy-area cascade,
-/// spurious sub-city place nodes (White House "The West End", SF "Hayes
-/// Valley") leak in where Nominatim's walk rejects them. Boundaries come
-/// first within a rank (isguess asc, placex_triggers.sql:599): a rank in
-/// `held_ranks` (a bit per rank) takes no node, and a boundary the walk
-/// passes after the last accepted node clears its fuzzy area
-/// (current_node_area := NULL, :651). Returns the accepted node's index per
-/// type, of the highest rank when a type has entries at two: the address
-/// keeps a label's first row, finest first (v1/format_json.py:31-34).
-pub fn accept_place_nodes(nodes: &[(usize, u8, f64, f32, f32)], held_ranks: u32, in_boundary: impl FnMut(usize) -> bool) -> [Option<usize>; 7] {
+/// placex_triggers.sql:596-670), and the row of them each rank shows
+/// (complete_address_details, results.py:611-632). `nodes` holds every
+/// place node covering the feature as (PlaceNode type, rank_address, squared
+/// distance, lat, lng). The walk takes them by rank_address, then by distance
+/// times PLACE_NODE_DISTANCE_WEIGHT at rank 16, passes over a node outside
+/// the current boundary of its rank (`in_boundary(index)`), which has no
+/// row, and turns down one outside the last accepted node's
+/// place_node_fuzzy_area, a row all the same; the first that passes is its
+/// rank's one entry (address_havelevel), and its fuzzy area the next one's.
+/// Boundaries come first within a rank (isguess asc, placex_triggers.sql:599):
+/// a rank in `held_ranks` (a bit per rank) takes no node, and a boundary the
+/// walk passes after the last accepted node clears its fuzzy area
+/// (current_node_area := NULL, :651). A rank no boundary holds and whose
+/// nodes the walk all turns down still shows one: their rows all score -1 at
+/// query time and none is an area, so `distance desc` puts the farthest
+/// first, by its plain distance (the weights only order the walk). Of
+/// Nislevvej's four hamlets outside the village Otterup's fuzzy area, that
+/// is Stormose. It sets no fuzzy area. Returns (rank, node, accepted) of the
+/// row each rank shows, by rank.
+pub fn accept_place_nodes(nodes: &[(usize, u8, f64, f32, f32)], held_ranks: u32, in_boundary: impl FnMut(usize) -> bool)
+    -> Vec<(u8, usize, bool)> {
     place_node_walk(nodes, held_ranks, in_boundary, false).0
 }
 
-/// accept_place_nodes' walk, and with `rows` the nodes it writes an address
-/// row for (placex_triggers.sql:666-669), in walk order: each node inside its
-/// rank's current boundary until one of the rank is accepted, those its
-/// fuzzy area cascade turns down among them, and after that, or in a rank a
-/// boundary holds, the ones within twice the nearest the rank had (:614-622,
-/// place_min_distance, from 1 degree). The nodes accepted are the same
-/// either way; without `rows` the walk tests no boundary of a node it can't
-/// accept.
+/// accept_place_nodes' rows, and with `rows` the nodes the walk writes an
+/// address row for (placex_triggers.sql:666-669), in walk order: each node
+/// inside its rank's current boundary until one of the rank is accepted,
+/// those its fuzzy area cascade turns down among them, and after that, or in
+/// a rank a boundary holds, the ones within twice the nearest the rank had
+/// (:614-622, place_min_distance, from 1 degree). The rows shown are the
+/// same either way; without `rows` the walk tests the boundary only of the
+/// nodes it may show.
 pub fn place_node_walk(nodes: &[(usize, u8, f64, f32, f32)], held_ranks: u32, mut in_boundary: impl FnMut(usize) -> bool, rows: bool)
-    -> ([Option<usize>; 7], Vec<usize>) {
+    -> (Vec<(u8, usize, bool)>, Vec<usize>) {
     let held = |rank: u8| held_ranks & (1 << rank) != 0;
     let rank = |k: usize| nodes[k].1;
     let weighed = |k: usize| {
         let (pt, rank, dist_sq, _, _) = nodes[k];
         dist_sq.sqrt() * if rank == CurrentBoundaries::CITY { PLACE_NODE_DISTANCE_WEIGHT[pt] } else { 1.0 }
     };
+    // Ties: type, then position, so neither the walk nor the farthest node
+    // depends on record order.
+    let ties = |a: usize, b: usize| {
+        nodes[a].0.cmp(&nodes[b].0).then(nodes[a].3.total_cmp(&nodes[b].3)).then(nodes[a].4.total_cmp(&nodes[b].4))
+    };
     let mut order: Vec<usize> = (0..nodes.len()).filter(|&k| rows || !held(rank(k))).collect();
-    // Ties: type, then position, so the walk doesn't depend on record order.
-    order.sort_by(|&a, &b| {
-        rank(a).cmp(&rank(b))
-            .then(weighed(a).total_cmp(&weighed(b)))
-            .then(nodes[a].0.cmp(&nodes[b].0))
-            .then(nodes[a].3.total_cmp(&nodes[b].3))
-            .then(nodes[a].4.total_cmp(&nodes[b].4))
-    });
+    order.sort_by(|&a, &b| rank(a).cmp(&rank(b)).then(weighed(a).total_cmp(&weighed(b))).then(ties(a, b)));
+    // Each node's boundary test, made once.
+    let mut inside: Vec<Option<bool>> = vec![None; nodes.len()];
+    let mut in_boundary = |k: usize| *inside[k].get_or_insert_with(|| in_boundary(k));
 
-    let mut accepted = [None; 7];
+    let mut shown = Vec::new();
     let mut written = Vec::new();
     // The ranks that have their entry (address_havelevel), and the nearest
     // node each rank had (place_min_distance), in degrees.
@@ -5482,7 +5487,7 @@ pub fn place_node_walk(nodes: &[(usize, u8, f64, f32, f32)], held_ranks: u32, mu
     let mut last_rank = 0;
     // The last accepted node's fuzzy area: (lat, lng, half side in metres).
     let mut fuzzy: Option<(f32, f32, f64)> = None;
-    for k in order {
+    for &k in &order {
         let (pt, r, dist_sq, lat, lng) = nodes[k];
         let first = had & (1 << r) == 0;
         if !first && !rows { continue; }
@@ -5502,12 +5507,23 @@ pub fn place_node_walk(nodes: &[(usize, u8, f64, f32, f32)], held_ranks: u32, mu
             continue;
         }
 
-        accepted[pt] = Some(k);
+        shown.push((r, k, true));
         had |= 1 << r;
         last_rank = r;
         fuzzy = Some((lat, lng, place_fuzzy_half_side_m(pt)));
     }
-    (accepted, written)
+
+    // The ranks the walk took no node of and no boundary holds: the farthest
+    // node of each inside its boundary.
+    let mut left: Vec<usize> = order.into_iter().filter(|&k| had & (1 << rank(k)) == 0).collect();
+    left.sort_by(|&a, &b| rank(a).cmp(&rank(b)).then(nodes[b].2.total_cmp(&nodes[a].2)).then(ties(a, b)));
+    for run in left.chunk_by(|&a, &b| rank(a) == rank(b)) {
+        if let Some(&k) = run.iter().find(|&&k| in_boundary(k)) {
+            shown.push((rank(k), k, false));
+        }
+    }
+    shown.sort_by_key(|&(rank, _, _)| rank);
+    (shown, written)
 }
 
 /// The rank_address range of place nodes that a boundary of their own rank
@@ -5655,8 +5671,8 @@ impl CurrentBoundaries {
 
 #[derive(Default)]
 pub struct PlaceResult<'a> {
-    /// The rows of the place nodes the walk takes, each labelled by its type
-    /// (PLACE_NODE_FIELDS), the finest first.
+    /// The row of a place node each rank shows (place_node_walk), each
+    /// labelled by its type (PLACE_NODE_FIELDS), the finest first.
     pub rows: Vec<AddressRow<'a>>,
     /// The address rows of the nodes of the name find_places was asked for
     /// (place_node_walk).
@@ -6734,20 +6750,41 @@ mod pure_helper_tests {
     fn place_nodes_fill_quarter_and_neighbourhood_both() {
         // Taguig: Nominatim's answer has a quarter and a neighbourhood.
         let nodes = [node_at(6, 0.0, 2.0), node_at(5, 500.0, 1.0)];
-        let accepted = accept_place_nodes(&nodes, 0, |_| true);
-        assert_eq!(accepted, [None, None, None, None, None, Some(1), Some(0)]);
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(22, 0, true), (24, 1, true)]);
     }
 
     #[test]
-    fn place_nodes_neighbourhood_must_sit_in_the_quarter_fuzzy_area() {
-        // 1000 m is the quarter's half side: 1100 m east is outside.
+    fn place_nodes_neighbourhood_outside_the_quarter_fuzzy_area_is_shown_but_not_accepted() {
+        // 1000 m is the quarter's half side: 1100 m east is outside, so the
+        // walk turns the neighbourhood down, and rank 24, which it accepts no
+        // node of, shows it all the same.
         let mut nodes = [node_at(6, 0.0, 1.0), node_at(5, 1100.0, 2.0)];
-        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [None, None, None, None, None, None, Some(0)]);
-        // Without an admissible quarter nothing holds the neighbourhood.
-        assert_eq!(accept_place_nodes(&nodes, 0, |k| k != 0), [None, None, None, None, None, Some(1), None]);
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(22, 0, true), (24, 1, false)]);
+        // Without an admissible quarter nothing holds the neighbourhood, and
+        // the quarter outside its boundary is no row.
+        assert_eq!(accept_place_nodes(&nodes, 0, |k| k != 0), [(24, 1, true)]);
         // 900 m east is inside: the half side is the radius, not radius / √2.
         nodes[1] = node_at(5, 900.0, 2.0);
-        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [None, None, None, None, None, Some(1), Some(0)]);
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(22, 0, true), (24, 1, true)]);
+    }
+
+    #[test]
+    fn place_nodes_a_rank_the_walk_accepts_none_of_shows_its_farthest_inside_its_boundary() {
+        // A village at 16 with a 2000 m fuzzy area, and three hamlets of rank
+        // 20 outside it: the one 3500 m east is the farthest inside its
+        // boundary, and shows; the one 4000 m east is outside its boundary,
+        // no row. That hamlet sets no fuzzy area: the neighbourhood 3600 m
+        // east, outside the village's, is turned down, and shows at 24 as the
+        // only row of its rank.
+        let d = |m: f64| (m / METRES_PER_DEGREE).powi(2);
+        let nodes = [node_at(2, 0.0, d(100.0)), node_at(4, 3000.0, d(300.0)), node_at(4, 3500.0, d(600.0)),
+                     node_at(4, 4000.0, d(900.0)), node_at(5, 3600.0, d(400.0))];
+        assert_eq!(accept_place_nodes(&nodes, 0, |k| k != 3), [(16, 0, true), (20, 2, false), (24, 4, false)]);
+        assert_eq!(place_node_walk(&nodes, 0, |k| k != 3, true).0, accept_place_nodes(&nodes, 0, |k| k != 3));
+        // No node of a rank a boundary holds shows.
+        assert_eq!(accept_place_nodes(&nodes, 1 << 20 | 1 << 24, |k| k != 3), [(16, 0, true)]);
+        // Nor one of a rank whose nodes all lie outside their boundary.
+        assert_eq!(accept_place_nodes(&nodes, 0, |k| k == 0), [(16, 0, true)]);
     }
 
     #[test]
@@ -6758,22 +6795,22 @@ mod pure_helper_tests {
         ];
         // A city 3 away weighs 0.75, a town 1.41 away 0.71, a village 1 away
         // 1: the town; the nearer of suburb and hamlet.
-        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [None, Some(1), None, None, Some(4), None, None]);
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(16, 1, true), (20, 4, true)]);
         // A city 2 away (0.5) beats the town.
         nodes[0] = node_at(0, 0.0, 4.0);
-        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [Some(0), None, None, None, Some(4), None, None]);
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(16, 0, true), (20, 4, true)]);
         // A boundary at rank 16 leaves city, town and village out.
-        assert_eq!(accept_place_nodes(&nodes, 1 << CurrentBoundaries::CITY, |_| true), [None, None, None, None, Some(4), None, None]);
+        assert_eq!(accept_place_nodes(&nodes, 1 << CurrentBoundaries::CITY, |_| true), [(20, 4, true)]);
     }
 
     #[test]
     fn place_nodes_rank_16_node_holds_the_suburb() {
-        // A village's fuzzy half side is 2000 m: a suburb 2100 m away stays
-        // out, one 1500 m away comes in.
+        // A village's fuzzy half side is 2000 m: a suburb 2100 m away is no
+        // entry of the walk, though the rank shows it; one 1500 m away is.
         let mut nodes = [node_at(2, 0.0, 1.0), node_at(3, 2100.0, 1.0)];
-        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [None, None, Some(0), None, None, None, None]);
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(16, 0, true), (20, 1, false)]);
         nodes[1] = node_at(3, 1500.0, 1.0);
-        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [None, None, Some(0), Some(1), None, None, None]);
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(16, 0, true), (20, 1, true)]);
     }
 
     #[test]
@@ -6825,8 +6862,8 @@ mod pure_helper_tests {
             let nodes: Vec<(usize, u8, f64, f32, f32)> = [north, east].iter()
                 .filter_map(|pn| place_node_covering(pn, feature).map(|d| (4, CurrentBoundaries::SUBURB, d, pn.lat, pn.lng)))
                 .collect();
-            let accepted = accept_place_nodes(&nodes, 0, |_| true)[4];
-            accepted.map(|k| nodes[k].4)
+            let shown = accept_place_nodes(&nodes, 0, |_| true);
+            shown.first().map(|&(_, k, _)| nodes[k].4)
         };
         assert_eq!(walk(line), Some(north.lng));
         assert_eq!(walk(point), Some(east.lng));
@@ -6869,15 +6906,19 @@ mod pure_helper_tests {
         // it ranks 18, so the boundary leaves it in; Nominatim's answer has
         // city=Taipei and village=Xingya.
         let nodes = [node_at(1, 0.0, 1.0), promoted_node_at(2, 100.0, 4.0)];
-        assert_eq!(accept_place_nodes(&nodes, 1 << CurrentBoundaries::CITY, |_| true), [None, None, Some(1), None, None, None, None]);
-        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [None, Some(0), Some(1), None, None, None, None]);
+        assert_eq!(accept_place_nodes(&nodes, 1 << CurrentBoundaries::CITY, |_| true), [(18, 1, true)]);
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(16, 0, true), (18, 1, true)]);
         // The rank_search weights apply at rank 16 only: at 18 a city 2 away
         // loses to a village 1 away.
         let nodes = [promoted_node_at(0, 0.0, 4.0), promoted_node_at(2, 100.0, 1.0)];
-        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [None, None, Some(1), None, None, None, None]);
-        // A hamlet at 20 and a promoted one at 22: the finer one names it.
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(18, 1, true)]);
+        // A village at 16 and a promoted one at 18, or a hamlet at 20 and a
+        // promoted one at 22: each is its rank's row, the address's label
+        // the finer one's.
+        let nodes = [node_at(2, 0.0, 1.0), promoted_node_at(2, 100.0, 4.0)];
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(16, 0, true), (18, 1, true)]);
         let nodes = [node_at(4, 0.0, 1.0), promoted_node_at(4, 100.0, 2.0)];
-        assert_eq!(accept_place_nodes(&nodes, 0, |_| true)[4], Some(1));
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(20, 0, true), (22, 1, true)]);
     }
 
     #[test]
@@ -6887,11 +6928,11 @@ mod pure_helper_tests {
         // inside it 22, behind the rank-22 village boundary as well.
         let nodes = [node_at(4, 0.0, 1.0), node_at(3, 100.0, 2.0), node_at(6, 200.0, 3.0)];
         let held = |ranks: &[u8]| ranks.iter().fold(0, |bits, r| bits | 1 << r);
-        assert_eq!(accept_place_nodes(&nodes, held(&[20]), |_| true), [None, None, None, None, None, None, Some(2)]);
-        assert_eq!(accept_place_nodes(&nodes, held(&[20, 22]), |_| true), [None; 7]);
+        assert_eq!(accept_place_nodes(&nodes, held(&[20]), |_| true), [(22, 2, true)]);
+        assert_eq!(accept_place_nodes(&nodes, held(&[20, 22]), |_| true), []);
         let hamlet_in_district = [promoted_node_at(4, 0.0, 1.0)];
-        assert_eq!(accept_place_nodes(&hamlet_in_district, held(&[20, 22]), |_| true), [None; 7]);
-        assert_eq!(accept_place_nodes(&hamlet_in_district, held(&[20]), |_| true)[4], Some(0));
+        assert_eq!(accept_place_nodes(&hamlet_in_district, held(&[20, 22]), |_| true), []);
+        assert_eq!(accept_place_nodes(&hamlet_in_district, held(&[20]), |_| true), [(22, 0, true)]);
     }
 
     #[test]
@@ -6901,25 +6942,21 @@ mod pure_helper_tests {
         // 700 m is more than twice the nearest away and no row.
         let d = |m: f64| (m / METRES_PER_DEGREE).powi(2);
         let nodes = [node_at(4, 0.0, d(300.0)), node_at(3, 50.0, d(500.0)), node_at(4, 100.0, d(590.0)), node_at(3, 150.0, d(700.0))];
-        let (accepted, rows) = place_node_walk(&nodes, 0, |_| true, true);
-        assert_eq!(accepted, accept_place_nodes(&nodes, 0, |_| true));
-        assert_eq!(accepted[4], Some(0));
+        let (shown, rows) = place_node_walk(&nodes, 0, |_| true, true);
+        assert_eq!(shown, accept_place_nodes(&nodes, 0, |_| true));
+        assert_eq!(shown, [(20, 0, true)]);
         assert_eq!(rows, [0, 1, 2]);
         // A node outside its rank's boundary is no row and no nearest: Drexel Hill is accepted,
         // and the rest are within twice its distance.
-        let (accepted, rows) = place_node_walk(&nodes, 0, |k| k != 0, true);
-        assert_eq!(accepted[3], Some(1));
+        let (shown, rows) = place_node_walk(&nodes, 0, |k| k != 0, true);
+        assert_eq!(shown, [(20, 1, true)]);
         assert_eq!(rows, [1, 2, 3]);
         // A rank a boundary holds takes no node, and its first node is the nearest.
-        let (accepted, rows) = place_node_walk(&nodes, 1 << 20, |_| true, true);
-        assert_eq!(accepted, [None; 7]);
+        let (shown, rows) = place_node_walk(&nodes, 1 << 20, |_| true, true);
+        assert_eq!(shown, []);
         assert_eq!(rows, [0, 1, 2]);
-        // Without rows the walk accepts the same nodes and lists none.
-        assert_eq!(place_node_walk(&nodes, 0, |_| true, false), (accepted_of(&nodes, 0), Vec::new()));
-    }
-
-    fn accepted_of(nodes: &[(usize, u8, f64, f32, f32)], held_ranks: u32) -> [Option<usize>; 7] {
-        accept_place_nodes(nodes, held_ranks, |_| true)
+        // Without rows the walk shows the same nodes and lists none.
+        assert_eq!(place_node_walk(&nodes, 0, |_| true, false), (accept_place_nodes(&nodes, 0, |_| true), Vec::new()));
     }
 
     #[test]
@@ -6930,19 +6967,20 @@ mod pure_helper_tests {
         let d = |m: f64| (m / METRES_PER_DEGREE).powi(2);
         let nodes = [node_at(2, 0.0, d(100.0)), node_at(4, 2500.0, d(300.0)), node_at(4, 2600.0, d(900.0)),
                      node_at(4, 1000.0, d(1000.0)), node_at(4, 1100.0, d(1500.0))];
-        let (accepted, rows) = place_node_walk(&nodes, 0, |_| true, true);
-        assert_eq!(accepted, [None, None, Some(0), None, Some(3), None, None]);
-        assert_eq!(accepted, accept_place_nodes(&nodes, 0, |_| true));
+        let (shown, rows) = place_node_walk(&nodes, 0, |_| true, true);
+        assert_eq!(shown, [(16, 0, true), (20, 3, true)]);
+        assert_eq!(shown, accept_place_nodes(&nodes, 0, |_| true));
         assert_eq!(rows, [0, 1, 2, 3]);
     }
 
     #[test]
     fn place_nodes_after_a_boundary_leave_the_fuzzy_area_behind() {
-        // A village's fuzzy area reaches 2000 m: a suburb 3000 m away stays
-        // out, unless a boundary between them (rank 18) took over.
+        // A village's fuzzy area reaches 2000 m: the walk turns a suburb
+        // 3000 m away down, unless a boundary between them (rank 18) took
+        // over.
         let nodes = [node_at(2, 0.0, 1.0), node_at(3, 3000.0, 1.0)];
-        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [None, None, Some(0), None, None, None, None]);
-        assert_eq!(accept_place_nodes(&nodes, 1 << 18, |_| true), [None, None, Some(0), Some(1), None, None, None]);
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(16, 0, true), (20, 1, false)]);
+        assert_eq!(accept_place_nodes(&nodes, 1 << 18, |_| true), [(16, 0, true), (20, 1, true)]);
     }
 
     #[test]
@@ -6969,14 +7007,14 @@ mod pure_helper_tests {
         // The nearer neighbourhood lies outside the current boundary: the
         // farther one is the entry.
         let nodes = [node_at(5, 100.0, 1.0), node_at(5, 200.0, 2.0)];
-        assert_eq!(accept_place_nodes(&nodes, 0, |k| k != 0)[5], Some(1));
+        assert_eq!(accept_place_nodes(&nodes, 0, |k| k != 0), [(24, 1, true)]);
         // The nearer one outside the quarter's fuzzy area: the farther one
         // inside it is the entry.
         let nodes = [node_at(6, 0.0, 1.0), node_at(5, 1100.0, 2.0), node_at(5, 900.0, 3.0)];
-        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [None, None, None, None, None, Some(2), Some(0)]);
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(22, 0, true), (24, 2, true)]);
         // A town passed over for its gate leaves rank 16 to the village.
         let nodes = [node_at(1, 0.0, 1.0), node_at(2, 100.0, 4.0)];
-        assert_eq!(accept_place_nodes(&nodes, 0, |k| k != 0), [None, None, Some(1), None, None, None, None]);
+        assert_eq!(accept_place_nodes(&nodes, 0, |k| k != 0), [(16, 1, true)]);
     }
 
     #[test]
