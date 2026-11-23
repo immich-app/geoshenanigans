@@ -97,20 +97,48 @@ It drops whatever prod applied after the copy from state; the next v4 plan puts 
 deployment key, say), so read it before applying. Otherwise (dev, no copy, or any domain re-created or changed since),
 adopt the live objects under the v4 types again, which needs no copy.
 
-For that, check that every hostname the environment serves has an ID (prod: `tiles.immich.cloud` and `tiles.prod.immich.cloud`,
-dev: `tiles.dev.immich.cloud`), then swap whichever v5 entries state has for the v4 ones:
+For that, check that every hostname the environment serves has an ID (prod: `tiles.immich.cloud` and
+`tiles.prod.immich.cloud`, dev: `tiles.dev.immich.cloud`), then swap whichever v5 entries state has for the v4 ones.
+The block removes only entries v5 wrote and imports only what state doesn't hold yet. If it stops part-way, say on a
+domain import, fix the cause and run the whole block again. An environment whose v4 entries were never removed comes
+through unchanged.
 
 ```sh
-mapfile -t v5 < <(tg state list |
-  grep -E '^cloudflare_workers_(script\.tiles|custom_domain\.tiles\[.*\]|cron_trigger\.heartbeat)$' || true)
+# The state's addresses, one per line. The script has the same address in v4 and v5; v5's entry, which has
+# script_name where v4's has name, gets " v5" after it.
+in_state() {
+  tg state pull | jq -r '
+    .resources[]? | select(.mode == "managed" and (.module // "") == "") | . as $r | .instances[]
+    | "\($r.type).\($r.name)" + (if .index_key == null then "" else "[\(.index_key | tojson)]" end)
+      + (if $r.type == "cloudflare_workers_script" and (.attributes | has("script_name")) then " v5" else "" end)'
+}
+found=$(in_state)
+v5=()
+while read -r address version; do
+  case "$address" in
+    cloudflare_workers_script.tiles)
+      if [ "$version" = v5 ]; then v5+=("$address"); fi
+      ;;
+    cloudflare_workers_custom_domain.tiles\[*\] | cloudflare_workers_cron_trigger.heartbeat) v5+=("$address") ;;
+  esac
+done <<<"$found"
 if [ ${#v5[@]} -gt 0 ]; then
   tg state rm "${v5[@]}"
+  found=$(in_state)
 fi
-tg import cloudflare_workers_script.tiles "$account/tiles-$ENVIRONMENT"
-tg import cloudflare_workers_cron_trigger.tiles "$account/tiles-$ENVIRONMENT"
-tg import cloudflare_workers_domain.tiles "$account/<ID of tiles.$ENVIRONMENT.immich.cloud>"
+# Imports an address unless state already has it.
+adopt() {
+  if grep -qxF "$1" <<<"$found"; then
+    echo "$1: already in state"
+  else
+    tg import "$1" "$2"
+  fi
+}
+adopt cloudflare_workers_script.tiles "$account/tiles-$ENVIRONMENT"
+adopt cloudflare_workers_cron_trigger.tiles "$account/tiles-$ENVIRONMENT"
+adopt cloudflare_workers_domain.tiles "$account/<ID of tiles.$ENVIRONMENT.immich.cloud>"
 # prod only:
-tg import 'cloudflare_workers_domain.tiles_prod[0]' "$account/<ID of tiles.immich.cloud>"
+adopt 'cloudflare_workers_domain.tiles_prod[0]' "$account/<ID of tiles.immich.cloud>"
 ```
 
 v4's import doesn't read secrets back, so the next v4 plan updates the script in place with them. Enable the two
