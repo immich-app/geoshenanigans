@@ -39,12 +39,14 @@ Ring square(Box b) { return ring_of({{b.s, b.w}, {b.s, b.e}, {b.n, b.e}, {b.n, b
 uint8_t pt(AdminPlaceType t) { return static_cast<uint8_t>(t); }
 
 // What a polygon carries beyond its rings: its own place tag, the type of the
-// place node it links and its wikidata.
+// place node it links and its wikidata; a place value AdminPlaceType holds
+// no type of where own_value is set.
 struct Tags {
     AdminPlaceType own = AdminPlaceType::NONE;
     AdminPlaceType linked = AdminPlaceType::NONE;
     std::string wikidata;
     bool boundary_category = false;
+    PlaceValue own_value = PlaceValue::NONE;
 };
 
 // Admin polygons and place nodes, every point in `country`, and the pass over
@@ -61,14 +63,26 @@ struct World {
         AdminPolygon p{};
         p.name_id = pid;
         p.admin_level = level;
-        p.own_place_type = pt(tags.own);
+        const PlaceValue own = tags.own_value != PlaceValue::NONE ? tags.own_value : place_value_of(tags.own);
+        p.own_place_value = static_cast<uint8_t>(own);
         p.place_type_override = pt(tags.linked != AdminPlaceType::NONE ? tags.linked : tags.own);
-        if (tags.linked != AdminPlaceType::NONE) p.flags |= ADMIN_FLAG_LINKED;
         if (tags.boundary_category) p.flags |= ADMIN_FLAG_BOUNDARY;
         p.area = data.admin_exact_rings.area(pid);
         data.admin_polygons.push_back(p);
         data.admin_osm_ids.push_back(osm_id);
-        if (!tags.wikidata.empty()) data.admin_wikidata.push_back({admin_boundary_id(osm_id), tags.wikidata});
+        const uint64_t boundary = admin_boundary_id(osm_id);
+        if (!tags.wikidata.empty()) {
+            AdminTags t;
+            t.boundary = boundary;
+            t.wikidata = tags.wikidata;
+            data.admin_tags.push_back(t);
+        }
+        // A link, as the link pass gives it: the node's rank in the country.
+        if (tags.linked != AdminPlaceType::NONE) {
+            const PlaceValue linked = place_value_of(tags.linked);
+            data.admin_links.push_back({boundary, 0, static_cast<uint8_t>(linked),
+                                        place_value_ranks(country, linked).address, LinkStep::LABEL});
+        }
         return pid;
     }
 
@@ -303,17 +317,42 @@ TEST(a_link_sets_the_rank_above_the_parents_and_lowers_it_too) {
     CHECK_EQ(stats.lowered, size_t(1));
 }
 
-TEST(an_own_place_tag_only_raises_a_boundary_nothing_links) {
-    // Baralla (admin_level 8, 16, own place=municipality, 14) keeps 16 here; a level 8
-    // boundary tagged place=suburb (20) takes 20.
+TEST(an_own_place_tag_ranks_a_boundary_nothing_links_up_or_down) {
+    // Baralla (admin_level 8, 16, own place=municipality, 14) ranks 14, above Lugo's 10 (ES
+    // admin_level 6); a level 8 boundary tagged place=suburb (20) takes 20.
     World w("ES");
     w.relation(1, 4, Box{42, -8, 44, -6});
     w.relation(2, 6, Box{42.5, -7.6, 43.5, -6.8});
     const uint32_t baralla = w.relation(3, 8, Box{42.85, -7.30, 42.95, -7.20}, {AdminPlaceType::MUNICIPALITY});
     const uint32_t suburb = w.relation(4, 8, Box{43.00, -7.30, 43.05, -7.20}, {AdminPlaceType::SUBURB});
-    w.rank();
-    CHECK_EQ(w.of(baralla), uint8_t(16));
+    const RankStats stats = w.rank();
+    CHECK_EQ(w.of(baralla), uint8_t(14));
     CHECK_EQ(w.of(suburb), uint8_t(20));
+    CHECK_EQ(stats.own_tags, size_t(2));
+    CHECK_EQ(stats.own_lowered, size_t(1));
+}
+
+TEST(an_own_place_tag_ranks_by_the_whole_place_table_but_not_below_the_parent) {
+    // Town Parks (IE admin_level 10, 20, own place=locality) ranks 25, which no address shows; a
+    // Spanish level 8 boundary tagged place=civil_parish (18 in Spain) 18. A place=county level 8
+    // boundary (12) under a level 6 one of 12 keeps its 16: the tag's rank is not above the
+    // parent's.
+    World ie("IE");
+    ie.relation(1, 4, Box{51, -11, 56, -5});
+    ie.relation(2, 6, Box{53, -7, 54, -6});
+    const uint32_t parks = ie.relation(3, 10, Box{53.5, -6.5, 53.6, -6.4}, {AdminPlaceType::NONE, AdminPlaceType::NONE, "", false,
+                                                                           PlaceValue::LOCALITY});
+    const uint32_t county = ie.relation(4, 8, Box{53.2, -6.9, 53.4, -6.7}, {AdminPlaceType::COUNTY});
+    ie.rank();
+    CHECK_EQ(ie.of(parks), uint8_t(25));
+    CHECK_EQ(ie.of(county), uint8_t(16));
+
+    World es("ES");
+    es.relation(1, 4, Box{42, -8, 44, -6});
+    const uint32_t parish = es.relation(2, 8, Box{42.85, -7.30, 42.95, -7.20}, {AdminPlaceType::NONE, AdminPlaceType::NONE, "", false,
+                                                                               PlaceValue::CIVIL_PARISH});
+    es.rank();
+    CHECK_EQ(es.of(parish), uint8_t(18));
 }
 
 TEST(a_boundary_of_rank_0_in_its_country_stays_out_whatever_its_place_tag_or_link) {

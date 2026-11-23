@@ -30,6 +30,7 @@
 #include "string_pool.h"
 #include "id_allocator.h"
 #include "place_claims.h"
+#include "place_link_types.h"
 #include "parallel.h"
 #include "ranked_bits.h"
 
@@ -410,10 +411,16 @@ struct ParsedData {
     // polygons, OSM_WAY + way_id for closed-way polygons (stable ids since
     // #105). Strategy-2 IdAllocator keys on this.
     std::vector<uint64_t> admin_osm_ids;
-    // The wikidata tag of each boundary that has one, as (boundary id,
-    // value): admin_boundary_id of its polygons' admin_osm_ids. The rank pass
-    // (rank_address.h) reads it, then frees it.
-    std::vector<std::pair<uint64_t, std::string>> admin_wikidata;
+    // What each boundary and place area links by (its label member, name tag
+    // and wikidata), by boundary id: admin_boundary_id of its polygons'
+    // admin_osm_ids. The link and rank passes read it; the rank pass frees it.
+    std::vector<AdminTags> admin_tags;
+    // Each linking boundary's and place area's link (place_links.h), which
+    // the rank pass reads, then frees.
+    std::vector<AdminLink> admin_links;
+    // The place nodes the boundaries and place areas may link, from the parse
+    // to the link pass, which frees them.
+    LinkCandidates link_candidates;
     // A continent's admin polygons' planet ids, parallel to admin_polygons
     // (NO_DATA for a strategy-2 tombstone); empty for the planet.
     std::vector<uint32_t> admin_planet_ids;
@@ -506,12 +513,11 @@ struct ParsedData {
     };
     std::unordered_map<uint64_t, PostcodeAccum> postcode_accum;
 
-    // Boundaries' label/wikidata claims on place nodes (build-time only,
-    // consumed by link_places_by_name to hide the nodes like Nominatim's
-    // linked_place_id and name their claimant); filled from parallel
-    // relation workers under the mutex.
+    // Each linked place node's claimant, the boundary of its last link (the
+    // link pass's), by which the node is hidden like Nominatim's
+    // linked_place_id and names its claimant once the polygons have their
+    // order.
     std::vector<PlaceClaim> place_claims;
-    std::unique_ptr<std::mutex> linked_pn_mutex = std::make_unique<std::mutex>();
     // Every boundary that links each place node, whichever one the node
     // names: no boundary promotes a node it stands for (rank_address.h),
     // which reads it, then frees it.

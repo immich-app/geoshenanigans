@@ -119,12 +119,12 @@ TEST(a_boundary_nests_under_the_relation_round_its_point_on_surface) {
     CHECK(displays(answer, "Somero, Mbale City, Bugisa, Eastern Region, Uganda"));
 }
 
-TEST(boundaries_repeating_their_parents_wikidata_and_outline_rank_as_their_link) {
-    // Lublin's admin_level 6, 7 and 8 relations share one outline and wikidata (Q37333), whose
-    // city node each links: the level 6 one ranks 16 by it, and the level 7 and 8 ones, which
-    // repeat their parent, take the node's 16 too, not 18 and 20. Zemborzyce (admin_level 9,
-    // place=suburb) inside them ranks 20, not 22, and a hamlet node in it 22, a rank no boundary
-    // holds.
+TEST(boundaries_repeating_their_parents_wikidata_and_outline_rank_0) {
+    // Lublin's admin_level 6, 7 and 8 relations share one outline and wikidata (Q37333). The
+    // level 6 one, indexed first, links the city node and ranks 16 by it; the level 7 and 8
+    // ones find the node linked, and repeat their parent: they rank 0, in no address.
+    // Zemborzyce (admin_level 9, place=suburb) inside them ranks 20 under the level 6 one, not
+    // 22, and a hamlet node in it 22, a rank no boundary holds.
     Fixture f;
     f.country(49, 14, 55, 24, "Poland", "PL");
     f.boundary(50, 21, 52, 24, 4, "Lubelskie");
@@ -148,16 +148,17 @@ TEST(a_linked_place_lowers_a_boundarys_rank) {
     CHECK(displays(answer, "Clive, Winsford, Cheshire West and Chester, England, United Kingdom"));
 }
 
-TEST(an_own_place_tag_labels_a_boundary_that_keeps_its_levels_rank) {
-    // Baralla (R342114, admin_level 8, place=municipality) links nothing: its own tag labels it
-    // municipality and doesn't raise its 16, so the village node of Baralla in it ranks 18, and
-    // the two Baralla meet in the line.
+TEST(an_own_place_tag_labels_and_ranks_a_boundary_that_links_nothing) {
+    // Baralla (R342114, admin_level 8, place=municipality) links nothing, its village node being
+    // of another wikidata: its own tag labels it municipality and ranks it 14, below its level's
+    // 16 (placex_triggers.sql:1157-1172). The village node of Baralla in it ranks 18, promoted by
+    // the boundary's place rank, 16, and the two Baralla meet in the line.
     Fixture f;
     f.country(36, -9, 44, 3, "Spain", "ES");
     f.boundary(42, -9, 44, -6.7, 4, "Galicia");
     f.boundary(42.5, -7.9, 43.8, -6.8, 6, "Lugo");
-    f.boundary(42.85, -7.30, 42.95, -7.20, 8, "Baralla", {{"place", "municipality"}});
-    f.node(42.890, -7.250, {{"place", "village"}, {"name", "Baralla"}});
+    f.boundary(42.85, -7.30, 42.95, -7.20, 8, "Baralla", {{"place", "municipality"}, {"wikidata", "Q1442553"}});
+    f.node(42.890, -7.250, {{"place", "village"}, {"name", "Baralla"}, {"wikidata", "Q5858186"}});
     const std::string answer = answer_of(f, "rank-baralla", 42.891, -7.251);
     CHECK(names(answer, "municipality", "Baralla"));
     CHECK(names(answer, "village", "Baralla"));
@@ -184,9 +185,9 @@ TEST(a_historic_place_area_keeps_its_place_rank) {
     CHECK(displays(answer, "Belfast City District, County Antrim, Northern Ireland, United Kingdom"));
 }
 
-TEST(every_boundary_holding_the_point_ranks_and_a_replicated_one_repeats_its_link) {
+TEST(every_boundary_holding_the_point_ranks_and_a_replicated_one_ranks_0) {
     // Brussels: Bruxelles - Brussel at admin_level 9 repeats Brussels (admin_level 8, linked to
-    // the city node, Q239) and takes its 16. At admin_level 10, R2404021 (18, named apart here)
+    // the city node, Q239) and ranks 0. At admin_level 10, R2404021 (18, named apart here)
     // lies round Quays Quarter (linked to a neighbourhood: 24); Nominatim's address has both,
     // and the Pentagon (boundary=place, place=suburb, 20) between them.
     Fixture f;

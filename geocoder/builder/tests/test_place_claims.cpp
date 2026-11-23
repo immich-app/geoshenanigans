@@ -69,8 +69,8 @@ TEST(place_claims_hidden_node_keeps_its_name_and_names_its_claimant) {
     const std::vector<uint64_t> ids{node_id(1), node_id(2), node_id(3)};
     // Node 1 is relation 100's label, node 2 claimed by a relation without
     // a polygon; node 3 unclaimed.
-    const std::vector<PlaceClaim> claims{{node_id(1), relation_boundary_id(100), true},
-                                         {node_id(2), relation_boundary_id(999), true}};
+    const std::vector<PlaceClaim> claims{{node_id(1), relation_boundary_id(100)},
+                                         {node_id(2), relation_boundary_id(999)}};
     CHECK_EQ(hide_claimed_place_nodes(nodes, ids, claims, b.polygons, b.ids), 2u);
 
     CHECK_EQ(nodes[0].name_id, 10u);
@@ -90,113 +90,25 @@ TEST(place_claims_hidden_node_keeps_its_name_and_names_its_claimant) {
     CHECK(!place_node_hidden(nodes[2]));
 }
 
-TEST(place_claims_several_claimants_resolve_as_nominatim_links_them) {
+TEST(place_claims_hide_each_node_by_its_one_claim_on_every_core) {
+    // The link pass leaves a node one claimant, the boundary of its last link: two are refused.
     Boundaries b;
     const std::vector<uint64_t> ids{node_id(1), node_id(2), node_id(3), node_id(4)};
-    std::vector<PlaceClaim> claims{
-        // Two labels: the higher level links last and keeps the node.
-        {node_id(1), relation_boundary_id(200), true}, {node_id(1), relation_boundary_id(500), true},
-        // Two wikidata matches: the lower level links first, the other
-        // finds the node taken.
-        {node_id(2), relation_boundary_id(500), false}, {node_id(2), way_boundary_id(300), false},
-        // A label beats a wikidata match at any level.
-        {node_id(3), relation_boundary_id(200), false}, {node_id(3), relation_boundary_id(400), true},
-        // Equal levels: the lower boundary id (a way's sorts before a relation's).
-        {node_id(4), relation_boundary_id(400), true}, {node_id(4), way_boundary_id(300), true},
-        // A claimant without a polygon never wins.
-        {node_id(4), relation_boundary_id(999), true},
-    };
-    for (int order = 0; order < 2; order++) {
+    std::vector<PlaceClaim> claims{{node_id(4), way_boundary_id(300)},
+                                   {node_id(1), relation_boundary_id(500)},
+                                   {node_id(3), relation_boundary_id(200)}};
+    for (unsigned threads : {1u, 3u}) {
         std::vector<PlaceNode> nodes(4, place(7, NO_DATA));
-        CHECK_EQ(hide_claimed_place_nodes(nodes, ids, claims, b.polygons, b.ids, 2), 4u);
-        CHECK_EQ(nodes[0].parent_poly_id, 5u);  // relation 500, L8
-        CHECK_EQ(nodes[1].parent_poly_id, 3u);  // way 300, L6
-        CHECK_EQ(nodes[2].parent_poly_id, 4u);  // relation 400's label
-        CHECK_EQ(nodes[3].parent_poly_id, 3u);  // way 300
-        for (const auto& pn : nodes) {
-            CHECK_EQ(pn._pad1, PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF);
-            CHECK_EQ(pn.name_id, 7u);
-        }
-        std::reverse(claims.begin(), claims.end());
+        CHECK_EQ(hide_claimed_place_nodes(nodes, ids, claims, b.polygons, b.ids, threads), 3u);
+        CHECK_EQ(nodes[0].parent_poly_id, 5u);
+        CHECK_EQ(nodes[1]._pad1, 0);
+        CHECK_EQ(nodes[2].parent_poly_id, 2u);
+        CHECK_EQ(nodes[3].parent_poly_id, 3u);
     }
-}
-
-TEST(place_claims_a_claimant_that_links_nothing_claims_nothing) {
-    // A boundary of rank 0 in its country links no place node (find_linked_place): its claims are
-    // none. Node 1 is the label of relation 400 (L6, of rank 0 here) alone and stays a place;
-    // node 2 is relation 400's label and relation 200's (L4), which takes it, though a label
-    // claim of a higher level wins.
-    Boundaries b;
-    std::vector<PlaceNode> nodes{place(10, NO_DATA), place(11, NO_DATA)};
-    const std::vector<uint64_t> ids{node_id(1), node_id(2)};
-    const std::vector<PlaceClaim> claims{{node_id(1), relation_boundary_id(400), true},
-                                         {node_id(2), relation_boundary_id(400), true},
-                                         {node_id(2), relation_boundary_id(200), true}};
-    const auto links = [&](uint32_t p) { return b.polygons[p].admin_level != 6; };
-    CHECK_EQ(hide_claimed_place_nodes(nodes, ids, claims, b.polygons, b.ids, 0, links), 1u);
-    CHECK(!place_node_hidden(nodes[0]));
-    CHECK_EQ(nodes[0]._pad1, 0);
-    CHECK_EQ(nodes[0].parent_poly_id, NO_DATA);
-    CHECK(place_node_hidden(nodes[1]));
-    CHECK_EQ(nodes[1].parent_poly_id, 2u);  // relation 200
-}
-
-TEST(place_claims_list_every_boundary_that_links_a_node) {
-    // Whichever claimant a node names, every boundary with a polygon that links it is listed, by
-    // node: the rank pass lets none of them promote it. A claimant of rank 0 (relation 400 here)
-    // or without a polygon (999) links nothing.
-    Boundaries b;
-    std::vector<PlaceNode> nodes(3, place(7, NO_DATA));
-    const std::vector<uint64_t> ids{node_id(1), node_id(2), node_id(3)};
-    const std::vector<PlaceClaim> claims{{node_id(2), relation_boundary_id(500), true},
-                                         {node_id(1), relation_boundary_id(200), true},
-                                         {node_id(2), relation_boundary_id(200), false},
-                                         {node_id(2), relation_boundary_id(400), true},
-                                         {node_id(3), relation_boundary_id(999), true}};
-    const auto links = [&](uint32_t p) { return b.polygons[p].admin_level != 6 || p == 3; };
-    std::vector<std::pair<uint32_t, uint64_t>> linkers;
-    CHECK_EQ(hide_claimed_place_nodes(nodes, ids, claims, b.polygons, b.ids, 2, links, &linkers), 3u);
-    const std::vector<std::pair<uint32_t, uint64_t>> expected{
-        {0, relation_boundary_id(200)}, {1, relation_boundary_id(200)}, {1, relation_boundary_id(500)}};
-    CHECK(linkers == expected);
-
-    // The name links too, each boundary once whichever of its rings matched.
-    std::vector<PlaceNode> named{place(10, 2), place(11, 2)};
-    linkers.clear();
-    hide_name_linked_place_nodes(named, {{0, 5}, {1, 1}, {0, 4}, {1, 0}}, b.polygons, b.ids, &linkers);
-    const std::vector<std::pair<uint32_t, uint64_t>> by_name{
-        {0, relation_boundary_id(400)}, {0, relation_boundary_id(500)}, {1, relation_boundary_id(100)}};
-    CHECK(linkers == by_name);
-}
-
-TEST(place_claims_name_links_keep_the_name_and_pick_the_lowest_level) {
-    Boundaries b;
-    std::vector<PlaceNode> nodes{place(10, 2), place(11, 2), place(12, 2)};
-    // Node 0: L8 relation 500 and L6 relation 400; node 1: both rings of
-    // relation 100.
-    std::vector<std::pair<uint32_t, uint32_t>> links{{0, 5}, {1, 1}, {0, 4}, {1, 0}};
-    CHECK_EQ(hide_name_linked_place_nodes(nodes, links, b.polygons, b.ids), 2u);
-    CHECK_EQ(nodes[0].name_id, 10u);
-    CHECK_EQ(nodes[0]._pad1, PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF);
-    CHECK_EQ(nodes[0].parent_poly_id, 4u);
-    CHECK_EQ(nodes[1].name_id, 11u);
-    CHECK_EQ(nodes[1].parent_poly_id, 1u);  // relation 100's largest ring
-    CHECK_EQ(nodes[2]._pad1, 0);
-    CHECK_EQ(nodes[2].parent_poly_id, 2u);
-    std::reverse(links.begin(), links.end());
-    std::vector<PlaceNode> again{place(10, 2), place(11, 2), place(12, 2)};
-    hide_name_linked_place_nodes(again, links, b.polygons, b.ids);
-    CHECK_EQ(again[0].parent_poly_id, 4u);
-    CHECK_EQ(again[1].parent_poly_id, 1u);
-}
-
-TEST(place_claims_a_name_link_names_the_largest_ring_whichever_ring_matched) {
-    Boundaries b;
-    std::vector<PlaceNode> nodes{place(10, 2)};
-    // Only relation 100's smaller ring matched the node.
-    CHECK_EQ(hide_name_linked_place_nodes(nodes, {{0, 0}}, b.polygons, b.ids), 1u);
-    CHECK_EQ(nodes[0]._pad1, PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF);
-    CHECK_EQ(nodes[0].parent_poly_id, 1u);
+    claims.push_back({node_id(1), relation_boundary_id(200)});
+    std::vector<PlaceNode> nodes(4, place(7, NO_DATA));
+    CHECK(!gctest::refusal_of<std::logic_error>([&] { hide_claimed_place_nodes(nodes, ids, claims, b.polygons, b.ids); })
+               .empty());
 }
 
 TEST(place_claims_subset_without_the_claimant_names_no_boundary) {

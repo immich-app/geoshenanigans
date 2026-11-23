@@ -58,6 +58,7 @@
 #include "admin_links.h"
 #include "cell_walk.h"
 #include "parallel.h"
+#include "place_links.h"
 #include "rank_address.h"
 #include "relation_import.h"
 #include "scratch_dir.h"
@@ -79,13 +80,14 @@ static_assert(sizeof(PoiRecord) == poi_files::LOGICAL_STRIDE && offsetof(PoiReco
 
 // --- Place type override classification ---
 
-static AdminPlaceType classify_place_override(const char* linked_place, const char* place_tag) {
+static AdminPlaceType classify_place_override(const char* place_tag) {
     // Nominatim's get_label_tag (classtypes.py) only checks
     //   extratags['place']  and  extratags['linked_place']
     // to short-circuit ADMIN_LABELS; `border_type` is kept in extratags
-    // but NOT read by the labeller. So for Nominatim-parity we only honour
-    // `linked_place` and a direct `place` tag on the boundary.
-    const char* val = linked_place ? linked_place : place_tag;
+    // but NOT read by the labeller. placex_update drops an OSM
+    // `linked_place` tag (placex_triggers.sql:810), and sets its own from
+    // the node a polygon links (place_links.h).
+    const char* val = place_tag;
     if (val == nullptr || val[0] == '\0') return AdminPlaceType::NONE;
     AdminPlaceType t = AdminPlaceType::NONE;
     if (std::strcmp(val, "city") == 0) t = AdminPlaceType::CITY;
@@ -103,31 +105,6 @@ static AdminPlaceType classify_place_override(const char* linked_place, const ch
     else if (std::strcmp(val, "district") == 0) t = AdminPlaceType::DISTRICT;
     else if (std::strcmp(val, "municipality") == 0) t = AdminPlaceType::MUNICIPALITY;
     return t;
-}
-
-// PlaceType (0=CITY, 1=TOWN, ...) → AdminPlaceType (0=NONE, 1=CITY, 2=TOWN, ...)
-// Used when linking an admin boundary to a label-role place node. Without this
-// conversion the enums disagree on zero (PlaceType::CITY=0 vs NONE=0) and any
-// place=city-linked boundary silently becomes unlinked.
-static uint8_t place_type_to_admin_override(uint8_t pt) {
-    switch (static_cast<PlaceType>(pt)) {
-        case PlaceType::CITY:          return static_cast<uint8_t>(AdminPlaceType::CITY);
-        case PlaceType::TOWN:          return static_cast<uint8_t>(AdminPlaceType::TOWN);
-        case PlaceType::VILLAGE:       return static_cast<uint8_t>(AdminPlaceType::VILLAGE);
-        case PlaceType::SUBURB:        return static_cast<uint8_t>(AdminPlaceType::SUBURB);
-        case PlaceType::HAMLET:        return static_cast<uint8_t>(AdminPlaceType::HAMLET);
-        case PlaceType::NEIGHBOURHOOD: return static_cast<uint8_t>(AdminPlaceType::NEIGHBOURHOOD);
-        case PlaceType::QUARTER:       return static_cast<uint8_t>(AdminPlaceType::QUARTER);
-        case PlaceType::BOROUGH:       return static_cast<uint8_t>(AdminPlaceType::BOROUGH);
-        // Non-settlement label-role targets. These match Nominatim's
-        // get_label_tag() which returns extratags['linked_place'] directly.
-        case PlaceType::STATE:         return static_cast<uint8_t>(AdminPlaceType::STATE);
-        case PlaceType::PROVINCE:      return static_cast<uint8_t>(AdminPlaceType::PROVINCE);
-        case PlaceType::REGION:        return static_cast<uint8_t>(AdminPlaceType::REGION);
-        case PlaceType::COUNTY:        return static_cast<uint8_t>(AdminPlaceType::COUNTY);
-        case PlaceType::DISTRICT:      return static_cast<uint8_t>(AdminPlaceType::DISTRICT);
-        default:                        return static_cast<uint8_t>(AdminPlaceType::NONE);
-    }
 }
 
 // --- TIGER address data loading ---
@@ -735,71 +712,14 @@ static void parallel_sort_and_build(std::vector<std::vector<CellItemPair>>& thre
     merge_pair_lists(thread_pairs, sorted_out);
 }
 
-// A place node that shares its wikidata with a boundary may link to it.
-struct WikidataPlace {
-    int64_t node;
-    PackedLocation at;
-    uint8_t place_type;  // PlaceType
-};
-
-// find_linked_place's wikidata step (placex_triggers.sql): of the place nodes
-// of a boundary's wikidata, the ones it covers (_st_covers(bnd.geometry,
-// placex.geometry)), `covers(at)` telling, into `nodes`; returns the place
-// type the boundary takes from them, the smallest of theirs, whatever order
-// they came in, or PlaceType::UNKNOWN where it covers none.
-template <class Covers>
-static uint8_t covered_wikidata_places(const std::vector<WikidataPlace>& places, Covers covers, std::vector<int64_t>& nodes) {
-    uint8_t place_type = static_cast<uint8_t>(PlaceType::UNKNOWN);
-    nodes.clear();
-    for (const WikidataPlace& place : places) {
-        if (!covers(place.at)) continue;
-        nodes.push_back(place.node);
-        if (nodes.size() == 1 || place.place_type < place_type) place_type = place.place_type;
-    }
-    return place_type;
-}
-
-// Whether the polygons (each an outer ring and its holes) hold the point.
-static bool polygons_hold(const std::vector<NestedPolygon<PackedLocation>>& polygons, PackedLocation at) {
-    for (const auto& polygon : polygons) {
-        if (polygon.outer.size() < 3 || !exact_ring_contains(polygon.outer.data(), static_cast<uint32_t>(polygon.outer.size()), at))
-            continue;
-        bool in_hole = false;
-        for (const auto& hole : polygon.holes)
-            in_hole |= hole.size() >= 3 && exact_ring_contains(hole.data(), static_cast<uint32_t>(hole.size()), at);
-        if (!in_hole) return true;
-    }
-    return false;
-}
-
-// The vertex average of polygon i's exact outer ring, each vertex once (a
-// closed ring repeats its first), summed in integers: the same point whatever
-// the ring's rotation. (0, 0) for a polygon without rings.
-static LatLng outer_vertex_average(const ParsedData& data, uint32_t i) {
-    if (data.admin_exact_rings.polygons[i].ring_count == 0) return {0, 0};
-    const RingSpan& outer = data.admin_exact_rings.rings_of(i)[0];
-    const PackedLocation* ring = data.admin_exact_rings.vertices.data() + outer.begin;
-    uint32_t ring_count = outer.count;
-    if (ring_count > 1 && ring[0] == ring[ring_count - 1]) ring_count--;
-    if (ring_count == 0) return {0, 0};
-    int64_t sum_lat = 0, sum_lng = 0;
-    for (uint32_t v = 0; v < ring_count; v++) {
-        sum_lat += ring[v].lat_e7;
-        sum_lng += ring[v].lon_e7;
-    }
-    return {static_cast<double>(sum_lat) / ring_count / 1e7, static_cast<double>(sum_lng) / ring_count / 1e7};
-}
-
-// The country polygon i lies in, as Nominatim takes a place's at its centroid
-// (get_country_code): its own code where it has one (a country, a postal
-// area), else the country at its outer ring's vertex average; 0 where none
-// is known.
-static uint16_t polygon_country(const ParsedData& data, const AdminRings& countries, uint32_t i) {
-    const AdminPolygon& poly = data.admin_polygons[i];
-    if (poly.country_code != 0) return poly.country_code;
-    if (data.admin_exact_rings.polygons[i].ring_count == 0) return 0;
-    const LatLng c = outer_vertex_average(data, i);
-    return country_code_at_point(data, countries, c.first, c.second);
+// What a closed way links a place node by (place_links.h): its name and
+// wikidata tags.
+static AdminTags way_link_tags(const WayTags& t, int64_t way_id) {
+    AdminTags tags;
+    tags.boundary = way_boundary_id(way_id);
+    if (t.name) tags.name = lowercase_utf8(t.name);
+    if (t.wikidata) tags.wikidata = t.wikidata;
+    return tags;
 }
 
 // Gives each postal area (admin_level 11) the country its centroid lies in,
@@ -833,223 +753,36 @@ static void assign_postal_area_countries(ParsedData& data, const AdminRings& cou
               << " of a postcode their country's pattern rejects" << std::endl;
 }
 
-// find_linked_place step 4: name-based linking of admin boundaries to place nodes
-// (Nominatim find_linked_place name-match fallback). `countries` are the
-// country polygons the country of a point is looked up in.
-static void link_places_by_name(ParsedData& data, const BuildConfig& cfg, const AdminRings& countries,
-                std::chrono::steady_clock::time_point& _pt, CpuTicks& _cpu) {
-    unsigned int num_threads = cfg.num_threads;
-    if (data.admin_polygons.empty()) return;
-    assign_postal_area_countries(data, countries, num_threads);
-    if (!data.place_nodes.empty()) {
-        auto _nl_t = std::chrono::steady_clock::now();
+// Nominatim's find_linked_place for every boundary and place area
+// (place_links.h), on the exact rings, each node's country looked up in the
+// country polygons: their labels, links and claims.
+static void link_admin_polygons(ParsedData& data, unsigned threads, std::chrono::steady_clock::time_point& _pt,
+                                CpuTicks& _cpu) {
+    const auto started = std::chrono::steady_clock::now();
+    const AdminRings countries = border_country_rings(data, threads);
+    RankLookups lookups;
+    lookups.country_at = [&](PackedLocation p) { return country_code_at_point(data, countries, p.lat(), p.lon()); };
+    const LinkStats stats = find_linked_places(data, lookups, threads);
+    std::cerr << "Links: " << stats.polygons << " boundaries and place areas in " << stats.runners << " runners, "
+              << stats.candidates << " place nodes to link; linked " << stats.by_step[size_t(LinkStep::LABEL)]
+              << " by a label member, " << stats.by_step[size_t(LinkStep::WIKIDATA)] << " by wikidata, "
+              << stats.by_step[size_t(LinkStep::TYPE)] << " by place type, " << stats.by_step[size_t(LinkStep::NAME)]
+              << " by name; " << stats.claimed << " nodes claimed, " << stats.taken
+              << " taken over by a later label link; " << stats.covers << " covers tests; "
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() << " s" << std::endl;
+    log_phase("Admin links", _pt, _cpu);
+}
 
-        // Normalised-name → place-node index for exact-match lookup.
-        // Nominatim's find_linked_place step 4 requires an exact name
-        // overlap via hstore `&&` (same language key, same value) —
-        // effectively a full-name identity match on at least one
-        // name:* tag. Our data only carries a single `name`, so we
-        // approximate by matching on the normalised primary name.
-        // Using exact-match avoids spurious token-overlap links like
-        // "1st District of Athens" → "Athens" or "Manhattan Community
-        // Board 3" → any "Manhattan" place node.
-        // Hide nodes claimed by the label/wikidata link steps (relation
-        // assembly and closed-way admins) before building the name index:
-        // Nominatim's find_linked_place only considers places without a
-        // linked_place_id, so an already-claimed node must neither match
-        // here nor surface in results. A hidden node keeps its name and
-        // names its claimant's polygon (place_claims.h).
-        // A boundary or place area of rank 0 in its country links nothing
-        // (find_linked_place returns at once, placex_triggers.sql:285): the
-        // node stays a place of its own.
-        if (!data.place_claims.empty()) {
-            const size_t claims = data.place_claims.size();
-            const auto links = [&](uint32_t p) {
-                const AdminPolygon& poly = data.admin_polygons[p];
-                return polygon_rank_address(polygon_country(data, countries, p), poly.admin_level,
-                                            poly.own_place_type) != 0;
-            };
-            const size_t hidden = hide_claimed_place_nodes(data.place_nodes, data.place_osm_ids,
-                std::move(data.place_claims), data.admin_polygons, data.admin_osm_ids, num_threads, links,
-                &data.place_node_links);
-            std::vector<PlaceClaim>().swap(data.place_claims);
-            std::cerr << "find_linked_place label/wikidata: hid " << hidden
-                      << " linked place nodes (" << claims << " claims)" << std::endl;
-        }
-
-        // (normalised name, node) of every named node, sorted on every core:
-        // a name's nodes sit together, in node order.
-        const auto& pool_data = data.string_pool.data();
-        using NamedPlace = std::pair<std::string, uint32_t>;
-        std::vector<NamedPlace> named = parallel_collect<NamedPlace>(data.place_nodes.size(),
-            [&](size_t i, std::vector<NamedPlace>& out) {
-                const auto& pn = data.place_nodes[i];
-                if (place_node_hidden(pn)) return;
-                const char* nm = pool_data.data() + pn.name_id;
-                if (!nm[0]) return;
-                std::string nn = normalise_for_matching(nm);
-                if (!nn.empty()) out.emplace_back(std::move(nn), static_cast<uint32_t>(i));
-            }, num_threads);
-        parallel_sort(named.begin(), named.end(), std::less<NamedPlace>(), num_threads);
-        auto places_named = [&](const std::string& name) {
-            return std::equal_range(named.begin(), named.end(), NamedPlace{name, 0},
-                                    [](const NamedPlace& a, const NamedPlace& b) { return a.first < b.first; });
-        };
-
-        // PlaceType → rank_search. Matches Nominatim's
-        // address_levels.json defaults: place=city 16, town 18,
-        // village 19, suburb/hamlet 20, neighbourhood/quarter 22.
-        // Nominatim rank_address for place nodes (address-levels.json
-        // `place` map, second element): city 16, town [18,16], village
-        // [19,16], borough 18, suburb [19,20], hamlet 20, quarter [20,22],
-        // neighbourhood 24.
-        auto place_addr_rank = [](uint8_t pt) -> uint8_t {
-            switch (static_cast<PlaceType>(pt)) {
-                case PlaceType::CITY:          return 16;
-                case PlaceType::TOWN:          return 16;
-                case PlaceType::VILLAGE:       return 16;
-                case PlaceType::BOROUGH:       return 18;
-                case PlaceType::SUBURB:        return 20;
-                case PlaceType::HAMLET:        return 20;
-                case PlaceType::QUARTER:       return 22;
-                case PlaceType::NEIGHBOURHOOD: return 24;
-                default:                        return 255;
-            }
-        };
-
-        // Nominatim gates step 4 to boundaries with
-        // rank_address 16-23 (admin_level 8-11 under the default
-        // rank mapping al*2). Coarser boundaries never fall through
-        // to step 4 because steps 1-3 almost always catch them
-        // (country/state wikidata coverage is near-total).
-        std::atomic<size_t> pol_idx{0};
-        std::atomic<uint64_t> linked{0};
-        std::atomic<uint64_t> considered{0};
-        std::vector<std::thread> nl_workers;
-        // (node, polygon) of each link. Nominatim sets linked_place_id on
-        // the node when a boundary links it, hiding it from all results
-        // (the boundary represents it). We mirror that by flagging the node
-        // after the join below.
-        std::mutex linked_nodes_mutex;
-        std::vector<std::pair<uint32_t, uint32_t>> linked_nodes;
-        const double max_dist_deg = 0.5;
-        const double max_dist_sq = max_dist_deg * max_dist_deg;
-
-        for (unsigned int t = 0; t < num_threads; t++) {
-            nl_workers.emplace_back([&]() {
-                while (true) {
-                    size_t i = pol_idx.fetch_add(1);
-                    if (i >= data.admin_polygons.size()) break;
-                    auto& poly = data.admin_polygons[i];
-                    if (poly.place_type_override != 0) continue;
-                    // AL11 slots hold boundary=postal_code polygons (their
-                    // "name" is the postcode string) — Nominatim's
-                    // find_linked_place only runs for boundary=administrative,
-                    // so postal boundaries never link (or hide) place nodes.
-                    if (poly.admin_level < 8 || poly.admin_level > 10) continue;
-                    if (data.admin_exact_rings.polygons[i].ring_count == 0) continue;
-                    if (poly.name_id == NO_DATA) continue;
-                    const char* bnd_name = pool_data.data() + poly.name_id;
-                    if (!bnd_name[0]) continue;
-                    considered.fetch_add(1);
-
-                    // Per-country rank_address (NL AL8 = 14, not the
-                    // default 16) — resolved from the boundary's country.
-                    // AL8+ boundaries don't carry country tags, so resolve
-                    // the country from the polygon centroid's admin cell.
-                    const LatLng centre = outer_vertex_average(data, static_cast<uint32_t>(i));
-                    const double clat = centre.first, clng = centre.second;
-                    const uint16_t bnd_cc = polygon_country(data, countries, static_cast<uint32_t>(i));
-                    uint8_t bnd_rank = admin_rank_address(bnd_cc, poly.admin_level);
-                    if (bnd_rank == 0) continue;  // not in this country's address chain
-
-                    std::string nb = normalise_for_matching(bnd_name);
-                    if (nb.empty()) continue;
-
-                    uint32_t best_idx = NO_DATA;
-                    double best_dist_sq = max_dist_sq;
-
-                    const auto [first, last] = places_named(nb);
-                    for (auto it = first; it != last; ++it) {
-                        const uint32_t pidx = it->second;
-                        const auto& pn = data.place_nodes[pidx];
-                        uint8_t pr = place_addr_rank(pn.place_type);
-                        if (pr == 255) continue;
-                        // Nominatim's name-match branch requires the
-                        // node's address rank to EQUAL the boundary's
-                        // rank_address (find_linked_place in
-                        // placex_triggers.sql). The previous ±2 window
-                        // on rank_search linked NL gemeentes (rank 14)
-                        // to their town nodes (16), relabelling
-                        // municipalities as towns.
-                        if (pr != bnd_rank) continue;
-                        double dlat = (double)pn.lat - clat;
-                        double dlng = (double)pn.lng - clng;
-                        double d2 = dlat * dlat + dlng * dlng;
-                        if (d2 > best_dist_sq) continue;
-                        if (d2 == best_dist_sq) {
-                            // Preserve the original `>=` reject at the
-                            // distance threshold (no real candidate yet:
-                            // best_dist_sq is still max_dist_sq), so this
-                            // only adds a tiebreak, not a behaviour change
-                            // at the 0.5° boundary.
-                            if (best_idx == NO_DATA) continue;
-                            // Break exact-distance ties by the place node's
-                            // stable osm_id (build-invariant, unique). A
-                            // name's nodes come in place-node order, a
-                            // non-deterministic one, so equidistant same-
-                            // named place nodes otherwise flipped the
-                            // linked place type → place_type_override →
-                            // admin_polygons.bin between same-PBF builds.
-                            if (pidx >= data.place_osm_ids.size() ||
-                                best_idx >= data.place_osm_ids.size() ||
-                                data.place_osm_ids[pidx] >= data.place_osm_ids[best_idx])
-                                continue;
-                        }
-                        best_dist_sq = d2;
-                        best_idx = pidx;
-                    }
-
-                    if (best_idx != NO_DATA) {
-                        const auto& pn = data.place_nodes[best_idx];
-                        uint8_t pto = place_type_to_admin_override(pn.place_type);
-                        if (pto != 0) {
-                            poly.place_type_override = pto;
-                            poly.flags |= ADMIN_FLAG_LINKED;
-                            linked.fetch_add(1);
-                            std::lock_guard<std::mutex> lk(linked_nodes_mutex);
-                            linked_nodes.push_back({best_idx, static_cast<uint32_t>(i)});
-                        }
-                    }
-                }
-            });
-        }
-        for (auto& w : nl_workers) w.join();
-
-        // Hide linked nodes: PLACE_FLAG_HIDDEN makes the server's
-        // place_node() accessor return None everywhere (find_places,
-        // containment, fallbacks) — the same observable effect as
-        // Nominatim's linked_place_id. Deterministic regardless of worker
-        // scheduling: the set of links is order-independent, and a node
-        // several boundaries link names the one claim_wins picks.
-        PlaceNodeLinks name_links;
-        const size_t name_hidden = hide_name_linked_place_nodes(data.place_nodes, std::move(linked_nodes),
-                                                                data.admin_polygons, data.admin_osm_ids, &name_links);
-        data.place_node_links.insert(data.place_node_links.end(), name_links.begin(), name_links.end());
-        sort_place_node_links(data.place_node_links);
-        const size_t labelled = parallel_count(data.place_nodes.size(),
-            [&](size_t i) { return (data.place_nodes[i]._pad1 & PLACE_FLAG_LABEL_OF) != 0; }, num_threads);
-        std::cerr << "Hidden place nodes: " << name_hidden << " linked by name; " << labelled
-                  << " name their claiming polygon" << std::endl;
-
-        double _nl_elapsed = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - _nl_t).count();
-        std::cerr << "find_linked_place step 4 (name match): "
-                  << linked.load() << "/" << considered.load()
-                  << " unlinked AL8-10 boundaries linked in "
-                  << _nl_elapsed << "s" << std::endl;
-        log_phase("find_linked_place step 4", _pt, _cpu);
-    }
+// Hides each linked place node (the link pass's claims) as Nominatim's
+// linked_place_id does, naming its claimant's polygon once the polygons have
+// their order, and gives the postal areas their countries.
+static void hide_linked_place_nodes(ParsedData& data, const AdminRings& countries, unsigned threads) {
+    assign_postal_area_countries(data, countries, threads);
+    const size_t claims = data.place_claims.size();
+    const size_t hidden = hide_claimed_place_nodes(data.place_nodes, data.place_osm_ids, std::move(data.place_claims),
+                                                   data.admin_polygons, data.admin_osm_ids, threads);
+    std::vector<PlaceClaim>().swap(data.place_claims);
+    std::cerr << "Hidden place nodes: " << hidden << " linked (" << claims << " claims)" << std::endl;
 }
 
 // Writes the pass's traces as TSV to `path`: a row a boundary or place area,
@@ -1068,13 +801,15 @@ static void write_rank_dump(const std::string& path, std::vector<RankTrace> trac
     auto country = [](uint16_t cc) {
         return cc ? std::string{static_cast<char>(cc >> 8), static_cast<char>(cc & 0xFF)} : std::string("-");
     };
+    static constexpr const char* kLinkSteps[] = {"-", "label", "wikidata", "type", "name"};
     out << "object\tlevel\tcountry\trank_search\tinitial\tparent\tparent_rank\tduplicate\tcontainer\tcontainer_rank"
-           "\tbefore_link\tstep\trank\n";
+           "\tbefore_link\tstep\trank\tlink\tnode\n";
     for (const RankTrace& t : trace)
         out << osm(t.id) << '\t' << int(t.level) << '\t' << country(t.country) << '\t' << int(t.initial.search) << '\t'
             << int(t.initial.address) << '\t' << osm(t.parent) << '\t' << int(t.parent_rank) << '\t' << int(t.duplicate)
             << '\t' << osm(t.container) << '\t' << int(t.container_rank) << '\t' << int(t.before_link) << '\t' << t.step
-            << '\t' << int(t.rank) << '\n';
+            << '\t' << int(t.rank) << '\t' << kLinkSteps[static_cast<size_t>(t.link)] << '\t'
+            << (t.node ? "n" + std::to_string(t.node) : std::string("-")) << '\n';
     std::cerr << "Ranks: wrote " << trace.size() << " rows to " << path << std::endl;
 }
 
@@ -1098,7 +833,7 @@ static void rank_admin_polygons(ParsedData& data, const AdminRings& countries, u
     std::cerr << "Ranks: " << stats.boundaries << " boundaries (" << stats.nested << " lifted by a parent, "
               << stats.duplicates << " repeating their parent, " << stats.contained << " lifted by a containing area, "
               << stats.linked << " ranked by a linked place, " << stats.lowered << " of them lowered, "
-              << stats.own_tags << " raised by their own place tag), " << stats.place_areas << " place areas; "
+              << stats.own_tags << " ranked by their own place tag, " << stats.own_lowered << " of them lowered), " << stats.place_areas << " place areas; "
               << stats.nodes_promoted << " of " << stats.nodes << " place nodes promoted; " << stats.pairs
               << " containment tests in " << stats.pair_seconds << " s; "
               << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() << " s"
@@ -2201,14 +1936,12 @@ static int run(int argc, char* argv[]) {
             PbfFile pbf(input_file, num_threads);
             log_phase("  Pass 1: blob scan", _bt, _bc);
 
-            std::vector<std::string> rel_wikidata; // parallel to data.collected_relations
             std::unordered_set<int64_t> wanted_label_nodes; // node IDs referenced as role=label
             {
                 // What each reader thread collects, joined after: one shared
                 // lock held across the vectors' growth queued every thread.
                 struct Collected {
                     std::vector<CollectedRelation> relations;
-                    std::vector<std::string> wikidata;  // parallel to relations
                     std::vector<int64_t> label_nodes;
                     std::vector<CollectedPoiRelation> poi_relations;
                     // Relations whose tags make an area kind (RelationKind)
@@ -2231,7 +1964,7 @@ static int run(int argc, char* argv[]) {
                         // type's rank, beside any boundary=administrative relation.
                         // A place type of address rank 0 (state, province, region)
                         // makes no address area.
-                        const AdminPlaceType rel_pt = rel_place ? classify_place_override(nullptr, rel_place) : AdminPlaceType::NONE;
+                        const AdminPlaceType rel_pt = rel_place ? classify_place_override(rel_place) : AdminPlaceType::NONE;
                         const RelationKind kind = area_relation_kind(boundary, is_address_place_type(rel_pt));
                         if (kind == RelationKind::NONE) {
                             if (rel_pt != AdminPlaceType::NONE && is_area_relation_type(rel_type)) mine.place_rank0++;
@@ -2260,7 +1993,7 @@ static int run(int argc, char* argv[]) {
                         if (is_place_area) {
                             const char* place_tag = rel_place;
                             if (place_tag) {
-                                AdminPlaceType pt = classify_place_override(nullptr, place_tag);
+                                AdminPlaceType pt = classify_place_override(place_tag);
                                 if (pt != AdminPlaceType::NONE) {
                                     const char* name = rel.tag("name:en");
                                     if (!name) name = rel.tag("name");
@@ -2271,9 +2004,10 @@ static int run(int argc, char* argv[]) {
                                         cr.admin_level = 15;  // special marker for boundary=place / place multipolygon
                                         cr.name = name;
                                         cr.is_postal = false;
-                                        cr.fallback_place_type = static_cast<uint8_t>(pt);
-                                        cr.own_place_type = static_cast<uint8_t>(pt);
+                                        cr.own_place_value = static_cast<uint8_t>(place_value_of(place_tag));
                                         cr.boundary_category = is_boundary_category(boundary);
+                                        if (const char* n = rel.tag("name")) cr.name_tag = n;
+                                        if (const char* wd = rel.tag("wikidata")) cr.wikidata = wd;
                                         for (size_t mi = 0; mi < rel.members.size(); mi++) {
                                             if (rel.members[mi].type == 'w') {
                                                 cr.members.emplace_back(rel.members[mi].ref, rel.member_role(mi));
@@ -2281,7 +2015,6 @@ static int run(int argc, char* argv[]) {
                                         }
                                         if (!cr.members.empty()) {
                                             mine.relations.push_back(std::move(cr));
-                                            mine.wikidata.emplace_back(); // already has override, no wikidata needed
                                             if (label_node_id >= 0) mine.label_nodes.push_back(label_node_id);
                                         }
                                     }
@@ -2324,24 +2057,26 @@ static int run(int argc, char* argv[]) {
                             if (cc) country_code = cc;
                         }
 
-                        const char* linked_place = rel.tag("linked_place");
-                        const char* wikidata_tag = rel.tag("wikidata");
                         // place=* tag on boundary=administrative relations (e.g. Tokyo
                         // has place=province, Suginami has place=city). Nominatim's
                         // get_label_tag prefers extratags['place'] over the admin_level
-                        // → rank label, so we honour it as a place_type_override.
-                        const char* place_tag_on_admin = rel.tag("place");
+                        // → rank label, so it labels a boundary that links no place
+                        // node, and placex_update ranks one by it. A postal area has
+                        // neither.
+                        const char* place_tag_on_admin = is_postal ? nullptr : rel.tag("place");
 
-                        AdminPlaceType po = classify_place_override(linked_place, place_tag_on_admin);
                         CollectedRelation cr;
                         cr.id = rel.id;
-                        cr.label_node_id = label_node_id;
+                        cr.label_node_id = is_postal ? -1 : label_node_id;
                         cr.admin_level = admin_level;
                         cr.name = std::move(name_str);
                         cr.country_code = std::move(country_code);
                         cr.is_postal = is_postal;
-                        cr.fallback_place_type = static_cast<uint8_t>(po);
-                        cr.own_place_type = static_cast<uint8_t>(classify_place_override(nullptr, place_tag_on_admin));
+                        cr.own_place_value = static_cast<uint8_t>(place_value_of(place_tag_on_admin));
+                        if (!is_postal) {
+                            if (name) cr.name_tag = name;
+                            if (const char* wd = rel.tag("wikidata")) cr.wikidata = wd;
+                        }
 
                         for (size_t mi = 0; mi < rel.members.size(); mi++) {
                             if (rel.members[mi].type == 'w') {
@@ -2350,18 +2085,8 @@ static int run(int argc, char* argv[]) {
                         }
 
                         if (!cr.members.empty()) {
-                            // Always store wikidata for relations. Nominatim's
-                            // find_linked_place (placex_triggers.sql) goes:
-                            // label role → wikidata → place type match → name
-                            // match. The wikidata step runs regardless of the
-                            // place=* tag on the boundary, and this is what
-                            // lets Tokyo (place=province + wikidata=Q1490) link
-                            // to its place=city admin_centre node and drop out
-                            // of the address hierarchy after Suginami wins.
-                            std::string wd_str = wikidata_tag ? wikidata_tag : "";
+                            if (cr.label_node_id >= 0) mine.label_nodes.push_back(cr.label_node_id);
                             mine.relations.push_back(std::move(cr));
-                            mine.wikidata.push_back(std::move(wd_str));
-                            if (label_node_id >= 0) mine.label_nodes.push_back(label_node_id);
                         }
                     }
                     // --- POI relation scanning (same pass) ---
@@ -2496,7 +2221,6 @@ static int run(int argc, char* argv[]) {
                 size_t place_rank0 = 0;
                 for (auto& c : collected) {
                     std::move(c.relations.begin(), c.relations.end(), std::back_inserter(data.collected_relations));
-                    std::move(c.wikidata.begin(), c.wikidata.end(), std::back_inserter(rel_wikidata));
                     wanted_label_nodes.insert(c.label_nodes.begin(), c.label_nodes.end());
                     std::move(c.poi_relations.begin(), c.poi_relations.end(),
                               std::back_inserter(data.collected_poi_relations));
@@ -2585,11 +2309,6 @@ static int run(int argc, char* argv[]) {
             // and the PoiClassification struct from types.h.
 
             std::cerr << "  Pass 2: processing nodes with " << num_threads << " threads..." << std::endl;
-            std::unordered_map<int64_t, uint8_t> label_node_to_place_type; // node_id → PlaceType
-            // The place nodes of each QID, so a boundary of the QID links
-            // the ones it covers and hides them like Nominatim's
-            // linked_place_id does.
-            std::unordered_map<std::string, std::vector<WikidataPlace>> wikidata_places;
             {
                 struct NodeThreadLocal {
                     // Strings below are codes into `strings` (kNone: none).
@@ -2603,7 +2322,6 @@ static int run(int argc, char* argv[]) {
                     std::vector<int64_t> addr_osm_node_ids; // parallel to addr_coords; strategy-2 stable identity
                     uint64_t count = 0;
                     uint64_t nodes = 0;
-                    std::vector<std::pair<int64_t, uint8_t>> label_hits; // (node_id, PlaceType)
                     // POI node data
                     std::vector<PoiRecord> poi_records;
                     std::vector<int64_t> poi_osm_node_ids; // parallel to poi_records; strategy-2 stable identity
@@ -2615,7 +2333,8 @@ static int run(int argc, char* argv[]) {
                     std::vector<PlaceNode> place_nodes;
                     std::vector<int64_t> place_osm_node_ids; // parallel to place_nodes; strategy-2 stable identity
                     std::vector<uint32_t> place_names;
-                    std::vector<std::pair<std::string, WikidataPlace>> place_wikidata; // (wikidata_id, node)
+                    // The place nodes a boundary or place area may link.
+                    LinkCandidates link_candidates;
                 };
                 // Use thread_local for streaming callback (no thread index available)
                 static thread_local NodeThreadLocal* tl_node_data = nullptr;
@@ -2777,13 +2496,12 @@ static int run(int argc, char* argv[]) {
                             }
                         }
 
-                        // Place nodes (settlements) + label-role higher-level place types.
-                        // Nominatim uses `ref` as the display name when
-                        // `name` is missing (see name_keys handling in
-                        // icu_tokenizer output builders) — most commonly
-                        // on numeric-ref quarter nodes like Moscow's
-                        // place=quarter ref=18 node. Fall back to ref
-                        // so these show up in the address walk.
+                        // Place nodes (settlements). Nominatim uses `ref` as the
+                        // display name when `name` is missing (see name_keys
+                        // handling in icu_tokenizer output builders) — most
+                        // commonly on numeric-ref quarter nodes like Moscow's
+                        // place=quarter ref=18 node. Fall back to ref so these
+                        // show up in the address walk.
                         const char* place_name = best_name;
                         if (!place_name && n_ref && n_ref[0]) place_name = n_ref;
                         if (n_place && place_name) {
@@ -2797,8 +2515,6 @@ static int run(int argc, char* argv[]) {
                             else if (std::strcmp(n_place, "neighbourhood") == 0) settlement_pt = PlaceType::NEIGHBOURHOOD;
                             else if (std::strcmp(n_place, "quarter") == 0) settlement_pt = PlaceType::QUARTER;
 
-                            bool is_label_member = wanted_label_nodes.count(id) > 0;
-
                             if (settlement_pt != PlaceType::UNKNOWN) {
                                 PlaceNode pn{};
                                 pn.lat = static_cast<float>(lat);
@@ -2808,46 +2524,17 @@ static int run(int argc, char* argv[]) {
                                 tl_node_data->place_osm_node_ids.push_back(id);
                                 tl_node_data->place_names.push_back(tl_node_data->strings.add(place_name));
                             }
+                        }
 
-                            // For the label-role lookup, also recognise higher-level
-                            // place types. Nominatim's find_linked_place() matches
-                            // class='place' (any type), and get_label_tag() then uses
-                            // extratags['linked_place'] (which is the place type) as
-                            // the label. So an admin L5 Region linked to a place=state
-                            // label node should be labelled "state" in the address.
-                            PlaceType label_pt = settlement_pt;
-                            if (label_pt == PlaceType::UNKNOWN) {
-                                if (std::strcmp(n_place, "state") == 0) label_pt = PlaceType::STATE;
-                                else if (std::strcmp(n_place, "province") == 0) label_pt = PlaceType::PROVINCE;
-                                else if (std::strcmp(n_place, "region") == 0) label_pt = PlaceType::REGION;
-                                else if (std::strcmp(n_place, "county") == 0) label_pt = PlaceType::COUNTY;
-                                else if (std::strcmp(n_place, "district") == 0) label_pt = PlaceType::DISTRICT;
-                                else if (std::strcmp(n_place, "borough") == 0) label_pt = PlaceType::BOROUGH;
-                            }
-                            // Capture wikidata → place type for the
-                            // admin-boundary wikidata link step in
-                            // Nominatim's find_linked_place() chain.
-                            // This must include *all* place types —
-                            // not just settlements — because e.g.
-                            // Mexico City's Cuauhtémoc borough
-                            // relation links via wikidata (Q645293)
-                            // to an admin_centre node tagged
-                            // place=borough, and without that the
-                            // boundary falls through to the default
-                            // admin_level=6 → county mapping instead
-                            // of picking up rank_address=18 (borough).
-                            //
-                            // Skip label-role members: nominatim's
-                            // find_linked_place claims a place node
-                            // via label role first, so wikidata
-                            // linking only considers non-label nodes.
-                            if (n_wikidata && !is_label_member && label_pt != PlaceType::UNKNOWN) {
-                                tl_node_data->place_wikidata.push_back(
-                                    {n_wikidata, WikidataPlace{id, point_e7(lat, lng), static_cast<uint8_t>(label_pt)}});
-                            }
-                            if (is_label_member) {
-                                tl_node_data->label_hits.push_back({id, static_cast<uint8_t>(label_pt)});
-                            }
+                        // Every place node a boundary or place area may link
+                        // (find_linked_place): of any place value, named by its
+                        // name tag, of a wikidata or a relation's label member.
+                        if (n_place && n_place[0]) {
+                            const bool named = n_name && n_name[0], of_wikidata = n_wikidata && n_wikidata[0];
+                            if (named || of_wikidata || wanted_label_nodes.count(id) > 0)
+                                tl_node_data->link_candidates.add(
+                                    id, point_e7(lat, lng), static_cast<uint8_t>(place_value_of(n_place)),
+                                    named ? lowercase_utf8(n_name) : std::string(), of_wikidata ? n_wikidata : "");
                         }
                     }
                 });
@@ -2953,37 +2640,9 @@ static int run(int argc, char* argv[]) {
                             pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, place_node_id);
                     }
                 });
-                // Build wikidata → place type map for admin boundary linking.
-                // Deterministic conflict resolution: when two place nodes share
-                // a wikidata id but carry different place types, plain
-                // last-write-wins picks the value from whichever thread-local
-                // batch happened to be processed last — and work-stealing makes
-                // that order non-deterministic, so the admin's
-                // place_type_override (and thus admin_polygons.bin) varied
-                // between same-PBF builds, cascading a spurious admin id_remap
-                // into way_parents / admin_entries. Keep the smallest PlaceType,
-                // which is order-independent.
-                for (auto& local : ntld) {
-                    for (auto& [wd, place] : local.place_wikidata) wikidata_places[wd].push_back(place);
-                    local.place_wikidata.clear();
-                }
-                // Build label-node → place type map (Nominatim's primary link
-                // method). Same deterministic conflict resolution.
-                for (auto& local : ntld) {
-                    for (auto& [nid, pt] : local.label_hits) {
-                        auto [it, ins] = label_node_to_place_type.try_emplace(nid, pt);
-                        if (!ins && pt < it->second) it->second = pt;
-                    }
-                    local.label_hits.clear();
-                }
-                if (!wikidata_places.empty()) {
-                    std::cerr << "  Built wikidata→place node map: "
-                              << wikidata_places.size() << " entries." << std::endl;
-                }
-                if (!label_node_to_place_type.empty()) {
-                    std::cerr << "  Built label-node→place_type map: "
-                              << label_node_to_place_type.size() << " entries." << std::endl;
-                }
+                for (auto& local : ntld) data.link_candidates.append(std::move(local.link_candidates));
+                std::cerr << "  Link candidates: " << data.link_candidates.nodes.size()
+                          << " place nodes a boundary may link." << std::endl;
                 std::cerr << "  Node processing complete: " << total_addrs
                           << " address points, " << total_poi_nodes
                           << " POI nodes, " << data.place_nodes.size()
@@ -3050,10 +2709,9 @@ static int run(int argc, char* argv[]) {
                         std::string name;
                         uint8_t admin_level;
                         std::string country_code;
-                        uint8_t fallback_place_type;  // from own place tag, used last
-                        std::string wikidata; // for place linking
-                        int64_t way_id;       // source closed-way id (strategy-2 stable identity)
-                        uint8_t own_place_type;  // AdminPlaceType of its place tag (AdminPolygon's)
+                        int64_t way_id;           // source closed-way id (strategy-2 stable identity)
+                        uint8_t own_place_value;  // PlaceValue of its place tag (AdminPolygon's)
+                        AdminTags tags;           // its name and wikidata tags, for the links
                     };
                     std::vector<ClosedWayAdmin> closed_way_admins;
                     // POI way data
@@ -3298,10 +2956,8 @@ static int run(int argc, char* argv[]) {
                                     if (!name_str.empty() && all_valid && resolved_locs.size() >= 3) {
                                         std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
                                         std::string cc; if (al == 2) { const char* iso = t.iso; if (iso) cc = iso; }
-                                        uint8_t fallback = static_cast<uint8_t>(classify_place_override(t.linked_place, t.place));
-                                        const uint8_t own = static_cast<uint8_t>(classify_place_override(nullptr, t.place));
-                                        std::string wd_str = t.wikidata ? t.wikidata : "";
-                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), fallback, std::move(wd_str), way_id, own});
+                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), way_id,
+                                                                           static_cast<uint8_t>(place_value_of(t.place)), way_link_tags(t, way_id)});
                                     }
                                 }
                             }
@@ -3310,11 +2966,11 @@ static int run(int argc, char* argv[]) {
                         if (is_place_boundary && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
                             const char* aname = t_best_name;
                             if (aname && t.place) {
-                                AdminPlaceType pt = classify_place_override(nullptr, t.place);
+                                AdminPlaceType pt = classify_place_override(t.place);
                                 if (is_address_place_type(pt) && all_valid && resolved_locs.size() >= 3) {
                                     std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
-                                    std::string wd_str = t.wikidata ? t.wikidata : "";
-                                    local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), std::move(wd_str), way_id, static_cast<uint8_t>(pt)});
+                                    local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), way_id,
+                                                                       static_cast<uint8_t>(place_value_of(t.place)), way_link_tags(t, way_id)});
                                 }
                             }
                         }
@@ -3333,7 +2989,7 @@ static int run(int argc, char* argv[]) {
                     // the polygon.
                     if (!boundary && t.place && t_best_name
                             && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
-                        AdminPlaceType pt = classify_place_override(nullptr, t.place);
+                        AdminPlaceType pt = classify_place_override(t.place);
                         // Only the rank-20+ place types (neighbourhood,
                         // quarter, suburb, borough) — higher-level place
                         // types on closed ways are rare and adding them
@@ -3345,16 +3001,9 @@ static int run(int argc, char* argv[]) {
                                   || pt == AdminPlaceType::BOROUGH);
                         if (want && all_valid && resolved_locs.size() >= 3) {
                             std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
-                            std::string wd_str = t.wikidata ? t.wikidata : "";
-                            local.closed_way_admins.push_back({
-                                std::move(verts),
-                                std::string(t_best_name),
-                                uint8_t(15),
-                                std::string(),
-                                static_cast<uint8_t>(pt),
-                                std::move(wd_str),
-                                way_id,
-                                static_cast<uint8_t>(pt)});
+                            local.closed_way_admins.push_back({std::move(verts), std::string(t_best_name), uint8_t(15), std::string(),
+                                                               way_id, static_cast<uint8_t>(place_value_of(t.place)),
+                                                               way_link_tags(t, way_id)});
                         }
                     }
                 });
@@ -3623,49 +3272,21 @@ static int run(int argc, char* argv[]) {
                 // --- Merge closed-way admin polygons ---
                 {
                     uint64_t closed_way_admin_count = 0;
-                    size_t cwa_wikidata_linked = 0;
                     for (auto& local : tld) {
                         for (auto& cwa : local.closed_way_admins) {
-                            // wikidata step first (Nominatim priority), then
-                            // fall back to the way's own place tag.
-                            uint8_t pto = 0;
-                            if (!cwa.wikidata.empty()) {
-                                auto it = wikidata_places.find(cwa.wikidata);
-                                if (it != wikidata_places.end()) {
-                                    std::vector<int64_t> covered;
-                                    const uint8_t pt = covered_wikidata_places(it->second, [&](PackedLocation at) {
-                                        return exact_ring_contains(cwa.vertices.data(), static_cast<uint32_t>(cwa.vertices.size()), at);
-                                    }, covered);
-                                    pto = covered.empty() ? 0 : place_type_to_admin_override(pt);
-                                    if (pto != 0) {
-                                        cwa_wikidata_linked++;
-                                        for (int64_t nid : covered)
-                                            data.place_claims.push_back(
-                                                {pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, nid),
-                                                 way_boundary_id(cwa.way_id), false});
-                                    }
-                                }
-                            }
-                            const bool linked = pto != 0;
-                            if (pto == 0) pto = cwa.fallback_place_type;
+                            // Its own place tag labels it until the links (place_links.h).
                             const char* cc = cwa.country_code.empty() ? nullptr : cwa.country_code.c_str();
-                            add_admin_polygon(data, cwa.vertices, cwa.name.c_str(),
-                                              cwa.admin_level, cc, pto,
-                                              cwa.way_id);
-                            // Its own place tag, beside the linked node's type, which labels it.
-                            data.admin_polygons.back().own_place_type = cwa.own_place_type;
-                            if (linked) data.admin_polygons.back().flags |= ADMIN_FLAG_LINKED;
+                            const PlaceValue own = static_cast<PlaceValue>(cwa.own_place_value);
+                            add_admin_polygon(data, cwa.vertices, cwa.name.c_str(), cwa.admin_level, cc,
+                                              static_cast<uint8_t>(place_label_of(own)), cwa.way_id);
+                            data.admin_polygons.back().own_place_value = cwa.own_place_value;
+                            data.admin_tags.push_back(std::move(cwa.tags));
                             closed_way_admin_count++;
                         }
                         local.closed_way_admins.clear();
                     }
-                    if (closed_way_admin_count > 0) {
-                        std::cerr << "  Added " << closed_way_admin_count
-                                  << " admin polygons from closed ways";
-                        if (cwa_wikidata_linked > 0)
-                            std::cerr << " (" << cwa_wikidata_linked << " wikidata-linked)";
-                        std::cerr << "." << std::endl;
-                    }
+                    if (closed_way_admin_count > 0)
+                        std::cerr << "  Added " << closed_way_admin_count << " admin polygons from closed ways." << std::endl;
                 }
 
                 log_phase("    Pass 2b: way merge", _st, _sc);
@@ -3689,7 +3310,7 @@ static int run(int argc, char* argv[]) {
                         uint8_t admin_level;
                         std::string country_code;
                         uint8_t place_type_override;
-                        uint8_t own_place_type = 0;
+                        uint8_t own_place_value = 0;
                         uint8_t flags = 0;  // ADMIN_FLAG_*
                         // Strategy-2 stable identity. Together (relation_id,
                         // ring_index) uniquely identifies one polygon ring
@@ -3714,7 +3335,6 @@ static int run(int argc, char* argv[]) {
                         [&](size_t i) { return member_coords(data.collected_relations[i]); }, num_threads);
                     std::atomic<size_t> rel_idx{0};
                     std::atomic<uint64_t> assembled_count{0};
-                    std::atomic<uint64_t> wikidata_linked_count{0};
                     // How the rings nested (logged), and where that disagrees
                     // with the member roles.
                     struct RingNesting {
@@ -3739,11 +3359,6 @@ static int run(int argc, char* argv[]) {
                             re_paired += a.crossing_coordinates > 0 && a.failure == AreaFailure::None;
                         }
                     } nesting;
-
-                    if (!wikidata_places.empty()) {
-                        std::cerr << "  Wikidata place linking: " << wikidata_places.size()
-                                  << " wikidata ids of place nodes available for matching." << std::endl;
-                    }
 
                     std::vector<std::thread> admin_workers;
                     for (unsigned int t = 0; t < num_threads; t++) {
@@ -3833,65 +3448,10 @@ static int run(int argc, char* argv[]) {
                                               << found << " found, " << missing << " missing)" << std::endl;
                                 }
 
-                                // Place linking, matching Nominatim's find_linked_place
-                                // priority order (placex_triggers.sql):
-                                //   1. label role (member with role=label, class=place)
-                                //   2. wikidata (place node with matching wikidata, inside
-                                //      the boundary, not already linked elsewhere)
-                                //   3. place type (boundary's own place=X tag with a
-                                //      matching-name place node — approximated here by
-                                //      the boundary's own place tag as a last resort)
-                                //   4. name match (not implemented)
-                                // An authoritative label-role match stops us falling
-                                // through — even if the label is a non-settlement
-                                // (state/province/country) Nominatim inherits its
-                                // rank_address from that node rather than trying wikidata.
-                                uint8_t pto = 0;
-                                bool label_checked = false;
-                                if (rel.label_node_id >= 0) {
-                                    auto it = label_node_to_place_type.find(rel.label_node_id);
-                                    if (it != label_node_to_place_type.end()) {
-                                        label_checked = true;
-                                        if (it->second != static_cast<uint8_t>(PlaceType::UNKNOWN)) {
-                                            pto = place_type_to_admin_override(it->second);
-                                            if (pto != 0) wikidata_linked_count.fetch_add(1);
-                                            // The boundary claims this node
-                                            // (Nominatim linked_place_id) —
-                                            // hide it from results.
-                                            std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
-                                            data.place_claims.push_back(
-                                                {pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, rel.label_node_id),
-                                                 relation_boundary_id(rel.id), true});
-                                        }
-                                    }
-                                }
-                                if (pto == 0 && !label_checked && !rel_wikidata[i].empty()) {
-                                    auto it = wikidata_places.find(rel_wikidata[i]);
-                                    if (it != wikidata_places.end()) {
-                                        std::vector<int64_t> covered;
-                                        const uint8_t pt = covered_wikidata_places(it->second, [&](PackedLocation at) {
-                                            return polygons_hold(polygons, at);
-                                        }, covered);
-                                        pto = covered.empty() ? 0 : place_type_to_admin_override(pt);
-                                        if (pto != 0) {
-                                            wikidata_linked_count.fetch_add(1);
-                                            std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
-                                            for (int64_t nid : covered)
-                                                data.place_claims.push_back(
-                                                    {pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, nid),
-                                                     relation_boundary_id(rel.id), false});
-                                        }
-                                    }
-                                }
-                                // The polygon keeps its own place tag beside the linked
-                                // node's type, which labels it: placex_update ranks by both
-                                // (rank_address.h).
-                                const uint8_t flags = static_cast<uint8_t>((pto != 0 ? ADMIN_FLAG_LINKED : 0) |
-                                                                           (rel.boundary_category ? ADMIN_FLAG_BOUNDARY : 0));
-                                // Fallback: place tag on the boundary itself
-                                if (pto == 0 && rel.fallback_place_type != 0) {
-                                    pto = rel.fallback_place_type;
-                                }
+                                // Its own place tag labels it until the links (place_links.h);
+                                // a postal area has none.
+                                const uint8_t pto = static_cast<uint8_t>(place_label_of(static_cast<PlaceValue>(rel.own_place_value)));
+                                const uint8_t flags = rel.boundary_category ? ADMIN_FLAG_BOUNDARY : 0;
 
                                 uint16_t ring_idx = 0;
                                 for (size_t k = 0; k < polygons.size(); k++) {
@@ -3911,7 +3471,7 @@ static int run(int argc, char* argv[]) {
                                         ar.admin_level = rel.admin_level;
                                         ar.country_code = rel.country_code;
                                         ar.place_type_override = pto;
-                                        ar.own_place_type = rel.own_place_type;
+                                        ar.own_place_value = rel.own_place_value;
                                         ar.flags = flags;
                                         ar.relation_id = rel.id;
                                         ar.ring_index = ring_idx;
@@ -3938,18 +3498,16 @@ static int run(int argc, char* argv[]) {
                               << " touching over " << MAX_TOUCHING_LOCATIONS << " times, " << nesting.crossing
                               << " crossing; " << nesting.re_paired
                               << " with rings crossing at shared nodes re-paired by turn order" << std::endl;
-                    if (wikidata_linked_count > 0) {
-                        std::cerr << "  Wikidata place linking: " << wikidata_linked_count
-                                  << " admin relations linked to place types." << std::endl;
+                    // What each relation links a place node by (place_links.h).
+                    for (CollectedRelation& rel : data.collected_relations) {
+                        if (rel.is_postal) continue;
+                        AdminTags tags;
+                        tags.boundary = relation_boundary_id(rel.id);
+                        tags.label = rel.label_node_id;
+                        tags.name = lowercase_utf8(rel.name_tag);
+                        tags.wikidata = std::move(rel.wikidata);
+                        data.admin_tags.push_back(std::move(tags));
                     }
-                    // The duplicate rule of the rank pass reads the boundaries' wikidata.
-                    for (size_t i = 0; i < data.collected_relations.size(); i++) {
-                        const CollectedRelation& rel = data.collected_relations[i];
-                        if (rel.admin_level >= 2 && rel.admin_level <= 10 && !rel_wikidata[i].empty())
-                            data.admin_wikidata.push_back({relation_boundary_id(rel.id), std::move(rel_wikidata[i])});
-                    }
-                    rel_wikidata.clear();
-                    rel_wikidata.shrink_to_fit();
                     log_phase("    Admin: ring assembly", _pt, _cpu);
 
                     // Flatten all admin results into a single vector for parallel processing
@@ -4017,7 +3575,7 @@ static int run(int argc, char* argv[]) {
                             poly.name_id = name_ids[k];
                             poly.admin_level = pp.admin_level;
                             poly.place_type_override = pp.place_type_override;
-                            poly.own_place_type = pp.own_place_type;
+                            poly.own_place_value = pp.own_place_value;
                             poly.flags = pp.flags;
                             poly.area = exact.area(static_cast<uint32_t>(poly_base + k));
                             const char* cc = pp.country_code.empty() ? nullptr : pp.country_code.c_str();
@@ -4318,6 +3876,7 @@ static int run(int argc, char* argv[]) {
             log_phase("    Admin: full arcs", _pt, _cpu);
             compute_full_admin_index_cells(data, arcs, num_threads);
             log_phase("    Admin: full index cells", _pt, _cpu);
+            link_admin_polygons(data, num_threads, _pt, _cpu);
 
             std::vector<bool> in_minimal(data.admin_polygons.size());
             for (size_t p = 0; p < in_minimal.size(); p++)
@@ -4361,7 +3920,7 @@ static int run(int argc, char* argv[]) {
 
         if (!data.admin_polygons.empty()) {
             const AdminRings countries = border_country_rings(data, num_threads);
-            link_places_by_name(data, cfg, countries, _pt, _cpu);
+            hide_linked_place_nodes(data, countries, num_threads);
             rank_admin_polygons(data, countries, num_threads, cfg.rank_dump, _pt, _cpu);
         }
 

@@ -89,6 +89,7 @@ add_executable(build-index
     src/cell_index.cpp
     src/interpolation.cpp
     src/rank_address.cpp
+    src/place_links.cpp
 )
 
 # Patch tools (no S2 dependency)
@@ -197,6 +198,7 @@ add_executable(geocoder-tests
     src/interpolation.cpp
     src/pbf_reader.cpp
     src/rank_address.cpp
+    src/place_links.cpp
 )
 target_include_directories(geocoder-tests PRIVATE src tools tests)
 target_compile_definitions(geocoder-tests PRIVATE

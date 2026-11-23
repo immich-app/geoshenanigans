@@ -45,46 +45,24 @@ constexpr uint64_t kNoOsmId = uint64_t(0xFF) << 56;
 
 bool lifted_rank(uint8_t rank) { return rank >= kMinLiftedRank && rank <= kMaxLiftedRank; }
 
-// A boundary or a place area: the polygons (rings) of one relation or way.
-struct Object {
-    uint64_t id = 0;                // admin_boundary_id
-    uint32_t first = 0, count = 0;  // its polygons, members[first, first + count)
-    uint8_t level = 0;
-    bool relation = false;
-    // Nominatim's categories: osm.place (an own place tag) and osm.boundary
-    // (every boundary; a place area by its boundary tag).
-    bool place_category = false, boundary_category = false;
-    bool linked = false;
-    uint8_t link_type = 0, own_type = 0;  // AdminPlaceType
-    uint16_t country = 0;
-    PlaceRanks initial;  // compute_place_rank's: also the prank others compare
-    PackedLocation point{0, 0};
-    float area = 0;
-    ExactRingBox box{INT32_MAX, INT32_MIN, INT32_MAX, INT32_MIN};
-    const std::string* wikidata = nullptr;
+// Takes the place-area step: a place area, or a way with a place tag, of a rank it lifts
+// (:930-933).
+bool place_area_step(const AdminObject& o) {
+    return (o.level == 15 || (!o.relation && o.place_category)) && lifted_rank(o.initial.address);
+}
 
-    bool boundary() const { return level != 15; }
-    // Takes the place-area step: a place area, or a way with a place tag,
-    // of a rank it lifts (:930-933).
-    bool place_area_step() const {
-        return (level == 15 || (!relation && place_category)) && lifted_rank(initial.address);
-    }
-};
-
-bool meets_area_and_box(const Object& outer, const Object& inner) {
+bool meets_area_and_box(const AdminObject& outer, const AdminObject& inner) {
     return outer.area >= inner.area && box_holds(outer.box, inner.box);
 }
 
 }  // namespace
 
-RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, unsigned threads,
-                                 std::vector<RankTrace>* trace) {
-    RankStats stats;
+AdminObjects admin_objects(ParsedData& data, const RankLookups& lookups, unsigned threads) {
     auto& polygons = data.admin_polygons;
     const AdminExactRings& exact = data.admin_exact_rings;
     if (data.admin_osm_ids.size() != polygons.size() || exact.polygons.size() != polygons.size())
         throw std::logic_error("the rank pass needs every admin polygon's osm id and rings");
-    for (AdminPolygon& p : polygons) p.rank_address = 0;
+    AdminObjects out;
 
     // Each boundary's polygons together, in ring order. A polygon without an osm id is an
     // object of its own.
@@ -92,15 +70,15 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
         const uint64_t osm = data.admin_osm_ids[pid];
         return osm ? admin_boundary_id(osm) : kNoOsmId | pid;
     };
-    std::vector<uint32_t> members;
+    std::vector<uint32_t>& members = out.members;
     for (uint32_t pid = 0; pid < polygons.size(); pid++)
         if (polygons[pid].admin_level != 11 && exact.polygons[pid].ring_count > 0) members.push_back(pid);
     std::sort(members.begin(), members.end(), [&](uint32_t a, uint32_t b) {
         const uint64_t ba = boundary_of(a), bb = boundary_of(b);
         return ba != bb ? ba < bb : data.admin_osm_ids[a] < data.admin_osm_ids[b];
     });
-    std::vector<Object> objects;
-    std::vector<uint32_t> object_of(polygons.size(), NO_DATA);
+    std::vector<AdminObject>& objects = out.objects;
+    out.object_of.assign(polygons.size(), NO_DATA);
     for (uint32_t k = 0; k < members.size(); k++) {
         const uint64_t id = boundary_of(members[k]);
         if (objects.empty() || objects.back().id != id) {
@@ -109,32 +87,23 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
             objects.back().first = k;
         }
         objects.back().count++;
-        object_of[members[k]] = static_cast<uint32_t>(objects.size() - 1);
+        out.object_of[members[k]] = static_cast<uint32_t>(objects.size() - 1);
     }
-    std::sort(data.admin_wikidata.begin(), data.admin_wikidata.end());
-
-    auto parts_of = [&](const Object& o) {
-        std::vector<RingPolygon> parts;
-        for (uint32_t m = o.first; m < o.first + o.count; m++) {
-            const uint32_t pid = members[m];
-            parts.push_back({exact.vertices.data(), exact.rings_of(pid), exact.polygons[pid].ring_count});
-        }
-        return parts;
-    };
+    std::sort(data.admin_tags.begin(), data.admin_tags.end(),
+              [](const AdminTags& a, const AdminTags& b) { return a.boundary < b.boundary; });
 
     // What each object is, its point on surface, country and initial ranks.
     parallel_for_dynamic(objects.size(), 256, [&](size_t begin, size_t end, unsigned) {
         for (size_t k = begin; k < end; k++) {
-            Object& o = objects[k];
+            AdminObject& o = objects[k];
             const AdminPolygon& first = polygons[members[o.first]];
             o.level = first.admin_level;
             o.relation = o.id >> 56 == static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_RELATION);
-            o.own_type = first.own_place_type;
-            o.place_category = o.own_type != 0;
+            o.own = first.own_place_value;
+            o.place_category = o.own != static_cast<uint8_t>(PlaceValue::NONE);
             o.boundary_category = o.boundary();
             double widest = -1;
             LatLng point{0, 0};
-            float linked_area = -1;
             for (uint32_t m = o.first; m < o.first + o.count; m++) {
                 const uint32_t pid = members[m];
                 const AdminPolygon& p = polygons[pid];
@@ -146,11 +115,6 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
                 }
                 if (p.country_code && !o.country) o.country = p.country_code;
                 if ((p.flags & ADMIN_FLAG_BOUNDARY) && !o.boundary()) o.boundary_category = true;
-                if ((p.flags & ADMIN_FLAG_LINKED) && p.area > linked_area) {
-                    linked_area = p.area;
-                    o.linked = true;
-                    o.link_type = p.place_type_override;
-                }
                 o.area += p.area;
                 const RingSpan& outer = exact.rings_of(pid)[0];
                 const ExactRingBox b = exact_ring_box(exact.vertices.data() + outer.begin, outer.count);
@@ -159,12 +123,46 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
             }
             o.point = point_e7(point.first, point.second);
             if (!o.country) o.country = lookups.country_at(o.point);
-            o.initial = polygon_ranks(o.country, o.level, o.own_type);
-            const auto w = std::lower_bound(data.admin_wikidata.begin(), data.admin_wikidata.end(),
-                                            std::make_pair(o.id, std::string()));
-            if (w != data.admin_wikidata.end() && w->first == o.id && !w->second.empty()) o.wikidata = &w->second;
+            o.initial = polygon_ranks(o.country, o.level, static_cast<PlaceValue>(o.own));
+            const auto t = std::lower_bound(data.admin_tags.begin(), data.admin_tags.end(), o.id,
+                                            [](const AdminTags& a, uint64_t id) { return a.boundary < id; });
+            if (t != data.admin_tags.end() && t->boundary == o.id) o.tags = &*t;
         }
     }, threads);
+    return out;
+}
+
+std::vector<RingPolygon> object_parts(const ParsedData& data, const AdminObjects& objects, const AdminObject& o) {
+    const AdminExactRings& exact = data.admin_exact_rings;
+    std::vector<RingPolygon> parts;
+    for (uint32_t m = o.first; m < o.first + o.count; m++) {
+        const uint32_t pid = objects.members[m];
+        parts.push_back({exact.vertices.data(), exact.rings_of(pid), exact.polygons[pid].ring_count});
+    }
+    return parts;
+}
+
+RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, unsigned threads,
+                                 std::vector<RankTrace>* trace) {
+    RankStats stats;
+    auto& polygons = data.admin_polygons;
+    for (AdminPolygon& p : polygons) p.rank_address = 0;
+    const AdminObjects all = admin_objects(data, lookups, threads);
+    const std::vector<AdminObject>& objects = all.objects;
+    const std::vector<uint32_t>& members = all.members;
+    const std::vector<uint32_t>& object_of = all.object_of;
+    auto parts_of = [&](const AdminObject& o) { return object_parts(data, all, o); };
+
+    // Each object's link, by object.
+    std::vector<AdminLink>& admin_links = data.admin_links;
+    std::sort(admin_links.begin(), admin_links.end(),
+              [](const AdminLink& a, const AdminLink& b) { return a.boundary < b.boundary; });
+    std::vector<const AdminLink*> link_of(objects.size(), nullptr);
+    for (size_t k = 0; k < objects.size(); k++) {
+        const auto l = std::lower_bound(admin_links.begin(), admin_links.end(), objects[k].id,
+                                        [](const AdminLink& a, uint64_t id) { return a.boundary < id; });
+        if (l != admin_links.end() && l->boundary == objects[k].id) link_of[k] = &*l;
+    }
 
     // Round each object's point: its admin-nested parents, nearest first,
     // with whether each repeats it, and the polygons that may contain it.
@@ -175,9 +173,9 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
         std::vector<uint32_t> near, at;
         std::vector<std::pair<uint32_t, uint32_t>> mine;
         for (size_t k = begin; k < end; k++) {
-            const Object& o = objects[k];
+            const AdminObject& o = objects[k];
             const bool nests = o.boundary() && o.relation && o.initial.address > 0;
-            const bool contains = nests || o.place_area_step();
+            const bool contains = nests || place_area_step(o);
             if (!nests && !contains) continue;
             near.clear();
             at.clear();
@@ -190,26 +188,26 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
             if (nests) {
                 auto& mine_parents = parents[k];
                 for (uint32_t q : at) {
-                    const Object& p = objects[q];
+                    const AdminObject& p = objects[q];
                     if (p.boundary() && p.relation && p.level > 3 && p.level < o.level) mine_parents.push_back({q, false});
                 }
                 // The relation of the highest level; equal levels, which Nominatim takes in no set
                 // order, to the smaller, then the lower osm id.
                 std::sort(mine_parents.begin(), mine_parents.end(), [&](const auto& a, const auto& b) {
-                    const Object &pa = objects[a.first], &pb = objects[b.first];
+                    const AdminObject &pa = objects[a.first], &pb = objects[b.first];
                     if (pa.level != pb.level) return pa.level > pb.level;
                     if (pa.area != pb.area) return pa.area < pb.area;
                     return pa.id < pb.id;
                 });
                 for (auto& [q, same] : mine_parents) {
-                    const Object& p = objects[q];
-                    same = o.wikidata && p.wikidata && *o.wikidata == *p.wikidata && polygons_equal(parts_of(p), parts_of(o));
+                    const AdminObject& p = objects[q];
+                    same = o.wikidata() && p.wikidata() && *o.wikidata() == *p.wikidata() && polygons_equal(parts_of(p), parts_of(o));
                 }
             }
             // A boundary below rank 10 with no parent to lift it takes no containment step.
             if (nests && o.initial.address <= kMaxUncontainedBoundaryRank && parents[k].empty()) continue;
             for (uint32_t q : at) {
-                const Object& c = objects[q];
+                const AdminObject& c = objects[q];
                 if (!meets_area_and_box(c, o)) continue;
                 // A boundary's containers: place polygons whose place rank can be its rank or
                 // more. A place area's: any polygon of a place rank from its own up to 23.
@@ -242,7 +240,7 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
     };
     parallel_for_dynamic(runs.size() - 1, 1, [&](size_t begin, size_t end, unsigned) {
         for (size_t r = begin; r < end; r++) {
-            const Object& c = objects[pairs[runs[r]].first];
+            const AdminObject& c = objects[pairs[runs[r]].first];
             const std::vector<RingPolygon> c_parts = parts_of(c);
             const auto c_index = indexed(c_parts);
             const auto c_pointers = pointers(c_index);
@@ -270,7 +268,7 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
         uint32_t best = NO_DATA;
         for (uint32_t q : containers[k]) {
             if (!fits(q)) continue;
-            const Object &c = objects[q];
+            const AdminObject &c = objects[q];
             if (best == NO_DATA || c.initial.address > objects[best].initial.address ||
                 (c.initial.address == objects[best].initial.address && c.id < objects[best].id))
                 best = q;
@@ -279,7 +277,7 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
     };
     // placex_update's place-area step (:930-950): a container of a place rank from the area's own
     // up to 23 and a rank of 1 to 25 lifts it.
-    auto place_area_step = [&](uint32_t k) {
+    auto area_step = [&](uint32_t k) {
         const uint32_t c = best_container(k, [&](uint32_t q) {
             return objects[q].initial.address >= rank[k] && objects[q].initial.address <= kMaxContainerRank &&
                    rank[q] >= 1 && rank[q] <= kMaxParentRank;
@@ -296,27 +294,28 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
         // Its branch takes no link step.
         if (t) t->before_link = rank[k];
     };
-    // The link, else the own place tag (:1109-1172), above parent_level. A polygon of initial
-    // rank 0 links nothing (find_linked_place, :285).
+    // The link, else the own place tag (:1109-1172), above parent_level: the rank of the
+    // place node the polygon links in the node's country, else that of its own place value in
+    // its own, either up or down.
     auto link_or_own_tag = [&](uint32_t k, uint8_t parent_level) {
-        const Object& o = objects[k];
+        const AdminObject& o = objects[k];
         RankTrace* t = traced_at(k);
         if (t) t->before_link = rank[k];
-        if (o.linked && o.initial.address > 0) {
-            const uint8_t linked = place_ranks(o.country, o.link_type).address;
-            if (linked > parent_level && linked < kStreetRank && linked != rank[k]) {
+        if (const AdminLink* link = link_of[k]) {
+            if (link->rank > parent_level && link->rank < kStreetRank && link->rank != rank[k]) {
                 stats.linked++;
-                stats.lowered += linked < rank[k];
-                rank[k] = linked;
+                stats.lowered += link->rank < rank[k];
+                rank[k] = link->rank;
                 if (t) t->step = 'L';
             }
             return;
         }
         if (!o.place_category || rank[k] < kMinTaggedRank || rank[k] > kMaxTaggedRank) return;
-        const uint8_t tagged = place_ranks(o.country, o.own_type).address;
-        if (tagged > parent_level && tagged < kStreetRank && tagged > rank[k]) {
-            rank[k] = tagged;
+        const uint8_t tagged = place_value_ranks(o.country, static_cast<PlaceValue>(o.own)).address;
+        if (tagged > parent_level && tagged < kStreetRank && tagged != rank[k]) {
             stats.own_tags++;
+            stats.own_lowered += tagged < rank[k];
+            rank[k] = tagged;
             if (t) t->step = 'O';
         }
     };
@@ -325,14 +324,14 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
     for (uint32_t k = 0; k < objects.size(); k++)
         if (objects[k].boundary()) order.push_back(k);
     std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-        const Object &oa = objects[a], &ob = objects[b];
+        const AdminObject &oa = objects[a], &ob = objects[b];
         if (oa.initial.search != ob.initial.search) return oa.initial.search < ob.initial.search;
         if (oa.level != ob.level) return oa.level < ob.level;
         return oa.id < ob.id;
     });
     stats.boundaries = order.size();
     for (uint32_t k : order) {
-        const Object& o = objects[k];
+        const AdminObject& o = objects[k];
         if (o.relation && rank[k] > 0) {
             uint8_t parent_level = kNoParentLevel;
             for (const auto& [q, same] : parents[k]) {
@@ -369,8 +368,8 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
                 }
             }
             link_or_own_tag(k, parent_level);
-        } else if (o.place_area_step()) {
-            place_area_step(k);
+        } else if (place_area_step(o)) {
+            area_step(k);
         } else {
             link_or_own_tag(k, kNoParentLevel);
         }
@@ -381,14 +380,14 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
         if (!objects[k].boundary()) order.push_back(k);
     // Within a rank the larger first, so that an area is final before the areas it holds.
     std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-        const Object &oa = objects[a], &ob = objects[b];
+        const AdminObject &oa = objects[a], &ob = objects[b];
         if (oa.initial.address != ob.initial.address) return oa.initial.address < ob.initial.address;
         if (oa.area != ob.area) return oa.area > ob.area;
         return oa.id < ob.id;
     });
     stats.place_areas = order.size();
     for (uint32_t k : order) {
-        if (objects[k].place_area_step()) place_area_step(k);
+        if (place_area_step(objects[k])) area_step(k);
         else link_or_own_tag(k, kNoParentLevel);
     }
 
@@ -403,6 +402,10 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
             t.country = objects[k].country;
             t.initial = objects[k].initial;
             t.rank = rank[k];
+            if (link_of[k]) {
+                t.link = link_of[k]->step;
+                t.node = link_of[k]->node;
+            }
         }
         *trace = std::move(traced);
     }
@@ -423,7 +426,7 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
             if (place_node_promotable(base)) {
                 const PackedLocation p = point_e7(pn.lat, pn.lng);
                 const auto first = std::lower_bound(links.begin(), links.end(), std::make_pair(uint32_t(i), uint64_t(0)));
-                auto links_it = [&](const Object& o) {
+                auto links_it = [&](const AdminObject& o) {
                     for (auto l = first; l != links.end() && l->first == i; ++l)
                         if (l->second == o.id) return true;
                     return false;
@@ -433,7 +436,7 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
                 for (uint32_t pid : near) {
                     const uint32_t q = pid < object_of.size() ? object_of[pid] : NO_DATA;
                     if (q == NO_DATA) continue;
-                    const Object& o = objects[q];
+                    const AdminObject& o = objects[q];
                     if (!o.relation || rank[q] < 1 || rank[q] > kMaxParentRank || links_it(o)) continue;
                     if (!((o.place_category && o.initial.address == base) || (o.boundary_category && rank[q] == base)))
                         continue;
@@ -451,7 +454,8 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
         return nodes[i].rank_address != place_node_rank(nodes[i].place_type);
     }, threads);
 
-    std::vector<std::pair<uint64_t, std::string>>().swap(data.admin_wikidata);
+    std::vector<AdminTags>().swap(data.admin_tags);
+    std::vector<AdminLink>().swap(data.admin_links);
     PlaceNodeLinks().swap(links);
     return stats;
 }

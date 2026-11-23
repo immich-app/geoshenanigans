@@ -12,7 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <mutex>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -20,12 +20,11 @@
 #include "parallel.h"
 #include "types.h"
 
-// A boundary's claim on a place node: the node is its label member or shares
-// its wikidata id (find_linked_place's first two steps).
+// A boundary's claim on a place node: the boundary whose link of the node
+// came last (place_links.h), as Nominatim's linked_place_id names it.
 struct PlaceClaim {
     uint64_t node;      // pack_osm_id(OSM_NODE, id), as place_osm_ids holds it
     uint64_t boundary;  // relation_boundary_id or way_boundary_id of the claimant
-    bool label;         // a label member, else a wikidata match
 };
 
 // The stable id admin_osm_ids holds for ring `ring` of relation `relation`.
@@ -75,25 +74,6 @@ inline uint32_t boundary_polygon(const std::vector<std::pair<uint64_t, uint32_t>
     return it != boundaries.end() && it->first == boundary ? it->second : NO_DATA;
 }
 
-// One boundary's claim on a node, for choosing between claimants.
-struct ClaimRank {
-    bool label;
-    uint8_t admin_level;
-    uint64_t boundary;
-};
-
-// Whether claim a takes the node over claim b, as Nominatim's last write of
-// linked_place_id: it indexes boundaries by ascending rank, a label link sets
-// the node's link whatever it was (the highest-level label claim keeps it),
-// a wikidata or name link only an unset one (the lowest-level claim keeps
-// it, and never over a label). Admin level stands in for rank; equal levels,
-// which Nominatim indexes in no set order, go to the lower boundary id.
-inline bool claim_wins(const ClaimRank& a, const ClaimRank& b) {
-    if (a.label != b.label) return a.label;
-    if (a.admin_level != b.admin_level) return a.label ? a.admin_level > b.admin_level : a.admin_level < b.admin_level;
-    return a.boundary < b.boundary;
-}
-
 // Hides a claimed node; names `polygon` (unless NO_DATA) as its claimant.
 inline void flag_claimed_place_node(PlaceNode& pn, uint32_t polygon) {
     pn._pad1 |= PLACE_FLAG_HIDDEN;
@@ -102,11 +82,8 @@ inline void flag_claimed_place_node(PlaceNode& pn, uint32_t polygon) {
     pn.parent_poly_id = polygon;
 }
 
-// Every claimant's polygon links (hide_claimed_place_nodes).
-inline bool every_polygon_links(uint32_t) { return true; }
-
-// (node, boundary id) of each boundary with a polygon that links a place
-// node, sorted, each pair once.
+// (node, boundary id) of each boundary that links a place node, sorted,
+// each pair once.
 using PlaceNodeLinks = std::vector<std::pair<uint32_t, uint64_t>>;
 
 inline void sort_place_node_links(PlaceNodeLinks& links) {
@@ -114,94 +91,29 @@ inline void sort_place_node_links(PlaceNodeLinks& links) {
     links.erase(std::unique(links.begin(), links.end()), links.end());
 }
 
-// Flags the place nodes (node_ids parallel to nodes) the label and wikidata
-// claims hit, each naming the polygon of the claimant claim_wins picks among
-// those with a polygon. A claim of a claimant whose polygon p does not link,
-// `links(p)` false (one of rank 0 in its country), is no claim. With
-// `linkers`, every claimant with a polygon that links a node is added there.
-// Returns how many nodes it hid.
-template <class Links = bool (*)(uint32_t)>
+// Flags the place nodes (node_ids parallel to nodes) the claims hit, one
+// claim a node at most, each naming its claimant's polygon where the
+// claimant has one. Returns how many nodes it hid.
 inline size_t hide_claimed_place_nodes(std::vector<PlaceNode>& nodes, const std::vector<uint64_t>& node_ids,
                                        std::vector<PlaceClaim> claims, const std::vector<AdminPolygon>& polygons,
-                                       const std::vector<uint64_t>& polygon_ids, unsigned threads = 0,
-                                       Links links = every_polygon_links, PlaceNodeLinks* linkers = nullptr) {
+                                       const std::vector<uint64_t>& polygon_ids, unsigned threads = 0) {
     if (claims.empty()) return 0;
     const auto boundaries = boundary_polygons(polygons, polygon_ids);
     std::sort(claims.begin(), claims.end(), [](const PlaceClaim& a, const PlaceClaim& b) { return a.node < b.node; });
+    for (size_t k = 1; k < claims.size(); k++)
+        if (claims[k].node == claims[k - 1].node) throw std::logic_error("a place node of two claimants");
     std::atomic<size_t> hidden{0};
-    std::mutex linkers_mutex;
     parallel_for(std::min(nodes.size(), node_ids.size()), [&](size_t begin, size_t end, unsigned) {
         size_t n = 0;
-        PlaceNodeLinks mine;
         for (size_t i = begin; i < end; i++) {
             auto it = std::lower_bound(claims.begin(), claims.end(), node_ids[i],
                                        [](const PlaceClaim& c, uint64_t node) { return c.node < node; });
             if (it == claims.end() || it->node != node_ids[i]) continue;
-            uint32_t best = NO_DATA;
-            ClaimRank best_rank{};
-            bool claimed = false;
-            for (; it != claims.end() && it->node == node_ids[i]; ++it) {
-                const uint32_t p = boundary_polygon(boundaries, it->boundary);
-                if (p != NO_DATA && !links(p)) continue;
-                claimed = true;
-                if (p == NO_DATA) continue;
-                if (linkers) mine.push_back({static_cast<uint32_t>(i), it->boundary});
-                const ClaimRank rank{it->label, polygons[p].admin_level, it->boundary};
-                if (best == NO_DATA || claim_wins(rank, best_rank)) {
-                    best = p;
-                    best_rank = rank;
-                }
-            }
-            if (!claimed) continue;
-            flag_claimed_place_node(nodes[i], best);
+            flag_claimed_place_node(nodes[i], boundary_polygon(boundaries, it->boundary));
             n++;
         }
         hidden += n;
-        if (!mine.empty()) {
-            std::lock_guard<std::mutex> lock(linkers_mutex);
-            linkers->insert(linkers->end(), mine.begin(), mine.end());
-        }
     }, threads);
-    if (linkers) sort_place_node_links(*linkers);
-    return hidden;
-}
-
-// Flags the place nodes the name match links (find_linked_place's last
-// step): `links` holds (node, polygon) for each boundary ring and its best
-// node. A node names its boundary's largest ring whichever ring matched, as
-// a label or wikidata claim does; a node several boundaries pick names the
-// one claim_wins picks. With `linkers`, every boundary that links a node is
-// added there.
-inline size_t hide_name_linked_place_nodes(std::vector<PlaceNode>& nodes, std::vector<std::pair<uint32_t, uint32_t>> links,
-                                           const std::vector<AdminPolygon>& polygons,
-                                           const std::vector<uint64_t>& polygon_ids, PlaceNodeLinks* linkers = nullptr) {
-    const auto boundaries = boundary_polygons(polygons, polygon_ids);
-    if (!boundaries.empty()) {
-        for (auto& link : links) {
-            if (polygon_ids[link.second] != 0)
-                link.second = boundary_polygon(boundaries, admin_boundary_id(polygon_ids[link.second]));
-        }
-    }
-    auto rank = [&](uint32_t p) {
-        return ClaimRank{false, polygons[p].admin_level, polygon_ids.size() == polygons.size() ? polygon_ids[p] : p};
-    };
-    std::sort(links.begin(), links.end(), [&](const auto& a, const auto& b) {
-        if (a.first != b.first) return a.first < b.first;
-        if (claim_wins(rank(a.second), rank(b.second))) return true;
-        if (claim_wins(rank(b.second), rank(a.second))) return false;
-        return a.second < b.second;
-    });
-    if (linkers && polygon_ids.size() == polygons.size()) {
-        for (const auto& [node, p] : links)
-            if (polygon_ids[p] != 0) linkers->push_back({node, admin_boundary_id(polygon_ids[p])});
-        sort_place_node_links(*linkers);
-    }
-    size_t hidden = 0;
-    for (size_t k = 0; k < links.size(); k++) {
-        if (k > 0 && links[k].first == links[k - 1].first) continue;
-        flag_claimed_place_node(nodes[links[k].first], links[k].second);
-        hidden++;
-    }
     return hidden;
 }
 

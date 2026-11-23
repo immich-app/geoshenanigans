@@ -43,9 +43,8 @@ static_assert(sizeof(InterpWay) == 24, "InterpWay must be 24 bytes");
 static_assert(offsetof(InterpWay, node_count) == 4 && offsetof(InterpWay, street_id) == 8,
               "geocoder-diff reads InterpWay fields at fixed offsets");
 
-// Place type override for admin polygons, derived from either a place/
-// linked_place tag on the boundary itself, or the place type of a
-// label-role member node (Nominatim's find_linked_place flow).
+// Place type override for admin polygons: the type of the place node the
+// polygon links (place_links.h), else of its own place tag.
 // Must stay in sync with geocoder/server/src/main.rs place_type_to_field.
 // Nominatim's get_label_tag (classtypes.py) returns extratags['place']
 // or extratags['linked_place'] verbatim as the JSON field key, so each
@@ -115,11 +114,11 @@ struct AdminPolygon {
     uint32_t name_id;
     uint8_t admin_level;
     uint8_t place_type_override = 0; // AdminPlaceType — overrides admin_level for field mapping
-    // The polygon's own place tag (AdminPlaceType), 0 where it has none: a
-    // place area's (admin_level 15) is its place type. Its label is
-    // place_type_override, the type of a place node it links where it links
-    // one (find_linked_place).
-    uint8_t own_place_type = 0;
+    // The polygon's own place tag (PlaceValue, admin_rank_config.h), 0 where
+    // it has none: a place area's (admin_level 15) is its place type. Its
+    // label is place_type_override, the type of a place node it links where
+    // it links one (place_links.h), else of this.
+    uint8_t own_place_value = 0;
     // Nominatim's rank_address of the polygon (rank_address.h); 0 for a
     // postal area and a tombstone.
     uint8_t rank_address = 0;
@@ -131,9 +130,6 @@ struct AdminPolygon {
 static_assert(sizeof(AdminPolygon) == 20, "AdminPolygon must be 20 bytes");
 
 // AdminPolygon.flags bits.
-// place_type_override is the type of a place node the polygon links
-// (find_linked_place's label, wikidata or name step), not its own tag.
-static constexpr uint8_t ADMIN_FLAG_LINKED = 0x01;
 // A place area whose boundary tag Nominatim keeps as a category of its own
 // (boundary=historic, ceremonial: relation_import.h is_boundary_category).
 static constexpr uint8_t ADMIN_FLAG_BOUNDARY = 0x02;
@@ -368,18 +364,16 @@ struct CollectedRelation {
     int64_t id;
     int64_t label_node_id = -1;  // role=label place node (Nominatim's primary link target)
     uint8_t admin_level;
-    // Fallback place-type override from the boundary's own tags
-    // (linked_place / place). Nominatim's find_linked_place tries label
-    // role → wikidata → place-type match → name match; the boundary's
-    // own place tag is only step 3, so we store it as a *fallback*
-    // applied after label / wikidata have been checked.
-    uint8_t fallback_place_type = 0;  // AdminPlaceType
-    // Its own place tag alone (AdminPlaceType), which ranks it, and whether a
+    // Its own place tag (PlaceValue), which labels it where it links no
+    // place node of a type of AdminPlaceType's and ranks it, and whether a
     // place area's boundary tag is a category of its own
     // (is_boundary_category).
-    uint8_t own_place_type = 0;
+    uint8_t own_place_value = 0;
     bool boundary_category = false;
     std::string name;
+    // Its name and wikidata tags, which it links a place node by
+    // (place_links.h).
+    std::string name_tag, wikidata;
     std::string country_code;
     bool is_postal;
     std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
@@ -390,12 +384,6 @@ struct CollectedRelation {
 enum class PlaceType : uint8_t {
     CITY = 0, TOWN = 1, VILLAGE = 2, SUBURB = 3,
     HAMLET = 4, NEIGHBOURHOOD = 5, QUARTER = 6,
-    // These are only used for the label-role lookup on admin boundaries —
-    // they never end up in place_nodes.bin itself. A label member with
-    // place=state/province/region/etc. lets us honour Nominatim's
-    // get_label_tag() fallthrough to extratags['linked_place'].
-    STATE = 7, PROVINCE = 8, REGION = 9, COUNTY = 10, DISTRICT = 11,
-    BOROUGH = 12,
     UNKNOWN = 255
 };
 

@@ -3,14 +3,30 @@
 // boundary links a place node of its wikidata only where it holds it, a
 // place=province area is an address area where its country ranks it, a
 // postal area names a point only of its own country and of a postcode its
-// country takes, and a place area linked to a place node of another type
-// ranks by its own place tag.
+// country takes, a place area linked to a place node of another type ranks
+// by its own place tag, and each step of find_linked_place links as
+// Nominatim's does.
 #include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <map>
 #include <string>
 #include <vector>
 
 #include "pbf_fixture.h"
+#include "place_files.h"
 #include "test_framework.h"
+#include "types.h"
+
+namespace {
+
+std::vector<char> file_bytes(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return std::vector<char>(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+}  // namespace
 
 TEST(a_boundary_of_rank_0_in_its_country_links_no_place_node) {
     // Gold Coast City is a local government area, admin_level 6, which ranks 0 in Australia
@@ -116,4 +132,138 @@ TEST(a_place_area_linked_to_a_place_node_of_another_type_ranks_by_its_own_place_
     CHECK(names(answers[0], "town", "Weesp"));
     CHECK(names(answers[0], "village", "Driemond"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_boundary_with_a_place_tag_of_its_own_links_its_namesake_city_node_by_name) {
+    // Ferraz de Vasconcelos (R298265, admin_level 8, place=municipality) has no label member and
+    // no wikidata: find_linked_place links its city node by name, the node ranking 16 as the
+    // boundary does (placex_triggers.sql:363-386). The boundary is the address's city, labelled
+    // by the node, and no municipality.
+    Fixture f;
+    f.country(-34, -54, -5, -35, "Brazil", "BR");
+    f.boundary(-25, -53, -20, -44, 4, "São Paulo");
+    f.boundary(-23.6, -46.4, -23.5, -46.3, 8, "Ferraz de Vasconcelos", {{"place", "municipality"}});
+    f.node(-23.54, -46.37, {{"place", "city"}, {"name", "Ferraz de Vasconcelos"}});
+    const std::vector<std::string> answers = answers_of(f, "link-by-name", {{-23.545, -46.365}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "city", "Ferraz de Vasconcelos"));
+    CHECK(answers[0].find("\"municipality\"") == std::string::npos);
+    std::printf("    %s\n", answers[0].c_str());
+}
+
+TEST(a_townland_of_a_locality_ranks_25_and_leaves_the_address) {
+    // Irish townlands: one whose label member is a place=locality node takes the node's 25
+    // (placex_triggers.sql:1129), and one tagged place=locality itself its tag's 25 (:1157-1172):
+    // no address shows either. A third, linked to nothing, ranks 20 by its level.
+    Fixture f;
+    f.country(51, -11, 56, -5, "Ireland", "IE");
+    f.boundary(53, -7, 54, -6, 6, "County Meath");
+    const int64_t locality = f.node(53.55, -6.55, {{"place", "locality"}, {"name", "Rathmore"}});
+    f.boundary(53.5, -6.6, 53.6, -6.5, 10, "Rathmore", {}, {{OsmType::Node, locality, "label"}});
+    f.boundary(53.5, -6.4, 53.6, -6.3, 10, "Town Parks", {{"place", "locality"}});
+    f.boundary(53.7, -6.4, 53.8, -6.3, 10, "Ballyboy");
+    const std::vector<std::string> answers = answers_of(f, "locality-25", {{53.56, -6.56}, {53.55, -6.35}, {53.75, -6.35}});
+    REQUIRE(answers.size() == 3);
+    CHECK(answers[0].find("Rathmore") == std::string::npos);
+    CHECK(answers[1].find("Town Parks") == std::string::npos);
+    CHECK(answers[2].find("Ballyboy") != std::string::npos);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_boundary_links_one_node_of_its_wikidata_its_namesake_first) {
+    // Springfield's wikidata is also on a suburb node inside it: find_linked_place takes one
+    // node, the one of its name (:323-337), and the suburb stays a place of its own.
+    Fixture f;
+    f.country(30, -100, 45, -70, "United States", "US");
+    f.boundary(38, -91, 42, -87, 4, "Illinois");
+    f.boundary(39.6, -89.8, 39.9, -89.5, 8, "Springfield", {{"wikidata", "Q28515"}});
+    f.node(39.78, -89.65, {{"place", "city"}, {"name", "Springfield"}, {"wikidata", "Q28515"}});
+    f.node(39.70, -89.60, {{"place", "suburb"}, {"name", "Springfield Centre"}, {"wikidata", "Q28515"}});
+    const std::vector<std::string> answers = answers_of(f, "wikidata-one", {{39.701, -89.601}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "suburb", "Springfield Centre"));
+    CHECK(names(answers[0], "city", "Springfield"));
+    std::printf("    %s\n", answers[0].c_str());
+}
+
+TEST(a_boundary_links_only_a_node_it_covers_by_name) {
+    // Northfield (admin_level 8) links no namesake village node outside it, however near: the
+    // village is a place of its own.
+    Fixture f;
+    f.country(30, -100, 45, -70, "United States", "US");
+    f.boundary(40, -80, 42, -76, 4, "Pennsylvania");
+    f.boundary(40.5, -79.0, 40.9, -78.5, 6, "Clearfield County");
+    f.boundary(40.70, -78.80, 40.80, -78.70, 8, "Northfield");
+    f.node(40.65, -78.75, {{"place", "village"}, {"name", "Northfield"}});
+    const std::vector<std::string> answers = answers_of(f, "name-covers", {{40.651, -78.751}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "village", "Northfield"));
+    std::printf("    %s\n", answers[0].c_str());
+}
+
+TEST(a_place_tagged_boundary_links_a_node_of_its_value_by_part_of_its_name) {
+    // Stadt Kreuzberg (admin_level 8, place=city) links the city node Kreuzberg, whose name lies
+    // in its own (:339-361), and hides it; a town node of the name, of another value, stays a
+    // place of its own.
+    Fixture f;
+    f.country(47, 6, 55, 15, "Germany", "DE");
+    f.boundary(52, 12, 53, 14, 4, "Brandenburg");
+    f.boundary(52.4, 13.3, 52.6, 13.5, 8, "Stadt Kreuzberg", {{"place", "city"}});
+    f.node(52.50, 13.40, {{"place", "city"}, {"name", "Kreuzberg"}});
+    f.node(52.45, 13.35, {{"place", "town"}, {"name", "Kreuzberg"}});
+    const ScratchDir root("link-by-type");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    write_test_pbf(pbf, f.objects(), 1000);
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/out", pbf}, log));
+    std::map<uint8_t, size_t> visible;
+    const std::string dir = root.path() + "/out/planet/";
+    const std::vector<char> cells = file_bytes(dir + place_files::CELLS_FILE), nodes = file_bytes(dir + place_files::NODES_FILE),
+                            hidden = file_bytes(dir + place_files::HIDDEN_FILE);
+    auto u8 = [](const std::vector<char>& v) { return reinterpret_cast<const uint8_t*>(v.data()); };
+    place_files::decode(u8(cells), cells.size(), u8(nodes), nodes.size(), u8(hidden), hidden.size(),
+                        [&](const place_files::LogicalPlace& p) { visible[p.node.place_type] += place_files::is_visible(p.node); });
+    CHECK_EQ(visible[uint8_t(PlaceType::CITY)], size_t(0));
+    CHECK_EQ(visible[uint8_t(PlaceType::TOWN)], size_t(1));
+    const std::vector<std::string> answers = server_answers(dir, {{52.501, 13.401}}, root.path() + "/answers", log);
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "city", "Stadt Kreuzberg"));
+    std::printf("    %s\n", answers[0].c_str());
+}
+
+TEST(an_unnamed_label_member_links_its_boundary) {
+    // Kilmore (a parish, admin_level 10, 20) has an unnamed village node as its label member:
+    // find_linked_place links it all the same, and the parish ranks 16 as a village.
+    Fixture f;
+    f.country(49, -8, 59, 2, "United Kingdom", "GB");
+    f.boundary(50, -6, 56, 2, 4, "England");
+    f.boundary(53.0, -3.0, 53.4, -2.4, 6, "Cheshire East");
+    const int64_t village = f.node(53.20, -2.70, {{"place", "village"}});
+    f.boundary(53.15, -2.75, 53.25, -2.65, 10, "Kilmore", {}, {{OsmType::Node, village, "label"}});
+    const std::vector<std::string> answers = answers_of(f, "unnamed-label", {{53.201, -2.701}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "village", "Kilmore"));
+    std::printf("    %s\n", answers[0].c_str());
+}
+
+TEST(a_place_area_admin_minimal_keeps_by_the_label_of_its_new_link) {
+    // A place=suburb multipolygon of the wikidata of a town node inside it links the node
+    // (:323-337), which labels it town: admin-minimal, which keeps place areas down to rank 16
+    // by the type that labels them, keeps it.
+    Fixture f;
+    f.country(52, 4.5, 53, 5.5, "Netherlands", "NL");
+    f.boundary(52.1, 4.6, 52.9, 5.4, 4, "North Holland");
+    f.area(52.295, 5.0, 52.325, 5.06, {{"type", "multipolygon"}, {"place", "suburb"}, {"name", "Weesp"}, {"wikidata", "Q9"}});
+    f.node(52.31, 5.04, {{"place", "town"}, {"name", "Weesp"}, {"wikidata", "Q9"}});
+    const ScratchDir root("minimal-link-label");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    write_test_pbf(pbf, f.objects(), 1000);
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/out", pbf, "--multi-output", "--multi-quality"}, log));
+    const std::vector<char> bytes = file_bytes(root.path() + "/out/planet/admin-minimal/admin_polygons.bin");
+    size_t towns = 0;
+    for (size_t at = 0; at + sizeof(AdminPolygonRecord) <= bytes.size(); at += sizeof(AdminPolygonRecord)) {
+        AdminPolygonRecord r;
+        std::memcpy(&r, bytes.data() + at, sizeof r);
+        towns += r.name_id != NO_DATA && r.level_override == (15 << 4 | uint8_t(AdminPlaceType::TOWN));
+    }
+    CHECK_EQ(towns, size_t(1));
 }

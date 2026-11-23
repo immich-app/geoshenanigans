@@ -5,6 +5,8 @@
 // default ones. rank_address.h gives every polygon and place node its final
 // rank_address from these, and the dirs carry it; nothing else ranks.
 #include <cstdint>
+#include <cstring>
+#include <utility>
 
 #include "country_code.h"
 #include "types.h"
@@ -61,39 +63,137 @@ inline PlaceRanks admin_ranks(uint16_t cc, uint8_t admin_level) {
 
 inline uint8_t admin_rank_address(uint16_t cc, uint8_t admin_level) { return admin_ranks(cc, admin_level).address; }
 
-// The ranks of a place=* tag of AdminPlaceType `place_type` in the country
-// `cc`: address-levels.json's `place` entries, the country's first (ca, de,
-// es, id, ru, sa; civil_parish is no type of ours). state, province and
-// region are outside addresses by default.
-inline PlaceRanks place_ranks(uint16_t cc, uint8_t place_type) {
+// A place=* value, each of address-levels.json's `place` keys its own (and
+// Spain's civil_parish); OTHER for any other value, which the file's "" entry
+// ranks. It is what the builder holds of a place tag; AdminPlaceType, which
+// labels a polygon, holds 14 of them.
+enum class PlaceValue : uint8_t {
+    NONE = 0,  // no place tag
+    OTHER,
+    SEA, ISLAND, ISLET, CONTINENT, COUNTRY, STATE, PROVINCE, REGION, COUNTY, DISTRICT, MUNICIPALITY, CITY, TOWN,
+    BOROUGH, VILLAGE, SUBURB, HAMLET, CROFT, SUBDIVISION, ALLOTMENTS, NEIGHBOURHOOD, QUARTER, ISOLATED_DWELLING,
+    FARM, CITY_BLOCK, MOUNTAIN_PASS, SQUARE, LOCALITY, HOUSES, HOUSE, CIVIL_PARISH,
+};
+
+// The PlaceValue of a place tag's value; NONE for none or an empty one.
+inline PlaceValue place_value_of(const char* value) {
+    if (!value || !value[0]) return PlaceValue::NONE;
+    static constexpr std::pair<const char*, PlaceValue> kValues[] = {
+        {"sea", PlaceValue::SEA}, {"island", PlaceValue::ISLAND}, {"islet", PlaceValue::ISLET},
+        {"continent", PlaceValue::CONTINENT}, {"country", PlaceValue::COUNTRY}, {"state", PlaceValue::STATE},
+        {"province", PlaceValue::PROVINCE}, {"region", PlaceValue::REGION}, {"county", PlaceValue::COUNTY},
+        {"district", PlaceValue::DISTRICT}, {"municipality", PlaceValue::MUNICIPALITY}, {"city", PlaceValue::CITY},
+        {"town", PlaceValue::TOWN}, {"borough", PlaceValue::BOROUGH}, {"village", PlaceValue::VILLAGE},
+        {"suburb", PlaceValue::SUBURB}, {"hamlet", PlaceValue::HAMLET}, {"croft", PlaceValue::CROFT},
+        {"subdivision", PlaceValue::SUBDIVISION}, {"allotments", PlaceValue::ALLOTMENTS},
+        {"neighbourhood", PlaceValue::NEIGHBOURHOOD}, {"quarter", PlaceValue::QUARTER},
+        {"isolated_dwelling", PlaceValue::ISOLATED_DWELLING}, {"farm", PlaceValue::FARM},
+        {"city_block", PlaceValue::CITY_BLOCK}, {"mountain_pass", PlaceValue::MOUNTAIN_PASS},
+        {"square", PlaceValue::SQUARE}, {"locality", PlaceValue::LOCALITY}, {"houses", PlaceValue::HOUSES},
+        {"house", PlaceValue::HOUSE}, {"civil_parish", PlaceValue::CIVIL_PARISH},
+    };
+    for (const auto& [name, v] : kValues)
+        if (std::strcmp(value, name) == 0) return v;
+    return PlaceValue::OTHER;
+}
+
+// The ranks of a place tag of value `v` in the country `cc` (packed upper
+// case, 0 where unknown): address-levels.json's `place` entries, the
+// country's first (ca, de, es, id, ru, sa), then the defaults, a value of
+// none of them taking the "" entry's. No place tag ranks nothing.
+inline PlaceRanks place_value_ranks(uint16_t cc, PlaceValue v) {
     constexpr auto pack = pack_country_code;
     auto both = [](uint8_t rank) { return PlaceRanks{rank, rank}; };
-    switch (static_cast<AdminPlaceType>(place_type)) {
-        case AdminPlaceType::COUNTY:
-            if (cc == pack('C', 'A') || cc == pack('D', 'E')) return {12, 0};
-            return both(12);
-        case AdminPlaceType::REGION:
-            if (cc == pack('D', 'E')) return {10, 0};
-            return {18, 0};
-        case AdminPlaceType::PROVINCE:
+    switch (v) {
+        case PlaceValue::NONE: return {};
+        case PlaceValue::SEA: case PlaceValue::CONTINENT: return {2, 0};
+        case PlaceValue::ISLAND: return {17, 0};
+        case PlaceValue::ISLET: return {20, 0};
+        case PlaceValue::COUNTRY: return {4, 0};
+        case PlaceValue::STATE: return {8, 0};
+        case PlaceValue::PROVINCE:
             if (cc == pack('E', 'S')) return both(10);
             if (cc == pack('S', 'A')) return both(12);
             return {8, 0};
-        case AdminPlaceType::MUNICIPALITY:
+        case PlaceValue::REGION:
+            if (cc == pack('D', 'E')) return {10, 0};
+            return {18, 0};
+        case PlaceValue::COUNTY:
+            if (cc == pack('C', 'A') || cc == pack('D', 'E')) return {12, 0};
+            return both(12);
+        case PlaceValue::DISTRICT: return both(12);
+        case PlaceValue::MUNICIPALITY:
             if (cc == pack('I', 'D') || cc == pack('R', 'U') || cc == pack('S', 'A')) return both(18);
             return both(14);
-        case AdminPlaceType::STATE: return {8, 0};
-        case AdminPlaceType::DISTRICT: return both(12);
-        case AdminPlaceType::CITY: return both(16);
-        case AdminPlaceType::TOWN: return {18, 16};
-        case AdminPlaceType::BOROUGH: return both(18);
-        case AdminPlaceType::VILLAGE: return {19, 16};
-        case AdminPlaceType::SUBURB: return {19, 20};
-        case AdminPlaceType::HAMLET: return both(20);
-        case AdminPlaceType::QUARTER: return {20, 22};
-        case AdminPlaceType::NEIGHBOURHOOD: return both(24);
-        default: return {};
+        case PlaceValue::CITY: return both(16);
+        case PlaceValue::TOWN: return {18, 16};
+        case PlaceValue::BOROUGH: return both(18);
+        case PlaceValue::VILLAGE: return {19, 16};
+        case PlaceValue::SUBURB: return {19, 20};
+        case PlaceValue::HAMLET: case PlaceValue::CROFT: return both(20);
+        case PlaceValue::SUBDIVISION: case PlaceValue::ALLOTMENTS: return both(22);
+        case PlaceValue::NEIGHBOURHOOD: return both(24);
+        case PlaceValue::QUARTER: return {20, 22};
+        case PlaceValue::ISOLATED_DWELLING: case PlaceValue::FARM: return {22, 25};
+        case PlaceValue::CITY_BLOCK: case PlaceValue::MOUNTAIN_PASS: case PlaceValue::SQUARE:
+        case PlaceValue::LOCALITY: return both(25);
+        case PlaceValue::HOUSES: return {28, 0};
+        case PlaceValue::HOUSE: return both(30);
+        case PlaceValue::CIVIL_PARISH:
+            if (cc == pack('E', 'S')) return both(18);
+            return {22, 0};
+        case PlaceValue::OTHER: return {22, 0};
     }
+    return {};
+}
+
+// The type that labels a polygon of a place value (get_label_tag returns the
+// value itself), NONE where AdminPlaceType holds no such type; and back.
+inline AdminPlaceType place_label_of(PlaceValue v) {
+    switch (v) {
+        case PlaceValue::CITY: return AdminPlaceType::CITY;
+        case PlaceValue::TOWN: return AdminPlaceType::TOWN;
+        case PlaceValue::VILLAGE: return AdminPlaceType::VILLAGE;
+        case PlaceValue::SUBURB: return AdminPlaceType::SUBURB;
+        case PlaceValue::NEIGHBOURHOOD: return AdminPlaceType::NEIGHBOURHOOD;
+        case PlaceValue::QUARTER: return AdminPlaceType::QUARTER;
+        case PlaceValue::STATE: return AdminPlaceType::STATE;
+        case PlaceValue::PROVINCE: return AdminPlaceType::PROVINCE;
+        case PlaceValue::REGION: return AdminPlaceType::REGION;
+        case PlaceValue::COUNTY: return AdminPlaceType::COUNTY;
+        case PlaceValue::DISTRICT: return AdminPlaceType::DISTRICT;
+        case PlaceValue::BOROUGH: return AdminPlaceType::BOROUGH;
+        case PlaceValue::HAMLET: return AdminPlaceType::HAMLET;
+        case PlaceValue::MUNICIPALITY: return AdminPlaceType::MUNICIPALITY;
+        default: return AdminPlaceType::NONE;
+    }
+}
+
+inline PlaceValue place_value_of(AdminPlaceType t) {
+    switch (t) {
+        case AdminPlaceType::CITY: return PlaceValue::CITY;
+        case AdminPlaceType::TOWN: return PlaceValue::TOWN;
+        case AdminPlaceType::VILLAGE: return PlaceValue::VILLAGE;
+        case AdminPlaceType::SUBURB: return PlaceValue::SUBURB;
+        case AdminPlaceType::NEIGHBOURHOOD: return PlaceValue::NEIGHBOURHOOD;
+        case AdminPlaceType::QUARTER: return PlaceValue::QUARTER;
+        case AdminPlaceType::STATE: return PlaceValue::STATE;
+        case AdminPlaceType::PROVINCE: return PlaceValue::PROVINCE;
+        case AdminPlaceType::REGION: return PlaceValue::REGION;
+        case AdminPlaceType::COUNTY: return PlaceValue::COUNTY;
+        case AdminPlaceType::DISTRICT: return PlaceValue::DISTRICT;
+        case AdminPlaceType::BOROUGH: return PlaceValue::BOROUGH;
+        case AdminPlaceType::HAMLET: return PlaceValue::HAMLET;
+        case AdminPlaceType::MUNICIPALITY: return PlaceValue::MUNICIPALITY;
+        default: return PlaceValue::NONE;
+    }
+}
+
+// The ranks of a place=* tag of AdminPlaceType `place_type` in the country
+// `cc` (place_value_ranks). state, province and region are outside addresses
+// by default.
+inline PlaceRanks place_ranks(uint16_t cc, uint8_t place_type) {
+    return place_value_ranks(cc, place_value_of(static_cast<AdminPlaceType>(place_type)));
 }
 
 // rank_address of a place area by its place type, outside any country's own
@@ -136,19 +236,13 @@ inline bool is_address_place_type(AdminPlaceType place_type) {
 }
 
 // The ranks of an admin polygon in the country `cc` before any nested
-// promotion, which Nominatim's compute_place_rank gives it: its place type's
-// for a place area (admin_level 15), its admin level's for a boundary (a
-// boundary's own place tag doesn't rank it there).
-inline PlaceRanks polygon_ranks(uint16_t cc, uint8_t admin_level, uint8_t place_type) {
-    return admin_level == 15 ? place_ranks(cc, place_type) : admin_ranks(cc, admin_level);
-}
-
-// rank_address of an admin polygon in the country `cc` before any nested
-// promotion: its place type's for a place area (admin_level 15), its admin
-// level's for a boundary. A polygon of rank 0 is in no address and links no
-// place node (find_linked_place, placex_triggers.sql:285).
-inline uint8_t polygon_rank_address(uint16_t cc, uint8_t admin_level, uint8_t place_type) {
-    return polygon_ranks(cc, admin_level, place_type).address;
+// promotion, which Nominatim's compute_place_rank gives it: its own place
+// value's for a place area (admin_level 15), its admin level's for a
+// boundary (a boundary's own place tag doesn't rank it there). A polygon of
+// rank 0 is in no address and links no place node (find_linked_place,
+// placex_triggers.sql:285).
+inline PlaceRanks polygon_ranks(uint16_t cc, uint8_t admin_level, PlaceValue own) {
+    return admin_level == 15 ? place_value_ranks(cc, own) : admin_ranks(cc, admin_level);
 }
 
 // Admin-minimal carries addresses down to rank 16, the cities, towns and
