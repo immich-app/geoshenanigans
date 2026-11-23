@@ -124,3 +124,36 @@ fn a_table_no_builder_writes_is_refused_at_open_and_a_garbled_block_reads_withou
         let _ = t.for_rows(|_| {});
     }
 }
+
+#[test]
+fn a_name_its_block_does_not_end_and_a_block_past_its_rows_room_read_as_no_name() {
+    // Two rows of one block; the block's last name without its 0 byte.
+    let file = encode(&[row(US, "19026", "Drexel Hill"), row(US, "19073", "Wayne")]);
+    let table_at = file.len() - FOOTER_BYTES - ENTRY_BYTES;
+    assert_eq!(file[table_at - 1], 0);
+    let mut unended = file.clone();
+    unended[table_at - 1] = b'X';
+    let t = PostalCities::open(FileBytes::Owned(unended)).unwrap();
+    assert_eq!(t.name(*b"US", "19026"), Some("Drexel Hill"));
+    assert_eq!(t.name(*b"US", "19073"), None);
+    assert!(!t.for_rows(|_| {}));
+    // A block of more bytes than its rows can hold, its rows and names as
+    // they were: no row of it reads.
+    let file = encode(&[row(US, "19026", "Media")]);
+    let table_at = file.len() - FOOTER_BYTES - ENTRY_BYTES;
+    let mut long = file[..table_at].to_vec();
+    long.extend(std::iter::repeat(b'x').take(4000));
+    long.push(0);
+    long.extend_from_slice(&file[table_at..]);
+    let t = PostalCities::open(FileBytes::Owned(long)).unwrap();
+    assert_eq!(t.name(*b"US", "19026"), None);
+    assert!(!t.for_rows(|_| {}));
+    // As long as its rows can hold: it reads.
+    let mut most = file[..table_at].to_vec();
+    let room = 2 + CODE_BYTES + NAME_BYTES + 1;
+    most.extend(std::iter::repeat(b'x').take(room - table_at - 1));
+    most.push(0);
+    most.extend_from_slice(&file[table_at..]);
+    let t = PostalCities::open(FileBytes::Owned(most)).unwrap();
+    assert_eq!(t.name(*b"US", "19026"), Some("Media"));
+}

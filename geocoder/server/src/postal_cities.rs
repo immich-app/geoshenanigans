@@ -5,7 +5,9 @@
 //! country with a table of each block's country, rows and offset, and a footer.
 //!
 //! The reader checks the footer and the table at open, and reads a block without trusting it: a
-//! malformed block reads as no name or a wrong one, never a panic.
+//! malformed block reads as no name or a wrong one, never a panic, and a block of more bytes than
+//! its rows can hold, or a name its block does not end, reads as none, as the patch tools refuse
+//! them.
 
 use crate::FileBytes;
 
@@ -17,6 +19,12 @@ const FOOTER_BYTES: usize = 12;
 /// The longest code and the longest name.
 pub const CODE_BYTES: usize = 14;
 pub const NAME_BYTES: usize = 48;
+
+/// The most bytes a block of `rows` rows can have (postal_cities.h's max_block_bytes): a byte, a
+/// code and an index a row, and a name of NAME_BYTES and its 0 a row.
+const fn max_block_bytes(rows: usize) -> usize {
+    rows * (2 + CODE_BYTES + NAME_BYTES + 1)
+}
 
 /// A postcode's row as the patch tools diff it (postal_cities.h's LogicalRow): its country (two
 /// upper-case letters), its code and its name.
@@ -61,9 +69,13 @@ impl<'a> Block<'a> {
     }
 
     /// Row i's name: the block's names' entry of its index, None where the block has no such
-    /// name or it is no UTF-8.
+    /// name ended by its 0 byte, or it is no UTF-8.
     fn name(&self, i: usize) -> Option<&'a str> {
-        let name = self.names.split(|&b| b == 0).nth(self.names_of[i] as usize)?;
+        let mut rest = self.names;
+        for _ in 0..self.names_of[i] {
+            rest = &rest[rest.iter().position(|&b| b == 0)? + 1..];
+        }
+        let name = &rest[..rest.iter().position(|&b| b == 0)?];
         if name.is_empty() || name.len() > NAME_BYTES {
             return None;
         }
@@ -119,10 +131,10 @@ impl PostalCities {
         Some((u16_at(f, at), f[at + 2] as usize, f.get(start..end.min(self.table_at))?))
     }
 
-    /// Block b's rows; None where it reads as malformed.
+    /// Block b's rows; None where it reads as malformed, or has more bytes than its rows can.
     fn block(&self, b: u32) -> Option<Block<'_>> {
         let (country, rows, bytes) = self.entry(b)?;
-        if rows == 0 || rows > BLOCK_ROWS {
+        if rows == 0 || rows > BLOCK_ROWS || bytes.len() > max_block_bytes(rows) {
             return None;
         }
         let mut block = Block { country, codes: [([0; CODE_BYTES], 0); BLOCK_ROWS], names_of: [0; BLOCK_ROWS], rows, names: &[] };
