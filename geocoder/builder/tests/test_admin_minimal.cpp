@@ -29,14 +29,34 @@ TEST(admin_minimal_keeps_place_areas_down_to_rank_16) {
     CHECK(!admin_minimal_keeps(15, pt(AdminPlaceType::NONE)));
 }
 
-TEST(place_areas_of_rank_0_are_no_address_areas) {
+TEST(place_areas_of_rank_0_everywhere_are_no_address_areas) {
     CHECK(is_address_place_type(AdminPlaceType::CITY));
     CHECK(is_address_place_type(AdminPlaceType::COUNTY));
     CHECK(is_address_place_type(AdminPlaceType::NEIGHBOURHOOD));
     CHECK(!is_address_place_type(AdminPlaceType::STATE));
-    CHECK(!is_address_place_type(AdminPlaceType::PROVINCE));
     CHECK(!is_address_place_type(AdminPlaceType::REGION));  // e.g. Mashriq
     CHECK(!is_address_place_type(AdminPlaceType::NONE));
+    // place=province ranks 10 in Spain and 12 in Saudi Arabia.
+    CHECK(is_address_place_type(AdminPlaceType::PROVINCE));
+}
+
+TEST(place_area_ranks_follow_the_country_levels) {
+    const uint16_t ca = pack_country_code('C', 'A'), de = pack_country_code('D', 'E'), es = pack_country_code('E', 'S');
+    const uint16_t sa = pack_country_code('S', 'A'), ru = pack_country_code('R', 'U'), gb = pack_country_code('G', 'B');
+    CHECK_EQ(place_area_rank_address(ca, pt(AdminPlaceType::COUNTY)), uint8_t(0));
+    CHECK_EQ(place_area_rank_address(de, pt(AdminPlaceType::COUNTY)), uint8_t(0));
+    CHECK_EQ(place_area_rank_address(de, pt(AdminPlaceType::REGION)), uint8_t(0));
+    CHECK_EQ(place_area_rank_address(es, pt(AdminPlaceType::PROVINCE)), uint8_t(10));
+    CHECK_EQ(place_area_rank_address(sa, pt(AdminPlaceType::PROVINCE)), uint8_t(12));
+    CHECK_EQ(place_area_rank_address(sa, pt(AdminPlaceType::MUNICIPALITY)), uint8_t(18));
+    CHECK_EQ(place_area_rank_address(ru, pt(AdminPlaceType::MUNICIPALITY)), uint8_t(18));
+    CHECK_EQ(place_area_rank_address(gb, pt(AdminPlaceType::COUNTY)), uint8_t(12));
+    CHECK_EQ(place_area_rank_address(gb, pt(AdminPlaceType::PROVINCE)), uint8_t(0));
+    CHECK_EQ(place_area_rank_address(0, pt(AdminPlaceType::CITY)), uint8_t(16));
+    // A boundary's is its level's.
+    CHECK_EQ(polygon_rank_address(pack_country_code('A', 'U'), 6, pt(AdminPlaceType::MUNICIPALITY)), uint8_t(0));
+    CHECK_EQ(polygon_rank_address(gb, 6, 0), uint8_t(12));
+    CHECK_EQ(polygon_rank_address(ca, 15, pt(AdminPlaceType::COUNTY)), uint8_t(0));
 }
 
 TEST(place_area_ranks_follow_address_levels) {

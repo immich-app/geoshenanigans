@@ -121,6 +121,26 @@ TEST(place_claims_several_claimants_resolve_as_nominatim_links_them) {
     }
 }
 
+TEST(place_claims_a_claimant_that_links_nothing_claims_nothing) {
+    // A boundary of rank 0 in its country links no place node (find_linked_place): its claims are
+    // none. Node 1 is the label of relation 400 (L6, of rank 0 here) alone and stays a place;
+    // node 2 is relation 400's label and relation 200's (L4), which takes it, though a label
+    // claim of a higher level wins.
+    Boundaries b;
+    std::vector<PlaceNode> nodes{place(10, NO_DATA), place(11, NO_DATA)};
+    const std::vector<uint64_t> ids{node_id(1), node_id(2)};
+    const std::vector<PlaceClaim> claims{{node_id(1), relation_boundary_id(400), true},
+                                         {node_id(2), relation_boundary_id(400), true},
+                                         {node_id(2), relation_boundary_id(200), true}};
+    const auto links = [&](uint32_t p) { return b.polygons[p].admin_level != 6; };
+    CHECK_EQ(hide_claimed_place_nodes(nodes, ids, claims, b.polygons, b.ids, 0, links), 1u);
+    CHECK(!place_node_hidden(nodes[0]));
+    CHECK_EQ(nodes[0]._pad1, 0);
+    CHECK_EQ(nodes[0].parent_poly_id, NO_DATA);
+    CHECK(place_node_hidden(nodes[1]));
+    CHECK_EQ(nodes[1].parent_poly_id, 2u);  // relation 200
+}
+
 TEST(place_claims_name_links_keep_the_name_and_pick_the_lowest_level) {
     Boundaries b;
     std::vector<PlaceNode> nodes{place(10, 2), place(11, 2), place(12, 2)};

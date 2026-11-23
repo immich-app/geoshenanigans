@@ -101,12 +101,19 @@ inline void flag_claimed_place_node(PlaceNode& pn, uint32_t polygon) {
     pn.parent_poly_id = polygon;
 }
 
+// Every claimant's polygon links (hide_claimed_place_nodes).
+inline bool every_polygon_links(uint32_t) { return true; }
+
 // Flags the place nodes (node_ids parallel to nodes) the label and wikidata
 // claims hit, each naming the polygon of the claimant claim_wins picks among
-// those with a polygon. Returns how many nodes it hid.
+// those with a polygon. A claim of a claimant whose polygon p does not link,
+// `links(p)` false (one of rank 0 in its country), is no claim. Returns how
+// many nodes it hid.
+template <class Links = bool (*)(uint32_t)>
 inline size_t hide_claimed_place_nodes(std::vector<PlaceNode>& nodes, const std::vector<uint64_t>& node_ids,
                                        std::vector<PlaceClaim> claims, const std::vector<AdminPolygon>& polygons,
-                                       const std::vector<uint64_t>& polygon_ids, unsigned threads = 0) {
+                                       const std::vector<uint64_t>& polygon_ids, unsigned threads = 0,
+                                       Links links = every_polygon_links) {
     if (claims.empty()) return 0;
     const auto boundaries = boundary_polygons(polygons, polygon_ids);
     std::sort(claims.begin(), claims.end(), [](const PlaceClaim& a, const PlaceClaim& b) { return a.node < b.node; });
@@ -119,8 +126,11 @@ inline size_t hide_claimed_place_nodes(std::vector<PlaceNode>& nodes, const std:
             if (it == claims.end() || it->node != node_ids[i]) continue;
             uint32_t best = NO_DATA;
             ClaimRank best_rank{};
+            bool claimed = false;
             for (; it != claims.end() && it->node == node_ids[i]; ++it) {
                 const uint32_t p = boundary_polygon(boundaries, it->boundary);
+                if (p != NO_DATA && !links(p)) continue;
+                claimed = true;
                 if (p == NO_DATA) continue;
                 const ClaimRank rank{it->label, polygons[p].admin_level, it->boundary};
                 if (best == NO_DATA || claim_wins(rank, best_rank)) {
@@ -128,6 +138,7 @@ inline size_t hide_claimed_place_nodes(std::vector<PlaceNode>& nodes, const std:
                     best_rank = rank;
                 }
             }
+            if (!claimed) continue;
             flag_claimed_place_node(nodes[i], best);
             n++;
         }

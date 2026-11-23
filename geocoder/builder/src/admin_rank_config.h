@@ -76,12 +76,46 @@ inline uint8_t place_area_rank_address(uint8_t place_type) {
     }
 }
 
-// Whether a place area of this type is part of addresses at all: Nominatim
-// makes an address area only of a place with rank_address > 0 (placex_update,
-// placex_triggers.sql:1254) and links no place node to one of rank 0
-// (find_linked_place, :285). place=state, province and region rank 0.
+// rank_address of a place area by its place type in the country `cc`
+// (packed upper case, 0 where unknown): the country's own "place" ranks of
+// address-levels.json (ca, de, es, id, ru, sa; civil_parish is no type of
+// ours), then the default ones. Mirrors the server's place_type_to_rank.
+inline uint8_t place_area_rank_address(uint16_t cc, uint8_t place_type) {
+    constexpr auto pack = pack_country_code;
+    switch (static_cast<AdminPlaceType>(place_type)) {
+        case AdminPlaceType::COUNTY:
+            if (cc == pack('C', 'A') || cc == pack('D', 'E')) return 0;
+            break;
+        case AdminPlaceType::REGION:
+            if (cc == pack('D', 'E')) return 0;
+            break;
+        case AdminPlaceType::PROVINCE:
+            if (cc == pack('E', 'S')) return 10;
+            if (cc == pack('S', 'A')) return 12;
+            break;
+        case AdminPlaceType::MUNICIPALITY:
+            if (cc == pack('I', 'D') || cc == pack('R', 'U') || cc == pack('S', 'A')) return 18;
+            break;
+        default: break;
+    }
+    return place_area_rank_address(place_type);
+}
+
+// Whether a place area of this type is part of addresses in some country:
+// Nominatim makes an address area only of a place with rank_address > 0
+// (placex_update, placex_triggers.sql:1254) and links no place node to one
+// of rank 0 (find_linked_place, :285). place=state and region rank 0
+// everywhere, place=province only outside Spain and Saudi Arabia.
 inline bool is_address_place_type(AdminPlaceType place_type) {
-    return place_area_rank_address(static_cast<uint8_t>(place_type)) > 0;
+    return place_area_rank_address(static_cast<uint8_t>(place_type)) > 0 || place_type == AdminPlaceType::PROVINCE;
+}
+
+// rank_address of an admin polygon in the country `cc` before any nested
+// promotion: its place type's for a place area (admin_level 15), its admin
+// level's for a boundary. A polygon of rank 0 is in no address and links no
+// place node (find_linked_place, placex_triggers.sql:285).
+inline uint8_t polygon_rank_address(uint16_t cc, uint8_t admin_level, uint8_t place_type) {
+    return admin_level == 15 ? place_area_rank_address(cc, place_type) : admin_rank_address(cc, admin_level);
 }
 
 // Admin-minimal carries addresses down to rank 16, the cities, towns and
