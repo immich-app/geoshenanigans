@@ -3024,11 +3024,11 @@ impl Index {
             // the most expand_by_meters' box reaches, but for a box across the antimeridian (read
             // below).
             let reach_m = country_code.map_or(MAX_POSTCODE_EXTENT_M, |cc| postcode_extent_m(cc, "")) * geography_box::BOX_REACH_FACTOR;
-            let max_dist_sq = {
+            let (max_dist_sq, dlng) = {
                 let dlat = reach_m / METRES_PER_DEGREE;
                 let metres_per_lng = METRES_PER_DEGREE * (lat.abs() + dlat).min(90.0).to_radians().cos();
                 let dlng = if metres_per_lng > reach_m / 360.0 { reach_m / metres_per_lng } else { 360.0 };
-                postcode_files::distance(0.0, 0.0, dlat, dlng) * (1.0 + 1e-9)
+                (postcode_files::distance(0.0, 0.0, dlat, dlng) * (1.0 + 1e-9), dlng)
             };
             let mut best: Option<(f64, Cow<'a, str>)> = None;
             let consider = |pc: postcode_files::Centroid, best: &mut Option<(f64, Cow<'a, str>)>| {
@@ -3069,9 +3069,12 @@ impl Index {
             read(&cells_near_point(lat, lng, reach_m, self.admin_cell_level), max_dist_sq, &mut best);
             // A box across the antimeridian spans every longitude between its corners the long
             // way round (expand_by_meters), so a centroid within reach of the antimeridian at
-            // the point's latitude can hold the point however far off it lies. Those are read
-            // where no centroid within reach holds it: any that does is nearer.
-            if best.is_none() {
+            // the point's latitude can hold the point however far off it lies, past the cells
+            // within reach. Those are read, at any distance, unless no centroid of the
+            // antimeridian's cells can be as near as the best so far: none lies closer to the
+            // point's longitude than `dlng` short of the antimeridian.
+            let gap = (180.0 - dlng - lng.abs()).max(0.0);
+            if best.as_ref().is_none_or(|&(best_d, _)| postcode_files::distance(0.0, 0.0, 0.0, gap) <= best_d) {
                 let cells: Vec<u64> = [180.0, -180.0].into_iter()
                     .flat_map(|edge| cells_near_point(lat, edge, reach_m, self.admin_cell_level))
                     .collect();
@@ -4644,6 +4647,17 @@ mod query_tests {
         let idx = centroids_at(&centroids[..1]);
         assert_eq!(idx.resolve_postcode(10.0, 0.0, None, None, None, None, None, Some(*b"us")).as_deref(), Some("96799"));
         assert_eq!(idx.resolve_postcode(10.0, 0.0, None, None, None, None, None, None).as_deref(), Some("96799"));
+
+        // One can be nearer than a centroid within reach that holds the point: at (0, 179.69),
+        // 96801's box 0.22° south-west holds it and 96802's across the antimeridian, 0.30° east,
+        // whose cell is past the cells within reach.
+        let centroids = [(0.22, 179.47, "96801", *b"us"), (0.0, 179.99, "96802", *b"us")];
+        let reach = MAX_POSTCODE_EXTENT_M * geography_box::BOX_REACH_FACTOR;
+        let wrapping = cell_id_at_level(centroids[1].0 as f64, centroids[1].1 as f64, DEFAULT_ADMIN_CELL_LEVEL);
+        assert!(!cells_near_point(0.0, 179.69, reach, DEFAULT_ADMIN_CELL_LEVEL).contains(&wrapping));
+        assert_eq!(nearest_centroid(&centroids[..1], 0.0, 179.69, Some(*b"us")), Some("96801"));
+        assert_eq!(nearest_centroid(&centroids, 0.0, 179.69, Some(*b"us")), Some("96802"));
+        assert_eq!(centroids_at(&centroids).resolve_postcode(0.0, 179.69, None, None, None, None, None, Some(*b"us")).as_deref(), Some("96802"));
     }
 
     #[test]
