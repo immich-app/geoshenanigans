@@ -10,7 +10,9 @@ import os
 import struct
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -90,6 +92,18 @@ def feature(props, rings):
 
 def square(x0, y0, x1, y1):
     return [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]
+
+
+def split_holed_parts_last(item):
+    """marine_import's split of a sea area part into tiles, a part with a hole held back long enough that the
+    workers finish the others first."""
+    import shapely
+    if shapely.get_num_interior_rings(shapely.from_wkb(item[1])):
+        time.sleep(0.5)
+    return SPLIT_INTO_TILES(item)
+
+
+SPLIT_INTO_TILES = marine_import._split_into_tiles
 
 
 def geometry(polygons):
@@ -200,6 +214,22 @@ class BuildTest(unittest.TestCase):
     def test_the_file_is_the_same_on_one_worker_and_many(self):
         one, _ = self.build("one.bin", workers=1)
         many, _ = self.build("many.bin", workers=3)
+        with open(one, "rb") as a, open(many, "rb") as b:
+            self.assertEqual(a.read(), b.read())
+
+    def test_each_tiles_pieces_keep_the_parts_order_whatever_order_the_workers_finish_in(self):
+        import shapely
+
+        def pieces():
+            return [(key, mrgid, [shapely.to_wkb(g) for g in geoms])
+                    for key, by_mrgid in marine_import._SEA_TILES.items() for mrgid, geoms in by_mrgid.items()]
+
+        one, _ = self.build("one.bin", workers=1)
+        in_order = pieces()
+        # The west sea's holed part, the costliest, goes first and finishes last.
+        with mock.patch.object(marine_import, "_split_into_tiles", split_holed_parts_last):
+            many, _ = self.build("many.bin", workers=3)
+        self.assertEqual(pieces(), in_order)
         with open(one, "rb") as a, open(many, "rb") as b:
             self.assertEqual(a.read(), b.read())
 

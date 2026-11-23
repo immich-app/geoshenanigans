@@ -423,9 +423,10 @@ def build(opts):
         names, parts = _read_seas(opts.eez_iho, pool)
         log(f"{len(names)} sea areas in {len(parts)} parts")
         # Every part, --bbox or not: a tile's water goes by the sea areas in the tiles around it, across the
-        # antimeridian too. The costliest first, so the last one doesn't run alone.
+        # antimeridian too. The costliest first, so the last one doesn't run alone; their pieces taken in that
+        # order, whichever worker finishes first, as a tile's overlays and so the file go by their order.
         order = sorted(parts, key=lambda p: -len(p[1]))
-        for pieces in pool.imap_unordered(_split_into_tiles, order):
+        for pieces in pool.imap(_split_into_tiles, order):
             for key, mrgid, wkb in pieces:
                 tiles.setdefault(key, {}).setdefault(mrgid, []).append(wkb)
     _SEA_TILES = {k: {m: list(shapely.from_wkb(w)) for m, w in v.items()} for k, v in tiles.items()}
