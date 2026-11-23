@@ -436,6 +436,12 @@ TEST(the_major_tier_takes_areas_of_100_km2_and_wikidata_rivers_of_5) {
     for (size_t p = 0; p < layer.size(); p++)
         if (layer.major[p]) major.insert(name_of(layer, p));
     CHECK(major == std::set<std::string>({"Big Lake", "Wide River"}));
+    // The major dir holds them and no other.
+    const ScratchDir dir("water-major");
+    write(layer, dir.path());
+    std::vector<std::string> slots = slot_names(tree(dir.path()), "water/major/simplified");
+    std::sort(slots.begin(), slots.end());
+    CHECK(slots == std::vector<std::string>({"Big Lake", "Wide River"}));
     // The big lake holds whole cells: interior entries.
     size_t interior = 0;
     for (const CellItemPair& cell : layer.cells)
@@ -919,6 +925,26 @@ TEST(namesakes_apart_are_rivers_of_their_own_and_a_line_lends_its_wikidata_item_
     const auto [held, major] = ways_held(layer, {2101, 2102, 2103, 2104});
     CHECK(held == std::set<int64_t>({2101, 2102, 2103, 2104}));
     CHECK(major == std::set<int64_t>({2103}));
+}
+
+TEST(namesakes_that_share_a_shore_are_one_river) {
+    Collected c = fixture();
+    // Two unnamed river areas of about 61 km2, one north of the other along
+    // a shared side, each with a line of a local name alone, Mill Creek, in
+    // it and no wikidata item: one river of about 123 km2.
+    const int32_t lat = kLat - 3000000, side = 850000;
+    for (const auto& [way, south] : std::vector<std::pair<int64_t, int32_t>>{{2111, lat}, {2112, lat + side}}) {
+        c.closed_ways.push_back({way, tags(code::kRiver, "", true), square(south, kLng, side)});
+        LineIn line;
+        line.way = way + 1000;
+        line.key = "nMill Creek";
+        line.local = line.display = "Mill Creek";
+        line.vertices = {pt(south + side / 2, kLng + side / 10), pt(south + side / 2, kLng + side * 9 / 10)};
+        c.lines.push_back(line);
+    }
+    const auto [held, major] = ways_held(build(c), {2111, 2112});
+    CHECK(held == std::set<int64_t>({2111, 2112}));
+    CHECK(major == std::set<int64_t>({2111, 2112}));
 }
 
 TEST(a_named_river_area_takes_only_its_own_rivers_identity_from_the_line_of_most_length_in_it) {
