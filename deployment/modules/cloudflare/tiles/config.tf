@@ -10,7 +10,8 @@ terraform {
       version = "4.52.10"
     }
     tigris = {
-      source = "tigrisdata/tigris"
+      source  = "tigrisdata/tigris"
+      version = "1.1.4"
     }
     random = {
       source  = "hashicorp/random"
