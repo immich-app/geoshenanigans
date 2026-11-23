@@ -2045,6 +2045,29 @@ test('an empty answer at sea shows no address, and falls back to what Immich sto
   assert.ok(!detailHtml([{ ...views[0], answer: { loading: true } }], ID, NAMES).includes('Full address'));
 });
 
+test('the water the location line names is the landmark in Immich, and at sea stands with what Immich stores', () => {
+  const lake = { name: 'Lake Geneva', class: 'water', type: 'lake', landmark: true };
+  const lausanne = { display_name: 'x', address: { city: 'Lausanne', state: 'Vaud', country: 'Switzerland', country_code: 'ch' } };
+  const shown = (data, others = []) => shownRows([data, ...others])['In Immich'];
+  assert.equal(shown({ ...lausanne, water: lake }).values[0], 'Lake Geneva, Lausanne, Vaud, Switzerland');
+  // Water the line doesn't name changes nothing.
+  const { landmark: _, ...unnamed } = lake;
+  assert.equal(shown({ ...lausanne, water: unnamed }).values[0], 'Lausanne, Vaud, Switzerland');
+  // It takes the place of the address's landmark.
+  const seine = { display_name: 'x', water: { name: 'La Seine', class: 'waterway', type: 'river', landmark: true },
+    address: { landmark: 'Banks of the Seine', city: 'Paris', state: 'Ile-de-France', country: 'France', country_code: 'fr' } };
+  assert.equal(shown(seine).values[0], 'La Seine, Paris, Ile-de-France, France');
+  assert.equal(shown({ ...seine, water: { ...seine.water, landmark: undefined } }).values[0], 'Banks of the Seine, Paris, Ile-de-France, France');
+  // At sea: the water alone, or before what Immich's own lookup stores.
+  const sea = { address: {}, water: { name: 'North Sea', class: 'place', type: 'sea', landmark: true } };
+  assert.deepEqual(plain(shown(sea)), { field: 'In Immich', values: ['North Sea'], differs: false, missing: false, fallback: [true] });
+  const shelf = { address: {}, water: { name: 'Filchner-Ronne Ice Shelf', class: 'natural', type: 'glacier', landmark: true } };
+  const ne = immichData('natural_earth', { city: null, state: null, country: 'Antarctica' });
+  assert.deepEqual(plain(shown(shelf, [ne]).values), ['Filchner-Ronne Ice Shelf, Antarctica', 'Antarctica']);
+  // Water at sea the line doesn't name: what Immich's lookup stores, as before.
+  assert.deepEqual(plain(shown({ ...shelf, water: { ...shelf.water, landmark: undefined } }, [ne]).values), ['Antarctica', 'Antarctica']);
+});
+
 test("the page names our answers' countries by the Immich column's names, none without it", () => {
   const { immichCountryNames } = core();
   assert.deepEqual(plain(immichCountryNames(withImmich())), NAMES);

@@ -1036,7 +1036,11 @@ function immichJoined({ city = null, state = null, country = null }) {
 // answer's own country where they have none, as the branch falls back.
 // None where there is no country: the integration then stores what
 // Immich's own lookup does (server/src/services/metadata.service.ts:
-// 264-266, the Immich column's).
+// 264-266, the Immich column's). With the water landmark
+// (water/in-address/recommendation.md §3.3): where the answer's water says
+// the location line names it (`water.landmark`), its name is the landmark
+// in place of the address's; and at sea, with no country, the integration
+// stores that landmark alone, Immich's own lookup filling in the rest.
 const DEPENDENT_TERRITORIES = {
   AI: { sovereign: 'GB', names: ['Anguilla'] },
   AS: { sovereign: 'US', names: ['American Samoa'] },
@@ -1152,18 +1156,19 @@ function immichCountryCode({ country_code, state, region, province }) {
   return countryCode;
 }
 
-function mapGeocoderAddress(address, countryNames = {}) {
+function mapGeocoderAddress(address, countryNames = {}, water = null) {
   const countryCode = immichCountryCode(address);
   const named = countryCode && Object.hasOwn(countryNames, countryCode) ? countryNames[countryCode] : null;
   const country = named || address.country || null;
+  const waterName = water && water.landmark && water.name ? water.name : null;
   if (!country) {
-    return null;
+    return waterName ? { country: null, state: null, city: null, landmark: waterName } : null;
   }
   return {
     country,
     state: address.state ?? address.province ?? address.region ?? address.county ?? address.municipality ?? address.city ?? null,
     city: address.city ?? address.town ?? address.village ?? address.hamlet ?? address.municipality ?? null,
-    landmark: address.landmark ?? null,
+    landmark: waterName ?? address.landmark ?? null,
   };
 }
 
@@ -1182,9 +1187,11 @@ function immichCountryNames(catalog) {
 // the Immich column's from what it stores, another's from what our
 // integration would store from the answer (mapGeocoderAddress), or, where
 // that is none, what Immich's own lookup stores, which the integration
-// falls back to: the Immich column's where it answered. Rows as fieldRows
-// gives them, "In Immich" with `fallback`, by column, true where it fell
-// back.
+// falls back to: the Immich column's where it answered; at sea, the water
+// the line names (water.landmark) before what that lookup stores, or alone,
+// as the integration's detail panel shows a landmark without a country.
+// Rows as fieldRows gives them, "In Immich" with `fallback`, by column,
+// true where it fell back.
 function displayRows(datas, countryNames = {}) {
   const immich = datas.find((d) => d && d.immich);
   const fallback = datas.map(() => false);
@@ -1192,10 +1199,12 @@ function displayRows(datas, countryNames = {}) {
   const shown = datas.map((d, i) => {
     if (!d) return '';
     if (d.immich) return immichShown(d.immich.stored || {});
-    const stored = mapGeocoderAddress(d.address || {}, countryNames);
-    if (stored) return immichShown(stored);
+    const stored = mapGeocoderAddress(d.address || {}, countryNames, d.water);
+    if (stored && stored.country) return immichShown(stored);
     fallback[i] = true;
-    return immich ? immichShown(immich.immich.stored || {}) : '';
+    const own = immich ? immich.immich.stored || {} : {};
+    if (stored) return [stored.landmark, own.city, own.state, own.country].filter(Boolean).join(', ');
+    return immich ? immichShown(own) : '';
   });
   return [compared('Full address', full, datas), { ...compared('In Immich', shown, datas), fallback }];
 }
@@ -1815,7 +1824,8 @@ function controlKey(data) {
 const SHOWN_TITLES = {
   'Full address': "The answer's display_name: Nominatim's concatenation of its address. The Immich column's: what it stores, joined as Immich joins it",
   'In Immich': "What Immich's asset viewer would show of a photo here: the landmark, city, state and country our Immich integration stores"
-    + " from the answer (the Immich column's: what Immich stores today), only with a country",
+    + " from the answer (the Immich column's: what Immich stores today), only with a country; the landmark is the water's name where"
+    + " the answer's water.landmark says the line names it, which at sea shows with no country",
 };
 
 // What the field table's water row is, as its name's title says it.
