@@ -1,6 +1,6 @@
 # Build the test portal's server, query-portal (includes the test page's
 # HTML), which fetches and decodes the build itself
-FROM rust:bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS builder
+FROM rust:trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
@@ -22,7 +22,7 @@ FROM ghcr.io/immich-app/immich-server:release AS immich
 RUN printf 'version=%s\ncommit=%s\n' "$IMMICH_SOURCE_REF" "$IMMICH_SOURCE_COMMIT" > /immich-release.txt
 
 # Runtime
-FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

@@ -703,12 +703,14 @@ impl Portal {
     }
 
     /// The bytes at `url`, tried again after each of the retry delays while
-    /// it fails.
+    /// it fails; a client that can't be built (http) fails it at once,
+    /// for the next round to try again.
     async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
+        let http = self.http().await.map_err(|e| e.to_string())?;
         let mut delays = self.config.retry_delays.iter();
         loop {
             let got = async {
-                let resp = downloader::get(&self.http, url).await?;
+                let resp = downloader::get(http, url).await?;
                 resp.bytes().await.map_err(|e| DownloadError::Http(format!("{url}: read body: {e}")))
             }
             .await;
@@ -1020,9 +1022,10 @@ impl Portal {
     /// (DownloadError::Leftover) is the last: each try writes a file of its
     /// own, and the room was weighed for one.
     async fn fetch_attempts(&self, root: &Path, cfg: &Configurations, date: &str, object: &catalog::Object) -> Result<(), DownloadError> {
+        let http = self.http().await?;
         let mut delays = self.config.retry_delays.iter();
         loop {
-            let got = try_object(&self.http, &self.config.base_url, date, cfg, object, root).await;
+            let got = try_object(http, &self.config.base_url, date, cfg, object, root).await;
             match (got, delays.next()) {
                 (Ok(()), _) => return Ok(()),
                 (Err(e @ DownloadError::Leftover(_)), _) => return Err(e),
