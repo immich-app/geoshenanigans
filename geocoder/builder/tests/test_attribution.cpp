@@ -2,6 +2,7 @@
 // template's entries for the sources its data came from.
 #include "attribution.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -146,17 +147,27 @@ std::string canonical_value(const std::string& s, size_t& i, const std::string& 
         expect('"');
         std::string raw;
         while (i < s.size() && s[i] != '"') {
+            if (static_cast<unsigned char>(s[i]) < 0x20)
+                throw std::runtime_error("a control character unescaped at " + std::to_string(i));
             if (s[i] != '\\') {
                 raw += s[i++];
                 continue;
             }
-            const char e = s.at(i + 1);
+            if (i + 1 >= s.size()) throw std::runtime_error("an escape at the end");
+            const char e = s[i + 1];
             i += 2;
             if (e == 'u') {
+                const bool hex = i + 4 <= s.size() &&
+                    std::all_of(s.begin() + i, s.begin() + i + 4, [](char c) { return std::isxdigit(static_cast<unsigned char>(c)); });
+                if (!hex) throw std::runtime_error("\\u without four hex digits at " + std::to_string(i));
                 raw += utf8(static_cast<uint32_t>(std::stoul(s.substr(i, 4), nullptr, 16)));
                 i += 4;
+            } else if (e == '"' || e == '\\' || e == '/') {
+                raw += e;
+            } else if (e == 'n' || e == 't' || e == 'r' || e == 'b' || e == 'f') {
+                raw += e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e == 'b' ? '\b' : '\f';
             } else {
-                raw += e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e == 'b' ? '\b' : e == 'f' ? '\f' : e;
+                throw std::runtime_error(std::string("no JSON escape \\") + e + " at " + std::to_string(i - 2));
             }
         }
         expect('"');
@@ -223,6 +234,10 @@ TEST(attribution_canonical_form_drops_only_the_members_named) {
 
 TEST(attribution_canonical_document_is_one_value_and_space) {
     CHECK_EQ(canonical_document(" [1, {\"a\": 2}]\n"), std::string(R"([1,{"a":2}])"));
+    // JSON's escapes, every one of them, and nothing else: a string holds no
+    // raw control character, and \u four hex digits.
+    CHECK_EQ(canonical_document(R"(["\" \\ \/ \b \f \n \r \t \u00A9"])"),
+             std::string(R"(["\" \\ / \u0008 \u000c \u000a \u000d \u0009 ©"])"));
     for (const char* bad : {"[1] [2]", "[1],", "[1]x", "[1]\n]", "[1", R"(["\G"])", R"(["\x41"])", R"(["\u12G4"])",
                             R"(["\u12"])", "[\"a\nb\"]", "[\"a\tb\"]", R"(["a\)"}) {
         bool threw = false;
