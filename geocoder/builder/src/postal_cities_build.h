@@ -7,9 +7,10 @@
 // A vote is an address point of the grid's (postcode_grid_build.h: in a grid
 // country, of a postcode its pattern takes) that carries addr:city. Its value
 // is cleaned (clean_value) and grouped by a lenient key (lenient_key), under
-// which Roy City is Roy and Barre Town is Barre. Values that name no postal
-// place (a digit, a state's name, two letters, a Township, Twp, County or
-// Borough last word) don't vote unless GeoNames' name of the ZIP is theirs.
+// which Roy City is Roy, Barre Town is Barre and Mayagüez is Mayaguez.
+// Values that name no postal place (a digit, a state's name, one or two
+// letters, a Township, Twp, County or Borough last word) don't vote unless
+// GeoNames' name of the ZIP is theirs.
 //
 // The choice (choose): a ZIP of 5 votes or more takes the key of the most
 // votes, GeoNames' key counting max(2, 10% of the votes) more, and
@@ -22,10 +23,12 @@
 // name of such a ZIP instead.
 //
 // The name is the winning key's spelling most of the ZIP's votes use
-// (pick_spelling): a mixed-case one over one all in capitals, yesterday's where it is
-// within the same margin of the top, and, for GeoNames' key, none ending in
-// a municipal word GeoNames' name lacks. A key the ZIP spells nowhere takes
-// the spelling most votes of its GeoNames state use, else GeoNames' text.
+// (pick_spelling): a mixed-case one over one all in capitals, and that over
+// one all in lower case, yesterday's where it is within the same margin of
+// the top, and, for GeoNames' key, none ending in a municipal word GeoNames'
+// name lacks. A key the ZIP spells nowhere, or in one case only, takes the
+// spelling most votes of its GeoNames state use, else GeoNames' text, where
+// that is cased better.
 #pragma once
 
 #include <algorithm>
@@ -113,12 +116,20 @@ inline constexpr std::pair<std::string_view, std::string_view> WORD_FORMS[] = {
 inline constexpr std::pair<std::string_view, std::string_view> FIRST_WORD_FORMS[] = {
     {"N", "NORTH"}, {"S", "SOUTH"}, {"E", "EAST"}, {"W", "WEST"}};
 
+// The ASCII letters an upper-case Latin-1 letter (U+00C0 to U+00DE, but
+// U+00D7), U+00DF or U+00FF is without its accent, by its second byte of
+// UTF-8 from 0x80; "" for one of none.
+inline constexpr std::string_view UNACCENTED[] = {
+    "A", "A", "A", "A", "A", "A", "AE", "C", "E", "E", "E", "E", "I", "I", "I", "I",
+    "D", "N", "O", "O", "O", "O", "O", "",  "O", "U", "U", "U", "U", "Y", "TH", "SS"};
+
 // The key two spellings of one name share: the cleaned value upper-cased,
-// without '.', apostrophes (' ’ `) and a leading "CITY OF" (or TOWN,
-// VILLAGE, BOROUGH, TOWNSHIP), '-', '/' and '_' as spaces, '&' as AND, a
-// word "MC" joined to the next and a first word "O" too, abbreviations
-// spelled out (WORD_FORMS; N, S, E and W first), single spaces.
-inline std::string strict_key(std::string_view value) {
+// its Latin-1 letters without their accents, without '.', apostrophes
+// (' ’ `) and a leading "CITY OF" (or TOWN, VILLAGE, BOROUGH, TOWNSHIP),
+// '-', '/' and '_' as spaces, '&' as AND, a word "MC" joined to the next
+// and a first word "O" too, abbreviations spelled out (WORD_FORMS; N, S, E
+// and W first) unless `spell_out` is false, single spaces.
+inline std::string strict_key(std::string_view value, bool spell_out = true) {
     std::string s = upper(clean_value(value));
     std::string t;
     for (size_t i = 0; i < s.size(); i++) {
@@ -127,6 +138,16 @@ inline std::string strict_key(std::string_view value) {
         if (c == '\xE2' && i + 2 < s.size() && s[i + 1] == '\x80' && s[i + 2] == '\x99') {
             i += 2;
             continue;
+        }
+        if (c == '\xC3' && i + 1 < s.size()) {
+            const unsigned char d = static_cast<unsigned char>(s[i + 1]);
+            const std::string_view plain =
+                d >= 0x80 && d <= 0x9F ? UNACCENTED[d - 0x80] : d == 0xBF ? std::string_view("Y") : std::string_view();
+            if (!plain.empty()) {
+                t += plain;
+                i++;
+                continue;
+            }
         }
         if (c == '-' || c == '/' || c == '_') t += ' ';
         else if (c == '&') t += "AND";
@@ -156,11 +177,11 @@ inline std::string strict_key(std::string_view value) {
     }
     for (std::string& w : joined)
         for (const auto& [from, to] : WORD_FORMS)
-            if (w == from) {
+            if (spell_out && w == from) {
                 w = std::string(to);
                 break;
             }
-    if (!joined.empty())
+    if (spell_out && !joined.empty())
         for (const auto& [from, to] : FIRST_WORD_FORMS)
             if (joined[0] == from) joined[0] = std::string(to);
     std::string key;
@@ -203,15 +224,19 @@ inline constexpr std::string_view STATE_NAMES[] = {
     "WEST VIRGINIA",  "WISCONSIN",      "WYOMING",        "PUERTO RICO",
 };
 
-// Whether a strict key names no postal place: it has a digit, is a state's
-// name or two letters, or ends in a word of TOWNSHIP, COUNTY or BOROUGH (TWP
-// is TOWNSHIP by then).
-inline bool names_no_postal_place(std::string_view strict) {
+// Whether a value names no postal place: its strict key has a digit, is a
+// state's name, or ends in a word of TOWNSHIP, COUNTY or BOROUGH (TWP is
+// TOWNSHIP by then); or the value is one or two letters before any
+// abbreviation is spelled out (PA, MT for Montana, ST, N).
+inline bool names_no_postal_place(std::string_view value, std::string_view strict) {
+    const std::string letters = strict_key(value, false);
+    if (!letters.empty() && letters.size() <= 2 &&
+        std::all_of(letters.begin(), letters.end(), [](char c) { return c >= 'A' && c <= 'Z'; }))
+        return true;
     for (char c : strict)
         if (c >= '0' && c <= '9') return true;
     for (std::string_view state : STATE_NAMES)
         if (strict == state) return true;
-    if (strict.size() == 2 && strict[0] >= 'A' && strict[0] <= 'Z' && strict[1] >= 'A' && strict[1] <= 'Z') return true;
     for (std::string_view w : {"TOWNSHIP", "COUNTY", "BOROUGH"})
         if (strict == w || (strict.size() > w.size() && strict.substr(strict.size() - w.size()) == w &&
                             strict[strict.size() - w.size() - 1] == ' '))
@@ -245,7 +270,7 @@ struct Classified {
 inline Classified classify(const Value& v, std::string_view geonames_key) {
     Classified c{v.text, strict_key(v.text), lenient_key(v.text), v.n, Kind::VOTE};
     if (v.text.empty() || v.text.size() > NAME_BYTES || !name_text(v.text) || c.strict.empty()) c.kind = Kind::UNFIT;
-    else if (names_no_postal_place(c.strict) && c.lenient != geonames_key) c.kind = Kind::FILTERED;
+    else if (names_no_postal_place(v.text, c.strict) && c.lenient != geonames_key) c.kind = Kind::FILTERED;
     return c;
 }
 
@@ -319,38 +344,38 @@ inline const char* step_name(Step s) {
 // max(2, 10% of them, rounded up).
 inline uint64_t margin(uint64_t votes) { return std::max<uint64_t>(2, (votes + 9) / 10); }
 
-// Whether a spelling is all in capitals: no lower-case ASCII letter, and an
-// upper-case one.
-inline bool all_capitals(std::string_view s) {
-    bool upper_seen = false;
+// How a spelling is cased, the better first: in mixed case (or of no ASCII
+// letter), all in capitals, all in lower case.
+enum class Casing : uint8_t { MIXED, CAPITALS, LOWER };
+inline Casing casing(std::string_view s) {
+    bool lower = false, capital = false;
     for (char c : s) {
-        if (c >= 'a' && c <= 'z') return false;
-        upper_seen |= c >= 'A' && c <= 'Z';
+        lower |= c >= 'a' && c <= 'z';
+        capital |= c >= 'A' && c <= 'Z';
     }
-    return upper_seen;
+    return lower == capital ? Casing::MIXED : capital ? Casing::CAPITALS : Casing::LOWER;
 }
 
 // Spellings with their votes, by text.
 using Spellings = std::map<std::string, uint64_t>;
 
-// The spelling of `spellings` a name takes: a mixed-case one over one all in
-// capitals, of the most votes, the least text of those; `prev` instead where
-// it is one of them within margin(key_votes) of the top. None of no
+// The spelling of `spellings` a name takes: of the best casing they have,
+// of the most votes, the least text of those; `prev` instead where it is one
+// of them of that casing within margin(key_votes) of the top. None of no
 // spelling.
 inline std::optional<std::string> pick_spelling(const Spellings& spellings, uint64_t key_votes,
                                                 const std::string* prev) {
-    bool mixed = false;
-    for (const auto& [text, n] : spellings) mixed |= !all_capitals(text);
+    Casing best = Casing::LOWER;
+    for (const auto& [text, n] : spellings) best = std::min(best, casing(text));
     const std::pair<const std::string, uint64_t>* top = nullptr;
     for (const auto& s : spellings) {
-        if (mixed && all_capitals(s.first)) continue;
+        if (casing(s.first) != best) continue;
         if (!top || s.second > top->second) top = &s;
     }
     if (!top) return std::nullopt;
     if (prev) {
         const auto it = spellings.find(*prev);
-        if (it != spellings.end() && !(mixed && all_capitals(it->first)) &&
-            it->second + margin(key_votes) >= top->second)
+        if (it != spellings.end() && casing(it->first) == best && it->second + margin(key_votes) >= top->second)
             return it->first;
     }
     return top->first;
@@ -433,7 +458,9 @@ inline Choice choose(const std::vector<Classified>& values, const Place* geoname
     }
     if (c.step == Step::NONE) return c;
 
-    // The spelling: the ZIP's own, else its state's, else GeoNames' text.
+    // The spelling: the ZIP's own, else its state's, else GeoNames' text; a
+    // name in one case only (DUARTE, westfield) takes the next of those
+    // that is cased better.
     const bool of_geonames = geonames && c.key == g;
     const std::string geonames_strict = of_geonames ? strict_key(geonames->name) : std::string();
     auto spellings_of = [&](Spellings s) { return of_geonames ? without_municipal_forms(std::move(s), geonames_strict) : s; };
@@ -445,11 +472,14 @@ inline Choice choose(const std::vector<Classified>& values, const Place* geoname
     const Spellings spelt = spellings_of(std::move(own));
     std::optional<std::string> name = pick_spelling(spelt, key_votes, prev_spelling);
     if (prev_spelling && name != pick_spelling(spelt, key_votes, nullptr)) c.held = true;
-    if (!name && geonames && !geonames->state.empty()) {
+    auto cased_better = [&](std::optional<std::string> other) {
+        if (other && (!name || casing(*other) < casing(*name))) name = std::move(other);
+    };
+    if ((!name || casing(*name) != Casing::MIXED) && geonames && !geonames->state.empty()) {
         const auto it = state_spellings.find({geonames->state, c.key});
-        if (it != state_spellings.end()) name = pick_spelling(spellings_of(it->second), 0, nullptr);
+        if (it != state_spellings.end()) cased_better(pick_spelling(spellings_of(it->second), 0, nullptr));
     }
-    if (!name && of_geonames) name = geonames->name;
+    if ((!name || casing(*name) != Casing::MIXED) && of_geonames) cased_better(geonames->name);
     if (!name) {
         c.step = Step::NONE;
         return c;

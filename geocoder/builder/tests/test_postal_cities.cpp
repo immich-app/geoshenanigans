@@ -104,7 +104,16 @@ TEST(the_spellings_of_one_name_share_a_key) {
     CHECK_EQ(strict_key("Little N Rock"), std::string("LITTLE N ROCK"));
     CHECK_EQ(strict_key("Bryn  Mawr"), std::string("BRYN MAWR"));
     CHECK_EQ(strict_key("Winston/Salem"), std::string("WINSTON SALEM"));
-    CHECK_EQ(strict_key("Cañon City"), std::string("CAÑON CITY"));
+    // A Latin-1 letter's accent goes: the votes spelling it and those that
+    // don't name one place (Cañon City, Mayagüez, Lindström).
+    CHECK_EQ(strict_key("Cañon City"), std::string("CANON CITY"));
+    CHECK_EQ(strict_key("Mayagüez"), strict_key("Mayaguez"));
+    CHECK_EQ(strict_key("Lindström"), std::string("LINDSTROM"));
+    CHECK_EQ(strict_key("Hagåtña"), std::string("HAGATNA"));
+    CHECK_EQ(strict_key("ÀÉÎÕÜÇÝÿ"), std::string("AEIOUCYY"));
+    CHECK_EQ(strict_key("Straße"), std::string("STRASSE"));
+    CHECK_EQ(strict_key("Ærø"), std::string("AERO"));
+    CHECK_EQ(strict_key("2×4"), std::string("2×4"));
     CHECK_EQ(strict_key("Twin Lakes Twp"), std::string("TWIN LAKES TOWNSHIP"));
     CHECK_EQ(strict_key("City of Yonkers"), std::string("YONKERS"));
     CHECK_EQ(strict_key("Texas A&M"), std::string("TEXAS AANDM"));
@@ -134,6 +143,14 @@ TEST(a_value_that_names_no_postal_place_votes_only_where_geonames_names_it) {
     CHECK(kind("19026") == Kind::FILTERED);
     CHECK(kind("Route 9 Village") == Kind::FILTERED);
     CHECK(kind("PA") == Kind::FILTERED);
+    // One or two letters name no place before an abbreviation is spelled
+    // out too: MT (Montana's code) is no Mount, nor ST a Saint.
+    for (const char* letters : {"MT", "Mt.", "ST", "St", "IS", "FT", "PT", "LK", "CY", "N", "W.", "X", "O K"})
+        CHECK(kind(letters, "Drexel Hill") == Kind::FILTERED);
+    CHECK(kind("MT", "Mount") == Kind::VOTE);
+    CHECK(kind("Mt Pleasant", "Drexel Hill") == Kind::VOTE);
+    CHECK(kind("St Louis", "Drexel Hill") == Kind::VOTE);
+    CHECK(kind("Ste", "Drexel Hill") == Kind::VOTE);
     // A state's name only as the whole key: Kansas City and Virginia Beach vote.
     CHECK(kind("Kansas City", "Overland Park") == Kind::VOTE);
     CHECK(kind("Virginia Beach") == Kind::VOTE);
@@ -227,9 +244,24 @@ TEST(the_name_is_spelt_as_the_zips_votes_spell_its_key) {
     // Its own most common spelling of the key, not GeoNames'.
     CHECK_EQ(name({{"Wilkes-Barre", 40}, {"Wilkes Barre", 8}}, "Wilkes Barre"), std::string("Wilkes-Barre"));
     CHECK_EQ(name({{"McLean", 30}, {"Mc Lean", 2}}, "Mc Lean"), std::string("McLean"));
-    // A mixed-case spelling over one all in capitals.
+    // A mixed-case spelling over one all in capitals, and one all in
+    // capitals over one all in lower case.
     CHECK_EQ(name({{"DREXEL HILL", 50}, {"Drexel Hill", 10}}, "Drexel Hill"), std::string("Drexel Hill"));
-    CHECK_EQ(name({{"DREXEL HILL", 50}}, "Drexel Hill"), std::string("DREXEL HILL"));
+    CHECK_EQ(name({{"van meter", 15}, {"Van Meter", 4}}, "Van Meter"), std::string("Van Meter"));
+    CHECK_EQ(name({{"drexel hill", 9}, {"DREXEL HILL", 3}}), std::string("DREXEL HILL"));
+    // A name in one case only takes GeoNames' text of its key where that is
+    // in mixed case: 91008 is Duarte and 01086 Westfield.
+    CHECK_EQ(name({{"DREXEL HILL", 50}}, "Drexel Hill"), std::string("Drexel Hill"));
+    CHECK_EQ(name({{"Arcadia", 3}, {"Bradbury", 1}, {"DUARTE", 1}}, "Duarte"), std::string("Duarte"));
+    CHECK_EQ(name({{"westfield", 1}}, "Westfield"), std::string("Westfield"));
+    CHECK_EQ(name({{"DREXEL HILL", 50}}), std::string("DREXEL HILL"));
+    CHECK_EQ(name({{"DREXEL HILL", 50}}, "Upper Darby"), std::string("DREXEL HILL"));
+    CHECK_EQ(name({}, "APO AA"), std::string("APO AA"));
+    CHECK_EQ(name({{"apo aa", 1}}, "APO AA"), std::string("APO AA"));
+    // The accents most of the ZIP's votes spell, whatever GeoNames' text.
+    CHECK_EQ(name({{"Loíza", 3}}, "Loiza"), std::string("Loíza"));
+    CHECK_EQ(name({{"Mayagüez", 20}, {"Mayaguez", 2}, {"Hormigueros", 21}}, "Mayaguez"), std::string("Mayagüez"));
+    CHECK_EQ(name({{"Comerío", 15}, {"Comerio", 16}}, "Comerio"), std::string("Comerio"));
     // For GeoNames' key, none ending in a municipal word GeoNames' name lacks.
     CHECK_EQ(name({{"Roy City", 30}, {"Roy", 5}}, "Roy"), std::string("Roy"));
     CHECK_EQ(name({{"Salt Lake City", 300}, {"Salt Lake", 2}}, "Salt Lake City"), std::string("Salt Lake City"));
@@ -254,6 +286,16 @@ TEST(a_key_the_zip_spells_nowhere_takes_its_states_spelling_else_geonames_text) 
     CHECK_EQ(choice({{"Vienna", 2}}, "Mc Lean", "", states, "VA").name, std::string("McLean"));
     CHECK_EQ(choice({}, "Mc Lean", "", states, "TX").name, std::string("Mc Lean"));
     CHECK_EQ(choice({}, "Mc Lean", "", states, "").name, std::string("Mc Lean"));
+    // A name in one case only takes its state's mixed-case spelling first,
+    // then GeoNames' text; else it stays, in capitals before lower case.
+    states[{"CA", "DUARTE"}] = {{"Duarte", 40}, {"DUARTE", 90}};
+    states[{"GU", "AGAT"}] = {{"AGAT", 4}};
+    states[{"HI", "JBPHH"}] = {{"JBPHH", 1}, {"jbphh", 7}};
+    CHECK_EQ(choice({{"DUARTE", 6}}, "DUARTE", "", states, "CA").name, std::string("Duarte"));
+    CHECK_EQ(choice({{"duarte", 6}}, "DUARTE", "", states, "CA").name, std::string("Duarte"));
+    CHECK_EQ(choice({}, "Agat", "", states, "GU").name, std::string("Agat"));
+    CHECK_EQ(choice({}, "JBPHH", "", states, "HI").name, std::string("JBPHH"));
+    CHECK_EQ(choice({{"jbphh", 2}}, "JBPHH", "", states, "HI").name, std::string("JBPHH"));
 }
 
 TEST(geonames_places_are_read_from_our_tsv_and_from_its_own_files) {
