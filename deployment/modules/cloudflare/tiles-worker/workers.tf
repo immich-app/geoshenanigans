@@ -14,8 +14,10 @@ resource "cloudflare_workers_script" "tiles" {
   account_id  = var.cloudflare_account_id
   script_name = local.script_name
   content     = file("${var.tiles_build_dir}/index.js")
-  main_module = "worker.js"
+  # The name provider v4 gave the module, which prod's live script still has.
+  main_module = "worker.mjs"
 
+  # In the order prod's state keeps them, so the move to v5 doesn't show them reordered.
   bindings = concat(
     [
       { type = "plain_text", name = "DEPLOYMENT_KEY", text = var.pmtiles_deployment_key },
@@ -31,8 +33,8 @@ resource "cloudflare_workers_script" "tiles" {
         text = var.env == "prod" ? "https://vmauth.futostatus.com" : "https://vmauth.staging.futostatus.com"
       },
       { type = "secret_text", name = "O11Y_TOKEN", text = var.o11y_vmauth_token },
-      { type = "secret_text", name = "TIGRIS_KEY_ID", text = var.tigris_read_key_id },
       { type = "secret_text", name = "TIGRIS_ACCESS_KEY", text = var.tigris_read_access_key },
+      { type = "secret_text", name = "TIGRIS_KEY_ID", text = var.tigris_read_key_id },
       {
         type = "d1"
         name = "D1_GLOBAL"
