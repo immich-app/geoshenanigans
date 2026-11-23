@@ -1319,8 +1319,9 @@ std::string attribution_json(bool marine) {
             "    \"licence_url\": \"https://creativecommons.org/licenses/by/4.0/\",\n"
             "    \"notices\": [\n"
             "      \"Changes: each IHO sea area's parts in every EEZ dissolved into one, cut to the water off "
-            "OpenStreetMap's land polygons and along a 1-degree grid, and simplified in the simplified tiers. Cut "
-            "to OpenStreetMap's land, the areas are part of this dataset's ODbL derivative database.\"\n"
+            "OpenStreetMap's land polygons and along a 1-degree grid, the coastal water the sea areas leave out "
+            "given to the nearest sea area, and simplified in the simplified tiers. Cut to OpenStreetMap's land, "
+            "the areas are part of this dataset's ODbL derivative database.\"\n"
             "    ]\n"
             "  }";
     return out + "\n]\n";

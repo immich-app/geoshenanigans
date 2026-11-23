@@ -12,6 +12,8 @@ TEMPLATE = os.path.join(HERE, "..", "configurations.template.json")
 # The major tier's thresholds (water_classify.h) and the client's guide to the water dirs.
 WATER_CLASSIFY = os.path.join(HERE, "..", "src", "water_classify.h")
 PATCHING = os.path.join(HERE, "..", "..", "PATCHING.md")
+# A water dir holding a sea as the water layer writes it (the builder's s2 tests check it is).
+WATER_DIR_WITH_A_SEA = os.path.join(HERE, "..", "..", "testdata", "water_dir", "day3")
 
 # The client files of a water dir, as the builder writes them (water_layer.h).
 WATER_DIR_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin", "arc_index.bin",
@@ -107,6 +109,17 @@ class AttributionTest(unittest.TestCase):
             self.assertTrue(any(fnmatch.fnmatchcase(f"water.{value}", p) for p in marine["applies_to"]), value)
         self.assertFalse(any(fnmatch.fnmatchcase("water.none", p) for p in marine["applies_to"]))
         self.assertFalse(any(fnmatch.fnmatchcase("mode.full", p) for p in marine["applies_to"]))
+
+    def test_the_marine_regions_changes_tell_where_the_water_they_leave_out_goes(self):
+        marine = {e["id"]: e for e in load_template()["attribution"]}["marine-regions"]
+        (changes,) = [n for n in marine["notices"] if n.startswith("Changes: ")]
+        self.assertIn("coastal water the sea areas leave out given to the nearest sea area", changes)
+
+    def test_a_water_dir_credits_marine_regions_as_the_template_does(self):
+        with open(os.path.join(WATER_DIR_WITH_A_SEA, "attribution.json")) as f:
+            written = {e["id"]: e for e in json.load(f)}
+        marine = {e["id"]: e for e in load_template()["attribution"]}["marine-regions"]
+        self.assertEqual(written["marine-regions"], {k: v for k, v in marine.items() if k != "applies_to"})
 
     def test_each_entry_has_what_a_credit_shows(self):
         for e in load_template()["attribution"]:
