@@ -393,12 +393,14 @@ Build assemble(Collected& c, unsigned threads) {
     free_storage(assembled);
     free_storage(c.relations);
     // The marine areas, each polygon as the file gives it, each ring's runs
-    // its stretches.
+    // its stretches; each shows the name it goes by (marine::shown_name),
+    // its IHO name its local one.
     for (marine::Area& area : c.marine) {
         if (area.polygons.empty()) continue;
         ObjectTags t;
         t.code = area.kind == marine::kOcean ? code::kPlaceOcean : code::kPlaceSea;
-        t.name = t.local_name = area.name;
+        t.name = marine::shown_name(area.name);
+        t.local_name = area.name;
         const uint32_t object = add_object(ObjectType::SYNTHETIC, static_cast<int64_t>(area.id), std::move(t));
         uint32_t rank = 0;
         for (auto& rings : area.polygons) {
@@ -693,10 +695,16 @@ bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& c
 }  // namespace
 
 size_t drop_marine_namesakes(Build& b) {
-    // The marine areas by their names' keys, and each object's polygons.
+    // The marine areas by their names' keys, the name each shows and its IHO
+    // name, and each object's polygons.
     std::map<std::string, std::vector<uint32_t>> marine;
-    for (uint32_t o = 0; o < b.objects.size(); o++)
-        if (b.objects[o].type == ObjectType::SYNTHETIC) marine[namesake_key(b.objects[o].tags.name)].push_back(o);
+    for (uint32_t o = 0; o < b.objects.size(); o++) {
+        const Object& obj = b.objects[o];
+        if (obj.type != ObjectType::SYNTHETIC) continue;
+        marine[namesake_key(obj.tags.name)].push_back(o);
+        if (namesake_key(obj.tags.local_name) != namesake_key(obj.tags.name))
+            marine[namesake_key(obj.tags.local_name)].push_back(o);
+    }
     if (marine.empty()) return 0;
     std::vector<uint32_t> first(b.objects.size() + 1, 0);
     for (uint32_t o : b.object_of) first[o + 1]++;

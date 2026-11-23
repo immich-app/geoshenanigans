@@ -44,6 +44,40 @@ inline constexpr uint8_t kOcean = 2;
 // One vertex in this many starts a stretch.
 inline constexpr uint64_t kMarineCutEvery = 256;
 
+// The names a marine area shows in place of its IHO name where that reads
+// awkwardly in a location line: a basin of a sea, a sea and its other name,
+// a sea and a channel, an old spelling. A name in dispute (Japan Sea,
+// Persian Gulf) stays as the source has it. By IHO name, ascending.
+struct ShownName {
+    const char* iho;
+    const char* shown;
+};
+inline constexpr ShownName kShownNames[] = {
+    {"Andaman or Burma Sea", "Andaman Sea"},
+    {"Balearic (Iberian Sea)", "Balearic Sea"},
+    {"Barentsz Sea", "Barents Sea"},
+    {"Ceram Sea", "Seram Sea"},
+    {"Eastern China Sea", "East China Sea"},
+    {"Gulf of Boni", "Gulf of Bone"},
+    {"Irish Sea and St. George's Channel", "Irish Sea"},
+    {"Malacca Strait", "Strait of Malacca"},
+    {"Mediterranean Sea - Eastern Basin", "Mediterranean Sea"},
+    {"Mediterranean Sea - Western Basin", "Mediterranean Sea"},
+    {"Molukka Sea", "Molucca Sea"},
+    {"Rio de La Plata", "Río de la Plata"},
+    {"Seto Naikai or Inland Sea", "Seto Inland Sea"},
+    {"The Coastal Waters of Southeast Alaska and British Columbia",
+     "Coastal Waters of Southeast Alaska and British Columbia"},
+    {"The Northwestern Passages", "Northwest Passages"},
+};
+
+// The name a marine area of IHO name `iho` shows (kShownNames), else `iho`.
+inline std::string shown_name(const std::string& iho) {
+    for (const ShownName& n : kShownNames)
+        if (iho == n.iho) return n.shown;
+    return iho;
+}
+
 // One marine object: its id (the sea area's MRGID), kind and name, and its
 // polygons, each its rings (outer first, then holes), each ring closed (its
 // first vertex repeated at its end).

@@ -1,5 +1,5 @@
-// marine.h: the marine areas file tools/marine_import.py writes, and the
-// stretches a marine ring's arcs are cut at.
+// marine.h: the marine areas file tools/marine_import.py writes, the
+// stretches a marine ring's arcs are cut at, and the names the areas show.
 #include "marine.h"
 
 #include <algorithm>
@@ -196,4 +196,21 @@ TEST(a_marine_ring_no_vertex_cuts_is_one_stretch) {
     const std::vector<PackedLocation> back(ring.rbegin(), ring.rend());
     CHECK_EQ(marine::ring_runs(turned)[0].way, runs[0].way);
     CHECK_EQ(marine::ring_runs(back)[0].way, runs[0].way);
+}
+
+TEST(a_marine_area_shows_the_name_its_sea_goes_by_and_a_disputed_name_as_the_source_has_it) {
+    CHECK(marine::shown_name("Mediterranean Sea - Eastern Basin") == "Mediterranean Sea");
+    CHECK(marine::shown_name("Mediterranean Sea - Western Basin") == "Mediterranean Sea");
+    CHECK(marine::shown_name("Barentsz Sea") == "Barents Sea");
+    CHECK(marine::shown_name("Andaman or Burma Sea") == "Andaman Sea");
+    CHECK(marine::shown_name("Balearic (Iberian Sea)") == "Balearic Sea");
+    CHECK(marine::shown_name("Rio de La Plata") == "Río de la Plata");
+    for (const char* kept :
+         {"Japan Sea", "Persian Gulf", "North Sea", "Gulf of St. Lawrence", "mediterranean sea - eastern basin"})
+        CHECK(marine::shown_name(kept) == kept);
+    // By IHO name, each once, and none shown under a name another shows in
+    // place of its own.
+    for (size_t i = 1; i < std::size(marine::kShownNames); i++)
+        CHECK(std::string(marine::kShownNames[i - 1].iho) < marine::kShownNames[i].iho);
+    for (const marine::ShownName& n : marine::kShownNames) CHECK(marine::shown_name(n.shown) == n.shown);
 }

@@ -245,7 +245,8 @@ Build assemble(Collected& c, unsigned threads);
 
 // Leaves out each OSM natural=bay or strait that is a marine area's
 // namesake, in place: its name or local name (name:en or name) is the
-// marine area's, ASCII case, spaces and punctuation aside, and the polygons
+// marine area's (the name it shows or its IHO name, marine::shown_name),
+// ASCII case, spaces and punctuation aside, and the polygons
 // of the marine areas of its name hold all its water (polygons_cover: its
 // polygons' rings even-odd, its holes left out, within theirs, a shared
 // shore aside). Those marine areas answer there; every other bay and strait

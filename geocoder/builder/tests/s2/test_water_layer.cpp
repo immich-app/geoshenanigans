@@ -876,6 +876,26 @@ TEST(an_osm_bay_or_strait_of_a_marine_areas_name_that_it_holds_all_of_is_left_ou
     CHECK_EQ(marine, size_t(3));
 }
 
+TEST(a_marine_area_shows_the_name_its_sea_goes_by_and_namesakes_of_either_name_go) {
+    // The western Mediterranean's IHO area, and OSM bays in it of its IHO
+    // name and of the name it shows; a bay of another name stays.
+    Collected c = fixture();
+    const int32_t lat = kLat - 20000000;
+    c.marine.push_back(marine_area(1913, marine::kSea, "Japan Sea", {{square(lat, kLng + 3000000, 2000000, 40)}}));
+    const std::string iho = "Mediterranean Sea - Western Basin";
+    c.marine.push_back(marine_area(4279, marine::kSea, iho, {{square(lat, kLng, 2000000, 40)}}));
+    c.closed_ways.push_back({2101, tags(code::kNaturalBay, iho), square(lat + 500000, kLng + 500000, 100000)});
+    c.closed_ways.push_back({2102, tags(code::kNaturalBay, "Mediterranean Sea"), square(lat + 800000, kLng + 500000, 100000)});
+    c.closed_ways.push_back({2103, tags(code::kNaturalBay, "Golfe du Lion"), square(lat + 1100000, kLng + 500000, 100000)});
+    const Layer layer = build(c);
+    std::map<std::string, size_t> marine;
+    for (size_t p = 0; p < layer.size(); p++)
+        if (layer.marine[p]) marine[name_of(layer, p)]++;
+    const std::map<std::string, size_t> shown = {{"Japan Sea", 1}, {"Mediterranean Sea", 1}};
+    CHECK(marine == shown);
+    CHECK(ways_held(layer, {2101, 2102, 2103}).first == std::set<int64_t>({2103}));
+}
+
 TEST(namesakes_apart_are_rivers_of_their_own_and_a_line_lends_its_wikidata_item_only_where_it_runs) {
     Collected c = fixture();
     // Four unnamed river areas far apart, each with a line of a local name
