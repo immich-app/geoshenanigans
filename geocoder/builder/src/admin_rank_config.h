@@ -120,8 +120,9 @@ inline uint8_t polygon_rank_address(uint16_t cc, uint8_t admin_level, uint8_t pl
 
 // Admin-minimal carries addresses down to rank 16, the cities, towns and
 // villages its place nodes also reach: boundaries of admin_level 2..8 and the
-// place areas (admin_level 15) of those ranks. Singapore's city is its
-// place=city area (R17140517), not a boundary.
+// place areas (admin_level 15) of those ranks, by the type that labels them (a
+// place area linked to a town node is a town there, whatever its own place
+// tag). Singapore's city is its place=city area (R17140517), not a boundary.
 inline bool admin_minimal_keeps(uint8_t admin_level, uint8_t place_type) {
     if (admin_level >= 2 && admin_level <= 8) return true;
     const uint8_t rank = place_area_rank_address(place_type);

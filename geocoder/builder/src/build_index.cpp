@@ -864,7 +864,7 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
             const auto links = [&](uint32_t p) {
                 const AdminPolygon& poly = data.admin_polygons[p];
                 return polygon_rank_address(polygon_country(data, countries, p), poly.admin_level,
-                                            poly.place_type_override) != 0;
+                                            own_place_tag(poly)) != 0;
             };
             const size_t hidden = hide_claimed_place_nodes(data.place_nodes, data.place_osm_ids,
                 std::move(data.place_claims), data.admin_polygons, data.admin_osm_ids, num_threads, links);
@@ -3582,6 +3582,9 @@ static int run(int argc, char* argv[]) {
                             add_admin_polygon(data, cwa.vertices, cwa.name.c_str(),
                                               cwa.admin_level, cc, pto,
                                               cwa.way_id);
+                            // A place area keeps its own place tag beside the linked node's type.
+                            if (cwa.admin_level == 15 && pto != cwa.fallback_place_type)
+                                data.admin_polygons.back().own_place_type = cwa.fallback_place_type;
                             closed_way_admin_count++;
                         }
                         local.closed_way_admins.clear();
@@ -3616,6 +3619,7 @@ static int run(int argc, char* argv[]) {
                         uint8_t admin_level;
                         std::string country_code;
                         uint8_t place_type_override;
+                        uint8_t own_place_type = 0;
                         // Strategy-2 stable identity. Together (relation_id,
                         // ring_index) uniquely identifies one polygon ring
                         // across builds: a relation can produce multiple
@@ -3812,6 +3816,11 @@ static int run(int argc, char* argv[]) {
                                 if (pto == 0 && rel.fallback_place_type != 0) {
                                     pto = rel.fallback_place_type;
                                 }
+                                // A place area keeps its own place tag beside the
+                                // linked node's type, which labels it: placex_update
+                                // ranks it by its own (the server's place_area_ranks).
+                                const uint8_t own_place_type =
+                                    rel.admin_level == 15 && pto != rel.fallback_place_type ? rel.fallback_place_type : 0;
 
                                 uint16_t ring_idx = 0;
                                 for (size_t k = 0; k < polygons.size(); k++) {
@@ -3831,6 +3840,7 @@ static int run(int argc, char* argv[]) {
                                         ar.admin_level = rel.admin_level;
                                         ar.country_code = rel.country_code;
                                         ar.place_type_override = pto;
+                                        ar.own_place_type = own_place_type;
                                         ar.relation_id = rel.id;
                                         ar.ring_index = ring_idx;
                                         local_results.push_back(std::move(ar));
@@ -3929,6 +3939,7 @@ static int run(int argc, char* argv[]) {
                             poly.name_id = name_ids[k];
                             poly.admin_level = pp.admin_level;
                             poly.place_type_override = pp.place_type_override;
+                            poly.own_place_type = pp.own_place_type;
                             poly.area = exact.area(static_cast<uint32_t>(poly_base + k));
                             const char* cc = pp.country_code.empty() ? nullptr : pp.country_code.c_str();
                             poly.country_code = (cc && cc[0] && cc[1])

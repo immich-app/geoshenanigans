@@ -532,7 +532,10 @@ fn golden_sets() -> Vec<(&'static str, Kind, Option<&'static str>, Files)> {
     fx.arc(3, &[PointE7 { lat: -1000, lng: 2000 }]);
     let mut polygons = Vec::new();
     for (ring_offset, name_id, area, country_code, admin_level) in [(0, 7, 0.5f32, 528u16, 2u8), (96, 11, 0.0625, 528, 8), (160, 12, 3.25, 36, 4)] {
-        let p = AdminPolygon { ring_offset, ring_bytes: 0, name_id, admin_level, place_type_override: (admin_level == 8) as u8, area, country_code };
+        let p = AdminPolygon {
+            ring_offset, ring_bytes: 0, name_id, admin_level, place_type_override: (admin_level == 8) as u8, own_place_type: 0, area,
+            country_code,
+        };
         polygons.extend(p.record_bytes());
     }
     polygons.extend([1, 2, 3, 4, 5]);

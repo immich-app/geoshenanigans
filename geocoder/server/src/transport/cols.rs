@@ -54,7 +54,7 @@ impl Layout {
 }
 
 /// A cols file's name as COLS_FILES holds it and its row's layout: admin_polygons.bin's ring
-/// offset, name, area, country code, level and override, reserved byte, a column each; a way
+/// offset, name, area, country code, level and override, own place type, a column each; a way
 /// group's off and anchor lat and lng (u32), a column each, then a column for each field its 16
 /// ways repeat: their counts and codes (u16), an interpolation's starts, spans (u32) and
 /// interpolations (u8), their names (u32); addr_index.bin's superblock starts (u64), a column

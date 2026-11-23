@@ -1,7 +1,8 @@
-//! The postcode of an answer without one of its own: the postcode grid's cell of the point where
-//! the dir has a grid of the point's country, else Nominatim 5.3's get_nearest_postcode on a
-//! point (utils.sql:168-178), the postcode area covering it, else the nearest postcode centroid
-//! whose box covers it, the box reaching the country's postcode extent from the centroid
+//! The postcode of an answer without one of its own: Nominatim 5.3's get_nearest_postcode on a
+//! point (utils.sql:168-178), the street's middle, the house or the query point, which the
+//! postcode grid's cell of the point names first where the dir has a grid of the point's country;
+//! else the postcode area covering it, else the nearest postcode centroid whose box covers it,
+//! the box reaching the country's postcode extent from the centroid
 //! (settings/country_settings.yaml, postcodes.py).
 
 use super::*;
@@ -172,6 +173,91 @@ fn a_house_the_street_that_won_has_near_names_its_own_postcode() {
 }
 
 #[test]
+fn a_house_without_a_postcode_of_its_own_takes_its_street_s() {
+    // Grange View Road, Gedling: a rank-30 object takes its own addr:postcode, else that of its
+    // parent street, else get_nearest_postcode at its own centroid (placex_update). House 30 on
+    // Grange View Road, 50 m north of the street, has none, and Yew Tree Lane runs nearer the
+    // point than Grange View Road does.
+    let gedling = (52.98, -1.07);
+    let index = country_at(gedling, b"GB")
+        .street("Grange View Road", &[(100.0, -300.0), (100.0, 300.0)])
+        .way_postcode("NG4 4BT")
+        .address("30", 55.0, 0.0)
+        .street("Yew Tree Lane", &[(40.0, -300.0), (40.0, 300.0)])
+        .centroid("NG4 4DA", 45.0, 0.0)
+        .load();
+    let address = address_from(&index, gedling, 50.0, 0.0);
+    assert_eq!(address["house_number"], "30");
+    assert_eq!(address["postcode"], "NG4 4BT");
+}
+
+#[test]
+fn a_house_whose_street_has_no_postcode_takes_the_one_nearest_the_house() {
+    // The street wins and its house 20 m off gives the number: the answer is the house, rank 30.
+    // Neither the house nor its street has a postcode (no centroid's 700 m box holds the street's
+    // middle, 1,450 m east), so get_nearest_postcode at the house names it: NG4 4AE's centroid is
+    // 50 m from the house, NG4 4AF's 55 m from it and 35 m from the point.
+    let gedling = (52.98, -1.07);
+    let index = country_at(gedling, b"GB")
+        .street("Long Lane", &[(0.0, -100.0), (0.0, 3000.0)])
+        .address("7", 20.0, 0.0)
+        .centroid("NG4 4AE", 70.0, 0.0)
+        .centroid("NG4 4AF", -35.0, 0.0)
+        .load();
+    let address = address_from(&index, gedling, 0.0, 0.0);
+    assert_eq!(address["house_number"], "7");
+    assert_eq!(address["postcode"], "NG4 4AE");
+}
+
+#[test]
+fn a_street_s_postcode_is_the_one_nearest_its_middle() {
+    // A street answers with its own postcode, which placex_update takes with get_nearest_postcode
+    // at the street's centroid, the point halfway along it (get_center_point,
+    // ST_LineInterpolatePoint(geometry, 0.5)). Long Lane runs 2 km east, its middle 900 m east
+    // of the point: NG4 4AB's centroid 30 m from the middle names it, not NG4 4AA's 60 m from the
+    // point, whose box doesn't reach the middle.
+    let gedling = (52.98, -1.07);
+    let index = country_at(gedling, b"GB")
+        .street("Long Lane", &[(0.0, -100.0), (0.0, 1000.0), (0.0, 1900.0)])
+        .centroid("NG4 4AA", 0.0, -60.0)
+        .centroid("NG4 4AB", 30.0, 900.0)
+        .load();
+    let address = address_from(&index, gedling, 5.0, 0.0);
+    assert_eq!(address["road"], "Long Lane");
+    assert_eq!(address["postcode"], "NG4 4AB");
+}
+
+#[test]
+fn a_street_whose_middle_no_postcode_reaches_has_none() {
+    // Nominatim's answer is the street, of the street's postcode: with no centroid box round its
+    // middle it has none, though a centroid's box holds the point.
+    let gedling = (52.98, -1.07);
+    let index = country_at(gedling, b"GB")
+        .street("Long Lane", &[(0.0, -100.0), (0.0, 1900.0)])
+        .centroid("NG4 4AA", 0.0, -60.0)
+        .load();
+    let address = address_from(&index, gedling, 5.0, 0.0);
+    assert_eq!(address["road"], "Long Lane");
+    assert_eq!(address["postcode"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_street_takes_the_postal_area_round_its_middle() {
+    // get_nearest_postcode at the street's middle takes the postal area holding it before any
+    // centroid: the point is in 10178 and the street's middle, 1,000 m east, in 10179.
+    let berlin = (52.52, 13.405);
+    let index = country_at(berlin, b"DE")
+        .boundary("10178", POSTCODE_AREA_LEVEL, 0, (-800.0, -800.0, 800.0, 500.0))
+        .boundary("10179", POSTCODE_AREA_LEVEL, 0, (-800.0, 500.0, 800.0, 2400.0))
+        .street("Rungestraße", &[(0.0, -100.0), (0.0, 2100.0)])
+        .centroid("10178", 0.0, 0.0)
+        .load();
+    let address = address_from(&index, berlin, 5.0, 0.0);
+    assert_eq!(address["road"], "Rungestraße");
+    assert_eq!(address["postcode"], "10179");
+}
+
+#[test]
 fn a_centroid_s_box_is_the_envelope_of_its_buffer_on_the_ellipsoid() {
     // expand_by_meters buffers the centroid on the geography (geography_box): at 20° N a degree
     // of latitude is 110,704 m, so a point 0.2255° north of a US centroid, 24,960 m off, is
@@ -188,6 +274,26 @@ fn grid_cell(origin: (f64, f64), north_m: f64, east_m: f64, n: i64) -> u64 {
     let p = at_from(origin, north_m, east_m);
     let cell = cell_id_at_level(p.lat as f64, p.lng as f64, 16);
     cell.wrapping_add_signed(n << 29)
+}
+
+/// The grid of the level-16 cells `cells`, each of its postcode, and of no postcode in every
+/// other cell.
+fn grid_of(dataset: &mut TestIndex, cells: &[(u64, &str)]) {
+    let mut cells = cells.to_vec();
+    cells.sort();
+    let mut runs = Vec::new();
+    for (i, &(cell, postcode)) in cells.iter().enumerate() {
+        runs.push((cell, postcode));
+        let next = cell.wrapping_add(1 << 29);
+        if cells.get(i + 1).is_none_or(|&(c, _)| c != next) {
+            runs.push((next, ""));
+        }
+    }
+    // A run goes on until a row of another postcode.
+    runs.dedup_by(|run, before| run.1 == before.1);
+    for (cell, postcode) in runs {
+        dataset.grid_run(postcode, cell);
+    }
 }
 
 #[test]
@@ -249,5 +355,72 @@ fn a_house_with_its_own_postcode_names_the_point_before_the_grid() {
         .load();
     let address = address_from(&index, point, 2.0, 0.0);
     assert_eq!(address["house_number"], "12");
+    assert_eq!(address["postcode"], "19083");
+}
+
+#[test]
+fn a_street_takes_the_grid_s_postcode_at_its_middle() {
+    // The grid stands for get_nearest_postcode where Nominatim runs it, at the street's centroid
+    // (placex_update). Gilmore Road runs 2 km east, its middle 900 m east of the point: the grid's
+    // cell of the middle is 19018's and the cell of the point 19026's, and 19333's centroid, 40 m
+    // from the middle, comes after the grid.
+    let point = (39.93538, -75.29800);
+    let mut dataset = country_at(point, b"US");
+    dataset.street("Gilmore Road", &[(0.0, -100.0), (0.0, 1000.0), (0.0, 1900.0)])
+        .centroid("19333", 40.0, 900.0);
+    grid_of(&mut dataset, &[(grid_cell(point, 0.0, 900.0, 0), "19018"), (grid_cell(point, 5.0, 0.0, 0), "19026")]);
+    let address = address_from(&dataset.load(), point, 5.0, 0.0);
+    assert_eq!(address["road"], "Gilmore Road");
+    assert_eq!(address["postcode"], "19018");
+}
+
+#[test]
+fn a_street_whose_middle_neither_the_grid_nor_a_centroid_reaches_has_none() {
+    // The grid's cell of the point has a postcode, but the street's middle lies in a cell of
+    // none and in no centroid's box: the street has none, so neither has its answer.
+    let point = (39.93538, -75.29800);
+    let mut dataset = country_at(point, b"US");
+    dataset.street("Gilmore Road", &[(0.0, -100.0), (0.0, 1900.0)]);
+    grid_of(&mut dataset, &[(grid_cell(point, 5.0, 0.0, 0), "19026")]);
+    let address = address_from(&dataset.load(), point, 5.0, 0.0);
+    assert_eq!(address["road"], "Gilmore Road");
+    assert_eq!(address["postcode"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_house_takes_the_grid_s_postcode_at_its_street_s_middle_else_at_the_house() {
+    // The street wins and its house 30 m south gives the number, in the grid's cell south of the
+    // point's. The house has no postcode of its own, so it takes its street's: the grid's at the
+    // street's middle, 1,450 m east, ahead of the grid's at the house and at the point.
+    let point = (39.93538, -75.29800);
+    let (house, middle) = ((-30.0, 0.0), (0.0, 1450.0));
+    assert_ne!(grid_cell(point, house.0, house.1, 0), grid_cell(point, 0.0, 0.0, 0));
+    let cells = |middle_postcode| [
+        (grid_cell(point, middle.0, middle.1, 0), middle_postcode),
+        (grid_cell(point, house.0, house.1, 0), "19073"),
+        (grid_cell(point, 0.0, 0.0, 0), "19026"),
+    ];
+    let mut dataset = country_at(point, b"US");
+    dataset.street("Gilmore Road", &[(0.0, -100.0), (0.0, 3000.0)]).address("7", house.0, house.1);
+    grid_of(&mut dataset, &cells("19018"));
+    let address = address_from(&dataset.load(), point, 0.0, 0.0);
+    assert_eq!(address["house_number"], "7");
+    assert_eq!(address["postcode"], "19018");
+
+    // Where the street's middle lies in a cell of no postcode and no centroid's box holds it, the
+    // street has none, and get_nearest_postcode runs at the house.
+    let mut dataset = country_at(point, b"US");
+    dataset.street("Gilmore Road", &[(0.0, -100.0), (0.0, 3000.0)]).address("7", house.0, house.1);
+    grid_of(&mut dataset, &cells(""));
+    let address = address_from(&dataset.load(), point, 0.0, 0.0);
+    assert_eq!(address["house_number"], "7");
+    assert_eq!(address["postcode"], "19073");
+
+    // A street's stored postcode comes before the grid.
+    let mut dataset = country_at(point, b"US");
+    dataset.street("Gilmore Road", &[(0.0, -100.0), (0.0, 3000.0)]).way_postcode("19083").address("7", house.0, house.1);
+    grid_of(&mut dataset, &cells("19018"));
+    let address = address_from(&dataset.load(), point, 0.0, 0.0);
+    assert_eq!(address["house_number"], "7");
     assert_eq!(address["postcode"], "19083");
 }

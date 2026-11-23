@@ -115,7 +115,11 @@ struct AdminPolygon {
     uint32_t name_id;
     uint8_t admin_level;
     uint8_t place_type_override = 0; // AdminPlaceType — overrides admin_level for field mapping
-    uint8_t _pad2 = 0, _pad3 = 0;
+    // A place area's own place tag (AdminPlaceType) where it links a place
+    // node of another type, whose type is its place_type_override and labels
+    // it (find_linked_place); 0 where its place type is its own.
+    uint8_t own_place_type = 0;
+    uint8_t _pad3 = 0;
     float area;                   // of the exact rings, holes subtracted
     uint16_t country_code;
     uint16_t _pad4 = 0;
@@ -127,14 +131,14 @@ static_assert(sizeof(AdminPolygon) == 20, "AdminPolygon must be 20 bytes");
 // record's offset is the running one, a tombstone's included, whose block is
 // empty, as is that of a polygon a tier left without rings. A tombstone's
 // name_id is NO_DATA. level_override is admin_level << 4 | the
-// place_type_override, both under 16.
+// place_type_override, both under 16, and own_place_type is the polygon's.
 struct AdminPolygonRecord {
     uint32_t ring_offset;
     uint32_t name_id;
     float area;
     uint16_t country_code;
     uint8_t level_override;
-    uint8_t reserved = 0;
+    uint8_t own_place_type = 0;
 };
 static_assert(sizeof(AdminPolygonRecord) == 16, "AdminPolygonRecord must be 16 bytes");
 
@@ -147,7 +151,14 @@ inline AdminPolygonRecord admin_polygon_record(const AdminPolygon& p, uint32_t r
     r.area = p.area;
     r.country_code = p.country_code;
     r.level_override = static_cast<uint8_t>(p.admin_level << 4 | p.place_type_override);
+    r.own_place_type = p.own_place_type;
     return r;
+}
+
+// The place type of a place area's own place tag: own_place_type where it
+// links a place node of another type, else place_type_override.
+inline uint8_t own_place_tag(const AdminPolygon& p) {
+    return p.own_place_type ? p.own_place_type : p.place_type_override;
 }
 
 struct NodeCoord {

@@ -231,3 +231,29 @@ fn an_answer_with_no_locality_road_or_country_still_has_a_display_name() {
     assert_eq!(address_at(&index, 0.0, 0.0)["state"], "Xinjiang");
     assert_eq!(display_at(&index, 0.0, 0.0), "Emin County, Xinjiang");
 }
+
+#[test]
+fn a_place_area_linked_to_a_place_node_of_another_type_keeps_its_own_rank() {
+    // Weesp (R15419242, boundary=place, place=suburb) has the town node Weesp as its label member:
+    // find_linked_place links it, and the link labels the area town, but placex_update keeps a
+    // place area of rank 16 to 23 at its own place type's rank (its branch leaves
+    // parent_address_level unset, placex_triggers.sql:930-950, :1129), here the suburb's 20. So
+    // Weesp comes before Driemond, a village node promoted to 18 inside Amsterdam (admin_level
+    // 10, linked city: 16, the ring round Driemond, which overlaps Weesp), and the two
+    // Amsterdams meet, as in Nominatim's line.
+    let mut dataset = TestIndex::country("Netherlands", b"NL");
+    dataset.boundary("North Holland", 4, 7, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Amsterdam", 8, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Amsterdam", 10, 1, (-1500.0, -3000.0, 1500.0, 1000.0))
+        .boundary("Weesp", 15, 2, (-2000.0, -2000.0, 2000.0, 2000.0));
+    dataset.polygons.last_mut().unwrap().0.own_place_type = 4;
+    dataset.place("Driemond", 2, -400.0, 300.0)
+        .street("Maanhof", &[(0.0, -100.0), (0.0, 100.0)]);
+    let index = dataset.load();
+    assert_eq!(display_at(&index, 0.0, 0.0), "Maanhof, Weesp, Driemond, Amsterdam, North Holland, Netherlands");
+    let address = address_at(&index, 0.0, 0.0);
+    assert_eq!(address["town"], "Weesp");
+    assert_eq!(address["village"], "Driemond");
+    assert_eq!(address["city"], "Amsterdam");
+    assert_eq!(address["municipality"], "Amsterdam");
+}
