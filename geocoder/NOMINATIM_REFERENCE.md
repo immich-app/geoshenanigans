@@ -247,8 +247,12 @@ with `amenity=fountain`).
   but never takes the primary slot (the builder links it no parent street),
   unless a highway kind ranks it a street. A POI polygon of a multipolygon is
   its outer rings, without its holes, so a water multipolygon with an `inner`
-  member that could take the slot (a rank-30 POI, or a street) never does
-  either; a plain bay or glacier of holes keeps its parent street.
+  member the classifier makes one that could take the slot (a rank-30 POI, or
+  a street) takes the scan's own categories instead, and never the slot: one
+  the scan takes none of (a lake that is a swimming area) is no POI, so a
+  point on its island finds neither its name nor its road, nor the address
+  its `addr:*` tags give. A plain bay or glacier of holes keeps its parent
+  street.
 - Where no boundary and no street anchors the address (a coast no boundary
   covers), Nominatim finds nothing; a water POI that would have won the slot
   but for the lane still gives the answer its `landmark` and `places`,

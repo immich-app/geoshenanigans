@@ -271,7 +271,10 @@ std::vector<std::string> server_answers(const std::string& dir, const std::vecto
 #ifdef GEOCODER_GRID_QUERY_BIN
     const std::string coords = scratch + ".coords", answers = scratch + ".answers";
     {
+        // Each to the 1e-7 degree of the fixtures' nodes: a stream's own 6
+        // digits would round 47.14033 to 47.1403.
         std::ofstream f(coords);
+        f.precision(10);
         for (const auto& [lat, lng] : points) f << lat << " " << lng << "\n";
     }
     const std::string cmd = gctest::quoted(GEOCODER_GRID_QUERY_BIN) + " " + gctest::quoted(dir) + " < " +
@@ -1269,9 +1272,11 @@ TEST(a_water_object_written_as_its_kind_takes_the_importance_of_that_kind) {
 // a wetland nature reserve whose rank-30 tag (emergency=suction_point) no
 // tier ships, and a reservoir that is a building and an attraction, whose
 // class (building, the first of its fallback tags) Nominatim's POI lane
-// takes none of. Nor does a lake that is a swimming area, whose island, a
-// hole of it, the POI's polygon of its outer ring leaves out; a bay of a hole
-// never takes the slot anyway, and keeps its parent street.
+// takes none of. A lake that is a swimming area with an island, a hole of
+// it, which a POI's polygon of its outer ring would fill, is no POI: a point
+// on the island finds neither its name nor its road, nor the address it
+// carries. A bay of a hole never takes the slot anyway, and keeps its parent
+// street.
 TEST(a_water_multipolygon_that_is_a_rank_30_poi_is_written_as_that_poi_and_answered) {
     const ScratchDir root("water-relation-build");
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
@@ -1302,8 +1307,9 @@ TEST(a_water_multipolygon_that_is_a_rank_30_poi_is_written_as_that_poi_and_answe
                                               {"tourism", "attraction"}}));
     water.push_back(multipolygon(5045, 4045, {{"emergency", "suction_point"}, {"leisure", "nature_reserve"},
                                               {"name", "Ried Testdorf"}, {"natural", "wetland"}}));
-    TestObject island_lake = multipolygon(5046, 4046, {{"leisure", "swimming_area"}, {"name", "Inselsee Testdorf"},
-                                                        {"natural", "water"}});
+    TestObject island_lake = multipolygon(5046, 4046, {{"addr:housenumber", "5"}, {"addr:postcode", "8899"},
+                                                        {"addr:street", "Inselweg"}, {"leisure", "swimming_area"},
+                                                        {"name", "Inselsee Testdorf"}, {"natural", "water"}});
     island_lake.members.emplace_back(OsmType::Way, 4047, "inner");
     water.push_back(island_lake);
     water.push_back(multipolygon(5048, 4048, {{"building", "yes"}, {"landuse", "reservoir"}, {"name", "Stausee Testdorf"},
@@ -1318,7 +1324,7 @@ TEST(a_water_multipolygon_that_is_a_rank_30_poi_is_written_as_that_poi_and_answe
     const std::vector<PoiRecord> pois = poi_records_in(tree(out), "planet/poi/all");
     const int bay = int(PoiCategory::BAY), swimming = int(PoiCategory::SWIMMING_AREA);
     const std::vector<int> want = {int(PoiCategory::ATTRACTION), int(PoiCategory::NATURE_RESERVE), bay, bay, bay, bay,
-                                   swimming, swimming, swimming};
+                                   swimming, swimming};
     if (categories_of(pois) != want)
         for (const PoiRecord& pr : pois) std::printf("    category %d at %.4f\n", int(pr.category), pr.lng);
     CHECK(categories_of(pois) == want);
@@ -1336,7 +1342,7 @@ TEST(a_water_multipolygon_that_is_a_rank_30_poi_is_written_as_that_poi_and_answe
     };
     for (const Want& w : {Want{8.1424, swimming, true, 0}, Want{8.1439, swimming, true, 0}, Want{8.1454, bay, true, 0},
                           Want{8.1469, bay, true, 0}, Want{8.1484, bay, true, POI_FLAG_HIGHWAY},
-                          Want{8.1524, int(PoiCategory::NATURE_RESERVE), false, 0}, Want{8.1539, swimming, false, 0},
+                          Want{8.1524, int(PoiCategory::NATURE_RESERVE), false, 0},
                           Want{8.1554, int(PoiCategory::ATTRACTION), false, 0}, Want{8.1569, bay, true, 0}}) {
         const PoiRecord* pr = at(w.lng);
         REQUIRE(pr != nullptr);
@@ -1363,8 +1369,13 @@ TEST(a_water_multipolygon_that_is_a_rank_30_poi_is_written_as_that_poi_and_answe
             std::printf("    %s\n", answers[k].c_str());
         CHECK(answer_string(answers[k], {"address", "road"}) == std::optional<std::string>(roads[k]));
     }
-    // The nature reserve is in `places`.
+    // The nature reserve is in `places`, and the island lake nowhere.
     CHECK(says(answers[4], "Ried Testdorf"));
+    CHECK(at(8.1539) == nullptr);
+    const bool lake = says(answers[5], "Inselsee Testdorf") || says(answers[5], "Inselweg") || says(answers[5], "8899") ||
+                      answer_string(answers[5], {"address", "house_number"});
+    if (lake) std::printf("    %s\n", answers[5].c_str());
+    CHECK(!lake);
     if (!says(answers[0], "Badebucht Testdorf")) std::printf("    %s\n", answers[0].c_str());
 }
 

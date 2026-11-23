@@ -2241,10 +2241,13 @@ static int run(int argc, char* argv[]) {
                         // is a bay or a glacier, or else takes the scan's own
                         // categories below, as before, but never the primary
                         // slot (POI_FLAG_PLACES_ONLY), unless a highway kind
-                        // ranks it a street, as it ranks the closed way. Nor
-                        // does one of the classifier's that could take it (a
-                        // rank-30 POI, or a street) whose holes its polygon,
-                        // of the outer rings alone, leaves out.
+                        // ranks it a street, as it ranks the closed way. One
+                        // the classifier makes one that could take it (a
+                        // rank-30 POI, or a street) but that has holes, which
+                        // its polygon of the outer rings alone would fill,
+                        // takes the scan's own categories instead, and never
+                        // the slot: one of none is no POI, whose name, or
+                        // address, a point in a hole would find.
                         std::optional<PoiClassification> water_poi;
                         bool places_only = false;
                         const char* r_landuse = rel.tag("landuse");
@@ -2269,10 +2272,12 @@ static int run(int argc, char* argv[]) {
                                 else places_only = !(cls->flags & POI_FLAG_HIGHWAY);
                             }
                             if (water_poi) {
-                                poi_cat = water_poi->category;
-                                const bool could_lead = poi_cat != r_water || (water_poi->flags & POI_FLAG_HIGHWAY);
+                                const bool could_lead =
+                                    water_poi->category != r_water || (water_poi->flags & POI_FLAG_HIGHWAY);
                                 for (size_t mi = 0; could_lead && mi < rel.members.size(); mi++)
                                     if (rel.member_role(mi) == "inner") places_only = true;
+                                if (places_only) water_poi.reset();
+                                else poi_cat = water_poi->category;
                             }
                         }
                         // boundary
