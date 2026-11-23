@@ -31,6 +31,7 @@
 #include "id_allocator.h"
 #include "place_claims.h"
 #include "parallel.h"
+#include "postcode_grid_build.h"
 #include "ranked_bits.h"
 
 // The records one POI tier's files carry, in record order, and how many of
@@ -501,6 +502,15 @@ struct ParsedData {
         double lng() const { return (sum_lng_e7 / 1e7) / static_cast<double>(count); }
     };
     std::unordered_map<uint64_t, PostcodeAccum> postcode_accum;
+
+    // The postcode grid (postcode_grid_build.h): the postcodes its cells
+    // name and the cells holding votes, found once on the full data
+    // (collect_postcode_grid; a continent keeps the cells whose centre lies
+    // in it), and the region's postcode_grid.bin, which every mode dir holds
+    // alike: empty for a region of no such cell.
+    std::vector<postcode_grid::GridCode> postcode_grid_codes;
+    std::vector<uint64_t> postcode_grid_cells;
+    std::vector<uint8_t> postcode_grid_file;
 
     // Boundaries' label/wikidata claims on place nodes (build-time only,
     // consumed by link_places_by_name to hide the nodes like Nominatim's

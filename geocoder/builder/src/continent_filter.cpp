@@ -417,8 +417,23 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         for (const Postcode* p : inside) out.postcode_accum.emplace(p->first, p->second);
     }
 
+    // --- The postcode grid's cells (spatially filtered), and its file ---
+    // A cell is the continent's when its centre is, as an admin cell is
+    // (cell_in_continent); the codes stay whole, so the cells' indices hold.
+    {
+        using namespace postcode_grid;
+        const auto& cells = full.postcode_grid_cells;
+        out.postcode_grid_cells = parallel_collect<uint64_t>(cells.size(), [&](size_t i, std::vector<uint64_t>& kept) {
+            if (cell_in_continent(cell_at(pos_of(cells[i]), GRID_LEVEL), bbox, polygon)) kept.push_back(cells[i]);
+        });
+        if (!out.postcode_grid_cells.empty()) {
+            out.postcode_grid_codes = full.postcode_grid_codes;
+            out.postcode_grid_file = encode_file(grid_rows(out.postcode_grid_cells, out.postcode_grid_codes, GRID_LEVEL));
+        }
+    }
+
     drop(full.way_parent_ids, full.admin_parent_ids, full.way_postcode_ids, full.interp_postcode_ids,
-         full.addr_postcode_ids, full.postcode_accum);
+         full.addr_postcode_ids, full.postcode_accum, full.postcode_grid_cells, full.postcode_grid_codes);
     log_phase(("      " + std::string(bbox.name) + " filter: parent + postcode projection").c_str(), _ft, _fc);
 
     // --- Remap sorted cell arrays for all 5 types (preserving INTERIOR_FLAG) ---
@@ -550,6 +565,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
               << " places=" << out.place_nodes.size()
               << " admins=" << out.admin_polygons.size()
               << " postcodes=" << out.postcode_accum.size()
+              << " postcode_grid_cells=" << out.postcode_grid_cells.size()
               << std::endl;
 
     return out;

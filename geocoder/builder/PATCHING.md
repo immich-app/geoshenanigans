@@ -581,7 +581,7 @@ build 23's unit of the old rows with their cells and entries files, and take
 257,858,727 B (245.91 MiB), and with-addresses and max-quality, whose full
 dir holds the same two files, 0.14 MiB more than above too.
 
-## Patch Format (.gcpatch, version 19)
+## Patch Format (.gcpatch, version 20)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -591,8 +591,8 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=19 (u32) + flags=0 (u32)
-  (a v19 patcher accepts only v19 patches; the v8 to v19 changes are marked
+Header: "GCPATCH\0" (8) + version=20 (u32) + flags=0 (u32)
+  (a v20 patcher accepts only v20 patches; the v8 to v20 changes are marked
   below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
@@ -779,6 +779,16 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   `postcode_centroid_cells.bin`, whose sizes the client list gives; a
   family sent unchanged is copied as its files sit. The content merge sends
   a centroid whose point moved as a DELETE and an INSERT.
+  (v20) The postcode grid merges as its logical rows (24 bytes: the run's
+  first cell, its country and its code, as `src/postcode_grid.h` lays a
+  LogicalRow out) under `postcode_grid.bin`'s id, right after the postcode
+  centroids' section, in every patch (an empty merge where neither day has
+  the file). It has no string field: the grid holds its postcodes as text.
+  The patcher decodes the old file strictly and encodes the new rows as
+  `postcode_grid.bin`, whose size the client list gives; a grid sent
+  unchanged is copied as it sits. A dir that gets its first grid or loses
+  its last merges as any other day. A run whose postcode or first cell
+  moved goes as a DELETE and an INSERT.
   A child stream (street_nodes, interp_nodes, addr_vertices, poi_vertices,
   in the section right after its parent's) replays along its parent by
   position: its MATCH bytes are the old bytes of the parent records at the
@@ -919,6 +929,7 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 9 to 11 its three lists, which the geo entry deltas name. v19 merges the
 postcode centroids under id 23, and ids 24 and 25 name no file: the patcher
 writes the cells file beside the centroids, and the entries file is gone.
+v20 gives id 36 to the postcode grid.
 
 | Id | File | How it travels |
 |----|------|----------------|
@@ -949,6 +960,7 @@ writes the cells file beside the centroids, and the entries file is gone.
 | 29-33 | `strings_core.bin` … `strings_poi.bin` | the strings section, of the decoded pools; a tier the old dir lacks, whole (its FCC2 file) |
 | 34 | `interp_postcodes.bin` | parallel delta along interp_ways, remap kind 2 |
 | 35 | `geo_entries.bin` | the geo index's blocks, rebuilt with `geo_cells.bin` (8) |
+| 36 | `postcode_grid.bin` | merge of the postcode grid's logical rows (`builder/src/postcode_grid.h`, decoded) at stride 24 (v20), no string field; the patcher encodes `postcode_grid.bin` from them |
 
 The four admin geometry files (`ADMIN_SLOT_FAMILIES`) follow the place nodes
 as arc_index, arc_vertices, admin_polygons, admin_rings, ahead of the admin

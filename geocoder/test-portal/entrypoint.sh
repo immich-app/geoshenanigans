@@ -31,10 +31,11 @@ selection_files() {
         # Everything comes from the admin-minimal/ subdir (filtered: admin
         # polygons of levels 2-8, place types in {city,town,village,hamlet}):
         # its own polygons on the minimal arc set, cell index, place nodes,
-        # core strings and layout.
+        # core strings and layout, and the postcode grid.
         for f in admin_cells.bin admin_entries.bin \
                  admin_polygons.bin admin_rings.bin arc_index.bin arc_vertices.bin \
-                 place_cells.bin place_hidden.bin place_nodes.bin strings_core.bin strings_layout.json; do
+                 place_cells.bin place_hidden.bin place_nodes.bin strings_core.bin strings_layout.json \
+                 postcode_grid.bin; do
             echo "admin-minimal $f"
         done
         return
@@ -45,7 +46,7 @@ selection_files() {
              interp_ways.bin interp_nodes.bin interp_postcodes.bin \
              admin_cells.bin admin_entries.bin admin_parents.bin \
              place_cells.bin place_hidden.bin place_nodes.bin \
-             postcode_centroids.bin postcode_centroid_cells.bin \
+             postcode_centroids.bin postcode_centroid_cells.bin postcode_grid.bin \
              way_parents.bin way_postcodes.bin \
              strings_core.bin strings_street.bin strings_addr.bin strings_postcode.bin; do
         echo "full $f"
@@ -131,10 +132,11 @@ fetch_unit() {
 }
 
 # Files a region may lack (interp_postcodes.bin outside TIGER regions, the
-# postcode centroids): the template's optional files of mode full.
+# postcode centroids and grid): the template's optional files of mode full
+# and admin-minimal.
 optional_file() {
     case "$1" in
-        interp_postcodes.bin|postcode_centroids.bin|postcode_centroid_cells.bin)
+        interp_postcodes.bin|postcode_centroids.bin|postcode_centroid_cells.bin|postcode_grid.bin)
             return 0 ;;
     esac
     return 1

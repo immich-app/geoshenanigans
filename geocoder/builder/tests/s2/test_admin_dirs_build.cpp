@@ -15,7 +15,8 @@
 // server takes its distance from. A fresh build writes its streets and
 // addresses in cell order, whatever their names, and its postcode centroids
 // in cell order in each mode dir, which a chained build writes as a fresh one
-// does.
+// does, and its postcode grid of a grid country's addresses in every mode dir
+// alike.
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -39,6 +40,7 @@
 #include "id_allocator.h"
 #include "pbf_test_objects.h"
 #include "postcode_files.h"
+#include "postcode_grid.h"
 #include "scratch_dir.h"
 #include "side_blocks.h"
 #include "string_files.h"
@@ -1311,4 +1313,64 @@ TEST(postcode_centroids_keep_no_slots_and_a_region_of_no_valid_postcode_has_file
         CHECK(none.at(at + postcode_files::CENTROIDS_FILE) == std::vector<char>({0, 0, 0, 0, 'P', 'C', 'C', '1'}));
         CHECK(none.at(at + postcode_files::CELLS_FILE).empty());
     }
+}
+
+TEST(a_build_writes_the_postcode_grid_of_its_us_addresses_in_every_mode_dir) {
+    // Testland as the United States: 19026's houses along 47.05 N from 8.02
+    // to 8.12 E, 19018's from 8.135 to 8.15. At 8.121 E the nearest centroid
+    // is 19018's (8.1425, 1.6 km) rather than 19026's (8.07, 3.9 km); the
+    // house 76 m west of it is 19026's. A house in Testreich (DE) names a US
+    // ZIP and casts no vote.
+    const ScratchDir root("postcode-grid-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log", out = root.path() + "/out";
+    std::vector<Postcoded> houses;
+    for (int i = 0; i <= 20; i++) houses.push_back({8100 + i, 470500000, 80200000 + 50000 * i, "19026"});
+    for (int i = 0; i < 4; i++) houses.push_back({8200 + i, 470500000, 81350000 + 50000 * i, "19018-0002"});
+    houses.push_back({8300, 468500000, 80500000, "19026"});
+    std::vector<TestObject> objects = with_postcodes(houses);
+    for (TestObject& o : objects)
+        if (o.type == OsmType::Relation && o.id == 40)
+            for (auto& [key, value] : o.tags)
+                if (key == "ISO3166-1" || key == "ISO3166-1:alpha2") value = "US";
+    write_test_pbf(pbf, objects, 1000);
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output", "--multi-quality"}, log));
+    const auto files = tree(out);
+
+    // Every mode dir of the planet and of Europe holds it, the same bytes;
+    // no other region does.
+    const std::string name = postcode_grid::FILE_NAME;
+    REQUIRE(files.count("planet/admin/" + name));
+    const std::vector<char>& grid = files.at("planet/admin/" + name);
+    for (const char* region : {"planet", "europe"})
+        for (const char* mode : {"admin", "no-addresses", "full", "admin-minimal", "admin-minimal-poi"}) {
+            const std::string at = std::string(region) + "/" + mode + "/" + name;
+            REQUIRE(files.count(at));
+            CHECK(files.at(at) == grid);
+        }
+    for (const std::string& file : names_of(files))
+        if (fs::path(file).filename() == name) CHECK(file.rfind("planet/", 0) == 0 || file.rfind("europe/", 0) == 0);
+
+    // Its runs: 19018 and 19026 of the US, at level 16; each house's cell
+    // has its postcode.
+    std::vector<postcode_grid::LogicalRow> rows;
+    postcode_grid::decode(reinterpret_cast<const uint8_t*>(grid.data()), grid.size(),
+                          [&](const postcode_grid::LogicalRow& r) { rows.push_back(r); });
+    REQUIRE(!rows.empty());
+    std::set<std::string> named;
+    for (const auto& r : rows) {
+        int level = 0;
+        CHECK(postcode_grid::level_of(r.cell, level) && level == 16);
+        CHECK(r.country_code == 0 || r.country_code == pack_country_code('U', 'S'));
+        if (r.country_code) named.insert(std::string(postcode_grid::code_of(r)));
+    }
+    CHECK(named == std::set<std::string>({"19018", "19026"}));
+    auto grid_at = [&](double lat, double lng) {
+        const uint64_t cell = S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(16).id();
+        std::string code = "-";
+        for (const auto& r : rows)
+            if (r.cell <= cell) code = r.country_code ? std::string(postcode_grid::code_of(r)) : "-";
+        return code;
+    };
+    for (const Postcoded& h : houses)
+        if (h.lat == 470500000) CHECK_EQ(grid_at(h.lat * 1e-7, h.lon * 1e-7), std::string(h.postcode).substr(0, 5));
 }

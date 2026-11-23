@@ -30,6 +30,7 @@
 #include "place_files.h"
 #include "polygon_rings.h"
 #include "postcode_files.h"
+#include "postcode_grid.h"
 #include "postcode_validation.h"
 #include "ranked_bits.h"
 #include "record_files_io.h"
@@ -597,6 +598,25 @@ void collect_postcode_centroids(ParsedData& data) {
     data.postcode_accum = std::move(osm);
 }
 
+void collect_postcode_grid(ParsedData& data) {
+    using namespace postcode_grid;
+    const AdminRings countries = border_country_rings(data);
+    GridCells grid = grid_cells(
+        data.addr_points, data.addr_postcode_ids, data.interp_ways, data.interp_nodes, data.interp_postcode_ids,
+        [&](uint32_t id) { return std::string_view(data.get_string(id)); },
+        [&](double lat, double lng) { return country_at(data, countries, lat, lng); },
+        [](double lat, double lng) {
+            return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(GRID_LEVEL).id() >> cell_shift(GRID_LEVEL);
+        });
+    data.postcode_grid_codes = std::move(grid.codes);
+    data.postcode_grid_cells = std::move(grid.cells);
+    if (!data.postcode_grid_cells.empty())
+        data.postcode_grid_file = encode_file(grid_rows(data.postcode_grid_cells, data.postcode_grid_codes, GRID_LEVEL));
+    std::cerr << "Postcode grid: " << grid.address_votes << " address votes, " << grid.tiger_votes << " TIGER line votes, "
+              << data.postcode_grid_codes.size() << " postcodes, " << data.postcode_grid_cells.size() << " cells, "
+              << data.postcode_grid_file.size() << " bytes" << std::endl;
+}
+
 // Writes centroids' postcode files into dir (postcode_files.h), the
 // centroids in their logical order; returns the cells they are in.
 static size_t write_postcode_files(const std::string& dir, const std::vector<postcode_files::LogicalCentroid>& centroids) {
@@ -788,6 +808,15 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             const size_t cells = write_postcode_files(output_dir, centroids);
             std::cerr << "postcode centroids: " << centroids.size() << " in " << cells << " cells" << std::endl;
             log_phase((label + "postcode centroids").c_str(), _pt, _pc);
+        }));
+    }
+
+    // The postcode grid (postcode_grid.h), an optional file: the same bytes
+    // in every mode dir of a region.
+    if (!data.postcode_grid_file.empty()) {
+        write_futures.push_back(std::async(std::launch::async, [&] {
+            write_binary_file(output_dir + "/" + postcode_grid::FILE_NAME, reinterpret_cast<const char*>(data.postcode_grid_file.data()),
+                              data.postcode_grid_file.size());
         }));
     }
 
@@ -1243,6 +1272,10 @@ void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, con
 
     string_files::write_file(dir + "/" + STR_TIER_FILENAMES[0], strings.core.data(), strings.core.size());
     write_strings_layout(dir, strings.bases);
+    // The postcode grid, which names no string: the mode dirs' bytes.
+    if (!data.postcode_grid_file.empty())
+        write_binary_file(dir + "/" + postcode_grid::FILE_NAME, reinterpret_cast<const char*>(data.postcode_grid_file.data()),
+                          data.postcode_grid_file.size());
 
     size_t kept = 0;
     for (uint32_t p : records.polygon_of) kept += p != NO_DATA;
