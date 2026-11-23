@@ -16,6 +16,7 @@
 #include <numeric>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -68,6 +69,7 @@
 #include "memory_limit.h"
 #include "output_dir.h"
 #include "write_schedule.h"
+#include "zlib_blob.h"
 
 // The POI writer reads PoiRecord as the logical record it encodes.
 static_assert(sizeof(PoiRecord) == poi_files::LOGICAL_STRIDE && offsetof(PoiRecord, vertex_offset) == poi_files::OFF_VERTEX_OFFSET &&
@@ -317,21 +319,22 @@ static ExternalPostcodes read_external_postcodes(const std::string& path) {
 
 // GeoNames' postal places (--postal-places, postal_cities_build.h's
 // parse_places: our TSV, or GeoNames' own files, plain or gzipped), by
-// their ZIP as the postcode grid's pattern takes it.
+// their ZIP as the postcode grid's pattern takes it. A gzipped file is
+// inflated in memory: its path goes to no shell.
 static postal_cities::Places read_postal_places(const std::string& path) {
-    std::optional<ScratchDir> scratch;
-    std::string tsv = path;
-    if (path.size() > 3 && path.compare(path.size() - 3, 3, ".gz") == 0) {
-        scratch.emplace("postal-places");
-        tsv = scratch->path() + "/postal_places.tsv";
-        const std::string cmd = "gunzip -c '" + path + "' > '" + tsv + "'";
-        if (system(cmd.c_str()) != 0) throw std::runtime_error("--postal-places: failed to gunzip " + path);
-    }
-    std::ifstream f(tsv);
+    std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("--postal-places: failed to open " + path);
-    postal_cities::Places places = postal_cities::parse_places(f, postcode_grid::grid_postcode);
+    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     if (f.bad()) throw std::runtime_error("--postal-places: failed to read " + path);
-    return places;
+    if (path.size() > 3 && path.compare(path.size() - 3, 3, ".gz") == 0) {
+        try {
+            text = gzip_inflate(text);
+        } catch (const std::runtime_error& e) {
+            throw std::runtime_error("--postal-places: " + path + ": " + e.what());
+        }
+    }
+    std::istringstream in(std::move(text));
+    return postal_cities::parse_places(in, postcode_grid::grid_postcode);
 }
 
 // Yesterday's postal cities (--prev-postal-cities): any mode dir's

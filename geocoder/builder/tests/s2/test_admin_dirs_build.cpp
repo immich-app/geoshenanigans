@@ -34,6 +34,7 @@
 
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
+#include <zlib.h>
 
 #include "addr_files.h"
 #include "country_code.h"
@@ -1544,6 +1545,20 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
                                                                                "US 19400 Postalton"}));
     const auto chained = tree(build("chained", {"--prev-output", out, "--prev-postal-cities", out + "/planet/admin/" + name}));
     CHECK(chained.at("planet/admin/" + name) == table);
+    // The same names gzipped, at a path a shell would read otherwise.
+    const std::string gz = root.path() + "/geonames' places $(false).tsv.gz";
+    {
+        std::ifstream f(places);
+        const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        gzFile out = gzopen(gz.c_str(), "wb");
+        REQUIRE(out != nullptr);
+        REQUIRE(gzwrite(out, text.data(), unsigned(text.size())) == int(text.size()));
+        REQUIRE(gzclose(out) == Z_OK);
+    }
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/gz", pbf, "--continents", "--multi-output", "--multi-quality",
+                         "--postal-places", gz},
+                        log));
+    CHECK(tree(root.path() + "/gz").at("planet/admin/" + name) == table);
     // A malformed table of yesterday's fails the build.
     {
         std::ofstream f(yesterday, std::ios::binary | std::ios::trunc);
