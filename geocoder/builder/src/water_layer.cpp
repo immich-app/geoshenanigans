@@ -1107,7 +1107,8 @@ std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const
         const Object& obj = b.objects[o];
         auto keeps = [&](bool margin) {
             if (obj.type == ObjectType::SYNTHETIC) return true;
-            if (water_major_keeps(obj.km2, false, false, margin && was_major[o])) return true;
+            if (water_major_keeps(obj.km2, false, false, margin && was_major[o], is_coastal(obj.tags.code)))
+                return true;
             if (!obj.tags.river_area) return false;
             const uint32_t g = groups.find(o);
             return water_major_keeps(river_km2[g], true, river_wikidata[g], margin && river_was_major[g]);

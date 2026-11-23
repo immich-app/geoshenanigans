@@ -369,6 +369,21 @@ TEST(the_major_tier_takes_areas_of_100_km2_and_wikidata_rivers_of_5) {
     CHECK(interior > 0);
 }
 
+TEST(the_major_tier_takes_bays_and_harbours_of_10_km2) {
+    Collected c = fixture();
+    // Squares of 0.05 degrees at 47 north (about 21 km²): a bay, a harbour
+    // and a lake; a bay of 0.02 degrees (about 3.4 km²).
+    c.closed_ways.push_back({63, tags(code::kNaturalBay, "Kiel Fjord"), square(kLat - 2000000, kLng, 500000)});
+    c.closed_ways.push_back({64, tags(10, "Sydney Harbour"), square(kLat - 3000000, kLng, 500000)});
+    c.closed_ways.push_back({65, tags(code::kLake, "Middle Lake"), square(kLat - 4000000, kLng, 500000)});
+    c.closed_ways.push_back({66, tags(code::kNaturalBay, "Small Bay"), square(kLat - 5000000, kLng, 200000)});
+    const Layer layer = build(c);
+    std::set<std::string> major;
+    for (size_t p = 0; p < layer.size(); p++)
+        if (layer.major[p]) major.insert(name_of(layer, p));
+    CHECK(major == std::set<std::string>({"Kiel Fjord", "Sydney Harbour"}));
+}
+
 TEST(a_regions_share_holds_the_polygons_its_cells_list_whole_with_their_names) {
     const Layer planet = build(fixture());
     // The cells of the lake alone.

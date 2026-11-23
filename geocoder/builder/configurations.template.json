@@ -168,7 +168,7 @@
         "major": {
           "label": "Major (~98K areas)",
           "precision_m": 37.5,
-          "description": "The seas and oceans, in builds that pin the marine areas; lakes, bays, straits, wetlands and glaciers of 100 km² or more; and whole rivers and canals whose areas sum to 100 km², or 5 km² with a Wikidata item. Those are the thresholds to enter: one in the previous build's tier stays down to 90 km², or 4.5 km² for a river or canal with a Wikidata item. ~37 m shores.",
+          "description": "The seas and oceans, in builds that pin the marine areas; lakes, wetlands and glaciers of 100 km² or more; bays, straits, fjords, sounds, lagoons and harbours of 10 km² or more; and whole rivers and canals whose areas sum to 100 km², or 5 km² with a Wikidata item. Those are the thresholds to enter: one in the previous build's tier stays down to 90 km², 9 km² for coastal water, or 4.5 km² for a river or canal with a Wikidata item. ~37 m shores.",
           "order": 2
         },
         "all": {

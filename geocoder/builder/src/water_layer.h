@@ -288,7 +288,8 @@ struct PolygonIdentities {
 PolygonIdentities polygon_identities(const Build& b);
 
 // The major tier of the planet (water_classify.h): every marine area, each
-// other object by its own area, and each river object by its river's, the
+// other object by its own area and kind, and each river object by its
+// river's, the
 // river objects grouped by their waterway relation (a naming key of one), by
 // wikidata item (theirs, or that of a line of their key in them) and by
 // local name along river polygons that share an arc. An object or river

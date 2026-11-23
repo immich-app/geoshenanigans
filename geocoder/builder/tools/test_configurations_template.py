@@ -76,7 +76,7 @@ class WaterAxisTest(unittest.TestCase):
             return float(re.search(rf"inline constexpr double {name} = ([0-9.]+);", header).group(1))
 
         keep = constant("kMajorKeepPercent") / 100
-        km2 = [constant("kMajorAreaKm2"), constant("kMajorWikidataRiverKm2")]
+        km2 = [constant("kMajorAreaKm2"), constant("kMajorCoastalKm2"), constant("kMajorWikidataRiverKm2")]
         with open(PATCHING) as f:
             row = next(line for line in f if line.startswith("| `water/major/"))
         for text in (load_template()["axes"]["water"]["values"]["major"]["description"], row):
