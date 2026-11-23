@@ -26,6 +26,14 @@ SplitRing box_ring(int32_t lat, int32_t lng, int32_t h, int32_t w, int64_t way) 
     return r;
 }
 
+// The ring the other way round, each edge with its way: edge i runs from
+// vertex i to the next, so the ways turn round and move one place.
+void turn(SplitRing& ring) {
+    std::reverse(ring.v.begin(), ring.v.end());
+    std::reverse(ring.way.begin(), ring.way.end());
+    std::rotate(ring.way.begin(), ring.way.begin() + 1, ring.way.end());
+}
+
 // A lake of 1.6 x 1.6 degrees from (47, 8) whose shore wiggles, with an n x n
 // grid of square islands, each `side` e7 units, and `extra` holes besides.
 SplitPolygon lake(int n, int32_t side, std::vector<SplitRing> extra = {}) {
@@ -48,7 +56,7 @@ SplitPolygon lake(int n, int32_t side, std::vector<SplitRing> extra = {}) {
         for (int j = 0; j < n; j++) {
             SplitRing h = box_ring(lat0 + 200000 + i * pitch + 1234, lng0 + 200000 + j * pitch + 4321, side, side,
                                    10 * (i * n + j) + 10);
-            std::reverse(h.v.begin(), h.v.end());
+            turn(h);
             p.holes.push_back(h);
         }
     for (SplitRing& h : extra) p.holes.push_back(h);
@@ -139,7 +147,7 @@ TEST(an_island_a_cut_crosses_is_cut_with_its_lake_and_each_stretch_of_cut_is_sha
     // 81 islands, and a long one between two of their rows across the whole
     // lake, which every cut along a meridian crosses.
     std::vector<SplitRing> long_isle = {box_ring(475800000, 80500000, 1000000, 15000000, 9000)};
-    std::reverse(long_isle[0].v.begin(), long_isle[0].v.end());
+    turn(long_isle[0]);
     const SplitPolygon p = lake(9, 100000, long_isle);
     const std::vector<SplitPolygon> pieces = split_polygon(p, 32);
     REQUIRE(pieces.size() > 1);
@@ -183,8 +191,8 @@ TEST(rings_that_cross_or_run_either_way_are_cut_by_what_they_hold_even_odd) {
                                        box_ring(475000000, 85000000, 400000, 400000, 7100),
                                        box_ring(475200000, 85200000, 400000, 400000, 7200)};
     SplitPolygon p = lake(20, 100000, crossing);
-    std::reverse(p.outer.v.begin(), p.outer.v.end());
-    for (size_t h = 0; h < p.holes.size(); h += 3) std::reverse(p.holes[h].v.begin(), p.holes[h].v.end());
+    turn(p.outer);
+    for (size_t h = 0; h < p.holes.size(); h += 3) turn(p.holes[h]);
     const std::vector<SplitPolygon> pieces = split_polygon(p, 64);
     REQUIRE(pieces.size() > 6);
     std::mt19937 rng(13);
@@ -200,11 +208,6 @@ TEST(the_same_polygon_cuts_the_same_way_whatever_its_rings_start_and_run) {
     std::rotate(q.outer.v.begin(), q.outer.v.begin() + 17, q.outer.v.end());
     std::rotate(q.outer.way.begin(), q.outer.way.begin() + 17, q.outer.way.end());
     // Every ring the other way round, each edge with its way.
-    auto turn = [](SplitRing& ring) {
-        std::reverse(ring.v.begin(), ring.v.end());
-        std::reverse(ring.way.begin(), ring.way.end());
-        std::rotate(ring.way.begin(), ring.way.begin() + 1, ring.way.end());
-    };
     turn(r.outer);
     for (SplitRing& h : r.holes) turn(h);
     const std::vector<SplitPolygon> a = split_polygon(p, 64), b = split_polygon(q, 64), c = split_polygon(r, 64);
@@ -232,7 +235,7 @@ TEST(each_lobe_a_cut_leaves_on_one_side_keeps_its_own_key_whatever_its_rings_sta
             const int32_t lat = s + 200000 + i * 1000000, lng = w + 200000 + j * 1000000;
             if (lat + 100000 > s + 5900000 && lat < s + 10100000 && lng + 100000 > w + 1900000) continue;
             SplitRing h = box_ring(lat, lng, 100000, 100000, 1000 + 10 * (i * 16 + j));
-            std::reverse(h.v.begin(), h.v.end());
+            turn(h);
             p.holes.push_back(h);
         }
     // Each piece's key, and the smallest vertex of its outer ring.
@@ -244,11 +247,6 @@ TEST(each_lobe_a_cut_leaves_on_one_side_keeps_its_own_key_whatever_its_rings_sta
             CHECK(out.emplace(q.key, least).second);
         }
         return out;
-    };
-    auto turn = [](SplitRing& ring) {
-        std::reverse(ring.v.begin(), ring.v.end());
-        std::reverse(ring.way.begin(), ring.way.end());
-        std::rotate(ring.way.begin(), ring.way.begin() + 1, ring.way.end());
     };
     const std::vector<SplitPolygon> a = split_polygon(p, 64);
     REQUIRE(a.size() > 2);
@@ -287,7 +285,7 @@ TEST(a_lobe_a_lake_gains_on_one_side_of_a_cut_leaves_the_other_lobes_keys_as_the
             for (int j = 0; j < 2; j++) {
                 SplitRing h = box_ring(s + 200000 + i * 390000, w + 300000 + j * 1000000, 100000, 100000,
                                        1000 + 10 * (i * 2 + j));
-                std::reverse(h.v.begin(), h.v.end());
+                turn(h);
                 p.holes.push_back(h);
             }
         return p;
@@ -344,7 +342,7 @@ TEST(each_stretch_of_cut_is_one_edge_of_both_pieces_beside_it_when_one_side_is_c
     for (int i = 0; i < 10; i++)
         for (int j = 0; j < 2; j++) {
             SplitRing h = box_ring(470500000 + i * 1500000, 80500000 + j * 1500000, 100000, 100000, 10 * (i * 2 + j) + 10);
-            std::reverse(h.v.begin(), h.v.end());
+            turn(h);
             p.holes.push_back(h);
         }
     size_t lines = 0;

@@ -59,7 +59,7 @@ TEST(water_rings_are_cut_where_their_member_ways_meet) {
     CHECK_EQ(ends.counts.junctions, size_t(2));
     REQUIRE(ends.arcs.size() == 2u);
     for (const Ring& v : arc_vertex_lists(ends, store)) {
-        CHECK_EQ(v.size(), size_t(3));
+        REQUIRE(v.size() == 3u);
         CHECK(v.front() == pt(0, 0) || v.front() == pt(100, 100));
         CHECK(v.back() == pt(0, 0) || v.back() == pt(100, 100));
     }
@@ -96,7 +96,7 @@ TEST(a_way_end_cuts_every_ring_through_it_so_shared_shores_stay_one_arc) {
         for (uint32_t r = 0; r < store.rings.size(); r++)
             for (uint32_t k = arcs.ring_refs[r]; k < arcs.ring_refs[r + 1]; k++) users[arcs.refs[k].arc].push_back(r);
         size_t shared = 0;
-        for (const auto& u : users) shared += u.size() == 2;
+        for (const auto& u : users) shared += u.size() == 2 && u[0] != u[1];
         return shared;
     };
     CHECK_EQ(shared_arcs(ArcCuts::Junctions), size_t(1));

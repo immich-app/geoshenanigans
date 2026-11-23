@@ -68,8 +68,15 @@ TEST(the_water_stage_holds_three_times_its_cells_beside_its_share_of_the_rest) {
     // The reservations carry it.
     const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
     CHECK_EQ(region_peak(bytes, counts, 0, RunOrder::Serial, all), kGiB + 3 * kGiB);
-    CHECK_EQ(continent_cost(bytes, counts, 0, UINT64_MAX, all).bytes,
-             region_peak(bytes, counts, 0, RunOrder::Concurrent, all));
+    // At once, the water stage beside the three modes; a byte short of that,
+    // one after another, the water stage the largest.
+    const uint64_t at_once = kGiB + 3 * kGiB + 3 * kModeBytes;
+    const RegionCost fits = continent_cost(bytes, counts, 0, at_once, all);
+    CHECK_EQ(fits.bytes, at_once);
+    CHECK(fits.order == RunOrder::Concurrent);
+    const RegionCost short_of_it = continent_cost(bytes, counts, 0, at_once - 1, all);
+    CHECK_EQ(short_of_it.bytes, kGiB + 3 * kGiB);
+    CHECK(short_of_it.order == RunOrder::Serial);
 }
 
 TEST(the_water_stage_holds_its_slot_arrays_for_every_slot_the_previous_build_left_tombstones_among_them) {

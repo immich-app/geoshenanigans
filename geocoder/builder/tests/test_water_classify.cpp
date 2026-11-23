@@ -179,6 +179,7 @@ TEST(the_major_tier_takes_100_km2_and_wikidata_rivers_of_5_and_keeps_its_own_at_
     CHECK(water_major_keeps(90, false, false, true));
     CHECK(!water_major_keeps(89.9, false, false, true));
     CHECK(water_major_keeps(4.5, true, true, true));
+    CHECK(!water_major_keeps(4.49, true, true, true));
 }
 
 TEST(a_riverbank_tagged_natural_water_too_is_a_river_area) {
