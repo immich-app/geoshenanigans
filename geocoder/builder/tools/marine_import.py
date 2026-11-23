@@ -10,8 +10,8 @@ Usage:
 EEZ_IHO is Marine Regions' intersect of the Exclusive Economic Zones and IHO sea areas, version 5 (CC BY 4.0),
 as its WFS serves it (typeNames=MarineRegions:eez_iho, GeoJSON). LAND is osmdata.openstreetmap.de's land
 polygons, made from OpenStreetMap's coastline, split, in WGS84 (land-polygons-split-4326.zip, read inside the
-zip; ODbL). Both are pinned: the nightly never runs this, it downloads what a run of it published
-(geocoder/builder/data/marine.json), so the marine areas don't change from one day to the next.
+zip; ODbL). The nightly pins the generated marine file, not these source downloads: it downloads what a run
+of this tool published (geocoder/builder/data/marine.json), so the marine areas stay fixed until the pin moves.
 
 Each IHO sea area (iho_mrgid and iho_sea: its features in every EEZ together) is one marine object, an ocean
 when its name ends in " Ocean" and a sea otherwise. Its polygons are its water, one 1-degree tile at a time:
