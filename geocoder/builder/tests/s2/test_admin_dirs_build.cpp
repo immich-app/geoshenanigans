@@ -1486,6 +1486,25 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
           std::string::npos);
     CHECK(text.find("19500") == std::string::npos);
 
+    // The server, from the dir of an admin preset and from admin-minimal,
+    // answers each point with the postal city of the grid's ZIP there,
+    // beside it: 19026 beside its last house, where the nearest centroid is
+    // 19018's, whose answer would have none.
+    const std::vector<std::pair<double, double>> points = {{47.0503, 8.121}, {47.0497, 8.14}, {47.1001, 8.032}};
+    const std::vector<std::string> want_postcode = {"19026", "19018", "19050"};
+    const std::vector<std::string> want_city = {"Drexel Hill", "Clifton Heights", "Lansdowne"};
+    for (const std::string& dir : {admin_preset_dir(out, "planet", root.path() + "/preset"), out + "/planet/admin-minimal"}) {
+        const std::vector<std::string> answers = server_answers(dir, points, root.path() + "/q", log);
+        REQUIRE(answers.size() == points.size());
+        for (size_t i = 0; i < points.size(); i++) {
+            CHECK(answer_string(answers[i], {"address", "postcode"}) == want_postcode[i]);
+            const std::optional<std::string> city = answer_string(answers[i], {"address", "postal_city"});
+            CHECK(city == want_city[i]);
+            if (city != want_city[i]) std::printf("    %s: %s\n", dir.c_str(), answers[i].c_str());
+            CHECK(answer_string(answers[i], {"display_name"}).value_or("").find(want_city[i]) == std::string::npos);
+        }
+    }
+
     // Yesterday's Yeadon keeps 19050 by its margin (5 + 2 against 6); a
     // chained build on top of the first build keeps its Lansdowne.
     const std::string yesterday = root.path() + "/yesterday.bin";

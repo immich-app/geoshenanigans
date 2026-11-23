@@ -30,6 +30,7 @@ pub use hex::lower_hex;
 pub mod place_files;
 pub mod poi_files;
 pub mod geography_box;
+pub mod postal_cities;
 pub mod postcode_files;
 pub mod postcode_grid;
 pub mod side_blocks;
@@ -1103,6 +1104,9 @@ pub struct Index {
     pub postcode_centroids: Option<PostcodeFiles>,
     /// The postcode grid (postcode_grid.bin): each cell's postcode in the countries it covers
     pub postcode_grid: Option<postcode_grid::PostcodeGrid>,
+    /// The postal cities (postal_cities.bin): the place name mail to each postcode of the
+    /// countries it covers is addressed with
+    pub postal_cities: Option<postal_cities::PostalCities>,
     pub admin_config: AdminLevelConfig,
     pub strings: StringPool,
     pub street_cell_level: u64,
@@ -1401,6 +1405,9 @@ impl Index {
         let postcode_grid = file(postcode_grid::FILE)
             .map(|f| postcode_grid::PostcodeGrid::open(f).map_err(|e| format!("{dir}: {e}")))
             .transpose()?;
+        let postal_cities = file(postal_cities::FILE)
+            .map(|f| postal_cities::PostalCities::open(f).map_err(|e| format!("{dir}: {e}")))
+            .transpose()?;
         // A cell pair index (cell_pairs.rs) of the dir, an error naming its cells file.
         let pairs = |prefix: &str, cells: FileBytes, entries: FileBytes, format: cell_pairs::Format| {
             CellPairs::open(cells, entries, format, admin_cell_level).map_err(|e| format!("{dir}/{prefix}_cells.bin: {e}"))
@@ -1444,6 +1451,7 @@ impl Index {
             way_postcodes,
             postcode_centroids,
             postcode_grid,
+            postal_cities,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::load(dir)?,
             street_cell_level,
@@ -2896,24 +2904,25 @@ impl Index {
     }
 
     /// The postcode of the answer at (lat, lng), as Nominatim stores it on the feature that
-    /// answers (the tiers above): `addr` the house that answers, `street` the street the
-    /// postcode comes from (a house's parent street, else the street that answers), `poi` the
-    /// POI that answers, `interp` the TIGER line near a street that answers, `postcode_area` the
-    /// postal area's postcode at the query point and `country_code` the answer's country.
-    pub fn resolve_postcode<'a>(&'a self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, postcode_area: Option<Cow<'a, str>>, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
+    /// answers (the tiers above), and where it came from: `addr` the house that answers, `street`
+    /// the street the postcode comes from (a house's parent street, else the street that
+    /// answers), `poi` the POI that answers, `interp` the TIGER line near a street that answers,
+    /// `postcode_area` the postal area's postcode at the query point and `country_code` the
+    /// answer's country.
+    pub fn resolve_postcode<'a>(&'a self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, postcode_area: Option<Cow<'a, str>>, country_code: Option<[u8; 2]>) -> Option<(Cow<'a, str>, PostcodeSource)> {
         // 0. The house's own postcode (from addr_postcodes.bin)
         // Matches Nominatim's token_get_postcode — the feature's own
         // addr:postcode tag is the highest-priority source.
         if let (Some(apc), Some((addr_id, _))) = (self.addr_postcodes.as_ref(), addr) {
             if let Some(pid) = Self::sidecar_u32(apc, addr_id as u64) {
-                return Some(self.get_string(pid));
+                return Some((self.get_string(pid), PostcodeSource::Address));
             }
         }
 
         // 1. way_postcodes[street.way_id] — street's computed postcode
         if let (Some(wpc), Some((way_id, _))) = (self.way_postcodes.as_ref(), street) {
             if let Some(pid) = Self::sidecar_u32(wpc, way_id as u64) {
-                return Some(self.get_string(pid));
+                return Some((self.get_string(pid), PostcodeSource::Street));
             }
         }
 
@@ -2923,7 +2932,7 @@ impl Index {
         // memory locality.
         if let Some(p) = poi {
             if p.parent_postcode_id != NO_DATA {
-                return Some(self.get_string(p.parent_postcode_id));
+                return Some((self.get_string(p.parent_postcode_id), PostcodeSource::Poi));
             }
         }
 
@@ -2952,7 +2961,7 @@ impl Index {
                         && street_tokens_overlap(seg_street, &self.get_string(way.name))
                     {
                         if let Some(pid) = Self::sidecar_u32(ipc, iw_idx as u64) {
-                            return Some(self.get_string(pid));
+                            return Some((self.get_string(pid), PostcodeSource::Tiger));
                         }
                     }
                 }
@@ -2966,29 +2975,45 @@ impl Index {
         // country.
         if let Some((way_id, _)) = street {
             if let Some((m_lat, m_lng)) = u32::try_from(way_id).ok().and_then(|id| self.street_middle(id)) {
-                let found = self.grid_postcode(m_lat, m_lng, country_code)
-                    .or_else(|| self.postal_area_at(m_lat, m_lng, country_code))
-                    .or_else(|| self.centroid_postcode(m_lat, m_lng, country_code));
+                let found = self.nearest_postcode_at(m_lat, m_lng, country_code);
                 if found.is_some() || addr.is_none() {
                     return found;
                 }
             }
         }
         if let Some((_, house)) = addr {
-            let (h_lat, h_lng) = (house.lat as f64, house.lng as f64);
-            return self.grid_postcode(h_lat, h_lng, country_code)
-                .or_else(|| self.postal_area_at(h_lat, h_lng, country_code))
-                .or_else(|| self.centroid_postcode(h_lat, h_lng, country_code));
+            return self.nearest_postcode_at(house.lat as f64, house.lng as f64, country_code);
         }
         if let Some(found) = self.grid_postcode(lat, lng, country_code) {
-            return Some(found);
+            return Some((found, PostcodeSource::Grid));
         }
         // The postcode area covering the point: get_nearest_postcode takes
         // one before any centroid (ORDER BY osm_id is null).
-        if postcode_area.is_some() {
-            return postcode_area;
+        if let Some(area) = postcode_area {
+            return Some((area, PostcodeSource::PostalArea));
         }
-        self.centroid_postcode(lat, lng, country_code)
+        self.centroid_postcode(lat, lng, country_code).map(|p| (p, PostcodeSource::Centroid))
+    }
+
+    /// get_nearest_postcode at the point (lat, lng) of the country `country_code`: the postcode
+    /// grid's cell of it where the dir has a grid of the country, else the postal area holding
+    /// it, else the nearest centroid whose box holds it.
+    fn nearest_postcode_at<'a>(&'a self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> Option<(Cow<'a, str>, PostcodeSource)> {
+        self.grid_postcode(lat, lng, country_code).map(|p| (p, PostcodeSource::Grid))
+            .or_else(|| self.postal_area_at(lat, lng, country_code).map(|p| (p, PostcodeSource::PostalArea)))
+            .or_else(|| self.centroid_postcode(lat, lng, country_code).map(|p| (p, PostcodeSource::Centroid)))
+    }
+
+    /// The postal city of an answer's postcode (postal_cities.bin): the place name mail to it is
+    /// addressed with, where the dir's table has a row of the answer's country and the
+    /// postcode's code. None for a postcode the nearest centroid gave, which names the ZIP of a
+    /// centroid near the point rather than the one the point is in.
+    fn postal_city<'a>(&'a self, postcode: &str, source: PostcodeSource, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
+        if source == PostcodeSource::Centroid {
+            return None;
+        }
+        let (table, cc) = (self.postal_cities.as_ref()?, country_code?);
+        table.name(cc, postal_cities::postal_key(cc, postcode)?).map(Cow::Borrowed)
     }
 
     /// The postcode grid's at the point (lat, lng), where the cell's run is of the country
@@ -3551,7 +3576,7 @@ impl Index {
         } else {
             street.as_ref().map(|(_, w, idx)| (*idx, *w))
         };
-        let resolved_postcode = self.resolve_postcode(
+        let (resolved_postcode, postcode_source) = match self.resolve_postcode(
             lat, lng,
             postcode_street.as_ref().map(|(idx, w)| (*idx as usize, w)),
             if addr_won_primary {
@@ -3569,7 +3594,10 @@ impl Index {
             },
             admin.postcode_area.clone(),
             admin.country_code,
-        );
+        ) {
+            Some((postcode, source)) => (Some(postcode), Some(source)),
+            None => (None, None),
+        };
 
         // Where no boundary holds the point, its place nodes are the whole
         // address: Nominatim has no country in Antarctica (no `aq` in
@@ -3659,6 +3687,34 @@ impl Index {
             (Some(r), Some(c)) if r == *c => (None, Some((ranks.get("region"), r))),
             (r, _) => (r, None),
         };
+        // Postcode from resolve_postcode(): 3-tier chain
+        // (own → inherited → grid, postal area or nearest centroid).
+        // Reject if the country has no postal-code system or if
+        // the string doesn't match the country's pattern, then
+        // normalise whitespace/separators per country.
+        let postcode = match resolved_postcode {
+            Some(pc) => match admin.country_code {
+                Some(cc) => {
+                    if country_has_no_postcode(&cc) || !postcode_looks_valid(&cc, &pc) {
+                        None
+                    } else {
+                        // The postcode as read unless formatting changes it.
+                        let formatted = match format_postcode(&cc, &pc) {
+                            Cow::Owned(s) => Some(s),
+                            Cow::Borrowed(_) => None,
+                        };
+                        Some(formatted.map_or(pc, Cow::Owned))
+                    }
+                }
+                None => Some(pc),
+            },
+            None => None,
+        };
+        // The postal city of that postcode, beside it: not Nominatim's, and never in display_name.
+        let postal_city = match (&postcode, postcode_source) {
+            (Some(pc), Some(source)) => self.postal_city(pc, source, admin.country_code),
+            _ => None,
+        };
         let address = AddressDetails {
             ranks,
             unlabelled: admin.unlabelled.into_iter().chain(country_region).collect(),
@@ -3684,29 +3740,8 @@ impl Index {
             city_district: admin.city_district,
             neighbourhood: if allow_place_neighbourhood { admin.neighbourhood.or(place.neighbourhood) } else { admin.neighbourhood },
             city_block: admin.city_block,
-            // Postcode from resolve_postcode(): 3-tier chain
-            // (own → inherited → grid, postal area or nearest centroid).
-            // Reject if the country has no postal-code system or if
-            // the string doesn't match the country's pattern, then
-            // normalise whitespace/separators per country.
-            postcode: match resolved_postcode {
-                Some(pc) => match admin.country_code {
-                    Some(cc) => {
-                        if country_has_no_postcode(&cc) || !postcode_looks_valid(&cc, &pc) {
-                            None
-                        } else {
-                            // The postcode as read unless formatting changes it.
-                            let formatted = match format_postcode(&cc, &pc) {
-                                Cow::Owned(s) => Some(s),
-                                Cow::Borrowed(_) => None,
-                            };
-                            Some(formatted.map_or(pc, Cow::Owned))
-                        }
-                    }
-                    None => Some(pc),
-                },
-                None => None,
-            },
+            postcode,
+            postal_city,
             country: admin.country,
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
         };
@@ -4311,6 +4346,7 @@ mod query_tests {
             way_postcodes: None,
             postcode_centroids: None,
             postcode_grid: None,
+            postal_cities: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, end, end, end, end, end]),
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
@@ -4540,7 +4576,7 @@ mod query_tests {
         // centroids are read from the west: its postcode is the 17th read at most.
         let (lat, lng) = at(0.0, 6.0);
         let blocks_before = postcode_files::BLOCK_READS.with(|n| n.get());
-        let (postcode, read) = reads(|| idx.resolve_postcode(lat, lng, None, None, None, None, None, Some(*b"fr")));
+        let (postcode, read) = reads(|| idx.resolve_postcode(lat, lng, None, None, None, None, None, Some(*b"fr")).map(|(p, _)| p));
         let blocks = postcode_files::BLOCK_READS.with(|n| n.get()) - blocks_before;
 
         assert_eq!(postcode.as_deref(), Some("11008"));
@@ -4570,7 +4606,7 @@ mod query_tests {
                     for (dlat, dlng) in [(0.0, 0.0), (-metre, 0.0), (metre, 0.0), (0.0, -metre), (0.0, metre)] {
                         let (lat, lng) = (lat + dlat, lng + dlng);
                         let want = nearest_centroid(&all, lat, lng, Some(*b"fr"));
-                        assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, None, Some(*b"fr")).as_deref(), want, "({lat}, {lng}) block {b}");
+                        assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, None, Some(*b"fr")).map(|(p, _)| p).as_deref(), want, "({lat}, {lng}) block {b}");
                         queries += 1;
                     }
                 }
@@ -4601,7 +4637,7 @@ mod query_tests {
             let lng = if lng > 180.0 { lng - 360.0 } else { lng };
             for lat in [-16.76, -16.75, -16.7495, -16.74] {
                 let want = nearest_centroid(&centroids, lat, lng, None);
-                assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, None, None).as_deref(), want, "({lat}, {lng})");
+                assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, None, None).map(|(p, _)| p).as_deref(), want, "({lat}, {lng})");
                 answered += usize::from(want.is_some());
             }
         }
@@ -4623,7 +4659,7 @@ mod query_tests {
             (1500.0, 0.0, "75005", *b"fr"),  // farther: not read
         ]);
 
-        let (postcode, read) = reads(|| idx.resolve_postcode(origin().0, origin().1, None, None, None, None, None, Some(*b"fr")));
+        let (postcode, read) = reads(|| idx.resolve_postcode(origin().0, origin().1, None, None, None, None, None, Some(*b"fr")).map(|(p, _)| p));
 
         assert_eq!(postcode.as_deref(), Some("75000"));
         assert_eq!(read, 4);
@@ -4782,7 +4818,7 @@ mod query_tests {
             nameless += read - read_named;
             for country in [None, Some(*b"fr"), Some(*b"de")] {
                 let (want, tie) = nearest(lat, lng, country);
-                assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, None, country).as_deref(), want, "({lat}, {lng}) {country:?}");
+                assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, None, country).map(|(p, _)| p).as_deref(), want, "({lat}, {lng}) {country:?}");
                 tied += usize::from(tie);
             }
         }
@@ -5688,6 +5724,20 @@ pub fn unlabelled_rows(ranked: &[RankedPoly], slots: &[Option<usize>], winners: 
     by_rank.into_iter().rev().flatten().collect()
 }
 
+/// Where an answer's postcode came from (resolve_postcode's tiers): the house's own, its
+/// street's stored one, the POI's, the TIGER line's, and get_nearest_postcode's at a point, which
+/// takes the postcode grid's cell, else the postal area holding it, else the nearest centroid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostcodeSource {
+    Address,
+    Street,
+    Poi,
+    Tiger,
+    Grid,
+    PostalArea,
+    Centroid,
+}
+
 #[derive(Serialize, Default)]
 pub struct AddressDetails<'a> {
     /// The rank_address of the polygon or the place node behind each place
@@ -5747,6 +5797,12 @@ pub struct AddressDetails<'a> {
     pub city_block: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postcode: Option<Cow<'a, str>>,
+    /// The place name mail to `postcode` is addressed with (postal_cities.bin): in the United
+    /// States the ZIP's postal city, which may differ from the city or town the point lies in. Not
+    /// a Nominatim field, and never part of display_name; absent where the postcode came from
+    /// the nearest centroid or the table has no row of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postal_city: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6981,6 +7037,7 @@ mod query_path_tests {
     use std::collections::BTreeMap;
 
     mod display_name;
+    mod postal_city;
     mod postcodes;
     mod ranks;
 
@@ -7132,6 +7189,8 @@ mod query_path_tests {
         centroids: Vec<postcode_files::Centroid>,
         /// The postcode grid's runs, in cell order.
         grid: Vec<postcode_grid::LogicalRow>,
+        /// The postal cities' rows, any order.
+        postal_cities: Vec<postal_cities::LogicalRow>,
     }
 
     impl TestIndex {
@@ -7326,6 +7385,13 @@ mod query_path_tests {
             self
         }
 
+        /// A row of the postal cities: the postcode `code` of Testland's country, named `name`.
+        fn postal_city(&mut self, code: &str, name: &str) -> &mut Self {
+            let country_code = self.polygons[0].0.country_code;
+            self.postal_cities.push(postal_cities::LogicalRow { country_code, code: code.to_string(), name: name.to_string() });
+            self
+        }
+
         /// The side files with a value set, each with its values: NO_DATA for every other record
         /// of the file it sits beside.
         fn side_values(&self) -> Vec<(&'static str, Vec<u32>)> {
@@ -7386,6 +7452,12 @@ mod query_path_tests {
 
             if !self.grid.is_empty() {
                 files.push((postcode_grid::FILE, postcode_grid::encode(&self.grid)));
+            }
+
+            if !self.postal_cities.is_empty() {
+                let mut rows = self.postal_cities.clone();
+                rows.sort_by(|a, b| (a.country_code, &a.code).cmp(&(b.country_code, &b.code)));
+                files.push((postal_cities::FILE, postal_cities::encode(&rows)));
             }
 
             if !(self.streets.is_empty() && self.addrs.is_empty() && self.interps.is_empty()) {
@@ -9831,6 +9903,7 @@ mod admin_scan_tests {
             way_parents: None, admin_parents: None, addr_postcodes: None, way_postcodes: None,
             postcode_centroids: None,
             postcode_grid: None,
+            postal_cities: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, len, len, len, len, len]),
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
