@@ -1548,6 +1548,19 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
     return layer;
 }
 
+uint32_t previous_slots(const std::string& region_prev) {
+    if (region_prev.empty()) return 0;
+    uint32_t most = 0;
+    for (const char* dir : {kWaterArcTiers[1].dir, "water/major/simplified"}) {
+        std::ifstream f(region_prev + "/" + dir + "/admin_polygons.osm_ids", std::ios::binary);
+        uint32_t head[3];
+        if (f.read(reinterpret_cast<char*>(head), sizeof head) && head[0] == gc::id_alloc::SIDECAR_MAGIC &&
+            head[1] == gc::id_alloc::SIDECAR_VERSION)
+            most = std::max(most, head[2]);
+    }
+    return most;
+}
+
 void write_water_exact(const Layer& layer, const std::string& dir) {
     const std::string out = dir + "/water";
     ensure_dir(out);

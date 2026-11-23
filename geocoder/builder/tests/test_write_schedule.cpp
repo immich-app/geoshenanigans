@@ -72,6 +72,24 @@ TEST(the_water_stage_holds_three_times_its_cells_beside_its_share_of_the_rest) {
              region_peak(bytes, counts, 0, RunOrder::Concurrent, all));
 }
 
+TEST(the_water_stage_holds_its_slot_arrays_for_every_slot_the_previous_build_left_tombstones_among_them) {
+    // A layer of 1 GiB over a previous build of 3 Mi slots: the write's
+    // records at their slots, each slot's polygon and the records it
+    // writes, 40 B a slot, past the share of the layer today's polygons
+    // take.
+    KindValues bytes = kinds(0, 0, 0, 0, 0, 0);
+    at(bytes, RecordKind::Waters) = kGiB;
+    const uint64_t pairs = kGiB / 4 / sizeof(CellItemPair), slots = uint64_t(3) << 20;
+    CHECK(kWaterSlotBytes >= sizeof(AdminPolygon) + sizeof(uint32_t) + sizeof(AdminPolygonRecord));
+    CHECK_EQ(stage_costs(bytes, pairs, slots).water, stage_costs(bytes, pairs).water + slots * kWaterSlotBytes);
+    // The reservations carry it.
+    const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
+    CHECK_EQ(region_peak(bytes, counts, 0, RunOrder::Serial, pairs, slots),
+             region_peak(bytes, counts, 0, RunOrder::Serial, pairs) + slots * kWaterSlotBytes);
+    CHECK_EQ(continent_cost(bytes, counts, 0, UINT64_MAX, pairs, slots).bytes,
+             region_peak(bytes, counts, 0, RunOrder::Concurrent, pairs, slots));
+}
+
 TEST(pair_counts_takes_the_water_cell_index_entries_for_the_waters_pairs) {
     ParsedData d;
     d.sorted_way_cells.resize(3);
@@ -131,8 +149,7 @@ TEST(filter_cost_holds_the_continents_water_pairs_among_the_pairs_the_workers_co
     // with the other kinds' while the continents run: of the planet's water
     // cells, nothing of its own.
     const KindValues planet_counts = kinds(80, 160, 0, 0, 0, 0);
-    KindValues planet_pairs = kinds(100, 0, 0, 0, 0, 0), pairs = kinds(10, 0, 0, 0, 0, 0);
-    at(planet_pairs, RecordKind::Waters) = 1000;
+    KindValues pairs = kinds(10, 0, 0, 0, 0, 0);
     at(pairs, RecordKind::Waters) = 40;
     CHECK_EQ(filter_cost(planet_counts, pairs), uint64_t(240 * 4 + 240 * 3 / 8 + 50 * 16 / 2));
 }

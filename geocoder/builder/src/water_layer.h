@@ -351,6 +351,13 @@ std::string write_water_dirs(const Layer& layer, const std::string& region_dir, 
 Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::function<uint32_t(uint32_t)>& sitelinks,
                   unsigned threads);
 
+// The most slots of the previous build's polygon sidecars of a region's
+// water dirs under region_prev (water/all/exact's and
+// water/major/simplified's, written one after the other), tombstones among
+// them, each of which write_water_dirs keeps: 0 for none there, and for one
+// that is no sidecar, which that write refuses.
+uint32_t previous_slots(const std::string& region_prev);
+
 // The single-output build's water: the all set's exact tier, in dir (the
 // region's dir), as water/ beside its mode's files.
 void write_water_exact(const Layer& layer, const std::string& dir);

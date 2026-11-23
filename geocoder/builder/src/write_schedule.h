@@ -144,6 +144,13 @@ constexpr uint64_t kPoiTierPoiTenths = 4;
 constexpr uint64_t kWaterStageWaterTenths = 6;
 constexpr uint64_t kWaterStageCellTimes = 3;
 
+// The water stage's arrays by slot, which a set's slot table sizes,
+// tombstones and all: the records at their slots, each slot's polygon and
+// the records it writes. The share of the layer above counts those of
+// today's polygons; a previous build whose slots outnumber them (water
+// gone since) leaves the rest to these.
+constexpr uint64_t kWaterSlotBytes = sizeof(AdminPolygon) + sizeof(uint32_t) + sizeof(AdminPolygonRecord);
+
 // What write_place_files holds beside the nodes it is given, as a multiple
 // of their bytes (20 a node): each node's cell key, the order and the sort's
 // scratch (4 bytes each), and the three files in memory until they are
@@ -227,8 +234,10 @@ struct StageCosts {
 // The place stage writes its dirs one after another, each through the place
 // writer; an admin-minimal dir writes the nodes it keeps, a copy of at most
 // all of them, through the same writer. `water_pairs` are the water cell
-// index's entries, among the waters' bytes.
-inline StageCosts stage_costs(const KindValues& bytes, uint64_t water_pairs = 0) {
+// index's entries, among the waters' bytes; `water_slots` the previous
+// build's slots of the water dirs (water::previous_slots), each of which
+// the write keeps.
+inline StageCosts stage_costs(const KindValues& bytes, uint64_t water_pairs = 0, uint64_t water_slots = 0) {
     StageCosts c;
     const uint64_t admins = at(bytes, RecordKind::Admins), places = at(bytes, RecordKind::Places);
     c.modes = 3 * kModeBytes;
@@ -238,7 +247,8 @@ inline StageCosts stage_costs(const KindValues& bytes, uint64_t water_pairs = 0)
     c.poi_tiers = at(bytes, RecordKind::Pois) * kPoiTierPoiTenths / 10;
     const uint64_t waters = at(bytes, RecordKind::Waters);
     const uint64_t cells = std::min<uint64_t>(waters, water_pairs * sizeof(CellItemPair));
-    c.water = (waters - cells) * kWaterStageWaterTenths / 10 + cells * kWaterStageCellTimes;
+    c.water = (waters - cells) * kWaterStageWaterTenths / 10 + cells * kWaterStageCellTimes +
+              water_slots * kWaterSlotBytes;
     return c;
 }
 
@@ -250,8 +260,8 @@ struct RegionCost {
 };
 
 inline uint64_t region_peak(const KindValues& bytes, const KindValues& counts, uint64_t filter_bytes,
-                            RunOrder order, uint64_t water_pairs = 0) {
-    const StageCosts stages = stage_costs(bytes, water_pairs);
+                            RunOrder order, uint64_t water_pairs = 0, uint64_t water_slots = 0) {
+    const StageCosts stages = stage_costs(bytes, water_pairs, water_slots);
     const uint64_t steps = order == RunOrder::Serial ? stages.largest() : stages.total();
     return sum(bytes) + std::max({filter_bytes, strategy2_cost(counts, order), steps});
 }
@@ -260,11 +270,11 @@ inline uint64_t region_peak(const KindValues& bytes, const KindValues& counts, u
 // after another. It holds its whole reservation: its write takes no stage
 // leases of its own.
 inline RegionCost continent_cost(const KindValues& bytes, const KindValues& counts, uint64_t filter_bytes,
-                                 uint64_t capacity, uint64_t water_pairs = 0) {
-    const uint64_t at_once = region_peak(bytes, counts, filter_bytes, RunOrder::Concurrent, water_pairs);
+                                 uint64_t capacity, uint64_t water_pairs = 0, uint64_t water_slots = 0) {
+    const uint64_t at_once = region_peak(bytes, counts, filter_bytes, RunOrder::Concurrent, water_pairs, water_slots);
     if (at_once <= capacity) return {at_once, RunOrder::Concurrent};
 
-    return {region_peak(bytes, counts, filter_bytes, RunOrder::Serial, water_pairs), RunOrder::Serial};
+    return {region_peak(bytes, counts, filter_bytes, RunOrder::Serial, water_pairs, water_slots), RunOrder::Serial};
 }
 
 // A continent's share of the planet's values, kind by kind, from its share

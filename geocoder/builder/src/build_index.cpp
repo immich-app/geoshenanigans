@@ -1442,7 +1442,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                 water::write_water_exact(d.water, base_dir);
         };
 
-        const StageCosts costs = stage_costs(record_bytes(d), d.water.cells.size());
+        const StageCosts costs =
+            stage_costs(record_bytes(d), d.water.cells.size(), multi_output ? water::previous_slots(region_prev) : 0);
         struct Stage {
             const char* name;
             std::function<void()> write;
@@ -1525,7 +1526,13 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
     // when the budget holds them beside the costliest continents that can
     // run together; else one after another, to hold memory down while
     // continent subsets build alongside.
-    const uint64_t planet_stages = stage_costs(record_bytes(data), data.water.cells.size()).total();
+    // The water stage keeps every slot of the previous build's water dirs.
+    auto water_slots_before = [&](const std::string& region) -> uint64_t {
+        return multi_output && !prev_output_dir.empty() ? water::previous_slots(prev_output_dir + "/" + region) : 0;
+    };
+    const uint64_t planet_water_slots = water_slots_before("planet");
+    const uint64_t planet_stages =
+        stage_costs(record_bytes(data), data.water.cells.size(), planet_water_slots).total();
 
     // The planet's own write and each continent's split read the planet
     // records; the last of them to finish frees them beside the work left,
@@ -1541,7 +1548,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
     auto write_planet = [&](uint64_t beside) {
         const RunOrder order = planet_stages + beside <= budget.capacity() ? RunOrder::Concurrent : RunOrder::Serial;
         const KindValues bytes = record_bytes(data);
-        const StageCosts costs = stage_costs(bytes, data.water.cells.size());
+        const StageCosts costs = stage_costs(bytes, data.water.cells.size(), planet_water_slots);
         std::cerr << "Planet: stages " << (order == RunOrder::Serial ? "one at a time" : "at once") << " (admins "
                   << (at(bytes, RecordKind::Admins) >> 20) << " MiB, pois " << (at(bytes, RecordKind::Pois) >> 20)
                   << " MiB, waters " << (at(bytes, RecordKind::Waters) >> 20)
@@ -1694,7 +1701,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             // reservation holds every stage, the boundary tiers and both
             // admin-minimal dirs included.
             pending.push_back({c, continent_cost(bytes, counts, filter_bytes, budget.capacity(),
-                                                 at(continent_pairs[c], RecordKind::Waters))});
+                                                 at(continent_pairs[c], RecordKind::Waters),
+                                                 water_slots_before(kContinents[c].name))});
         }
         // A continent past the budget even with its steps one after another
         // goes last, once nothing else reads the planet records: its split

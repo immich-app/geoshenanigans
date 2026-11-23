@@ -541,6 +541,27 @@ TEST(the_water_dirs_hold_every_file_and_keep_each_polygons_slot_the_next_day) {
           std::string::npos);
 }
 
+TEST(the_previous_slots_of_a_regions_water_dirs_count_their_tombstones) {
+    const ScratchDir root("water-previous-slots");
+    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    CHECK_EQ(previous_slots(""), 0u);
+    CHECK_EQ(previous_slots(one), 0u);
+    write(build(fixture()), one);
+    CHECK_EQ(previous_slots(one), 4u);
+    // The pond gone, its slot a tombstone the next day's dirs keep.
+    Collected without_pond = fixture();
+    without_pond.closed_ways.erase(without_pond.closed_ways.begin());
+    const Layer day2 = build(without_pond, one);
+    REQUIRE(day2.size() == 3u);
+    write(day2, two, one);
+    CHECK_EQ(previous_slots(two), 4u);
+    // One that is no sidecar counts none, as the write refuses it.
+    fs::remove(two + "/water/major/simplified/admin_polygons.osm_ids");
+    CHECK_EQ(previous_slots(two), 4u);
+    std::ofstream(two + "/water/all/exact/admin_polygons.osm_ids", std::ios::binary | std::ios::trunc) << "no";
+    CHECK_EQ(previous_slots(two), 0u);
+}
+
 namespace {
 
 // A marine area as marine::read_areas gives it: each ring closed.
