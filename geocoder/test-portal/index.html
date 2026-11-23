@@ -329,6 +329,16 @@
     .map-panel { flex: 0 0 45vh; }
     .side-panel { flex: 1; border-left: none; border-top: 1px solid var(--border); }
   }
+
+  /* Where the sidebar is short, below the map on a narrow screen or on a short screen, it
+     scrolls as a whole: the results keep a usable height, and the credit, opened, flows in it,
+     its summary scrolling with its notices, so every result and every link of it is reachable. */
+  @media (max-width: 800px), (max-height: 640px) {
+    .side-panel { overflow-y: auto; }
+    .results-section { flex: 1 0 auto; min-height: 240px; }
+    .data-credit { flex: 0 0 auto; min-height: 0; max-height: none; overflow: visible; }
+    .data-credit summary { position: static; }
+  }
 </style>
 </head>
 <body>

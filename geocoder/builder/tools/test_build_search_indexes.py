@@ -312,15 +312,25 @@ class TestPortalTest(unittest.TestCase):
         self.assertIn("loadCredits();", toggle[0])
 
     # The credit is one line until opened, a summary of the sources, and opened it scrolls in a box
-    # of bounded height that gives up room where the sidebar has none: on a short screen the results
-    # keep their room and every link of the credit stays reachable.
-    def test_the_page_keeps_its_credit_behind_a_summary_that_opens_a_bounded_box(self):
+    # of bounded height that gives up room where the sidebar has none. Where the sidebar is short
+    # (below the map on a narrow screen, or on a short one), the sidebar scrolls as a whole
+    # instead: the results keep a usable height, and the opened credit, its summary too, flows in
+    # it, so every result and every link of it is reachable.
+    def test_the_page_keeps_its_results_and_credit_reachable_on_short_screens(self):
         footer, page = self.credit_footer()
         self.assertTrue(footer.summary)
         box = re.findall(r"\n  \.data-credit \{([^}]*)\}", page)
         self.assertEqual(len(box), 1)
         for rule in (r"flex: 0 1 auto;", r"max-height: \d+vh;", r"overflow-y: auto;"):
             self.assertRegex(box[0], rule)
+        short = re.findall(r"@media \(max-width: 800px\), \(max-height: \d+px\) \{(.*?)\n  \}", page, re.S)
+        self.assertEqual(len(short), 1)
+        rules = {sel.strip(): body for sel, body in re.findall(r"([^{}]+)\{([^}]*)\}", short[0])}
+        self.assertRegex(rules[".side-panel"], r"overflow-y: auto;")
+        self.assertRegex(rules[".results-section"], r"min-height: \d+px;")
+        self.assertRegex(rules[".data-credit"], r"max-height: none;")
+        self.assertRegex(rules[".data-credit"], r"overflow: visible;")
+        self.assertRegex(rules[".data-credit summary"], r"position: static;")
 
     def unit_of(self, name):
         """The transport unit entrypoint.sh --unit-of fetches a file through, or ""."""
