@@ -602,38 +602,69 @@ void collect_postcode_centroids(ParsedData& data) {
 void collect_postcode_grid(ParsedData& data) {
     using namespace postcode_grid;
     const AdminRings countries = border_country_rings(data);
+    auto pos_at = [](double lat, double lng) {
+        return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(GRID_LEVEL).id() >> cell_shift(GRID_LEVEL);
+    };
     GridCells grid = grid_cells(
         data.addr_points, data.addr_postcode_ids, data.addr_city_ids, data.interp_ways, data.interp_nodes,
         data.interp_postcode_ids, [&](uint32_t id) { return std::string_view(data.get_string(id)); },
-        [&](double lat, double lng) { return country_at(data, countries, lat, lng); },
-        [](double lat, double lng) {
-            return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(GRID_LEVEL).id() >> cell_shift(GRID_LEVEL);
-        });
+        [&](double lat, double lng) { return country_at(data, countries, lat, lng); }, pos_at);
     data.postcode_grid_codes = std::move(grid.codes);
     data.postcode_grid_cells = std::move(grid.cells);
-    data.postcode_grid_other_votes = std::move(grid.other_votes);
     if (!data.postcode_grid_cells.empty())
         data.postcode_grid_file = encode_file(grid_rows(data.postcode_grid_cells, data.postcode_grid_codes, GRID_LEVEL));
     std::cerr << "Postcode grid: " << grid.address_votes << " address votes, " << grid.tiger_votes << " TIGER line votes, "
               << data.postcode_grid_codes.size() << " postcodes, " << data.postcode_grid_cells.size() << " cells, "
               << data.postcode_grid_file.size() << " bytes" << std::endl;
 
-    // The postal cities, of the grid's codes and the votes of its addresses
-    // with a city; then the cities go, before the strategy-2 remap.
+    // The postal cities, of the codes an answer in a grid country can give
+    // (the grid's, and its postal areas', which assign_postal_area_countries
+    // gave their centroid's country) and the votes of its addresses with a
+    // city; then the cities go, before the strategy-2 remap.
+    std::vector<std::pair<GridCode, uint64_t>> areas;
+    const auto& rings = data.admin_exact_rings;
+    for (size_t i = 0; i < data.admin_polygons.size() && i < rings.polygons.size(); i++) {
+        const AdminPolygon& area = data.admin_polygons[i];
+        if (area.admin_level != 11 || area.place_type_override == POSTAL_AREA_INVALID || area.name_id == NO_DATA ||
+            !grid_country(area.country_code) || rings.polygons[i].ring_count == 0)
+            continue;
+        std::optional<std::string> code = grid_postcode(area.country_code, data.get_string(area.name_id));
+        if (!code) continue;
+        const LatLng c = exact_polygon_centroid(rings.vertices.data(), rings.rings_of(static_cast<uint32_t>(i)),
+                                                rings.polygons[i].ring_count);
+        areas.push_back({GridCode{area.country_code, std::move(*code)}, pos_at(c.first, c.second)});
+    }
+    const size_t postal_areas = areas.size();
+    postal_cities::TableCodes codes =
+        postal_cities::table_codes(data.postcode_grid_codes, data.postcode_grid_cells, grid.other_votes, std::move(areas));
+    std::vector<uint64_t>().swap(grid.other_votes);
+    // The city votes of the table's codes: the merge keeps their order.
+    if (codes.codes.size() != data.postcode_grid_codes.size())
+        parallel_for(grid.city_votes.size(), [&](size_t b, size_t e, unsigned) {
+            for (size_t i = b; i < e; i++)
+                grid.city_votes[i] = city_vote(codes.of_grid[city_vote_code(grid.city_votes[i])], city_vote_city(grid.city_votes[i]));
+        });
     const char* pool = data.postal_vote_pool.data().data();
     const size_t pool_size = data.postal_vote_pool.data().size();
     postal_cities::Table table = postal_cities::choose_all(
-        data.postcode_grid_codes, grid.city_votes,
+        codes.codes, grid.city_votes,
         [&](uint32_t id) { return id < pool_size ? std::string_view(pool + id) : std::string_view(); },
-        data.postal_places, data.prev_postal_names);
+        data.postal_places, data.prev_postal_names, &codes.reachable);
     if (!data.postal_votes_dump.empty()) {
         std::ofstream dump(data.postal_votes_dump, std::ios::binary);
-        postal_cities::write_votes(dump, data.postcode_grid_codes, table, data.postal_places, data.prev_postal_names);
+        postal_cities::write_votes(dump, codes.codes, table, data.postal_places, data.prev_postal_names);
         dump.flush();
         if (!dump) throw std::runtime_error("failed to write " + data.postal_votes_dump);
     }
+    // Each grid code's row, and each other row a cell or a postal area gives,
+    // which a continent keeps the rows of its cells by.
+    std::vector<uint32_t> row_of(codes.codes.size(), NO_DATA);
+    for (size_t r = 0; r < table.row_codes.size(); r++) row_of[table.row_codes[r]] = static_cast<uint32_t>(r);
+    data.postal_city_row_of_grid_code.resize(codes.of_grid.size());
+    for (size_t g = 0; g < codes.of_grid.size(); g++) data.postal_city_row_of_grid_code[g] = row_of[codes.of_grid[g]];
+    for (uint64_t v : codes.others)
+        if (row_of[code_index(v)] != NO_DATA) data.postal_city_other_votes.push_back(vote(pos_of(v), row_of[code_index(v)]));
     data.postal_city_rows = std::move(table.rows);
-    data.postal_city_codes = std::move(table.row_codes);
     if (!data.postal_city_rows.empty()) data.postal_cities_file = postal_cities::encode_file(data.postal_city_rows);
     std::cerr << "Postal cities: " << table.votes << " votes over " << table.zips << " ZIPs, " << data.postal_city_rows.size()
               << " rows (" << table.by_votes << " from votes, " << table.by_geonames << " from GeoNames, "
@@ -641,7 +672,7 @@ void collect_postcode_grid(ParsedData& data) {
               << " yesterday's without GeoNames), " << table.names << " names, "
               << table.kept << " kept / " << table.switched << " switched / " << table.held
               << " held by the margin versus yesterday's " << data.prev_postal_names.size() << ", "
-              << data.postal_cities_file.size() << " bytes" << std::endl;
+              << postal_areas << " postal areas, " << data.postal_cities_file.size() << " bytes" << std::endl;
     if (data.postal_places.empty() && table.zips > 0)
         std::cerr << "Warning: no --postal-places: a ZIP of fewer than " << postal_cities::MIN_VOTES
                   << " votes keeps yesterday's name, having no GeoNames name" << std::endl;

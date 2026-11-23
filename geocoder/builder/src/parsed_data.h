@@ -518,23 +518,23 @@ struct ParsedData {
     std::vector<postcode_grid::GridCode> postcode_grid_codes;
     std::vector<uint64_t> postcode_grid_cells;
     std::vector<uint8_t> postcode_grid_file;
-    // The votes of each cell for a postcode other than the cell's own
-    // (postcode_grid::vote(pos, code), ascending), which a continent's
-    // postal cities name too.
-    std::vector<uint64_t> postcode_grid_other_votes;
 
     // The postal cities (postal_cities.h): the build's inputs to them
     // (--postal-places, GeoNames' entries; --prev-postal-cities, yesterday's
     // names; --dump-postal-votes, where the votes go, "" for nowhere); the
     // planet's rows, found once on the full data with the grid
-    // (collect_postcode_grid), each with its index among
-    // postcode_grid_codes; and the region's postal_cities.bin, which every
-    // mode dir holds alike: empty for a region of no row.
+    // (collect_postcode_grid), of the ZIPs an answer can give; where the
+    // continents find theirs: each postcode_grid_codes entry's row
+    // (NO_DATA for none), which its cells give, and a
+    // postcode_grid::vote(pos, row) for each other row a cell holds votes
+    // for and each postal area's; and the region's postal_cities.bin, which
+    // every mode dir holds alike: empty for a region of no row.
     postal_cities::Places postal_places;
     postal_cities::Names prev_postal_names;
     std::string postal_votes_dump;
     std::vector<postal_cities::LogicalRow> postal_city_rows;
-    std::vector<uint32_t> postal_city_codes;
+    std::vector<uint32_t> postal_city_row_of_grid_code;
+    std::vector<uint64_t> postal_city_other_votes;
     std::vector<uint8_t> postal_cities_file;
 
     // Boundaries' label/wikidata claims on place nodes (build-time only,

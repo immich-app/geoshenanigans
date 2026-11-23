@@ -368,6 +368,38 @@ TEST(a_builds_table_names_each_code_of_its_votes_in_code_order) {
     CHECK(text.find("99999") == std::string::npos);
 }
 
+TEST(a_builds_postal_cities_are_chosen_for_the_codes_an_answer_can_give) {
+    // Grid codes 0 19018, 1 19026 and 2 19600, which only a foreign address
+    // names; cells 10 (19026, and one vote of 19018) and 11 (19018); postal
+    // areas of 19400 at cell 50 and of 19026 at cell 60.
+    using postcode_grid::vote;
+    const std::vector<postcode_grid::GridCode> grid = {{US, "19018"}, {US, "19026"}, {US, "19600"}};
+    const postal_cities::TableCodes t = postal_cities::table_codes(
+        grid, {vote(10, 1), vote(11, 0)}, {vote(10, 0)}, {{{US, "19400"}, 50}, {{US, "19026"}, 60}});
+    std::vector<std::string> codes;
+    for (const auto& c : t.codes) codes.push_back(c.code);
+    CHECK(codes == std::vector<std::string>({"19018", "19026", "19400", "19600"}));
+    CHECK(t.of_grid == std::vector<uint32_t>({0, 1, 3}));
+    CHECK(t.others == std::vector<uint64_t>({vote(10, 0), vote(60, 1), vote(50, 2)}));
+    CHECK(t.reachable == std::vector<bool>({true, true, true, false}));
+    // Each code GeoNames names gets its row where an answer can give it:
+    // 19400 by its postal area, and not 19600.
+    postal_cities::Places places;
+    places[{US, "19018"}] = {"Clifton Heights", "PA"};
+    places[{US, "19026"}] = {"Drexel Hill", "PA"};
+    places[{US, "19400"}] = {"Postalton", "PA"};
+    places[{US, "19600"}] = {"Foreignville", "PA"};
+    const postal_cities::Table table = postal_cities::choose_all(
+        t.codes, std::vector<uint64_t>(), [](uint32_t) { return std::string_view(); }, places, {}, &t.reachable);
+    CHECK(same(table.rows, {row(US, "19018", "Clifton Heights"), row(US, "19026", "Drexel Hill"), row(US, "19400", "Postalton")}));
+    CHECK(table.row_codes == std::vector<uint32_t>({0, 1, 2}));
+    // No areas: the grid's codes as they are.
+    const postal_cities::TableCodes g = postal_cities::table_codes(grid, {vote(10, 1)}, {}, {});
+    CHECK_EQ(g.codes.size(), size_t(3));
+    CHECK(g.of_grid == std::vector<uint32_t>({0, 1, 2}));
+    CHECK(g.reachable == std::vector<bool>({false, true, false}));
+}
+
 TEST(a_build_without_geonames_keeps_yesterdays_names_of_its_zips_of_few_votes) {
     // No GeoNames entry at all (a build without --postal-places): a ZIP
     // below five votes keeps yesterday's name, else takes a majority of its

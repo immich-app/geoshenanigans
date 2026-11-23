@@ -430,30 +430,28 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
             out.postcode_grid_codes = full.postcode_grid_codes;
             out.postcode_grid_file = encode_file(grid_rows(out.postcode_grid_cells, out.postcode_grid_codes, GRID_LEVEL));
         }
-        // The postal cities of the postcodes the continent's cells hold
-        // votes for: each cell's own and the others it holds votes for, so a
-        // house of its own postcode finds its row.
-        if (!full.postal_city_rows.empty() && !out.postcode_grid_cells.empty()) {
-            std::vector<uint32_t> voted = parallel_collect<uint32_t>(
-                full.postcode_grid_other_votes.size(), [&](size_t i, std::vector<uint32_t>& kept) {
-                    const uint64_t v = full.postcode_grid_other_votes[i];
+        // The postal cities of the postcodes the continent's answers can
+        // give: its cells' own, the others they hold votes for, so a house
+        // of its own postcode finds its row, and its postal areas'.
+        if (!full.postal_city_rows.empty()) {
+            std::vector<uint32_t> rows = parallel_collect<uint32_t>(
+                full.postal_city_other_votes.size(), [&](size_t i, std::vector<uint32_t>& kept) {
+                    const uint64_t v = full.postal_city_other_votes[i];
                     if (cell_in_continent(cell_at(pos_of(v), GRID_LEVEL), bbox, polygon)) kept.push_back(code_index(v));
                 });
-            for (uint64_t c : out.postcode_grid_cells) voted.push_back(code_index(c));
-            std::sort(voted.begin(), voted.end());
-            voted.erase(std::unique(voted.begin(), voted.end()), voted.end());
-            for (size_t r = 0; r < full.postal_city_rows.size(); r++)
-                if (std::binary_search(voted.begin(), voted.end(), full.postal_city_codes[r])) {
-                    out.postal_city_rows.push_back(full.postal_city_rows[r]);
-                    out.postal_city_codes.push_back(full.postal_city_codes[r]);
-                }
+            for (uint64_t c : out.postcode_grid_cells)
+                if (full.postal_city_row_of_grid_code[code_index(c)] != NO_DATA)
+                    rows.push_back(full.postal_city_row_of_grid_code[code_index(c)]);
+            std::sort(rows.begin(), rows.end());
+            rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+            for (uint32_t r : rows) out.postal_city_rows.push_back(full.postal_city_rows[r]);
             if (!out.postal_city_rows.empty()) out.postal_cities_file = postal_cities::encode_file(out.postal_city_rows);
         }
     }
 
     drop(full.way_parent_ids, full.admin_parent_ids, full.way_postcode_ids, full.interp_postcode_ids,
          full.addr_postcode_ids, full.postcode_accum, full.postcode_grid_cells, full.postcode_grid_codes,
-         full.postcode_grid_other_votes, full.postal_city_rows, full.postal_city_codes);
+         full.postal_city_rows, full.postal_city_row_of_grid_code, full.postal_city_other_votes);
     log_phase(("      " + std::string(bbox.name) + " filter: parent + postcode projection").c_str(), _ft, _fc);
 
     // --- Remap sorted cell arrays for all 5 types (preserving INTERIOR_FLAG) ---
