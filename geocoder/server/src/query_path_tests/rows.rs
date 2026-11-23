@@ -345,3 +345,21 @@ fn a_node_outside_its_boundary_or_its_fuzzy_area_s_reach_or_at_a_rank_an_area_ho
     assert_eq!(display, "Kartavya Path, Raisina Hill, New Delhi, Delhi, India");
     assert_eq!(address["suburb"], "Raisina Hill");
 }
+
+#[test]
+fn a_boundary_repeating_the_outline_of_the_one_before_it_holds_no_rank() {
+    // Bruxelles - Brussel (admin_level 9) repeats the outline of Brussels (8, linked city: 16), and
+    // Nominatim takes it out of addresses (placex_triggers.sql:895-899), so rank 18, which its
+    // level would lift it to under the city, stays free. A town node inside the city ranks 18
+    // (placex_triggers.sql:951-971) and is the rank's row.
+    let mut index = country("Belgium", b"BE");
+    index
+        .boundary("Brussels-Capital", 4, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Brussels", 8, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Bruxelles - Brussel", 9, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .place("Laeken", 1, 1500.0, 0.0)
+        .street("Rue Melsens - Melsensstraat", &[(0.0, -100.0), (0.0, 100.0)]);
+    let (display, address) = answer_at(&index.load(), 0.0, 0.0);
+    assert_eq!(display, "Rue Melsens - Melsensstraat, Laeken, Brussels, Brussels-Capital, Belgium");
+    assert_eq!((&address["town"], &address["city"]), (&serde_json::json!("Laeken"), &serde_json::json!("Brussels")));
+}
