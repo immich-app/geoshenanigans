@@ -34,7 +34,7 @@ axum-server = "0.8"
 bcrypt = "0.19"
 getrandom = "0.4"
 arc-swap = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
 zstd = "0.14"
 sha2 = "0.11"
 futures-util = "0.3"
