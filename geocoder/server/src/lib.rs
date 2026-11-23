@@ -3015,8 +3015,8 @@ impl Index {
         });
         if let Some(files) = &self.postcode_centroids {
             // No centroid farther than its country's extent along either axis holds the point,
-            // the most expand_by_meters' box reaches. (A box across the antimeridian spans every
-            // longitude between its corners; it is taken only near its centroid here.)
+            // the most expand_by_meters' box reaches, but for a box across the antimeridian (read
+            // below).
             let reach_m = country_code.map_or(MAX_POSTCODE_EXTENT_M, |cc| postcode_extent_m(cc, "")) * geography_box::BOX_REACH_FACTOR;
             let max_dist_sq = {
                 let dlat = reach_m / METRES_PER_DEGREE;
@@ -3049,17 +3049,28 @@ impl Index {
                     *best = Some((d, s));
                 }
             };
-            // The blocks of the centroids of the cells a centroid holding the point can be in,
-            // the nearest box first: no centroid is nearer than its block's box, so a block whose
-            // box is farther than the best so far holds none that can win, and is left undecoded.
-            let cells = cells_near_point(lat, lng, reach_m, self.admin_cell_level);
-            NEAR_BLOCKS.with_borrow_mut(|near| {
-                files.blocks_near(&cells, lat, lng, max_dist_sq, near);
+            // The blocks of the centroids of `cells` nearer than `max_d`, the nearest box first:
+            // no centroid is nearer than its block's box, so a block whose box is farther than
+            // the best so far holds none that can win, and is left undecoded.
+            let read = |cells: &[u64], max_d: f64, best: &mut Option<(f64, Cow<'a, str>)>| NEAR_BLOCKS.with_borrow_mut(|near| {
+                files.blocks_near(cells, lat, lng, max_d, near);
                 for n in near.iter() {
                     if best.as_ref().is_some_and(|&(best_d, _)| n.d > best_d) { continue; }
-                    files.rows_of(n.block, n.rows, |_, pc| consider(pc, &mut best));
+                    files.rows_of(n.block, n.rows, |_, pc| consider(pc, best));
                 }
             });
+            // The cells a centroid holding the point can be in.
+            read(&cells_near_point(lat, lng, reach_m, self.admin_cell_level), max_dist_sq, &mut best);
+            // A box across the antimeridian spans every longitude between its corners the long
+            // way round (expand_by_meters), so a centroid within reach of the antimeridian at
+            // the point's latitude can hold the point however far off it lies. Those are read
+            // where no centroid within reach holds it: any that does is nearer.
+            if best.is_none() {
+                let cells: Vec<u64> = [180.0, -180.0].into_iter()
+                    .flat_map(|edge| cells_near_point(lat, edge, reach_m, self.admin_cell_level))
+                    .collect();
+                read(&cells, f64::INFINITY, &mut best);
+            }
             return best.map(|(_, s)| s);
         }
 
@@ -4606,6 +4617,27 @@ mod query_tests {
         }
         assert_eq!(answered, 40 * 4);
         assert_eq!(nearest_centroid(&centroids, -16.75, 180.0, None), None);
+    }
+
+    #[test]
+    fn a_box_across_the_antimeridian_holds_points_far_from_its_centroid() {
+        // expand_by_meters' 25 km box of a US centroid at (10, 179.999) reaches across the
+        // antimeridian, and ST_Envelope makes it of every longitude between its corners the long
+        // way round (geography_box): it holds points of its latitudes 110 km west, across the
+        // antimeridian and half a world away where no nearer centroid's box does, as
+        // get_nearest_postcode finds them, and none of other latitudes or another country.
+        let centroids = [(10.0, 179.999, "96799", *b"us"), (10.0, 0.05, "96800", *b"us")];
+        let idx = centroids_at(&centroids);
+        for (lat, lng, country, want) in [
+            (10.0, 179.0, b"us", Some("96799")), (10.1, -170.0, b"us", Some("96799")), (10.2, 90.0, b"us", Some("96799")),
+            (10.0, 0.0, b"us", Some("96800")), (10.3, 90.0, b"us", None), (10.0, 179.0, b"fr", None),
+        ] {
+            assert_eq!(nearest_centroid(&centroids, lat, lng, Some(*country)), want, "({lat}, {lng})");
+            assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, None, Some(*country)).as_deref(), want, "({lat}, {lng})");
+        }
+        let idx = centroids_at(&centroids[..1]);
+        assert_eq!(idx.resolve_postcode(10.0, 0.0, None, None, None, None, None, Some(*b"us")).as_deref(), Some("96799"));
+        assert_eq!(idx.resolve_postcode(10.0, 0.0, None, None, None, None, None, None).as_deref(), Some("96799"));
     }
 
     #[test]
