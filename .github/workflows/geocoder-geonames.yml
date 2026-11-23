@@ -10,10 +10,15 @@ on:
     - cron: '37 3 * * 1'  # Weekly on Monday at 3:37 UTC
   workflow_dispatch:
 
+# One refresh at a time: each reads the rows the cache holds before it replaces latest.json, so two
+# at once could both pass the check against the same rows.
+concurrency:
+  group: geocoder-geonames
+  cancel-in-progress: false
+
 env:
   S3_BUCKET: geoshenanigans-reverse-geocoding
   S3_ENDPOINT: https://t3.storage.dev
-  S3_PUBLIC_URL: https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io
 
 permissions:
   contents: read
@@ -44,38 +49,53 @@ jobs:
           SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
 
       - name: Download GeoNames postal code files
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          mkdir -p /tmp/geonames
+          GN="$RUNNER_TEMP/geonames"
+          mkdir -p "$GN"
           for CC in US PR VI GU AS MP; do
             curl -sSfL --connect-timeout 30 --max-time 300 --retry 3 --retry-delay 20 --retry-all-errors \
-              -o "/tmp/geonames/$CC.zip" "https://download.geonames.org/export/zip/$CC.zip"
-            echo "$CC.zip: $(stat -c%s "/tmp/geonames/$CC.zip") bytes"
+              -o "$GN/$CC.zip" "https://download.geonames.org/export/zip/$CC.zip"
+            echo "$CC.zip: $(stat -c%s "$GN/$CC.zip") bytes"
           done
           curl -sSfL --connect-timeout 30 --max-time 60 --retry 3 --retry-delay 20 --retry-all-errors \
-            -o /tmp/geonames/readme.txt "https://download.geonames.org/export/zip/readme.txt"
+            -o "$GN/readme.txt" "https://download.geonames.org/export/zip/readme.txt"
           # The licence the cache's credit rests on (configurations.template.json, attribution).
-          grep -q "Creative Commons Attribution 4.0" /tmp/geonames/readme.txt \
+          grep -q "Creative Commons Attribution 4.0" "$GN/readme.txt" \
             || { echo "::error::GeoNames' readme no longer gives CC BY 4.0"; exit 1; }
 
       - name: Build and upload postal_places.tsv.gz
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5"
-          # The rows the cache holds now: a refresh that loses more than 1% of them is refused, and
-          # the cache stays as it was.
-          LATEST=$(curl -sL --fail --connect-timeout 30 --max-time 60 "$S3_PUBLIC_URL/geocoder/geonames/latest.json" || echo '{}')
-          PREVIOUS_ROWS=$(echo "$LATEST" | jq -r '.rows // 0')
+          GN="$RUNNER_TEMP/geonames"
+          # The rows the cache holds now, read from the bucket itself (the public URL may serve an
+          # older copy): a refresh that loses more than 1% of them is refused, and the cache stays
+          # as it was. Only a bucket that holds no latest.json is a first refresh; a read that
+          # fails, or a latest.json of no row count, fails the run.
+          if $S5 cat "s3://$S3_BUCKET/geocoder/geonames/latest.json" > "$GN/latest.json" 2> "$GN/latest.err"; then
+            PREVIOUS_ROWS=$(jq -e '.rows | select(type == "number" and . >= 0 and . == floor)' "$GN/latest.json") \
+              || { echo "::error::geocoder/geonames/latest.json gives no row count; the cache stays as it was"; exit 1; }
+          elif grep -q "given object .* not found" "$GN/latest.err"; then
+            PREVIOUS_ROWS=0
+          else
+            echo "::error::Could not read geocoder/geonames/latest.json ($(tr '\n' ' ' < "$GN/latest.err")); the cache stays as it was"
+            exit 1
+          fi
           echo "The cache holds $PREVIOUS_ROWS rows"
-          SUMMARY=$(python3 geocoder/builder/tools/postal_places.py /tmp/postal_places.tsv.gz \
-            /tmp/geonames/{US,PR,VI,GU,AS,MP}.zip --previous-rows "$PREVIOUS_ROWS")
+          SUMMARY=$(python3 geocoder/builder/tools/postal_places.py "$GN/postal_places.tsv.gz" \
+            "$GN"/{US,PR,VI,GU,AS,MP}.zip --previous-rows "$PREVIOUS_ROWS")
           echo "$SUMMARY" | jq .
           # A run's own key, never overwritten: a nightly reading the file latest.json named before
           # this run still finds it.
           DATE=$(date -u +%Y%m%d)
           KEY="geonames/$DATE/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          $S5 cp /tmp/postal_places.tsv.gz "s3://$S3_BUCKET/geocoder/$KEY/postal_places.tsv.gz"
-          $S5 cp /tmp/geonames/readme.txt "s3://$S3_BUCKET/geocoder/$KEY/readme.txt"
+          $S5 cp "$GN/postal_places.tsv.gz" "s3://$S3_BUCKET/geocoder/$KEY/postal_places.tsv.gz"
+          $S5 cp "$GN/readme.txt" "s3://$S3_BUCKET/geocoder/$KEY/readme.txt"
           echo "$SUMMARY" | jq \
             --arg date "$DATE" \
             --arg path "$KEY/postal_places.tsv.gz" \

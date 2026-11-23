@@ -75,6 +75,30 @@ cat "$path"
 """
 
 
+# An s5cmd whose `cat` reads as S5CMD's, and whose `cp SRC DST` and `pipe DST` write
+# $SERVED/s3/<bucket path>, each write noted in $NOTES/uploads.
+S5CMD_RW = r"""#!/bin/bash
+while [ $# -gt 0 ]; do case "$1" in cat|cp|pipe) op=$1; shift; break ;; *) shift ;; esac; done
+case "$op" in
+  cat)
+    path="$SERVED/s3/${1#s3://}"
+    if [ -f "$path.fail" ]; then echo "ERROR \"cat $1\": InternalError: We encountered an internal error. status code: 500" >&2; exit 1; fi
+    if ! [ -f "$path" ]; then echo "ERROR \"cat $1\": given object $1 not found" >&2; exit 1; fi
+    cat "$path" ;;
+  cp) mkdir -p "$(dirname "$SERVED/s3/${2#s3://}")"; cp "$1" "$SERVED/s3/${2#s3://}"; echo "$2" >> "$NOTES/uploads" ;;
+  pipe) mkdir -p "$(dirname "$SERVED/s3/${1#s3://}")"; cat > "$SERVED/s3/${1#s3://}"; echo "$1" >> "$NOTES/uploads" ;;
+esac
+"""
+# postal_places.py as the refresh runs it: OUT ZIP... --previous-rows N.
+FAKE_POSTAL_PLACES = r"""#!/bin/bash
+shift
+echo "$@" > "$NOTES/args"
+if [ -n "${REFUSE:-}" ]; then echo "postal_places: 1 rows, fewer than 99% of the cache's 41706" >&2; exit 1; fi
+echo gz > "$1"
+echo '{"rows": 41706, "size": 3, "sha256": "aa", "sources": {"US": 41529}}'
+"""
+
+
 class NightlyPostalCitiesTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -324,6 +348,80 @@ class NightlyPostalCitiesTest(unittest.TestCase):
         downloads = step_script(text, "Download GeoNames postal code files")
         self.assertIn("for CC in US PR VI GU AS MP; do", downloads)
         self.assertIn("readme.txt", downloads)
+
+    def test_refreshes_of_the_cache_run_one_at_a_time(self):
+        self.assertRegex(workflow("geocoder-geonames.yml"),
+                         r"(?m)^concurrency:\n  group: geocoder-geonames\n  cancel-in-progress: false$")
+
+    def test_a_refresh_checks_its_rows_against_the_buckets_latest_json_and_fails_without_it(self):
+        script = step_script(workflow("geocoder-geonames.yml"), "Build and upload postal_places.tsv.gz")
+        self.assertNotIn("S3_PUBLIC_URL", workflow("geocoder-geonames.yml"))
+        with open(os.path.join(self.bin, "s5cmd"), "w") as f:
+            f.write(S5CMD_RW)
+        # postal_places.py as the step runs it: its arguments noted, its summary printed, unless
+        # it refuses the files.
+        with open(os.path.join(self.bin, "python3"), "w") as f:
+            f.write(FAKE_POSTAL_PLACES)
+        for name in ("s5cmd", "python3"):
+            os.chmod(os.path.join(self.bin, name), 0o755)
+        runner = os.path.join(self.root, "runner")
+        os.makedirs(os.path.join(runner, "geonames"))
+        with open(os.path.join(runner, "geonames", "readme.txt"), "w") as f:
+            f.write("GeoNames\n")
+        pointer = os.path.join(self.served, "s3", "bucket", "geocoder", "geonames", "latest.json")
+
+        def refresh(**env):
+            for name in ("args", "uploads"):
+                if os.path.exists(os.path.join(self.root, name)):
+                    os.remove(os.path.join(self.root, name))
+            r = subprocess.run(["bash", "-eo", "pipefail", "-c", script], capture_output=True, text=True, env={
+                "PATH": self.bin + os.pathsep + os.environ["PATH"], "SERVED": self.served, "NOTES": self.root,
+                "S3_ENDPOINT": "https://bucket.example", "S3_BUCKET": "bucket", "RUNNER_TEMP": runner,
+                "GITHUB_RUN_ID": "77", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_STEP_SUMMARY": os.path.join(self.root, "summary"),
+                **env})
+            args = open(os.path.join(self.root, "args")).read().split() if os.path.exists(os.path.join(self.root, "args")) else None
+            uploads = open(os.path.join(self.root, "uploads")).read().split() if os.path.exists(os.path.join(self.root, "uploads")) else []
+            return r, args, uploads
+
+        # A first refresh: the bucket holds no latest.json.
+        r, args, uploads = refresh()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(args[args.index("--previous-rows") + 1], "0")
+        with open(pointer) as f:
+            self.assertEqual(json.load(f)["rows"], 41706)
+        self.assertEqual(len(uploads), 3)
+        # The next one checks against its rows.
+        r, args, _ = refresh()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(args[args.index("--previous-rows") + 1], "41706")
+        # A refused refresh, a failed read and a latest.json of no row count leave it as it was.
+        with open(pointer, "rb") as f:
+            before = f.read()
+        failing = [({"REFUSE": "1"}, None, "fewer than 99%"),
+                   ({}, "fail", "Could not read geocoder/geonames/latest.json"),
+                   ({}, '{"path": "geonames/x"}', "gives no row count"),
+                   ({}, '{"rows": "41706"}', "gives no row count"),
+                   ({}, "<html>", "gives no row count")]
+        for env, served, why in failing:
+            if served == "fail":
+                open(pointer + ".fail", "w").close()
+            elif served is not None:
+                with open(pointer, "w") as f:
+                    f.write(served)
+            r, args, uploads = refresh(**env)
+            self.assertNotEqual(r.returncode, 0, why)
+            self.assertIn(why, r.stdout + r.stderr)
+            self.assertEqual(uploads, [], why)
+            if served is None:
+                self.assertIsNotNone(args)
+            else:
+                self.assertIsNone(args, why)
+            if os.path.exists(pointer + ".fail"):
+                os.remove(pointer + ".fail")
+            with open(pointer, "rb") as f:
+                self.assertEqual(f.read(), before if served in (None, "fail") else served.encode(), why)
+            with open(pointer, "wb") as f:
+                f.write(before)
 
     def test_a_change_to_the_cache_workflow_runs_these_tests(self):
         paths = re.search(r"(?ms)^  pull_request:\n    paths:\n(.*?)^\S", workflow("geocoder-tests.yml")).group(1)
