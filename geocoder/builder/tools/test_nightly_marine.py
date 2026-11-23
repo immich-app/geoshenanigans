@@ -160,6 +160,18 @@ def fake_s5cmd(bin_dir):
     os.chmod(path, 0o755)
 
 
+# build-index as the Build step runs it: writes each of its arguments on a line of $BUILD_INDEX_ARGS.
+FAKE_BUILD_INDEX = '#!/bin/sh\nprintf "%s\\n" "$@" > "$BUILD_INDEX_ARGS"\n'
+
+
+def build_run():
+    """The Build step's build-index arguments and its run of build-index with them, as bash."""
+    text = script(read(NIGHTLY), "Build geocoder index")
+    args = re.search(r'^# Build args\n.*?(?=^echo "Building geocoder index)', text, re.M | re.S)
+    run = re.search(r"^build-index .*\\\n(?: +.*\\\n)* +.*\n", text, re.M)
+    return args.group(0) + run.group(0) if args and run else None
+
+
 def sidecar_block():
     """The Download step's fetch of yesterday's sidecars, as bash, with its $S5, up to its pid."""
     text = script(read(NIGHTLY), "Download PBF and previous indexes")
@@ -301,6 +313,28 @@ class NightlyTest(unittest.TestCase):
         download = script(text, "Download PBF and previous indexes")
         sidecars = download[download.index("# ── Background: previous strategy-2 sidecars ──"):download.index("IDX_PID=$!")]
         self.assertIn("planet/water/all/exact/water_meta.json", sidecars)
+
+    def test_build_index_takes_the_marine_areas_when_the_download_gave_a_file(self):
+        block = build_run()
+        self.assertIsNotNone(block)
+        path = os.path.join(self.bin, "build-index")
+        with open(path, "w") as f:
+            f.write(FAKE_BUILD_INDEX)
+        os.chmod(path, 0o755)
+        marine = os.path.join(self.work, "marine_areas.bin")
+        with open(marine, "wb") as f:
+            f.write(self.raw)
+        recorded = os.path.join(self.tmp.name, "build-index-args")
+        for given, want in ((marine, [["--marine", marine]]), ("", []), (os.path.join(self.work, "gone.bin"), [])):
+            with self.subTest(marine=given):
+                env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "WORKDIR": self.work, "MARINE_FILE": given,
+                       "BUILD_INDEX_ARGS": recorded}
+                run = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", block], env=env, capture_output=True,
+                                     text=True, timeout=60)
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                args = read(recorded).splitlines()
+                self.assertEqual(args[:2], [f"{self.work}/output/", f"{self.work}/planet.osm.pbf"])
+                self.assertEqual([args[i:i + 2] for i, a in enumerate(args) if a == "--marine"], want)
 
 
 class SidecarFetchTest(unittest.TestCase):
