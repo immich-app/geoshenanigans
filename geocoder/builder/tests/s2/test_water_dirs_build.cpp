@@ -211,7 +211,8 @@ TEST(build_index_writes_every_regions_water_dirs_and_a_chained_build_writes_them
     CHECK(tree(again) == files);
 
     // The pond gone, on top of the first build: its slot is a tombstone and
-    // the others keep theirs, where a build of its own holds three records.
+    // the others keep theirs, on the planet and in Europe, where a build of
+    // its own holds three records.
     std::vector<TestObject> drained;
     for (const TestObject& o : fixture())
         if (o.type != OsmType::Way || o.id != 110) drained.push_back(o);
@@ -220,12 +221,15 @@ TEST(build_index_writes_every_regions_water_dirs_and_a_chained_build_writes_them
     REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, after, drained_pbf, "--continents", "--multi-output", "--multi-quality",
                          "--prev-output", first},
                         log));
-    std::vector<std::string> slots = slot_names(first + "/planet/water/all/exact");
-    REQUIRE(slots.size() == 4u);
-    const auto pond = std::find(slots.begin(), slots.end(), "Weiher");
-    REQUIRE(pond != slots.end());
-    *pond = "";
-    CHECK(slot_names(after + "/planet/water/all/exact") == slots);
+    for (const char* region : {"planet", "europe"}) {
+        const std::string dir = std::string("/") + region + "/water/all/exact";
+        std::vector<std::string> slots = slot_names(first + dir);
+        REQUIRE(slots.size() == 4u);
+        const auto pond = std::find(slots.begin(), slots.end(), "Weiher");
+        REQUIRE(pond != slots.end());
+        *pond = "";
+        CHECK(slot_names(after + dir) == slots);
+    }
 }
 
 TEST(a_way_only_the_water_layer_reads_stays_out_of_the_other_layers) {
@@ -298,7 +302,8 @@ TEST(a_build_without_multi_output_writes_the_exact_water_tier_beside_its_modes_f
     REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, tiers, pbf, "--continents", "--multi-output", "--multi-quality"}, log));
     const auto one = tree(single), multi = tree(tiers);
     for (const char* f : {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin", "admin_cells.bin",
-                          "admin_entries.bin", "strings_core.bin", "water_meta.json"}) {
+                          "admin_entries.bin", "strings_core.bin", "strings_layout.json", "water_meta.json",
+                          "attribution.json"}) {
         REQUIRE(one.count(std::string("planet/water/") + f));
         CHECK(one.at(std::string("planet/water/") + f) == multi.at(std::string("planet/water/all/exact/") + f));
     }
@@ -381,9 +386,10 @@ TEST(a_node_the_input_lacks_leaves_a_gap_that_no_water_ring_or_line_crosses) {
     objects.push_back(relation(501, {{"type", "multipolygon"}, {"natural", "water"}, {"water", "lake"}, {"name", "Whole Lake"}},
                                {{101, "outer"}}));
     // A river area the line of a river would cross only along a gap: its
-    // nodes either side lie west and east of it.
+    // runs of resolved nodes either side lie west and east of it.
     objects.push_back(way(110, square(lat0 + 100000, lng0, 10000), {{"natural", "water"}, {"water", "river"}}));
-    objects.push_back(way(111, {at(lat0 + 105000, lng0 - 5000), missing, at(lat0 + 105000, lng0 + 15000)},
+    objects.push_back(way(111, {at(lat0 + 105000, lng0 - 8000), at(lat0 + 105000, lng0 - 5000), missing,
+                                at(lat0 + 105000, lng0 + 15000), at(lat0 + 105000, lng0 + 18000)},
                           {{"waterway", "river"}, {"name", "Gap River"}}));
     // One a run of a river's resolved nodes runs through names.
     objects.push_back(way(120, square(lat0 + 200000, lng0, 10000), {{"natural", "water"}, {"water", "river"}}));
