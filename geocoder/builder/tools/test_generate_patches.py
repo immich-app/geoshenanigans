@@ -441,8 +441,8 @@ class WaterDirPatchTest(unittest.TestCase):
     def test_a_water_dir_diffs_patches_and_verifies_on_its_own(self):
         self.assertEqual(self.run_.returncode, 0, self.run_.stdout + self.run_.stderr)
         result = read(os.path.join(self.results, "r_water_all_exact")).split()
-        # All ten client files, the JSON ones among them, as the new day's.
-        self.assertEqual(result[:2], ["PASS", "10"], result)
+        # All eleven client files, the JSON ones among them, as the new day's.
+        self.assertEqual(result[:2], ["PASS", "11"], result)
         self.assertTrue(os.path.getsize(os.path.join(self.new, "r", "water", "all", "exact", "patch.gcpatch")) > 0)
         self.assertEqual(read(os.path.join(self.results, "r_full")).split(), ["SKIP"])
         # Its strings are its core alone, three dirs down from the mode dirs: its estimate holds no street tier.
@@ -457,6 +457,7 @@ class WaterDirPatchTest(unittest.TestCase):
         self.assertRegex(log, r"admin_polygons\.bin by slot: match=3 replace=1 insert=0 delete=0")
         self.assertIn("admin_rings.bin: unchanged", log)
         self.assertIn("arc_index.bin: unchanged", log)
+        self.assertIn("water_cut_arcs.bin: unchanged", log)
         arcs = re.search(r"arc_vertices\.bin: .* recs m/i/d/r=(\d+)/(\d+)/(\d+)/(\d+)", log)
         self.assertIsNotNone(arcs, log)
         kept, inserted, deleted, replaced = map(int, arcs.groups())
@@ -483,10 +484,12 @@ class WaterDirKindsPatchTest(unittest.TestCase):
             self.assertNotEqual(before, after, name)
         self.assertEqual(self.run_.returncode, 0, self.run_.stdout + self.run_.stderr)
         result = read(os.path.join(self.results, "r_water_all_exact")).split()
-        # All ten client files as the new day's, the changed JSON ones among them.
-        self.assertEqual(result[:2], ["PASS", "10"], result)
+        # All eleven client files as the new day's, the changed JSON ones among them.
+        self.assertEqual(result[:2], ["PASS", "11"], result)
         log = read(os.path.join(self.logs, "r_water_all_exact.log"))
         self.assertRegex(log, r"admin_polygons\.bin by slot: match=\d+ replace=\d+ insert=[1-9]")
+        # The sea's arc slots, more than the day before held, take words of the cut arcs of their own.
+        self.assertRegex(log, r"water_cut_arcs\.bin: sparse delta [1-9]\d*/")
 
 
 # The nightly's patch step (geocoder-build.yml): its reserve, as a shell

@@ -14,6 +14,9 @@
 //                                         records' areas don't add up
 //   arc_index.bin + arc_vertices.bin      the tier's arcs (kWaterArcStage:
 //                                         rings cut at member way ends)
+//   water_cut_arcs.bin                    a bit per arc slot, set for a cut:
+//                                         an arc only one object's polygons
+//                                         use, twice or more
 //   admin_cells.bin + admin_entries.bin   the cell index at the admin cell
 //                                         level (--admin-level, L10 by
 //                                         default), interior where both

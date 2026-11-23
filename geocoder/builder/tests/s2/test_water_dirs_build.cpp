@@ -181,7 +181,7 @@ TEST(build_index_writes_every_regions_water_dirs_and_a_chained_build_writes_them
         for (const char* dir : {"water/all/simplified", "water/all/exact", "water/major/simplified"})
             for (const char* f : {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin",
                                   "admin_cells.bin", "admin_entries.bin", "strings_core.bin", "strings_layout.json",
-                                  "water_meta.json", "attribution.json"})
+                                  "water_cut_arcs.bin", "water_meta.json", "attribution.json"})
                 CHECK(files.count(region + "/" + dir + "/" + f));
     // The lake, the pond, the reservoir and the river area its waterway
     // names, in Europe as on the planet; the river area nothing names is out.
@@ -299,7 +299,7 @@ TEST(a_build_without_multi_output_writes_the_exact_water_tier_beside_its_modes_f
     REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, tiers, pbf, "--continents", "--multi-output", "--multi-quality"}, log));
     const auto one = tree(single), multi = tree(tiers);
     for (const char* f : {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin", "admin_cells.bin",
-                          "admin_entries.bin", "strings_core.bin", "water_meta.json"}) {
+                          "admin_entries.bin", "strings_core.bin", "water_cut_arcs.bin", "water_meta.json"}) {
         REQUIRE(one.count(std::string("planet/water/") + f));
         CHECK(one.at(std::string("planet/water/") + f) == multi.at(std::string("planet/water/all/exact/") + f));
     }

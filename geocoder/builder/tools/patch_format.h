@@ -271,7 +271,9 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // postcode_centroids.bin and postcode_centroid_cells.bin. No sparse delta
 // carries them (remap kind 3 is gone), no cell list delta (stride 0xFB)
 // carries any index, and file ids 24 and 25 name no file.
-static constexpr uint32_t GCPATCH_VERSION = 19;
+// v20: file id 36 names a water dir's water_cut_arcs.bin, a bit per arc slot
+// in u32 words, sent as a sparse delta of its words (SPARSE_DELTA_FILES).
+static constexpr uint32_t GCPATCH_VERSION = 20;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -328,7 +330,9 @@ enum class PatchFileId : uint32_t {
     INTERP_POSTCODES = 34,
     // The geo index's blocks, beside its top file (GEO_CELLS).
     GEO_ENTRIES = 35,
-    COUNT = 36
+    // A water dir's cut arcs: a bit per arc slot, in u32 words.
+    WATER_CUT_ARCS = 36,
+    COUNT = 37
 };
 
 static const char* patch_file_names[] = {
@@ -345,7 +349,8 @@ static const char* patch_file_names[] = {
     "strings_core.bin", "strings_street.bin", "strings_addr.bin",
     "strings_postcode.bin", "strings_poi.bin",
     "interp_postcodes.bin",
-    "geo_entries.bin"
+    "geo_entries.bin",
+    "water_cut_arcs.bin"
 };
 
 // The string offset fields of a record file the patch merges, as byte
@@ -368,9 +373,10 @@ inline std::vector<size_t> string_field_offsets(PatchFileId fid) {
 // The files sent as SPARSE_DELTA_STRIDE sections, in emission order, with
 // the value each position holds:
 //   remap_kind 0 = raw, 2 = string offset.
-// Admin parents are admin slots, which polygons keep, so they go raw; kind 1
-// (an admin id the patch remapped) and kind 3 (a 16-byte postcode centroid,
-// to v18) name no file.
+// Admin parents are admin slots, which polygons keep, so they go raw, as do
+// a water dir's cut arcs, whose words follow the arc slots; kind 1 (an admin
+// id the patch remapped) and kind 3 (a 16-byte postcode centroid, to v18)
+// name no file.
 struct SparseDeltaFile { PatchFileId fid; uint32_t value_stride, remap_kind; };
 static constexpr SparseDeltaFile SPARSE_DELTA_FILES[] = {
     {PatchFileId::ADDR_POSTCODES, 4, 2},
@@ -378,6 +384,7 @@ static constexpr SparseDeltaFile SPARSE_DELTA_FILES[] = {
     {PatchFileId::WAY_PARENTS, 4, 0},
     {PatchFileId::WAY_POSTCODES, 4, 2},
     {PatchFileId::INTERP_POSTCODES, 4, 2},
+    {PatchFileId::WATER_CUT_ARCS, 4, 0},
 };
 
 inline const SparseDeltaFile* sparse_delta_file(PatchFileId fid) {

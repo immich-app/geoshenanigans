@@ -294,9 +294,11 @@ TEST(a_segment_of_no_length_lends_its_line_no_wikidata_item) {
     CHECK_EQ(named, size_t(1));
 }
 
-TEST(a_lake_of_many_islands_is_cut_into_pieces_that_each_carry_the_lakes_name_type_and_area) {
-    Collected c = fixture();
-    // A lake of 0.4 x 0.4 degrees with 12 x 12 islands, one way round.
+namespace {
+
+// Island Lake: a lake of 0.4 x 0.4 degrees with 12 x 12 islands, one way
+// round, which the split cuts into pieces.
+void add_island_lake(Collected& c) {
     const int32_t lat = kLat - 10000000, side = 4000000;
     add_geometry(c, 70, square(lat, kLng, side, 8));
     CollectedArea isles;
@@ -310,6 +312,13 @@ TEST(a_lake_of_many_islands_is_cut_into_pieces_that_each_carry_the_lakes_name_ty
             isles.members.push_back({way, "inner"});
         }
     c.relations.push_back(isles);
+}
+
+}  // namespace
+
+TEST(a_lake_of_many_islands_is_cut_into_pieces_that_each_carry_the_lakes_name_type_and_area) {
+    Collected c = fixture();
+    add_island_lake(c);
     const Layer layer = build(c);
     std::vector<size_t> pieces;
     for (size_t p = 0; p < layer.size(); p++)
@@ -394,7 +403,8 @@ TEST(the_water_dirs_hold_every_file_and_keep_each_polygons_slot_the_next_day) {
     const auto files = tree(one);
     const std::vector<std::string> client = {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin",
                                              "admin_cells.bin", "admin_entries.bin", "strings_core.bin",
-                                             "strings_layout.json", "water_meta.json", "attribution.json"};
+                                             "strings_layout.json", "water_cut_arcs.bin", "water_meta.json",
+                                             "attribution.json"};
     for (const char* dir : {"water/all/simplified", "water/all/exact", "water/major/simplified"})
         for (const std::string& f : client) CHECK(files.count(std::string(dir) + "/" + f));
     for (const char* dir : {"water/all/exact", "water/major/simplified"})
@@ -405,7 +415,8 @@ TEST(the_water_dirs_hold_every_file_and_keep_each_polygons_slot_the_next_day) {
     // The two tiers of the all set: one set of records, rings, cells and
     // names; their own arcs.
     for (const char* f : {"admin_polygons.bin", "admin_rings.bin", "admin_cells.bin", "admin_entries.bin",
-                          "strings_core.bin", "strings_layout.json", "water_meta.json", "attribution.json"})
+                          "strings_core.bin", "strings_layout.json", "water_cut_arcs.bin", "water_meta.json",
+                          "attribution.json"})
         CHECK(files.at(std::string("water/all/simplified/") + f) == files.at(std::string("water/all/exact/") + f));
     // The simplified tier drops the vertices along the lake's sides that the
     // exact tier keeps.
@@ -486,6 +497,91 @@ Collected with_marine() {
 std::string text_of(const std::vector<char>& bytes) { return std::string(bytes.begin(), bytes.end()); }
 
 }  // namespace
+
+namespace {
+
+// Each slot's refs in the dir `dir` of `files` (its admin_polygons.bin and
+// admin_rings.bin), by record: none for a tombstone.
+std::vector<std::vector<uint32_t>> slot_refs(const std::map<std::string, std::vector<char>>& files, const std::string& dir) {
+    const std::vector<char>& records = files.at(dir + "/admin_polygons.bin");
+    const std::vector<char>& rings = files.at(dir + "/admin_rings.bin");
+    const size_t n = records.size() / sizeof(AdminPolygonRecord);
+    std::vector<std::vector<uint32_t>> out(n);
+    for (size_t i = 0; i < n; i++) {
+        AdminPolygonRecord r, next;
+        std::memcpy(&r, records.data() + i * sizeof r, sizeof r);
+        size_t end = rings.size();
+        if (i + 1 < n) {
+            std::memcpy(&next, records.data() + (i + 1) * sizeof next, sizeof next);
+            end = next.ring_offset;
+        }
+        std::vector<std::vector<arc_blocks::SlotRef>> decoded;
+        REQUIRE(arc_blocks::decode_rings(reinterpret_cast<const uint8_t*>(rings.data()) + r.ring_offset, end - r.ring_offset,
+                                         decoded));
+        for (const auto& ring : decoded)
+            for (const arc_blocks::SlotRef& ref : ring) out[i].push_back(ref.slot);
+    }
+    return out;
+}
+
+// The slots water_cut_arcs.bin of the dir marks; false where it isn't a bit
+// for each of arc_index.bin's slots, in whole u32 words.
+bool cut_slots(const std::map<std::string, std::vector<char>>& files, const std::string& dir, std::set<uint32_t>& out) {
+    const std::vector<char>& words = files.at(dir + "/water_cut_arcs.bin");
+    const size_t slots = files.at(dir + "/arc_index.bin").size() / 4;
+    if (words.size() != (slots + 31) / 32 * 4) return false;
+    out.clear();
+    for (uint32_t s = 0; s < slots; s++) {
+        uint32_t w;
+        std::memcpy(&w, words.data() + s / 32 * 4, 4);
+        if (w >> (s % 32) & 1) out.insert(s);
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST(a_water_dirs_cut_arcs_are_those_two_pieces_of_one_object_share) {
+    Collected c = with_marine();
+    add_island_lake(c);
+    const ScratchDir root("water-cuts");
+    write(build(c), root.path());
+    const auto files = tree(root.path());
+    CHECK(files.at("water/all/simplified/water_cut_arcs.bin") == files.at("water/all/exact/water_cut_arcs.bin"));
+    for (const char* dir : {"water/all/exact", "water/major/simplified"}) {
+        std::set<uint32_t> cuts;
+        REQUIRE(cut_slots(files, dir, cuts));
+        // By object, each record's name: the arcs two of its polygons (or
+        // one twice) use and no other object's.
+        const std::vector<std::string> names = slot_names(files, dir);
+        const std::vector<std::vector<uint32_t>> refs = slot_refs(files, dir);
+        std::map<uint32_t, std::multiset<std::string>> users;
+        for (size_t i = 0; i < refs.size(); i++)
+            for (uint32_t slot : refs[i]) users[slot].insert(names[i]);
+        std::set<uint32_t> want;
+        for (const auto& [slot, by] : users)
+            if (by.size() >= 2 && by.count(*by.begin()) == by.size()) want.insert(slot);
+        CHECK(cuts == want);
+        // Island Lake's pieces meet along the grid; the ocean's square and
+        // the sea's share a side, a shore of each.
+        size_t lake = 0, shared = 0;
+        for (uint32_t slot : cuts) lake += *users[slot].begin() == "Island Lake";
+        for (const auto& [slot, by] : users)
+            shared += by.count("North Atlantic Ocean") && by.count("North Sea") && !cuts.count(slot);
+        CHECK(lake >= 2u);
+        CHECK_EQ(lake, cuts.size());
+        CHECK(shared >= 1u);
+    }
+    // A dir of no cut, and one of no arc.
+    const ScratchDir plain("water-no-cuts");
+    write(build(fixture()), plain.path());
+    const auto none = tree(plain.path());
+    std::set<uint32_t> cuts;
+    REQUIRE(cut_slots(none, "water/all/exact", cuts));
+    CHECK(cuts.empty());
+    CHECK(!none.at("water/all/exact/water_cut_arcs.bin").empty());
+    CHECK(none.at("water/major/simplified/water_cut_arcs.bin").empty());
+}
 
 TEST(marine_areas_are_objects_of_their_own_as_seas_and_oceans) {
     const Layer layer = build(with_marine());
@@ -1113,9 +1209,10 @@ TEST(the_local_names_of_a_rivers_reaches_dont_rename_it) {
 // days, which tools/test_generate_patches.py diffs, patches and verifies
 // with the real tools. Day 2 is day 1 with the pond's second vertex moved,
 // on day 1's slots. Day 3 is day 2 with a pond of a water=* value of its own
-// and a sea, on day 2's slots: its water_meta.json lists one more kind and
-// its attribution.json credits Marine Regions. With GEOCODER_WRITE_TESTDATA
-// set this writes them instead.
+// and a sea of two tiles side by side, on day 2's slots: its water_meta.json
+// lists one more kind, its attribution.json credits Marine Regions and its
+// water_cut_arcs.bin marks the side the tiles share. With
+// GEOCODER_WRITE_TESTDATA set this writes them instead.
 TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     const ScratchDir root("water-fixture");
     const std::string one = root.path() + "/one", two = root.path() + "/two", three = root.path() + "/three";
@@ -1128,15 +1225,18 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     ObjectTags salt = tags(0, "Salzweiher");
     salt.verbatim = "salt_pond";
     more.closed_ways.push_back({33, salt, square(kLat + 600000, kLng, 1000)});
-    more.marine.push_back(marine_area(2350, marine::kSea, "North Sea", {{square(kLat - 20000000, kLng, 20000, 4)}}));
+    more.marine.push_back(marine_area(2350, marine::kSea, "North Sea",
+                                      {{square(kLat - 20000000, kLng, 20000, 4)},
+                                       {square(kLat - 20000000, kLng + 20000, 20000, 4)}}));
     write(build(more, two), three, two);
     const std::string fixture_dir = std::string(GEOCODER_TESTDATA_DIR) + "/water_dir";
     const bool rewrite = std::getenv("GEOCODER_WRITE_TESTDATA") != nullptr;
-    // Every day's client files, each day all ten, before any fixture dir is
-    // compared or written.
+    // Every day's client files, each day all eleven, before any fixture dir
+    // is compared or written.
     const std::set<std::string> client = {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin",
                                           "admin_cells.bin", "admin_entries.bin", "strings_core.bin",
-                                          "strings_layout.json", "water_meta.json", "attribution.json"};
+                                          "strings_layout.json", "water_cut_arcs.bin", "water_meta.json",
+                                          "attribution.json"};
     std::map<std::string, std::map<std::string, std::vector<char>>> days;
     for (const auto& [day, dir] : {std::pair<std::string, std::string>{"day1", one}, {"day2", two}, {"day3", three}}) {
         std::set<std::string> names;
@@ -1168,6 +1268,17 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     }
     CHECK(text_of(days["day3"]["water_meta.json"]).find("\"type\": \"salt_pond\"") != std::string::npos);
     CHECK(text_of(days["day3"]["attribution.json"]).find("marine-regions") != std::string::npos);
+    // No cut arc but on day 3: the side the sea's two tiles share.
+    auto cuts = [&](const std::string& day) {
+        std::map<std::string, std::vector<char>> files;
+        for (const auto& [name, bytes] : days[day]) files["d/" + name] = bytes;
+        std::set<uint32_t> out;
+        REQUIRE(cut_slots(files, "d", out));
+        return out.size();
+    };
+    CHECK_EQ(cuts("day1"), size_t(0));
+    CHECK_EQ(cuts("day2"), size_t(0));
+    CHECK(cuts("day3") >= 1u);
 }
 
 TEST(an_unnamed_riverbank_tagged_natural_water_too_takes_its_waterways_name) {

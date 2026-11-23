@@ -2,7 +2,7 @@
   "schema_version": 1,
   "build": {
     "version": 24,
-    "patch_version": 19
+    "patch_version": 20
   },
   "attribution": [
     {
@@ -395,6 +395,7 @@
         "{region}/water/major/simplified/arc_vertices.bin",
         "{region}/water/major/simplified/strings_core.bin",
         "{region}/water/major/simplified/strings_layout.json",
+        "{region}/water/major/simplified/water_cut_arcs.bin",
         "{region}/water/major/simplified/water_meta.json",
         "{region}/water/major/simplified/attribution.json"
       ]
@@ -411,6 +412,7 @@
         "{region}/water/all/simplified/arc_vertices.bin",
         "{region}/water/all/simplified/strings_core.bin",
         "{region}/water/all/simplified/strings_layout.json",
+        "{region}/water/all/simplified/water_cut_arcs.bin",
         "{region}/water/all/simplified/water_meta.json",
         "{region}/water/all/simplified/attribution.json"
       ]
@@ -427,6 +429,7 @@
         "{region}/water/all/exact/arc_vertices.bin",
         "{region}/water/all/exact/strings_core.bin",
         "{region}/water/all/exact/strings_layout.json",
+        "{region}/water/all/exact/water_cut_arcs.bin",
         "{region}/water/all/exact/water_meta.json",
         "{region}/water/all/exact/attribution.json"
       ]
