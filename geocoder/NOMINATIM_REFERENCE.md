@@ -182,7 +182,9 @@ street lane takes address ranks 26 to 29 (`reverse.py:187-189`): the builder
 gives it the highway flag where no place or landuse kind of a rank below 26
 ranks it (`poi_classify.h` `classify_poi`; `place=square` ranks 26), and the server lets a water area
 of that flag compete as streets do, its own name the `road` inside it
-(`Index::is_out_of_the_primary_lanes`).
+(`Index::is_out_of_the_primary_lanes`). Such a street ships in the POI tier of
+its water kind or in that of the category its tags give, whichever is lower: a
+lake that is an attraction is in `poi/notable`, as an attraction is.
 
 **Water with a POI main tag.** A water object that also carries a main tag of
 the import's POI list (`presets.lua` `MAIN_TAGS_POIS`, lines 170-262) with a

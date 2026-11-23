@@ -1416,6 +1416,44 @@ TEST(a_water_area_of_a_sidewalk_crossing_link_or_traffic_aisle_footway_answers_n
     }
 }
 
+// A named water area of highway=pedestrian that is an attraction, of no wiki
+// tag, is a street in Nominatim, which the build writes as a lake of the
+// highway flag in the tier an attraction ships in, 2: poi/notable holds it
+// as poi/all does, and from either the server answers its own name inside
+// it, though Teststrasse, 6 m south of the point, is nearer than its outline.
+// poi/major holds none.
+TEST(a_water_street_that_is_an_attraction_answers_its_own_name_from_poi_notable_too) {
+    const ScratchDir root("water-street-tier-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    std::vector<TestObject> water;
+    add_rectangle(water, 4040, 990, lat0 + 1396000, lng0 + 1420000, lat0 + 1404000, lng0 + 1428000,
+                  {{"area", "yes"}, {"highway", "pedestrian"}, {"name", "Seeplatz Testdorf"}, {"natural", "water"},
+                   {"tourism", "attraction"}});
+    write_fixture_with(pbf, water);
+    const std::string out = root.path() + "/single";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
+    const auto files = tree(out);
+
+    CHECK(poi_records_in(files, "planet/poi/major").empty());
+    for (const std::string tier : {"notable", "all"}) {
+        const std::vector<PoiRecord> pois = poi_records_in(files, "planet/poi/" + tier);
+        if (pois.size() != 1) std::printf("    poi/%s holds %zu\n", tier.c_str(), pois.size());
+        CHECK_EQ(pois.size(), size_t(1));
+        for (const PoiRecord& pr : pois) {
+            CHECK_EQ(int(pr.category), int(PoiCategory::NATURAL_WATER));
+            CHECK_EQ(int(pr.tier), 2);
+            CHECK_EQ(int(pr.flags), int(POI_FLAG_HIGHWAY));
+        }
+        const std::string dataset = poi_dataset(out, tier, root.path() + "/" + tier);
+        const std::vector<std::string> answers = server_answers(dataset, {{47.14005, 8.1424}}, root.path() + "/q-" + tier, log);
+        REQUIRE(answers.size() == 1);
+        if (answer_string(answers[0], {"address", "road"}) != std::optional<std::string>("Seeplatz Testdorf"))
+            std::printf("    poi/%s: %s\n", tier.c_str(), answers[0].c_str());
+        CHECK(answer_string(answers[0], {"address", "road"}) == std::optional<std::string>("Seeplatz Testdorf"));
+    }
+}
+
 // A build logs, for each dir it writes with addresses and for each POI tier,
 // the bytes of the dir's logical vertex stream, the most a patch indexes of
 // them and their share of that: a STREAM_BYTES line, which the nightly's

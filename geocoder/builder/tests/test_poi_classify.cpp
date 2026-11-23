@@ -4,6 +4,7 @@
 // validated via full planet builds + grid diffs).
 #include "poi_classify.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -568,6 +569,36 @@ TEST(poi_classify_a_water_highway_area_takes_the_highway_flag_where_its_highway_
     square.place = "locality";
     square.area = true;
     CHECK_EQ(int(classify(square)->flags), int(POI_FLAG_HIGHWAY));
+}
+
+TEST(poi_classify_a_water_street_ships_in_the_lower_of_its_kinds_tier_and_its_tags_categorys) {
+    // A water area a highway kind ranks a street stays water, of the highway
+    // flag, and ships in its water kind's tier or in that of the category
+    // its tags give where that is lower: a lake that is an attraction (tier
+    // 2, a lake's 3) in poi/notable, where the server answers its own name
+    // inside it; with a wiki tag in poi/major. A water area a place kind
+    // ranks lower is no street, and the water it is, of its kind's tier, and
+    // so is a water street of no other tag.
+    for (const WaterKind& kind : kWaterKinds) {
+        Tags t = with(with(water(kind), "highway", "pedestrian"), "tourism", "attraction");
+        t.area = true;
+        const int kind_tier = poi_tier_of(kind.category, 0);
+        const auto street = classify(t);
+        REQUIRE(street.has_value());
+        CHECK_EQ(uint8_t(street->category), uint8_t(kind.category));
+        CHECK_EQ(int(street->flags), int(POI_FLAG_HIGHWAY));
+        CHECK_EQ(int(street->tier), std::min(kind_tier, 2));
+        Tags wiki = t;
+        wiki.wikidata = "Q1";
+        CHECK_EQ(int(classify(wiki)->tier), 1);
+        const auto locality = classify(with(t, "place", "locality"));
+        REQUIRE(locality.has_value());
+        CHECK_EQ(int(locality->flags), 0);
+        CHECK_EQ(int(locality->tier), kind_tier);
+        Tags plain = with(water(kind), "highway", "pedestrian");
+        plain.area = true;
+        CHECK_EQ(int(classify(plain)->tier), kind_tier);
+    }
 }
 
 TEST(poi_classify_a_water_area_of_a_sidewalk_crossing_link_or_traffic_aisle_footway_is_no_street) {

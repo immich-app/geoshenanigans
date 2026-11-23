@@ -3,6 +3,7 @@
 // Extracted verbatim from build_index.cpp so the mapping — which encodes
 // hundreds of Nominatim-parity decisions and evolves frequently — can be
 // unit-tested (tests/test_poi_classify.cpp) without a full build+diff cycle.
+#include <algorithm>
 #include <cstring>
 #include <initializer_list>
 #include <optional>
@@ -205,7 +206,10 @@ inline std::optional<PoiClassification> classify_poi(
     // (the street lane takes address ranks 26 to 29, reverse.py:187-189): it
     // takes the highway flag below, unless a place or landuse kind of a rank
     // below 26 ranks it, every one but place=square (26), which makes it no
-    // street either.
+    // street either. Such a street ships in its kind's tier, or in that of
+    // the category the classifier's branches give its tags where that is
+    // lower: a lake that is an attraction, as an attraction does, in
+    // poi/notable, where the server answers its own name inside it.
     const PoiCategory kind = poi_water_kind(t_natural, t_landuse);
     // highway=footway of footway=sidewalk, crossing, link or traffic_aisle is
     // no main tag in Nominatim (presets.lua:23-33 filter_footways): beside
@@ -220,12 +224,15 @@ inline std::optional<PoiClassification> classify_poi(
     const bool poi_main_tag = has_poi_main_tag(t_amenity, t_leisure, t_emergency, t_tourism, t_historic, t_shop, t_craft,
                                                t_office, t_aeroway, t_railway, t_man_made);
     PoiCategory yielded = PoiCategory::UNKNOWN;
+    // The kind that stays the object's category, once the branches below
+    // gave its tags theirs.
+    PoiCategory kept = PoiCategory::UNKNOWN;
     if (kind != PoiCategory::UNKNOWN &&
         (!ranks_30 || (kind == PoiCategory::RESERVOIR && poi_main_tag &&
                        reservoir_leaves_poi_lane(t_aeroway, t_amenity, t_boundary, t_building, t_craft, t_emergency,
                                                  t_highway, t_leisure, t_man_made, t_natural, t_office, t_place,
                                                  t_railway, t_shop, t_tourism, t_waterway, area)))) {
-        cat = kind;
+        kept = kind;
     } else if (kind != PoiCategory::UNKNOWN &&
                (poi_main_tag || (kind != PoiCategory::RESERVOIR && t_building && std::strcmp(t_building, "no") != 0))) {
         yielded = kind;
@@ -553,6 +560,8 @@ inline std::optional<PoiClassification> classify_poi(
         }
     }
 
+    const PoiCategory tagged = cat;
+    if (kept != PoiCategory::UNKNOWN) cat = kept;
     if (cat == PoiCategory::UNKNOWN) return std::optional<PoiClassification>{};
 
     uint8_t flags = 0;
@@ -573,6 +582,7 @@ inline std::optional<PoiClassification> classify_poi(
         flags |= POI_FLAG_HIGHWAY;
     }
     uint8_t tier = poi_tier_of(cat, flags);
+    if (kept != PoiCategory::UNKNOWN && (flags & POI_FLAG_HIGHWAY)) tier = std::min(tier, poi_tier_of(tagged, flags));
     // A water object that yields ships as the water it is in the tiers whose
     // dirs ship its water kind but not its category: all of them where its
     // rank-30 tags give a category no POI dir ships (a generic rank-30
