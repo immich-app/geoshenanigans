@@ -551,8 +551,9 @@ std::vector<bool> exact_rings_nest(const AdminExactRings& store, unsigned thread
 // (arc_grid), round after round while that changes anything; on a tier that
 // takes collapsing rings to the e7 grid, a ring that a junction so moved
 // leaves with under 3 vertices or no area with every vertex kept has its
-// arcs and their junctions on the e7 grid too. A tier with no tolerance
-// keeps everything and counts nothing.
+// arcs and their junctions on the e7 grid too, and a ring of the arcs that
+// changed that is left so as stored gets vertices back as in the validity
+// rounds. A tier with no tolerance keeps everything and counts nothing.
 //
 // A tier that coarsens does all that on its fine grid, notes the rings valid
 // there, then snaps every arc and junction to its own grid and keeps

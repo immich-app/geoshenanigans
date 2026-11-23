@@ -318,3 +318,33 @@ TEST(a_ring_the_nesting_pass_flattens_at_a_junction_it_moves_keeps_its_own_shore
     CHECK(exact_ring_area2(ring.data(), static_cast<uint32_t>(ring.size())) != 0);
     for (const PackedLocation& v : ring) CHECK(v.lat_e7 % 100 != 0);
 }
+
+TEST(a_ring_the_nesting_pass_flattens_as_stored_gets_its_dropped_vertex_back) {
+    // The lake and island above, and the triangle with a fourth vertex
+    // halfway along its edge back to the lake's shore, which Douglas-Peucker
+    // drops. Snapped whole it holds an area, with the vertex it shares with
+    // the lake on the grid or on the e7 grid, so it stays on the grid; as
+    // stored, its three vertices lie on one line once the nesting pass puts
+    // that vertex on the e7 grid, until the dropped one is back.
+    const int32_t lat = 470000000, lng = 80000000;
+    AdminExactRings store;
+    store.append(closed({pt(lat + 40, lng + 20), pt(lat + 100000, lng + 50000), pt(lat + 100000, lng - 50000),
+                         pt(lat, lng - 50000)}),
+                 {closed({pt(lat + 1149, lng + 551), pt(lat + 1149, lng + 351), pt(lat + 1349, lng + 351),
+                          pt(lat + 1349, lng + 551)})});
+    store.append(closed({pt(lat + 40, lng + 20), pt(lat + 110, lng + 190), pt(lat + 190, lng + 510), pt(lat + 115, lng + 265)}),
+                 {});
+    const AdminArcs arcs = build_arc_topology(store, 1, {}, ArcCuts::JunctionsAndWayEnds);
+    const std::vector<bool> nests = exact_rings_nest(store, 1);
+    REQUIRE(nests[0] && nests[1]);
+    const ArcTierState water = build_arc_tier(arcs, store, water_simplified(), nests, 1);
+    CHECK(water.counts.e7_grid_rounds >= 1);
+    CHECK_EQ(water.counts.rings_nest_introduced, size_t(0));
+    CHECK_EQ(water.counts.e7_collapsing_rings, size_t(0));
+    CHECK_EQ(water.counts.degenerate_rings, size_t(0));
+    std::vector<PackedLocation> ring, raw;
+    std::vector<StoredVertex> stored;
+    tier_ring(arcs, store, water_simplified(), water, 2, ring, raw, stored);
+    CHECK(exact_ring_area2(ring.data(), static_cast<uint32_t>(ring.size())) != 0);
+    CHECK(std::find(ring.begin(), ring.end(), pt(lat + 100, lng + 300)) != ring.end());
+}
