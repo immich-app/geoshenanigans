@@ -613,6 +613,13 @@ fn one_outline_is_the_same_whichever_vertex_and_way_round_its_ring_starts() {
     let beside = ring_polygon(&mut s, vec![box_deg(47.2, 8.3, 47.5, 8.7)]);
     let off = ring_polygon(&mut s, vec![box_deg(47.1, 8.3000001, 47.4, 8.7000001)]);
     let turned = ring_polygon(&mut s, vec![box_deg(47.05, 8.35, 47.45, 8.65)]);
+    // The rectangle with a vertex more halfway along its southern edge, in two arcs.
+    let (south, rest) = (ring_deg(&[(47.1, 8.3), (47.1, 8.5), (47.1, 8.7)]), ring_deg(&[(47.1, 8.7), (47.4, 8.7), (47.4, 8.3), (47.1, 8.3)]));
+    let cut = {
+        let refs = vec![Ref::fwd(s.fx.arc(0, &south)), Ref::fwd(s.fx.arc(0, &rest))];
+        let ring: Vec<PointE7> = south.iter().chain(&rest[1..]).copied().collect();
+        s.polygon(8, &[refs], vec![ring])
+    };
     let ringless = s.polygon(8, &[], vec![]);
     let (geom, mut polys) = s.geometry();
     for id in [beside, off] {
@@ -620,7 +627,8 @@ fn one_outline_is_the_same_whichever_vertex_and_way_round_its_ring_starts() {
     }
     assert_eq!(polys[turned as usize].area, polys[square as usize].area);
     let same = |a: u32, b: u32| geom.same_outline(&polys[a as usize], &polys[b as usize]);
-    assert!(same(square, square) && same(square, again) && same(again, square));
+    assert_eq!(polys[cut as usize].area, polys[square as usize].area);
+    assert!(same(square, square) && same(square, again) && same(again, square) && same(square, cut) && same(cut, again));
     assert!(!same(square, beside) && !same(square, off) && !same(square, turned) && !same(ringless, ringless));
     // Of another area, the same ring is another outline.
     polys[again as usize].area *= 2.0;

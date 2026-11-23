@@ -266,10 +266,10 @@ impl AdminGeometry {
         (c.sums.area > 0.0).then(|| (lat0 + c.sums.y / c.sums.area, lng0 + c.sums.x / c.sums.area))
     }
 
-    /// Whether `a` and `b` have one outline: the same area, and the same ring block or the same
-    /// edges, each taken either way round, whatever vertex their rings start at and whichever
-    /// arcs hold them. False when either has no rings or a malformed ring block, and where one
-    /// cuts an edge that the other doesn't.
+    /// Whether `a` and `b` have one outline: the same area, and the same ring block, or every
+    /// edge of each along the other's edges, whatever vertex their rings start at, which way
+    /// round they run, which arcs hold them and which vertices cut their edges. False when
+    /// either has no rings or a malformed ring block.
     pub fn same_outline(&self, a: &AdminPolygon, b: &AdminPolygon) -> bool {
         if a.area != b.area {
             return false;
@@ -278,17 +278,14 @@ impl AdminGeometry {
         if block_a == block_b {
             return true;
         }
-        let edges = |block: &[u8]| {
-            let mut read = EdgeReader { arcs: self.arcs(), edges: Vec::new(), vertices: Vec::new() };
-            walk_rings(block, &mut read)?;
-            let mut edges: Vec<_> = read.edges.into_iter()
-                .map(|(p, q)| if (p.lng, p.lat) <= (q.lng, q.lat) { (p, q) } else { (q, p) })
-                .map(|(p, q)| (p.lng, p.lat, q.lng, q.lat))
-                .collect();
-            edges.sort_unstable();
-            Some(edges)
+        let held = |poly: &AdminPolygon, block: &[u8]| {
+            let (lat, lng) = self.memo_surface_point(poly, block)?;
+            HeldRings::of(block, self.arcs(), AdminPoint::new(lat, lng).e7())
         };
-        matches!((edges(block_a), edges(block_b)), (Some(e), Some(f)) if e == f)
+        let (Some(held_a), Some(held_b)) = (held(a, block_a), held(b, block_b)) else { return false };
+        let mut cuts = Vec::new();
+        let all_along = |edges: &[(PointE7, PointE7)], other: &HeldRings, cuts: &mut Vec<PointE7>| edges.iter().all(|&(p, q)| other.runs_along(p, q, cuts));
+        all_along(&held_a.edges, &held_b, &mut cuts) && all_along(&held_b.edges, &held_a, &mut cuts)
     }
 
     /// `poly`'s point on surface (the builder's interior_point) as (lat, lng); none without rings.
@@ -654,6 +651,11 @@ fn cross_inside(a: PointE7, b: PointE7, c: PointE7, d: PointE7) -> bool {
     side(a, b, c) * side(a, b, d) < 0 && side(c, d, a) * side(c, d, b) < 0
 }
 
+/// How far along the edge a-b the point `v` on it lies, in a measure that orders such points.
+fn along(a: PointE7, b: PointE7, v: PointE7) -> i128 {
+    (v.lat - a.lat) as i128 * (b.lat - a.lat) as i128 + (v.lng - a.lng) as i128 * (b.lng - a.lng) as i128
+}
+
 /// Twice the coordinates of `p`: there the middle of two e7 points is on the grid.
 fn twice(p: PointE7) -> PointE7 {
     PointE7 { lat: 2 * p.lat, lng: 2 * p.lng }
@@ -768,6 +770,28 @@ impl HeldRings {
         odd
     }
 
+    /// Whether the point of twice the coordinates `p2` lies on an edge of the rings.
+    fn on_edges(&self, p2: PointE7) -> bool {
+        let lng = p2.lng.div_euclid(2);
+        self.edges_between(lng, lng).any(|(a, b)| on_edge(twice(a), twice(b), p2))
+    }
+
+    /// Whether the edge a-b lies along the rings' edges: cut at their vertices on it (into
+    /// `cuts`), the middle of each piece on one of their edges.
+    fn runs_along(&self, a: PointE7, b: PointE7, cuts: &mut Vec<PointE7>) -> bool {
+        let (lng0, lng1) = (a.lng.min(b.lng), a.lng.max(b.lng));
+        let first = self.probes.partition_point(|q| q.p.lng < lng0);
+        cuts.clear();
+        cuts.extend(self.probes[first..].iter().take_while(|q| q.p.lng <= lng1).map(|q| q.p).filter(|&p| p != a && p != b && on_edge(a, b, p)));
+        cuts.sort_unstable_by_key(|v| along(a, b, *v));
+        let mut from = a;
+        cuts.iter().chain([&b]).all(|&to| {
+            let middle = PointE7 { lat: from.lat + to.lat, lng: from.lng + to.lng };
+            from = to;
+            self.on_edges(middle)
+        })
+    }
+
     /// Reads the other polygon's edge a-b into every probe whose longitude it spans; whether it
     /// leaves some of the rings outside: it crosses an edge of theirs at a point inside both, or
     /// a piece of it runs inside them off their edges. Cut at the vertices of the rings on it, a
@@ -785,8 +809,7 @@ impl HeldRings {
         self.surface.read(a, b);
         let outside = !(a.lat.max(b.lat) <= self.lo.lat || a.lat.min(b.lat) >= self.hi.lat || lng1 <= self.lo.lng || lng0 >= self.hi.lng)
             && (self.edges_between(lng0, lng1).any(|(c, d)| cross_inside(a, b, c, d)) || {
-                let along = |v: &PointE7| (v.lat - a.lat) as i128 * (b.lat - a.lat) as i128 + (v.lng - a.lng) as i128 * (b.lng - a.lng) as i128;
-                cuts.sort_unstable_by_key(along);
+                cuts.sort_unstable_by_key(|v| along(a, b, *v));
                 let mut from = a;
                 cuts.iter().chain([&b]).any(|&to| {
                     let middle = PointE7 { lat: from.lat + to.lat, lng: from.lng + to.lng };
