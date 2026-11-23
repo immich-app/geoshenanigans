@@ -598,6 +598,48 @@ TEST(a_water_dirs_cut_arcs_are_those_two_pieces_of_one_object_share) {
     CHECK(none.at("water/major/simplified/water_cut_arcs.bin").empty());
 }
 
+TEST(an_arc_two_objects_of_one_name_type_and_area_share_is_no_cut) {
+    // The Mediterranean's two IHO basins, which show one name, side by side;
+    // and two OSM lakes of one name side by side: each pair squares of one
+    // size, so one name, type code and area. The side each pair shares is a
+    // shore of either object, not a cut.
+    Collected c = fixture();
+    const int32_t lat = kLat - 20000000;
+    c.marine.push_back(marine_area(4279, marine::kSea, "Mediterranean Sea - Western Basin", {{square(lat, kLng, 2000000, 40)}}));
+    c.marine.push_back(
+        marine_area(4280, marine::kSea, "Mediterranean Sea - Eastern Basin", {{square(lat, kLng + 2000000, 2000000, 40)}}));
+    c.closed_ways.push_back({2601, tags(code::kLake, "Twin Lake"), square(kLat - 3000000, kLng, 100000, 4)});
+    c.closed_ways.push_back({2602, tags(code::kLake, "Twin Lake"), square(kLat - 3000000, kLng + 100000, 100000, 4)});
+    const ScratchDir root("water-twins");
+    write(build(c), root.path());
+    const auto files = tree(root.path());
+    for (const auto& [dir, twins] : {std::pair<std::string, std::vector<std::string>>{"water/all/exact", {"Mediterranean Sea", "Twin Lake"}},
+                                     {"water/major/simplified", {"Mediterranean Sea"}}}) {
+        std::set<uint32_t> cuts;
+        REQUIRE(cut_slots(files, dir, cuts));
+        CHECK(cuts.empty());
+        // Each pair's records: one name, code and area; and the arcs both use.
+        const std::vector<std::string> names = slot_names(files, dir);
+        const std::vector<std::vector<uint32_t>> refs = slot_refs(files, dir);
+        const std::vector<char>& records = files.at(dir + "/admin_polygons.bin");
+        for (const std::string& name : twins) {
+            std::vector<AdminPolygonRecord> pair;
+            std::map<uint32_t, int> uses;
+            for (size_t i = 0; i < names.size(); i++) {
+                if (names[i] != name) continue;
+                AdminPolygonRecord r;
+                std::memcpy(&r, records.data() + i * sizeof r, sizeof r);
+                pair.push_back(r);
+                for (uint32_t slot : std::set<uint32_t>(refs[i].begin(), refs[i].end())) uses[slot]++;
+            }
+            REQUIRE(pair.size() == 2u);
+            CHECK_EQ(pair[0].country_code, pair[1].country_code);
+            CHECK_EQ(pair[0].area, pair[1].area);
+            CHECK(std::count_if(uses.begin(), uses.end(), [](const auto& u) { return u.second == 2; }) >= 1);
+        }
+    }
+}
+
 TEST(marine_areas_are_objects_of_their_own_as_seas_and_oceans) {
     const Layer layer = build(with_marine());
     // After the OSM objects, by id: the ocean's two polygons, then the sea.
