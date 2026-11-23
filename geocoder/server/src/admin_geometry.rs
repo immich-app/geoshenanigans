@@ -317,12 +317,12 @@ impl AdminGeometry {
 
     /// Whether `poly` lies within `other`, as Nominatim's ST_Contains(other, poly) of a place
     /// area or a boundary: every vertex of its rings inside `other` or on its edges, none of its
-    /// edges crossing one of `other`'s, no vertex of `other`'s rings inside it off its edges (as
-    /// one of a hole of `other` that it lies round, or of a notch in `other` that it spans), and
-    /// its point on surface inside `other` off its edges (not so for one filling a hole of
-    /// `other`). Areas nested along shared ways meet on edges alone. `poly`'s rings are read once
-    /// and held, and `other`'s once, but for the chunks and arcs south of `poly` or beside it.
-    /// False when either has no rings.
+    /// edges crossing one of `other`'s, no point of `other`'s edges inside it off its edges (as
+    /// of a hole of `other` that it lies round, or of a notch in `other` that it spans), and its
+    /// point on surface inside `other` off its edges (not so for one filling a hole of `other`).
+    /// Areas nested along shared ways meet on edges alone. `poly`'s rings are read once and
+    /// held, and `other`'s once, but for the chunks and arcs south of `poly` or beside it. False
+    /// when either has no rings.
     pub fn polygon_within(&self, poly: &AdminPolygon, other: &AdminPolygon) -> bool {
         let (Some(block), Some(other_block)) = (self.ring_block(poly), self.ring_block(other)) else { return false };
         let (poly_key, other_key) = (Self::block_key(poly), Self::block_key(other));
@@ -629,9 +629,12 @@ impl Probe {
         Probe { p, odd: false, on_edge: false }
     }
 
-    fn read(&mut self, a: PointE7, b: PointE7) {
+    /// Reads the edge a-b; whether the point lies on it.
+    fn read(&mut self, a: PointE7, b: PointE7) -> bool {
+        let on = on_edge(a, b, self.p);
         self.odd ^= edge_crosses(a, b, self.p);
-        self.on_edge |= on_edge(a, b, self.p);
+        self.on_edge |= on;
+        on
     }
 }
 
@@ -645,12 +648,19 @@ fn cross_inside(a: PointE7, b: PointE7, c: PointE7, d: PointE7) -> bool {
     side(a, b, c) * side(a, b, d) < 0 && side(c, d, a) * side(c, d, b) < 0
 }
 
+/// Twice the coordinates of `p`: there the middle of two e7 points is on the grid.
+fn twice(p: PointE7) -> PointE7 {
+    PointE7 { lat: 2 * p.lat, lng: 2 * p.lng }
+}
+
 /// A polygon's rings held whole for AdminGeometry::polygon_within: its vertices, each once and by
 /// longitude, and its point on surface, as probes of the other polygon's edges; and its edges,
 /// each listed in every strip of longitude its own longitudes meet, so that a point or an edge
 /// of the other polygon is tested against the edges of its strips alone.
 struct HeldRings {
     probes: Vec<Probe>,
+    /// The probes on the edge read last but for its ends, which cut it into pieces.
+    cuts: Vec<PointE7>,
     surface: Probe,
     edges: Vec<(PointE7, PointE7)>,
     /// The edges meeting strip s are edges[listed[k]] for k in starts[s]..starts[s + 1].
@@ -714,7 +724,7 @@ impl HeldRings {
             }
         }
         let probes = vertices.into_iter().map(Probe::at).collect();
-        Some(HeldRings { probes, surface: Probe::at(surface), edges, starts, listed, lo, hi, strip_width })
+        Some(HeldRings { probes, cuts: Vec::new(), surface: Probe::at(surface), edges, starts, listed, lo, hi, strip_width })
     }
 
     /// The edges listed in the strips from the one of longitude `lng0` to the one of `lng1`
@@ -732,34 +742,54 @@ impl HeldRings {
         max_lat < self.lo.lat || min_lng > self.hi.lng || max_lng < self.lo.lng
     }
 
-    /// Whether `p` lies inside the rings, off their edges.
-    fn holds_off_edges(&self, p: PointE7) -> bool {
-        if !(self.lo.lat < p.lat && p.lat < self.hi.lat && self.lo.lng < p.lng && p.lng < self.hi.lng) {
+    /// Whether the point of twice the coordinates `p2` lies inside the rings, off their edges.
+    /// (The ray cast's products stay far inside i128 at twice the coordinates.)
+    fn holds_off_edges(&self, p2: PointE7) -> bool {
+        let (lo, hi) = (twice(self.lo), twice(self.hi));
+        if !(lo.lat < p2.lat && p2.lat < hi.lat && lo.lng < p2.lng && p2.lng < hi.lng) {
             return false;
         }
+        // An edge spanning a longitude halfway between two of the grid spans the lower one.
+        let lng = p2.lng.div_euclid(2);
         let mut odd = false;
-        for (a, b) in self.edges_between(p.lng, p.lng) {
-            if on_edge(a, b, p) {
+        for (a, b) in self.edges_between(lng, lng) {
+            let (a, b) = (twice(a), twice(b));
+            if on_edge(a, b, p2) {
                 return false;
             }
-            odd ^= edge_crosses(a, b, p);
+            odd ^= edge_crosses(a, b, p2);
         }
         odd
     }
 
     /// Reads the other polygon's edge a-b into every probe whose longitude it spans; whether it
-    /// crosses an edge of the rings at a point inside both.
+    /// leaves some of the rings outside: it crosses an edge of theirs at a point inside both, or
+    /// a piece of it runs inside them off their edges. Cut at the vertices of the rings on it, a
+    /// piece meets their edges at its ends alone, so it lies inside them where its middle does.
     fn read_edge(&mut self, a: PointE7, b: PointE7) -> bool {
         let (lng0, lng1) = (a.lng.min(b.lng), a.lng.max(b.lng));
         let first = self.probes.partition_point(|q| q.p.lng < lng0);
+        let mut cuts = std::mem::take(&mut self.cuts);
+        cuts.clear();
         for q in self.probes[first..].iter_mut().take_while(|q| q.p.lng <= lng1) {
-            q.read(a, b);
+            if q.read(a, b) && q.p != a && q.p != b {
+                cuts.push(q.p);
+            }
         }
         self.surface.read(a, b);
-        if a.lat.max(b.lat) <= self.lo.lat || a.lat.min(b.lat) >= self.hi.lat || lng1 <= self.lo.lng || lng0 >= self.hi.lng {
-            return false;
-        }
-        self.edges_between(lng0, lng1).any(|(c, d)| cross_inside(a, b, c, d))
+        let outside = !(a.lat.max(b.lat) <= self.lo.lat || a.lat.min(b.lat) >= self.hi.lat || lng1 <= self.lo.lng || lng0 >= self.hi.lng)
+            && (self.edges_between(lng0, lng1).any(|(c, d)| cross_inside(a, b, c, d)) || {
+                let along = |v: &PointE7| (v.lat - a.lat) as i128 * (b.lat - a.lat) as i128 + (v.lng - a.lng) as i128 * (b.lng - a.lng) as i128;
+                cuts.sort_unstable_by_key(along);
+                let mut from = a;
+                cuts.iter().chain([&b]).any(|&to| {
+                    let middle = PointE7 { lat: from.lat + to.lat, lng: from.lng + to.lng };
+                    from = to;
+                    self.holds_off_edges(middle)
+                })
+            });
+        self.cuts = cuts;
+        outside
     }
 
     /// Whether the rings lie within the polygon whose ring block is `other`, read through `arcs`.
@@ -800,8 +830,7 @@ impl RingVisitor for EdgeReader<'_> {
 }
 
 /// AdminGeometry::polygon_within's walk of the other polygon's rings: each edge read into the
-/// held rings, the walk stopped at the first edge crossing one of theirs or vertex inside them
-/// off their edges.
+/// held rings, the walk stopped at the first that leaves some of them outside.
 struct WithinWalk<'a> {
     arcs: ArcFiles<'a>,
     held: HeldRings,
@@ -823,11 +852,11 @@ impl RingVisitor for WithinWalk<'_> {
         let (mut prev, mut outside) = (None::<PointE7>, false);
         arc_vertices(block, |v| {
             if outside { return; }
-            outside = held.holds_off_edges(v) || prev.is_some_and(|a| held.read_edge(a, v));
+            outside = prev.is_some_and(|a| held.read_edge(a, v));
             prev = Some(v);
         })?;
         self.outside |= outside;
-        // An edge or a vertex that leaves the rings outside ends the walk, which then reads as
+        // An edge that leaves some of the rings outside ends the walk, which then reads as
         // malformed.
         (!outside).then_some(())
     }

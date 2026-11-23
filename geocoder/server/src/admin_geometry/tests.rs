@@ -676,14 +676,28 @@ fn cross_inside_brute(a: PointE7, b: PointE7, c: PointE7, d: PointE7) -> bool {
 
 /// polygon_within over rings as given, every edge against every edge: each vertex of `rings`
 /// inside `other` or on its edges, no edge of theirs crossing one of `other`'s inside both, no
-/// vertex of `other` inside them off their edges, and `surface` inside `other` off its edges.
+/// point of `other`'s edges inside them off their edges, and `surface` inside `other` off its
+/// edges. An edge of `other`, cut at the vertices of `rings` on it, meets their edges only at the
+/// ends of its pieces, so each piece is inside them where its middle is: tested at twice the
+/// coordinates, where the middle of two e7 points is on the grid.
 fn within_brute(rings: &[Vec<PointE7>], other: &[Vec<PointE7>], surface: PointE7) -> bool {
     let edges = |rings: &[Vec<PointE7>]| -> Vec<(PointE7, PointE7)> { rings.iter().flat_map(|r| r.windows(2).map(|e| (e[0], e[1]))).collect() };
     let (own, others) = (edges(rings), edges(other));
     let on = |edges: &[(PointE7, PointE7)], p: PointE7| edges.iter().any(|&(a, b)| on_edge(a, b, p));
+    let twice = |p: PointE7| pt(2 * p.lat, 2 * p.lng);
+    let doubled: Vec<Vec<PointE7>> = rings.iter().map(|r| r.iter().map(|&v| twice(v)).collect()).collect();
+    let doubled_edges = edges(&doubled);
+    let inside_off_edges = |p2: PointE7| brute(&doubled, p2) && !on(&doubled_edges, p2);
+    let enters = |&(a, b): &(PointE7, PointE7)| {
+        let along = |v: &PointE7| (v.lat - a.lat) as i128 * (b.lat - a.lat) as i128 + (v.lng - a.lng) as i128 * (b.lng - a.lng) as i128;
+        let mut cuts: Vec<PointE7> = rings.iter().flatten().copied().filter(|&v| on_edge(a, b, v)).chain([a, b]).collect();
+        cuts.sort_by_key(along);
+        cuts.windows(2).any(|w| inside_off_edges(pt(w[0].lat + w[1].lat, w[0].lng + w[1].lng)))
+    };
     rings.iter().flatten().all(|&v| brute(other, v) || on(&others, v))
         && !own.iter().any(|&(a, b)| others.iter().any(|&(c, d)| cross_inside_brute(a, b, c, d)))
-        && !other.iter().flatten().any(|&v| brute(rings, v) && !on(&own, v))
+        && !other.iter().flatten().any(|&v| inside_off_edges(twice(v)))
+        && !others.iter().any(enters)
         && brute(other, surface) && !on(&others, surface)
 }
 
@@ -706,6 +720,12 @@ fn a_polygon_is_within_another_only_where_no_part_of_it_is_outside() {
     let half = ring_polygon(&mut s, vec![box_deg(0.0, 0.0, 10.0, 5.0)]);
     let enclave = ring_polygon(&mut s, vec![box_deg(4.0, 4.0, 6.0, 6.0)]);
     let past = ring_polygon(&mut s, vec![box_deg(5.0, 5.0, 15.0, 15.0)]);
+    // A larger square with a triangular hole whose corners all lie on the 0..10 square's edges:
+    // the hole is inside that square, its edges run through it from edge to edge. And one whose
+    // hole touches the square's southern edge from outside.
+    let larger = box_deg(-5.0, -5.0, 15.0, 15.0);
+    let chords = ring_polygon(&mut s, vec![larger.clone(), ring_deg(&[(0.0, 2.0), (0.0, 4.0), (2.0, 0.0), (0.0, 2.0)])]);
+    let touching = ring_polygon(&mut s, vec![larger.clone(), ring_deg(&[(0.0, 2.0), (0.0, 4.0), (-2.0, 3.0), (0.0, 2.0)])]);
     let ringless = s.polygon(8, &[], vec![]);
     let (geom, polys) = s.geometry();
     let within = |a: u32, b: u32| geom.polygon_within(&polys[a as usize], &polys[b as usize]);
@@ -717,6 +737,7 @@ fn a_polygon_is_within_another_only_where_no_part_of_it_is_outside() {
         (enclave, square, true), (enclave, holed, false),
         (holed, square, true), (square, holed, false), (notched, square, true), (square, notched, false),
         (square, square, true), (past, square, false), (square, inner, false),
+        (square, chords, false), (square, touching, true), (corner, chords, false), (inner, chords, true),
         (ringless, square, false), (square, ringless, false),
     ] {
         assert_eq!(within(a, b), want, "{a} in {b}");
