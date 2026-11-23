@@ -2,7 +2,7 @@
   "schema_version": 1,
   "build": {
     "version": 24,
-    "patch_version": 19
+    "patch_version": 22
   },
   "axes": {
     "region": {
@@ -242,6 +242,7 @@
         "{region}/full/addr_vertices.bin",
         "{region}/full/addr_index.bin",
         "{region}/full/addr_postcodes.bin",
+        "{region}/full/addr_cities.bin",
         "{region}/full/interp_ways.bin",
         "{region}/full/interp_nodes.bin",
         "{region}/full/admin_cells.bin",
