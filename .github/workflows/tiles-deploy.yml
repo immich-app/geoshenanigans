@@ -320,6 +320,12 @@ jobs:
           done
           exit 1
 
+      # As in tiles-worker.yml's Deploy Terragrunt: takes what Cloudflare provider v4 left in tiles-worker's state,
+      # which v5 can't read, out of it for the apply's imports. A no-op once that has run.
+      - name: Forget tiles-worker's provider v4 state
+        working-directory: deployment
+        run: op run --env-file=".env" -- scripts/tiles-worker-v4-state.sh forget
+
       - name: Apply tiles worker
         working-directory: deployment/modules/cloudflare/tiles-worker
         env:

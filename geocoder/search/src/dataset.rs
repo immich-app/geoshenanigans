@@ -10,6 +10,7 @@ use crate::build::{
     Contended, HeldIndexDir,
 };
 use crate::constants::*;
+use crate::query::{Found, QueryStats, Searcher};
 use crate::reader::SearchIndex;
 use query_server::{lower_hex, FileStamp, Index, WATER_DIR, WATER_FILES};
 use serde_json::{json, Value};
@@ -18,6 +19,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::path::Path;
+use std::sync::Arc;
 
 /// The geocoder files an index is derived from: the records its postings point at, the string
 /// tiers of their names and the boundary geometry its label points come from, the boundary tier's
@@ -288,12 +290,40 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
     Ok((opened, origin))
 }
 
+/// A place search `open` opened, held with the geocoder index its postings point into, so that it
+/// can be kept and shared across threads: the node binding's and the test portal's.
+pub struct PlaceSearch {
+    // Fields drop in order: the searcher borrows the index, which borrows the geocoder index.
+    searcher: Searcher<'static, 'static>,
+    _index: Arc<SearchIndex<'static>>,
+    _geo: Arc<Index>,
+}
+
+impl PlaceSearch {
+    /// `open` of the index in `index` for `geo`, the dataset in `dir` loaded from files stamped
+    /// `loaded`.
+    pub fn open(geo: Arc<Index>, loaded: &Stamps, dir: &Path, index: &Path, on_device: &BuildOnDevice) -> Result<(PlaceSearch, Origin), String> {
+        // SAFETY: the borrows point into the two Arcs' shared allocations, which never move and
+        // are held by this struct until after the searcher and the index that borrow them drop.
+        let geo_ref: &'static Index = unsafe { &*Arc::as_ptr(&geo) };
+        let (opened, origin) = open(geo_ref, loaded, dir, index, on_device)?;
+        let opened = Arc::new(opened);
+        let index_ref: &'static SearchIndex<'static> = unsafe { &*Arc::as_ptr(&opened) };
+        Ok((PlaceSearch { searcher: Searcher::new(index_ref), _index: opened, _geo: geo }, origin))
+    }
+
+    /// `Searcher::search`: the results for `q`, best first, and the work they took. They borrow
+    /// this search, which they can't outlive.
+    pub fn search(&self, q: &str, limit: usize) -> (Vec<Found<'_>>, QueryStats) {
+        self.searcher.search(q, limit)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::build::build_all;
     use crate::fixture::{Geo, TempDir};
-    use crate::query::Searcher;
     use query_server::{AdminPoint, ADMIN_GEOMETRY_FILES, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
     use std::path::PathBuf;
 
@@ -804,6 +834,25 @@ mod tests {
         assert_eq!((names(&idx, "testville"), names(&idx, "prüfdorf")), (vec!["Testville".to_string()], vec![]));
         drop(idx);
         assert_eq!(open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap().1, Origin::Current);
+    }
+
+    #[test]
+    fn a_place_search_answers_as_a_searcher_over_the_index_it_opened() {
+        let ds = TempDir::new("place-search");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let (geo, stamps) = load_dataset(&ds.0);
+        let index = ds.0.join("search");
+
+        let (search, origin) = PlaceSearch::open(Arc::new(geo), &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap();
+
+        // Kept by another thread than the one that opened it.
+        let search = std::thread::spawn(move || search).join().unwrap();
+        assert_eq!(origin, Origin::Built);
+        let geo = load_dataset(&ds.0).0;
+        let idx = SearchIndex::open(&geo, &index, None, None).unwrap();
+        let (found, _) = search.search("otherton", 5);
+        assert_eq!(crate::query::results_json(&found), crate::query::results_json(&Searcher::new(&idx).search("otherton", 5).0));
+        assert_eq!(found.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Otherton"]);
     }
 
     #[test]

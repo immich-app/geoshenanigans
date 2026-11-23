@@ -130,6 +130,19 @@ class BoundsTest(unittest.TestCase):
                     self.assertFalse(os.path.exists(out))
 
 
+class WorkersTest(unittest.TestCase):
+    # Without --workers, a build runs a tile worker a CPU of the budget the nightly's tools size theirs by
+    # (cpu_budget.sh): under a CPU quota, fewer than the CPUs the process may run on.
+    def test_without_workers_a_build_runs_one_a_cpu_of_the_budget(self):
+        from test_cpu_budget import fake_cpus
+        args = ["build", "--eez-iho", "eez_iho.geojson", "--land", "land.zip", "-o", "marine_areas.bin"]
+        with mock.patch.dict(os.environ, fake_cpus(self, 8, "/job", {"/job": "300000 100000"})), \
+                mock.patch.object(marine_import, "build", return_value=0) as build:
+            self.assertEqual(marine_import.main(args), 0)
+            self.assertEqual(marine_import.main(args + ["--workers", "5"]), 0)
+        self.assertEqual([call.args[0].workers for call in build.call_args_list], [3, 5])
+
+
 def feature(props, rings):
     return {"type": "Feature", "properties": props, "geometry": {"type": "Polygon", "coordinates": rings}}
 

@@ -44,6 +44,7 @@ import json
 import math
 import os
 import struct
+import subprocess
 import sys
 import time
 
@@ -185,6 +186,16 @@ def stats(path):
         for k, v in enumerate((1, len(polygons), rings, vertices)):
             total[k] += v
     print(f"total\t{total[0]} objects\t{total[1]} polygons\t{total[2]} rings\t{total[3]} vertices")
+
+
+# Prints the CPUs this process may run on, or fewer under its cgroup's CPU quota: what the nightly's tools size
+# their threads by too.
+CPU_BUDGET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpu_budget.sh")
+
+
+def cpu_budget():
+    """The tile workers `build` runs without --workers: a CPU of the budget each (cpu_budget.sh)."""
+    return int(subprocess.run([CPU_BUDGET], check=True, capture_output=True, text=True).stdout)
 
 
 # --- The geometry (shapely, numpy and pyogrio, which only `build` needs) ---
@@ -530,7 +541,8 @@ def main(argv=None):
     b.add_argument("--land", required=True)
     b.add_argument("-o", "--output", required=True)
     b.add_argument("--stats", default="")
-    b.add_argument("--workers", type=int, default=os.cpu_count())
+    b.add_argument("--workers", type=int, default=None,
+                   help="tile workers (default: a CPU of the budget each, cpu_budget.sh)")
     b.add_argument("--bbox", default="", type=_bbox,
                    help="only the tiles whose centres are in WEST,SOUTH,EAST,NORTH")
     s = sub.add_parser("stats")
@@ -539,6 +551,8 @@ def main(argv=None):
     if opts.command == "stats":
         stats(opts.path)
         return 0
+    if opts.workers is None:
+        opts.workers = cpu_budget()
     return build(opts)
 
 

@@ -9,9 +9,8 @@ use napi::bindgen_prelude::*;
 use napi::Env;
 use napi_derive::napi;
 use place_search::constants::{DATASET_SEARCH_DIR, DEFAULT_LIMIT};
-use place_search::dataset::{self, BuildOnDevice, Origin, Stamps};
-use place_search::query::Searcher;
-use place_search::reader::SearchIndex;
+use place_search::dataset::{self, BuildOnDevice, Origin, PlaceSearch, Stamps};
+use place_search::query::results_json;
 use query_server::transport::{self, ChunkReader, Expected};
 use query_server::Index;
 use std::path::{Path, PathBuf};
@@ -48,27 +47,6 @@ impl Task for QueryTask {
     }
 }
 
-/// An open place search index and the geocoder index its postings point into.
-pub struct PlaceSearch {
-    // Fields drop in order: the searcher borrows the index, which borrows the geocoder index.
-    searcher: Searcher<'static, 'static>,
-    _index: Arc<SearchIndex<'static>>,
-    _geo: Arc<Index>,
-}
-
-impl PlaceSearch {
-    /// `dataset::open` of the index in `index_dir` for `geo`, the dataset in `dir` stamped `loaded`.
-    fn open(geo: Arc<Index>, loaded: &Stamps, dir: &Path, index_dir: &Path, on_device: &BuildOnDevice) -> std::result::Result<(PlaceSearch, Origin), String> {
-        // SAFETY: the borrows point into the two Arcs' shared allocations, which never move and
-        // are held by this struct until after the searcher and the index that borrow them drop.
-        let geo_ref: &'static Index = unsafe { &*Arc::as_ptr(&geo) };
-        let (index, origin) = dataset::open(geo_ref, loaded, dir, index_dir, on_device)?;
-        let index = Arc::new(index);
-        let index_ref: &'static SearchIndex<'static> = unsafe { &*Arc::as_ptr(&index) };
-        Ok((PlaceSearch { searcher: Searcher::new(index_ref), _index: index, _geo: geo }, origin))
-    }
-}
-
 pub struct SearchTask {
     search: Arc<PlaceSearch>,
     query: String,
@@ -80,9 +58,8 @@ impl Task for SearchTask {
     type JsValue = String;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        let (found, _) = self.search.searcher.search(&self.query, self.limit);
-        let results: Vec<String> = found.iter().map(|f| f.to_json().to_string()).collect();
-        Ok(format!("[{}]", results.join(",")))
+        let (found, _) = self.search.search(&self.query, self.limit);
+        Ok(results_json(&found))
     }
 
     fn resolve(&mut self, _env: Env, output: Self::JsValue) -> Result<Self::JsValue> {
