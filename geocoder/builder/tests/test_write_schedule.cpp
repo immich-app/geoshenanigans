@@ -131,11 +131,11 @@ TEST(filter_cost_holds_the_water_splits_marks_over_the_planets_water_cells) {
     KindValues planet_pairs = kinds(100, 0, 0, 0, 0, 0), pairs = kinds(10, 0, 0, 0, 0, 0);
     at(planet_pairs, RecordKind::Waters) = 1000;
     at(pairs, RecordKind::Waters) = 40;
-    // Beside the rest, a mark a planet water cell entry and the starts and
-    // marks of its cells, and the continent's water pairs among the pairs
-    // the workers copy.
+    // Beside the rest, a planet water cell entry's mark (1 B), its cell's
+    // mark (1 B) and the cell's start at the peak (24 B), and the
+    // continent's water pairs among the pairs the workers copy.
     CHECK_EQ(filter_cost(planet_counts, planet_pairs, pairs),
-             uint64_t(240 * 4 + 240 * 3 / 8 + 50 * 16 / 2 + 1000 * kFilterWaterBytesPerPair));
+             uint64_t(240 * 4 + 240 * 3 / 8 + 50 * 16 / 2 + 1000 * (1 + 1 + 3 * 8)));
     // An entry a cell at most: its mark, the cell's mark, and the cell's
     // start in the output beside the workers' parts, which grow to twice it.
     CHECK(kFilterWaterBytesPerPair >= 1 + 1 + 8 + 2 * 8);
