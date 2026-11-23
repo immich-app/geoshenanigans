@@ -10,7 +10,7 @@ COPY server/ server/
 COPY search/ search/
 COPY test-portal/index.html test-portal/index.html
 COPY builder/data/ builder/data/
-RUN cargo build --release --manifest-path server/Cargo.toml
+RUN cargo build --release --locked --manifest-path server/Cargo.toml
 # geocoder-transport, which decodes the transport units the download fetches:
 # a bin of the place search crate.
 RUN cargo build --release --locked --manifest-path search/Cargo.toml --bin geocoder-transport

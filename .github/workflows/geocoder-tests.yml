@@ -28,7 +28,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake zlib1g-dev libprotozero-dev \
-            libbz2-dev libdeflate-dev libexpat1-dev libzstd-dev zstd
+            libdeflate-dev libexpat1-dev libzstd-dev zstd
       # The patcher's too-small-TMPDIR cases mount a tmpfs in a private user
       # namespace (unshare), which the image's AppArmor policy forbids; here
       # they must run (GEOCODER_TESTS_NEED_PRIVATE_TMPFS fails them if not).
@@ -75,7 +75,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake zlib1g-dev libprotozero-dev \
-            libbz2-dev libdeflate-dev libexpat1-dev libzstd-dev zstd
+            libdeflate-dev libexpat1-dev libzstd-dev zstd
       # As in the job above: the private tmpfs cases run, or fail.
       - name: Allow user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -108,7 +108,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake zlib1g-dev libprotozero-dev \
-            libbz2-dev libdeflate-dev libexpat1-dev libssl-dev libzstd-dev patch xz-utils
+            libdeflate-dev libexpat1-dev libssl-dev libzstd-dev patch xz-utils
       - name: Restore S2
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -144,7 +144,7 @@ jobs:
       - name: Test
         run: |
           cd geocoder/server
-          cargo test --release
+          cargo test --release --locked
 
   search-tests:
     name: Place search unit tests
