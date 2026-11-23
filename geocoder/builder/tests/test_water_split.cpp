@@ -81,10 +81,16 @@ std::set<int64_t> ways_along(const SplitPolygon& p, PackedLocation a, PackedLoca
     return out;
 }
 
-// The pieces' keys.
-std::multiset<uint64_t> keys_of(const std::vector<SplitPolygon>& pieces) {
-    std::multiset<uint64_t> out;
-    for (const SplitPolygon& q : pieces) out.insert(q.key);
+// Each piece's key and its outer ring's vertices, sorted: the ring whatever
+// vertex it starts at and whichever way it runs.
+std::map<uint64_t, std::vector<std::pair<int32_t, int32_t>>> rings_by_key(const std::vector<SplitPolygon>& pieces) {
+    std::map<uint64_t, std::vector<std::pair<int32_t, int32_t>>> out;
+    for (const SplitPolygon& q : pieces) {
+        std::vector<std::pair<int32_t, int32_t>> ring;
+        for (const PackedLocation& v : q.outer.v) ring.emplace_back(v.lat_e7, v.lon_e7);
+        std::sort(ring.begin(), ring.end());
+        CHECK(out.emplace(q.key, ring).second);
+    }
     return out;
 }
 
@@ -205,8 +211,9 @@ TEST(the_same_polygon_cuts_the_same_way_whatever_its_rings_start_and_run) {
     REQUIRE(a.size() > 1);
     REQUIRE(a.size() == b.size());
     REQUIRE(a.size() == c.size());
-    CHECK(keys_of(a) == keys_of(b));
-    CHECK(keys_of(a) == keys_of(c));
+    // Each key stays with its piece.
+    CHECK(rings_by_key(a) == rings_by_key(b));
+    CHECK(rings_by_key(a) == rings_by_key(c));
 }
 
 TEST(each_lobe_a_cut_leaves_on_one_side_keeps_its_own_key_whatever_its_rings_start_and_run) {
@@ -298,15 +305,22 @@ TEST(each_stretch_of_cut_is_one_edge_of_both_pieces_beside_it_when_one_side_is_c
     const std::vector<SplitPolygon> pieces = split_polygon(p, 12, &lines);
     REQUIRE(pieces.size() == 3u);
     CHECK_EQ(lines, size_t(2));
-    std::map<std::pair<uint64_t, uint64_t>, int> cut_edges;
+    // Each stretch of cut, by its ends, and the ways of the pieces' edges
+    // along it: two pieces' edges, of one cut's way.
+    std::map<std::pair<uint64_t, uint64_t>, std::vector<int64_t>> cut_edges;
     auto key = [](PackedLocation a) { return uint64_t(uint32_t(a.lat_e7)) << 32 | uint32_t(a.lon_e7); };
     for (const SplitPolygon& q : pieces) {
         REQUIRE(q.outer.v.size() == q.outer.way.size());
         for (size_t i = 0; i < q.outer.v.size(); i++)
-            if (q.outer.way[i] < 0) cut_edges[std::minmax(key(q.outer.v[i]), key(q.outer.v[(i + 1) % q.outer.v.size()]))]++;
+            if (q.outer.way[i] < 0)
+                cut_edges[std::minmax(key(q.outer.v[i]), key(q.outer.v[(i + 1) % q.outer.v.size()]))].push_back(
+                    q.outer.way[i]);
     }
     CHECK_EQ(cut_edges.size(), size_t(3));
-    for (const auto& [edge, n] : cut_edges) CHECK_EQ(n, 2);
+    for (const auto& [edge, ways] : cut_edges) {
+        REQUIRE(ways.size() == 2u);
+        CHECK_EQ(ways[0], ways[1]);
+    }
     std::mt19937 rng(14);
     std::uniform_int_distribution<int32_t> lat(469000000, 487000000), lng(79000000, 97000000);
     for (int k = 0; k < 20000; k++) {
