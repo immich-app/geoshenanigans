@@ -972,6 +972,8 @@ static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
             [&](uint32_t i, NearbyStreets& nearby) {
                 auto& pr = data.poi_records[i];
                 pr.parent_street_id = 0xFFFFFFFFu;
+                // One that never takes the primary slot links none.
+                if (pr.flags & POI_FLAG_PLACES_ONLY) return;
 
                 double best_d2 = 1e18;
                 uint32_t best_name = 0xFFFFFFFFu;
@@ -2222,31 +2224,48 @@ static int run(int argc, char* argv[]) {
                         const char* r_office   = rel.tag("office");
 
                         PoiCategory poi_cat = PoiCategory::UNKNOWN;
-                        // A water multipolygon (poi_water_kind) that is a
-                        // rank-30 POI of another main tag in Nominatim, which
-                        // imports a multipolygon as it does a closed way, is
-                        // classified as a closed way is (classify_poi). Of the
-                        // water kinds, the scan takes bays and glaciers alone,
-                        // as below: a lake, a wetland or a reservoir is no POI
-                        // as its water kind in any tier.
+                        // A water multipolygon (poi_water_kind), which
+                        // Nominatim imports as it does a closed way, is
+                        // classified as a closed way is (classify_poi), but
+                        // of the water kinds the scan takes bays and glaciers
+                        // alone: a lake, a wetland or a reservoir is no POI as
+                        // its water kind in any tier. One that is a rank-30
+                        // POI of another main tag is that POI. One that is the
+                        // water it is (a main tag of a lower rank ranks it, it
+                        // is a reservoir of a class the POI lane leaves out,
+                        // or no tier ships what its rank-30 tags make of it)
+                        // is a bay or a glacier, or else takes the scan's own
+                        // categories below, as before, but never the primary
+                        // slot (POI_FLAG_PLACES_ONLY), unless a highway kind
+                        // ranks it a street, as it ranks the closed way. Nor
+                        // does one of the classifier's whose holes its
+                        // polygon, of the outer rings alone, leaves out.
                         std::optional<PoiClassification> water_poi;
+                        bool places_only = false;
                         const char* r_landuse = rel.tag("landuse");
-                        if (area_type && poi_water_kind(r_natural, r_landuse) != PoiCategory::UNKNOWN) {
+                        const PoiCategory r_water = area_type ? poi_water_kind(r_natural, r_landuse) : PoiCategory::UNKNOWN;
+                        if (r_water != PoiCategory::UNKNOWN) {
                             auto cls = classify_poi(r_tourism, rel.tag("historic"), r_boundary, rel.tag("amenity"),
                                                     r_leisure, r_natural, rel.tag("railway"), r_aeroway,
                                                     rel.tag("man_made"), rel.tag("building"), rel.tag("craft"),
                                                     rel.tag("power"), r_place, rel.tag("waterway"), r_office,
                                                     rel.tag("wikipedia"), rel.tag("wikidata"), rel.tag("highway"),
                                                     rel.tag("shop"), r_landuse, rel.tag("emergency"), /*area=*/true);
-                            if (cls && cls->water != PoiCategory::UNKNOWN) {
-                                auto taken = [](PoiCategory c) {
-                                    return c == PoiCategory::BAY || c == PoiCategory::GLACIER;
-                                };
-                                if (cls->category == cls->water && !taken(cls->water)) continue;
+                            auto taken = [](PoiCategory c) {
+                                return c == PoiCategory::BAY || c == PoiCategory::GLACIER;
+                            };
+                            if (cls && cls->water != PoiCategory::UNKNOWN && cls->category != cls->water) {
                                 if (!taken(poi_water_of(cls->flags)))
                                     cls->flags &= static_cast<uint8_t>(~POI_FLAG_WATER_MASK);
                                 water_poi = cls;
-                                poi_cat = cls->category;
+                            } else if (cls && cls->category == r_water) {
+                                if (taken(r_water)) water_poi = cls;
+                                else places_only = !(cls->flags & POI_FLAG_HIGHWAY);
+                            }
+                            if (water_poi) {
+                                poi_cat = water_poi->category;
+                                for (size_t mi = 0; mi < rel.members.size(); mi++)
+                                    if (rel.member_role(mi) == "inner") places_only = true;
                             }
                         }
                         // boundary
@@ -2330,6 +2349,7 @@ static int run(int argc, char* argv[]) {
                                     tier = water_poi->tier;
                                     flags = water_poi->flags;
                                 }
+                                if (places_only) flags |= POI_FLAG_PLACES_ONLY;
 
                                 CollectedPoiRelation cpr;
                                 cpr.id = rel.id;

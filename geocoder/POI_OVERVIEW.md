@@ -59,9 +59,12 @@ glaciers, and reservoirs and basins mapped as areas. They still show in
 `places`, and all but bays as the `landmark`. A water object that is also a
 POI of another main tag (a fountain, a swimming area, a fire pond, a pier, a
 shop, ...) is classified as that POI, as Nominatim ranks it 30 by that tag;
-it takes the primary slot like any POI. It stays water where a place, an
-admin landuse or a highway tag ranks it lower, as Nominatim's does, and where
-that POI would be a generic one no tier ships.
+it takes the primary slot like any POI. It stays water where a place, an admin
+landuse or a highway tag ranks it lower, as Nominatim's does, where that POI
+would be a generic one no tier ships, and where it is a reservoir whose
+class Nominatim's POI lane takes none of (a building or a place). A water
+area a highway tag ranks is a street there, and answers its own name as the
+`road` inside it, as a street does.
 [NOMINATIM_REFERENCE.md](NOMINATIM_REFERENCE.md#the-primary-poi-nominatims-rank-30-lane)
 traces both to Nominatim's source.
 

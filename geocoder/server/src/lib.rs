@@ -2277,6 +2277,16 @@ impl Index {
         }
     }
 
+    // Whether `poi` stays out of the primary slot: a water kind below the
+    // POI rank, but a water area of the highway flag, which a highway kind of
+    // rank 26 or 27 ranks (the builder flags it only there): Nominatim's
+    // street lane takes it by its address rank (26 to 29, reverse.py
+    // _find_closest_street_or_pois), and its own name answers inside it as a
+    // street's does.
+    pub fn is_out_of_the_primary_lanes(poi: &PoiRecord) -> bool {
+        Self::is_below_poi_rank(poi.category, poi.is_polygon()) && !(poi.is_polygon() && poi.flags & POI_FLAG_HIGHWAY != 0)
+    }
+
     // Chain-containment check for a POI primary candidate.
     // The POI's parent_poly_id is the smallest admin polygon (level
     // 2..10) that contained the POI at build time. At query time we
@@ -2342,7 +2352,7 @@ impl Index {
                 // Need a linked parent street (for the `road` field)
                 // when this POI wins — without it we have nothing to
                 // surface as the road name.
-                if poi.parent_street_id == NO_DATA || Self::is_below_poi_rank(poi.category, poi.is_polygon()) {
+                if poi.parent_street_id == NO_DATA || Self::is_out_of_the_primary_lanes(&poi) {
                     return;
                 }
 
@@ -8599,14 +8609,14 @@ mod query_path_tests {
     /// `index` with one polygon POI, the rectangle: `name_id` its name and `parent_street_id`
     /// its parent street's, strings of the index's. The admin cell of its middle lists it.
     fn with_polygon_poi(index: Index, name_id: u32, parent_street_id: u32, span: Span) -> Index {
-        with_poi(index, 1, name_id, (parent_street_id, NO_DATA), span, true)
+        with_poi(index, (1, 0), name_id, (parent_street_id, NO_DATA), span, true)
     }
 
-    /// `index` with one POI of `category`: the rectangle, or a point at its middle where
-    /// `polygon` is false. `name_id` its name and `parents` its parent street's and postcode's,
-    /// strings of the index's. The admin cell of its middle lists it.
-    fn with_poi(mut index: Index, category: u8, name_id: u32, (parent_street_id, parent_postcode_id): (u32, u32), (s, w, n, e): Span,
-                polygon: bool) -> Index {
+    /// `index` with one POI of `category` and `flags`: the rectangle, or a point at its middle
+    /// where `polygon` is false. `name_id` its name and `parents` its parent street's and
+    /// postcode's, strings of the index's. The admin cell of its middle lists it.
+    fn with_poi(mut index: Index, (category, flags): (u8, u8), name_id: u32, (parent_street_id, parent_postcode_id): (u32, u32),
+                (s, w, n, e): Span, polygon: bool) -> Index {
         let (low, middle) = (at(s, w), at((s + n) / 2.0, (w + e) / 2.0));
         // Its corners at 1e-7 degrees (encoding 3) from its low corner.
         let steps = |v: f32, from: f32| ((v as f64 - from as f64) / 1e-7).round() as u32;
@@ -8615,7 +8625,7 @@ mod query_path_tests {
             q: [at(s, w), at(s, e), at(n, e), at(n, w)].iter().map(|c| (steps(c.lat, low.lat), steps(c.lng, low.lng))).collect(),
         });
         let record = PoiRecord {
-            lat: middle.lat, lng: middle.lng, vertex_offset: if polygon { 0 } else { NO_DATA }, name_id, category, tier: 0, flags: 0,
+            lat: middle.lat, lng: middle.lng, vertex_offset: if polygon { 0 } else { NO_DATA }, name_id, category, tier: 0, flags,
             importance: 0, parent_street_id, parent_postcode_id, parent_poly_id: NO_DATA,
         };
         let (records, vertices) = poi_files::encode(&[(record, outline)]);
@@ -8666,7 +8676,7 @@ mod query_path_tests {
             let mut dataset = TestIndex::new();
             dataset.street("Main Street", &parallel(-40.0, 200.0)).way_postcode("2020");
             let (name, lane, postcode) = (dataset.string("Water"), dataset.string("Mill Lane"), dataset.string("4510"));
-            let index = with_poi(dataset.load(), category, name, (lane, postcode), (0.0, 0.0, 40.0, 60.0), polygon);
+            let index = with_poi(dataset.load(), (category, 0), name, (lane, postcode), (0.0, 0.0, 40.0, 60.0), polygon);
             let primary = primary_at(&index, 30.0, 10.0);
             let address = address_at(&index, 30.0, 10.0);
             (primary["poi"]["category"].as_u64(), address["road"].as_str().map(str::to_owned), address["postcode"].as_str().map(str::to_owned))
@@ -8688,6 +8698,36 @@ mod query_path_tests {
             assert_eq!(answer(category, true), poi(category), "category {category}");
         }
     }
+
+    #[test]
+    fn a_water_area_of_the_highway_flag_answers_its_own_name_as_a_street_does() {
+        // A water area a highway kind of rank 26 or 27 ranks (area=yes, highway=pedestrian,
+        // natural=water, tourism=attraction: the builder's NATURAL_WATER of the highway flag)
+        // is a street in Nominatim, whose street lane takes address ranks 26 to 29 (reverse.py
+        // _find_closest_street_or_pois): inside it, its own name answers, though Main Street,
+        // 5 m south of the query, is nearer than its outline, 10 m west, and its parent street
+        // is Mill Lane. Of no flag, the water stays out of both lanes and Main Street answers;
+        // a node of the flag stays out too.
+        let answer = |flags: u8, polygon: bool| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Main Street", &parallel(25.0, 200.0));
+            let (name, lane) = (dataset.string("Seeplatz"), dataset.string("Mill Lane"));
+            let index = with_poi(dataset.load(), (99, flags), name, (lane, NO_DATA), (0.0, 0.0, 40.0, 60.0), polygon);
+            address_at(&index, 30.0, 10.0)["road"].as_str().map(str::to_owned)
+        };
+        assert_eq!(answer(POI_FLAG_HIGHWAY, true).as_deref(), Some("Seeplatz"));
+        assert_eq!(answer(0, true).as_deref(), Some("Main Street"));
+        assert_eq!(answer(POI_FLAG_HIGHWAY, false).as_deref(), Some("Main Street"));
+        for category in [86, 91, 97, 148] {
+            let record = PoiRecord {
+                lat: 0.0, lng: 0.0, vertex_offset: 0, name_id: 0, category, tier: 0, flags: POI_FLAG_HIGHWAY,
+                importance: 0, parent_street_id: 0, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
+            };
+            assert!(!Index::is_out_of_the_primary_lanes(&record), "category {category}");
+            assert!(Index::is_out_of_the_primary_lanes(&PoiRecord { flags: 0, ..record }), "category {category}");
+        }
+    }
+
 
     #[test]
     fn interpolation_files_of_no_ways_load_and_give_no_interpolation() {

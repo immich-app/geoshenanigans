@@ -1194,36 +1194,109 @@ TEST(a_bay_that_is_a_pier_is_a_pier_where_piers_ship_and_a_bay_where_only_bays_d
 // imports a multipolygon as a closed way: the build writes both as
 // SWIMMING_AREA, and the server answers the bay at a point inside, on its
 // parent street. A plain multipolygon bay stays a BAY, which never takes the
-// primary slot nor gives the road.
+// primary slot nor gives the road: Seeweg, its parent street, runs nearer its
+// middle than Teststrasse, and the answer at a point inside nearer
+// Teststrasse takes Teststrasse. A main tag of a lower rank ranks the object
+// whatever its others: a bay of place=locality (25) that is an attraction
+// stays a BAY, out of the primary slot, and one of highway=footway (27), a
+// street in Nominatim (the street lane takes address ranks 26 to 29), a BAY of
+// the highway flag, whose own name the server answers inside it, as Nominatim
+// answers a street. A multipolygon the scan takes by its own categories
+// where the classifier makes it water of a kind the scan takes no POI of
+// keeps its name in `places` but never the primary slot, of no parent street:
+// a wetland nature reserve whose rank-30 tag (emergency=suction_point) no
+// tier ships, and a reservoir that is a building and an attraction, whose
+// class (building, the first of its fallback tags) Nominatim's POI lane
+// takes none of. Nor does a lake that is a swimming area, whose island, a
+// hole of it, the POI's polygon of its outer ring leaves out.
 TEST(a_water_multipolygon_that_is_a_rank_30_poi_is_written_as_that_poi_and_answered) {
     const ScratchDir root("water-relation-build");
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
-    // 22 m by 60 m each, 33 m north of Teststrasse.
+    // 22 m by 60 m each, 33 m north of Teststrasse; Seeweg 22 m north of the
+    // last six.
     const int32_t lat0 = 470000000, lng0 = 80000000, south = lat0 + 1403000, north = lat0 + 1405000;
     std::vector<TestObject> water;
     add_rectangle(water, 4040, 990, south, lng0 + 1420000, north, lng0 + 1428000);
     add_rectangle(water, 4041, 994, south, lng0 + 1435000, north, lng0 + 1443000);
     add_rectangle(water, 4042, 998, south, lng0 + 1450000, north, lng0 + 1458000);
+    add_rectangle(water, 4043, 1002, south, lng0 + 1465000, north, lng0 + 1473000);
+    add_rectangle(water, 4044, 1006, south, lng0 + 1480000, north, lng0 + 1488000);
+    add_rectangle(water, 4045, 1010, south, lng0 + 1520000, north, lng0 + 1528000);
+    add_rectangle(water, 4046, 1014, south, lng0 + 1535000, north, lng0 + 1543000);
+    add_rectangle(water, 4047, 1018, lat0 + 1403200, lng0 + 1537000, lat0 + 1403800, lng0 + 1541000);
+    add_rectangle(water, 4048, 1022, south, lng0 + 1550000, north, lng0 + 1558000);
+    water.push_back(node(1100, lat0 + 1407000, lng0 + 1449000));
+    water.push_back(node(1101, lat0 + 1407000, lng0 + 1560000));
+    water.push_back(way(4060, {1100, 1101}, {{"highway", "residential"}, {"name", "Seeweg"}}));
     water.push_back(multipolygon(5040, 4040, {{"leisure", "swimming_area"}, {"name", "Badebucht Testdorf"}, {"natural", "bay"}}));
     water.push_back(multipolygon(5041, 4041, {{"leisure", "swimming_area"}, {"name", "Badesee Testdorf"}, {"natural", "water"}}));
     water.push_back(multipolygon(5042, 4042, {{"name", "Bucht Testdorf"}, {"natural", "bay"}}));
+    water.push_back(multipolygon(5043, 4043, {{"name", "Ortsbucht Testdorf"}, {"natural", "bay"}, {"place", "locality"},
+                                              {"tourism", "attraction"}}));
+    water.push_back(multipolygon(5044, 4044, {{"highway", "footway"}, {"name", "Uferweg Testdorf"}, {"natural", "bay"},
+                                              {"tourism", "attraction"}}));
+    water.push_back(multipolygon(5045, 4045, {{"emergency", "suction_point"}, {"leisure", "nature_reserve"},
+                                              {"name", "Ried Testdorf"}, {"natural", "wetland"}}));
+    TestObject island_lake = multipolygon(5046, 4046, {{"leisure", "swimming_area"}, {"name", "Inselsee Testdorf"},
+                                                        {"natural", "water"}});
+    island_lake.members.emplace_back(OsmType::Way, 4047, "inner");
+    water.push_back(island_lake);
+    water.push_back(multipolygon(5048, 4048, {{"building", "yes"}, {"landuse", "reservoir"}, {"name", "Stausee Testdorf"},
+                                              {"tourism", "attraction"}}));
     write_fixture_with(pbf, water);
     const std::string out = root.path() + "/single";
     REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
 
     const std::vector<PoiRecord> pois = poi_records_in(tree(out), "planet/poi/all");
-    const std::vector<int> want = {int(PoiCategory::BAY), int(PoiCategory::SWIMMING_AREA), int(PoiCategory::SWIMMING_AREA)};
+    const int bay = int(PoiCategory::BAY), swimming = int(PoiCategory::SWIMMING_AREA);
+    const std::vector<int> want = {int(PoiCategory::ATTRACTION), int(PoiCategory::NATURE_RESERVE), bay, bay, bay,
+                                   swimming, swimming, swimming};
+    if (categories_of(pois) != want)
+        for (const PoiRecord& pr : pois) std::printf("    category %d at %.4f\n", int(pr.category), pr.lng);
     CHECK(categories_of(pois) == want);
-    for (const PoiRecord& pr : pois) CHECK(pr.parent_street_id != NO_DATA);
+    // The record whose polygon holds longitude `lng`.
+    auto at = [&](double lng) -> const PoiRecord* {
+        for (const PoiRecord& pr : pois)
+            if (std::abs(pr.lng - lng) < 0.0004) return &pr;
+        return nullptr;
+    };
+    struct Want {
+        double lng;
+        int category;
+        bool parent;
+        uint8_t flags;
+    };
+    for (const Want& w : {Want{8.1424, swimming, true, 0}, Want{8.1439, swimming, true, 0}, Want{8.1454, bay, true, 0},
+                          Want{8.1469, bay, true, 0}, Want{8.1484, bay, true, POI_FLAG_HIGHWAY},
+                          Want{8.1524, int(PoiCategory::NATURE_RESERVE), false, 0}, Want{8.1539, swimming, false, 0},
+                          Want{8.1554, int(PoiCategory::ATTRACTION), false, 0}}) {
+        const PoiRecord* pr = at(w.lng);
+        REQUIRE(pr != nullptr);
+        if (pr->category != w.category || (pr->parent_street_id != NO_DATA) != w.parent || pr->flags != w.flags)
+            std::printf("    at %.4f: category %d, parent %u, flags %d\n", w.lng, int(pr->category), pr->parent_street_id,
+                        int(pr->flags));
+        CHECK_EQ(int(pr->category), w.category);
+        CHECK_EQ(pr->parent_street_id != NO_DATA, w.parent);
+        CHECK_EQ(int(pr->flags), int(w.flags));
+    }
 
     const std::string dataset = poi_dataset(out, "all", root.path() + "/dataset");
-    const std::vector<std::string> answers =
-        server_answers(dataset, {{47.1404, 8.1424}, {47.1404, 8.1454}}, root.path() + "/q", log);
-    REQUIRE(answers.size() == 2);
+    const std::vector<std::pair<double, double>> points = {{47.1404, 8.1424},  {47.14031, 8.1454}, {47.14031, 8.1469},
+                                                           {47.14031, 8.1484}, {47.14031, 8.1524}, {47.14033, 8.1539},
+                                                           {47.14031, 8.1554}};
+    const std::vector<std::string> answers = server_answers(dataset, points, root.path() + "/q", log);
+    REQUIRE(answers.size() == points.size());
     CHECK(answer_string(answers[0], {"display_name"}).value_or("").rfind("Badebucht Testdorf, ", 0) == 0);
-    CHECK(answer_string(answers[0], {"address", "road"}) == std::optional<std::string>("Teststrasse"));
     CHECK(answer_string(answers[1], {"display_name"}).value_or("").rfind("Bucht Testdorf", 0) == std::string::npos);
-    CHECK(answer_string(answers[1], {"address", "road"}) == std::optional<std::string>("Teststrasse"));
+    const char* roads[] = {"Teststrasse", "Teststrasse", "Teststrasse", "Uferweg Testdorf", "Teststrasse",
+                           "Teststrasse", "Teststrasse"};
+    for (size_t k = 0; k < answers.size(); k++) {
+        if (answer_string(answers[k], {"address", "road"}) != std::optional<std::string>(roads[k]))
+            std::printf("    %s\n", answers[k].c_str());
+        CHECK(answer_string(answers[k], {"address", "road"}) == std::optional<std::string>(roads[k]));
+    }
+    // The nature reserve is in `places`.
+    CHECK(says(answers[4], "Ried Testdorf"));
     if (!says(answers[0], "Badebucht Testdorf")) std::printf("    %s\n", answers[0].c_str());
 }
 

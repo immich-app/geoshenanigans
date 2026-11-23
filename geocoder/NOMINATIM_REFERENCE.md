@@ -175,7 +175,14 @@ So no water kind ever reaches the lane: `natural=water`, `wetland`, `bay` and
 server never lets those categories (`NATURAL_WATER`, `WETLAND`, `BAY`,
 `GLACIER`, and `RESERVOIR` as a polygon) take the primary slot, nor set `road`
 or `postcode` from it (`Index::is_below_poi_rank`); a `RESERVOIR` point, a
-`landuse=reservoir|basin` node, is a rank-30 POI there and stays.
+`landuse=reservoir|basin` node, is a rank-30 POI there and stays. A water
+area a `highway=*` kind of rank 26 or 27 ranks (`area=yes`,
+`highway=pedestrian`, `natural=water`, ...) is a street in Nominatim, whose
+street lane takes address ranks 26 to 29 (`reverse.py:187-189`): the builder
+gives it the highway flag where no place or landuse kind of a rank below 26
+ranks it (`poi_classify.h` `classify_poi`; `place=square` ranks 26), and the server lets a water area
+of that flag compete as streets do, its own name the `road` inside it
+(`Index::is_out_of_the_primary_lanes`).
 
 **Water with a POI main tag.** A water object that also carries a main tag of
 the import's POI list (`presets.lua` `MAIN_TAGS_POIS`, lines 170-262) with a
@@ -210,7 +217,13 @@ tags of a rank below 30 and no address rank (`leisure=park`,
 category; beside a tag the object yields to, `shop=no` makes no shop.
 `building=*`, a fallback tag, ranks 30 beside `natural=*` (the class stays
 `natural`) but is the class beside `landuse=*`, also a fallback tag, and
-the lane takes no class `building`.
+the lane takes no class `building`. So a reservoir or basin whose class the
+lane leaves out stays one, whatever tag ranks it 30
+(`reservoir_leaves_poi_lane`): `building` where it has fallback tags alone
+(`building`, `historic`, `tourism=attraction`), building sorting first
+among them, and `place` where `place=*` sorts before every other main tag of
+no fallback (`place=island` with `tourism=attraction` or `shop=bakery`, not
+with `amenity=fountain`).
 
 **Not matched.**
 - The builder reads no `club`, `military`, `healthcare` or `aerialway` key,
@@ -223,9 +236,16 @@ the lane takes no class `building`.
   builder classifies a water multipolygon that is a rank-30 POI of another
   main tag as it does a closed way (a bay or a lake that is a swimming area
   is a `SWIMMING_AREA`). Otherwise its relation scan takes only some keys,
-  and of the water kinds bays and glaciers alone: a multipolygon lake,
-  wetland or reservoir is no POI as its water kind, nor in the tiers that
-  don't ship the POI it is.
+  and of the water kinds bays and glaciers alone: a multipolygon bay or
+  glacier the classifier keeps water (a lower rank, or rank-30 tags no tier
+  ships) is the `BAY` or `GLACIER` it is; a lake, wetland or reservoir is no
+  POI as its water kind, nor in the tiers that don't ship the POI it is, and
+  one the scan's own keys take (`leisure=nature_reserve`,
+  `tourism=attraction`, `place=island`, ...) keeps that category in `places`
+  but never takes the primary slot (the builder links it no parent street),
+  unless a highway kind ranks it a street. A POI polygon of a multipolygon is
+  its outer rings, without its holes, so a water multipolygon the classifier
+  makes a POI of, with an `inner` member, never takes the slot either.
 - A water object of a generic rank-30 tag without a wiki tag stays water,
   out of the primary slot, where Nominatim's lane holds it as a POI.
 - The lower rank leaves out `boundary=administrative`, which ranks by an

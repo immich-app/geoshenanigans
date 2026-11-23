@@ -470,3 +470,101 @@ TEST(poi_classify_a_water_object_that_yields_takes_its_category_from_a_rank_30_t
             CHECK_EQ(uint8_t(category_of(t)), uint8_t(c.category));
         }
 }
+
+TEST(poi_classify_a_reservoir_whose_class_the_poi_lane_takes_none_of_stays_a_reservoir) {
+    // landuse=* is a fallback main tag (presets.lua MAIN_TAGS.all_boundaries),
+    // so a reservoir's class is its alphabetically first main tag of no
+    // fallback, else its first fallback tag in key order (init.lua
+    // process_tags), and Nominatim's POI lane takes no class building or
+    // place (reverse.py:192-195). Beside fallback tags alone (building,
+    // historic, tourism=attraction), building sorts first and the reservoir
+    // stays one; beside a main tag of no fallback before place, or after it
+    // without place, the object is a rank-30 POI of its tag; place=* is the
+    // class where no main tag before it is there.
+    struct Case {
+        std::vector<std::pair<const char*, const char*>> tags;
+        PoiCategory category;
+    };
+    const Case cases[] = {
+        {{{"building", "yes"}, {"tourism", "attraction"}}, PoiCategory::RESERVOIR},
+        {{{"building", "yes"}, {"historic", "memorial"}}, PoiCategory::RESERVOIR},
+        {{{"building", "yes"}, {"historic", "memorial"}, {"tourism", "attraction"}}, PoiCategory::RESERVOIR},
+        // Main tags of no fallback: the class is theirs.
+        {{{"building", "yes"}, {"amenity", "fountain"}}, PoiCategory::FOUNTAIN},
+        {{{"building", "yes"}, {"tourism", "museum"}}, PoiCategory::MUSEUM},
+        {{{"building", "yes"}, {"tourism", "attraction"}, {"natural", "water"}}, PoiCategory::ATTRACTION},
+        {{{"building", "yes"}, {"tourism", "attraction"}, {"leisure", "park"}}, PoiCategory::ATTRACTION},
+        // boundary=protected_area, a fallback tag, sorts before building.
+        {{{"building", "yes"}, {"tourism", "attraction"}, {"boundary", "protected_area"}}, PoiCategory::ATTRACTION},
+        // Without building, landuse sorts before historic's and tourism's.
+        {{{"tourism", "attraction"}}, PoiCategory::ATTRACTION},
+        {{{"historic", "memorial"}}, PoiCategory::MEMORIAL},
+        // place=island before shop, after amenity.
+        {{{"place", "island"}, {"tourism", "attraction"}}, PoiCategory::RESERVOIR},
+        {{{"place", "island"}, {"shop", "bakery"}}, PoiCategory::RESERVOIR},
+        {{{"place", "island"}, {"amenity", "fountain"}}, PoiCategory::FOUNTAIN},
+    };
+    for (const char* landuse : {"reservoir", "basin"})
+        for (const Case& c : cases)
+            for (const bool area : {true, false}) {
+                Tags t;
+                t.landuse = landuse;
+                t.area = area;
+                for (const auto& [key, value] : c.tags) t = with(t, key, value);
+                if (category_of(t) != c.category)
+                    std::printf("    landuse=%s with %s=%s, %s\n", landuse, c.tags[0].first, c.tags[0].second,
+                                area ? "an area" : "a node");
+                CHECK_EQ(uint8_t(category_of(t)), uint8_t(c.category));
+                // No wiki tag lifts it out: it stays a reservoir.
+                if (c.category == PoiCategory::RESERVOIR) {
+                    t.wikidata = "Q1";
+                    CHECK_EQ(uint8_t(category_of(t)), uint8_t(PoiCategory::RESERVOIR));
+                    CHECK_EQ(uint8_t(classify(t)->water), uint8_t(PoiCategory::UNKNOWN));
+                }
+            }
+    // natural=* is no fallback tag: beside it the class is natural.
+    for (const char* natural : {"water", "wetland", "bay", "glacier"}) {
+        Tags t;
+        t.natural = natural;
+        t.area = true;
+        t = with(with(t, "building", "yes"), "tourism", "attraction");
+        CHECK_EQ(uint8_t(category_of(t)), uint8_t(PoiCategory::ATTRACTION));
+    }
+}
+
+TEST(poi_classify_a_water_highway_area_takes_the_highway_flag_where_its_highway_ranks_it) {
+    // A water area of a highway kind of rank 26 or 27 (address-levels.json)
+    // is a street in Nominatim, whose street lane takes address ranks 26 to
+    // 29 (reverse.py _find_closest_street_or_pois): it stays water, of the
+    // highway flag, so the server answers its own name inside it. A place or
+    // landuse kind of a rank below 26 beside it ranks it lower, no street: no
+    // flag; place=square ranks 26, a street's. A POI that is no water keeps
+    // the flag as it was.
+    for (const WaterKind& kind : kWaterKinds)
+        for (const char* highway : {"pedestrian", "footway"}) {
+            Tags t = with(with(water(kind), "highway", highway), "tourism", "attraction");
+            t.area = true;
+            const auto street = classify(t);
+            REQUIRE(street.has_value());
+            CHECK_EQ(uint8_t(street->category), uint8_t(kind.category));
+            CHECK_EQ(int(street->flags), int(POI_FLAG_HIGHWAY));
+            const auto square = classify(with(t, "place", "square"));
+            REQUIRE(square.has_value());
+            CHECK_EQ(int(square->flags), int(POI_FLAG_HIGHWAY));
+            for (const auto& [key, value] : {std::pair{"place", "locality"}, std::pair{"place", "suburb"},
+                                             std::pair{"landuse", "residential"}}) {
+                if (kind.landuse && !std::strcmp(key, "landuse")) continue;
+                const auto lower = classify(with(t, key, value));
+                REQUIRE(lower.has_value());
+                if (lower->flags != 0) std::printf("    %s with %s=%s\n", highway, key, value);
+                CHECK_EQ(uint8_t(lower->category), uint8_t(kind.category));
+                CHECK_EQ(int(lower->flags), 0);
+            }
+        }
+    Tags square;
+    square.tourism = "attraction";
+    square.highway = "pedestrian";
+    square.place = "locality";
+    square.area = true;
+    CHECK_EQ(int(classify(square)->flags), int(POI_FLAG_HIGHWAY));
+}

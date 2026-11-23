@@ -106,6 +106,44 @@ inline bool has_lower_rank_main_tag(const char* t_place, const char* t_landuse, 
                                                "pedestrian", "road", "construction"});
 }
 
+// Whether Nominatim's POI lane leaves out, by its class, a reservoir or basin
+// of these tags that ranks 30. landuse=* is a fallback main tag (presets.lua
+// MAIN_TAGS.all_boundaries), so the object's class is that of its
+// alphabetically first main tag that is no fallback tag, else that of its
+// first fallback tag in key order (init.lua process_tags:775-835), and the
+// lane takes no class building or place (reverse.py:192-195): place=* is the
+// class where no main tag of a key before it is there, and building=* where
+// the object has fallback tags alone and no boundary=protected_area, the one
+// fallback key before it. Of the main tags this reads the keys the
+// classifier takes, without the values the import drops.
+inline bool reservoir_leaves_poi_lane(const char* t_aeroway, const char* t_amenity, const char* t_boundary,
+                                      const char* t_building, const char* t_craft, const char* t_emergency,
+                                      const char* t_highway, const char* t_leisure, const char* t_man_made,
+                                      const char* t_natural, const char* t_office, const char* t_place,
+                                      const char* t_railway, const char* t_shop, const char* t_tourism,
+                                      const char* t_waterway, bool area) {
+    auto main = [](const char* v, std::initializer_list<const char*> dropped) { return v && !poi_tag_is(v, dropped); };
+    // presets.lua MAIN_TAGS_POIS, MAIN_TAGS.natural and all_boundaries
+    // (boundary=* of a name is one on an area alone, named_area).
+    const bool before_place =
+        main(t_aeroway, {"no"}) ||
+        main(t_amenity, {"no", "parking_space", "parking_entrance", "waste_disposal", "hunting_stand"}) ||
+        (area && main(t_boundary, {"protected_area", "place", "land_area", "postal_code"})) || main(t_craft, {"no"}) ||
+        main(t_emergency, {"no", "yes", "fire_hydrant"}) ||
+        main(t_highway, {"no", "turning_circle", "mini_roundabout", "noexit", "crossing", "give_way", "stop",
+                         "turning_loop", "passing_place"}) ||
+        main(t_leisure, {"no"}) || (t_man_made && poi_man_made_is_main(t_man_made)) ||
+        main(t_natural, {"yes", "no", "coastline", "saddle"}) || main(t_office, {"no"});
+    if (before_place) return false;
+    if (t_place) return true;
+    const bool after_place = main(t_railway, {"rail", "no", "abandoned", "disused", "razed", "level_crossing", "switch",
+                                              "signal", "buffer_stop"}) ||
+                             main(t_shop, {"no"}) || main(t_tourism, {"attraction", "no", "yes"}) ||
+                             main(t_waterway, {"riverbank"});
+    if (after_place || (t_boundary && std::strcmp(t_boundary, "protected_area") == 0)) return false;
+    return t_building && std::strcmp(t_building, "no") != 0;
+}
+
 // The water kind of an object, the category its tags give it as water, or
 // UNKNOWN for none: landuse=reservoir or basin, which the classifier reads
 // before natural=*, else natural=water, wetland, bay or glacier.
@@ -136,7 +174,8 @@ inline PoiCategory poi_water_kind(const char* t_natural, const char* t_landuse) 
 // ships that, it stays water, and where its water kind ships in a lower tier
 // than its category, its flags carry the kind for the tiers in between
 // (POI_FLAG_WATER_MASK). An object a main tag of a lower positive rank ranks
-// is the water it is, whatever its other tags.
+// is the water it is, whatever its other tags, and so is a reservoir whose
+// class the POI lane takes none of (reservoir_leaves_poi_lane).
 inline std::optional<PoiClassification> classify_poi(
     const char* t_tourism, const char* t_historic, const char* t_boundary,
     const char* t_amenity, const char* t_leisure, const char* t_natural,
@@ -160,16 +199,29 @@ inline std::optional<PoiClassification> classify_poi(
     // landuse=* on an area (24, 0; a landuse node ranks 30), leisure=park,
     // natural=wood, place=island, waterway=waterfall, man_made=dam and
     // power=*, nor shop=no, which the import drops, and which the shop branch
-    // would take for a shop. `yielded` is the kind that yielded.
+    // would take for a shop. `yielded` is the kind that yielded. A reservoir
+    // of the class building or place, which the lane leaves out, stays one.
+    // A water object a highway kind of rank 26 or 27 ranks is a street there
+    // (the street lane takes address ranks 26 to 29, reverse.py:187-189): it
+    // takes the highway flag below, unless a place or landuse kind of a rank
+    // below 26 ranks it, every one but place=square (26), which makes it no
+    // street either.
     const PoiCategory kind = poi_water_kind(t_natural, t_landuse);
     const bool ranks_30 = !has_lower_rank_main_tag(t_place, t_landuse, t_highway, area);
+    const char* t_place_below_streets = t_place && std::strcmp(t_place, "square") == 0 ? nullptr : t_place;
+    const bool no_street =
+        kind != PoiCategory::UNKNOWN && has_lower_rank_main_tag(t_place_below_streets, t_landuse, nullptr, area);
+    const bool poi_main_tag = has_poi_main_tag(t_amenity, t_leisure, t_emergency, t_tourism, t_historic, t_shop, t_craft,
+                                               t_office, t_aeroway, t_railway, t_man_made);
     PoiCategory yielded = PoiCategory::UNKNOWN;
-    if (kind != PoiCategory::UNKNOWN && !ranks_30) {
+    if (kind != PoiCategory::UNKNOWN &&
+        (!ranks_30 || (kind == PoiCategory::RESERVOIR && poi_main_tag &&
+                       reservoir_leaves_poi_lane(t_aeroway, t_amenity, t_boundary, t_building, t_craft, t_emergency,
+                                                 t_highway, t_leisure, t_man_made, t_natural, t_office, t_place,
+                                                 t_railway, t_shop, t_tourism, t_waterway, area)))) {
         cat = kind;
     } else if (kind != PoiCategory::UNKNOWN &&
-               (has_poi_main_tag(t_amenity, t_leisure, t_emergency, t_tourism, t_historic, t_shop, t_craft, t_office,
-                                 t_aeroway, t_railway, t_man_made) ||
-                (kind != PoiCategory::RESERVOIR && t_building && std::strcmp(t_building, "no") != 0))) {
+               (poi_main_tag || (kind != PoiCategory::RESERVOIR && t_building && std::strcmp(t_building, "no") != 0))) {
         yielded = kind;
         t_boundary = nullptr;
         if (area || kind == PoiCategory::RESERVOIR) t_landuse = nullptr;
@@ -503,8 +555,9 @@ inline std::optional<PoiClassification> classify_poi(
     // Nominatim treats highway=pedestrian/footway/living_street/
     // path/service areas as rank_search=26 (road rank) rather
     // than rank_search=30. Mark so the server can surface the
-    // feature's own name as `road` rather than its parent street.
-    if (t_highway && (
+    // feature's own name as `road` rather than its parent street. Water a
+    // place or landuse kind of a lower rank ranks is no street (no_street).
+    if (t_highway && !no_street && (
             std::strcmp(t_highway, "pedestrian") == 0 ||
             std::strcmp(t_highway, "footway") == 0 ||
             std::strcmp(t_highway, "living_street") == 0 ||
