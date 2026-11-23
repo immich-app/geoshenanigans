@@ -741,9 +741,10 @@ struct WikidataPlace {
 
 // find_linked_place's wikidata step (placex_triggers.sql): of the place nodes
 // of a boundary's wikidata, the ones it covers (_st_covers(bnd.geometry,
-// placex.geometry)), `covers(at)` telling, into `nodes`; returns the place
-// type the boundary takes from them, the smallest of theirs, whatever order
-// they came in, or PlaceType::UNKNOWN where it covers none.
+// placex.geometry), its edges included), `covers(at)` telling, into `nodes`;
+// returns the place type the boundary takes from them, the smallest of
+// theirs, whatever order they came in, or PlaceType::UNKNOWN where it covers
+// none.
 template <class Covers>
 static uint8_t covered_wikidata_places(const std::vector<WikidataPlace>& places, Covers covers, std::vector<int64_t>& nodes) {
     uint8_t place_type = static_cast<uint8_t>(PlaceType::UNKNOWN);
@@ -754,19 +755,6 @@ static uint8_t covered_wikidata_places(const std::vector<WikidataPlace>& places,
         if (nodes.size() == 1 || place.place_type < place_type) place_type = place.place_type;
     }
     return place_type;
-}
-
-// Whether the polygons (each an outer ring and its holes) hold the point.
-static bool polygons_hold(const std::vector<NestedPolygon<PackedLocation>>& polygons, PackedLocation at) {
-    for (const auto& polygon : polygons) {
-        if (polygon.outer.size() < 3 || !exact_ring_contains(polygon.outer.data(), static_cast<uint32_t>(polygon.outer.size()), at))
-            continue;
-        bool in_hole = false;
-        for (const auto& hole : polygon.holes)
-            in_hole |= hole.size() >= 3 && exact_ring_contains(hole.data(), static_cast<uint32_t>(hole.size()), at);
-        if (!in_hole) return true;
-    }
-    return false;
 }
 
 // The vertex average of polygon i's exact outer ring, each vertex once (a
@@ -788,15 +776,18 @@ static LatLng outer_vertex_average(const ParsedData& data, uint32_t i) {
 }
 
 // The country polygon i lies in, as Nominatim takes a place's at its centroid
-// (get_country_code): its own code where it has one (a country, a postal
-// area), else the country at its outer ring's vertex average; 0 where none
-// is known.
+// (get_country_code), ST_PointOnSurface for an area (get_center_point): its
+// own code where it has one (a country, a postal area), else the country at a
+// point inside its exact rings (interior_point), which a concave polygon's
+// vertex average needn't be; 0 where none is known.
 static uint16_t polygon_country(const ParsedData& data, const AdminRings& countries, uint32_t i) {
     const AdminPolygon& poly = data.admin_polygons[i];
     if (poly.country_code != 0) return poly.country_code;
-    if (data.admin_exact_rings.polygons[i].ring_count == 0) return 0;
-    const LatLng c = outer_vertex_average(data, i);
-    return country_code_at_point(data, countries, c.first, c.second);
+    const auto& rings = data.admin_exact_rings;
+    const uint32_t ring_count = rings.polygons[i].ring_count;
+    if (ring_count == 0) return 0;
+    const LatLng inside = interior_point(rings.vertices.data(), rings.rings_of(i), ring_count);
+    return country_code_at_point(data, countries, inside.first, inside.second);
 }
 
 // Gives each postal area (admin_level 11) the country its centroid lies in,
@@ -838,6 +829,18 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
     if (data.admin_polygons.empty()) return;
     const AdminRings countries = border_country_rings(data, num_threads);
     assign_postal_area_countries(data, countries, num_threads);
+    // Each polygon's country (polygon_country), found the first time the
+    // claims or the name match ask for it, on any thread: 0 not yet, else
+    // kKnown and the code. Threads that race find the same code.
+    constexpr uint32_t kKnown = 1u << 16;
+    std::vector<std::atomic<uint32_t>> country_memo(data.admin_polygons.size());
+    const auto country_of = [&](uint32_t p) {
+        const uint32_t memo = country_memo[p].load(std::memory_order_relaxed);
+        if (memo != 0) return static_cast<uint16_t>(memo);
+        const uint16_t cc = polygon_country(data, countries, p);
+        country_memo[p].store(kKnown | cc, std::memory_order_relaxed);
+        return cc;
+    };
     if (!data.place_nodes.empty()) {
         auto _nl_t = std::chrono::steady_clock::now();
 
@@ -863,8 +866,7 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
             const size_t claims = data.place_claims.size();
             const auto links = [&](uint32_t p) {
                 const AdminPolygon& poly = data.admin_polygons[p];
-                return polygon_rank_address(polygon_country(data, countries, p), poly.admin_level,
-                                            own_place_tag(poly)) != 0;
+                return polygon_rank_address(country_of(p), poly.admin_level, own_place_tag(poly)) != 0;
             };
             const size_t hidden = hide_claimed_place_nodes(data.place_nodes, data.place_osm_ids,
                 std::move(data.place_claims), data.admin_polygons, data.admin_osm_ids, num_threads, links);
@@ -949,23 +951,22 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                     if (!bnd_name[0]) continue;
                     considered.fetch_add(1);
 
+                    std::string nb = normalise_for_matching(bnd_name);
+                    if (nb.empty()) continue;
+                    const auto [first, last] = places_named(nb);
+                    if (first == last) continue;
+
                     // Per-country rank_address (NL AL8 = 14, not the
-                    // default 16) — resolved from the boundary's country.
-                    // AL8+ boundaries don't carry country tags, so resolve
-                    // the country from the polygon centroid's admin cell.
-                    const LatLng centre = outer_vertex_average(data, static_cast<uint32_t>(i));
-                    const double clat = centre.first, clng = centre.second;
-                    const uint16_t bnd_cc = polygon_country(data, countries, static_cast<uint32_t>(i));
+                    // default 16), in the boundary's country.
+                    const uint16_t bnd_cc = country_of(static_cast<uint32_t>(i));
                     uint8_t bnd_rank = admin_rank_address(bnd_cc, poly.admin_level);
                     if (bnd_rank == 0) continue;  // not in this country's address chain
 
-                    std::string nb = normalise_for_matching(bnd_name);
-                    if (nb.empty()) continue;
-
+                    // The nearest node to the outer ring's vertex average.
+                    const LatLng centre = outer_vertex_average(data, static_cast<uint32_t>(i));
+                    const double clat = centre.first, clng = centre.second;
                     uint32_t best_idx = NO_DATA;
                     double best_dist_sq = max_dist_sq;
-
-                    const auto [first, last] = places_named(nb);
                     for (auto it = first; it != last; ++it) {
                         const uint32_t pidx = it->second;
                         const auto& pn = data.place_nodes[pidx];
@@ -2212,7 +2213,9 @@ static int run(int argc, char* argv[]) {
                                         }
                                         if (!cr.members.empty()) {
                                             mine.relations.push_back(std::move(cr));
-                                            mine.wikidata.emplace_back(); // already has override, no wikidata needed
+                                            // find_linked_place's wikidata step runs for a place area too.
+                                            const char* wikidata = rel.tag("wikidata");
+                                            mine.wikidata.emplace_back(wikidata ? wikidata : "");
                                             if (label_node_id >= 0) mine.label_nodes.push_back(label_node_id);
                                         }
                                     }
@@ -3561,7 +3564,7 @@ static int run(int argc, char* argv[]) {
                                 if (it != wikidata_places.end()) {
                                     std::vector<int64_t> covered;
                                     const uint8_t pt = covered_wikidata_places(it->second, [&](PackedLocation at) {
-                                        return exact_ring_contains(cwa.vertices.data(), static_cast<uint32_t>(cwa.vertices.size()), at);
+                                        return exact_ring_covers(cwa.vertices.data(), static_cast<uint32_t>(cwa.vertices.size()), at);
                                     }, covered);
                                     pto = covered.empty() ? 0 : place_type_to_admin_override(pt);
                                     if (pto != 0) {
@@ -3795,7 +3798,7 @@ static int run(int argc, char* argv[]) {
                                     if (it != wikidata_places.end()) {
                                         std::vector<int64_t> covered;
                                         const uint8_t pt = covered_wikidata_places(it->second, [&](PackedLocation at) {
-                                            return polygons_hold(polygons, at);
+                                            return exact_polygons_cover(polygons, at);
                                         }, covered);
                                         pto = covered.empty() ? 0 : place_type_to_admin_override(pt);
                                         if (pto != 0) {

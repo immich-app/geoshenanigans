@@ -12,6 +12,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 #include "packed_location.h"
 #include "polygon_rings.h"
@@ -46,6 +47,47 @@ inline bool exact_ring_contains(const PackedLocation* v, uint32_t n, PackedLocat
     for (uint32_t a = 0, b = n - 1; a < n; b = a++)
         if (exact_edge_crosses(v[b], v[a], p)) inside = !inside;
     return inside;
+}
+
+// Whether p lies on the segment a-b: on its line (exact_edge_crosses' cross
+// product is 0, as exact) and within its box.
+inline bool exact_on_segment(PackedLocation a, PackedLocation b, PackedLocation p) {
+    const int64_t lhs = (int64_t(p.lat_e7) - a.lat_e7) * (int64_t(b.lon_e7) - a.lon_e7);
+    const int64_t rhs = (int64_t(b.lat_e7) - a.lat_e7) * (int64_t(p.lon_e7) - a.lon_e7);
+    return lhs == rhs && std::min(a.lat_e7, b.lat_e7) <= p.lat_e7 && p.lat_e7 <= std::max(a.lat_e7, b.lat_e7) &&
+           std::min(a.lon_e7, b.lon_e7) <= p.lon_e7 && p.lon_e7 <= std::max(a.lon_e7, b.lon_e7);
+}
+
+// Whether p lies on an edge of the ring v[0, n), its last vertex joined back
+// to its first.
+inline bool exact_ring_touches(const PackedLocation* v, uint32_t n, PackedLocation p) {
+    for (uint32_t a = 0, b = n - 1; a < n; b = a++)
+        if (exact_on_segment(v[b], v[a], p)) return true;
+    return false;
+}
+
+// Whether the ring v[0, n) covers p, as PostGIS's ST_Covers: p is inside it
+// or on its edges, which exact_ring_contains leaves to one side or the other.
+inline bool exact_ring_covers(const PackedLocation* v, uint32_t n, PackedLocation p) {
+    return exact_ring_touches(v, n, p) || exact_ring_contains(v, n, p);
+}
+
+// Whether the polygons (each an outer ring and its holes; a ring of fewer
+// than 3 vertices is none) cover p, as ST_Covers of their multipolygon: p is
+// on an edge of one of their rings, a hole's too, or inside an outer ring and
+// none of its holes.
+inline bool exact_polygons_cover(const std::vector<NestedPolygon<PackedLocation>>& polygons, PackedLocation p) {
+    auto touches = [&](const std::vector<PackedLocation>& ring) {
+        return ring.size() >= 3 && exact_ring_touches(ring.data(), static_cast<uint32_t>(ring.size()), p);
+    };
+    auto contains = [&](const std::vector<PackedLocation>& ring) {
+        return ring.size() >= 3 && exact_ring_contains(ring.data(), static_cast<uint32_t>(ring.size()), p);
+    };
+    for (const auto& polygon : polygons) {
+        if (touches(polygon.outer) || std::any_of(polygon.holes.begin(), polygon.holes.end(), touches)) return true;
+        if (contains(polygon.outer) && std::none_of(polygon.holes.begin(), polygon.holes.end(), contains)) return true;
+    }
+    return false;
 }
 
 // A ring's bounds, for a reject in front of exact_ring_contains.

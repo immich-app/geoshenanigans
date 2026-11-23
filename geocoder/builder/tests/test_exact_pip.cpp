@@ -1,7 +1,8 @@
 // exact_pip.h: the e7 ray cast against the shared vectors in geocoder/testdata
 // (which the reader is held to as well), its edge index and box against the
-// plain scan, and the exact area. In the sanitized suite: the products reach
-// 6.5e18 at the poles and the antimeridian.
+// plain scan, the covers test that takes the edges in, and the exact area. In
+// the sanitized suite: the products reach 6.5e18 at the poles and the
+// antimeridian.
 #include "exact_pip.h"
 
 #include <algorithm>
@@ -230,4 +231,39 @@ TEST(exact_polygon_area_takes_the_holes_off_whatever_the_rotation) {
     // Holes larger than their ring leave no negative area.
     const std::vector<RingSpan> swapped = {{5, 5}, {0, 5}};
     CHECK_EQ(exact_polygon_area(v.data(), swapped.data(), 2), 0.0f);
+}
+
+TEST(exact_ring_covers_its_edges_and_vertices_as_well_as_its_inside) {
+    // A square whose north and east edges exact_ring_contains leaves out.
+    const std::vector<PackedLocation> square = {{0, 0}, {0, 10}, {10, 10}, {10, 0}, {0, 0}};
+    const uint32_t n = static_cast<uint32_t>(square.size());
+    for (const PackedLocation p : {PackedLocation{10, 5}, PackedLocation{5, 10}, PackedLocation{10, 10},
+                                   PackedLocation{0, 5}, PackedLocation{10, 0}, PackedLocation{5, 5}})
+        CHECK(exact_ring_covers(square.data(), n, p));
+    CHECK(!exact_ring_contains(square.data(), n, {10, 5}));
+    for (const PackedLocation p : {PackedLocation{11, 5}, PackedLocation{5, 11}, PackedLocation{-1, 5},
+                                   PackedLocation{10, 11}, PackedLocation{5, -1}})
+        CHECK(!exact_ring_covers(square.data(), n, p));
+    // A slanted edge, on and one step beside it.
+    const std::vector<PackedLocation> slanted = {{0, 0}, {30, 10}, {30, -20}, {0, -20}, {0, 0}};
+    for (int32_t k = 1; k < 10; k++) {
+        CHECK(exact_ring_covers(slanted.data(), 5, {3 * k, k}));
+        CHECK(!exact_ring_covers(slanted.data(), 5, {3 * k - 1, k}));
+    }
+}
+
+TEST(exact_polygons_cover_their_outer_and_hole_edges_but_not_their_holes) {
+    // A 10 x 10 square with a hole from 3 to 6, and an island apart from it.
+    std::vector<NestedPolygon<PackedLocation>> polygons(2);
+    polygons[0].outer = {{0, 0}, {0, 10}, {10, 10}, {10, 0}, {0, 0}};
+    polygons[0].holes = {{{3, 3}, {6, 3}, {6, 6}, {3, 6}, {3, 3}}};
+    polygons[1].outer = {{20, 20}, {20, 30}, {30, 30}, {30, 20}, {20, 20}};
+    for (const PackedLocation p : {PackedLocation{1, 1}, PackedLocation{10, 5}, PackedLocation{5, 10},
+                                   PackedLocation{10, 10}, PackedLocation{3, 4}, PackedLocation{6, 4},
+                                   PackedLocation{4, 3}, PackedLocation{4, 6}, PackedLocation{6, 6},
+                                   PackedLocation{30, 25}, PackedLocation{25, 25}})
+        CHECK(exact_polygons_cover(polygons, p));
+    for (const PackedLocation p : {PackedLocation{4, 4}, PackedLocation{5, 5}, PackedLocation{11, 5},
+                                   PackedLocation{15, 15}, PackedLocation{31, 25}})
+        CHECK(!exact_polygons_cover(polygons, p));
 }
