@@ -473,7 +473,7 @@
     {
       "id": "max-quality",
       "label": "Maximum quality",
-      "description": "Full mode with exact boundaries, every OSM point. Largest configuration available.",
+      "description": "Full mode with exact boundaries, every OSM point and all POIs, without water.",
       "selections": {
         "region": "planet",
         "mode": "full",

@@ -33,6 +33,8 @@ class WaterAxisTest(unittest.TestCase):
         for preset in cfg["presets"]:
             self.assertEqual(sorted(preset["selections"]), sorted(cfg["axes"]), preset["id"])
             self.assertEqual(preset["selections"]["water"], "none", preset["id"])
+            # Water adds files to any selection, so a preset without it is never the largest.
+            self.assertNotIn("largest", preset["description"].lower(), preset["id"])
         # Any boundary precision with any water: no constraint names it.
         for c in cfg["constraints"]:
             self.assertNotIn("water", c["when"], c["id"])
