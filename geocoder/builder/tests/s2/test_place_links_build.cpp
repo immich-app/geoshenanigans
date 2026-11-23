@@ -1,9 +1,10 @@
 // build-index's place links and postal areas, from a PBF to the server's
 // answers: a boundary of rank 0 in its country links no place node, a
 // boundary links a place node of its wikidata only where it holds it, a
-// place=province area is an address area where its country ranks it, and a
+// place=province area is an address area where its country ranks it, a
 // postal area names a point only of its own country and of a postcode its
-// country takes.
+// country takes, and a place area linked to a place node of another type
+// ranks by its own place tag.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -202,5 +203,31 @@ TEST(a_postal_area_names_a_point_only_of_its_country_and_of_a_postcode_its_count
     CHECK(names(answers[0], "postcode", "60311"));
     CHECK(answers[1].find("8000") == std::string::npos);
     CHECK(names(answers[2], "postcode", "8000"));
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_place_area_linked_to_a_place_node_of_another_type_ranks_by_its_own_place_tag) {
+    // Weesp (R15419242) is a boundary=place area tagged place=suburb whose label member is the
+    // town node Weesp: find_linked_place links the node, which labels the area town, but
+    // placex_update keeps a place area of rank 16 to 23 at its own place tag's rank, the
+    // suburb's 20 (placex_triggers.sql:930-950, :1129). It comes before Driemond, a village
+    // node promoted to 18 inside Amsterdam (admin_level 10, rank 16 in the Netherlands, linked to
+    // its city node), as Nominatim's line has it.
+    Fixture f;
+    f.country(52, 4.5, 53, 5.5, "Netherlands", "NL");
+    f.boundary(52.1, 4.6, 52.9, 5.4, 4, "North Holland");
+    f.boundary(52.2, 4.8, 52.5, 5.2, 8, "Amsterdam");
+    const int64_t amsterdam = f.node(52.30, 4.96, {{"place", "city"}, {"name", "Amsterdam"}});
+    f.boundary(52.29, 4.94, 52.32, 5.02, 10, "Amsterdam", {}, {{OsmType::Node, amsterdam, "label"}});
+    const int64_t weesp = f.node(52.31, 5.04, {{"place", "town"}, {"name", "Weesp"}});
+    f.area(52.295, 5.0, 52.325, 5.06, {{"type", "boundary"}, {"boundary", "place"}, {"place", "suburb"}, {"name", "Weesp"}},
+           {{OsmType::Node, weesp, "label"}});
+    f.node(52.305, 5.015, {{"place", "village"}, {"name", "Driemond"}});
+    const std::vector<std::string> answers = answers_of(f, "place-area-own-rank", {{52.31, 5.01}});
+    REQUIRE(answers.size() == 1);
+    CHECK(answers[0].find("\"display_name\":\"Weesp, Driemond, Amsterdam, North Holland, Netherlands\"") !=
+          std::string::npos);
+    CHECK(names(answers[0], "town", "Weesp"));
+    CHECK(names(answers[0], "village", "Driemond"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }

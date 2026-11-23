@@ -118,13 +118,31 @@ inline uint8_t polygon_rank_address(uint16_t cc, uint8_t admin_level, uint8_t pl
     return admin_level == 15 ? place_area_rank_address(cc, place_type) : admin_rank_address(cc, admin_level);
 }
 
+// rank_address of a place area (admin_level 15) of its own place tag `own`
+// that links a place node of type `linked` (both AdminPlaceType), in the
+// country `cc`, before an area containing it lifts it: placex_update keeps a
+// place area of rank 16 to 23 at its own rank whether it links a node or not
+// (that branch leaves parent_address_level unset, placex_triggers.sql:930-950,
+// :1129), and gives any other the linked node's rank where that is above 3
+// and below 26 (:1109-1133). One of rank 0 links nothing (find_linked_place,
+// :285). Mirrors the server's place_area_ranks.
+inline uint8_t linked_place_area_rank(uint16_t cc, uint8_t own, uint8_t linked) {
+    const uint8_t own_rank = place_area_rank_address(cc, own);
+    if (own_rank == 0 || (own_rank >= 16 && own_rank <= 23)) return own_rank;
+    const uint8_t linked_rank = place_area_rank_address(cc, linked);
+    return linked_rank > 3 && linked_rank < 26 ? linked_rank : own_rank;
+}
+
 // Admin-minimal carries addresses down to rank 16, the cities, towns and
 // villages its place nodes also reach: boundaries of admin_level 2..8 and the
-// place areas (admin_level 15) of those ranks. Singapore's city is its
-// place=city area (R17140517), not a boundary.
-inline bool admin_minimal_keeps(uint8_t admin_level, uint8_t place_type) {
+// place areas (admin_level 15) of those ranks, a place area linked to a place
+// node of another type at linked_place_area_rank's (`own_place_type` its own
+// place tag, 0 where that is `place_type`). Singapore's city is its place=city
+// area (R17140517), not a boundary.
+inline bool admin_minimal_keeps(uint8_t admin_level, uint8_t place_type, uint8_t own_place_type = 0) {
     if (admin_level >= 2 && admin_level <= 8) return true;
-    const uint8_t rank = place_area_rank_address(place_type);
+    const uint8_t rank = own_place_type ? linked_place_area_rank(0, own_place_type, place_type)
+                                        : place_area_rank_address(place_type);
 
     return admin_level == 15 && rank > 0 && rank <= 16;
 }

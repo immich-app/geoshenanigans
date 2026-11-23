@@ -77,3 +77,21 @@ TEST(boundary_ranks_follow_the_country_levels) {
     CHECK_EQ(admin_rank_address(br, 8), uint8_t(16));
     CHECK_EQ(admin_rank_address(pack_country_code('A', 'U'), 6), uint8_t(0));
 }
+
+TEST(a_linked_place_area_ranks_by_its_own_tag_from_16_to_23_else_by_the_node) {
+    // placex_update keeps a place area of rank 16 to 23 at its own place tag's rank whether it links
+    // a place node or not, and gives any other the linked node's rank where that is above 3 and
+    // below 26 (placex_triggers.sql:930-950, :1109-1133); one of rank 0 links nothing (:285).
+    const uint16_t ru = pack_country_code('R', 'U'), ca = pack_country_code('C', 'A');
+    using T = AdminPlaceType;
+    CHECK_EQ(linked_place_area_rank(0, pt(T::SUBURB), pt(T::TOWN)), uint8_t(20));  // Weesp
+    CHECK_EQ(linked_place_area_rank(0, pt(T::VILLAGE), pt(T::HAMLET)), uint8_t(16));
+    CHECK_EQ(linked_place_area_rank(ru, pt(T::MUNICIPALITY), pt(T::TOWN)), uint8_t(18));
+    CHECK_EQ(linked_place_area_rank(0, pt(T::NEIGHBOURHOOD), pt(T::QUARTER)), uint8_t(22));
+    CHECK_EQ(linked_place_area_rank(0, pt(T::MUNICIPALITY), pt(T::CITY)), uint8_t(16));
+    CHECK_EQ(linked_place_area_rank(0, pt(T::NEIGHBOURHOOD), pt(T::STATE)), uint8_t(24));
+    CHECK_EQ(linked_place_area_rank(ca, pt(T::COUNTY), pt(T::TOWN)), uint8_t(0));
+    // Admin-minimal leaves out a suburb area linked to a town node, a suburb at 20.
+    CHECK(!admin_minimal_keeps(15, pt(T::TOWN), pt(T::SUBURB)));
+    CHECK(admin_minimal_keeps(15, pt(T::CITY), pt(T::MUNICIPALITY)));
+}
