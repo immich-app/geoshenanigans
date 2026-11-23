@@ -1,4 +1,12 @@
 name: Build Geocoder Index
+# A dispatch under a scratch s3_prefix is a test run, and its title says so:
+# the watchdog counts only the live nightly's runs, as today's success, as a
+# failure to retry, or as the nightly it reports. Those are titled "Build
+# Geocoder Index" (scheduled) and "Build Geocoder Index [geocoder]" (a
+# dispatch, the watchdog's retries among them), which it matches byte for
+# byte: an expression's == is blind to case, so a dispatch's title names its
+# prefix as given, and one under Geocoder (Setup refuses it) is no live run.
+run-name: "${{ (inputs.s3_prefix || 'geocoder') != 'geocoder' && format('Build Geocoder Index [scratch: {0}]', inputs.s3_prefix) || inputs.s3_prefix && format('Build Geocoder Index [{0}]', inputs.s3_prefix) || 'Build Geocoder Index' }}"
 
 concurrency:
   group: geocoder-build
@@ -34,6 +42,11 @@ on:
         required: false
         type: string
         default: 'geocoder'
+      seed_previous:
+        description: 'With a scratch s3_prefix: first copy the live build of the day before into it, for a patch night'
+        required: false
+        type: boolean
+        default: false
 
 env:
   S3_BUCKET: geoshenanigans-reverse-geocoding
@@ -81,6 +94,22 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
+
+      # The job's CPU, memory and work-volume IO, every 30 s from here to its
+      # end (job_sampler.sh), and what of the PBF pbf-apply reads and the one
+      # it writes, which build-index reads, is in the page cache; detached so
+      # it outlives this step; the runner stops it with the job. Its log goes
+      # up with the job's other logs (Upload job logs); its first line, here,
+      # gives the CPUs and the quota.
+      - name: Start the job sampler
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          setsid nohup "$GITHUB_WORKSPACE/geocoder/builder/tools/job_sampler.sh" "$RUNNER_TEMP/jobstat.log" "$RUNNER_TEMP" 30 \
+            "$RUNNER_TEMP/geocoder/planet.osm.pbf" "$RUNNER_TEMP/geocoder/planet-tmp.osm.pbf" \
+            > /dev/null 2>&1 < /dev/null &
+          sleep 1
+          head -1 "$RUNNER_TEMP/jobstat.log" || true
 
       # ── Setup ──────────────────────────────────────────────────────
       # libzstd-dev: geocoder-patch, which verifies the night's patches, links
@@ -171,9 +200,13 @@ jobs:
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           echo "$GITHUB_WORKSPACE/geocoder/builder/build" >> "$GITHUB_PATH"
+          # The unit tests' scratch (mkdtemp under TMPDIR) goes on the work
+          # volume, not the container's /tmp: this starts before Setup sets
+          # TMPDIR.
+          mkdir -p "$RUNNER_TEMP/tools-tmp"
           # The inner script expands its own arguments ($0 is the status file).
           # shellcheck disable=SC2016
-          setsid nohup bash -c '"$@"; echo $? > "$0"' "$RUNNER_TEMP/tools.status" \
+          TMPDIR="$RUNNER_TEMP/tools-tmp" setsid nohup bash -c '"$@"; echo $? > "$0"' "$RUNNER_TEMP/tools.status" \
             geocoder/builder/tools/ci_build_tools.sh geocoder/builder/build .tools-cache "$GITHUB_WORKSPACE/.s2-prefix" \
             > "$RUNNER_TEMP/tools.log" 2>&1 < /dev/null &
 
@@ -182,18 +215,21 @@ jobs:
       # same crate, which encodes the transport units (Compress index files)
       # and decodes yesterday's (fetch_previous_index.sh): compiled beside
       # Setup and the downloads like the tools, detached so it outlives this
-      # step. search.status is written once both are built.
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: stable
-
+      # step, after the stable toolchain it installs first (rust_toolchain.sh:
+      # a fresh pod downloads it, ~15 s no step waits for). search.status is
+      # written once both are built; rust-toolchain.status, the install's
+      # alone, for Check the Rust toolchain.
       - name: Build place search
         env:
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
-          # The inner script expands its own arguments ($0 is the status file).
+          CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}
+          export CARGO_HOME CARGO_INCREMENTAL=0 PATH="$CARGO_HOME/bin:$PATH"
+          # The inner script expands its own arguments ($0 is the status file,
+          # $1 the toolchain's install and $2 its status file, then the build).
           # shellcheck disable=SC2016
-          setsid nohup bash -c '"$@"; echo $? > "$0"' "$RUNNER_TEMP/search.status" \
+          setsid nohup bash -c '"$1" "$2" && shift 2 && "$@"; echo $? > "$0"' "$RUNNER_TEMP/search.status" \
+            geocoder/builder/tools/rust_toolchain.sh "$RUNNER_TEMP/rust-toolchain.status" \
             cargo build --release --locked --manifest-path geocoder/search/Cargo.toml \
             > "$RUNNER_TEMP/search.log" 2>&1 < /dev/null &
 
@@ -202,6 +238,7 @@ jobs:
         env:
           BUILD_DATE: ${{ inputs.build_date }}
           FORCE_FRESH: ${{ inputs.force_fresh }}
+          SEED_PREVIOUS: ${{ inputs.seed_previous }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           # The cleanup steps delete under builds/ of the prefix: one segment,
@@ -228,6 +265,18 @@ jobs:
           fi
           echo "cache_endpoint=http://${BUCKET_HOST}:${BUCKET_PORT}" >> "$GITHUB_OUTPUT"
           echo "cache_bucket=$BUCKET_NAME" >> "$GITHUB_OUTPUT"
+          # The PBF cache key the run writes today's PBF to: the shared one on
+          # a live run, which a retry of the day takes it from; on a scratch
+          # prefix's its own, which Cleanup old cache bucket deletes, so a test
+          # run neither takes a PBF of the day (it applies the diff) nor writes
+          # or prunes the shared ones. Yesterday's comes from the shared key,
+          # read only, either way.
+          if [ "$S3_PREFIX" = geocoder ]; then
+            PBF_CACHE=geocoder-cache
+          else
+            PBF_CACHE=geocoder-scratch/$S3_PREFIX
+          fi
+          echo "pbf_cache=$PBF_CACHE" >> "$GITHUB_OUTPUT"
 
           # Determine target date + sequence
           SERVER="https://planet.openstreetmap.org/replication/day"
@@ -262,23 +311,75 @@ jobs:
           echo "Previous:   $PREV_DATE"
           echo "Server:     $CURRENT_DATE (seq $CURRENT_SEQ, offset: -${DAYS_OFFSET}d)"
 
-          # Check if previous build exists on Tigris with compatible build_version.
-          # Look for an index file, not just the directory: dates past the
-          # full-index window keep configurations.json beside their patches.
-          # Its transport units must be of this build's transport version too:
-          # the fetch decodes them with tonight's geocoder-transport.
+          # A patch base's versions, read from the configurations.json of the
+          # build at $1 into PREV_VERSION (its build version) and
+          # PREV_TRANSPORT (its units' transport version): the run patches only
+          # from a build of this one's, the fetch decoding its units with
+          # tonight's geocoder-transport.
           EXPECTED_BUILD_VERSION=$(jq -r .build.version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
           EXPECTED_TRANSPORT_VERSION=$(jq -r .transport.version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
+          patch_base_versions() {
+            PREV_CFG=$(s5cmd --endpoint-url $S3_ENDPOINT cat "$1/configurations.json" 2>/dev/null || echo "")
+            PREV_VERSION=$(echo "$PREV_CFG" | jq -r '.build.version // 0' 2>/dev/null || echo 0)
+            # Every unit's transport version, one or none ("" for a build of no units).
+            PREV_TRANSPORT=$(echo "$PREV_CFG" | jq -r '[.units // {} | .[].transport_version] | unique | map(tostring) | join(",")' 2>/dev/null || echo "")
+          }
+
+          # A scratch prefix's patch night: the live build of the day before,
+          # copied in server side (~30 GB, its sidecars too) for the run to
+          # patch from. Never into the live prefix. The date's whole object
+          # set becomes the live build's: what an earlier run left there goes
+          # first (the patch base would otherwise mix two builds, a unit and
+          # the standalone files it replaced, say), and the copy must then
+          # hold the live build's keys and sizes, no more and no fewer.
+          if [ "$SEED_PREVIOUS" = true ]; then
+            if [ "$S3_PREFIX" = geocoder ]; then
+              echo "::error::seed_previous copies the live build into a scratch s3_prefix; this run publishes the live builds"
+              exit 1
+            fi
+            SEED_FROM="s3://$S3_BUCKET/geocoder/builds/$PREV_DATE"
+            SEED_TO="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE"
+            SEED_S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
+            echo "Seeding $S3_PREFIX/builds/$PREV_DATE with the live build of $PREV_DATE"
+            # A live build past the full-index window (KEEP_FULL_DAYS) keeps
+            # its patches and configurations.json alone: the run would build
+            # fresh from such a seed, not patch.
+            if [ -z "$($SEED_S5 ls "$SEED_FROM/planet/full/*.bin.zst" 2> /dev/null)" ]; then
+              echo "::error::The live build of $PREV_DATE has no full index (planet/full/*.bin.zst) to seed $S3_PREFIX/builds/$PREV_DATE with"
+              exit 1
+            fi
+            # Nor would one of other versions than this run's (a branch that
+            # bumps build.version, say) be patched from.
+            patch_base_versions "$SEED_FROM"
+            if [ "$PREV_VERSION" != "$EXPECTED_BUILD_VERSION" ] || [ "$PREV_TRANSPORT" != "$EXPECTED_TRANSPORT_VERSION" ]; then
+              echo "::error::The live build of $PREV_DATE is of build_version=$PREV_VERSION, transport_version=${PREV_TRANSPORT:-none} (this run's are $EXPECTED_BUILD_VERSION, $EXPECTED_TRANSPORT_VERSION): no patch base to seed $S3_PREFIX/builds/$PREV_DATE with"
+              exit 1
+            fi
+            $SEED_S5 rm "$SEED_TO/*" > /dev/null 2>&1 || true
+            $SEED_S5 cp "$SEED_FROM/*" "$SEED_TO/"
+            # Each listing whole, or the check fails: two failed ones would
+            # compare as the same empty set.
+            if ! LIVE_KEYS=$(set -o pipefail; $SEED_S5 ls "$SEED_FROM/*" | awk '{print $(NF-1), $NF}' | sort) \
+               || ! SEED_KEYS=$(set -o pipefail; $SEED_S5 ls "$SEED_TO/*" | awk '{print $(NF-1), $NF}' | sort) \
+               || [ -z "$LIVE_KEYS" ] || [ -z "$SEED_KEYS" ]; then
+              echo "::error::Could not list the live build of $PREV_DATE and its seed in $S3_PREFIX/builds/$PREV_DATE"
+              exit 1
+            fi
+            if ! diff <(echo "$LIVE_KEYS") <(echo "$SEED_KEYS"); then
+              echo "::error::The seed of $S3_PREFIX/builds/$PREV_DATE does not hold the live build of $PREV_DATE (above: < live, > seed)"
+              exit 1
+            fi
+          fi
+
+          # Check if previous build exists on Tigris with compatible versions.
+          # Look for an index file, not just the directory: dates past the
+          # full-index window keep configurations.json beside their patches.
           PREV_BUILD="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE"
           if [ "$FORCE_FRESH" = "true" ]; then
             echo "has_previous=false" >> "$GITHUB_OUTPUT"
             echo "force_fresh=true requested — building fresh (ignoring $PREV_DATE)"
           elif [ -n "$(s5cmd --endpoint-url $S3_ENDPOINT ls "$PREV_BUILD/planet/full/*.bin.zst" 2>/dev/null)" ]; then
-            # Check build_version in previous configurations.json.
-            PREV_CFG=$(s5cmd --endpoint-url $S3_ENDPOINT cat "$PREV_BUILD/configurations.json" 2>/dev/null || echo "")
-            PREV_VERSION=$(echo "$PREV_CFG" | jq -r '.build.version // 0' 2>/dev/null || echo 0)
-            # Every unit's transport version, one or none ("" for a build of no units).
-            PREV_TRANSPORT=$(echo "$PREV_CFG" | jq -r '[.units // {} | .[].transport_version] | unique | map(tostring) | join(",")' 2>/dev/null || echo "")
+            patch_base_versions "$PREV_BUILD"
             if [ "$PREV_VERSION" = "$EXPECTED_BUILD_VERSION" ] && [ "$PREV_TRANSPORT" = "$EXPECTED_TRANSPORT_VERSION" ]; then
               echo "has_previous=true" >> "$GITHUB_OUTPUT"
               echo "Previous build ($PREV_DATE) found, build_version=$PREV_VERSION, transport_version=$PREV_TRANSPORT — compatible"
@@ -305,11 +406,15 @@ jobs:
           CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
           YESTERDAY: ${{ steps.setup.outputs.yesterday }}
           TODAY: ${{ steps.setup.outputs.today }}
+          TODAY_SEQ: ${{ steps.setup.outputs.today_seq }}
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
+          PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}
         run: |
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
           STEP_START=$(date +%s)
+          # This step's timeout-minutes, in seconds.
+          STEP_SECONDS=3600
 
           # Retry wrapper: retries a command up to N times with backoff
           retry() {
@@ -325,7 +430,8 @@ jobs:
             return 1
           }
 
-          # Cache check: returns 0 if path exists, with retries for transient failures
+          # Cache check: returns 0 if path exists, with retries for transient
+          # failures (yesterday's PBF: a miss means the mirror)
           cache_exists() {
             local pattern="$1"
             local check="$2"
@@ -475,11 +581,16 @@ jobs:
             return 1
           }
 
-          if cache_exists "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" "planet-"; then
+          # Today's PBF is there only when a run of the day applied the diff
+          # already: one look, with no retries, as a miss costs nothing. A
+          # scratch prefix's run never takes it: it is there to apply the diff,
+          # and its key may hold an earlier test run's PBF of the day.
+          if [ "$PBF_CACHE" = geocoder-cache ] \
+             && $CACHE ls "s3://$CACHE_BUCKET/$PBF_CACHE/planet-${TODAY}.osm.pbf" 2> /dev/null | grep -q "planet-"; then
             if download_pbf_from_cache \
-                "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" \
+                "s3://$CACHE_BUCKET/$PBF_CACHE/planet-${TODAY}.osm.pbf" \
                 "$WORKDIR/planet.osm.pbf" "today's PBF ($TODAY)"; then
-              echo "pbf_source=today" >> "$GITHUB_OUTPUT"
+              PBF_SOURCE=today
             else
               echo "[pbf] Falling back to yesterday's PBF..."
               # Fall through to next check
@@ -492,7 +603,7 @@ jobs:
             if download_pbf_from_cache \
                 "s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf" \
                 "$WORKDIR/planet.osm.pbf" "yesterday's PBF ($YESTERDAY)"; then
-              echo "pbf_source=yesterday" >> "$GITHUB_OUTPUT"
+              PBF_SOURCE=yesterday
             fi
           fi
 
@@ -504,17 +615,67 @@ jobs:
               || true
             SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
             echo "[pbf] Done: $((SIZE/1024/1024)) MiB"
-            echo "pbf_source=mirror" >> "$GITHUB_OUTPUT"
+            PBF_SOURCE=mirror
+          fi
+          echo "pbf_source=$PBF_SOURCE" >> "$GITHUB_OUTPUT"
+
+          # ── Background: the day's diff ──
+          # What Apply replication diffs applies to yesterday's PBF (it fetches
+          # it itself if this failed or ran out of time): ~130 MiB, at most 10
+          # minutes (fetch_day_diff.sh), once the PBF is down. Beside the PBF
+          # it took 140 to 179 s on the runner and ended 20 to 25 s after it,
+          # the PBF's download taking the bandwidth; alone it takes 12 to 14 s,
+          # beside the waits below and the tool build's. Today's PBF needs no
+          # diff, and the mirror's fetches its diffs in Apply replication
+          # diffs.
+          # It has at most the time the step has left, less 2 minutes, and
+          # none under 30 s: a PBF that took most of the hour must not leave
+          # the step past its timeout, a cancelled step the watchdog doesn't
+          # retry, for a diff Apply replication diffs can fetch.
+          if [ "$PBF_SOURCE" = yesterday ]; then
+            DIFF_SECONDS=$((STEP_START + STEP_SECONDS - 120 - $(date +%s)))
+            [ "$DIFF_SECONDS" -le 600 ] || DIFF_SECONDS=600
+            if [ "$DIFF_SECONDS" -ge 30 ]; then
+              { "$GITHUB_WORKSPACE/geocoder/builder/tools/fetch_day_diff.sh" "$TODAY_SEQ" "$WORKDIR/diff-today.osc.gz" "$DIFF_SECONDS" \
+                  || echo "[diff] Apply replication diffs fetches it"; } > "$WORKDIR/diff-today.log" 2>&1 < /dev/null &
+              DIFF_PID=$!
+            else
+              echo "[diff] ${DIFF_SECONDS}s left in the step; Apply replication diffs fetches it"
+            fi
           fi
 
           # Wait for the sidecars and the small downloads (wikidata or TIGER
-          # fails the step)
+          # fails the step), then the diff.
           if [ "$HAS_PREVIOUS" = "true" ]; then
             echo "Waiting for the sidecar download..."
             wait $IDX_PID
           fi
           wait $EXTRAS_PID
+          if [ -n "${DIFF_PID:-}" ]; then
+            wait "$DIFF_PID" || true
+            cat "$WORKDIR/diff-today.log"
+          fi
           echo "All downloads complete in $(($(date +%s) - STEP_START))s"
+
+      # A failed install of the Rust toolchain (Build place search), a
+      # release server down, is worth a retry: it fails the run here, early,
+      # in a step the watchdog retries. Left to itself it would leave no
+      # place-search, and fail the run at its end in Fail run on place
+      # search index failure, which the watchdog doesn't retry: a failed
+      # place-search build fails alike on every rerun.
+      - name: Check the Rust toolchain
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          for _ in $(seq 180); do
+            [ -s "$RUNNER_TEMP/rust-toolchain.status" ] && break
+            sleep 5
+          done
+          if [ "$(cat "$RUNNER_TEMP/rust-toolchain.status" 2> /dev/null)" != 0 ]; then
+            tail -40 "$RUNNER_TEMP/search.log"
+            echo "::error::Installing the Rust toolchain failed or did not end within 15 min"
+            exit 1
+          fi
 
       - name: Run builder tests
         env:
@@ -538,7 +699,7 @@ jobs:
             tail -20 "$RUNNER_TEMP/tools.log"
             echo "::error::The tool build or its unit tests failed"; exit 1
           fi
-          grep -E "Tools from the cache|afresh|tests passed" "$RUNNER_TEMP/tools.log"
+          grep -E "^\[tools |afresh|tests passed" "$RUNNER_TEMP/tools.log"
 
       # ── Apply replication diffs ───────────────────────────────────
       # Skipped when PBF source is already today's data.
@@ -575,13 +736,21 @@ jobs:
           }
 
           if [ "$PBF_SOURCE" = "yesterday" ]; then
-            DIR1=$(printf "%03d" $((TODAY_SEQ / 1000000)))
-            DIR2=$(printf "%03d" $(((TODAY_SEQ / 1000) % 1000)))
-            FILE=$(printf "%03d" $((TODAY_SEQ % 1000)))
-            echo "Downloading replication diff (seq $TODAY_SEQ)..."
-            curl -sL --fail --retry 5 --retry-delay 30 --retry-all-errors \
-              -o "$WORKDIR/diff-today.osc.gz" "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
-            gzip -t "$WORKDIR/diff-today.osc.gz"
+            # The download step fetched it once the PBF was down; this is its
+            # fallback. fetch_day_diff.sh leaves the diff only once gzip -t
+            # has passed, so it isn't tested again (~6 s on the runner). The
+            # fallback has 10 minutes too: a server that stalls fails the
+            # step, which the watchdog retries, where it would otherwise hold
+            # it to its timeout, a cancelled step it doesn't.
+            if [ -s "$WORKDIR/diff-today.osc.gz" ]; then
+              echo "Replication diff (seq $TODAY_SEQ) fetched during the download"
+            else
+              echo "Downloading replication diff (seq $TODAY_SEQ)..."
+              if ! "$GITHUB_WORKSPACE/geocoder/builder/tools/fetch_day_diff.sh" "$TODAY_SEQ" "$WORKDIR/diff-today.osc.gz" 600; then
+                echo "::error::No replication diff (seq $TODAY_SEQ) to apply to yesterday's PBF"
+                exit 1
+              fi
+            fi
             DIFF_SIZE=$(stat -c%s "$WORKDIR/diff-today.osc.gz")
             echo "Diff: $((DIFF_SIZE/1024/1024)) MiB"
 
@@ -594,11 +763,23 @@ jobs:
             echo "Disk after apply-diffs:"
             df -h "$WORKDIR"
           else
-            # Mirror path — PBF may be a few days behind
+            # Mirror path — PBF may be a few days behind; the diffs it needs
+            # come down here, the download step's diff of the day with them.
+            rm -f "$WORKDIR/diff-today.osc.gz"
             PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" 2>/dev/null | cut -dT -f1)
+            if ! [[ "$PBF_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+              echo "::error::The mirror's PBF has no replication timestamp to take diffs from (read '$PBF_DATE')"
+              exit 1
+            fi
             DAYS_NEEDED=$(( ($(date -u -d "$TODAY" +%s) - $(date -u -d "$PBF_DATE" +%s)) / 86400 ))
             PBF_SEQ=$((TODAY_SEQ - DAYS_NEEDED))
             echo "PBF date=$PBF_DATE seq=$PBF_SEQ, need $DAYS_NEEDED diffs"
+            # A PBF of a later date than the build's (planet-latest, for a
+            # dispatch of a past date) can't be wound back to it.
+            if [ "$DAYS_NEEDED" -lt 0 ]; then
+              echo "::error::The mirror's PBF ($PBF_DATE) is newer than the build date $TODAY"
+              exit 1
+            fi
 
             if [ $DAYS_NEEDED -gt 0 ]; then
               DIFFS=""
@@ -636,6 +817,7 @@ jobs:
           WIKIDATA_DATE: ${{ steps.download.outputs.wikidata_date }}
           TIGER_FILE: ${{ steps.download.outputs.tiger_data }}
           GEONAMES_FILE: ${{ steps.download.outputs.postcode_centroids_external }}
+          PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
@@ -644,17 +826,21 @@ jobs:
           # Two transfers run beside the build, detached so they outlive this
           # step; each writes its exit status last for the step that needs it.
           # - Today's PBF goes to the cache for tomorrow's run (skipped if it
-          #   came from there); Finalize waits for it, then frees the disk.
+          #   came from there), under the run's own key on a scratch prefix;
+          #   Finalize waits for it, then frees the disk.
           # - Yesterday's client files come down and decompress for patch
           #   generation, which waits for them; its transport units decode
           #   once geocoder-transport is built (Build place search).
           if [ "$PBF_SOURCE" != "today" ]; then
-            echo "Caching today's PBF in background..."
+            echo "Caching today's PBF in background from $(date -u +%H:%M:%S)..."
             # The inner script expands its own arguments ($0 is the status file).
             # shellcheck disable=SC2016
             setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/pbf-cache.status" \
-              $CACHE cp --concurrency 16 "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" \
+              $CACHE cp --concurrency 16 "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/$PBF_CACHE/planet-${TODAY}.osm.pbf" \
               > "$WORKDIR/pbf-cache.log" 2>&1 < /dev/null &
+            # Its session, for a scratch run's Cleanup old cache bucket to end
+            # before it deletes the key.
+            echo "$!" > "$WORKDIR/pbf-cache.pid"
           fi
           if [ "$HAS_PREVIOUS" = "true" ]; then
             echo "Fetching yesterday's index in background..."
@@ -753,28 +939,30 @@ jobs:
 
       # ── Place search indexes ──────────────────────────────────────
       # The selections configurations.json ships them for (search_index), in
-      # every region, from the .bin files just built; compression publishes
-      # them with the rest. A failed one is left out (its clients build theirs
-      # on the device) and fails the run once the data is up.
+      # every region, from the .bin files just built, in the background from
+      # here (place_search_indexes.sh, detached so it outlives this step):
+      # compression and the patches start beside them at once, and
+      # compression takes their files once place-search.status is written
+      # (compress_index.py --late-search). nice 5: below the patch jobs (the
+      # night's longest chain), above compression (nice 10). Past 30 minutes
+      # the build is stopped. A failed one is left out (its clients build
+      # theirs on the device) and fails the run once the data is up: Compress
+      # index files reads the status.
       - name: Build place search indexes
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
-          WAIT_START=$(date +%s)
-          until [ -s "$RUNNER_TEMP/search.status" ] || [ $(( $(date +%s) - WAIT_START )) -gt 1800 ]; do
-            sleep 5
-          done
-          START=$(date +%s)
-          if [ "$(cat "$RUNNER_TEMP/search.status" 2> /dev/null)" != 0 ]; then
-            tail -40 "$RUNNER_TEMP/search.log"
-            echo "::error::Building place-search failed; no place search indexes"
-            echo "SEARCH_INDEX_FAILED=1" >> "$GITHUB_ENV"
-          elif ! python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/build_search_indexes.py" "$WORKDIR/output" \
-              "$GITHUB_WORKSPACE/geocoder/search/target/release/place-search"; then
-            echo "SEARCH_INDEX_FAILED=1" >> "$GITHUB_ENV"
-          fi
-          echo "Place search indexes done in $(($(date +%s) - START))s"
+          # The inner script expands its own arguments ($0 is the status file).
+          # shellcheck disable=SC2016
+          setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/place-search.status" \
+            nice -n 5 "$GITHUB_WORKSPACE/geocoder/builder/tools/place_search_indexes.sh" "$WORKDIR/output" \
+            "$GITHUB_WORKSPACE/geocoder/search/target/release/place-search" "$RUNNER_TEMP/search.status" 1800 \
+            > "$WORKDIR/place-search.log" 2>&1 < /dev/null &
+          # Its session, for Compress index files to end should compression
+          # stop waiting for it.
+          echo "$!" > "$WORKDIR/place-search.pid"
+          echo "Place search indexes building in the background from $(date -u +%H:%M:%S)"
 
       # ── Generate patches + verify ─────────────────────────────────
       - name: Generate patches and verify
@@ -783,14 +971,68 @@ jobs:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           OLD_DATE: ${{ steps.setup.outputs.yesterday }}
           NEW_DATE: ${{ steps.setup.outputs.today }}
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
 
           echo "Disk at start of patch step:"
           df -h "$WORKDIR"
 
+          # Compress the new index alongside the diffs, whose long tail
+          # (planet/full) leaves most cores idle, and the place search, whose
+          # files it takes once its status is written; from build-index's exit,
+          # as it reads none of yesterday's files, which the diffs wait for
+          # below. It keeps the .bin files the diffs and verifies read; the
+          # compress step removes them. Each .zst and transport unit streams to
+          # this date's Tigris prefix as soon as it exists and the prefix is
+          # cleared (prefix.cleared, below): the upload is network-bound, so it
+          # hides behind the compression. Finalize uploads whatever is still
+          # missing. The .zst are final once it ends: their checksums
+          # (checksums.sh zst) are taken then, beside the patches, for
+          # Finalize's checksums.sha256. geocoder-transport, which encodes the
+          # units, comes from the place search build (done long before, on a
+          # normal night).
+          WAIT_START=$(date +%s)
+          until [ -s "$RUNNER_TEMP/search.status" ] || [ $(( $(date +%s) - WAIT_START )) -gt 1800 ]; do sleep 5; done
+          # In a session of its own, which the wait below ends should
+          # yesterday's files not come. The inner script expands its own
+          # variables (the step's env).
+          # shellcheck disable=SC2016
+          setsid bash -e -c '
+            COMPRESS_RC=0
+            nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
+              --transport-bin "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" \
+              --late-search "$WORKDIR/place-search.status" --late-search-taken "$WORKDIR/place-search.taken" \
+              --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" --upload-after "$WORKDIR/prefix.cleared" \
+              --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" || COMPRESS_RC=$?
+            if [ "$COMPRESS_RC" = 0 ] || [ "$COMPRESS_RC" = 3 ]; then
+              nice -n 10 "$GITHUB_WORKSPACE/geocoder/builder/tools/checksums.sh" zst "$WORKDIR/output" > "$WORKDIR/zst.sha256.part" \
+                && mv "$WORKDIR/zst.sha256.part" "$WORKDIR/zst.sha256"
+            fi
+            exit "$COMPRESS_RC"
+          ' > "$WORKDIR/compress.log" 2>&1 < /dev/null &
+          COMPRESS_PID=$!
+
           # Yesterday's client files came down and decompressed beside the
-          # build (fetch_previous_index.sh, started by the build step).
+          # build (fetch_previous_index.sh, started by the build step). Without
+          # them there are no patches and the run fails: compression ends
+          # first, its session and all (its uploads, held back, too), and is
+          # gone (a zombie aside); this date's prefix is left as it was, a
+          # build published under it included. So does a step that ends
+          # otherwise before it lets the uploads go (the trap). Its launch is
+          # killed too, as a fetch that failed before build-index exited stops
+          # it before it has made its session.
+          compressing() { ps -o stat= -s "$COMPRESS_PID" | grep -q '^[^Z]'; }
+          stop_compression() {
+            local start
+            start=$(date +%s)
+            kill -KILL "$COMPRESS_PID" 2> /dev/null || true
+            while compressing && [ $(( $(date +%s) - start )) -lt 60 ]; do
+              pkill -KILL -s "$COMPRESS_PID" 2> /dev/null || true
+              sleep 1
+            done
+          }
+          trap '[ -e "$WORKDIR/prefix.cleared" ] || stop_compression' EXIT
           WAIT_START=$(date +%s)
           until [ -s "$WORKDIR/old-output.status" ]; do
             if [ $(( $(date +%s) - WAIT_START )) -gt 3600 ]; then
@@ -805,20 +1047,21 @@ jobs:
           fi
           df -h "$WORKDIR"
 
-          # Compress the new index alongside the diffs, whose long tail
-          # (planet/full) leaves most cores idle. It keeps the .bin files the
-          # diffs and verifies read; the compress step removes them. Each
-          # .zst and transport unit streams to this date's (cleared) Tigris
-          # prefix as soon as it exists: the upload is network-bound, so it
-          # hides behind the compression. Finalize uploads whatever is still
-          # missing.
+          # This date's prefix is cleared and written from here on. The
+          # strategy-2 sidecars (*.osm_ids, tomorrow's --prev-output) are final
+          # since build-index exited: up now, rather than in Finalize's first
+          # pass, which waits for sidecars.status. Its session, for Compress
+          # index files or Finalize to end should it outlast their wait for it.
+          # Then compression's uploads go, held back until now.
           $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
-          nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
-            --transport-bin "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" \
-            --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" \
-            --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" \
-            > "$WORKDIR/compress.log" 2>&1 < /dev/null &
-          COMPRESS_PID=$!
+          find "$WORKDIR/output" -name '*.osm_ids' -printf "cp %p s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/%P\n" > "$WORKDIR/sidecars.run"
+          # The inner script expands its own arguments ($0 is the status file).
+          # shellcheck disable=SC2016
+          setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/sidecars.status" \
+            s5cmd --endpoint-url "$S3_ENDPOINT" --retry-count 10 --numworkers 16 run "$WORKDIR/sidecars.run" \
+            > "$WORKDIR/sidecars.log" 2>&1 < /dev/null &
+          echo "$!" > "$WORKDIR/sidecars.pid"
+          touch "$WORKDIR/prefix.cleared"
 
           # Patch generation runs against uncompressed .bin files (old was
           # decompressed as it came down, new was just built).
@@ -833,13 +1076,32 @@ jobs:
           RESULTS_DIR="$WORKDIR/results"
           VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
 
+          # Until its status is written the place search runs beside the patch
+          # jobs: its indexes, their scratch and (through the compressor) their
+          # .zst may still land on the volume, ~16 GB of writes on a planet
+          # night scratch included, and its builds hold a few GiB of memory
+          # (72 GiB of diff estimates then admit 66). The status is read before
+          # the files below are counted: one written during the count would
+          # leave files it missed.
+          SEARCH_RESERVE_KIB=0
+          MEM_RESERVE_KIB=0
+          if ! [ -s "$WORKDIR/place-search.status" ]; then
+            SEARCH_RESERVE_KIB=$((16 * 1024 * 1024))
+            MEM_RESERVE_KIB=$((6 * 1024 * 1024))
+          fi
           # The compressor writes into the volume the diffs and verifies use
           # for scratch: at most the bytes of the files it compresses (every
-          # .bin, the load sidecars, the search indexes). The patch jobs leave
-          # that much of the free space alone.
-          RESERVE_KIB=$(find "$WORKDIR/output" -type f \
-            \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -path '*/search/*' \) \
-            ! -name '*.zst' -printf '%s\n' | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}')
+          # .bin, the load sidecars, the search indexes), none once it has
+          # ended (what it wrote has left the free space then). The patch jobs
+          # leave that much of the free space alone, with what the place search
+          # may still write.
+          RESERVE_KIB=0
+          if compressing; then
+            RESERVE_KIB=$(find "$WORKDIR/output" -type f \
+              \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -path '*/search/*' \) \
+              ! -name '*.zst' -printf '%s\n' | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}')
+          fi
+          RESERVE_KIB=$((RESERVE_KIB + SEARCH_RESERVE_KIB))
 
           # Per variant: diff, apply to a scratch copy, verify the whole client
           # file set (JSON included, no extra files). Jobs are admitted by
@@ -848,6 +1110,7 @@ jobs:
           # A script abort leaves variants without results; the collector
           # counts those as CRASH, so patches are dropped but data still uploads.
           GEOCODER_PATCH_SCRATCH_RESERVE_KIB="$RESERVE_KIB" \
+          GEOCODER_PATCH_MEM_RESERVE_KIB="$MEM_RESERVE_KIB" \
             "$GITHUB_WORKSPACE/geocoder/builder/tools/generate_patches.sh" \
             "$WORKDIR/old-output" "$WORKDIR/output" "$RESULTS_DIR" "$WORKDIR/diff-logs" \
             || echo "::error::generate_patches.sh exited $?"
@@ -930,18 +1193,51 @@ jobs:
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           NEW_DATE: ${{ steps.setup.outputs.today }}
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
           # Patch generation compresses alongside its diffs; a fresh build
           # (or a failed background run) compresses here, streaming the
-          # upload the same way.
+          # upload the same way: on a fresh night from build-index's exit
+          # too, beside the place search (this step follows it at once).
           if [ -f "$WORKDIR/compress.done" ]; then
             echo "Compressed during patch generation"
           else
             COMPRESS_START=$(date +%s)
+            # After a failed background run, the sidecars' upload it started
+            # ends before the prefix is cleared, then starts again. One still
+            # running after 15 minutes is stopped, its session and all, and
+            # gone (a zombie aside) first: it would otherwise write its status
+            # over the new upload's.
+            if [ -f "$WORKDIR/sidecars.run" ]; then
+              until [ -s "$WORKDIR/sidecars.status" ] || [ $(( $(date +%s) - COMPRESS_START )) -gt 900 ]; do sleep 2; done
+              SESSION=$(cat "$WORKDIR/sidecars.pid" 2> /dev/null || true)
+              if ! [ -s "$WORKDIR/sidecars.status" ] && [ -n "$SESSION" ]; then
+                echo "::warning::The sidecars' upload is still running after 15 minutes; stopping it"
+                pkill -KILL -s "$SESSION" 2> /dev/null || true
+                WAIT_START=$(date +%s)
+                while ps -o stat= -s "$SESSION" | grep -q '^[^Z]' && [ $(( $(date +%s) - WAIT_START )) -lt 60 ]; do sleep 1; done
+              fi
+            fi
             s5cmd --endpoint-url "$S3_ENDPOINT" --numworkers 32 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
+            # The strategy-2 sidecars, as the patch step uploads them.
+            rm -f "$WORKDIR/sidecars.status"
+            find "$WORKDIR/output" -name '*.osm_ids' -printf "cp %p s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/%P\n" > "$WORKDIR/sidecars.run"
+            # The inner script expands its own arguments ($0 is the status file).
+            # shellcheck disable=SC2016
+            setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/sidecars.status" \
+              s5cmd --endpoint-url "$S3_ENDPOINT" --retry-count 10 --numworkers 16 run "$WORKDIR/sidecars.run" \
+              > "$WORKDIR/sidecars.log" 2>&1 < /dev/null &
+            echo "$!" > "$WORKDIR/sidecars.pid"
+            # geocoder-transport, which encodes the units, comes from the place
+            # search build.
+            until [ -s "$RUNNER_TEMP/search.status" ] || [ $(( $(date +%s) - COMPRESS_START )) -gt 1800 ]; do sleep 5; done
+            # A compression run again rewrites the .zst: their checksums too, and
+            # what it takes the place search's files on.
+            rm -f "$WORKDIR/zst.sha256" "$WORKDIR/place-search.taken"
             COMPRESS_RC=0
-            python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
+            nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
               --transport-bin "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" \
+              --late-search "$WORKDIR/place-search.status" --late-search-taken "$WORKDIR/place-search.taken" \
               --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" \
               --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" || COMPRESS_RC=$?
             # 3: done, but a transport unit failed and its files went as .zst.
@@ -952,6 +1248,33 @@ jobs:
               exit "$COMPRESS_RC"
             fi
             echo "Compression done in $(($(date +%s) - COMPRESS_START))s"
+            # The .zst are final: their checksums for Finalize.
+            "$GITHUB_WORKSPACE/geocoder/builder/tools/checksums.sh" zst "$WORKDIR/output" > "$WORKDIR/zst.sha256.part" \
+              && mv "$WORKDIR/zst.sha256.part" "$WORKDIR/zst.sha256"
+          fi
+          # The place search ran beside compression, which waited for its
+          # status: a failed or stopped build left no index, and fails the run
+          # at its end (Fail run on place search index failure). What counts is
+          # the status compression took its files on (place-search.taken),
+          # "none" when it stopped waiting and left them out: a status written
+          # since came too late for them.
+          cat "$WORKDIR/place-search.log" 2> /dev/null || true
+          SEARCH_STATUS=$(cat "$WORKDIR/place-search.taken" 2> /dev/null || true)
+          if [ "$SEARCH_STATUS" != 0 ]; then
+            if [ -z "$SEARCH_STATUS" ] || [ "$SEARCH_STATUS" = none ]; then
+              # Its files were left out: what it still runs ends here, and is
+              # gone (a zombie aside) before its indexes go.
+              SESSION=$(cat "$WORKDIR/place-search.pid" 2> /dev/null || true)
+              if [ -n "$SESSION" ]; then
+                pkill -KILL -s "$SESSION" 2> /dev/null || true
+                WAIT_START=$(date +%s)
+                while ps -o stat= -s "$SESSION" | grep -q '^[^Z]' && [ $(( $(date +%s) - WAIT_START )) -lt 60 ]; do sleep 1; done
+              fi
+              rm -rf "$WORKDIR"/output/*/search
+              SEARCH_STATUS=none
+            fi
+            echo "::error::The place search indexes failed (status $SEARCH_STATUS): no index of a failed one is published"
+            echo "SEARCH_INDEX_FAILED=1" >> "$GITHUB_ENV"
           fi
           find "$WORKDIR/output" -name "*.bin" -delete
           # The place search index files, but for search_meta.json, which
@@ -969,6 +1292,7 @@ jobs:
           OLD_DATE: ${{ steps.setup.outputs.yesterday }}
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
           WIKIDATA_DATE: ${{ steps.download.outputs.wikidata_date || 'null' }}
+          PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
 
@@ -983,7 +1307,23 @@ jobs:
           # mapping that the next build's IdAllocator reads as
           # --prev-output. Clients never read them. The cleanup step
           # further down ages them out at the same rate as full builds
-          # (3 days).
+          # (3 days). They went up beside compression (sidecars.status);
+          # the pass below sends them only if that failed. One still running
+          # after 15 minutes is stopped, its session and all, and gone (a
+          # zombie aside) before the pass below sends the same keys.
+          if [ -f "$WORKDIR/sidecars.run" ]; then
+            until [ -s "$WORKDIR/sidecars.status" ] || [ $(( $(date +%s) - UPLOAD_START )) -gt 900 ]; do sleep 2; done
+            SESSION=$(cat "$WORKDIR/sidecars.pid" 2> /dev/null || true)
+            if ! [ -s "$WORKDIR/sidecars.status" ] && [ -n "$SESSION" ]; then
+              pkill -KILL -s "$SESSION" 2> /dev/null || true
+              WAIT_START=$(date +%s)
+              while ps -o stat= -s "$SESSION" | grep -q '^[^Z]' && [ $(( $(date +%s) - WAIT_START )) -lt 60 ]; do sleep 1; done
+            fi
+            if [ "$(cat "$WORKDIR/sidecars.status" 2> /dev/null)" != 0 ]; then
+              echo "::warning::The sidecars' upload beside compression failed or was still running after 15 minutes (stopped); the pass below sends them"
+              tail -20 "$WORKDIR/sidecars.log" || true
+            fi
+          fi
           # The .zst files streamed up during compression (the prefix was
           # cleared then): only what is missing or differs in size goes now.
           # The runner's ~1 Gbit/s link caps the rate; 16 workers reach it.
@@ -1012,9 +1352,19 @@ jobs:
           # hashes for server-side verification after decompression, while
           # this checksums.sha256 holds the on-wire hashes (compressed).
           echo "Generating checksums..."
-          # Hashed on every core (~35 GB), listed in path order.
-          (cd "$WORKDIR/output" && find . -type f \( -name "*.zst" -o -name "*.gcpatch" -o -name "*.json" \) -print0 \
-            | xargs -0 -P "$(nproc)" -n 8 sha256sum | sort -k2) > "$WORKDIR/output/checksums.sha256"
+          # The .zst were hashed when compression ended ($WORKDIR/zst.sha256,
+          # hashed here when missing); the patches and JSON now, configurations.json
+          # after the splice above. checksums.sh refuses .zst lines that don't
+          # name the .zst files there, and a configurations.json line that
+          # isn't its hash; the .zst are then hashed again.
+          if ! [ -s "$WORKDIR/zst.sha256" ]; then
+            "$GITHUB_WORKSPACE/geocoder/builder/tools/checksums.sh" zst "$WORKDIR/output" > "$WORKDIR/zst.sha256"
+          fi
+          if ! "$GITHUB_WORKSPACE/geocoder/builder/tools/checksums.sh" all "$WORKDIR/output" "$WORKDIR/zst.sha256" > "$WORKDIR/output/checksums.sha256"; then
+            echo "::warning::The .zst checksums taken when compression ended don't hold; hashing the .zst again"
+            "$GITHUB_WORKSPACE/geocoder/builder/tools/checksums.sh" zst "$WORKDIR/output" > "$WORKDIR/zst.sha256"
+            "$GITHUB_WORKSPACE/geocoder/builder/tools/checksums.sh" all "$WORKDIR/output" "$WORKDIR/zst.sha256" > "$WORKDIR/output/checksums.sha256"
+          fi
           echo "$(wc -l < "$WORKDIR/output/checksums.sha256") file checksums generated"
 
           # Upload configurations.json + checksums (index files + patches
@@ -1130,15 +1480,67 @@ jobs:
           echo "Upload complete."
 
           # Today's PBF went to the cache beside the build (tomorrow's run
-          # starts from it): let it finish before the job frees the disk.
-          if [ -f "$WORKDIR/pbf-cache.log" ]; then
+          # starts from it): on a live run, let it finish before the job frees
+          # the disk. A scratch run's, under its own key, is Cleanup old cache
+          # bucket's to wait for, at most 30 minutes, then stop and delete;
+          # the PBF leaves the disk under it (the copy reads the file it
+          # opened).
+          if [ -f "$WORKDIR/pbf-cache.log" ] && [ "$PBF_CACHE" = geocoder-cache ]; then
             until [ -s "$WORKDIR/pbf-cache.status" ]; do sleep 10; done
+            echo "Caching today's PBF ended at $(date -u -r "$WORKDIR/pbf-cache.status" +%H:%M:%S)"
             if [ "$(cat "$WORKDIR/pbf-cache.status")" != 0 ]; then
               echo "::warning::Caching today's PBF failed; tomorrow downloads it from a mirror"
               cat "$WORKDIR/pbf-cache.log"
             fi
           fi
           rm -f "$WORKDIR/planet.osm.pbf"
+
+      # For Report to o11y's token. A failed install doesn't fail the run:
+      # the report then warns and sends nothing.
+      - name: Install 1Password CLI
+        if: always() && github.ref == 'refs/heads/main' && env.S3_PREFIX == 'geocoder'
+        continue-on-error: true
+        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
+
+      # What only this runner has, to FUTO o11y, whatever the outcome (see
+      # geocoder/README.md, Monitoring): build phases, memory, verify counts,
+      # patch and index sizes and the logs. The run's outcome comes from the
+      # watchdog, which also sees runs whose runner died before this step.
+      # Reporting never fails the run. Only main's live runs (the schedule
+      # and the watchdog's retries): a test dispatch from another branch, or
+      # under a scratch s3_prefix, isn't the nightly. The token is read here
+      # and handed to the report alone, so no other step can see it.
+      # Everything it reads is final once Finalize ends, so it runs beside
+      # the cleanups and the artifacts after it, detached so it outlives this
+      # step; Wait for the o11y report, the job's last step, collects it.
+      - name: Report to o11y
+        if: always() && github.ref == 'refs/heads/main' && env.S3_PREFIX == 'geocoder'
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
+          BUILD_DATE: ${{ steps.setup.outputs.today }}
+          DATA_TIMESTAMP: ${{ steps.setup.outputs.data_timestamp }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          # The `if:` compares without case: a dispatch under Geocoder, which
+          # Setup refuses, passes it too.
+          [ "$S3_PREFIX" = geocoder ] || exit 0
+          if ! token=$(op read "op://tf_prod/O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD/password"); then
+            echo "::warning::Could not read the o11y token from 1Password; reporting nothing"
+            exit 0
+          fi
+          echo "::add-mask::$token"
+          # The inner script expands its own arguments ($0 is the status file).
+          # shellcheck disable=SC2016
+          O11Y_TOKEN="$token" setsid nohup bash -c '"$@"; echo $? > "$0"' "$RUNNER_TEMP/o11y.status" \
+            timeout 240 python3 geocoder/builder/tools/o11y_report.py nightly --base-url "$O11Y_URL" \
+            --build-log "$WORKDIR/build.log" --memwatch-log "$WORKDIR/memwatch.log" \
+            --results-dir "$WORKDIR/results" --output-dir "$WORKDIR/output" \
+            --build-date "$BUILD_DATE" --data-timestamp "$DATA_TIMESTAMP" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            > "$RUNNER_TEMP/o11y.log" 2>&1 < /dev/null &
 
       # ── Cleanup old Tigris builds ──────────────────────────────────────
       # Retention policy:
@@ -1222,30 +1624,70 @@ jobs:
       # (geocoder-cache/planet-<DATE>.osm.pbf); the download step only ever
       # reads today's and yesterday's. Pruning goes by date alone, so it runs
       # after a failed build too: a run that fails once it has cached its
-      # PBF would otherwise leave ~99 GB behind each day.
+      # PBF would otherwise leave ~99 GB behind each day. A scratch prefix's
+      # run deletes its own key instead (Setup's pbf_cache), once its upload
+      # has ended or been stopped, and leaves the shared PBFs as they are.
+      # Either aborts the bucket's multipart uploads begun over a day ago (a
+      # stopped upload's parts among them): no run lasts a day, so none is a
+      # running upload's, and a runner only scratch runs use is cleaned too.
+      # A scratch run cancelled before here leaves its key to the next live
+      # run, whose cleanup deletes what the scratch keys hold from over a day
+      # ago.
       - name: Cleanup old cache bucket
         if: ${{ !cancelled() && steps.setup.outputs.cache_bucket != '' }}
         env:
           CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
           CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
           NEW_DATE: ${{ steps.setup.outputs.today }}
+          PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
         run: |
           set -eu
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
 
-          # Every planet-*.osm.pbf not dated from the cutoff on goes, an
-          # undated name too.
-          PBF_CUTOFF=$(date -u -d "$NEW_DATE -${KEEP_CACHE_PBF_DAYS} days +1 day" +%Y-%m-%d)
-          echo "Cache PBFs: keep ≥ $PBF_CUTOFF"
-          for name in $($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/planet-*.osm.pbf" 2>/dev/null | awk '{print $NF}'); do
-            d=$(echo "$name" | sed -n -E 's/^planet-([0-9]{4}-[0-9]{2}-[0-9]{2})\.osm\.pbf$/\1/p')
-            if [ -n "$d" ] && { [ "$d" \> "$PBF_CUTOFF" ] || [ "$d" = "$PBF_CUTOFF" ]; }; then
-              echo "  $name: KEEP"
-            else
-              echo "  $name: DELETE"
-              $CACHE rm "s3://$CACHE_BUCKET/geocoder-cache/$name" >/dev/null 2>&1 || true
+          if [ "$PBF_CACHE" != geocoder-cache ]; then
+            # The PBF's upload ends first, or a copy that finished after the
+            # delete would put the PBF back: up to 30 minutes, then it is
+            # stopped, its session and all, and gone before the delete.
+            if [ -f "$WORKDIR/pbf-cache.log" ]; then
+              for _ in $(seq 180); do
+                [ -s "$WORKDIR/pbf-cache.status" ] && break
+                sleep 10
+              done
+              UPLOAD=$(cat "$WORKDIR/pbf-cache.pid" 2> /dev/null || true)
+              if ! [ -s "$WORKDIR/pbf-cache.status" ] && [ -n "$UPLOAD" ]; then
+                echo "::warning::The scratch PBF's upload is still running after 30 minutes; stopping it"
+                pkill -KILL -s "$UPLOAD" 2> /dev/null || true
+                for _ in $(seq 60); do
+                  pgrep -s "$UPLOAD" > /dev/null || break
+                  sleep 1
+                done
+              fi
             fi
-          done
+            echo "Scratch PBF cache: deleting $PBF_CACHE"
+            $CACHE rm "s3://$CACHE_BUCKET/$PBF_CACHE/*" > /dev/null 2>&1 || true
+          else
+            # Every planet-*.osm.pbf not dated from the cutoff on goes, an
+            # undated name too.
+            PBF_CUTOFF=$(date -u -d "$NEW_DATE -${KEEP_CACHE_PBF_DAYS} days +1 day" +%Y-%m-%d)
+            echo "Cache PBFs: keep ≥ $PBF_CUTOFF"
+            for name in $($CACHE ls "s3://$CACHE_BUCKET/$PBF_CACHE/planet-*.osm.pbf" 2>/dev/null | awk '{print $NF}'); do
+              d=$(echo "$name" | sed -n -E 's/^planet-([0-9]{4}-[0-9]{2}-[0-9]{2})\.osm\.pbf$/\1/p')
+              if [ -n "$d" ] && { [ "$d" \> "$PBF_CUTOFF" ] || [ "$d" = "$PBF_CUTOFF" ]; }; then
+                echo "  $name: KEEP"
+              else
+                echo "  $name: DELETE"
+                $CACHE rm "s3://$CACHE_BUCKET/$PBF_CACHE/$name" >/dev/null 2>&1 || true
+              fi
+            done
+            # What scratch runs cancelled before their own cleanup left under
+            # their keys more than a day ago (no run lasts one).
+            STALE=$(date -u -d '1 day ago' '+%Y/%m/%d %H:%M:%S')
+            for name in $($CACHE ls "s3://$CACHE_BUCKET/geocoder-scratch/*" 2>/dev/null | awk -v stale="$STALE" '$1 " " $2 < stale {print $NF}'); do
+              echo "  geocoder-scratch/$name: DELETE"
+              $CACHE rm "s3://$CACHE_BUCKET/geocoder-scratch/$name" >/dev/null 2>&1 || true
+            done
+          fi
 
           env AWS_ACCESS_KEY_ID="$CACHE_AWS_KEY" AWS_SECRET_ACCESS_KEY="$CACHE_AWS_SECRET" \
             python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/abort_stale_uploads.py" "$CACHE_ENDPOINT" "$CACHE_BUCKET" us-east-1 \
@@ -1270,6 +1712,23 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      # The job sampler's samples and the background jobs' logs: the tools
+      # and their unit tests, the place search build and indexes, and
+      # compression, one line an item.
+      - name: Upload job logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: job-logs
+          path: |
+            ${{ runner.temp }}/jobstat.log
+            ${{ runner.temp }}/tools.log
+            ${{ runner.temp }}/search.log
+            ${{ runner.temp }}/geocoder/place-search.log
+            ${{ runner.temp }}/geocoder/compress.log
+          if-no-files-found: ignore
+          retention-days: 7
+
       # Fail the run at the very end if patch verify reported failures
       # earlier. This lets compress + upload run first so the dated
       # build + individual file-level mismatch reports are all uploaded
@@ -1277,7 +1736,7 @@ jobs:
       - name: Fail run on place search index failure
         if: env.SEARCH_INDEX_FAILED == '1'
         run: |
-          echo "::error::Place search indexes failed — see Build place search indexes"
+          echo "::error::Place search indexes failed — see place-search.log in Compress index files"
           exit 1
 
       - name: Fail run on patch verify failure
@@ -1295,38 +1754,18 @@ jobs:
           echo "::error::A transport unit failed; its files were published as .zst — see Compress index files (or compress.log of Generate patches and verify)"
           exit 1
 
-      # For Report to o11y's token. A failed install doesn't fail the run:
-      # the report then warns and sends nothing.
-      - name: Install 1Password CLI
-        if: always() && github.ref == 'refs/heads/main'
-        continue-on-error: true
-        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
-
-      # What only this runner has, to FUTO o11y, whatever the outcome (see
-      # geocoder/README.md, Monitoring): build phases, memory, verify counts,
-      # patch and index sizes and the logs. The run's outcome comes from the
-      # watchdog, which also sees runs whose runner died before this step.
-      # Reporting never fails the run. Only main's runs (the schedule and
-      # the watchdog's retries): a test dispatch from another branch isn't
-      # the nightly. The token is read here and handed to the report alone,
-      # so no other step can see it.
-      - name: Report to o11y
-        if: always() && github.ref == 'refs/heads/main'
+      # The report Report to o11y started beside the steps since: the runner
+      # ends what a job leaves running, so the job's last step waits for it.
+      - name: Wait for the o11y report
+        if: always() && github.ref == 'refs/heads/main' && env.S3_PREFIX == 'geocoder'
         continue-on-error: true
         timeout-minutes: 5
         env:
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
-          WORKDIR: ${{ steps.setup.outputs.workdir }}
-          BUILD_DATE: ${{ steps.setup.outputs.today }}
-          DATA_TIMESTAMP: ${{ steps.setup.outputs.data_timestamp }}
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
-          if ! token=$(op read "op://tf_prod/O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD/password"); then
-            echo "::warning::Could not read the o11y token from 1Password; reporting nothing"
-            exit 0
-          fi
-          echo "::add-mask::$token"
-          O11Y_TOKEN="$token" python3 geocoder/builder/tools/o11y_report.py nightly --base-url "$O11Y_URL" \
-            --build-log "$WORKDIR/build.log" --memwatch-log "$WORKDIR/memwatch.log" \
-            --results-dir "$WORKDIR/results" --output-dir "$WORKDIR/output" \
-            --build-date "$BUILD_DATE" --data-timestamp "$DATA_TIMESTAMP" \
-            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          # None started: Report to o11y had no token.
+          [ -f "$RUNNER_TEMP/o11y.log" ] || exit 0
+          WAIT_START=$(date +%s)
+          until [ -s "$RUNNER_TEMP/o11y.status" ] || [ $(( $(date +%s) - WAIT_START )) -gt 270 ]; do sleep 1; done
+          echo "Waited $(( $(date +%s) - WAIT_START ))s for the o11y report (exit status $(cat "$RUNNER_TEMP/o11y.status" 2> /dev/null || echo none))"
+          cat "$RUNNER_TEMP/o11y.log"
