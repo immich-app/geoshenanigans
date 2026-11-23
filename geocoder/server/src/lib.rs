@@ -3780,6 +3780,24 @@ impl MultiIndex {
         self.continents.iter().filter(|c| c.index.load().is_some()).count()
     }
 
+    /// The credit of the data the loaded datasets hold (dir_credits), each source once, in the
+    /// order the datasets list them; none where none is loaded.
+    pub fn credits(&self) -> Vec<serde_json::Value> {
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for slot in self.continents.iter().filter(|c| c.index.load().is_some()) {
+            let dir = match slot.continent {
+                None => self.root_dir.clone(),
+                Some(_) => format!("{}/{}", self.root_dir, slot.name),
+            };
+            for entry in dir_credits(&dir) {
+                if !out.iter().any(|e| e["id"] == entry["id"]) {
+                    out.push(entry);
+                }
+            }
+        }
+        out
+    }
+
     /// A point off the globe is in no slot: S2 would wrap it onto a cell of the globe.
     fn covers(&self, slot: &ContinentSlot, lat: f64, lng: f64) -> bool {
         coords_in_range(lat, lng) && slot.continent.map_or(true, |c| c.covers_query(lat, lng, self.admin_cell_level))
@@ -5400,6 +5418,80 @@ impl Serialize for Licence {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(OSM_LICENCE)
     }
+}
+
+/// OpenStreetMap's entry of the builder's credits (builder/src/attribution.h kAttribution), the
+/// credit of a dataset whose dir holds no attribution.json.
+pub fn osm_credit() -> serde_json::Value {
+    serde_json::json!({
+        "id": "osm",
+        "text": "© OpenStreetMap contributors",
+        "url": "https://www.openstreetmap.org/copyright",
+        "licence": "ODbL 1.0",
+        "licence_url": "https://opendatacommons.org/licenses/odbl/1-0/",
+        "notices": ["This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0."],
+    })
+}
+
+/// The credit of the data in dataset dir `dir`: the entries of its attribution.json and
+/// poi_attribution.json, as the builder writes them; OpenStreetMap's alone in place of an
+/// attribution.json the dir holds none of, or one that is no list.
+pub fn dir_credits(dir: &str) -> Vec<serde_json::Value> {
+    let read = |name: &str| -> Option<Vec<serde_json::Value>> {
+        serde_json::from_str(&std::fs::read_to_string(format!("{dir}/{name}")).ok()?).ok()
+    };
+    let mut credits = read("attribution.json").unwrap_or_else(|| vec![osm_credit()]);
+    credits.extend(read("poi_attribution.json").unwrap_or_default());
+    credits
+}
+
+/// `credits` as the test page shows them (main.rs /test/credits): a disclosure whose summary
+/// names each source, and a paragraph of each, its text linked to its URL and its licence to the
+/// licence's, then its notices, all as text. A URL of no http(s) scheme links nothing. No
+/// credits, no disclosure.
+pub fn credits_html(credits: &[serde_json::Value]) -> String {
+    fn escape(s: &str) -> String {
+        s.chars().fold(String::with_capacity(s.len()), |mut out, c| {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&#39;"),
+                _ => out.push(c),
+            }
+            out
+        })
+    }
+    fn link(url: &str, label: &str) -> String {
+        if url.starts_with("https://") || url.starts_with("http://") {
+            format!(r#"<a href="{}" target="_blank" rel="noopener">{}</a>"#, escape(url), escape(label))
+        } else {
+            escape(label)
+        }
+    }
+    if credits.is_empty() {
+        return String::new();
+    }
+    let field = |e: &serde_json::Value, key: &str| e[key].as_str().unwrap_or("").to_owned();
+    let names: Vec<String> = credits.iter().map(|e| escape(&field(e, "text"))).collect();
+    let mut out = format!("<details><summary>Data: {}</summary>\n", names.join(", "));
+    for e in credits {
+        out += "<p>";
+        out += &link(&field(e, "url"), &field(e, "text"));
+        let licence = field(e, "licence");
+        if !licence.is_empty() {
+            out += ", ";
+            out += &link(&field(e, "licence_url"), &licence);
+        }
+        out += ".";
+        for notice in e["notices"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) {
+            out += " ";
+            out += &escape(notice);
+        }
+        out += "</p>\n";
+    }
+    out + "</details>\n"
 }
 
 #[derive(Serialize, Default)]
@@ -7264,6 +7356,122 @@ mod query_path_tests {
     fn loaded_continents(root: &std::path::Path) -> Vec<&'static str> {
         let mi = MultiIndex::load(root.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
         mi.continents.iter().filter(|c| c.index.load().is_some()).map(|c| c.name).collect()
+    }
+
+    /// The template's credits (configurations.template.json `attribution`), each without its
+    /// `applies_to`: what the builder writes for each source.
+    fn template_credits() -> Vec<serde_json::Value> {
+        let template: serde_json::Value = serde_json::from_str(include_str!("../../builder/configurations.template.json")).unwrap();
+        template["attribution"].as_array().unwrap().iter()
+            .map(|e| {
+                let mut e = e.clone();
+                e.as_object_mut().unwrap().remove("applies_to");
+                e
+            })
+            .collect()
+    }
+
+    /// The ids of `credits`, in order.
+    fn ids(credits: &[serde_json::Value]) -> Vec<&str> {
+        credits.iter().map(|e| e["id"].as_str().unwrap()).collect()
+    }
+
+    // A server credits the data of the datasets it loaded, as their dirs credit it: each
+    // source once. Europe's dataset holds OpenStreetMap's data and GeoNames's, and Wikidata
+    // ranked its POIs; Asia's of a build before attribution.json, OpenStreetMap's alone. A
+    // dataset whose credit names no GeoNames gives none; one of a minimal selection, of
+    // OpenStreetMap alone, OpenStreetMap's.
+    #[test]
+    fn a_server_credits_the_sources_of_the_datasets_it_loaded() {
+        let template = template_credits();
+        let entry = |id: &str| template.iter().find(|e| e["id"] == id).unwrap().clone();
+        let write = |dir: &std::path::Path, name: &str, entries: &[&str]| {
+            std::fs::write(dir.join(name), serde_json::to_string(&entries.iter().map(|&id| entry(id)).collect::<Vec<_>>()).unwrap()).unwrap();
+        };
+        let load = |root: &std::path::Path| {
+            MultiIndex::load(root.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap()
+        };
+
+        let root = two_continents();
+        write(&root.path().join("europe"), "attribution.json", &["osm", "geonames", "codepoint-open"]);
+        write(&root.path().join("europe"), "poi_attribution.json", &["wikidata"]);
+        let credits = load(root.path()).credits();
+        assert_eq!(ids(&credits), ["osm", "geonames", "codepoint-open", "wikidata"]);
+        // Asia's, first, of no file.
+        assert_eq!(credits[0], osm_credit());
+        assert_eq!(credits[1], entry("geonames"));
+
+        for (written, want) in [(vec!["osm", "tiger"], vec!["osm", "tiger"]), (vec!["osm"], vec!["osm"]), (vec![], vec!["osm"])] {
+            let flat = ScratchDir::new();
+            oldtown().write(flat.path());
+            if !written.is_empty() {
+                write(flat.path(), "attribution.json", &written);
+            }
+            let credits = load(flat.path()).credits();
+            assert_eq!(ids(&credits), want, "{written:?}");
+            assert_eq!(credits[0], entry("osm"));
+        }
+    }
+
+    // A dataset of no attribution.json is OpenStreetMap's data: its credit is the builder's
+    // OpenStreetMap entry, the template's.
+    #[test]
+    fn the_credit_of_a_dataset_of_no_attribution_file_is_the_templates_osm_entry() {
+        assert_eq!(osm_credit(), template_credits()[0]);
+    }
+
+    /// Each paragraph of `html`: the hrefs of its links, and its text, tags left out and
+    /// entities decoded.
+    fn paragraphs(html: &str) -> Vec<(Vec<String>, String)> {
+        let decode = |s: &str| s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&amp;", "&");
+        html.split("<p>").skip(1).map(|p| {
+            let p = &p[..p.find("</p>").unwrap()];
+            let hrefs = p.split("href=\"").skip(1).map(|h| decode(&h[..h.find('"').unwrap()])).collect();
+            let mut text = String::new();
+            let mut in_tag = false;
+            for c in p.chars() {
+                match c {
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    _ if !in_tag => text.push(c),
+                    _ => {}
+                }
+            }
+            (hrefs, decode(&text))
+        }).collect()
+    }
+
+    // The test page's credits: a paragraph a source, its URL and its licence's the hrefs of
+    // its links, its text, licence and notices its text. Text is text, whatever it holds, and
+    // a URL of another scheme than http(s) links nothing.
+    #[test]
+    fn the_test_pages_credits_link_each_source_and_its_licence_and_give_its_notices() {
+        let credits = template_credits();
+        let html = credits_html(&credits);
+        let names: Vec<&str> = credits.iter().map(|e| e["text"].as_str().unwrap()).collect();
+        assert!(html.starts_with(&format!("<details><summary>Data: {}</summary>", names.join(", ").replace('&', "&amp;"))), "{html}");
+        let found = paragraphs(&html);
+        assert_eq!(found.len(), credits.len());
+        for (entry, (hrefs, text)) in credits.iter().zip(&found) {
+            let mut links = vec![entry["url"].as_str().unwrap()];
+            links.extend(entry["licence_url"].as_str());
+            assert_eq!(hrefs, &links, "{}", entry["id"]);
+            for field in ["text", "licence"] {
+                assert!(text.contains(entry[field].as_str().unwrap()), "{} {field}: {text}", entry["id"]);
+            }
+            for notice in entry["notices"].as_array().unwrap() {
+                assert!(text.contains(notice.as_str().unwrap()), "{}: {text}", entry["id"]);
+            }
+        }
+
+        let hostile = serde_json::json!([{"id": "x", "text": "<b>X</b> & Co", "url": "javascript:alert(1)",
+                                          "licence": "L", "licence_url": "https://l.example/?a=1&b=\"2\"",
+                                          "notices": ["<script>alert(1)</script> 'q'"]}]);
+        let html = credits_html(hostile.as_array().unwrap());
+        assert!(!html.contains("<script>") && !html.contains("<b>") && !html.contains("javascript:"), "{html}");
+        assert_eq!(paragraphs(&html), [(vec![r#"https://l.example/?a=1&b="2""#.to_owned()],
+                                         "<b>X</b> & Co, L. <script>alert(1)</script> 'q'".to_owned())]);
+        assert_eq!(credits_html(&[]), "");
     }
 
     // A dir holding the downloader's ledger but no stamp is one whose

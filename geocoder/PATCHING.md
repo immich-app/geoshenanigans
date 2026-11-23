@@ -324,7 +324,9 @@ The data is owed credit, and the dataset carries it in two places:
   tier's `optional_files`.
 
 A client shows the entries of the `attribution.json` and
-`poi_attribution.json` it holds wherever it credits map data. Every reverse answer also carries Nominatim's `licence`
+`poi_attribution.json` it holds wherever it credits map data; the test
+portal's page shows those of the datasets its servers loaded
+(`/test/credits`). Every reverse answer also carries Nominatim's `licence`
 string (README.md).
 
 ## Client Decision Tree

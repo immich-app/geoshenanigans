@@ -197,6 +197,16 @@ async fn test_portal() -> impl IntoResponse {
     )
 }
 
+// The credit of the data this server answers from, as the test page shows
+// it: the loaded datasets' attribution.json and poi_attribution.json
+// (credits_html), read-only and unauthenticated, as the page is.
+async fn test_credits(index: axum::extract::Extension<Arc<MultiIndex>>) -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        credits_html(&index.credits()),
+    )
+}
+
 async fn get_configuration(
     Query(params): Query<KeyParam>,
     headers: axum::http::HeaderMap,
@@ -368,6 +378,7 @@ async fn async_main() {
         .route("/reverse", get(reverse_geocode))
         .route("/polygons", get(polygons_geojson))
         .route("/test", get(test_portal))
+        .route("/test/credits", get(test_credits))
         .route("/admin/configuration", get(get_configuration).put(put_configuration))
         .merge(auth::router())
         .layer(axum::Extension(index))

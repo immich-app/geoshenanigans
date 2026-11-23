@@ -231,11 +231,10 @@
   }
   .detail-panel.visible { display: block; }
 
-  /* The credit of the data the answers come from: each source of the planet's full dataset and
-     its POI tier (configurations.template.json "attribution"), its licence and its notices. One
-     line until opened, then a box of at most 30vh that scrolls on its own and gives up room
-     where the sidebar has none, its summary line staying in sight, so on a short screen every
-     link of it stays reachable. */
+  /* The credit of the data the answers come from, as each server gives it from its datasets
+     (/test/credits): each source, its licence and its notices. One line until opened, then a
+     box of at most 30vh that scrolls on its own and gives up room where the sidebar has none,
+     its summary line staying in sight. */
   .data-credit {
     flex: 0 1 auto;
     min-height: 3em;
@@ -250,6 +249,7 @@
   .data-credit summary { cursor: pointer; position: sticky; top: 0; background: var(--bg); }
   .data-credit p { margin: 4px 0 0; }
   .data-credit a { color: var(--accent); }
+  .data-credit .credit-of { margin-top: 4px; text-transform: uppercase; letter-spacing: 0.08em; }
 
   .detail-panel h3 {
     font-size: 11px;
@@ -372,30 +372,11 @@
       <div id="detailContent"></div>
     </div>
 
-    <footer class="data-credit">
-      <details>
-      <summary>Data © OpenStreetMap contributors, GeoNames, Ordnance Survey, US Census Bureau, Wikidata</summary>
-      The answers come from the data of these sources.
+    <footer class="data-credit" id="dataCredit">
+      <details><summary>Data: © OpenStreetMap contributors</summary>
       <p><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a>,
         <a href="https://opendatacommons.org/licenses/odbl/1-0/" target="_blank" rel="noopener">ODbL 1.0</a>.
         This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0.</p>
-      <p><a href="https://www.geonames.org/" target="_blank" rel="noopener">GeoNames</a>,
-        <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>, for GB postcodes.
-        UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.
-        The Data is provided "as is" without warranty or any representation of accuracy, timeliness or completeness.
-        Changes: this dataset holds the coordinates of the GB postcodes of GB_full.csv.zip that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the file's other fields.</p>
-      <p><a href="https://www.ordnancesurvey.co.uk/products/code-point-open" target="_blank" rel="noopener">Ordnance Survey Code-Point Open</a>,
-        <a href="https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/" target="_blank" rel="noopener">OGL v3.0</a>.
-        GeoNames's GB_full.csv.zip is derived from Code-Point Open.
-        Contains Ordnance Survey data © Crown copyright and database right 2022.
-        Contains Royal Mail data © Royal Mail copyright and database right 2022.
-        Contains National Statistics data © Crown copyright and database right 2022.</p>
-      <p><a href="https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html" target="_blank" rel="noopener">US Census Bureau TIGER/Line</a>,
-        Public domain.
-        Address ranges and ZIP codes in the United States from the US Census Bureau's TIGER/Line files, which are in the public domain.</p>
-      <p><a href="https://www.wikidata.org/" target="_blank" rel="noopener">Wikidata</a>,
-        <a href="https://creativecommons.org/publicdomain/zero/1.0/" target="_blank" rel="noopener">CC0 1.0</a>.
-        POI importance from the sitelink counts of the POIs' Wikidata items; Wikidata's structured data is available under CC0 1.0.</p>
       </details>
     </footer>
   </div>
@@ -933,6 +914,7 @@ function toggleMinimal() {
     }
   }
   if (selectedId) showDetail(selectedId);
+  loadCredits();
 }
 function updateMinimalBtn() {
   const btn = document.getElementById('minimalBtn');
@@ -940,6 +922,23 @@ function updateMinimalBtn() {
   btn.textContent = 'Minimal: ' + (minimalEnabled ? 'On' : 'Off');
   btn.style.background = minimalEnabled ? 'var(--blue)' : 'var(--surface2)';
 }
+
+// -- Data credits --
+// The credit of the data the answers come from, as each server renders it
+// from the datasets it loaded (/test/credits: their attribution.json and
+// poi_attribution.json, OpenStreetMap's alone for one of none): this
+// server's, and the minimal server's beside it, each named, while its
+// answers show. The footer keeps OpenStreetMap's until this server answers.
+function loadCredits() {
+  const get = (base) => fetch(`${base}/test/credits`).then(r => r.ok ? r.text() : '').catch(() => '');
+  Promise.all([get(''), minimalEnabled ? get(MINIMAL_BASE_URL) : Promise.resolve('')]).then(([full, minimal]) => {
+    if (!full) return;
+    document.getElementById('dataCredit').innerHTML = minimal
+      ? `<div class="credit-of">This server</div>${full}<div class="credit-of">Minimal server</div>${minimal}`
+      : full;
+  });
+}
+loadCredits();
 // Run once on initial load so buttons reflect saved state.
 document.addEventListener('DOMContentLoaded', () => {
   updateNominatimBtn();

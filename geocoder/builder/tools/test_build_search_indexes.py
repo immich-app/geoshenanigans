@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Tests for build_search_indexes.py. Run: python3 -m unittest discover -s geocoder/builder/tools"""
+import html.parser
 import itertools
 import json
 import os
@@ -244,35 +245,78 @@ class TestPortalTest(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(run.stdout.strip(), str(load_template()["build"]["version"]))
 
-    # The page shows the answers of the planet's full dataset and its POI tier, whose attribution.json
-    # and poi_attribution.json list every source of the template, so its credit names each, in the
-    # template's order, with its licence and every notice of it: the GeoNames readme's warranty line
-    # too, a disclaimer CC BY 4.0 keeps a notice of.
-    def test_the_page_credits_every_source_of_the_template_with_its_notices(self):
+    @staticmethod
+    def credit_footer():
+        """The page's credit footer as html.parser reads it: its id, its paragraphs' text (tags
+        left out, entities decoded) and the hrefs of its links, in order."""
+        class Footer(html.parser.HTMLParser):
+            def __init__(self):
+                super().__init__(convert_charrefs=True)
+                self.depth, self.id, self.summary, self.paragraphs, self.hrefs, self.at = 0, None, "", [], [], None
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if tag == "footer" and "data-credit" in (attrs.get("class") or "").split():
+                    self.depth, self.id = 1, attrs.get("id")
+                elif self.depth:
+                    self.depth += tag not in ("br",)
+                    if tag == "summary":
+                        self.at = "summary"
+                    elif tag == "p":
+                        self.paragraphs.append("")
+                        self.at = "p"
+                    elif tag == "a" and "href" in attrs:
+                        self.hrefs.append(attrs["href"])
+
+            def handle_endtag(self, tag):
+                if self.depth:
+                    self.depth -= 1
+                    if tag in ("summary", "p"):
+                        self.at = None
+
+            def handle_data(self, data):
+                if self.at == "summary":
+                    self.summary += data
+                elif self.at == "p":
+                    self.paragraphs[-1] += data
+
         with open(os.path.join(PORTAL, "index.html"), encoding="utf-8") as f:
             page = f.read()
-        credit = re.findall(r'<footer class="data-credit">(.*?)</footer>', page, re.S)
-        self.assertEqual(len(credit), 1)
-        sources = re.findall(r"<p>(.*?)</p>", credit[0], re.S)
-        entries = load_template()["attribution"]
-        self.assertEqual(len(sources), len(entries))
-        for entry, source in zip(entries, sources):
-            for field in ("text", "url", "licence", "licence_url"):
-                if field in entry:
-                    self.assertIn(entry[field], source, (entry["id"], field))
-            for notice in entry["notices"]:
-                self.assertIn(notice, source, entry["id"])
+        footer = Footer()
+        footer.feed(page)
+        return footer, page
+
+    # The page credits the data of the answers it shows as each server gives it from the
+    # datasets it loaded (query-server's /test/credits, their attribution.json and
+    # poi_attribution.json, whose rendering the server's tests check): this server's, and the
+    # minimal server's beside it while its answers show. Until this server answers, the footer
+    # credits OpenStreetMap, the data of every dataset: its entry in the template, linked.
+    def test_the_page_credits_the_data_each_server_answers_from(self):
+        footer, page = self.credit_footer()
+        self.assertEqual(footer.id, "dataCredit")
+        osm = load_template()["attribution"][0]
+        self.assertEqual(osm["id"], "osm")
+        self.assertEqual(" ".join(footer.summary.split()), "Data: " + osm["text"])
+        self.assertEqual(footer.hrefs, [osm["url"], osm["licence_url"]])
+        self.assertEqual(len(footer.paragraphs), 1)
+        text = " ".join(footer.paragraphs[0].split())
+        for part in [osm["text"], osm["licence"]] + osm["notices"]:
+            self.assertIn(part, text)
+        script = re.findall(r"function loadCredits\(\) \{(.*?)\n\}", page, re.S)
+        self.assertEqual(len(script), 1)
+        self.assertIn("fetch(`${base}/test/credits`)", script[0])
+        self.assertIn("minimalEnabled ? get(MINIMAL_BASE_URL)", script[0])
+        self.assertIn("getElementById('dataCredit')", script[0])
+        toggle = re.findall(r"function toggleMinimal\(\) \{(.*?)\n\}", page, re.S)
+        self.assertEqual(len(toggle), 1)
+        self.assertIn("loadCredits();", toggle[0])
 
     # The credit is one line until opened, a summary of the sources, and opened it scrolls in a box
     # of bounded height that gives up room where the sidebar has none: on a short screen the results
     # keep their room and every link of the credit stays reachable.
     def test_the_page_keeps_its_credit_behind_a_summary_that_opens_a_bounded_box(self):
-        with open(os.path.join(PORTAL, "index.html"), encoding="utf-8") as f:
-            page = f.read()
-        credit = re.findall(r'<footer class="data-credit">(.*?)</footer>', page, re.S)
-        self.assertEqual(len(credit), 1)
-        self.assertRegex(credit[0], re.compile(r'^\s*<details>\s*<summary>[^<]+</summary>(?:(?!</?details).)*</details>\s*$',
-                                               re.S))
+        footer, page = self.credit_footer()
+        self.assertTrue(footer.summary)
         box = re.findall(r"\n  \.data-credit \{([^}]*)\}", page)
         self.assertEqual(len(box), 1)
         for rule in (r"flex: 0 1 auto;", r"max-height: \d+vh;", r"overflow-y: auto;"):
