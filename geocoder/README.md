@@ -112,17 +112,20 @@ ledger naming them or not; files of other names stay. A `water/` that is a link
 or a file fails the download before it writes anything: it writes nothing
 through a link, as the dir's lock guards only the continent dir. A fetch writes
 its file in `.fetching/` beside its place (the continent dir's, or `water/`'s),
-a dir of the downloader's own, which holds a `.downloader` file from when it is
-made, and renames it into place; a file at the name of one of the build's with
-`.tmp` after it (`water/admin_polygons.bin.tmp`, an operator's copy, say) is
-none of a download's, and stays. The dir names its build in `.build_date` once
+a dir of the downloader's own, which holds a `.downloader` file of the
+downloader's own text from when it is made, and renames it into place; a file
+at the name of one of the build's with `.tmp` after it
+(`water/admin_polygons.bin.tmp`, an operator's copy, say) is none of a
+download's, and stays. The dir names its build in `.build_date` once
 a whole selection of it is in and those are gone; a download that fetches or
 removes anything fails where a `.fetching` is a file, a link, or a dir holding
-files but no `.downloader` (an operator's, say), before it changes the ledger
-or the stamp; else it removes the stamp first, once it has made the ledger
-where the dir has none (a dir holding neither was laid out by hand, and a
-server loads it), then removes each `.fetching/`, with what killed fetches left
-there, and again once its last fetch is in. Before it reads the dir a download finishes what a
+files but no `.downloader` of the downloader's own text (an operator's, say; a
+`.downloader` holding only the start of that text, as a download killed while
+it wrote it leaves, is the downloader's only where it is all the dir holds),
+before it changes the ledger or the stamp; else it removes the stamp first,
+once it has made the ledger where the dir has none (a dir holding neither was
+laid out by hand, and a server loads it), then removes each `.fetching/`, with
+what killed fetches left there, and again once its last fetch is in. Before it reads the dir a download finishes what a
 transport decode killed part way left there and in `water/`, which the water
 dirs' units decode into (PATCHING.md): such a decode would otherwise put back
 the files it replaced once the download had listed the files to remove; one it
