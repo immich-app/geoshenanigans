@@ -16,7 +16,7 @@
 // addresses in cell order, whatever their names, and its postcode centroids
 // in cell order in each mode dir, which a chained build writes as a fresh one
 // does, and its postcode grid of a grid country's addresses in every mode dir
-// alike.
+// alike, which the server answers from before the nearest centroid.
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -1315,7 +1315,7 @@ TEST(postcode_centroids_keep_no_slots_and_a_region_of_no_valid_postcode_has_file
     }
 }
 
-TEST(a_build_writes_the_postcode_grid_of_its_us_addresses_in_every_mode_dir) {
+TEST(a_build_writes_the_postcode_grid_of_its_us_addresses_in_every_mode_dir_and_the_server_answers_from_it) {
     // Testland as the United States: 19026's houses along 47.05 N from 8.02
     // to 8.12 E, 19018's from 8.135 to 8.15. At 8.121 E the nearest centroid
     // is 19018's (8.1425, 1.6 km) rather than 19026's (8.07, 3.9 km); the
@@ -1373,4 +1373,20 @@ TEST(a_build_writes_the_postcode_grid_of_its_us_addresses_in_every_mode_dir) {
     };
     for (const Postcoded& h : houses)
         if (h.lat == 470500000) CHECK_EQ(grid_at(h.lat * 1e-7, h.lon * 1e-7), std::string(h.postcode).substr(0, 5));
+
+    // The server, from the dir of an admin preset and from admin-minimal,
+    // answers each point from the grid: 19026 beside its last house, where
+    // the nearest centroid is 19018's.
+    const std::vector<std::pair<double, double>> points = {{47.0503, 8.121}, {47.0497, 8.14}, {47.0502, 8.03}};
+    const std::vector<std::string> want = {"19026", "19018", "19026"};
+    for (const std::string& dir : {admin_preset_dir(out, "planet", root.path() + "/preset"), out + "/planet/admin-minimal"}) {
+        const std::vector<std::string> answers = server_answers(dir, points, root.path() + "/q", log);
+        REQUIRE(answers.size() == points.size());
+        for (size_t i = 0; i < points.size(); i++) {
+            CHECK(says(answers[i], "Testland"));
+            const std::optional<std::string> postcode = answer_string(answers[i], {"address", "postcode"});
+            CHECK(postcode == want[i]);
+            if (postcode != want[i]) std::printf("    %s: %s\n", dir.c_str(), answers[i].c_str());
+        }
+    }
 }

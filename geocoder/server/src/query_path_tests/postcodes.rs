@@ -1,4 +1,5 @@
-//! The postcode of an answer without one of its own: Nominatim 5.3's get_nearest_postcode on a
+//! The postcode of an answer without one of its own: the postcode grid's cell of the point where
+//! the dir has a grid of the point's country, else Nominatim 5.3's get_nearest_postcode on a
 //! point (utils.sql:168-178), the postcode area covering it, else the nearest postcode centroid
 //! whose box covers it, the box reaching the country's postcode extent from the centroid
 //! (settings/country_settings.yaml, postcodes.py).
@@ -179,4 +180,74 @@ fn a_centroid_s_box_is_the_envelope_of_its_buffer_on_the_ellipsoid() {
     let index = country_at(origin, b"US").centroid("00601", 0.0, 0.0).load();
     assert_eq!(postcode_from(&index, origin, 0.2255 * METRES_PER_DEGREE, 0.0), "00601");
     assert_eq!(postcode_from(&index, origin, 0.2262 * METRES_PER_DEGREE, 0.0), serde_json::Value::Null);
+}
+
+/// The level-16 cell `n` cells along the curve from the one of the point `north_m`, `east_m` from
+/// `origin`, as a query takes the point.
+fn grid_cell(origin: (f64, f64), north_m: f64, east_m: f64, n: i64) -> u64 {
+    let p = at_from(origin, north_m, east_m);
+    let cell = cell_id_at_level(p.lat as f64, p.lng as f64, 16);
+    cell.wrapping_add_signed(n << 29)
+}
+
+#[test]
+fn the_postcode_grid_names_a_point_before_the_nearest_centroid() {
+    // Drexel Hill, Delaware County (39.93538, -75.29800), with no postal area: 19018's centroid is
+    // 1,242 m off and 19026's 1,860 m, but the house 18 m off is 19026's, as Nominatim's zoom-18
+    // answer is, and so is the grid's cell of the point.
+    let point = (39.93538, -75.29800);
+    let mut dataset = country_at(point, b"US");
+    dataset.centroid("19018", 1242.0, 0.0).centroid("19026", 0.0, -1860.0);
+    assert_eq!(postcode_from(&dataset.load(), point, 0.0, 0.0), "19018");
+    dataset.grid_run("19026", grid_cell(point, 0.0, 0.0, -2)).grid_run("19018", grid_cell(point, 0.0, 0.0, 1));
+    assert_eq!(postcode_from(&dataset.load(), point, 0.0, 0.0), "19026");
+
+    // Newtown Township (40.0033, -75.40011): the centroid nearest is 19333's, the TIGER line's
+    // ZIP there 19073, which the grid's run from the cell of the point holds.
+    let point = (40.0033, -75.40011);
+    let mut dataset = country_at(point, b"US");
+    dataset.centroid("19333", 4700.0, -2000.0).centroid("19073", -3500.0, -5800.0);
+    dataset.grid_run("19073", grid_cell(point, 0.0, 0.0, 0)).grid_run("", grid_cell(point, 0.0, 0.0, 1));
+    assert_eq!(postcode_from(&dataset.load(), point, 0.0, 0.0), "19073");
+}
+
+#[test]
+fn a_cell_of_no_postcode_in_the_grid_leaves_the_point_to_the_nearest_centroid() {
+    // Past the reach of every house the grid has no postcode, and get_nearest_postcode names the
+    // point; before the grid's first run too.
+    let point = (39.93538, -75.29800);
+    let mut dataset = country_at(point, b"US");
+    dataset.centroid("19018", 1242.0, 0.0);
+    dataset.grid_run("19026", grid_cell(point, 0.0, 0.0, -3)).grid_run("", grid_cell(point, 0.0, 0.0, 0));
+    assert_eq!(postcode_from(&dataset.load(), point, 0.0, 0.0), "19018");
+    let mut dataset = country_at(point, b"US");
+    dataset.centroid("19018", 1242.0, 0.0).grid_run("19026", grid_cell(point, 0.0, 0.0, 1));
+    assert_eq!(postcode_from(&dataset.load(), point, 0.0, 0.0), "19018");
+}
+
+#[test]
+fn the_grid_names_a_point_of_its_runs_country_only() {
+    // Beyond the US border the grid's US runs name no point: a Canadian one takes its own
+    // country's centroid.
+    let point = (45.0, -73.5);
+    let mut dataset = country_at(point, b"CA");
+    dataset.centroid("J0L 1A0", 500.0, 0.0).grid_run("12919", grid_cell(point, 0.0, 0.0, 0));
+    dataset.grid.last_mut().unwrap().country_code = u16::from_be_bytes(*b"US");
+    assert_eq!(postcode_from(&dataset.load(), point, 0.0, 0.0), "J0L 1A0");
+}
+
+#[test]
+fn a_house_with_its_own_postcode_names_the_point_before_the_grid() {
+    // The house the street that won has near keeps its own addr:postcode (tier 0), whatever the
+    // grid's cell holds.
+    let point = (39.93538, -75.29800);
+    let index = country_at(point, b"US")
+        .street("Whalens Court", &[(0.0, -100.0), (0.0, 100.0)])
+        .address("12", 20.0, 0.0)
+        .addr_postcode("19083")
+        .grid_run("19026", grid_cell(point, 2.0, 0.0, -1))
+        .load();
+    let address = address_from(&index, point, 2.0, 0.0);
+    assert_eq!(address["house_number"], "12");
+    assert_eq!(address["postcode"], "19083");
 }

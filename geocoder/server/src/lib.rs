@@ -31,6 +31,7 @@ pub mod place_files;
 pub mod poi_files;
 pub mod geography_box;
 pub mod postcode_files;
+pub mod postcode_grid;
 pub mod side_blocks;
 pub mod strings;
 pub mod transport;
@@ -1070,6 +1071,8 @@ pub struct Index {
     /// The postcode centroids: postcode_centroids.bin and postcode_centroid_cells.bin
     /// (postcode_files.rs).
     pub postcode_centroids: Option<PostcodeFiles>,
+    /// The postcode grid (postcode_grid.bin): each cell's postcode in the countries it covers
+    pub postcode_grid: Option<postcode_grid::PostcodeGrid>,
     pub admin_config: AdminLevelConfig,
     pub strings: StringPool,
     pub street_cell_level: u64,
@@ -1365,6 +1368,9 @@ impl Index {
             }
             _ => None,
         };
+        let postcode_grid = file(postcode_grid::FILE)
+            .map(|f| postcode_grid::PostcodeGrid::open(f).map_err(|e| format!("{dir}: {e}")))
+            .transpose()?;
         // A cell pair index (cell_pairs.rs) of the dir, an error naming its cells file.
         let pairs = |prefix: &str, cells: FileBytes, entries: FileBytes, format: cell_pairs::Format| {
             CellPairs::open(cells, entries, format, admin_cell_level).map_err(|e| format!("{dir}/{prefix}_cells.bin: {e}"))
@@ -1407,6 +1413,7 @@ impl Index {
             addr_postcodes,
             way_postcodes,
             postcode_centroids,
+            postcode_grid,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::load(dir)?,
             street_cell_level,
@@ -2890,6 +2897,21 @@ impl Index {
             }
         }
 
+        // 1d. The postcode grid's, where the point's country is the grid's
+        // for its cell: the postcode most of the houses round the point
+        // carry (postcode_grid_build.h). Nominatim answers a point there with
+        // the postcode of the house or TIGER line it lands on; the centroid
+        // of a large ZIP lies farther from its edge than a neighbour's. A
+        // cell of no postcode, past the reach of every house, leaves the
+        // point to get_nearest_postcode.
+        if let (Some(grid), Some(cc)) = (self.postcode_grid.as_ref(), country_code) {
+            if let Some((country, code)) = grid.postcode_at(cell_id_at_level(lat, lng, grid.level())) {
+                if country == cc {
+                    return Some(Cow::Borrowed(code));
+                }
+            }
+        }
+
         // 2a. The postcode area covering the point: get_nearest_postcode
         // takes one before any centroid (ORDER BY osm_id is null). Of two,
         // Nominatim takes the one whose centroid is nearest, here the smaller.
@@ -4191,6 +4213,7 @@ mod query_tests {
             addr_postcodes: None,
             way_postcodes: None,
             postcode_centroids: None,
+            postcode_grid: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, end, end, end, end, end]),
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
@@ -6966,6 +6989,8 @@ mod query_path_tests {
         interp_postcodes: Vec<(u32, u32)>,
         /// The postcode centroids, each one's point, postcode and country.
         centroids: Vec<postcode_files::Centroid>,
+        /// The postcode grid's runs, in cell order.
+        grid: Vec<postcode_grid::LogicalRow>,
     }
 
     impl TestIndex {
@@ -7152,6 +7177,14 @@ mod query_path_tests {
             self
         }
 
+        /// A run of the postcode grid from `cell`, a level-16 cell, of Testland's country and
+        /// `postcode`, or of no postcode for "": runs go in cell order.
+        fn grid_run(&mut self, postcode: &str, cell: u64) -> &mut Self {
+            let country_code = if postcode.is_empty() { 0 } else { self.polygons[0].0.country_code };
+            self.grid.push(postcode_grid::LogicalRow { cell, country_code, code: postcode.to_string() });
+            self
+        }
+
         /// The side files with a value set, each with its values: NO_DATA for every other record
         /// of the file it sits beside.
         fn side_values(&self) -> Vec<(&'static str, Vec<u32>)> {
@@ -7208,6 +7241,10 @@ mod query_path_tests {
             if !self.centroids.is_empty() {
                 let (centroids, cells) = postcode_files::encode_points(&self.centroids, DEFAULT_ADMIN_CELL_LEVEL);
                 files.extend([(postcode_files::CENTROIDS_FILE, centroids), (postcode_files::CELLS_FILE, cells)]);
+            }
+
+            if !self.grid.is_empty() {
+                files.push((postcode_grid::FILE, postcode_grid::encode(&self.grid)));
             }
 
             if !(self.streets.is_empty() && self.addrs.is_empty() && self.interps.is_empty()) {
@@ -9652,6 +9689,7 @@ mod admin_scan_tests {
             places: None,
             way_parents: None, admin_parents: None, addr_postcodes: None, way_postcodes: None,
             postcode_centroids: None,
+            postcode_grid: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, len, len, len, len, len]),
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
