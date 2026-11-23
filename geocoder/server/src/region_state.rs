@@ -120,10 +120,11 @@ pub struct RegionState {
     /// rest wait on the lock and find the region already loaded. It holds
     /// the selection whose files this server last downloaded into the
     /// region and installed, which the region's files are of: none before it
-    /// did (for a region it loaded from its dir as it started, say), and
-    /// none from when a download begins till it and the install went
-    /// through, as one that fails may leave the dir without its stamp and
-    /// with files of no selection.
+    /// did (for a region it loaded from its dir as it started, say), none
+    /// from when a download begins till it and the install went through, as
+    /// one that fails may leave the dir without its stamp and with files of
+    /// no selection, and none where the install loaded the files of another
+    /// server's download into the dir, which ran between the two.
     pub region_locks: Mutex<HashMap<String, Arc<Mutex<Option<RegionSelection>>>>>,
     pub http: reqwest::Client,
 }
@@ -157,10 +158,13 @@ impl RegionState {
     /// and of each loaded region again whose dir the downloader filled,
     /// unless this server's last download of it was of the new selection
     /// (mode, quality, poi_tier and water) and it and the install went
-    /// through, for the new selection's files, which load in place of the
-    /// index it had once they are in. So a region it loaded from its dir as
-    /// it started is downloaded again once, and one whose download failed on
-    /// each configuration, of whichever selection, till one goes through.
+    /// through, the install loading the files that download left, for the
+    /// new selection's files, which load in place of the index it had once
+    /// they are in. So a region it loaded from its dir as it started is
+    /// downloaded again once, one whose download failed on each
+    /// configuration, of whichever selection, till one goes through, and one
+    /// whose install loaded the files of another server's download into its
+    /// dir (on the same data dir) once more.
     /// Till then, and where the download or the load fails, the region
     /// answers as before. Returns immediately — downloads run as tokio
     /// tasks.
@@ -281,7 +285,8 @@ impl RegionState {
     /// (by hand, by the test portal), as the flat layout's one slot was, and
     /// is never downloaded again. The selection is forgotten as a download
     /// begins, and noted once the download and the install went through, and
-    /// only then.
+    /// only then, where the install found the stamp that download left: a
+    /// download of another server on the data dir may run between the two.
     async fn download_if(self: &Arc<Self>, region: &str, unloaded: bool, loaded: bool) -> Result<(), DownloadError> {
         // Per-region serialisation. Acquire the inner mutex so only
         // one concurrent request runs the download below; the rest
@@ -317,7 +322,7 @@ impl RegionState {
             // selection before, and the region's dir is then downloaded again
             // for whichever selection comes next.
             *installed = None;
-            *installed = Some(state.download_and_install(&region).await?);
+            *installed = state.download_and_install(&region).await?;
             Ok(())
         })
         .await
@@ -338,19 +343,20 @@ impl RegionState {
     }
 
     /// Downloads `region` and installs it, returning the selection it
-    /// downloaded: the task of download_if. A region loaded already answers
+    /// downloaded where the dir it loaded holds the stamp its download left,
+    /// else None: the task of download_if. A region loaded already answers
     /// from the files its index mapped until the new index is installed, and
     /// goes on doing so where the download or the load fails: Index::load
     /// maps each file it reads and opens none by its path later, and a
     /// download writes no file in place, but renames a new one over it or
     /// removes it, which leaves a mapped file as it was.
-    async fn download_and_install(&self, region: &str) -> Result<RegionSelection, DownloadError> {
+    async fn download_and_install(&self, region: &str) -> Result<Option<RegionSelection>, DownloadError> {
         let configurations = self.ensure_configurations().await?;
         let cfg = self.config.lock().await.clone();
         let sel = cfg.selection(region);
 
         let region_owned = region.to_string();
-        download_region(
+        let downloaded = download_region(
             &self.http,
             &cfg.base_url,
             &configurations,
@@ -371,13 +377,16 @@ impl RegionState {
         // Another server's download into the dir may begin once this one let
         // go of it: the dir loads once that one ended, where it finished. The
         // load waits for it on a thread of its own, not on one of the
-        // runtime's, which answer the queries meanwhile.
+        // runtime's, which answer the queries meanwhile. It loaded the files
+        // of `sel` only where it found the stamp this download left: another
+        // stamp is that of a download after it, of a selection this server
+        // can't tell.
         let (multi_index, name) = (self.multi_index.clone(), region.to_string());
-        tokio::task::spawn_blocking(move || multi_index.install_region(&name))
+        let loaded = tokio::task::spawn_blocking(move || multi_index.install_region(&name))
             .await
             .map_err(|e| DownloadError::Io(format!("load task: {}", e)))?
             .map_err(DownloadError::UnknownRegion)?;
-        Ok(sel)
+        Ok((loaded == Some(downloaded)).then_some(sel))
     }
 }
 
@@ -837,6 +846,55 @@ mod tests {
 
         assert!(slot.index.load_full().unwrap().water.is_some());
         assert_eq!(seen.borrow().last(), Some(&names_of(&bucket, &all.selection("europe"))));
+    }
+
+    /// Downloads `sel` into the data dir `root` as another server on it
+    /// would, from a bucket of its own on a runtime of its own: it runs to
+    /// its end while this thread waits for it, in a hook a download on this
+    /// thread runs (ONCE_DOWNLOADED) too.
+    fn another_servers_download(root: &std::path::Path, sel: &RegionSelection) {
+        let (root, sel) = (root.to_path_buf(), sel.clone());
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                let bucket = test_bucket::serve(test_bucket::template_components()).await;
+                download_region(&reqwest::Client::new(), &bucket.url, &bucket.manifest, &sel, &root, |_| {}).await.unwrap();
+            });
+        }).join().unwrap();
+    }
+
+    // Servers on one data dir may download other selections into a region
+    // dir: another server's download may run once this one's let go of the
+    // dir and before this one loads it, which then loads that download's
+    // files. A server knows the selection of the files it loaded only where
+    // the dir holds the stamp its own download left. Here another server
+    // downloads water all into europe as this one's download of no water is
+    // in: europe loads with water, and the next configuration of no water
+    // downloads it again and loads it without.
+    #[tokio::test]
+    async fn a_region_another_server_downloaded_into_before_it_loaded_is_downloaded_again() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (root, state) = state_for(bucket.url.clone(), Duration::from_secs(3600)).await;
+        let state = Arc::new(state);
+        let none = state.get_configuration().await;
+        let (data_dir, theirs) = (root.path().to_path_buf(), Configuration { water: "all".into(), ..none.clone() }.selection("europe"));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let after = seen.clone();
+        ONCE_DOWNLOADED.set(Some(Box::new(move |dir: &std::path::Path| {
+            another_servers_download(&data_dir, &theirs);
+            make_loadable(dir);
+            on_each_download(after);
+        })));
+        state.ensure_loaded("europe").await.unwrap();
+        let slot = state.multi_index.continents.iter().find(|c| c.name == "europe").unwrap();
+        let wet = slot.index.load_full().unwrap().water.is_some();
+
+        for task in state.configure(none.clone()).await.unwrap() {
+            task.await.unwrap();
+        }
+
+        assert_eq!((wet, slot.index.load_full().unwrap().water.is_some()), (true, false));
+        assert_eq!(*seen.borrow(), [names_of(&bucket, &none.selection("europe"))]);
     }
 
     // A server knows the selection of a region's files only once it

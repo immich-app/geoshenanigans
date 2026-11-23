@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
-use query_server::{lower_hex, take_download_lock, LockFor, BUILD_STAMP, DOWNLOAD_LOCK, FILE_LEDGER};
+use query_server::{file_mark, lower_hex, take_download_lock, FileMark, LockFor, BUILD_STAMP, DOWNLOAD_LOCK, FILE_LEDGER};
 use query_server::transport::{self, ChunkReader, Expected, TRANSPORT_VERSION};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -908,6 +908,11 @@ thread_local! {
 ///
 /// `progress` fires after each file or unit completes with the running
 /// total; the caller logs it.
+///
+/// Returns the mark of the stamp it leaves in the dir (FileMark), found
+/// while it holds the lock: a load that finds that stamp loads the files of
+/// `sel`, and one that finds another those of a download that ran after it
+/// (another server's, on the same data dir).
 pub async fn download_region(
     client: &reqwest::Client,
     base_url: &str,
@@ -915,7 +920,7 @@ pub async fn download_region(
     sel: &RegionSelection,
     root: &Path,
     progress: impl Fn(DownloadProgress) + Send + Sync,
-) -> Result<(), DownloadError> {
+) -> Result<FileMark, DownloadError> {
     let resolved = resolve_files(cfg, sel)?;
     if resolved.paths.is_empty() {
         return Err(DownloadError::UnknownRegion(sel.region.clone()));
@@ -1100,7 +1105,9 @@ pub async fn download_region(
         // it loaded.
         write_whole(&stamp, cfg.build.date.as_bytes()).await?;
     }
-    Ok(())
+    file_mark(&stamp)
+        .map_err(|e| DownloadError::Io(format!("stat {}: {}", stamp.display(), e)))?
+        .ok_or_else(|| DownloadError::Io(format!("{} isn't there once the download put it in", stamp.display())))
 }
 
 // --- Regression tests ---------------------------------------------------------
@@ -1568,7 +1575,7 @@ mod tests {
     }
 
     async fn download(bucket: &TestBucket, s: &RegionSelection, root: &Path) -> Result<(), DownloadError> {
-        download_region(&reqwest::Client::new(), &bucket.url, &bucket.manifest, s, root, |_| {}).await
+        download_region(&reqwest::Client::new(), &bucket.url, &bucket.manifest, s, root, |_| {}).await.map(drop)
     }
 
     // Skipping a value the build lacks fetched the rest of the selection and
@@ -2900,7 +2907,7 @@ mod tests {
         drop(other);
         let late = match early {
             Some(_) => None,
-            None => Some(waiting.await.map_err(|e| e.to_string())),
+            None => Some(waiting.await.map(drop).map_err(|e| e.to_string())),
         };
 
         assert_eq!(early, None, "done while the lock was held");

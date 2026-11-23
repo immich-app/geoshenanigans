@@ -3570,18 +3570,34 @@ fn cant_write(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EROFS | libc::EACCES | libc::EPERM))
 }
 
+/// A file's device and FileStamp (inode, size, modification time): which
+/// file is at a path, one renamed into place over it another.
+pub type FileMark = (u64, FileStamp);
+
+/// The mark of the file at `path`, None where none is there.
+pub fn file_mark(path: &std::path::Path) -> std::io::Result<Option<FileMark>> {
+    match std::fs::metadata(path) {
+        #[cfg(unix)]
+        Ok(m) => Ok(Some((std::os::unix::fs::MetadataExt::dev(&m), FileStamp::of(&m)))),
+        #[cfg(not(unix))]
+        Ok(m) => Ok(Some((0, FileStamp::of(&m)))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// A continent dir's BUILD_STAMP and FILE_LEDGER as a load finds them: each
-/// None where it isn't there, else its device and FileStamp (inode, size,
-/// modification time). A download that changes a file in the dir changes
-/// one of them first: it makes the ledger where the dir has none, and
-/// removes the stamp. It appends to the ledger or renames a new one over
-/// it, and writes the stamp only under a temp name renamed into place, a
-/// new inode. So a load that finds them the same before it checks the dir
-/// and once it loaded it knows no download changed the dir meanwhile.
+/// None where it isn't there, else its FileMark. A download that changes a
+/// file in the dir changes one of them first: it makes the ledger where the
+/// dir has none, and removes the stamp. It appends to the ledger or renames
+/// a new one over it, and writes the stamp only under a temp name renamed
+/// into place, a new inode. So a load that finds them the same before it
+/// checks the dir and once it loaded it knows no download changed the dir
+/// meanwhile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DirMarks {
-    stamp: Option<(u64, FileStamp)>,
-    ledger: Option<(u64, FileStamp)>,
+    stamp: Option<FileMark>,
+    ledger: Option<FileMark>,
 }
 
 impl DirMarks {
@@ -3589,14 +3605,7 @@ impl DirMarks {
     fn of(dir: &str) -> Result<DirMarks, String> {
         let mark = |name: &str| {
             let path = format!("{}/{}", dir, name);
-            match std::fs::metadata(&path) {
-                #[cfg(unix)]
-                Ok(m) => Ok(Some((std::os::unix::fs::MetadataExt::dev(&m), FileStamp::of(&m)))),
-                #[cfg(not(unix))]
-                Ok(m) => Ok(Some((0, FileStamp::of(&m)))),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(format!("can't check {}: {}", path, e)),
-            }
+            file_mark(std::path::Path::new(&path)).map_err(|e| format!("can't check {}: {}", path, e))
         };
         Ok(DirMarks { stamp: mark(BUILD_STAMP)?, ledger: mark(FILE_LEDGER)? })
     }
@@ -3642,14 +3651,16 @@ thread_local! {
 /// checked and again once Index::load returned, and a load that finds them
 /// changed is dropped. That holds where the lock is taken too: a download
 /// on a file system whose locks don't reach other machines may not see it,
-/// and the check costs a few stats. The files stay mapped after. None for
-/// a dir that isn't there or holds no admin_cells.bin. An error, why the
-/// dir doesn't load, for a lock that can't be taken, a download that broke
-/// off (unfinished_download): it can leave files of a build or selection
-/// beside those of the one before, which Index::load can't tell apart; for
-/// a dir Index::load refuses; and for one a download changed while it
-/// loaded.
-fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Option<Index>, String> {
+/// and the check costs a few stats. The files stay mapped after. With the
+/// index, the mark of the stamp the dir held as it loaded, which tells the
+/// download whose files it loaded (None for a dir laid out by other means).
+/// None for a dir that isn't there or holds no admin_cells.bin. An error,
+/// why the dir doesn't load, for a lock that can't be taken, a download that
+/// broke off (unfinished_download): it can leave files of a build or
+/// selection beside those of the one before, which Index::load can't tell
+/// apart; for a dir Index::load refuses; and for one a download changed
+/// while it loaded.
+fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Option<(Index, Option<FileMark>)>, String> {
     // A dir that isn't there holds nothing to load, and gets no lock file.
     if !std::path::Path::new(dir).is_dir() {
         return Ok(None);
@@ -3675,7 +3686,7 @@ fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, sear
     if DirMarks::of(dir)? != marks {
         return Err(format!("a download into it ran while it loaded ({} or {} changed): it may mix two selections' files", BUILD_STAMP, FILE_LEDGER));
     }
-    Ok(Some(index))
+    Ok(Some((index, marks.stamp)))
 }
 
 pub struct ContinentSlot {
@@ -3730,7 +3741,7 @@ impl MultiIndex {
             // take down the continents that did load; the slot stays empty
             // so the downloader can complete it later.
             let arc_opt = match load_continent(&dir, street_cell_level, admin_cell_level, search_distance) {
-                Ok(idx) => idx.map(Arc::new),
+                Ok(idx) => idx.map(|(idx, _)| Arc::new(idx)),
                 Err(why) => {
                     eprintln!("skipping continent {}: {}", continent.name, why);
                     None
@@ -3790,14 +3801,16 @@ impl MultiIndex {
     /// where the dir holds no admin_cells.bin, an error, the slot as it was.
     /// It blocks as long as that download runs: an async caller runs it on a
     /// thread of its own (spawn_blocking), not on one of the runtime's.
-    pub fn install_region(&self, name: &str) -> Result<(), String> {
+    /// Returns the mark of the stamp the dir held as it loaded (FileMark),
+    /// which is that of the download whose files it loaded.
+    pub fn install_region(&self, name: &str) -> Result<Option<FileMark>, String> {
         let slot = self.continents.iter().find(|c| c.name == name)
             .ok_or_else(|| format!("unknown continent: {}", name))?;
         let dir = format!("{}/{}", self.root_dir, name);
-        let idx = load_continent(&dir, self.street_cell_level, self.admin_cell_level, self.search_distance)?
+        let (idx, stamp) = load_continent(&dir, self.street_cell_level, self.admin_cell_level, self.search_distance)?
             .ok_or_else(|| format!("{}/admin_cells.bin isn't there", dir))?;
         slot.index.store(Some(Arc::new(idx)));
-        Ok(())
+        Ok(stamp)
     }
 
     /// Reverse-geocode dispatch. Picks the best result among matching
@@ -7825,7 +7838,7 @@ mod query_path_tests {
             let (early, late) = std::thread::scope(|s| {
                 let (done, added) = std::sync::mpsc::channel();
                 let mi = &mi;
-                s.spawn(move || done.send(mi.install_region("europe")).unwrap());
+                s.spawn(move || done.send(mi.install_region("europe").map(drop)).unwrap());
                 let early = added.recv_timeout(std::time::Duration::from_millis(500)).ok();
                 if stopped {
                     std::fs::remove_file(europe.join(BUILD_STAMP)).unwrap();
@@ -7852,7 +7865,7 @@ mod query_path_tests {
         let telling = told.clone();
         BEFORE_INDEX_LOAD.set(Some(Box::new(move |dir: &str| telling.borrow_mut().push(free(std::path::Path::new(dir))))));
 
-        let added = mi.install_region("europe");
+        let added = mi.install_region("europe").map(drop);
 
         BEFORE_INDEX_LOAD.set(None);
         assert_eq!((added, mi.loaded_count()), (Ok(()), 2));

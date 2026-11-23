@@ -425,8 +425,9 @@ files into `<dataset>/water/` (or removes the water layer's files, for
 `PUT /admin/configuration` downloads each loaded region again whose dir the
 downloader filled (it holds `.file_sha256` or `.build_date`; one laid out by
 hand stays as it is) unless the server's last download of it was of the PUT's
-selection and went through, as it isn't where `water` (or another axis)
-changes: the download removes the files of `water/` the new value doesn't take
+selection and went through, and the region loaded the files that download left
+(not those of another server's download into the dir after it), as it isn't
+where `water` (or another axis) changes: the download removes the files of `water/` the new value doesn't take
 and fetches the ones it does, its ledger naming each `water/<name>`, and the
 region loads again once that is in, answering from the files it had until then
 (and where the download fails, till a PUT, of whichever selection, downloads
