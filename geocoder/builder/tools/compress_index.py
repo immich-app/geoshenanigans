@@ -22,11 +22,18 @@ published: its files go as .zst like any other, and the script exits
 UNIT_FAILED once all else is done, for the caller to fail the run at its end.
 
 configurations.json["component_sizes"] gives, per region, each component's
-bytes, so a client can weigh a selection without summing files: "raw", its
-files on disk, and "wire", what downloading them costs (a unit's size once,
-or its share by its files' raw bytes when the component holds only some of
-them; each other file's .zst). A component counts only the files the region
-has, and a region lists only the components it has a file of.
+bytes: "raw", its files on disk, and "wire", what downloading them costs (a
+unit's size once, or its share by its files' raw bytes when the component
+holds only some of them; each other file's .zst). A component counts only
+the files the region has, and a region lists only the components it has a
+file of. Each is that component's own files alone, so a selection's bytes
+are not the sum of its axes' components: one of variants alone
+(mode.admin-minimal) has none, and the files a variant replaces stay in
+the sizes of the components that list them. A client resolves a
+selection's variants first, as it does to download them, then adds up the
+components it downloads, the variant's among them, and leaves out the
+files the variant replaces (configurations.json["files"] and ["units"]
+give each file's and unit's bytes).
 
 --upload streams each .zst and unit to DEST/<path> as soon as it exists,
 through one long-running CMD (an `s5cmd ... run` reading cp commands on
