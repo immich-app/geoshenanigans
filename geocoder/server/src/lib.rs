@@ -987,6 +987,9 @@ pub struct Index {
     pub street_cell_level: u64,
     pub admin_cell_level: u64,
     pub max_distance_sq: f64,
+    /// The credit of the data in the dir as it loaded (dir_credits): a download may replace the
+    /// dir's files later, while this index answers from those it mapped.
+    pub credits: Vec<serde_json::Value>,
 }
 
 /// Normalised street-name token overlap, mirroring the builder's
@@ -1324,6 +1327,7 @@ impl Index {
             street_cell_level,
             admin_cell_level,
             max_distance_sq,
+            credits: dir_credits(dir),
         })
     }
 
@@ -3788,18 +3792,14 @@ impl MultiIndex {
         self.continents.iter().filter(|c| c.index.load().is_some()).count()
     }
 
-    /// The credit of the data the loaded datasets hold (dir_credits), each source once, in the
-    /// order the datasets list them; none where none is loaded.
+    /// The credit of the data the loaded datasets hold (Index::credits, as each loaded), each
+    /// source once, in the order the datasets list them; none where none is loaded.
     pub fn credits(&self) -> Vec<serde_json::Value> {
         let mut out: Vec<serde_json::Value> = Vec::new();
-        for slot in self.continents.iter().filter(|c| c.index.load().is_some()) {
-            let dir = match slot.continent {
-                None => self.root_dir.clone(),
-                Some(_) => format!("{}/{}", self.root_dir, slot.name),
-            };
-            for entry in dir_credits(&dir) {
+        for index in self.continents.iter().filter_map(|c| c.index.load_full()) {
+            for entry in &index.credits {
                 if !out.iter().any(|e| e["id"] == entry["id"]) {
-                    out.push(entry);
+                    out.push(entry.clone());
                 }
             }
         }
@@ -4074,6 +4074,7 @@ mod query_tests {
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
             admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
             max_distance_sq: (DEFAULT_SEARCH_DISTANCE / 6_371_000.0).powi(2),
+            credits: Vec::new(),
         }
     }
 
@@ -7384,6 +7385,17 @@ mod query_path_tests {
         credits.iter().map(|e| e["id"].as_str().unwrap()).collect()
     }
 
+    /// The template's entry `id` (template_credits).
+    fn template_entry(id: &str) -> serde_json::Value {
+        template_credits().into_iter().find(|e| e["id"] == id).unwrap()
+    }
+
+    /// Writes `name` in `dir`: the template's entries of `ids`, as the builder writes a credit file.
+    fn write_credits(dir: &std::path::Path, name: &str, ids: &[&str]) {
+        let entries: Vec<serde_json::Value> = ids.iter().map(|&id| template_entry(id)).collect();
+        std::fs::write(dir.join(name), serde_json::to_string(&entries).unwrap()).unwrap();
+    }
+
     // A server credits the data of the datasets it loaded, as their dirs credit it: each
     // source once. Europe's dataset holds OpenStreetMap's data and GeoNames's, and Wikidata
     // ranked its POIs; Asia's of a build before attribution.json, OpenStreetMap's alone. A
@@ -7391,34 +7403,55 @@ mod query_path_tests {
     // OpenStreetMap alone, OpenStreetMap's.
     #[test]
     fn a_server_credits_the_sources_of_the_datasets_it_loaded() {
-        let template = template_credits();
-        let entry = |id: &str| template.iter().find(|e| e["id"] == id).unwrap().clone();
-        let write = |dir: &std::path::Path, name: &str, entries: &[&str]| {
-            std::fs::write(dir.join(name), serde_json::to_string(&entries.iter().map(|&id| entry(id)).collect::<Vec<_>>()).unwrap()).unwrap();
-        };
         let load = |root: &std::path::Path| {
             MultiIndex::load(root.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap()
         };
 
         let root = two_continents();
-        write(&root.path().join("europe"), "attribution.json", &["osm", "geonames", "codepoint-open"]);
-        write(&root.path().join("europe"), "poi_attribution.json", &["wikidata"]);
+        write_credits(&root.path().join("europe"), "attribution.json", &["osm", "geonames", "codepoint-open"]);
+        write_credits(&root.path().join("europe"), "poi_attribution.json", &["wikidata"]);
         let credits = load(root.path()).credits();
         assert_eq!(ids(&credits), ["osm", "geonames", "codepoint-open", "wikidata"]);
         // Asia's, first, of no file.
         assert_eq!(credits[0], osm_credit());
-        assert_eq!(credits[1], entry("geonames"));
+        assert_eq!(credits[1], template_entry("geonames"));
 
         for (written, want) in [(vec!["osm", "tiger"], vec!["osm", "tiger"]), (vec!["osm"], vec!["osm"]), (vec![], vec!["osm"])] {
             let flat = ScratchDir::new();
             oldtown().write(flat.path());
             if !written.is_empty() {
-                write(flat.path(), "attribution.json", &written);
+                write_credits(flat.path(), "attribution.json", &written);
             }
             let credits = load(flat.path()).credits();
             assert_eq!(ids(&credits), want, "{written:?}");
-            assert_eq!(credits[0], entry("osm"));
+            assert_eq!(credits[0], template_entry("osm"));
         }
+    }
+
+    // A server credits the datasets it loaded, not those their dirs hold now: a server sharing
+    // the data dir may have replaced Europe's selection with a minimal one since, while this one
+    // still answers from the files it mapped. Once it loads Europe's dir again it credits what
+    // that holds, in a flat dir as in a continent's.
+    #[test]
+    fn a_server_credits_the_datasets_it_loaded_until_it_loads_their_dirs_again() {
+        let root = two_continents();
+        let europe = root.path().join("europe");
+        write_credits(&europe, "attribution.json", &["osm", "geonames"]);
+        write_credits(&europe, "poi_attribution.json", &["wikidata"]);
+        let mi = MultiIndex::load(root.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+        write_credits(&europe, "attribution.json", &["osm"]);
+        std::fs::remove_file(europe.join("poi_attribution.json")).unwrap();
+
+        assert_eq!(ids(&mi.credits()), ["osm", "geonames", "wikidata"]);
+        mi.install_region("europe").unwrap();
+        assert_eq!(ids(&mi.credits()), ["osm"]);
+
+        let flat = ScratchDir::new();
+        oldtown().write(flat.path());
+        write_credits(flat.path(), "attribution.json", &["osm", "tiger"]);
+        let mi = MultiIndex::load(flat.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+        std::fs::remove_file(flat.path().join("attribution.json")).unwrap();
+        assert_eq!(ids(&mi.credits()), ["osm", "tiger"]);
     }
 
     // A dataset of no attribution.json is OpenStreetMap's data: its credit is the builder's
@@ -9852,6 +9885,7 @@ mod admin_scan_tests {
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
             admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
             max_distance_sq: 1.0,
+            credits: Vec::new(),
         }
     }
 
