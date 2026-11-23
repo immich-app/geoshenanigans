@@ -2,7 +2,9 @@
 """Tests for the nightly's postal cities inputs: GeoNames' postal places come from our cache, which
 Update GeoNames Postal Places fills and a missing or bad copy of fails the night; yesterday's
 postal_cities.bin comes from the newest build latest.json names before today's, whatever its
-version, so a fresh night keeps its names; the build takes both.
+version, so a fresh night keeps its names, and a rerun of a day from the day its first run took,
+which its configurations.json records; a pointer or manifest that can't be read fails the night,
+and only one the bucket holds no object for is no state; the build takes both.
 Run: python3 -m unittest discover -s geocoder/builder/tools"""
 import hashlib
 import json
@@ -16,6 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WORKFLOWS = os.path.join(HERE, "..", "..", "..", ".github", "workflows")
 DOWNLOAD = "Download PBF and previous indexes"
 BUILD = "Build geocoder index"
+FINALIZE = "Finalize upload and configurations.json"
 
 
 def workflow(name):
@@ -37,6 +40,13 @@ def postal_block():
     return block.group(0) if block else None
 
 
+def splice_block():
+    """The finalize step's lines that splice the build's metadata into configurations.json."""
+    script = step_script(workflow("geocoder-build.yml"), FINALIZE)
+    block = re.search(r'^PREV_VAL=.*?^   *&& mv "\$WORKDIR/output/configurations.tmp".*?\n', script, re.M | re.S)
+    return block.group(0) if block else None
+
+
 def build_args_block():
     """The build step's postal lines, which add to BUILD_ARGS."""
     script = step_script(workflow("geocoder-build.yml"), BUILD)
@@ -45,7 +55,8 @@ def build_args_block():
 
 
 # A curl that serves $SERVED/<url path> (after the host), and an s5cmd whose `cat` serves
-# $SERVED/s3/<bucket path>: what the cache and the bucket hold.
+# $SERVED/s3/<bucket path>: what the cache and the bucket hold. A missing object reads as s5cmd
+# 2.3's "given object ... not found"; one beside a <path>.fail file as a failed request.
 CURL = r"""#!/bin/bash
 out=""; url=""
 while [ $# -gt 0 ]; do
@@ -58,7 +69,8 @@ if [ -n "$out" ]; then cp "$path" "$out"; else cat "$path"; fi
 S5CMD = r"""#!/bin/bash
 while [ $# -gt 0 ]; do case "$1" in cat) shift; break ;; *) shift ;; esac; done
 path="$SERVED/s3/${1#s3://}"
-[ -f "$path" ] || exit 1
+if [ -f "$path.fail" ]; then echo "ERROR \"cat $1\": InternalError: We encountered an internal error. status code: 500" >&2; exit 1; fi
+if ! [ -f "$path" ]; then echo "ERROR \"cat $1\": given object $1 not found" >&2; exit 1; fi
 cat "$path"
 """
 
@@ -89,15 +101,30 @@ class NightlyPostalCitiesTest(unittest.TestCase):
         self.serve("geocoder/geonames/latest.json", json.dumps(
             {"path": path, "size": len(data), "sha256": sha or hashlib.sha256(data).hexdigest(), "rows": 1}))
 
-    def build(self, date, table=None, listed=True):
-        """A published build of `date`: its configurations.json, and its postal table (zstd)."""
+    def build(self, date, table=None, listed=True, built_from=None):
+        """A published build of `date`: its configurations.json, and its postal table (zstd); its
+        build.postal_cities_previous `built_from` where given ("" for null)."""
         files = {}
         if table is not None:
             self.serve(f"s3/bucket/geocoder/builds/{date}/planet/admin/postal_cities.bin.zst",
                        subprocess.run(["zstd", "-q", "-c"], input=table, capture_output=True, check=True).stdout)
             if listed:
                 files["planet/admin/postal_cities.bin"] = {"sha256": hashlib.sha256(table).hexdigest()}
-        self.serve(f"s3/bucket/geocoder/builds/{date}/configurations.json", json.dumps({"files": files}))
+        manifest = {"files": files}
+        if built_from is not None:
+            manifest["build"] = {"date": date, "postal_cities_previous": built_from or None}
+        self.serve(f"s3/bucket/geocoder/builds/{date}/configurations.json", json.dumps(manifest))
+
+    def latest(self, latest, previous):
+        self.serve("s3/bucket/geocoder/builds/latest.json", json.dumps({"latest": latest, "previous": previous}))
+
+    def fail(self, path):
+        """A read of the bucket's object `path` that fails."""
+        self.serve(f"s3/bucket/geocoder/{path}.fail", "")
+
+    def table_of(self, outputs):
+        with open(outputs["prev_postal_cities"], "rb") as f:
+            return f.read()
 
     def run_block(self, script):
         out = os.path.join(self.root, "github_output")
@@ -138,6 +165,7 @@ class NightlyPostalCitiesTest(unittest.TestCase):
         r, outputs = self.run_block(block)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertNotIn("prev_postal_cities", outputs)
+        self.assertEqual(outputs["prev_postal_cities_date"], "null")
         # The newest build before today's: latest, or its previous where latest is today's.
         self.build("2026-11-21", b"day 21")
         self.build("2026-11-22", b"day 22")
@@ -147,8 +175,8 @@ class NightlyPostalCitiesTest(unittest.TestCase):
             self.serve("s3/bucket/geocoder/builds/latest.json", json.dumps({"latest": latest, "previous": previous}))
             r, outputs = self.run_block(block)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-            with open(outputs["prev_postal_cities"], "rb") as f:
-                self.assertEqual(f.read(), want, latest)
+            self.assertEqual(self.table_of(outputs), want, latest)
+            self.assertEqual(outputs["prev_postal_cities_date"], "2026-11-" + want.decode()[-2:])
         # A build that published none.
         self.build("2026-11-22", b"day 22", listed=False)
         self.serve("s3/bucket/geocoder/builds/latest.json", json.dumps({"latest": "2026-11-22", "previous": None}))
@@ -161,6 +189,106 @@ class NightlyPostalCitiesTest(unittest.TestCase):
         r, _ = self.run_block(block)
         self.assertEqual(r.returncode, 1)
         self.assertIn("::error::[postal] The postal cities of 2026-11-22", r.stdout)
+
+    def test_a_rerun_of_a_day_takes_the_postal_cities_its_first_run_took(self):
+        block = postal_block()
+        self.cache()
+        self.build("2026-11-20", b"day 20")
+        self.build("2026-11-22", b"day 22")
+        # Day 23's first run, fresh, takes day 22's; it publishes with no previous build.
+        self.latest("2026-11-22", "2026-11-21")
+        r, outputs = self.run_block(block)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.table_of(outputs), b"day 22")
+        self.assertEqual(outputs["prev_postal_cities_date"], "2026-11-22")
+        self.build("2026-11-23", b"day 23", built_from="2026-11-22")
+        self.latest("2026-11-23", None)
+        r, outputs = self.run_block(block)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.table_of(outputs), b"day 22")
+        self.assertEqual(outputs["prev_postal_cities_date"], "2026-11-22")
+        # One that took none takes none again, whatever latest.json names; one after a gap, the
+        # day before the gap.
+        self.build("2026-11-23", b"day 23", built_from="")
+        self.latest("2026-11-22", None)
+        r, outputs = self.run_block(block)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("prev_postal_cities", outputs)
+        self.assertEqual(outputs["prev_postal_cities_date"], "null")
+        self.build("2026-11-23", b"day 23", built_from="2026-11-20")
+        r, outputs = self.run_block(block)
+        self.assertEqual(self.table_of(outputs), b"day 20")
+        # A day of a build of before the record: latest.json's, as for a first run.
+        self.build("2026-11-23", b"day 23")
+        self.latest("2026-11-23", "2026-11-22")
+        r, outputs = self.run_block(block)
+        self.assertEqual(self.table_of(outputs), b"day 22")
+        # A record of no day before today's fails the night.
+        for bad in ("2026-11-23", "2026-11-24", "latest"):
+            self.build("2026-11-23", b"day 23", built_from=bad)
+            r, _ = self.run_block(block)
+            self.assertEqual(r.returncode, 1, bad)
+            self.assertIn("is no day before 2026-11-23", r.stdout)
+
+    def test_a_pointer_or_manifest_that_cant_be_read_fails_the_night(self):
+        block = postal_block()
+        self.cache()
+        self.build("2026-11-22", b"day 22")
+        self.latest("2026-11-22", None)
+        self.assertEqual(self.run_block(block)[0].returncode, 0)
+        # latest.json, the named build's configurations.json, and today's (a rerun's) each fail
+        # the night when their read fails, and when they hold no JSON object.
+        for path in ("builds/latest.json", "builds/2026-11-22/configurations.json", "builds/2026-11-23/configurations.json"):
+            self.fail(path)
+            r, outputs = self.run_block(block)
+            self.assertEqual(r.returncode, 1, path)
+            self.assertIn("::error::[postal] Could not read s3://bucket/geocoder/" + path, r.stdout)
+            self.assertIn("status code: 500", r.stdout)
+            self.assertNotIn("prev_postal_cities", outputs)
+            os.remove(os.path.join(self.served, f"s3/bucket/geocoder/{path}.fail"))
+        self.assertEqual(self.run_block(block)[0].returncode, 0)
+        for path, text in (("builds/latest.json", "<html>"), ("builds/latest.json", "[]"),
+                           ("builds/2026-11-22/configurations.json", "{\"files\": "),
+                           ("builds/2026-11-23/configurations.json", "")):
+            self.serve(f"s3/bucket/geocoder/{path}", text)
+            r, _ = self.run_block(block)
+            self.assertEqual(r.returncode, 1, path)
+            self.assertIn("holds no JSON object", r.stdout)
+            if path == "builds/latest.json":
+                self.latest("2026-11-22", None)
+            elif path.startswith("builds/2026-11-22"):
+                self.build("2026-11-22", b"day 22")
+            else:
+                os.remove(os.path.join(self.served, f"s3/bucket/geocoder/{path}"))
+        self.assertEqual(self.run_block(block)[0].returncode, 0)
+        # The build latest.json names has no configurations.json: no state to go on.
+        os.remove(os.path.join(self.served, "s3/bucket/geocoder/builds/2026-11-22/configurations.json"))
+        r, _ = self.run_block(block)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("The build of 2026-11-22 has no configurations.json", r.stdout)
+
+    def test_the_build_records_the_day_whose_postal_cities_it_took(self):
+        block = splice_block()
+        self.assertIsNotNone(block)
+        text = workflow("geocoder-build.yml")
+        self.assertIn("POSTAL_CITIES_PREVIOUS: ${{ steps.download.outputs.prev_postal_cities_date || 'null' }}", text)
+        out = os.path.join(self.work, "output")
+        os.makedirs(out)
+
+        def spliced(postal):
+            with open(os.path.join(out, "configurations.json"), "w") as f:
+                json.dump({"build": {"version": 24, "patch_version": 21}, "files": {}}, f)
+            env = {"PATH": os.environ["PATH"], "WORKDIR": self.work, "NEW_DATE": "2026-11-23", "OLD_DATE": "2026-11-22",
+                   "HAS_PREVIOUS": "false", "WIKIDATA_DATE": "null", "POSTAL_CITIES_PREVIOUS": postal}
+            r = subprocess.run(["bash", "-eo", "pipefail", "-c", block], env=env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            with open(os.path.join(out, "configurations.json")) as f:
+                return json.load(f)["build"]
+
+        build = spliced("2026-11-20")
+        self.assertEqual(build["postal_cities_previous"], "2026-11-20")
+        self.assertEqual((build["version"], build["date"], build["previous"]), (24, "2026-11-23", None))
+        self.assertIsNone(spliced("null")["postal_cities_previous"])
 
     def test_the_build_takes_the_postal_places_and_yesterdays_postal_cities(self):
         block = build_args_block()

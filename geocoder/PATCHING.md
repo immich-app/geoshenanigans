@@ -233,7 +233,8 @@ it), and the `units` map of the build's transport units:
     "date": "2026-04-10",
     "previous": "2026-04-09",
     "built_at": "2026-04-10T09:00:14Z",
-    "wikidata_date": "2026-04-08"
+    "wikidata_date": "2026-04-08",
+    "postal_cities_previous": "2026-04-09"
   },
   "axes":        { "region": { ... }, "mode": { ... }, ... },
   "components":  { "mode.full": { "files": ["{region}/full/...", ... ] }, ... },
@@ -258,7 +259,10 @@ it), and the `units` map of the build's transport units:
 The static portions (axes/components/constraints/presets/transport) come
 from `geocoder/builder/configurations.template.json` and are stable across
 builds. CI splices in `build.*` and the `files` and `units` tables during
-the build's compress step. `transport` lists the units a dir publishes when
+the build's compress step. `build.postal_cities_previous` is the build whose
+`postal_cities.bin` gave this one yesterday's names (null for none): a rerun
+of the same date takes that table again, whatever `latest.json` names by
+then. `transport` lists the units a dir publishes when
 it holds all of their files; `units` the ones this build has, each with its
 kind, the transport version it was written in, its bytes on the wire and its
 files. A client refuses a unit of a `transport_version` it doesn't read.
