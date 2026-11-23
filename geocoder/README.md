@@ -243,7 +243,8 @@ when all of these hold, the same on every water tier:
 - **Big enough**: still water and wetlands of 1 ha or more; rivers, canals,
   coastal water, seas and glaciers at any size.
 - **Not in the line already**: its name, lower case with letters and digits
-  alone, is not the city, state or country Immich shows (the first of `city`,
+  alone and accents aside (NFKD, its marks dropped), is not the city, state or
+  country Immich shows (the first of `city`,
   `town`, `village`, `hamlet`, `municipality`; of `state`, `province`,
   `region`, `county`, `municipality`, `city`; and `country`, none without a
   country), and neither it nor the landmark's name holds the other (from 4

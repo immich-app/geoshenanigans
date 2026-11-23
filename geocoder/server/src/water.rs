@@ -26,6 +26,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use unicode_normalization::{char::canonical_combining_class, UnicodeNormalization};
 
 /// The dir of a dataset that holds its water layer.
 pub const WATER_DIR: &str = "water";
@@ -290,9 +291,15 @@ pub struct LandmarkPoi {
     pub area: f64,
 }
 
-/// A name as the line compares names: lower case, letters and digits alone.
+/// A name as the line compares names: its compatibility decomposition (NFKD) without its
+/// combining marks, in lower case, letters and digits alone ("Lágoa D'água" and "Lagoa D'Agua"
+/// alike).
 fn fold(name: &str) -> String {
-    name.chars().flat_map(char::to_lowercase).filter(|c| c.is_alphanumeric()).collect()
+    name.nfkd()
+        .filter(|&c| canonical_combining_class(c) == 0)
+        .flat_map(char::to_lowercase)
+        .filter(|c| c.is_alphanumeric())
+        .collect()
 }
 
 /// Whether two names name one thing: folded (`fold`), equal, or the shorter, of 4 characters or
@@ -1254,6 +1261,14 @@ mod tests {
         assert!(!lake("Milford Sound", &reserve("Piopiotahi (Milford Sound) Marine Reserve")));
         assert!(lake("Mill Pond", &reserve("Mil")));
         assert!(lake("Tonle Sap Lake", &reserve("Boeung Tonle Sap Protected Area")));
+        // Accents aside (NFKD, its marks dropped), and compatibility forms too.
+        assert!(!lake("Lagoa D'água", &shown(Some("Lágoa D'água"), Some("Bahia"), Some("Brazil"))));
+        assert!(!lake("Jamijarvi", &shown(Some("Jämijärvi"), None, Some("Finland"))));
+        assert!(!lake("Lake Mahinapua", &reserve("Lake Māhinapua Scenic Reserve")));
+        assert!(!lake("Ｌａｋｅ Ｂｌｅｄ", &shown(None, Some("Lake Bled"), Some("Slovenia"))));
+        assert!(lake("Lagoa D'água", &shown(Some("Lagoa Dourada"), Some("Bahia"), Some("Brazil"))));
+        assert_eq!(fold("Lágoa D'Água"), "lagoadagua");
+        assert_eq!(fold("Ångström-Sjön №5"), "angstromsjonno5");
     }
 
     #[test]

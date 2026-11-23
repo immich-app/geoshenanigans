@@ -39,6 +39,7 @@ zstd = "0.14"
 sha2 = "0.11"
 futures-util = "0.3"
 bytes = "1"
+unicode-normalization = "0.1"
 
 # The binary's tests (the download tests' bucket) build their datasets with the library's
 # fixture encoders.

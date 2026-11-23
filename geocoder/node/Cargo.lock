@@ -1488,6 +1488,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-stream",
+ "unicode-normalization",
  "zstd",
 ]
 
