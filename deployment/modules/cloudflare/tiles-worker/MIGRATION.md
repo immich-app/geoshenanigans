@@ -69,20 +69,12 @@ tg() { op run --env-file=../../../.env -- terragrunt run -- "$@"; }
 tg init -reconfigure
 ```
 
-and either push prod's copy back:
-
-```sh
-op document get "tiles-worker-prod state before provider v5" --vault tf_prod | tg state push -force -
-```
-
-which drops anything prod applied after the copy from state; the next v4 plan puts back what config still has (a
-newer deployment key, say), so read it before applying. Or adopt the live objects under the v4 types again, which needs
-no copy:
+then look up the live domains' hostnames and IDs in Cloudflare, not state (a v5 apply that failed after forget never
+saved its imports):
 
 ```sh
 account=$(op read op://tf/cloudflare/account_id)
-# The live domains' hostnames and IDs, from Cloudflare rather than state: a v5 apply that failed after forget never
-# saved its imports. CLOUDFLARE_API_TOKEN is any token that can read the account's Workers. On 2026-11-23 they were
+# CLOUDFLARE_API_TOKEN is any token that can read the account's Workers. On 2026-11-23 the IDs were
 # 17b3213004b9d5f077563e3c4ea3171ef9d0c5fc (tiles.immich.cloud), 784d38aa18d0afda5695908b56a3799379362122
 # (tiles.prod.immich.cloud) and 8ec3085eac0b585919ba6cfa71adb181482915f5 (tiles.dev.immich.cloud).
 curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
@@ -90,7 +82,22 @@ curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
   jq -r '.result[] | "\(.hostname) \(.id)"'
 ```
 
-Check that every hostname the environment serves has an ID (prod: `tiles.immich.cloud` and `tiles.prod.immich.cloud`,
+In prod, if the copy from before the merge lists exactly those domains with the same IDs, pushing it back is the
+quickest way:
+
+```sh
+op document get "tiles-worker-prod state before provider v5" --vault tf_prod |
+  jq -r '.resources[] | select(.type == "cloudflare_workers_domain") | .instances[]
+    | "\(.attributes.hostname) \(.attributes.id)"'
+# Only when that matches the lookup above:
+op document get "tiles-worker-prod state before provider v5" --vault tf_prod | tg state push -force -
+```
+
+It drops whatever prod applied after the copy from state; the next v4 plan puts back what config still has (a newer
+deployment key, say), so read it before applying. Otherwise (dev, no copy, or any domain re-created or changed since),
+adopt the live objects under the v4 types again, which needs no copy.
+
+For that, check that every hostname the environment serves has an ID (prod: `tiles.immich.cloud` and `tiles.prod.immich.cloud`,
 dev: `tiles.dev.immich.cloud`), then swap whichever v5 entries state has for the v4 ones:
 
 ```sh
