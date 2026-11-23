@@ -424,12 +424,12 @@ files into `<dataset>/water/` (or removes the water layer's files, for
 `none`), as a fresh install does, with no patch. On the server, a
 `PUT /admin/configuration` downloads each loaded region again whose dir the
 downloader filled (it holds `.file_sha256` or `.build_date`; one laid out by
-hand stays as it is) unless the server's last download of it that went through
-was of the PUT's selection, as it isn't where `water` (or another axis)
+hand stays as it is) unless the server's last download of it was of the PUT's
+selection and went through, as it isn't where `water` (or another axis)
 changes: the download removes the files of `water/` the new value doesn't take
 and fetches the ones it does, its ledger naming each `water/<name>`, and the
 region loads again once that is in, answering from the files it had until then
-(and where the download fails, till a PUT, of the same selection too, downloads
+(and where the download fails, till a PUT, of whichever selection, downloads
 it again). Other names in `water/` stay, and a dir holding none of the water
 files has no water.
 

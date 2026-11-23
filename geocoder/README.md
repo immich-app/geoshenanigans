@@ -78,10 +78,10 @@ admin sets another selection with `PUT /admin/configuration` (a JSON body of
 `base_url`, `mode`, `quality`, `poi_tier`, `water` and the regions to `preload`;
 a body without `water` takes `none`). A PUT downloads each loaded continent
 again for its selection, with the latest build, unless the server's last
-download of it that went through was of that selection, and loads it once that
-is in; till then, and where the download or the load fails, the continent
-answers from the files it had, and the next PUT, of the same selection too,
-downloads it again. A continent the server loaded from its dir as it started
+download of it was of that selection and it and the load after it went
+through, and loads it once that is in; till then, and where the download or
+the load fails, the continent answers from the files it had, and the next PUT,
+of whichever selection, downloads it again. A continent the server loaded from its dir as it started
 is downloaded again on the first PUT. A loaded continent whose dir holds
 neither the downloader's ledger nor its stamp (`.file_sha256`, `.build_date`,
 below) was laid out by other means, by hand or by the test portal, and is never
