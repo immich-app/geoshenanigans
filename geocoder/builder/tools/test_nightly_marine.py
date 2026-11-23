@@ -450,8 +450,9 @@ class MarineWorkflowTest(unittest.TestCase):
         run, compressed = self.run_build(good)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertTrue(compressed)
-        for summary in ({"objects": 0, "oceans": 0, "polygons": 0}, {**good, "objects": 0}, {**good, "oceans": 0},
-                        {**good, "polygons": 0}):
+        # Its oceans are some of its objects: objects no more than its oceans are oceans alone, without a sea.
+        for summary in ({"objects": 0, "oceans": 0, "polygons": 0}, {**good, "objects": 0}, {**good, "objects": 7},
+                        {**good, "oceans": 0}, {**good, "polygons": 0}):
             with self.subTest(summary=summary):
                 run, compressed = self.run_build(summary)
                 self.assertNotEqual(run.returncode, 0)
