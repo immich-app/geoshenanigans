@@ -29,9 +29,9 @@ builds/
       water/
         all/
           simplified/  admin_rings.bin.zst + admin_cells.bin.zst + admin_entries.bin.zst
-                       + strings_core.bin.zst + arcs.tt.zst + admin_polygons.tt.zst
-                       + strings_layout.json(.zst) + water_meta.json(.zst)
-                       + attribution.json(.zst) + patch.gcpatch
+                       + strings_core.bin.zst + water_cut_arcs.bin.zst + arcs.tt.zst
+                       + admin_polygons.tt.zst + strings_layout.json(.zst)
+                       + water_meta.json(.zst) + attribution.json(.zst) + patch.gcpatch
           exact/       ...
         major/
           simplified/  ...
@@ -105,8 +105,10 @@ POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.
 
 Water files: `admin_polygons.bin`, `admin_rings.bin`, `arc_index.bin`,
 `arc_vertices.bin`, `admin_cells.bin`, `admin_entries.bin`,
-`strings_core.bin`, `strings_layout.json`, `water_meta.json` (each type
-code's class, type and Nominatim rank) and `attribution.json`. The names of
+`strings_core.bin`, `strings_layout.json`, `water_cut_arcs.bin` (a bit per
+arc slot, set for a cut between two pieces of one water, which the server's
+`water.landmark` takes for no shore), `water_meta.json` (each type code's
+class, type and Nominatim rank) and `attribution.json`. The names of
 the admin geometry, but a set of their own: their records, slots, arcs,
 cells and strings point into nothing else, and nothing points into them. A
 client puts them in `<dataset>/water/` (their component's `dir`, below), not
@@ -354,7 +356,7 @@ variants', and only those the region has.
    - builds/{date}/europe/full/…                (23 files + up to 4 optional)
    - builds/{date}/europe/quality/simplified/…  (4 files)
    - builds/{date}/europe/poi/notable/…         (7 files, optional)
-   - builds/{date}/europe/water/all/simplified/… (10 files, optional), into <dataset>/water/
+   - builds/{date}/europe/water/all/simplified/… (11 files, optional), into <dataset>/water/
    The JSON files (strings_layout.json, poi_meta.json, water_meta.json,
    attribution.json) are part of the set: the server reads
    strings_layout.json and poi_meta.json to load a region, water_meta.json

@@ -209,7 +209,7 @@ address, which it never changes (46.45, 6.55, in Lake Geneva):
     "country": "France",
     "country_code": "FR"
   },
-  "water": { "name": "Lake Geneva", "class": "water", "type": "lake" }
+  "water": { "name": "Lake Geneva", "class": "water", "type": "lake", "landmark": true }
 }
 ```
 
@@ -223,6 +223,40 @@ lake is in no water, unless a larger one holds the island. Nominatim's default
 answer has no water at all; [NOMINATIM_REFERENCE.md](NOMINATIM_REFERENCE.md#water-an-extension)
 gives how this field relates to its `layer=natural` lookup, the selection rule
 and how river areas are named.
+
+`"landmark": true`, last inside `water` and there only when true, says that a
+location line shows this water in the landmark's place, before the city, state
+and country: `landmark = water.landmark ? water.name : address.landmark`, as
+Immich stores it. Nothing else in the answer changes with it. The server sets it
+when all of these hold, the same on every water tier:
+
+- **A kind people name**: a sea or ocean; a bay, strait, cove, fjord, sound,
+  lagoon or harbour; a lake, reservoir, pond, oxbow or `natural/water`; a river
+  or canal area; a glacier; a wetland. Never a basin, fountain, fishpond, lock,
+  moat, salt pool or wastewater, nor a `water=*` value of its own.
+- **A real name**: none without a letter ("49,0"), nor a number after "No",
+  "Nr", "#", "№", or a word such as "Lake" or "Glacier" alone ("№30",
+  "Lake 938"); nor a river area's name taken weakly from a waterway that runs
+  only a short way into it (a tributary's, as "Newtown Creek" for the East
+  River's unnamed area).
+- **Big enough**: still water and wetlands of 1 ha or more; rivers, canals,
+  coastal water, seas and glaciers at any size.
+- **Not in the line already**: its name, lower case with letters and digits
+  alone, is not the city, state or country Immich shows (the first of `city`,
+  `town`, `village`, `hamlet`, `municipality`; of `state`, `province`,
+  `region`, `county`, `municipality`, `city`; and `country`, none without a
+  country), and neither it nor the landmark's name holds the other (from 4
+  characters: "Lake Titicaca (Peruvian sector)" names Lake Titicaca).
+- **The landmark gives way**: with no landmark, or a nature reserve, national
+  park or protected area (UNESCO zones among them) whose polygon is larger than
+  the water and the water a lake, glacier or coastal water of 0.1 km² or more,
+  or a river; or a natural feature (a beach, a glacier) whose polygon is larger
+  than the water. A sea, an ocean or a wetland never displaces a park, and
+  every other landmark (a bridge, a pier, a marina, a park, a building) stays.
+- **On the water, not at its edge**: no shore of that water within 40 m of the
+  point, in the dir's own geometry; a cut between two pieces of the same water
+  (`water_cut_arcs.bin`) and the marine areas' tenth-of-a-degree tile lines
+  are no shore.
 
 Status codes:
 - `200` - success
@@ -239,7 +273,7 @@ The project consists of four components:
 
 - **Builder** (`builder/`, C++) - `build-index` parses OSM PBF files and creates a compact binary index using S2 geometry cells for spatial lookup. `geocoder-diff` and `geocoder-patch` make and apply the daily patches ([builder/PATCHING.md](builder/PATCHING.md)), and `pbf-apply` applies OSM replication diffs to a PBF.
 - **Server** (`server/`, Rust) - Memory-maps the index files and serves queries via HTTP/HTTPS with sub-millisecond latency. It is also the `query_server` library the binding wraps.
-- **Node binding** (`node/`) - The native module Immich uses to geocode in-process: `Geocoder.load(dir)` (the dataset and its `water/` dir), then `reverseGeocode(lat, lng)` resolves to the response JSON as a string, `water` among it. `openPlaceSearch()` opens the place search index of the dataset (shipped with the bigger packs, else built on the device; see [builder/PATCHING.md](builder/PATCHING.md#place-search-index)), then `searchPlaces(query)` resolves to the results as a JSON string. `createTransportDecoder(dir, files)` decodes a downloading transport unit into the dir it is given, an existing one: the dataset dir for the units of the dataset's own dirs, `<dataset>/water/` for those of a water dir, whose files have the names of the boundary units' ([PATCHING.md](PATCHING.md#transport-units)).
+- **Node binding** (`node/`) - The native module Immich uses to geocode in-process: `Geocoder.load(dir)` (the dataset and its `water/` dir), then `reverseGeocode(lat, lng)` resolves to the response JSON as a string, `water` (and its `landmark` flag) among it. `openPlaceSearch()` opens the place search index of the dataset (shipped with the bigger packs, else built on the device; see [builder/PATCHING.md](builder/PATCHING.md#place-search-index)), then `searchPlaces(query)` resolves to the results as a JSON string. `createTransportDecoder(dir, files)` decodes a downloading transport unit into the dir it is given, an existing one: the dataset dir for the units of the dataset's own dirs, `<dataset>/water/` for those of a water dir, whose files have the names of the boundary units' ([PATCHING.md](PATCHING.md#transport-units)).
 - **Test portal** (`test-portal/`) - The map page served at `/test`, and a compose file that runs it on the published index.
 
 ### Index Structure
@@ -269,7 +303,7 @@ to the same files ([builder/PATCHING.md](builder/PATCHING.md#transport-units)).
 | `strings_core.bin`, `strings_street.bin`, `strings_addr.bin`, `strings_postcode.bin`, `strings_poi.bin` | Deduplicated string pool, in five tiers so each variant ships only the strings it uses; each tier front-coded in buckets cut by content (FCC2, `builder/src/string_files.h`), a string's id still its offset in the tier's pool |
 | `strings_layout.json` | Start and end of each string tier, which place every string offset |
 | `poi_meta.json` | POI category names and scoring parameters |
-| `water/` | The water layer, a set of its own in the admin files' formats (`admin_polygons.bin`, `admin_rings.bin`, `arc_index.bin`, `arc_vertices.bin`, `admin_cells.bin`, `admin_entries.bin`, `strings_core.bin`, `strings_layout.json`) and `water_meta.json`, each type code's class, type and Nominatim rank: a record per polygon carrying its OSM object's name, type code and area, and nothing pointing into the other files (`server/src/water.rs`, `builder/src/water_layer.h`) |
+| `water/` | The water layer, a set of its own in the admin files' formats (`admin_polygons.bin`, `admin_rings.bin`, `arc_index.bin`, `arc_vertices.bin`, `admin_cells.bin`, `admin_entries.bin`, `strings_core.bin`, `strings_layout.json`), `water_cut_arcs.bin`, a bit per arc slot marking the cuts between two pieces of one water, and `water_meta.json`, each type code's class, type and Nominatim rank: a record per polygon carrying its OSM object's name, type code, area and flags, and nothing pointing into the other files (`server/src/water.rs`, `builder/src/water_layer.h`) |
 
 ## Building from Source
 

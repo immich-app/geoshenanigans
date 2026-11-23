@@ -441,17 +441,26 @@ dirs must all be patched to the same date and swapped in together.
 
 The water layer (`src/water_layer.h`) writes three dirs under each region:
 `water/all/simplified/`, `water/all/exact/` and `water/major/simplified/`.
-Each is made of file names the patch format already has a section for, so no
-file id, GCPATCH or transport version changes:
+Each is made of file names the patch format has a section for, the admin
+geometry's and one of its own (file id 36, GCPATCH v20):
 
 - `admin_polygons.bin` and `admin_rings.bin`: one 16-byte record per polygon
   (an outer ring of an OSM object, with the holes inside it), its name in the
   dir's own `strings_core.bin`, its type code in the `country_code` field
-  (`water_meta.json` gives each code's class, type and Nominatim rank) and
-  the object's area, its polygons' exact areas less their holes, summed, in
-  the `area` field. Merged by slot (`ADMIN_SLOT_FAMILIES`), as the boundary
-  tiers are.
+  (`water_meta.json` gives each code's class, type and Nominatim rank), the
+  object's area, its polygons' exact areas less their holes, summed, in the
+  `area` field, and its flags in byte 14's place type: `kWeakName` where a
+  river area's name is a waterway's that runs under half the side of a square
+  of its area inside it (`weak_name`, `src/water_names.h`), a tributary's.
+  Merged by slot (`ADMIN_SLOT_FAMILIES`), as the boundary tiers are.
 - `arc_index.bin` and `arc_vertices.bin`: the tier's arcs, merged by slot.
+- `water_cut_arcs.bin`: a bit per arc slot, in u32 words (bit `s % 32` of
+  word `s / 32`), set where the arc is a cut: one only one object's polygons
+  use, and use twice or more (two pieces of a lake the split cut, two tiles
+  of a marine area), so that its water lies on both sides. The server takes
+  it for no shore. A sparse delta of its words (`SPARSE_DELTA_FILES`), raw:
+  its words follow the slots, so a day changes the words of the slots it
+  changes.
 - `admin_cells.bin` and `admin_entries.bin`: the cell index at
   `--admin-level` (L10 by default), interior where both tiers' rings hold
   the whole cell; the admin cell-index delta.
@@ -462,9 +471,12 @@ file id, GCPATCH or transport version changes:
   are empty pools.
 - `water_meta.json` and `attribution.json`: small JSON, carried inline.
 
-The two `all` dirs hold the same records, rings, cells and strings, byte for
-byte; only their arcs differ. `major/simplified/` is a subset with slots of
-its own.
+The two `all` dirs hold the same records, rings, cut arcs, cells and strings,
+byte for byte; only their arcs differ. `major/simplified/` is a subset with
+slots of its own: every marine area, objects of 100 km² or more, coastal water
+(bays, straits, fjords, sounds, lagoons and harbours, `is_coastal`) of 10 km²
+or more, so that a harbour answers there by its own name and not its sea's,
+and whole rivers (`src/water_classify.h`).
 
 What keeps a day's patch small:
 
@@ -535,7 +547,11 @@ seas, and Nominatim answers no `place=sea`. So does an OSM `natural=bay` or
 `strait` of a marine area's name (its `name` or `name:en`, ASCII case,
 spaces and punctuation aside) that holds water together with that area (a
 shared shore or point alone doesn't count), such as the Gulf of Oman
-(`drop_marine_namesakes`); every other OSM bay and strait stays.
+(`drop_marine_namesakes`); every other OSM bay and strait stays. An area
+shows the name its sea goes by where the IHO's reads awkwardly in a line
+(`marine::kShownNames`: "Mediterranean Sea" for either basin, "Barents Sea"
+for "Barentsz Sea"), a name in dispute as the source has it; its namesakes
+are those of either name.
 
 - **They don't change from day to day.** The nightly never runs the tool: it
   downloads the version `data/marine.json` pins (a run of Update Marine
@@ -577,7 +593,7 @@ and `admin_polygons` transport units (every dir holding all of a unit's files
 publishes it), the other `.bin` files as `.zst`, and `water_meta.json` and
 `attribution.json` among the JSON files (compressed and kept raw). The
 template's `water` axis takes `none`, `major`, `all` or `all-exact`, each a
-component of one dir's ten client files with `"dir": "water"`: a client puts
+component of one dir's eleven client files with `"dir": "water"`: a client puts
 them in `<dataset>/water/` and patches that dir with the water dir's own
 patch (`generate_patches.sh` diffs every dir holding `.bin` files, these
 among them). `component_sizes` in configurations.json gives each region's
@@ -737,8 +753,8 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=19 (u32) + flags=0 (u32)
-  (a v19 patcher accepts only v19 patches; the v8 to v19 changes are marked
+Header: "GCPATCH\0" (8) + version=20 (u32) + flags=0 (u32)
+  (a v20 patcher accepts only v20 patches; the v8 to v20 changes are marked
   below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
@@ -872,7 +888,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     remap_kind 0 raw, 2 a string offset, as its file's row of
     SPARSE_DELTA_FILES gives it, and the patcher refuses any other.
     v14: no kind 1, an admin id the patch remapped; v19: no kind 3, a
-    16-byte postcode centroid, whose file merges instead)
+    16-byte postcode centroid, whose file merges instead; v20: file id 36,
+    a water dir's water_cut_arcs.bin, raw)
   stride=0xFA (v8): parallel delta for a per-record side file (way_parents,
     way_postcodes, addr_postcodes, interp_postcodes), rebuilt along its
     parent's merge: parent_file_id u32, value_stride u32 = 4, remap_kind u32,

@@ -164,7 +164,7 @@ Where Nominatim's rank adjustment matters:
 | Suburb/neighbourhood rank adjustment | Covered by the query-time rank adjustment above | ✅ Implemented |
 | TIGER address interpolation | `--tiger-data` loads Nominatim's TIGER export (address ranges, one CSV per county) as interpolation lines, with each line's ZIP in interp_postcodes.bin | ✅ Implemented — a US street that wins without an address point takes its house number from the nearest interpolation line of that street, as Nominatim's `_find_tiger_number_for_street` does |
 | Postal city names | Not implemented | ❌ Deferred — in the US, USPS assigns city names to ZIP codes that may differ from the actual municipal jurisdiction (e.g., "Cumming, GA" for unincorporated Forsyth County). Neither we nor Nominatim handle this — would require external USPS data or addr:city extraction. |
-| `layer=natural` water bodies | The `water` field beside the address, from an optional water dir: the smallest area holding the point, then rank; river and canal areas named by their waterway; seas and oceans from Marine Regions (see "Water" above) | ℹ️ Extension — Nominatim's default answer has no water, and its `layer=natural` order is rank first |
+| `layer=natural` water bodies | The `water` field beside the address, from an optional water dir: the smallest area holding the point, then rank; river and canal areas named by their waterway; seas and oceans from Marine Regions; `water.landmark` where a location line names the water (see "Water" above) | ℹ️ Extension — Nominatim's default answer has no water, and its `layer=natural` order is rank first |
 | Name localisation | Not implemented — we store one name per feature, `name:en` where present, else `name` | ❌ Deferred — Nominatim supports `accept-language` header to return locale-specific names (e.g., `name:en=Borough of Luton` instead of `name=Luton`). Builder would need to store `name:en`, `name:fr`, etc. in the string pool (or a separate name table), and server would need to select based on client language preference. |
 
 ## Water (an extension)
@@ -226,7 +226,11 @@ Where Nominatim's rank adjustment matters:
   answers `{"address": {}, "water": {...}}`, where Nominatim answers
   `Unable to geocode`. Only a dataset whose region covers the open sea answers
   there: the planet's; a continent's dirs hold the coastal seas its region
-  takes in.
+  takes in. An area answers by the name its sea goes by where the IHO's reads
+  awkwardly in a line (`marine::kShownNames`: "Mediterranean Sea" for either
+  basin, "Barents Sea" for "Barentsz Sea", "Andaman Sea" for "Andaman or Burma
+  Sea"); a name in dispute ("Japan Sea", "Persian Gulf") stays as the source
+  has it.
 - **River naming.** River and canal areas are answers, as `waterway/river` and
   `waterway/canal`, named by themselves or by a waterway; an unnamed one that no
   waterway names is left out. An unnamed one takes the river whose waterway has
@@ -240,7 +244,11 @@ Where Nominatim's rank adjustment matters:
   across a missing node), the `name:en` of the most length among them, a tie
   going to the smaller name; else the relation's `name`. So neither one way's
   `name:en` nor a reach's local name renames the river. A river mapped only as
-  a line has no area and gets no `water`.
+  a line has no area and gets no `water`. A name so taken is weak where the
+  river's lines run under half the side of a square of the area's size inside
+  it, as a tributary's line ends in the river it flows into (the East River's
+  unnamed area takes "Newtown Creek"): the record says so, and the location
+  line (below) doesn't name it.
 - **Kinds out of scope**, as in Nominatim: unnamed water (but river and canal
   areas a waterway names, above), `water=stream|ditch|drain|fish_pass`, `water=*` without
   `natural=water`, `natural=coastline`. Left out for the Marine Regions areas:
@@ -249,6 +257,21 @@ Where Nominatim's rank adjustment matters:
 - **Precision.** `water=all-exact` holds every OSM point of every shore. `major`
   and `all` are simplified within 37.5 m, so a point within that of a shore can
   fall either side of it.
+- **The location line (`water.landmark`).** Nominatim has nothing like it. The
+  answer's `water` carries `"landmark": true`, last and only when true, where a
+  photo's location line would show the water in its landmark's place
+  (`landmark = water.landmark ? water.name : address.landmark`): a kind people
+  name (no basin, fishpond, lock or `water=*` value of its own), a name that is
+  no catalogue number nor a weak river name, still water and wetlands of 1 ha
+  or more, a name the line's city, state, country or landmark doesn't hold
+  already, a landmark that gives way (none; a nature reserve, national park or
+  protected area to a notable lake, glacier, coastal water or river smaller than
+  it; a natural feature to smaller water; never a sea, ocean or wetland over a
+  park), and no shore of the water within 40 m of the point, a cut between
+  pieces of one water and the marine tile lines aside. It is decided in the
+  multi-continent answer once the water and the address are final, the same on
+  every tier; `display_name`, `address` and `places` don't change. README.md
+  gives each rule.
 
 The server's lookup is `server/src/water.rs`; the builder's kinds, ranks and
 naming are `builder/src/water_classify.h`, `water_types.h` and `water_names.h`.
