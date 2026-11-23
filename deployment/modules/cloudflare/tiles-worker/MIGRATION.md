@@ -55,10 +55,12 @@ Dev needs none: nothing is removed from its state.
 
 ## Going back to v4
 
-v4 can't read state v5 has written, and reverting the commit doesn't put the removed entries back. Revert the module
-(`config.tf`, `workers.tf`, `.terraform.lock.hcl`) and the workflow steps. Then, for each environment and with no tiles
-deploy running, work from `deployment/modules/cloudflare/tiles-worker` with `TF_VAR_tiles_build_dir` pointing at a
-build of the worker (`npm run build` in `tiles`):
+v4 can't read state v5 has written, and reverting the commit doesn't put the removed entries back. First stop every
+apply of the module until you're done, since one in between would write v5 state again or apply over a half-restored
+one: `gh workflow disable tiles-worker.yml` and `gh workflow disable tiles-deploy.yml` once no run of either is in
+progress. Revert the module (`config.tf`, `workers.tf`, `.terraform.lock.hcl`) and the workflow steps. Then, for each
+environment, work from `deployment/modules/cloudflare/tiles-worker` with `TF_VAR_tiles_build_dir` pointing at a build
+of the worker (`npm run build` in `tiles`):
 
 ```sh
 set -euo pipefail
@@ -67,21 +69,36 @@ tg() { op run --env-file=../../../.env -- terragrunt run -- "$@"; }
 tg init -reconfigure
 ```
 
-and either push prod's copy back, if prod has applied nothing since it was taken:
+and either push prod's copy back:
 
 ```sh
 op document get "tiles-worker-prod state before provider v5" --vault tf_prod | tg state push -force -
 ```
 
-or adopt the live objects under the v4 types again, which needs no copy:
+which drops anything prod applied after the copy from state; the next v4 plan puts back what config still has (a
+newer deployment key, say), so read it before applying. Or adopt the live objects under the v4 types again, which needs
+no copy:
 
 ```sh
 account=$(op read op://tf/cloudflare/account_id)
-# Each custom domain's hostname and ID.
-tg state pull | jq -r '.resources[] | select(.type == "cloudflare_workers_custom_domain") | .instances[]
-  | "\(.index_key) \(.attributes.id)"'
-tg state rm cloudflare_workers_script.tiles cloudflare_workers_custom_domain.tiles \
-  cloudflare_workers_cron_trigger.heartbeat
+# The live domains' hostnames and IDs, from Cloudflare rather than state: a v5 apply that failed after forget never
+# saved its imports. CLOUDFLARE_API_TOKEN is any token that can read the account's Workers. On 2026-11-23 they were
+# 17b3213004b9d5f077563e3c4ea3171ef9d0c5fc (tiles.immich.cloud), 784d38aa18d0afda5695908b56a3799379362122
+# (tiles.prod.immich.cloud) and 8ec3085eac0b585919ba6cfa71adb181482915f5 (tiles.dev.immich.cloud).
+curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  "https://api.cloudflare.com/client/v4/accounts/$account/workers/domains?service=tiles-$ENVIRONMENT" |
+  jq -r '.result[] | "\(.hostname) \(.id)"'
+```
+
+Check that every hostname the environment serves has an ID (prod: `tiles.immich.cloud` and `tiles.prod.immich.cloud`,
+dev: `tiles.dev.immich.cloud`), then swap whichever v5 entries state has for the v4 ones:
+
+```sh
+mapfile -t v5 < <(tg state list |
+  grep -E '^cloudflare_workers_(script\.tiles|custom_domain\.tiles\[.*\]|cron_trigger\.heartbeat)$' || true)
+if [ ${#v5[@]} -gt 0 ]; then
+  tg state rm "${v5[@]}"
+fi
 tg import cloudflare_workers_script.tiles "$account/tiles-$ENVIRONMENT"
 tg import cloudflare_workers_cron_trigger.tiles "$account/tiles-$ENVIRONMENT"
 tg import cloudflare_workers_domain.tiles "$account/<ID of tiles.$ENVIRONMENT.immich.cloud>"
@@ -89,7 +106,8 @@ tg import cloudflare_workers_domain.tiles "$account/<ID of tiles.$ENVIRONMENT.im
 tg import 'cloudflare_workers_domain.tiles_prod[0]' "$account/<ID of tiles.immich.cloud>"
 ```
 
-v4's import doesn't read secrets back, so the next v4 plan updates the script in place with them.
+v4's import doesn't read secrets back, so the next v4 plan updates the script in place with them. Enable the two
+workflows again once that plan is what you expect.
 
 ## Afterwards
 

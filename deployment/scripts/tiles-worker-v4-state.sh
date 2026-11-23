@@ -67,6 +67,7 @@ case "$mode" in
       echo "$env: no provider v4 entries in tiles-worker state"
       exit 0
     fi
+    # Reverting the commit doesn't put these back; MIGRATION.md has how to go back to v4.
     echo "$env: removing ${#entries[@]} provider v4 entries from tiles-worker state; the apply imports the live objects"
     printf '  %s\n' "${entries[@]}"
     tg state rm -lock-timeout=1m "${entries[@]}"
