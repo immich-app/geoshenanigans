@@ -5356,6 +5356,10 @@ pub fn coarse_fields<T, N: PartialEq>(chain: [Option<T>; 3], query: [Option<T>; 
 /// (22) and neighbourhood (24) are ranks of their own.
 pub const PLACE_NODE_RANK: [u8; 7] = [16, 16, 16, 20, 20, 24, 22];
 
+/// rank_search of each PlaceNode type, from address-levels.json: a town's 18, a village's and a
+/// suburb's 19, a hamlet's and a quarter's 20.
+pub const PLACE_NODE_SEARCH_RANK: [u8; 7] = [16, 18, 19, 19, 20, 24, 20];
+
 /// insert_addresslines' weight on a place node's distance by its
 /// rank_search (placex_triggers.sql:597-605): city (16) 0.25, town (18) 0.5,
 /// all others 1. (A capital, rank_search 15, weighs 0.2 there; place nodes
@@ -5442,7 +5446,8 @@ pub fn place_node_covering(pn: &PlaceNode, feature: PlaceFeature<'_>) -> Option<
 /// (current_node_area := NULL, :651). A rank no boundary holds and whose
 /// nodes the walk all turns down still shows one: their rows all score -1 at
 /// query time and none is an area, so `distance desc` puts the farthest
-/// first, by its plain distance (the weights only order the walk). Of
+/// first, by its plain distance (the weights only order the walk), and of
+/// two as far the one of the higher rank_search (`rank_search desc`). Of
 /// Nislevvej's four hamlets outside the village Otterup's fuzzy area, that
 /// is Stormose. It sets no fuzzy area. Returns (rank, node, accepted) of the
 /// row each rank shows, by rank.
@@ -5514,9 +5519,11 @@ pub fn place_node_walk(nodes: &[(usize, u8, f64, f32, f32)], held_ranks: u32, mu
     }
 
     // The ranks the walk took no node of and no boundary holds: the farthest
-    // node of each inside its boundary.
+    // node of each inside its boundary, of equals the one of the higher
+    // rank_search (results.py:623).
+    let search = |k: usize| PLACE_NODE_SEARCH_RANK[nodes[k].0];
     let mut left: Vec<usize> = order.into_iter().filter(|&k| had & (1 << rank(k)) == 0).collect();
-    left.sort_by(|&a, &b| rank(a).cmp(&rank(b)).then(nodes[b].2.total_cmp(&nodes[a].2)).then(ties(a, b)));
+    left.sort_by(|&a, &b| rank(a).cmp(&rank(b)).then(nodes[b].2.total_cmp(&nodes[a].2)).then(search(b).cmp(&search(a))).then(ties(a, b)));
     for run in left.chunk_by(|&a, &b| rank(a) == rank(b)) {
         if let Some(&k) = run.iter().find(|&&k| in_boundary(k)) {
             shown.push((rank(k), k, false));
@@ -6785,6 +6792,18 @@ mod pure_helper_tests {
         assert_eq!(accept_place_nodes(&nodes, 1 << 20 | 1 << 24, |k| k != 3), [(16, 0, true)]);
         // Nor one of a rank whose nodes all lie outside their boundary.
         assert_eq!(accept_place_nodes(&nodes, 0, |k| k == 0), [(16, 0, true)]);
+    }
+
+    #[test]
+    fn place_nodes_of_a_rank_the_walk_accepts_none_of_tie_by_search_rank() {
+        // A suburb (rank_search 19) and a hamlet (20), both of rank 20 and as far from the street,
+        // outside the village's fuzzy area: `rank_search desc` orders them after the distance
+        // (results.py:611-623), so the hamlet shows.
+        let d = |m: f64| (m / METRES_PER_DEGREE).powi(2);
+        let nodes = [node_at(2, 0.0, d(100.0)), node_at(3, 3000.0, d(500.0)), node_at(4, 3100.0, d(500.0))];
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(16, 0, true), (20, 2, false)]);
+        let nodes = [node_at(2, 0.0, d(100.0)), node_at(4, 3100.0, d(500.0)), node_at(3, 3000.0, d(500.0))];
+        assert_eq!(accept_place_nodes(&nodes, 0, |_| true), [(16, 0, true), (20, 1, false)]);
     }
 
     #[test]
