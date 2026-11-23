@@ -108,6 +108,37 @@ TEST(a_segment_whose_ends_lie_more_than_half_the_world_apart_wraps) {
     CHECK(!segment_wraps({0, 1790000000}, {0, 1800000000}));
 }
 
+TEST(a_segment_across_the_antimeridian_is_cut_there_at_the_latitude_it_crosses_at) {
+    // 0.0002 east of it to 0.0001 west of it, rising 0.0003: it crosses two
+    // thirds of the way along, 0.0002 up, either way along it.
+    CHECK_EQ(antimeridian_latitude({100, 1799998000}, {3100, -1799999000}), int32_t(2100));
+    CHECK_EQ(antimeridian_latitude({3100, -1799999000}, {100, 1799998000}), int32_t(2100));
+    // Half an e7 unit up from its southern end: a half to the north.
+    CHECK_EQ(antimeridian_latitude({0, 1799999999}, {1, -1799999999}), int32_t(1));
+    CHECK_EQ(antimeridian_latitude({1, -1799999999}, {0, 1799999999}), int32_t(1));
+    CHECK_EQ(antimeridian_latitude({-1, 1799999999}, {0, -1799999999}), int32_t(0));
+    const std::vector<PackedLocation> line = {{0, 1799990000}, {100, 1799998000}, {3100, -1799999000}, {3200, -1799990000}};
+    std::vector<PackedLocation> cut;
+    cut_at_antimeridian(line.data(), static_cast<uint32_t>(line.size()), cut);
+    CHECK(cut == std::vector<PackedLocation>({{0, 1799990000},
+                                              {100, 1799998000},
+                                              {2100, 1800000000},
+                                              {2100, -1800000000},
+                                              {3100, -1799999000},
+                                              {3200, -1799990000}}));
+    // Each piece stays on its side; the stretch along the antimeridian wraps.
+    CHECK(!segment_wraps(cut[1], cut[2]) && segment_wraps(cut[2], cut[3]) && !segment_wraps(cut[3], cut[4]));
+    // West to east: the first end's side first.
+    cut.clear();
+    const std::vector<PackedLocation> back = {{3100, -1799999000}, {100, 1799998000}};
+    cut_at_antimeridian(back.data(), 2, cut);
+    CHECK(cut == std::vector<PackedLocation>({{3100, -1799999000}, {2100, -1800000000}, {2100, 1800000000}, {100, 1799998000}}));
+    // A line that never crosses it is as it was.
+    cut.clear();
+    cut_at_antimeridian(line.data(), 2, cut);
+    CHECK(cut == std::vector<PackedLocation>(line.begin(), line.begin() + 2));
+}
+
 TEST(an_area_takes_the_key_of_most_length_and_that_keys_display_of_most_length) {
     // Object 0: key 1 (500 + 400) beats key 0 (800); key 1's display 3 has
     // 500 against display 2's 400. Object 1: keys tie, the smaller wins;

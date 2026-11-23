@@ -294,6 +294,55 @@ TEST(a_segment_of_no_length_lends_its_line_no_wikidata_item) {
     CHECK_EQ(named, size_t(1));
 }
 
+TEST(a_segment_across_the_antimeridian_credits_the_river_areas_it_runs_through_on_either_side) {
+    // Two unnamed river areas, 0.01 by 0.01 degrees, either side of the
+    // antimeridian along it, and one segment of a line from the middle of
+    // one to the middle of the other: each holds the half of it on its side.
+    Collected c = fixture();
+    const int32_t lat = 650000000, east = kAntimeridianE7 - 100000, west = -kAntimeridianE7;
+    c.closed_ways.push_back({2201, tags(code::kRiver, "", true), square(lat, east, 100000)});
+    c.closed_ways.push_back({2202, tags(code::kRiver, "", true), square(lat, west, 100000)});
+    LineIn anadyr;
+    anadyr.way = 2210;
+    anadyr.key = "nAnadyr";
+    anadyr.local = anadyr.display = "Anadyr";
+    anadyr.vertices = {pt(lat + 40000, east + 50000), pt(lat + 60000, west + 50000)};
+    c.lines.push_back(anadyr);
+    Collected joined = c;
+    Build b = assemble(joined, 1);
+    std::vector<uint32_t> rivers;
+    for (uint32_t p = 0; p < b.rings.polygons.size(); p++)
+        if (b.objects[b.object_of[p]].tags.river_area) rivers.push_back(p);
+    NamingCounts counts;
+    std::vector<Credit> credits = credit_naming_lines(b.rings, rivers, b.object_of, b.lines, counts, 2);
+    std::map<int64_t, uint64_t> mm;
+    for (const Credit& cr : credits) mm[b.objects[cr.object].id] += cr.mm;
+    const PackedLocation seam_east = pt(lat + 50000, kAntimeridianE7), seam_west = pt(lat + 50000, -kAntimeridianE7);
+    CHECK_EQ(mm[2201], segment_mm(anadyr.vertices[0], seam_east));
+    CHECK_EQ(mm[2202], segment_mm(seam_west, anadyr.vertices[1]));
+    // So both take its name.
+    const Layer layer = build(c);
+    std::set<int64_t> named;
+    for (size_t p = 0; p < layer.size(); p++)
+        for (int64_t id : {2201, 2202})
+            if (layer.identities[p] == way_identity(id) && name_of(layer, p) == "Anadyr") named.insert(id);
+    CHECK(named == std::set<int64_t>({2201, 2202}));
+}
+
+TEST(the_join_of_no_lines_credits_nothing_and_covers_no_river_area) {
+    Collected c = fixture();
+    Build b = assemble(c, 1);
+    std::vector<uint32_t> rivers;
+    for (uint32_t p = 0; p < b.rings.polygons.size(); p++)
+        if (b.objects[b.object_of[p]].tags.river_area) rivers.push_back(p);
+    REQUIRE(rivers.size() == 2u);
+    NamingCounts counts;
+    CHECK(credit_naming_lines(b.rings, rivers, b.object_of, NamingLines(), counts, 2).empty());
+    CHECK_EQ(counts.cover_entries, size_t(0));
+    CHECK(credit_naming_lines(b.rings, {}, b.object_of, b.lines, counts, 2).empty());
+    CHECK_EQ(counts.segments_in_cover, size_t(0));
+}
+
 TEST(a_lake_of_many_islands_is_cut_into_pieces_that_each_carry_the_lakes_name_type_and_area) {
     Collected c = fixture();
     // A lake of 0.4 x 0.4 degrees with 12 x 12 islands, one way round.
