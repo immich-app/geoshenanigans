@@ -439,10 +439,13 @@ dirs must all be patched to the same date and swapped in together.
 
 ### The water dirs
 
-The water layer (`src/water_layer.h`) writes three dirs under each region:
-`water/all/simplified/`, `water/all/exact/` and `water/major/simplified/`.
-Each is made of file names the patch format already has a section for, so no
-file id, GCPATCH or transport version changes:
+With `--multi-output`, the water layer (`src/water_layer.h`) writes three
+dirs under each region: `water/all/simplified/`, `water/all/exact/` and
+`water/major/simplified/`. A build without it writes one, `water/` beside
+the region's mode files: the `all` set's exact tier, its polygons in their
+own order as slots, with none of the sidecars (`*.osm_ids`) the patches'
+slots come from. Each is made of file names the patch format already has a
+section for, so no file id, GCPATCH or transport version changes:
 
 - `admin_polygons.bin` and `admin_rings.bin`: one 16-byte record per polygon
   (an outer ring of an OSM object, with the holes inside it), its name in the
@@ -533,9 +536,10 @@ bay, harbour or lake inside a sea answers there, the sea out in open water.
 OSM's own `place=sea` areas stay out of the layer: the marine areas hold the
 seas, and Nominatim answers no `place=sea`. So does an OSM `natural=bay` or
 `strait` of a marine area's name (its `name` or `name:en`, ASCII case,
-spaces and punctuation aside) that holds water together with that area (a
-shared shore or point alone doesn't count), such as the Gulf of Oman
-(`drop_marine_namesakes`); every other OSM bay and strait stays.
+spaces and punctuation aside) all of whose water the marine areas of that
+name hold (a shared shore or point aside), such as the Gulf of Oman
+(`drop_marine_namesakes`); every other OSM bay and strait stays, one that
+reaches past them or only overlaps them among them.
 
 - **They don't change from day to day.** The nightly never runs the tool: it
   downloads the version `data/marine.json` pins (a run of Update Marine
