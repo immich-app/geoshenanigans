@@ -120,15 +120,13 @@ What the polygons at a point cannot tell, and Nominatim decides on the whole geo
 
 Two rules wait for those. Nominatim ranks every boundary holding the point; here only the smallest of each admin_level is ranked, as a larger one round a replicated boundary would rank too high (Brussels' level 10 boundary under Bruxelles - Brussel would take the suburb from the Pentagon). And a boundary labelled city, town or village holds rank 16 from place nodes whatever its own rank, standing in for the linked place's rank that Nominatim gives it even below its own (the parish of Winsford ranks 16, its admin_level 20): holding only its own rank lets villages such as Argir in Tórshavn into the address.
 
-Smallest-area-wins then settles polygons that still map to the same output field (if two polygons both map to "county", the smaller one wins), and display_name lists the other at its rank as well, where no field's polygon has that rank (Nominatim's display_name joins every row): York County (rank 10, labelled county) beside the City of Fredericton (12). A polygon of the outline of the one that took its field is not listed, as Nominatim takes out a boundary repeating its parent's wikidata and geometry (Bruxelles - Brussel under Brussels).
+Each rank then shows one polygon, as Nominatim's `complete_address_details` orders a rank's rows (results.py:611-632). The street's index-time walk (`insert_addresslines`) takes the areas of a rank by getNearFeatures' distance, the street middle's distance to the area plus a hundred-thousandth of the street's to its centroid (partition-functions.sql:32-35), and accepts the first whose centroid lies in the area accepted before it; that row scores 0, and another area holding the result's centroid scores 1, the farthest first. Here every polygon of a rank holds the query point, so a rank of two or more shows the last in walk order that the walk does not accept: at 40 Mespil Road, County Dublin over the postal district Dublin 4 (a place area of rank 12 whose centre is the nearer the street), and in Belfast the County Borough over Belfast City District at 16. The others are no part. The same walk, keyed by the same distance, gives the place nodes their `current_boundary`. A polygon of the field and the outline of one before it is none of a rank's, as Nominatim takes out a boundary repeating its parent's wikidata and geometry (Bruxelles - Brussel under Brussels).
 
 The answer is then a list of rows, finest first, as Nominatim's `complete_address_details` gives it: these polygons, and at each rank no polygon holds the place node the walk takes there. Each row is a part of display_name, and the address keeps the first row of each label, finest first (`_write_typed_address`, format_json.py:29-34), a place node's or a polygon's alike: Brentwood's town node, promoted to 18 inside the Town of Islip (a boundary of rank 16 labelled town), is the town, and the Town of Islip is a part of display_name only; the parish of Vernhams Dean (rank 20, a linked village) is the village over the village node Vernham Street (18), which display_name lists after it. The one exception is a region of the country's own name (the Netherlands' constituent country), which the address leaves out and display_name keeps.
 
 ## Step 5: Competing polygons
 
-Nominatim uses `isaddress` flag in the database to determine which boundaries appear in the address. When multiple boundaries exist at the same rank, only one gets `isaddress=true`.
-
-We use smallest-area-wins with PIP verification. This is a different mechanism but achieves a similar result for most cases.
+Nominatim's `insert_addresslines` sets `isaddress` on one area a rank, and `complete_address_details` puts an area holding the result's centroid before it at query time, so one row a rank is shown. We take the polygons holding the query point, walk them as `insert_addresslines` does and show the one of Step 4.
 
 ## boundary=place handling
 
@@ -156,7 +154,7 @@ In `get_label_tag()`, DC has `category=('place', 'city')` so it hits check 5 (li
 ### Our approach
 
 - At query time: apply Nominatim's rank adjustment to the polygons containing the point (Nominatim runs it at index time)
-- Then for each output field (city, county, state, etc.), keep the smallest-area polygon, admin boundaries before place areas — when two polygons map to the same field, the more specific (smaller) one wins
+- Then one polygon a rank (Step 4), and each label to the finest row that has it
 
 ### Difference impact
 
@@ -173,7 +171,7 @@ Where Nominatim's rank adjustment matters:
 | get_label_tag() check 4 (ADMIN_LABELS rank//2) | rank_to_field() function | ✅ Implemented |
 | get_label_tag() check 5 (category[1] for place=* entities) | place_type_override covers this — boundary=place entities get place_type set | ✅ Implemented |
 | find_linked_place() node linking | Builder: label role member, wikidata match, the boundary's own place tag, then name match (`link_places_by_name`), in Nominatim's order; a boundary or place area of rank 0 in its country links nothing (find_linked_place returns at once); a linked place node is hidden from place results, except in admin-minimal when that set leaves its boundary out (L9-L11, place areas below rank 16): nothing there stands for the node | ✅ Implemented |
-| Rank adjustment for nested boundaries | At query time on the polygons containing the point, then smallest-area-wins per field | ✅ Implemented — containment judged by admin level, area and point on surface; what that leaves out is listed under Step 4 |
+| Rank adjustment for nested boundaries | At query time on the polygons containing the point, then one polygon a rank by the address walk | ✅ Implemented — containment judged by admin level, area and point on surface; what that leaves out is listed under Step 4 |
 | boundary=place entities (e.g., Washington DC) | Extracted in builder with admin_level=15 + place_type_override | ✅ Implemented |
 | Place node fallback (nearest city/town/village) | place_nodes.bin + find_places() with wide search | ✅ Implemented — place nodes are indexed at the admin cell level (L10); the query cell and its 8 neighbours cover ~30 km |
 | place_addressline pre-computed relationships | Not applicable — we do spatial lookup at query time | N/A — different architecture |

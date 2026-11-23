@@ -561,17 +561,6 @@ pub fn rank_to_field(rank: u8) -> Option<&'static str> {
     }
 }
 
-/// The address fields a polygon fills (AdminResult's), each in a slot of its own.
-pub const ADMIN_FIELDS: [&str; 18] = [
-    "country", "state", "province", "region", "state_district", "county", "district", "municipality", "city", "town",
-    "village", "hamlet", "city_district", "borough", "suburb", "quarter", "neighbourhood", "city_block",
-];
-
-/// The slot of an address field in ADMIN_FIELDS.
-pub fn admin_field_index(field: &str) -> Option<usize> {
-    ADMIN_FIELDS.iter().position(|f| *f == field)
-}
-
 /// The address fields a place node fills, by PlaceNode type.
 pub const PLACE_NODE_FIELDS: [&str; 7] = ["city", "town", "village", "suburb", "hamlet", "neighbourhood", "quarter"];
 
@@ -1847,9 +1836,10 @@ impl Index {
 
     pub fn debug_places(&self, lat: f64, lng: f64) -> serde_json::Value {
         let mut admin_scan = AdminScan::new(self, lat, lng);
-        let admin = self.find_admin_in(&mut admin_scan);
-        let current_boundaries = self.find_current_boundaries(&mut admin_scan, admin.country_code);
-        let place = self.find_places(PlaceFeature::Point(lat, lng), &current_boundaries, 0, None);
+        let point = PlaceFeature::Point(lat, lng);
+        let admin = self.find_admin_in(&mut admin_scan, point);
+        let current_boundaries = self.find_current_boundaries(&mut admin_scan, admin.country_code, point);
+        let place = self.find_places(point, &current_boundaries, 0, None);
 
         if self.places.is_none() { return serde_json::json!({"error": "no place nodes"}); }
         let to_m = |d2: f64| (d2.sqrt() * 6_371_000.0) as f64;
@@ -2006,11 +1996,12 @@ impl Index {
     }
 
     pub fn find_admin(&self, lat: f64, lng: f64) -> AdminResult<'_> {
-        self.find_admin_in(&mut AdminScan::new(self, lat, lng))
+        self.find_admin_in(&mut AdminScan::new(self, lat, lng), PlaceFeature::Point(lat, lng))
     }
 
-    /// `find_admin` over a scan the caller may share with the other admin lookups of the point.
-    pub fn find_admin_in(&self, scan: &mut AdminScan) -> AdminResult<'_> {
+    /// `find_admin` over a scan the caller may share with the other admin lookups of the point,
+    /// the rows of the address hanging from `feature` (area_rows).
+    pub fn find_admin_in(&self, scan: &mut AdminScan, feature: PlaceFeature<'_>) -> AdminResult<'_> {
         // For each admin level, the smallest-area polygon holding the point, the first in
         // visiting order among equals (`ScanPip::holds`: an entry flagged interior holds it
         // without a test). Owned AdminPolygon values so the backing admin_polygons file can be a
@@ -2082,11 +2073,6 @@ impl Index {
             .unwrap_or_default();
         result.postcode_area = self.postal_area_postcode(&postal_areas, &country_code_str, scan.pip.point.degrees());
 
-        // Map admin levels to address fields using country-specific config
-        // Track best (smallest area) polygon per output field, by its place
-        // in `ranked`: a slot per field of ADMIN_FIELDS.
-        let mut best_by_field: [Option<usize>; ADMIN_FIELDS.len()] = [None; ADMIN_FIELDS.len()];
-
         // Collect polygons at this point with their initial rank_address;
         // promote_nested_ranks then gives them their effective one.
         let mut ranked: Vec<RankedPoly> = Vec::new();
@@ -2130,59 +2116,49 @@ impl Index {
         ranked.retain(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address));
         result.boundary_ranks = rank_bits(&ranked);
 
-        // Now assign each polygon to its field slot. Each rank yields one
-        // field label (via place_type_override → fixed field, or
-        // rank_to_field). Smaller polygon (later in list after sort) wins
-        // Two-pass field assignment: admin boundaries (al < 15) have
-        // priority over place-area polygons (al=15). This prevents a
-        // small place=suburb closed way (e.g. Le Marais, Paris) from
-        // overriding the admin boundary (4th Arrondissement) that
-        // Nominatim uses for the same field. Nominatim's addressline
-        // walk prioritizes admin boundaries via `fromarea DESC` in the
-        // ORDER BY clause.
-        // Field assignment helper: determines which address field (if any)
-        // a polygon should claim. For sub-city ranks (>= 20), only polygons
-        // with an explicit place_type_override (i.e. tagged place=suburb /
-        // neighbourhood / quarter in OSM) get a named field. Pure admin
-        // boundaries at admin_level 9-11 (e.g. NYC community boards,
-        // Paris arrondissements-level sub-divisions) are administrative
-        // containers — Nominatim puts them in display_name as anonymous
-        // address rows but doesn't let them claim "neighbourhood" or
-        // "suburb" in the address dict, so they don't suppress the actual
-        // place=neighbourhood nodes found by find_places.
-        let field_for = polygon_field;
-        let slots: Vec<Option<usize>> = ranked.iter().map(|r| field_for(r).and_then(admin_field_index)).collect();
-
-        for (k, r) in ranked.iter().enumerate() {
-            if r.poly.admin_level == 15 { continue; } // skip place-area in first pass
-            if let Some(idx) = slots[k] {
-                if best_by_field[idx].is_some_and(|best| r.poly.area >= ranked[best].poly.area) { continue; }
-                best_by_field[idx] = Some(k);
-            }
-        }
-        // Second pass: place-area polygons fill only empty fields.
-        for (k, r) in ranked.iter().enumerate() {
-            if r.poly.admin_level != 15 { continue; }
-            if let Some(idx) = slots[k] {
-                best_by_field[idx].get_or_insert(k);
-            }
-        }
-
-        // The rows: each field's polygon, then those that lost their field at a rank no field's
-        // polygon has.
-        let winners = best_by_field;
-        result.country_code = winners[0].and_then(|k| country_code_bytes(ranked[k].poly.country_code));
-        let shown = winners.iter().flatten().copied().chain(unlabelled_rows(&ranked, &slots, &winners));
+        let shown = self.area_rows(&ranked, feature);
+        result.country_code = shown.iter()
+            .find(|&&k| polygon_field(&ranked[k]) == Some("country"))
+            .and_then(|&k| country_code_bytes(ranked[k].poly.country_code));
         result.rows = self.polygon_rows(&ranked, shown);
         result.ranked = ranked;
 
         result
     }
 
+    /// The polygon of `ranked` each rank shows, as Nominatim's complete_address_details orders
+    /// a rank's rows (results.py:611-632): the address walk accepts one area a rank
+    /// (CurrentBoundaries::accepted, by getNearFeatures' distance from `feature`,
+    /// area_row_distance), which scores 0, and another area holding the result's centroid scores
+    /// 1, the farthest first. Every polygon of `ranked` holds the point, so a rank of two or more
+    /// shows the last in walk order that the walk does not accept: of County Dublin and the postal
+    /// district Dublin 4 at rank 12, whose centre is the nearer Mespil Road, County Dublin. A
+    /// polygon of the field and the outline of one before it in `ranked` is none of a rank's: a
+    /// boundary repeating its parent's wikidata and geometry, which Nominatim takes out of
+    /// addresses (placex_triggers.sql:895-899), Bruxelles - Brussel under Brussels. Indices into
+    /// `ranked`, in walk order.
+    fn area_rows(&self, ranked: &[RankedPoly], feature: PlaceFeature<'_>) -> Vec<usize> {
+        let repeats = |k: usize| {
+            let (field, area) = (polygon_field(&ranked[k]), ranked[k].poly.area);
+            field.is_some() && ranked[..k].iter().any(|r| polygon_field(r) == field && r.poly.area == area)
+        };
+        let kept: Vec<usize> = (0..ranked.len()).filter(|&k| !repeats(k)).collect();
+        let candidates: Vec<(u8, AdminPolygon)> = kept.iter().map(|&k| (ranked[k].rank_address, ranked[k].poly)).collect();
+        let geometry = &self.admin_geometry;
+        let walk = CurrentBoundaries::accepted(&candidates, |c| self.area_row_distance(&candidates[c].1, feature),
+                                               |poly, current| geometry.point_on_surface_in(poly, current));
+        walk.chunk_by(|a, b| candidates[a.0].0 == candidates[b.0].0)
+            .map(|rank| match rank {
+                [(c, _)] => kept[*c],
+                _ => kept[rank.iter().rev().find(|(_, accepted)| !accepted).map_or(rank[0].0, |(c, _)| *c)],
+            })
+            .collect()
+    }
+
     /// The address rows of polygons `shown` of `ranked`, each labelled by its field
     /// (polygon_field), the finest first.
-    fn polygon_rows(&self, ranked: &[RankedPoly], shown: impl Iterator<Item = usize>) -> Vec<AddressRow<'_>> {
-        let mut rows: Vec<AddressRow> = shown.map(|k| self.area_row(&ranked[k])).collect();
+    fn polygon_rows(&self, ranked: &[RankedPoly], shown: impl IntoIterator<Item = usize>) -> Vec<AddressRow<'_>> {
+        let mut rows: Vec<AddressRow> = shown.into_iter().map(|k| self.area_row(&ranked[k])).collect();
         rows.sort_by(|a, b| b.rank.cmp(&a.rank));
         rows
     }
@@ -2198,13 +2174,14 @@ impl Index {
     // admin_level: on a Vatican point that is the Vatican itself, which keeps
     // Rome's neighbourhood nodes out. The walk accepts one boundary per rank,
     // and only one whose centroid lies in the boundary accepted before it
-    // (CurrentBoundaries::walk); the smallest containing polygon of a rank is
-    // tried first, and a polygon's point on surface stands in for its
-    // centroid. The rank is placex's rank_address, after the nested-boundary
-    // promotions (CurrentBoundaries::from_ranked). They are found at the
-    // point of `scan`, which keeps the polygons find_admin tested there from
-    // being tested again.
-    pub fn find_current_boundaries(&self, scan: &mut AdminScan, country_code: Option<[u8; 2]>) -> CurrentBoundaries {
+    // (CurrentBoundaries::walk); the containing polygon of a rank nearest
+    // `feature` is tried first (area_row_distance), and a polygon's point on
+    // surface stands in for its centroid. The rank is placex's rank_address,
+    // after the nested-boundary promotions (CurrentBoundaries::from_ranked).
+    // They are found at the point of `scan`, which keeps the polygons
+    // find_admin tested there from being tested again.
+    pub fn find_current_boundaries(&self, scan: &mut AdminScan, country_code: Option<[u8; 2]>, feature: PlaceFeature<'_>)
+        -> CurrentBoundaries {
         let cc: String = country_code
             .map(|c| c.iter().map(|b| b.to_ascii_uppercase() as char).collect())
             .unwrap_or_default();
@@ -2233,7 +2210,8 @@ impl Index {
             .collect();
         let inside = |poly: &AdminPolygon, current: &AdminPolygon| self.admin_geometry.point_on_surface_in(poly, current);
         let within = |poly: &AdminPolygon, other: &AdminPolygon| self.admin_geometry.polygon_within(poly, other);
-        CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter(), &cc, inside, within)
+        let distance = |poly: &AdminPolygon| self.area_row_distance(poly, feature);
+        CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter(), &cc, inside, within, distance)
     }
 
     /// The place nodes of an address along `feature` (Nominatim's address walk, place_node_walk),
@@ -2627,13 +2605,15 @@ impl Index {
     // in the result, avoiding the false-positive EXTRAs from
     // the pure PIP approach.
     pub fn find_admin_from_chain(&self, start_poly_id: u32, lat: f64, lng: f64) -> AdminResult<'_> {
-        self.find_admin_from_chain_in(start_poly_id, &mut AdminScan::new(self, lat, lng))
+        self.find_admin_from_chain_in(start_poly_id, &mut AdminScan::new(self, lat, lng), PlaceFeature::Point(lat, lng))
     }
 
-    pub fn find_admin_from_chain_in(&self, start_poly_id: u32, scan: &mut AdminScan) -> AdminResult<'_> {
+    /// `find_admin_from_chain` over a scan the caller may share, the rows of the address hanging
+    /// from `feature` (area_rows).
+    pub fn find_admin_from_chain_in(&self, start_poly_id: u32, scan: &mut AdminScan, feature: PlaceFeature<'_>) -> AdminResult<'_> {
         let admin_parents = match &self.admin_parents {
             Some(m) => m,
-            None => return self.find_admin_in(scan),
+            None => return self.find_admin_in(scan, feature),
         };
         let parents_count = admin_parents.len() / 4;
         let total_polys = u64::from(self.admin_polygon_count());
@@ -2698,27 +2678,10 @@ impl Index {
         ranked.retain(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address));
         result.boundary_ranks = rank_bits(&ranked);
 
-        // Map to fields, a slot per field of ADMIN_FIELDS, each the polygon's place in `ranked`.
-        let mut best_by_field: [Option<usize>; ADMIN_FIELDS.len()] = [None; ADMIN_FIELDS.len()];
-        let slots: Vec<Option<usize>> = ranked.iter()
-            .map(|r| if r.poly.place_type_override > 0 {
-                place_type_to_field(r.poly.place_type_override)
-            } else {
-                rank_to_field(r.rank_address)
-            })
-            .map(|field| field.and_then(admin_field_index))
-            .collect();
-
-        for (k, r) in ranked.iter().enumerate() {
-            if let Some(idx) = slots[k] {
-                if best_by_field[idx].is_some_and(|best| r.poly.area >= ranked[best].poly.area) { continue; }
-                best_by_field[idx] = Some(k);
-            }
-        }
-
-        let winners = best_by_field;
-        result.country_code = winners[0].and_then(|k| country_code_bytes(ranked[k].poly.country_code));
-        let shown = winners.iter().flatten().copied().chain(unlabelled_rows(&ranked, &slots, &winners));
+        let shown = self.area_rows(&ranked, feature);
+        result.country_code = shown.iter()
+            .find(|&&k| polygon_field(&ranked[k]) == Some("country"))
+            .and_then(|&k| country_code_bytes(ranked[k].poly.country_code));
         result.rows = self.polygon_rows(&ranked, shown);
         result.ranked = ranked;
 
@@ -2970,7 +2933,8 @@ impl Index {
 
     // --- Combined query ---
 
-    fn resolve_admin<'a>(&'a self, scan: &mut AdminScan, lat: f64, lng: f64, street: Option<&(f64, WayRow, u32)>) -> AdminResult<'a> {
+    fn resolve_admin<'a>(&'a self, scan: &mut AdminScan, lat: f64, lng: f64, street: Option<&(f64, WayRow, u32)>,
+                         feature: PlaceFeature<'_>) -> AdminResult<'a> {
         // Hybrid admin resolution: when the primary is a street with a
         // pre-computed parent polygon, walk its admin_parents chain for
         // coarse ranks (country → city) and use PIP for finer ranks
@@ -2982,12 +2946,12 @@ impl Index {
         // street's centroid often sits in a different suburb polygon
         // than the query point — chain walk would then pick the
         // centroid-containing suburb rather than the query's suburb.
-        let admin_pip = self.find_admin_in(scan);
+        let admin_pip = self.find_admin_in(scan, feature);
         let admin_chain = (|| -> Option<AdminResult<'_>> {
             let wp = self.way_parents.as_ref()?;
             let (_, _, way_idx) = street?;
             let start = Self::sidecar_u32(wp, u64::from(*way_idx))?;
-            Some(self.find_admin_from_chain_in(start, scan))
+            Some(self.find_admin_from_chain_in(start, scan, feature))
         })();
         // Nominatim's answer puts, at each rank, a boundary holding the
         // result's centroid (for a street its ST_ClosestPoint to the query)
@@ -3090,24 +3054,6 @@ impl Index {
         // Run geo lookups first so we know the primary street
         let (addr, interp, street) = self.query_geo(lat, lng);
 
-        // One admin cell scan serves every admin lookup at the point.
-        let mut admin_scan = AdminScan::new(self, lat, lng);
-        let admin = self.resolve_admin(&mut admin_scan, lat, lng, street.as_ref());
-        // The boundaries place nodes must sit inside to be accepted in the
-        // address walk (Nominatim's `current_boundary`).
-        let current_boundaries = self.find_current_boundaries(&mut admin_scan, admin.country_code);
-        // address_havelevel: the ranks the address's boundaries hold take no
-        // place node. A boundary-derived city/town/village covers rank 16
-        // whatever its rank, so place nodes must not fill (or fuzzy-anchor
-        // on) a competing rank-16 candidate. Nominatim gives a boundary its
-        // linked place's rank even below its own (placex_triggers.sql:1129):
-        // the parish of Winsford, linked to a town, ranks 16 where its
-        // admin_level gives 20. The place type here need not be the one
-        // Nominatim links, so promote_nested_ranks only raises, and the hold
-        // stands in for that rank.
-        let rank16 = ["city", "town", "village"].iter().any(|label| admin.row(label).is_some());
-        let held_ranks = admin.boundary_ranks | if rank16 { 1 << CurrentBoundaries::CITY } else { 0 };
-
         // Primary-feature selection: match Nominatim's reverse flow —
         // pick the closest rank-26+ feature (road OR addressable POI),
         // then refine with a house number if one sits on the selected
@@ -3132,6 +3078,9 @@ impl Index {
         // house, of the house's postcode.
         let mut street_house: Option<(u32, AddrRecord)> = None;
         let mut road: Option<Cow<'_, str>> = None;
+        // The reach of a TIGER number, where a street won: the house number the street takes from
+        // the nearest interpolation line of its name in the US, without an address point.
+        let mut tiger_reach_sq: Option<f64> = None;
 
         // POI primary-feature candidate: Nominatim's
         // _find_closest_street_or_pois returns the closest rank-26+
@@ -3349,12 +3298,7 @@ impl Index {
                         street_house = Some((id, addr_pt));
                     }
                 }
-                // No address point: Nominatim falls back to TIGER in the US.
-                if house_number.is_none() && admin.country_code == Some(*b"US") {
-                    if let Some(number) = road.as_deref().and_then(|name| self.find_interp_on_way(lat, lng, name, refine_max_sq)) {
-                        house_number = Some(Cow::Owned(number.to_string()));
-                    }
-                }
+                tiger_reach_sq = Some(refine_max_sq);
             }
         }
 
@@ -3389,6 +3333,32 @@ impl Index {
             let house = if addr_won_primary { addr.as_ref().map(|(_, _, id)| *id) } else { street_house.as_ref().map(|(id, _)| *id) };
             Self::sidecar_u32(cities, u64::from(house?))
         });
+        // One admin cell scan serves every admin lookup at the point. The
+        // rows are those of the address hanging from `feature`.
+        let mut admin_scan = AdminScan::new(self, lat, lng);
+        let admin = self.resolve_admin(&mut admin_scan, lat, lng, street.as_ref(), feature);
+        // No address point: Nominatim falls back to TIGER in the US.
+        if let Some(refine_max_sq) = tiger_reach_sq {
+            if house_number.is_none() && admin.country_code == Some(*b"US") {
+                if let Some(number) = road.as_deref().and_then(|name| self.find_interp_on_way(lat, lng, name, refine_max_sq)) {
+                    house_number = Some(Cow::Owned(number.to_string()));
+                }
+            }
+        }
+        // The boundaries place nodes must sit inside to be accepted in the
+        // address walk (Nominatim's `current_boundary`).
+        let current_boundaries = self.find_current_boundaries(&mut admin_scan, admin.country_code, feature);
+        // address_havelevel: the ranks the address's boundaries hold take no
+        // place node. A boundary-derived city/town/village covers rank 16
+        // whatever its rank, so place nodes must not fill (or fuzzy-anchor
+        // on) a competing rank-16 candidate. Nominatim gives a boundary its
+        // linked place's rank even below its own (placex_triggers.sql:1129):
+        // the parish of Winsford, linked to a town, ranks 16 where its
+        // admin_level gives 20. The place type here need not be the one
+        // Nominatim links, so promote_nested_ranks only raises, and the hold
+        // stands in for that rank.
+        let rank16 = admin.ranked.iter().any(|r| matches!(polygon_field(r), Some("city" | "town" | "village")));
+        let held_ranks = admin.boundary_ranks | if rank16 { 1 << CurrentBoundaries::CITY } else { 0 };
         let place = self.find_places(feature, &current_boundaries, held_ranks, city);
 
         // Resolve postcode: mirror Nominatim's stored placex.postcode chain
@@ -4383,7 +4353,7 @@ mod query_tests {
         let idx = index(&[SHOALS, ("Elsewhere", 8, [0.0, 0.0, 0.1, 0.1])], &[SHOALS_VILLAGE]);
         let elsewhere = idx.admin_polygon(1).unwrap();
         let village = |gate: AdminPolygon| {
-            let gates = CurrentBoundaries::walk([(CurrentBoundaries::CITY, gate)], |_, _| true);
+            let gates = CurrentBoundaries::walk([(CurrentBoundaries::CITY, gate)], |_| 0.0, |_, _| true);
             idx.find_places(PlaceFeature::Point(5.05, 112.65), &gates, 0, None).rows.into_iter()
                 .find(|row| row.label == Some("village")).map(|row| row.name)
         };
@@ -5393,10 +5363,11 @@ pub const PLACE_NODE_RANK: [u8; 7] = [16, 16, 16, 20, 20, 24, 22];
 /// here carry no capital flag.)
 pub const PLACE_NODE_DISTANCE_WEIGHT: [f64; 7] = [0.25, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0];
 
-/// What place nodes are matched against (getNearFeatures' `feature`): the
-/// street an answer's address hangs from, Nominatim computing a street's
-/// address lines on its whole geometry (placex_triggers.sql:1216-1220), or
-/// the query point where the answer has no street.
+/// What place nodes and areas are matched against (getNearFeatures'
+/// `feature`): the street an answer's address hangs from, Nominatim
+/// computing a street's address lines on its whole geometry
+/// (placex_triggers.sql:1216-1220), or the query point where the answer has
+/// no street.
 #[derive(Clone, Copy)]
 pub enum PlaceFeature<'a> {
     Point(f64, f64),
@@ -5589,13 +5560,15 @@ impl CurrentBoundaries {
     /// ranked 22, not 14), then `walk` takes them as Nominatim's address walk
     /// does, over the ranks of address areas (ADDRESS_AREA_RANKS). `inside(
     /// poly, other)` tells whether poly's point on surface lies in other,
-    /// `within(poly, other)` whether poly lies within other.
+    /// `within(poly, other)` whether poly lies within other, and `distance`
+    /// is a boundary's getNearFeatures distance (Index::area_row_distance).
     pub fn from_ranked<'a>(
         mut ranked: Vec<RankedPoly>,
         place_areas: impl Iterator<Item = &'a AdminPolygon> + Clone,
         country: &str,
         inside: impl Fn(&AdminPolygon, &AdminPolygon) -> bool,
         within: impl Fn(&AdminPolygon, &AdminPolygon) -> bool,
+        distance: impl FnMut(&AdminPolygon) -> f64,
     ) -> Self {
         promote_nested_ranks(&mut ranked, place_areas.clone(), country, within);
         ranked.sort_by(|a, b| a.poly.area.total_cmp(&b.poly.area));
@@ -5605,38 +5578,78 @@ impl CurrentBoundaries {
             .collect();
         let gating = ranked.into_iter()
             .filter(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address) && !matches!(r.rank_address, 5 | 11));
-        Self { promoting, ..Self::walk(gating.map(|r| (r.rank_address, r.poly)), inside) }
+        Self { promoting, ..Self::walk(gating.map(|r| (r.rank_address, r.poly)), distance, inside) }
     }
 
     /// Each rank's boundary as Nominatim's address walk (insert_addresslines)
-    /// leaves it, from (rank_address, polygon) candidates holding the point:
-    /// taken by rank, the smallest first within a rank, a boundary is accepted
-    /// when none is yet at its rank and its centroid lies in the boundary
-    /// accepted before it. A rank's boundary is the last accepted at or below
-    /// it. A boundary smaller than the current one is taken to lie in it, as
-    /// nested boundaries do; one as large or larger is tested (`inside(
-    /// boundary, current)`), so it gates only when it is round the current
-    /// one (a suburb-linked boundary round a city-linked one), not beside it.
-    /// Simplified polygons overlap at shared borders, and testing a smaller
-    /// boundary there would reject the one the point is really in.
+    /// leaves it, from (rank_address, polygon) candidates holding the point
+    /// (`accepted`): a rank's boundary is the last accepted at or below it.
     pub fn walk(
         candidates: impl IntoIterator<Item = (u8, AdminPolygon)>,
+        mut distance: impl FnMut(&AdminPolygon) -> f64,
         inside: impl Fn(&AdminPolygon, &AdminPolygon) -> bool,
     ) -> Self {
-        let mut candidates: Vec<(u8, AdminPolygon)> = candidates.into_iter().collect();
-        candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.area.total_cmp(&b.1.area)));
+        let candidates: Vec<(u8, AdminPolygon)> = candidates.into_iter().collect();
         let mut found = Self::default();
-        let mut current: Option<(u8, AdminPolygon)> = None;
-        for (rank, poly) in candidates {
-            if let Some((current_rank, current_poly)) = &current {
-                if *current_rank == rank || (poly.area >= current_poly.area && !inside(&poly, current_poly)) { continue; }
-            }
-            current = Some((rank, poly));
+        for (k, accepted) in Self::accepted(&candidates, |k| distance(&candidates[k].1), inside) {
+            let (rank, poly) = candidates[k];
+            if !accepted || Self::UNGATED.contains(&rank) { continue; }
             for (slot, gate) in found.gates.iter_mut().zip(Self::RANKS) {
                 if rank <= gate { *slot = Some(poly); }
             }
         }
         found
+    }
+
+    /// The ranks whose areas the walk accepts without testing them against
+    /// the current boundary, and which never become it (postcodes 5 and
+    /// rank 11, placex_triggers.sql:629-631, :645).
+    pub const UNGATED: [u8; 2] = [5, 11];
+
+    /// Nominatim's address walk over areas (insert_addresslines,
+    /// placex_triggers.sql:596-656): `candidates`, (rank_address, polygon),
+    /// in walk order, each with whether the walk accepts it (isaddress). The
+    /// walk takes them by rank, and within a rank by getNearFeatures'
+    /// distance (`distance(index)`, Index::area_row_distance), the smaller
+    /// area first where that ties; a rank of one candidate needs no
+    /// distance. It accepts a candidate when none is yet at its rank and its
+    /// centroid lies in the boundary accepted before it, which it then
+    /// becomes. A boundary smaller than the current one is taken to lie in
+    /// it, as nested boundaries do; one as large or larger is tested
+    /// (`inside(boundary, current)`), so it is accepted only when it is round
+    /// the current one (a suburb-linked boundary round a city-linked one),
+    /// not beside it. Simplified polygons overlap at shared borders, and
+    /// testing a smaller boundary there would reject the one the point is
+    /// really in.
+    pub fn accepted(
+        candidates: &[(u8, AdminPolygon)],
+        mut distance: impl FnMut(usize) -> f64,
+        inside: impl Fn(&AdminPolygon, &AdminPolygon) -> bool,
+    ) -> Vec<(usize, bool)> {
+        let mut order: Vec<usize> = (0..candidates.len()).collect();
+        order.sort_by(|&a, &b| candidates[a].0.cmp(&candidates[b].0).then(candidates[a].1.area.total_cmp(&candidates[b].1.area)));
+        let mut keys = vec![0.0; candidates.len()];
+        for run in order.chunk_by_mut(|&a, &b| candidates[a].0 == candidates[b].0) {
+            if run.len() < 2 { continue; }
+            for &k in run.iter() {
+                keys[k] = distance(k);
+            }
+            run.sort_by(|&a, &b| keys[a].total_cmp(&keys[b]));
+        }
+        let mut walked = Vec::with_capacity(order.len());
+        let (mut had, mut current): (Option<u8>, Option<AdminPolygon>) = (None, None);
+        for k in order {
+            let (rank, poly) = candidates[k];
+            let ungated = Self::UNGATED.contains(&rank);
+            let accepted = had != Some(rank)
+                && (ungated || current.is_none_or(|current| poly.area < current.area || inside(&poly, &current)));
+            if accepted {
+                had = Some(rank);
+                if !ungated { current = Some(poly); }
+            }
+            walked.push((k, accepted));
+        }
+        walked
     }
 }
 
@@ -5727,28 +5740,6 @@ pub fn rank_bits(ranked: &[RankedPoly]) -> u32 {
     ranked.iter()
         .filter(|r| (1..u32::BITS as u8).contains(&r.rank_address))
         .fold(0, |bits, r| bits | 1 << r.rank_address)
-}
-
-/// The polygons of `ranked` that fill no field but are rows of the address all the same:
-/// Nominatim's address has a row a rank and keeps the first row of each label, and its
-/// display_name joins every row (format_json.py, results.py). `slots[k]` is the field ranked[k]
-/// would fill and `winners[f]` the polygon filling field f. Of each rank no field's polygon has,
-/// the smallest polygon that lost its field, unless it has the outline of the one that took it:
-/// that is one place tagged twice, as a boundary repeating its parent's wikidata and geometry,
-/// which Nominatim takes out of addresses (placex_triggers.sql:895-899). Indices into `ranked`,
-/// the finest rank first.
-pub fn unlabelled_rows(ranked: &[RankedPoly], slots: &[Option<usize>], winners: &[Option<usize>]) -> Vec<usize> {
-    let held = winners.iter().flatten().fold(0u32, |bits, &w| bits | 1u32.checked_shl(ranked[w].rank_address as u32).unwrap_or(0));
-    let mut by_rank: [Option<usize>; u32::BITS as usize] = [None; u32::BITS as usize];
-    for (k, (r, slot)) in ranked.iter().zip(slots).enumerate() {
-        let Some(winner) = slot.and_then(|f| winners[f]) else { continue };
-        let rank = r.rank_address as usize;
-        if winner == k || rank >= by_rank.len() || held & 1 << rank != 0 || ranked[winner].poly.area == r.poly.area { continue; }
-        if by_rank[rank].is_none_or(|b| r.poly.area < ranked[b].poly.area) {
-            by_rank[rank] = Some(k);
-        }
-    }
-    by_rank.into_iter().rev().flatten().collect()
 }
 
 #[derive(Serialize, Default)]
@@ -6464,7 +6455,7 @@ mod pure_helper_tests {
     fn current_boundaries_fall_back_to_the_country() {
         // A Vatican point: Rome's boundaries are near but leave it out; the
         // country holds it and gates every place rank.
-        let found = CurrentBoundaries::walk([(4, boundary(3, 2))], |_, _| true);
+        let found = CurrentBoundaries::walk([(4, boundary(3, 2))], |_| 0.0, |_, _| true);
         assert_eq!(names(&found), [Some(3); 5]);
     }
 
@@ -6473,7 +6464,7 @@ mod pure_helper_tests {
         // Spain's admin_level 10 ranks 22: it gates quarters and
         // neighbourhoods, while suburbs see the municipality around it.
         let candidates = [(22, boundary(1, 10)), (16, boundary(2, 8)), (4, boundary(3, 2))];
-        let found = CurrentBoundaries::walk(candidates, |_, _| true);
+        let found = CurrentBoundaries::walk(candidates, |_| 0.0, |_, _| true);
         assert_eq!(names(&found), [Some(2), Some(2), Some(2), Some(1), Some(1)]);
     }
 
@@ -6490,7 +6481,7 @@ mod pure_helper_tests {
             RankedPoly { poly: suburb, rank_address: 12 },
             RankedPoly { poly: country, rank_address: 4 },
         ];
-        let found = CurrentBoundaries::from_ranked(ranked, [].iter(), "", |_, _| true, |_, _| true);
+        let found = CurrentBoundaries::from_ranked(ranked, [].iter(), "", |_, _| true, |_, _| true, |_| 0.0);
         assert_eq!(names(&found), [Some(3), Some(3), Some(1), Some(2), Some(2)]);
     }
 
@@ -6503,7 +6494,7 @@ mod pure_helper_tests {
         let country = AdminPolygon { area: 1000.0, ..boundary(2, 2) };
         let nairobi = AdminPolygon { area: 100.0, place_type_override: 1, ..boundary(3, 15) };
         let ranked = vec![RankedPoly { poly: starehe, rank_address: 12 }, RankedPoly { poly: country, rank_address: 4 }];
-        let found = CurrentBoundaries::from_ranked(ranked, [nairobi].iter(), "", |_, _| true, |_, _| true);
+        let found = CurrentBoundaries::from_ranked(ranked, [nairobi].iter(), "", |_, _| true, |_, _| true, |_| 0.0);
         assert_eq!(names(&found), [Some(2), Some(1), Some(1), Some(1), Some(1)]);
     }
 
@@ -6521,7 +6512,7 @@ mod pure_helper_tests {
             level(10, 20, 1.0, 0), level(9, 18, 2.0, 0), level(8, 16, 4.0, 0),
             level(7, 14, 8.0, 0), level(6, 12, 16.0, 1), level(2, 4, 1000.0, 0),
         ];
-        let found = CurrentBoundaries::from_ranked(ranked, [].iter(), "", |_, _| true, |_, _| true);
+        let found = CurrentBoundaries::from_ranked(ranked, [].iter(), "", |_, _| true, |_, _| true, |_| 0.0);
         let gate = |rank| found.for_rank(rank).map(|p| p.admin_level);
         assert_eq!(gate(CurrentBoundaries::SUBURB), Some(8));
         assert_eq!(gate(CurrentBoundaries::QUARTER), Some(9));
@@ -6544,9 +6535,9 @@ mod pure_helper_tests {
             RankedPoly { poly: suburb, rank_address: 12 },
             RankedPoly { poly: country, rank_address: 4 },
         ];
-        let concentric = CurrentBoundaries::from_ranked(ranked(), [].iter(), "", |_, _| true, |_, _| true);
+        let concentric = CurrentBoundaries::from_ranked(ranked(), [].iter(), "", |_, _| true, |_, _| true, |_| 0.0);
         assert_eq!(names(&concentric), [Some(2), Some(2), Some(1), Some(1), Some(1)]);
-        let overlapping = CurrentBoundaries::from_ranked(ranked(), [].iter(), "", |poly, _| poly.name_id != 1, |_, _| true);
+        let overlapping = CurrentBoundaries::from_ranked(ranked(), [].iter(), "", |poly, _| poly.name_id != 1, |_, _| true, |_| 0.0);
         assert_eq!(names(&overlapping), [Some(2); 5]);
     }
 
@@ -6555,23 +6546,51 @@ mod pure_helper_tests {
         // A county, then a town, each smaller than the boundary before: both
         // are accepted without testing their centroids.
         let candidates = [(4, boundary(3, 2)), (12, AdminPolygon { area: 0.5, ..boundary(5, 6) }), (16, AdminPolygon { area: 0.1, ..boundary(6, 8) })];
-        let found = CurrentBoundaries::walk(candidates, |_, _| false);
+        let found = CurrentBoundaries::walk(candidates, |_| 0.0, |_, _| false);
         assert_eq!(names(&found), [Some(6); 5]);
     }
 
     #[test]
-    fn current_boundaries_try_the_smallest_of_a_rank_first() {
-        // Two rank 20 boundaries: the smaller is accepted and the larger
-        // skipped; where the smaller lies outside the current boundary, the
-        // larger is tried next.
+    fn current_boundaries_try_the_nearest_of_a_rank_first() {
+        // Two rank 20 boundaries: the one nearer the street is accepted and
+        // the other skipped; where the nearer lies outside the current
+        // boundary, the other is tried next. At an equal distance the smaller
+        // is tried first.
         let wider = AdminPolygon { area: 20.0, ..boundary(4, 8) };
         let suburb = AdminPolygon { area: 10.0, ..boundary(1, 8) };
         let city = AdminPolygon { area: 1.0, ..boundary(2, 6) };
         let candidates = [(20, wider), (20, suburb), (16, city)];
-        let found = CurrentBoundaries::walk(candidates, |_, _| true);
+        let suburb_nearer = |poly: &AdminPolygon| if poly.name_id == 1 { 1.0 } else { 2.0 };
+        let found = CurrentBoundaries::walk(candidates, suburb_nearer, |_, _| true);
         assert_eq!(names(&found), [Some(2), Some(2), Some(1), Some(1), Some(1)]);
-        let found = CurrentBoundaries::walk(candidates, |poly, _| poly.name_id != 1);
+        let found = CurrentBoundaries::walk(candidates, suburb_nearer, |poly, _| poly.name_id != 1);
         assert_eq!(names(&found), [Some(2), Some(2), Some(4), Some(4), Some(4)]);
+        let wider_nearer = |poly: &AdminPolygon| if poly.name_id == 4 { 1.0 } else { 2.0 };
+        let found = CurrentBoundaries::walk(candidates, wider_nearer, |_, _| true);
+        assert_eq!(names(&found), [Some(2), Some(2), Some(4), Some(4), Some(4)]);
+        let found = CurrentBoundaries::walk(candidates, |_| 0.0, |_, _| true);
+        assert_eq!(names(&found), [Some(2), Some(2), Some(1), Some(1), Some(1)]);
+    }
+
+    #[test]
+    fn the_area_walk_accepts_one_a_rank_and_tests_no_rank_11_area_against_the_current_boundary() {
+        // A rank 12 boundary nearer the street than another of its rank is
+        // accepted, the other not. A rank 11 area is accepted without a test
+        // and never becomes the current boundary: the rank 16 one after it is
+        // tested against the county.
+        let county = AdminPolygon { area: 10.0, ..boundary(1, 6) };
+        let other = AdminPolygon { area: 5.0, ..boundary(2, 6) };
+        let eleven = AdminPolygon { area: 20.0, ..boundary(3, 7) };
+        let town = AdminPolygon { area: 15.0, ..boundary(4, 8) };
+        let candidates = [(12, other), (16, town), (11, eleven), (12, county)];
+        let distance = |k: usize| if k == 3 { 1.0 } else { 2.0 };
+        let tested = std::cell::RefCell::new(Vec::new());
+        let inside = |poly: &AdminPolygon, current: &AdminPolygon| {
+            tested.borrow_mut().push((poly.name_id, current.name_id));
+            true
+        };
+        assert_eq!(CurrentBoundaries::accepted(&candidates, distance, inside), [(2, true), (3, true), (0, false), (1, true)]);
+        assert_eq!(tested.into_inner(), [(4, 1)]);
     }
 
     #[test]
@@ -6580,7 +6599,7 @@ mod pure_helper_tests {
         // the city, town and village nodes; Keraniganj across the river,
         // outside it, is no candidate.
         let candidates = [(12, boundary(1, 6)), (10, boundary(2, 5)), (8, boundary(3, 4)), (4, boundary(4, 2))];
-        let found = CurrentBoundaries::walk(candidates, |_, _| true);
+        let found = CurrentBoundaries::walk(candidates, |_| 0.0, |_, _| true);
         assert_eq!(names(&found), [Some(1); 5]);
         assert_eq!(found.for_rank(CurrentBoundaries::CITY).map(|p| p.admin_level), Some(6));
     }
@@ -6940,7 +6959,7 @@ mod pure_helper_tests {
             RankedPoly { poly: county, rank_address: 12 },
             RankedPoly { poly: country, rank_address: 4 },
         ];
-        let found = CurrentBoundaries::from_ranked(ranked, [suburb, neighbourhood].iter(), "", |_, _| true, |_, _| true);
+        let found = CurrentBoundaries::from_ranked(ranked, [suburb, neighbourhood].iter(), "", |_, _| true, |_, _| true, |_| 0.0);
         let promoting: Vec<(u8, u32)> = found.promoting.iter().map(|(r, p)| (*r, p.name_id)).collect();
         assert_eq!(promoting, [(16, 1), (20, 4)]);
     }
@@ -6962,7 +6981,7 @@ mod pure_helper_tests {
 
     #[test]
     fn current_boundaries_are_empty_without_a_containing_boundary() {
-        let found = CurrentBoundaries::walk([], |_, _| true);
+        let found = CurrentBoundaries::walk([], |_| 0.0, |_, _| true);
         assert_eq!(names(&found), [None; 5]);
         assert!(found.for_rank(CurrentBoundaries::SUBURB).is_none());
     }
@@ -8511,9 +8530,10 @@ mod query_path_tests {
         for (north, east) in [(0.0, 0.0), (2000.0, 0.0), (0.0, 4000.0), (-2000.0, -2000.0)] {
             let p = at(north, east);
             let mut scan = AdminScan::new(&index, p.lat as f64, p.lng as f64);
-            let admin = index.find_admin_in(&mut scan);
-            let shared = index.find_current_boundaries(&mut scan, admin.country_code);
-            let fresh = index.find_current_boundaries(&mut AdminScan::new(&index, p.lat as f64, p.lng as f64), admin.country_code);
+            let point = PlaceFeature::Point(p.lat as f64, p.lng as f64);
+            let admin = index.find_admin_in(&mut scan, point);
+            let shared = index.find_current_boundaries(&mut scan, admin.country_code, point);
+            let fresh = index.find_current_boundaries(&mut AdminScan::new(&index, p.lat as f64, p.lng as f64), admin.country_code, point);
             assert_eq!(names(shared), names(fresh), "({north}, {east})");
         }
     }
@@ -10063,7 +10083,7 @@ mod admin_scan_tests {
             assert_eq!((a.name("country"), a.name("state"), a.name("neighbourhood")), (None, None, None), "({lat}, {lng})");
             let mut scan = AdminScan::new(&idx, lat, lng);
             assert!(scan.rings.is_empty(), "({lat}, {lng})");
-            let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"));
+            let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"), PlaceFeature::Point(lat, lng));
             assert!(gates.gates.iter().all(Option::is_none) && gates.promoting.is_empty(), "({lat}, {lng})");
             assert_eq!(idx.find_admin_from_chain(0, lat, lng).name("neighbourhood"), None, "({lat}, {lng})");
         }
@@ -10119,16 +10139,16 @@ mod admin_scan_tests {
         let parents = [NO_DATA, 0, 1, NO_DATA, 0];
         idx.admin_parents = Some(FileBytes::Owned(parents.iter().flat_map(|p| p.to_le_bytes()).collect()));
         let mut scan = AdminScan::new(&idx, Q.0, Q.1);
-        let a = idx.find_admin_in(&mut scan);
+        let a = idx.find_admin_in(&mut scan, PlaceFeature::Point(Q.0, Q.1));
         assert_eq!((a.name("country"), a.name("state"), a.name("city"), a.name("neighbourhood")), (Some("Egypt"), Some("Kharga"), Some("Paris"), Some("Bir Tarfawi")));
-        let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"));
+        let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"), PlaceFeature::Point(Q.0, Q.1));
         assert_eq!(gates.for_rank(CurrentBoundaries::CITY).map(|p| idx.get_string(p.name_id)).as_deref(), Some("Paris"));
         assert_eq!(scan.pip.memo.arcs_read(), 0);
         // The chain lookup from Paris over a scan of its own: its boundaries are the chain's (New
         // Valley, not the scan's Kharga, so this is no fallback to find_admin), its place area the
         // scan's interior entry.
         let mut scan = AdminScan::new(&idx, Q.0, Q.1);
-        let c = idx.find_admin_from_chain_in(2, &mut scan);
+        let c = idx.find_admin_from_chain_in(2, &mut scan, PlaceFeature::Point(Q.0, Q.1));
         assert_eq!((c.name("country"), c.name("state"), c.name("city"), c.name("neighbourhood")), (Some("Egypt"), Some("New Valley"), Some("Paris"), Some("Bir Tarfawi")));
         assert_eq!(scan.pip.memo.arcs_read(), 0);
         // The same rings listed not interior are tested.
@@ -10137,7 +10157,7 @@ mod admin_scan_tests {
             ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, false)]),
         ]);
         let mut scan = AdminScan::new(&idx, Q.0, Q.1);
-        assert_eq!(idx.find_admin_in(&mut scan).name("state"), Some("New Valley"));
+        assert_eq!(idx.find_admin_in(&mut scan, PlaceFeature::Point(Q.0, Q.1)).name("state"), Some("New Valley"));
         assert!(scan.pip.memo.arcs_read() > 0);
     }
 
@@ -10176,7 +10196,7 @@ mod admin_scan_tests {
         let arcs_read = |rings: &[Ring]| {
             let idx = admin_index(rings);
             let mut scan = AdminScan::new(&idx, Q.0, Q.1);
-            let state = idx.find_admin_in(&mut scan).name("state").map(str::to_owned);
+            let state = idx.find_admin_in(&mut scan, PlaceFeature::Point(Q.0, Q.1)).name("state").map(str::to_owned);
             (state, scan.pip.memo.arcs_read())
         };
         // Listed first, so visited first in a walk down the list.
@@ -10252,7 +10272,7 @@ mod admin_scan_tests {
             ring("Balat", 8, 0.5, (21.9, 27.4, 21.95, 27.7), &[(0, false)]),
             ring("Mut", 10, 0.3, (21.99, 27.5, 22.05, 27.6), &[(0, false)]),
         ]);
-        let gates = idx.find_current_boundaries(&mut AdminScan::new(&idx, Q.0, Q.1), Some(*b"eg"));
+        let gates = idx.find_current_boundaries(&mut AdminScan::new(&idx, Q.0, Q.1), Some(*b"eg"), PlaceFeature::Point(Q.0, Q.1));
         let name = |rank| gates.for_rank(rank).map(|p| idx.get_string(p.name_id));
         assert_eq!(name(CurrentBoundaries::CITY).as_deref(), Some("Paris"));
         assert_eq!(name(CurrentBoundaries::SUBURB).as_deref(), Some("Mut"));
@@ -10268,14 +10288,14 @@ mod admin_scan_tests {
             Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(0, false)]) },
         ]);
         let mut scan = AdminScan::new(&idx, Q.0, Q.1);
-        let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"));
+        let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"), PlaceFeature::Point(Q.0, Q.1));
         let name = |rank| gates.for_rank(rank).map(|p| idx.get_string(p.name_id));
         assert_eq!(name(CurrentBoundaries::CITY).as_deref(), Some("Paris"));
         assert_eq!(name(CurrentBoundaries::SUBURB).as_deref(), Some("Mut"));
-        let a = idx.find_admin_in(&mut scan);
+        let a = idx.find_admin_in(&mut scan, PlaceFeature::Point(Q.0, Q.1));
         assert_eq!((a.name("country"), a.name("state"), a.name("neighbourhood")), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
         // No admin_parents: the chain lookup falls back to find_admin over the same scan.
-        let c = idx.find_admin_from_chain_in(0, &mut scan);
+        let c = idx.find_admin_from_chain_in(0, &mut scan, PlaceFeature::Point(Q.0, Q.1));
         assert_eq!((c.name("country"), c.name("state"), c.name("neighbourhood")), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
     }
 
