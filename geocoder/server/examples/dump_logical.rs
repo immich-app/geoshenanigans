@@ -17,7 +17,8 @@
 //   addr_points.bin, addr_vertices.bin  an AddrPoint a record, and the
 //                                       footprints' logical blobs back to back
 //   way_parents.bin, way_postcodes.bin, addr_postcodes.bin,
-//   interp_postcodes.bin                a u32 a record
+//   addr_cities.bin, interp_postcodes.bin
+//                                       a u32 a record
 //   postcode_centroids.bin              a LogicalCentroid a centroid
 //                                       (builder/src/postcode_files.h), in
 //                                       their order, with its cell's key
@@ -63,10 +64,11 @@ use std::process::ExitCode;
 const USAGE: &str = "usage: dump_logical <build-dir> <out-dir>";
 
 /// The side files, each with the file of the records its values are of.
-const SIDE_FILES: [(&str, &str); 4] = [
+const SIDE_FILES: [(&str, &str); 5] = [
     ("way_parents.bin", "street_ways.bin"),
     ("way_postcodes.bin", "street_ways.bin"),
     ("addr_postcodes.bin", addr_files::POINTS_FILE),
+    ("addr_cities.bin", addr_files::POINTS_FILE),
     ("interp_postcodes.bin", "interp_ways.bin"),
 ];
 
@@ -201,7 +203,8 @@ fn dump(dir: &str, out: &str) -> Result<Vec<Family>, String> {
     let addrs = AddrFiles::open(file(addr_files::POINTS_FILE)?, file(addr_files::VERTICES_FILE)?, file(addr_files::INDEX_FILE)?)
         .map_err(|e| format!("{dir}: {e}"))?;
     let (street_ways, interp_ways) = (streets.as_ref().map(WayFiles::count), interps.as_ref().map(WayFiles::count));
-    let records = [street_ways, street_ways, addrs.as_ref().map(AddrFiles::count), interp_ways];
+    let addr_points = addrs.as_ref().map(AddrFiles::count);
+    let records = [street_ways, street_ways, addr_points, addr_points, interp_ways];
     let mut sides = Vec::new();
     for ((name, parent), records) in SIDE_FILES.into_iter().zip(records) {
         sides.push((name, side(dir, name, parent, records)?));
