@@ -162,10 +162,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
+      # query-portal, a bin of this crate, is built with this crate's
+      # lockfile, but its sources are tested in query-server's tests, with
+      # that crate's: every package this one holds is in that one alike.
+      - name: Lockfiles agree
+        run: python3 geocoder/builder/tools/check_cargo_locks.py geocoder/server/Cargo.lock geocoder/search/Cargo.lock
       - name: Test
         run: |
           cd geocoder/search
           cargo test --release --locked
+      # The test portal's server, a bin of this crate, as its image builds
+      # it: its tests run in query-server's, and it builds with the feature
+      # portal alone, so the step above doesn't build it.
+      - name: Build query-portal
+        run: |
+          cd geocoder/search
+          cargo build --release --locked --features portal --bin query-portal
 
   node-tests:
     name: Node binding tests
@@ -187,11 +199,16 @@ jobs:
           node --test test/*.test.mjs
 
   test-portal-tests:
-    name: Test portal entrypoint tests
+    name: Test portal tests
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: Test
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: geocoder/node/.nvmrc
+      - name: Entrypoint
         run: geocoder/test-portal/entrypoint.test.sh
+      - name: Page
+        run: node --test geocoder/test-portal/page.test.mjs

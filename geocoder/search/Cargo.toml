@@ -21,6 +21,25 @@ path = "src/main.rs"
 name = "geocoder-transport"
 path = "src/transport_cli.rs"
 
+# The test portal's server, which syncs the whole planet build and serves each selection of it,
+# its place search among it. Its sources are query-server's (server/src/portal.rs, taken in by
+# #[path]) and its tests run in query-server's, beside the routes it answers as, so it has no test
+# target of its own. It builds with the feature portal alone: a plain build of this crate (the
+# nightly's) makes place-search and geocoder-transport, and its dependencies stay out of the
+# library's. CI builds it as the image does. It runs on Unix alone: elsewhere it builds to a
+# binary that says so and exits.
+[[bin]]
+name = "query-portal"
+path = "src/portal_main.rs"
+test = false
+required-features = ["portal"]
+
+[features]
+# query-portal's server: the dependencies of query-server's own that its sources take.
+# float_roundtrip: the Immich column reads Natural Earth's GeoJSON to the bit, as JSON.parse does.
+portal = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:arc-swap", "dep:bcrypt", "dep:getrandom", "dep:http-body", "dep:libc",
+          "dep:serde", "dep:futures-util", "dep:bytes", "serde_json/float_roundtrip"]
+
 [dependencies]
 fst = "0.4"
 levenshtein_automata = "0.2"
@@ -30,6 +49,17 @@ serde_json = "1"
 sha2 = "0.11"
 zstd = "0.14"
 query-server = { path = "../server" }
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"], optional = true }
+arc-swap = { version = "1", optional = true }
+bcrypt = { version = "0.19", optional = true }
+getrandom = { version = "0.4", optional = true }
+http-body = { version = "1", optional = true }
+libc = { version = "0.2", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+futures-util = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
 
 [dev-dependencies]
 query-server = { path = "../server", features = ["fixtures"] }
