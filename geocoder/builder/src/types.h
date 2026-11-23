@@ -678,8 +678,11 @@ inline constexpr PoiCategory kPoiWaterKinds[] = {PoiCategory::NATURAL_WATER, Poi
 // links no parent street, so that the server's primary lane, which needs
 // one, takes none of it (compute_poi_parent_streets).
 static constexpr uint8_t POI_FLAG_PLACES_ONLY = 0x40;
+// A POI whose importance took the sitelink count of its Wikidata item
+// (reorder_pois), which the tier dirs holding one credit.
+static constexpr uint8_t POI_FLAG_SITELINKS = 0x80;
 // The flags no file holds.
-static constexpr uint8_t POI_FLAG_BUILD_MASK = POI_FLAG_WATER_MASK | POI_FLAG_PLACES_ONLY;
+static constexpr uint8_t POI_FLAG_BUILD_MASK = POI_FLAG_WATER_MASK | POI_FLAG_PLACES_ONLY | POI_FLAG_SITELINKS;
 
 // The tier of a POI of `cat`: its category's, one more important (lower)
 // with a wiki tag, but for tier 1.

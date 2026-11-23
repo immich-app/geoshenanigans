@@ -870,6 +870,7 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
                     if (sl > 0) {
                         // Smooth curve: 1 sitelink=1.2x, 10=1.8x, 50=2.9x, 200=3.6x
                         wiki_mult = 1.0 + std::log2(1.0 + sl) / 3.0;
+                        pr.flags |= POI_FLAG_SITELINKS;
                     } else if (has_wp && has_wd) {
                         wiki_mult = 3.0;  // fallback to binary flags
                     } else if (has_wp) {

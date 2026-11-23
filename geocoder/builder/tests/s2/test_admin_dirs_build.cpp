@@ -1745,38 +1745,75 @@ TEST(each_mode_dir_credits_the_sources_of_its_data) {
 }
 
 // A build that ranks its POIs by Wikidata's sitelinks (--wikidata-sitelinks)
-// credits Wikidata in each POI tier dir's poi_attribution.json, beside the
-// mode dir's credit of the OpenStreetMap data; one without them writes none
-// there. Downloads land flat by name, so no POI tier dir holds an
-// attribution.json, which would take the place of the mode dir's.
+// credits Wikidata in the poi_attribution.json of each POI tier dir holding
+// a POI whose importance took its item's count, beside the mode dir's credit
+// of the OpenStreetMap data; a tier of none of them, or a build without
+// them, writes none there. A museum (20) of Wikidata's Q4242 and 9 sitelinks
+// takes 20 x (1 + log2(10) / 3) = 42 for its importance, where without them
+// its wikidata tag gives 20 x 1.5 = 30; an artwork (2) of Q4243, tier 2 with
+// its tag, 2 x (1 + log2(10) / 3) = 4, else 3. Downloads land flat by name,
+// so no POI tier dir holds an attribution.json, which would take the place
+// of the mode dir's.
 TEST(poi_tiers_ranked_by_wikidata_sitelinks_credit_wikidata) {
     const ScratchDir root("wikidata-credit-build");
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
     const int32_t lat0 = 470000000, lng0 = 80000000;
     write_fixture_with(pbf, {node(990, lat0 + 1404000, lng0 + 1424000,
-                                  {{"name", "Museum Testdorf"}, {"tourism", "museum"}, {"wikidata", "Q4242"}})});
-    // Q4242 of 9 sitelinks, packed as extract_wikidata_sitelinks.py packs
-    // them ('<IH').
-    const std::string sitelinks = root.path() + "/qid_sitelinks.bin";
-    {
-        const uint8_t entry[6] = {0x92, 0x10, 0, 0, 9, 0};
-        std::ofstream f(sitelinks, std::ios::binary);
-        f.write(reinterpret_cast<const char*>(entry), sizeof entry);
+                                  {{"name", "Museum Testdorf"}, {"tourism", "museum"}, {"wikidata", "Q4242"}}),
+                             node(991, lat0 + 1404000, lng0 + 1434000,
+                                  {{"name", "Kunstwerk Testdorf"}, {"tourism", "artwork"}, {"wikidata", "Q4243"}})});
+    // Items of 9 sitelinks each, packed as extract_wikidata_sitelinks.py
+    // packs them ('<IH'), in QID order.
+    auto sitelinks = [&](const std::string& name, std::vector<uint32_t> qids) {
+        const std::string path = root.path() + "/" + name;
+        std::ofstream f(path, std::ios::binary);
+        for (const uint32_t qid : qids) {
+            const uint8_t entry[6] = {uint8_t(qid), uint8_t(qid >> 8), uint8_t(qid >> 16), uint8_t(qid >> 24), 9, 0};
+            f.write(reinterpret_cast<const char*>(entry), sizeof entry);
+        }
         REQUIRE(f.good());
-    }
+        return path;
+    };
     using Ids = std::vector<std::string>;
-    for (const bool ranked : {true, false}) {
-        const std::string out = root.path() + (ranked ? "/ranked" : "/plain");
+    const Ids wikidata = {"wikidata"}, none = {"none"};
+    struct Build {
+        const char* name;
+        std::string sitelinks;
+        // The credit of poi/major, poi/notable and poi/all.
+        std::vector<Ids> credits;
+        int museum, artwork;
+    };
+    const Build builds[] = {
+        {"ranked", sitelinks("both.bin", {4242, 4243}), {wikidata, wikidata, wikidata}, 42, 4},
+        // Of the artwork's item alone, and of one no POI has: poi/major
+        // holds the museum only, of no count.
+        {"artwork", sitelinks("artwork.bin", {1, 4243}), {none, wikidata, wikidata}, 30, 4},
+        {"unmatched", sitelinks("unmatched.bin", {1}), {none, none, none}, 30, 3},
+        {"plain", "", {none, none, none}, 30, 3},
+    };
+    for (const Build& b : builds) {
+        const std::string out = root.path() + "/" + b.name;
         std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf};
-        if (ranked) words.insert(words.end(), {"--wikidata-sitelinks", sitelinks});
+        if (!b.sitelinks.empty()) words.insert(words.end(), {"--wikidata-sitelinks", b.sitelinks});
         REQUIRE(gctest::run(words, log));
         const auto files = tree(out);
-        for (const char* tier : {"major", "notable", "all"}) {
-            const std::string dir = std::string("planet/poi/") + tier + "/", at = dir + "poi_attribution.json";
-            REQUIRE(files.count(dir + "poi_records.bin"));
-            if (credited(files, at) != (ranked ? Ids{"wikidata"} : Ids{"none"})) std::printf("    %s\n", at.c_str());
-            CHECK(credited(files, at) == (ranked ? Ids{"wikidata"} : Ids{"none"}));
+        const char* tiers[] = {"major", "notable", "all"};
+        for (size_t t = 0; t < 3; t++) {
+            const std::string dir = std::string("planet/poi/") + tiers[t] + "/", at = dir + "poi_attribution.json";
+            if (credited(files, at) != b.credits[t]) std::printf("    %s: %s\n", b.name, at.c_str());
+            CHECK(credited(files, at) == b.credits[t]);
             CHECK(!files.count(dir + "attribution.json"));
+            // The importance each POI of the tier took.
+            const std::vector<PoiRecord> pois = poi_records_in(files, std::string("planet/poi/") + tiers[t]);
+            REQUIRE(pois.size() == (t == 0 ? 1u : 2u));
+            for (const PoiRecord& pr : pois) {
+                const bool museum = pr.category == uint8_t(PoiCategory::MUSEUM);
+                if (pr.importance != (museum ? b.museum : b.artwork))
+                    std::printf("    %s %s: category %d of importance %d\n", b.name, tiers[t], int(pr.category),
+                                int(pr.importance));
+                CHECK_EQ(int(pr.importance), museum ? b.museum : b.artwork);
+                CHECK_EQ(int(pr.flags), int(POI_FLAG_WIKIDATA));
+            }
         }
         CHECK(credited(files, "planet/attribution.json") == Ids{"osm"});
     }

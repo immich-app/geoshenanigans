@@ -224,7 +224,7 @@ to the same files ([builder/PATCHING.md](builder/PATCHING.md#transport-units)).
 | `strings_layout.json` | Start and end of each string tier, which place every string offset |
 | `poi_meta.json` | POI category names and scoring parameters |
 | `attribution.json` | In each mode dir: the credit of the data it holds, one entry per source ([PATCHING.md](PATCHING.md#attribution)) |
-| `poi_attribution.json` | In a POI tier dir: Wikidata's credit, where its sitelinks ranked the POIs ([PATCHING.md](PATCHING.md#attribution)) |
+| `poi_attribution.json` | In a POI tier dir: Wikidata's credit, where its sitelinks ranked a POI of it ([PATCHING.md](PATCHING.md#attribution)) |
 
 ## Building from Source
 

@@ -90,7 +90,7 @@ stored once; those two files are what the tiers differ in.
 | `poi/notable/` | 7 files | Major + notable POIs (museums, castles, stadiums, beaches, etc.) |
 | `poi/all/` | 7 files | All POIs including minor ones (picnic sites, small galleries, etc.) |
 
-POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin`, `strings_poi.bin`, `strings_layout.json`, `poi_meta.json`, and `poi_attribution.json` (optional: Wikidata's credit, where its sitelinks ranked the POIs; Attribution, below). POIs with Wikipedia/Wikidata tags are promoted one tier.
+POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin`, `strings_poi.bin`, `strings_layout.json`, `poi_meta.json`, and `poi_attribution.json` (optional: Wikidata's credit, where its sitelinks ranked a POI of the tier; Attribution, below). POIs with Wikipedia/Wikidata tags are promoted one tier.
 
 ## Transport units
 
@@ -301,7 +301,7 @@ The data is owed credit, and the dataset carries it in two places:
   | `geonames` | GeoNames: postcode centroids where OSM has none (GB_full, which the nightly loads), with the Royal Mail notice of its readme and the changes the dataset made (CC BY 4.0 section 3(a)(1)(B)) | CC BY 4.0 | the dirs of `full`, `no-addresses` and `admin`, the ones holding postcode centroids |
   | `codepoint-open` | Ordnance Survey Code-Point Open, which GB_full is derived from, with the Ordnance Survey, Royal Mail and National Statistics statements of its licence | OGL v3.0 | the same, always beside `geonames` |
   | `tiger` | US Census Bureau TIGER/Line: US address ranges and ZIPs, and postcode centroids where OSM has none | Public domain, credited as a courtesy | the same |
-  | `wikidata` | Wikidata: the sitelink counts of the POIs' items, which their importance takes (`--wikidata-sitelinks`, which the nightly passes) | CC0 1.0 | the POI tier dirs of a build ranked by them |
+  | `wikidata` | Wikidata: the sitelink counts of the POIs' items, which their importance takes (`--wikidata-sitelinks`, which the nightly passes) | CC0 1.0 | the POI tier dirs holding a POI whose importance took one |
 
 - **`attribution.json`** in every mode dir (`full/`, `no-addresses/`,
   `admin/`, `admin-minimal/`, `admin-minimal-poi/`): a JSON array of the
@@ -314,8 +314,9 @@ The data is owed credit, and the dataset carries it in two places:
   postcodes, OSM alone). The quality dirs hold OpenStreetMap data only,
   which the mode dir's OSM entry covers.
 - **`poi_attribution.json`** in each POI tier dir (`poi/major/`,
-  `poi/notable/`, `poi/all/`) of a build whose POIs Wikidata's sitelinks
-  ranked: Wikidata's entry alone, in the same form. Their other data is
+  `poi/notable/`, `poi/all/`) holding a POI whose importance took the
+  sitelink count of its Wikidata item: Wikidata's entry alone, in the same
+  form. Their other data is
   OpenStreetMap's, which the mode dir's OSM entry covers, so a dataset with a
   POI tier credits the union of the two files. It has a name of its own as a
   dataset's files land in one dir by name. The template lists it among the
