@@ -30,7 +30,8 @@ TEST(attribution_of_osm_alone_is_its_entry) {
 }
 
 TEST(attribution_lists_its_sources_in_the_templates_order) {
-    const std::string all = attribution_json(ATTRIBUTION_TIGER | ATTRIBUTION_GEONAMES | ATTRIBUTION_OSM);
+    const std::string all =
+        attribution_json(ATTRIBUTION_TIGER | ATTRIBUTION_CODEPOINT | ATTRIBUTION_GEONAMES | ATTRIBUTION_OSM);
     const size_t osm = all.find("\"id\": \"osm\""), geonames = all.find("\"id\": \"geonames\""),
                  codepoint = all.find("\"id\": \"codepoint-open\""), tiger = all.find("\"id\": \"tiger\"");
     REQUIRE(osm != std::string::npos && geonames != std::string::npos && codepoint != std::string::npos &&
@@ -53,18 +54,20 @@ TEST(attribution_lists_its_sources_in_the_templates_order) {
 TEST(attribution_of_geonames_says_how_the_dataset_changed_its_data) {
     // CC BY 4.0 asks a distributor to say how it modified the material
     // (section 3(a)(1)(B)): the GeoNames entry says what the dataset holds of
-    // GB_full, after the readme's two notices.
-    const std::string geonames = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES);
-    const size_t at = geonames.find("\"id\": \"geonames\"");
-    REQUIRE(at != std::string::npos);
-    const std::string entry = geonames.substr(at, geonames.find('}', at) - at);
-    const size_t warranty = entry.find("The Data is provided");
-    const size_t changes = entry.find(
-        R"("Changes: this dataset holds the coordinates of the GB postcodes of GB_full.csv.zip that are of a valid )"
-        R"(form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none )"
-        R"(of the file's other fields.")");
-    REQUIRE(warranty != std::string::npos);
-    CHECK(changes != std::string::npos && warranty < changes);
+    // its postal code files, after the readme's notices.
+    for (const uint8_t sources : {uint8_t(ATTRIBUTION_GEONAMES), uint8_t(ATTRIBUTION_GEONAMES | ATTRIBUTION_CODEPOINT)}) {
+        const std::string geonames = attribution_json(ATTRIBUTION_OSM | sources);
+        const size_t at = geonames.find("\"id\": \"geonames\"");
+        REQUIRE(at != std::string::npos);
+        const std::string entry = geonames.substr(at, geonames.find('}', at) - at);
+        const size_t warranty = entry.find("The Data is provided");
+        const size_t changes = entry.find(
+            R"("Changes: this dataset holds the coordinates of the postcodes of GeoNames's postal code files that are )"
+            R"(of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it )"
+            R"(holds none of the files' other fields.")");
+        REQUIRE(warranty != std::string::npos);
+        CHECK(changes != std::string::npos && warranty < changes);
+    }
 }
 
 TEST(attribution_of_geonames_carries_the_credit_of_code_point_open) {
@@ -72,7 +75,7 @@ TEST(attribution_of_geonames_carries_the_credit_of_code_point_open) {
     // whose entry, under the Open Government Licence, travels with it: the
     // attribution statements of its licence.txt, the year GeoNames's Royal
     // Mail notice gives.
-    const std::string geonames = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES);
+    const std::string geonames = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES | ATTRIBUTION_CODEPOINT);
     const size_t at = geonames.find("\"id\": \"codepoint-open\"");
     REQUIRE(at != std::string::npos);
     const std::string entry = geonames.substr(at, geonames.find('}', at) - at);
@@ -104,8 +107,8 @@ TEST(attribution_of_wikidata_is_its_cc0_entry_alone) {
         if (wikidata.find(line) == std::string::npos) std::printf("    %s\n", line);
         CHECK(wikidata.find(line) != std::string::npos);
     }
-    const std::string every =
-        attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES | ATTRIBUTION_TIGER | ATTRIBUTION_WIKIDATA);
+    const std::string every = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES | ATTRIBUTION_CODEPOINT |
+                                               ATTRIBUTION_TIGER | ATTRIBUTION_WIKIDATA);
     CHECK(every.find("\"id\": \"tiger\"") < every.find("\"id\": \"wikidata\""));
 }
 
@@ -220,7 +223,8 @@ TEST(attribution_canonical_form_drops_only_the_members_named) {
 
 TEST(attribution_canonical_document_is_one_value_and_space) {
     CHECK_EQ(canonical_document(" [1, {\"a\": 2}]\n"), std::string(R"([1,{"a":2}])"));
-    for (const char* bad : {"[1] [2]", "[1],", "[1]x", "[1]\n]", "[1"}) {
+    for (const char* bad : {"[1] [2]", "[1],", "[1]x", "[1]\n]", "[1", R"(["\G"])", R"(["\x41"])", R"(["\u12G4"])",
+                            R"(["\u12"])", "[\"a\nb\"]", "[\"a\tb\"]", R"(["a\)"}) {
         bool threw = false;
         try {
             canonical_document(bad);
@@ -244,8 +248,8 @@ TEST(attribution_entries_are_the_templates) {
     const std::string key = "\"attribution\": [";
     const size_t at = json.find(key);
     REQUIRE(at != std::string::npos && json.find(key, at + 1) == std::string::npos);
-    const std::string all =
-        attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES | ATTRIBUTION_TIGER | ATTRIBUTION_WIKIDATA);
+    const std::string all = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES | ATTRIBUTION_CODEPOINT |
+                                             ATTRIBUTION_TIGER | ATTRIBUTION_WIKIDATA);
     const std::string templates = canonical(json, at + key.size() - 1, "applies_to"), written = canonical_document(all);
     if (templates != written) std::printf("    template: %s\n    written:  %s\n", templates.c_str(), written.c_str());
     CHECK(templates == written);
@@ -256,4 +260,26 @@ TEST(attribution_json_quote_escapes_what_json_needs) {
     CHECK_EQ(json_quote("a \"b\" \\ c"), std::string(R"("a \"b\" \\ c")"));
     CHECK_EQ(json_quote("tab\tline\n"), std::string(R"("tab\u0009line\u000a")"));
     CHECK_EQ(json_quote("©"), std::string("\"©\""));
+}
+
+TEST(attribution_of_geonames_beyond_gb_claims_no_gb_data) {
+    // GeoNames's centroids of other countries than GB (an operator's
+    // --external-postcodes) are no GB_full's: its entry gives the readme's
+    // notice of every file and the changes, without the UK notice, and no
+    // Code-Point Open entry comes with it.
+    const std::string swiss = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES);
+    CHECK(swiss.find("\"id\": \"geonames\"") != std::string::npos);
+    CHECK(swiss.find("The Data is provided") != std::string::npos);
+    CHECK(swiss.find("UK (GB_full.csv.zip)") == std::string::npos);
+    CHECK(swiss.find("Royal Mail") == std::string::npos);
+    CHECK(swiss.find("\"id\": \"codepoint-open\"") == std::string::npos);
+    // Its notices skip the UK one and stay one JSON document.
+    CHECK(canonical_document(swiss).find(R"("notices":["The Data is provided)") != std::string::npos);
+    // With a GB centroid, the UK notice opens GeoNames's notices.
+    const std::string gb = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES | ATTRIBUTION_CODEPOINT);
+    const size_t at = gb.find("\"id\": \"geonames\"");
+    REQUIRE(at != std::string::npos);
+    CHECK(gb.find(R"("notices": [
+      "UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.",
+      "The Data is provided)", at) != std::string::npos);
 }

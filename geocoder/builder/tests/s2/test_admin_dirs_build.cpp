@@ -1720,6 +1720,20 @@ TEST(each_mode_dir_credits_the_sources_of_its_data) {
         for (const char* mode : {"full", "no-addresses", "admin"})
             CHECK(credited(taken, std::string(region) + "/" + mode + "/attribution.json") == osm);
 
+    // A Swiss row of a postcode OSM has none for is GeoNames's, of no GB
+    // data: no Code-Point Open, nor GB_full's notice.
+    const std::string bern = root.path() + "/bern.csv";
+    write(bern, header + "8099,47.05,8.05,CH\n");
+    const auto swiss_only = build("swiss", {"--continents", "--multi-output", "--multi-quality", "--external-postcodes", bern});
+    for (const char* region : {"planet", "europe"})
+        for (const char* mode : {"full", "no-addresses", "admin"}) {
+            const std::string at = std::string(region) + "/" + mode + "/attribution.json";
+            if (credited(swiss_only, at) != Ids({"osm", "geonames"})) std::printf("    %s\n", at.c_str());
+            CHECK(credited(swiss_only, at) == Ids({"osm", "geonames"}));
+            const auto& file = swiss_only.at(at);
+            CHECK(std::string(file.begin(), file.end()).find("GB_full") == std::string::npos);
+        }
+
     // A whole dir, without the multi flags, credits its sources too.
     const auto single = build("single", {"--tiger-data", tiger});
     CHECK(credited(single, "planet/attribution.json") == Ids({"osm", "tiger"}));
