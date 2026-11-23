@@ -452,8 +452,9 @@ file id, GCPATCH or transport version changes:
   the `area` field. Merged by slot (`ADMIN_SLOT_FAMILIES`), as the boundary
   tiers are.
 - `arc_index.bin` and `arc_vertices.bin`: the tier's arcs, merged by slot.
-- `admin_cells.bin` and `admin_entries.bin`: the L10 cell index, interior
-  where both tiers' rings hold the whole cell; the admin cell-index delta.
+- `admin_cells.bin` and `admin_entries.bin`: the cell index at
+  `--admin-level` (L10 by default), interior where both tiers' rings hold
+  the whole cell; the admin cell-index delta.
 - `strings_core.bin` and a `strings_layout.json` of that core alone, as
   `admin-minimal/` has: the dir resolves no other dir's strings and no other
   dir resolves its. The diff looks for the other tiers beside the dir, then
