@@ -52,7 +52,7 @@ TEST(water_rings_are_cut_where_their_member_ways_meet) {
     AdminExactRings store;
     store.append(square.ring, {}, square.runs);
     const AdminArcs junctions = build_arc_topology(store, 1);
-    CHECK_EQ(junctions.arcs.size(), size_t(1));
+    REQUIRE(junctions.arcs.size() == 1u);
     CHECK(junctions.arcs[0].view.closed);
     const AdminArcs ends = build_arc_topology(store, 1, {}, ArcCuts::JunctionsAndWayEnds);
     CHECK_EQ(ends.counts.way_ends, size_t(2));
@@ -183,7 +183,7 @@ TEST(the_water_stage_builds_and_encodes_its_two_tiers_with_no_minimal_set) {
     }
     CHECK(arcs.stage == &kWaterArcStage);
     CHECK(blocks.stage == &kWaterArcStage);
-    CHECK_EQ(arcs.tiers.size(), kWaterArcTierCount);
+    REQUIRE(arcs.tiers.size() == kWaterArcTierCount);
     CHECK(arcs.minimal.arcs.empty());
     CHECK(arcs.minimal.ring_refs.empty());
     CHECK_EQ(arcs.arcs.size(), size_t(4));

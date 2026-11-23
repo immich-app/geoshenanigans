@@ -197,6 +197,7 @@ TEST(the_join_credits_each_segment_the_length_it_has_inside_an_area) {
         CHECK_EQ(b.objects[cr.object].id, int64_t(30));
         (b.lines.keys[cr.key] == "r900" ? main_mm : tributary_mm) += cr.mm;
     }
+    REQUIRE(b.lines.vertices.size() == 5u);
     const PackedLocation* v = b.lines.vertices.data();
     CHECK_EQ(main_mm, segment_mm(v[0], v[1]) + share_mm(v[1], v[2], 0.25L));
     CHECK_EQ(tributary_mm, segment_mm(v[3], v[4]));

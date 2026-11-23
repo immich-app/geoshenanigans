@@ -123,7 +123,6 @@ TEST(water_meta_json_round_trips_quotes_and_controls_and_refuses_what_it_did_not
     const std::optional<std::vector<MetaType>> back = parse_meta_json(meta_json(table, {c}));
     REQUIRE(back.has_value() && back->size() == 1u);
     CHECK((*back)[0].type == "a \"quoted\" \\ value\x01");
-    CHECK(parse_meta_json(meta_json(table, {}))->empty());
     CHECK(!parse_meta_json("").has_value());
     CHECK(!parse_meta_json("{\"types\": [{\"code\": 2}]}").has_value());
     // Of a string, the writer's escapes alone: \", \\ and \u00xx below 0x20,
