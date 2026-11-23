@@ -82,9 +82,16 @@ struct Fixture {
     }
 };
 
+// Says that `tool` failed and prints its log, which the scratch dir takes
+// with it.
+void print_failure(const std::string& tool, const std::string& log) {
+    const std::vector<char> text = read_file(log);
+    std::printf("    %s failed; its log:\n%.*s\n", tool.c_str(), static_cast<int>(text.size()), text.data());
+}
+
 // The server's answers (its query_json, through the grid_query example) at
 // each point from the index under dir, one JSON line each; none when it
-// can't load the index. Its stderr goes to log.
+// can't load the index. Its stderr goes to log, printed when it fails.
 std::vector<std::string> server_answers(const std::string& dir, const std::vector<std::pair<double, double>>& points,
                                         const std::string& scratch, const std::string& log) {
 #ifdef GEOCODER_GRID_QUERY_BIN
@@ -96,7 +103,10 @@ std::vector<std::string> server_answers(const std::string& dir, const std::vecto
     }
     const std::string cmd = gctest::quoted(GEOCODER_GRID_QUERY_BIN) + " " + gctest::quoted(dir) + " < " +
                             gctest::quoted(coords) + " > " + gctest::quoted(answers) + " 2>> " + gctest::quoted(log);
-    if (std::system(cmd.c_str()) != 0) return {};
+    if (std::system(cmd.c_str()) != 0) {
+        print_failure("grid_query", log);
+        return {};
+    }
     std::vector<std::string> lines;
     std::ifstream f(answers);
     for (std::string line; std::getline(f, line);) lines.push_back(line);
@@ -113,14 +123,18 @@ bool names(const std::string& answer, const std::string& field, const std::strin
     return answer.find("\"" + field + "\":\"" + value + "\"") != std::string::npos;
 }
 
-// The answers at the points from a build of the fixture, one each.
+// The answers at the points from a build of the fixture, one each; none,
+// the log printed, when the build fails.
 std::vector<std::string> answers_of(const Fixture& fixture, const std::string& name,
                                     const std::vector<std::pair<double, double>>& points) {
     const ScratchDir root(name);
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
     write_test_pbf(pbf, fixture.objects(), 1000);
     const std::string out = root.path() + "/out";
-    if (!gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log)) return {};
+    if (!gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log)) {
+        print_failure("build-index", log);
+        return {};
+    }
     return server_answers(out + "/planet", points, root.path() + "/answers", log);
 }
 
