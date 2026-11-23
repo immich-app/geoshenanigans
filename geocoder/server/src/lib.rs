@@ -3824,6 +3824,15 @@ impl MultiIndex {
     /// The answers borrow their strings from the continents' indexes,
     /// whose Arcs are held here until the chosen one is serialized.
     pub fn query_json(&self, lat: f64, lng: f64) -> String {
+        self.query_json_with_water(lat, lng, None)
+    }
+
+    /// query_json, with `water`, a water dir's layer the caller holds apart from the continents'
+    /// (the test portal's water= picks one), answering the water where no matching continent's
+    /// water holds the point, as a continent whose water dir held it would: its water.landmark
+    /// decided as query_json decides a continent's. A point no loaded continent covers has no
+    /// answer, as in query_json.
+    pub fn query_json_with_water(&self, lat: f64, lng: f64, water: Option<&WaterLayer>) -> String {
         let arcs = self.loaded_matches(lat, lng);
         let mut answers: Vec<Address<'_>> = arcs.iter().map(|arc| arc.query(lat, lng)).collect();
         let mut best: Option<(i32, usize)> = None;
@@ -3839,6 +3848,9 @@ impl MultiIndex {
             .chain(answers.into_iter().map(|r| r.water))
             .flatten()
             .min_by(WaterDetail::order);
+        if answer.water.is_none() {
+            answer.water = water.and_then(|w| w.at(lat, lng));
+        }
         let landmark = answer.water.as_ref().is_some_and(|w| w.takes_landmark(lat, lng, &answer.location_line()));
         if let Some(water) = answer.water.as_mut() {
             water.landmark = landmark;
@@ -4241,6 +4253,48 @@ mod query_tests {
         assert_eq!(with(lake("Vaud", (46.2, 6.1, 46.6, 6.9))), wet("Vaud", ""));
         // Without water, the answer is the dry one, byte for byte.
         assert_eq!(with(lake("Lac Léman", (46.5, 6.1, 46.6, 6.9))), dry);
+    }
+
+    // A water dir's layer held apart from the continents (the test portal's water= one) answers
+    // the water where no continent's water holds the point, its water.landmark decided as
+    // query_json decides a continent's: the answer is the one a continent whose water dir holds
+    // the layer gives. A continent's own water stays its own, and a point no continent covers
+    // still has no answer.
+    #[test]
+    fn a_water_layer_held_apart_answers_as_a_continents_water_where_theirs_holds_none() {
+        use crate::water::fixture::{WaterFixture, LAKE};
+        let (lat, lng) = (46.45, 6.55);
+        let (switzerland, vaud) = (("Switzerland", 2, [45.45, 5.55, 47.45, 7.55]), ("Vaud", 4, [45.95, 6.05, 46.95, 7.05]));
+        let europe = |water: Option<WaterLayer>| {
+            let mut idx = index(&[switzerland, vaud], &[]);
+            if let FileBytes::Owned(records) = &mut idx.admin_polygons {
+                records[12..14].copy_from_slice(&(u16::from(b'c') << 8 | u16::from(b'h')).to_le_bytes());
+            }
+            idx.water = water;
+            multi(vec![("europe", idx)])
+        };
+        let lake = |name: &str, span| WaterFixture::new().area(name, LAKE, span, &[]).layer();
+        let (far_in, near_shore) = ((46.2, 6.1, 46.6, 6.9), (46.4497, 6.1, 46.6, 6.9));
+
+        for span in [far_in, near_shore] {
+            let held = lake("Lac Léman", span);
+            let got = europe(None).query_json_with_water(lat, lng, Some(&held));
+            assert_eq!(got, europe(Some(lake("Lac Léman", span))).query_json(lat, lng));
+            assert_eq!(got.contains("\"landmark\":true"), span == far_in);
+        }
+        assert!(europe(None).query_json_with_water(lat, lng, Some(&lake("Lac Léman", far_in))).ends_with(
+            "\"water\":{\"name\":\"Lac Léman\",\"class\":\"water\",\"type\":\"lake\",\"landmark\":true}}"));
+        // None held, or one that doesn't hold the point: query_json's answer.
+        let dry = europe(None).query_json(lat, lng);
+        assert!(!dry.contains("water"));
+        assert_eq!(europe(None).query_json_with_water(lat, lng, None), dry);
+        assert_eq!(europe(None).query_json_with_water(lat, lng, Some(&lake("Lac Léman", (46.5, 6.1, 46.6, 6.9)))), dry);
+        // The continent's own water answers before the held one.
+        let own = europe(Some(lake("Lac de Joux", far_in)));
+        assert_eq!(own.query_json_with_water(lat, lng, Some(&lake("Lac Léman", far_in))), own.query_json(lat, lng));
+        assert!(own.query_json(lat, lng).contains("Lac de Joux"));
+        // Off every continent's cover: no answer.
+        assert_eq!(europe(None).query_json_with_water(91.0, lng, Some(&lake("Lac Léman", far_in))), "{}");
     }
 
     // The line the water is decided against is the one Immich shows: the first of the address's
