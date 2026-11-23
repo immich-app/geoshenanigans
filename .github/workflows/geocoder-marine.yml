@@ -107,6 +107,13 @@ jobs:
           SRC="$RUNNER_TEMP/marine-src"
           mkdir -p "$SRC"
           curl -sSfL --retry 3 --retry-delay 30 --connect-timeout 30 -o "$SRC/eez_iho.geojson" "$EEZ_IHO_URL"
+          # The WFS returns at most its server's cap of features, as a whole document all the same: only its
+          # counts tell a part of the layer from all of it, and a download without them stops the run too.
+          COMPLETE='.numberMatched == .numberReturned and .numberReturned == (.features | length)'
+          if ! jq -e "$COMPLETE" "$SRC/eez_iho.geojson" > /dev/null; then
+            echo "::error::The WFS gave a part of the sea areas, not the whole layer: $(jq -c '{numberMatched, numberReturned, features: (.features | length)}' "$SRC/eez_iho.geojson")"
+            exit 1
+          fi
           curl -sSfL --retry 3 --retry-delay 30 --connect-timeout 30 -o "$SRC/land-polygons-split-4326.zip" "$LAND_URL"
           LAND_DATE=$(unzip -p "$SRC/land-polygons-split-4326.zip" '*/README.txt' | sed -n 's/^Date of the data used is //p' | head -1)
           echo "LAND_DATE=$LAND_DATE" >> "$GITHUB_ENV"

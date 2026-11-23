@@ -107,16 +107,13 @@ constexpr uint64_t kStrategy2BytesPerRecord = 56;
 // The continent split's planet-sized scratch: an id map per record (4 B)
 // and, while ids are collected, 3 bits per record (the bit every worker
 // marks, and its RankedBits blocks of 16 B per 64 records); beside it, the
-// workers' copies of a share of the subset's cell pairs. The water split's
-// marks each planet water cell entry (1 B) and each of its cells, at most as
-// many as the entries: whether the continent routes it (1 B) and its first
-// entry (8 B), which the workers collect in parts of their own (8 B a cell,
-// up to twice that while they grow) beside the starts they make (24 B at
-// the peak).
+// workers' copies of a share of the subset's cell pairs. The water split
+// reads the planet's water masks (a byte a water cell entry, held with the
+// other kinds' masks while the continents run), and marks no entry or cell
+// of its own.
 constexpr uint64_t kFilterMapBytesPerRecord = 4;
 constexpr uint64_t kFilterMarkBitsPerRecord = 3;
 constexpr uint64_t kFilterPairCopyDivisor = 2;
-constexpr uint64_t kFilterWaterBytesPerPair = 1 + 1 + 3 * 8;
 
 // Per mode dir, write_index's slices in flight, postcode centroids and admin
 // cell copies (planet: 0.8 GiB for the three). The slices are the geo
@@ -146,6 +143,13 @@ constexpr uint64_t kPoiTierPoiTenths = 4;
 // sorted through a buffer as large (three times the cells).
 constexpr uint64_t kWaterStageWaterTenths = 6;
 constexpr uint64_t kWaterStageCellTimes = 3;
+
+// The water stage's arrays by slot, which a set's slot table sizes,
+// tombstones and all: the records at their slots, each slot's polygon and
+// the records it writes. The share of the layer above counts those of
+// today's polygons; a previous build whose slots outnumber them (water
+// gone since) leaves the rest to these.
+constexpr uint64_t kWaterSlotBytes = sizeof(AdminPolygon) + sizeof(uint32_t) + sizeof(AdminPolygonRecord);
 
 // What write_place_files holds beside the nodes it is given, as a multiple
 // of their bytes (20 a node): each node's cell key, the order and the sort's
@@ -211,12 +215,10 @@ inline uint64_t ordering_cost(const ParsedData& d) {
 }
 
 // What the continent split holds beyond the subset it builds.
-inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& planet_pairs,
-                            const KindValues& continent_pairs) {
+inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& continent_pairs) {
     const uint64_t records = sum(planet_counts);
     return records * kFilterMapBytesPerRecord + records * kFilterMarkBitsPerRecord / 8
-         + sum(continent_pairs) * sizeof(CellItemPair) / kFilterPairCopyDivisor
-         + at(planet_pairs, RecordKind::Waters) * kFilterWaterBytesPerPair;
+         + sum(continent_pairs) * sizeof(CellItemPair) / kFilterPairCopyDivisor;
 }
 
 // What each write stage holds while it runs: every stage a region's write
@@ -232,8 +234,10 @@ struct StageCosts {
 // The place stage writes its dirs one after another, each through the place
 // writer; an admin-minimal dir writes the nodes it keeps, a copy of at most
 // all of them, through the same writer. `water_pairs` are the water cell
-// index's entries, among the waters' bytes.
-inline StageCosts stage_costs(const KindValues& bytes, uint64_t water_pairs = 0) {
+// index's entries, among the waters' bytes; `water_slots` the previous
+// build's slots of the water dirs (water::previous_slots), each of which
+// the write keeps.
+inline StageCosts stage_costs(const KindValues& bytes, uint64_t water_pairs = 0, uint64_t water_slots = 0) {
     StageCosts c;
     const uint64_t admins = at(bytes, RecordKind::Admins), places = at(bytes, RecordKind::Places);
     c.modes = 3 * kModeBytes;
@@ -243,7 +247,8 @@ inline StageCosts stage_costs(const KindValues& bytes, uint64_t water_pairs = 0)
     c.poi_tiers = at(bytes, RecordKind::Pois) * kPoiTierPoiTenths / 10;
     const uint64_t waters = at(bytes, RecordKind::Waters);
     const uint64_t cells = std::min<uint64_t>(waters, water_pairs * sizeof(CellItemPair));
-    c.water = (waters - cells) * kWaterStageWaterTenths / 10 + cells * kWaterStageCellTimes;
+    c.water = (waters - cells) * kWaterStageWaterTenths / 10 + cells * kWaterStageCellTimes +
+              water_slots * kWaterSlotBytes;
     return c;
 }
 
@@ -255,8 +260,8 @@ struct RegionCost {
 };
 
 inline uint64_t region_peak(const KindValues& bytes, const KindValues& counts, uint64_t filter_bytes,
-                            RunOrder order, uint64_t water_pairs = 0) {
-    const StageCosts stages = stage_costs(bytes, water_pairs);
+                            RunOrder order, uint64_t water_pairs = 0, uint64_t water_slots = 0) {
+    const StageCosts stages = stage_costs(bytes, water_pairs, water_slots);
     const uint64_t steps = order == RunOrder::Serial ? stages.largest() : stages.total();
     return sum(bytes) + std::max({filter_bytes, strategy2_cost(counts, order), steps});
 }
@@ -265,11 +270,11 @@ inline uint64_t region_peak(const KindValues& bytes, const KindValues& counts, u
 // after another. It holds its whole reservation: its write takes no stage
 // leases of its own.
 inline RegionCost continent_cost(const KindValues& bytes, const KindValues& counts, uint64_t filter_bytes,
-                                 uint64_t capacity, uint64_t water_pairs = 0) {
-    const uint64_t at_once = region_peak(bytes, counts, filter_bytes, RunOrder::Concurrent, water_pairs);
+                                 uint64_t capacity, uint64_t water_pairs = 0, uint64_t water_slots = 0) {
+    const uint64_t at_once = region_peak(bytes, counts, filter_bytes, RunOrder::Concurrent, water_pairs, water_slots);
     if (at_once <= capacity) return {at_once, RunOrder::Concurrent};
 
-    return {region_peak(bytes, counts, filter_bytes, RunOrder::Serial, water_pairs), RunOrder::Serial};
+    return {region_peak(bytes, counts, filter_bytes, RunOrder::Serial, water_pairs, water_slots), RunOrder::Serial};
 }
 
 // A continent's share of the planet's values, kind by kind, from its share

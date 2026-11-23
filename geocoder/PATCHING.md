@@ -49,7 +49,7 @@ A file is published either as its own `<path>.zst` or inside a transport unit
 
 ## Files Overview
 
-A complete geocoder index for a given region and configuration consists of files from **up to three directories**:
+A complete geocoder index for a given region and configuration consists of files from **up to four directories**:
 
 ### Mode directory (pick one)
 
@@ -99,8 +99,8 @@ POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.
 
 | Water | Files | Description |
 |-------|-------|-------------|
-| `water/major/simplified/` | 10 files | The seas and oceans, in builds that pin the marine areas; lakes, bays, straits, wetlands and glaciers of 100 km² or more; whole rivers and canals whose areas sum to 100 km² (5 km² with a Wikidata item). Those are the thresholds to enter: one in the previous build's tier stays down to 90 km² (4.5 km²). Shores within 37.5 m |
-| `water/all/simplified/` | 10 files | Every named water area, every river or canal area its waterway names, and the seas and oceans in builds that pin the marine areas. Shores within 37.5 m |
+| `water/major/simplified/` | 10 files | The seas and oceans, in builds that pin the marine areas; every named water area of 100 km² or more, whatever its kind (lakes, reservoirs, bays, straits, wetlands, glaciers and the rest); whole rivers and canals whose areas sum to 100 km² (5 km² with a Wikidata item). Those are the thresholds to enter: one in the previous build's tier stays down to 90 km² (4.5 km²). Shores simplified with a tolerance of 37.5 m |
+| `water/all/simplified/` | 10 files | Every named water area, every river or canal area its waterway names, and the seas and oceans in builds that pin the marine areas. Shores simplified with a tolerance of 37.5 m |
 | `water/all/exact/` | 10 files | The same with every OSM point of every shore |
 
 Water files: `admin_polygons.bin`, `admin_rings.bin`, `arc_index.bin`,

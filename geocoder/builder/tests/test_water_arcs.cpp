@@ -59,7 +59,7 @@ TEST(water_rings_are_cut_where_their_member_ways_meet) {
     CHECK_EQ(ends.counts.junctions, size_t(2));
     REQUIRE(ends.arcs.size() == 2u);
     for (const Ring& v : arc_vertex_lists(ends, store)) {
-        CHECK_EQ(v.size(), size_t(3));
+        REQUIRE(v.size() == 3u);
         CHECK(v.front() == pt(0, 0) || v.front() == pt(100, 100));
         CHECK(v.back() == pt(0, 0) || v.back() == pt(100, 100));
     }
@@ -96,7 +96,7 @@ TEST(a_way_end_cuts_every_ring_through_it_so_shared_shores_stay_one_arc) {
         for (uint32_t r = 0; r < store.rings.size(); r++)
             for (uint32_t k = arcs.ring_refs[r]; k < arcs.ring_refs[r + 1]; k++) users[arcs.refs[k].arc].push_back(r);
         size_t shared = 0;
-        for (const auto& u : users) shared += u.size() == 2;
+        for (const auto& u : users) shared += u.size() == 2 && u[0] != u[1];
         return shared;
     };
     CHECK_EQ(shared_arcs(ArcCuts::Junctions), size_t(1));
@@ -317,4 +317,34 @@ TEST(a_ring_the_nesting_pass_flattens_at_a_junction_it_moves_keeps_its_own_shore
     tier_ring(arcs, store, water_simplified(), water, 2, ring, raw, stored);
     CHECK(exact_ring_area2(ring.data(), static_cast<uint32_t>(ring.size())) != 0);
     for (const PackedLocation& v : ring) CHECK(v.lat_e7 % 100 != 0);
+}
+
+TEST(a_ring_the_nesting_pass_flattens_as_stored_gets_its_dropped_vertex_back) {
+    // The lake and island above, and the triangle with a fourth vertex
+    // halfway along its edge back to the lake's shore, which Douglas-Peucker
+    // drops. Snapped whole it holds an area, with the vertex it shares with
+    // the lake on the grid or on the e7 grid, so it stays on the grid; as
+    // stored, its three vertices lie on one line once the nesting pass puts
+    // that vertex on the e7 grid, until the dropped one is back.
+    const int32_t lat = 470000000, lng = 80000000;
+    AdminExactRings store;
+    store.append(closed({pt(lat + 40, lng + 20), pt(lat + 100000, lng + 50000), pt(lat + 100000, lng - 50000),
+                         pt(lat, lng - 50000)}),
+                 {closed({pt(lat + 1149, lng + 551), pt(lat + 1149, lng + 351), pt(lat + 1349, lng + 351),
+                          pt(lat + 1349, lng + 551)})});
+    store.append(closed({pt(lat + 40, lng + 20), pt(lat + 110, lng + 190), pt(lat + 190, lng + 510), pt(lat + 115, lng + 265)}),
+                 {});
+    const AdminArcs arcs = build_arc_topology(store, 1, {}, ArcCuts::JunctionsAndWayEnds);
+    const std::vector<bool> nests = exact_rings_nest(store, 1);
+    REQUIRE(nests[0] && nests[1]);
+    const ArcTierState water = build_arc_tier(arcs, store, water_simplified(), nests, 1);
+    CHECK(water.counts.e7_grid_rounds >= 1);
+    CHECK_EQ(water.counts.rings_nest_introduced, size_t(0));
+    CHECK_EQ(water.counts.e7_collapsing_rings, size_t(0));
+    CHECK_EQ(water.counts.degenerate_rings, size_t(0));
+    std::vector<PackedLocation> ring, raw;
+    std::vector<StoredVertex> stored;
+    tier_ring(arcs, store, water_simplified(), water, 2, ring, raw, stored);
+    CHECK(exact_ring_area2(ring.data(), static_cast<uint32_t>(ring.size())) != 0);
+    CHECK(std::find(ring.begin(), ring.end(), pt(lat + 100, lng + 300)) != ring.end());
 }

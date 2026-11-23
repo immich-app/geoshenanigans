@@ -10,8 +10,8 @@ Usage:
 EEZ_IHO is Marine Regions' intersect of the Exclusive Economic Zones and IHO sea areas, version 5 (CC BY 4.0),
 as its WFS serves it (typeNames=MarineRegions:eez_iho, GeoJSON). LAND is osmdata.openstreetmap.de's land
 polygons, made from OpenStreetMap's coastline, split, in WGS84 (land-polygons-split-4326.zip, read inside the
-zip; ODbL). Both are pinned: the nightly never runs this, it downloads what a run of it published
-(geocoder/builder/data/marine.json), so the marine areas don't change from one day to the next.
+zip; ODbL). The nightly pins the generated marine file, not these source downloads: it downloads what a run
+of this tool published (geocoder/builder/data/marine.json), so the marine areas stay fixed until the pin moves.
 
 Each IHO sea area (iho_mrgid and iho_sea: its features in every EEZ together) is one marine object, an ocean
 when its name ends in " Ocean" and a sea otherwise. Its polygons are its water, one 1-degree tile at a time:
@@ -130,50 +130,57 @@ def write_marine(path, objects):
     os.replace(tmp, path)
 
 
+def _read_objects(path, ring):
+    """The objects of a file write_marine wrote, one at a time as it reads them: (id, kind, name, polygons),
+    each ring what ring(n, data) makes of its vertex count and its vertices' bytes."""
+    with open(path, "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+
+        def take(n):
+            at = f.tell()
+            if at + n > size:
+                raise ValueError(f"{path}: cut short at byte {at}")
+            return f.read(n)
+
+        magic, version, count = HEADER.unpack(take(HEADER.size))
+        if magic != MAGIC or version != VERSION:
+            raise ValueError(f"{path}: not a marine areas file of version {VERSION}")
+        for _ in range(count):
+            oid, kind, name_len = OBJECT_HEAD.unpack(take(OBJECT_HEAD.size))
+            name = take(name_len).decode("utf-8")
+            polygons = []
+            for _ in range(COUNT.unpack(take(4))[0]):
+                rings = []
+                for _ in range(COUNT.unpack(take(4))[0]):
+                    n = COUNT.unpack(take(4))[0]
+                    rings.append(ring(n, take(8 * n)))
+                polygons.append(rings)
+            yield oid, kind, name, polygons
+        if f.tell() != size:
+            raise ValueError(f"{path}: {size - f.tell()} bytes past its last object")
+
+
+def _vertices(n, data):
+    """A ring's n vertices from its bytes, (lat, lon) each."""
+    flat = struct.unpack(f"<{2 * n}i", data)
+    ring, lat, lon = [], 0, 0
+    for k in range(n):
+        lat, lon = (flat[0], flat[1]) if k == 0 else (lat + flat[2 * k], lon + flat[2 * k + 1])
+        ring.append((lat, lon))
+    return ring
+
+
 def read_marine(path):
     """A file write_marine wrote: its objects, (id, kind, name, polygons), each ring a list of (lat, lon)."""
-    with open(path, "rb") as f:
-        data = f.read()
-    at = 0
-
-    def take(n):
-        nonlocal at
-        if at + n > len(data):
-            raise ValueError(f"{path}: cut short at byte {at}")
-        piece = data[at:at + n]
-        at += n
-        return piece
-
-    magic, version, count = HEADER.unpack(take(HEADER.size))
-    if magic != MAGIC or version != VERSION:
-        raise ValueError(f"{path}: not a marine areas file of version {VERSION}")
-    objects = []
-    for _ in range(count):
-        oid, kind, name_len = OBJECT_HEAD.unpack(take(OBJECT_HEAD.size))
-        name = take(name_len).decode("utf-8")
-        polygons = []
-        for _ in range(COUNT.unpack(take(4))[0]):
-            rings = []
-            for _ in range(COUNT.unpack(take(4))[0]):
-                n = COUNT.unpack(take(4))[0]
-                flat = struct.unpack(f"<{2 * n}i", take(8 * n))
-                ring, lat, lon = [], 0, 0
-                for k in range(n):
-                    lat, lon = (flat[0], flat[1]) if k == 0 else (lat + flat[2 * k], lon + flat[2 * k + 1])
-                    ring.append((lat, lon))
-                rings.append(ring)
-            polygons.append(rings)
-        objects.append((oid, kind, name, polygons))
-    if at != len(data):
-        raise ValueError(f"{path}: {len(data) - at} bytes past its last object")
-    return objects
+    return list(_read_objects(path, _vertices))
 
 
 def stats(path):
     total = [0, 0, 0, 0]
-    for oid, kind, name, polygons in read_marine(path):
+    # Each ring as its vertex count, a ring read at a time: as tuples, a planet's vertices take some 10 GB.
+    for oid, kind, name, polygons in _read_objects(path, lambda n, data: n):
         rings = sum(len(p) for p in polygons)
-        vertices = sum(len(r) for p in polygons for r in p)
+        vertices = sum(sum(p) for p in polygons)
         print(f"{oid}\t{KIND_NAMES[kind]}\t{name}\t{len(polygons)} polygons\t{rings} rings\t{vertices} vertices")
         for k, v in enumerate((1, len(polygons), rings, vertices)):
             total[k] += v
@@ -438,6 +445,11 @@ def build(opts):
 
     if opts.stats and os.path.realpath(opts.stats) == os.path.realpath(opts.output):
         raise ValueError(f"--stats {opts.stats} is the output, -o {opts.output}")
+    # Both are written once the sources are read: either over a source would replace it.
+    for flag, path in (("-o", opts.output), ("--stats", opts.stats)):
+        for source_flag, source in (("--eez-iho", opts.eez_iho), ("--land", opts.land)):
+            if path and os.path.realpath(path) == os.path.realpath(source):
+                raise ValueError(f"{flag} {path} is a source, {source_flag} {source}")
     bbox = opts.bbox
     ctx = multiprocessing.get_context("fork")
     tiles = {}
@@ -458,6 +470,9 @@ def build(opts):
                                       bbox=(bbox[0] - 1, bbox[1] - 1, bbox[2] + 1, bbox[3] + 1) if bbox else None)
     _LAND = shapely.from_wkb(geoms)
     del geoms
+    # Without land every tile by a sea area is water. A bounded run's tiles can all lie offshore.
+    if not bbox and not (np.isin(shapely.get_type_id(_LAND), (3, 6)) & ~shapely.is_empty(_LAND)).any():
+        raise ValueError(f"{opts.land}: no land polygons")
     _LAND_TREE = shapely.STRtree(_LAND)
     log(f"{len(_LAND)} land polygons, {shapely.get_num_coordinates(_LAND).sum()} vertices")
 

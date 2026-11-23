@@ -172,12 +172,12 @@ struct Collected {
 // (Collected::waterway_of_way).
 void index_collected(Collected& c);
 
-// The key and display name of a waterway=river or canal way, given its
-// tags: its waterway relation's id and name (a member of one), else its
-// local name and its name:en (else name); false for neither. Its wikidata
-// item is its relation's, else its own. A member of a relation of a local
-// name alone keeps its own name:en (LineIn::way_en), which assemble may show
-// in the relation's place.
+// The key and display name of a waterway=river or canal way or a waterway
+// relation's member way, given its tags: its waterway relation's id and
+// name (a member of one), else its local name and its name:en (else name);
+// false for neither. Its wikidata item is its relation's, else its own. A
+// member of a relation of a local name alone keeps its own name:en
+// (LineIn::way_en), which assemble may show in the relation's place.
 bool line_key(const Collected& c, int64_t way, const char* name, const char* name_en, uint32_t way_qid, LineIn& line);
 
 // Keys every line by its way's tags (line_key) against the waterway
@@ -242,15 +242,20 @@ Build assemble(Collected& c, unsigned threads);
 // namesake, in place: its name or local name (name:en or name) is the
 // marine area's, ASCII case, spaces and punctuation aside, and the polygons
 // of the marine areas of its name hold all its water (polygons_cover: its
-// polygons' rings even-odd, its holes left out, within theirs, a shared
-// shore aside). Those marine areas answer there; every other bay and strait
-// stays, the water of one that reaches past them, or round an island they
-// leave out, among them. Logs each it leaves out and returns how many.
+// polygons' rings even-odd, its holes left out, within the union of the
+// areas', each area's rings even-odd, a shared shore aside). Those marine
+// areas answer there; every other bay and strait stays, the water of one
+// that reaches past them, or round an island they leave out, among them.
+// Logs each it leaves out and returns how many.
 size_t drop_marine_namesakes(Build& b);
 
 // Names each unnamed river or canal object by `choices` (pick_names, by
 // object) and drops the objects with no name and their polygons, in place;
-// sums each object's area. Returns how many objects it named.
+// sums each object's area. Each object takes its choice's key and wikidata
+// item, by which the major tier joins it to its river, but one of a name of
+// its own only where they are its own: the choice's item its own item where
+// it has one, else the key's local name its local name. Returns how many
+// objects it named.
 size_t apply_names(Build& b, const std::vector<NameChoice>& choices);
 
 // Cuts each polygon of more than kSplitMaxHoles holes into pieces along the
@@ -298,13 +303,14 @@ Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::
                    PolygonIdentities identities, AdminArcBlocks arcs, std::vector<CellItemPair> cells);
 
 // A region's share of the planet's layer: the polygons listed in the cells
-// `kept` marks (parallel to planet.cells), whole, with their arcs
-// (subset_admin_arcs, no slots yet), names and those cells' entries.
-Layer subset_layer(const Layer& planet, const std::vector<uint8_t>& kept, unsigned threads = 0);
+// whose `masks` (parallel to planet.cells) have a bit of `bit`, whole, with
+// their arcs (subset_admin_arcs, no slots yet), names and those cells'
+// entries.
+Layer subset_layer(const Layer& planet, const std::vector<uint8_t>& masks, uint8_t bit, unsigned threads = 0);
 
 // Which of `regions` regions (up to 8) keep each entry of a water cell index
 // `cells` (sorted by cell) as a continent's split does (subset_layer's
-// `kept`): bit r where region r holds the entry's cell or one around it
+// `masks`): bit r where region r holds the entry's cell or one around it
 // (admin_cell_routed), `holds(r, cell)` saying whether it holds a cell.
 std::vector<uint8_t> routed_cell_masks(const std::vector<CellItemPair>& cells, size_t regions,
                                        const std::function<bool(size_t, uint64_t)>& holds, unsigned threads = 0);
@@ -344,6 +350,13 @@ std::string write_water_dirs(const Layer& layer, const std::string& region_dir, 
 // counts. Uses up `c`.
 Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::function<uint32_t(uint32_t)>& sitelinks,
                   unsigned threads);
+
+// The most slots of the previous build's polygon sidecars of a region's
+// water dirs under region_prev (water/all/exact's and
+// water/major/simplified's, written one after the other), tombstones among
+// them, each of which write_water_dirs keeps: 0 for none there, and for one
+// that is no sidecar, which that write refuses.
+uint32_t previous_slots(const std::string& region_prev);
 
 // The single-output build's water: the all set's exact tier, in dir (the
 // region's dir), as water/ beside its mode's files.

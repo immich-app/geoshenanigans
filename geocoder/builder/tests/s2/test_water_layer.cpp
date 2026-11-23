@@ -294,6 +294,55 @@ TEST(a_segment_of_no_length_lends_its_line_no_wikidata_item) {
     CHECK_EQ(named, size_t(1));
 }
 
+TEST(a_segment_across_the_antimeridian_credits_the_river_areas_it_runs_through_on_either_side) {
+    // Two unnamed river areas, 0.01 by 0.01 degrees, either side of the
+    // antimeridian along it, and one segment of a line from the middle of
+    // one to the middle of the other: each holds the half of it on its side.
+    Collected c = fixture();
+    const int32_t lat = 650000000, east = kAntimeridianE7 - 100000, west = -kAntimeridianE7;
+    c.closed_ways.push_back({2201, tags(code::kRiver, "", true), square(lat, east, 100000)});
+    c.closed_ways.push_back({2202, tags(code::kRiver, "", true), square(lat, west, 100000)});
+    LineIn anadyr;
+    anadyr.way = 2210;
+    anadyr.key = "nAnadyr";
+    anadyr.local = anadyr.display = "Anadyr";
+    anadyr.vertices = {pt(lat + 40000, east + 50000), pt(lat + 60000, west + 50000)};
+    c.lines.push_back(anadyr);
+    Collected joined = c;
+    Build b = assemble(joined, 1);
+    std::vector<uint32_t> rivers;
+    for (uint32_t p = 0; p < b.rings.polygons.size(); p++)
+        if (b.objects[b.object_of[p]].tags.river_area) rivers.push_back(p);
+    NamingCounts counts;
+    std::vector<Credit> credits = credit_naming_lines(b.rings, rivers, b.object_of, b.lines, counts, 2);
+    std::map<int64_t, uint64_t> mm;
+    for (const Credit& cr : credits) mm[b.objects[cr.object].id] += cr.mm;
+    const PackedLocation seam_east = pt(lat + 50000, kAntimeridianE7), seam_west = pt(lat + 50000, -kAntimeridianE7);
+    CHECK_EQ(mm[2201], segment_mm(anadyr.vertices[0], seam_east));
+    CHECK_EQ(mm[2202], segment_mm(seam_west, anadyr.vertices[1]));
+    // So both take its name.
+    const Layer layer = build(c);
+    std::set<int64_t> named;
+    for (size_t p = 0; p < layer.size(); p++)
+        for (int64_t id : {2201, 2202})
+            if (layer.identities[p] == way_identity(id) && name_of(layer, p) == "Anadyr") named.insert(id);
+    CHECK(named == std::set<int64_t>({2201, 2202}));
+}
+
+TEST(the_join_of_no_lines_credits_nothing_and_covers_no_river_area) {
+    Collected c = fixture();
+    Build b = assemble(c, 1);
+    std::vector<uint32_t> rivers;
+    for (uint32_t p = 0; p < b.rings.polygons.size(); p++)
+        if (b.objects[b.object_of[p]].tags.river_area) rivers.push_back(p);
+    REQUIRE(rivers.size() == 2u);
+    NamingCounts counts;
+    CHECK(credit_naming_lines(b.rings, rivers, b.object_of, NamingLines(), counts, 2).empty());
+    CHECK_EQ(counts.cover_entries, size_t(0));
+    CHECK(credit_naming_lines(b.rings, {}, b.object_of, b.lines, counts, 2).empty());
+    CHECK_EQ(counts.segments_in_cover, size_t(0));
+}
+
 TEST(a_lake_of_many_islands_is_cut_into_pieces_that_each_carry_the_lakes_name_type_and_area) {
     Collected c = fixture();
     // A lake of 0.4 x 0.4 degrees with 12 x 12 islands, one way round.
@@ -332,6 +381,40 @@ TEST(a_lake_of_many_islands_is_cut_into_pieces_that_each_carry_the_lakes_name_ty
     CHECK(std::abs(layer.records[pieces[0]].area - float(0.16 - 144 * 0.000004)) < 1e-5f);
 }
 
+TEST(a_lake_of_many_islands_the_grid_cant_cut_keeps_its_store_as_it_was) {
+    // A lake of 0.0019 x 0.0019 degrees with 9 x 8 islands, between the
+    // lines of the finest grid a cut takes (2^16 e7 units: 7171 and 7172 of
+    // them in latitude, 1220 and 1221 in longitude).
+    Collected c;
+    add_geometry(c, 70, square(kLat, kLng, 19000));
+    CollectedArea isles;
+    isles.id = 600;
+    isles.tags = tags(code::kLake, "Tiny Isles Lake");
+    isles.members = {{70, "outer"}};
+    for (int i = 0; i < 9; i++)
+        for (int j = 0; j < 8; j++) {
+            const int64_t way = 1000 + i * 8 + j;
+            add_geometry(c, way, square(kLat + 1000 + i * 2000, kLng + 1000 + j * 2000, 500));
+            isles.members.push_back({way, "inner"});
+        }
+    c.relations.push_back(isles);
+    Build b = assemble(c, 1);
+    REQUIRE(b.rings.polygons.size() == 1u);
+    REQUIRE(b.rings.polygons[0].ring_count == 73u);
+    const PackedLocation* vertices = b.rings.vertices.data();
+    const std::vector<RingSpan> rings = b.rings.rings;
+    const gctest::CapturedStderr log;
+    split_polygons(b, 1);
+    CHECK(log.str().find("Tiny Isles Lake, 72 holes) kept whole: no cut leaves it in more than one piece") !=
+          std::string::npos);
+    CHECK(log.str().find("0 cut along 0 lines into 0 pieces, 1 kept whole; 1 polygons") != std::string::npos);
+    // Not copied: the store's vertices where they were.
+    CHECK(b.rings.vertices.data() == vertices);
+    CHECK_EQ(b.rings.rings.size(), rings.size());
+    CHECK(b.piece_key == std::vector<uint64_t>({0}));
+    CHECK(b.object_of == std::vector<uint32_t>({0}));
+}
+
 TEST(the_layer_is_the_same_on_one_thread_and_many) {
     const Layer one = build(fixture(), "", 1), many = build(fixture(), "", 8);
     const ScratchDir a("water-one"), b("water-many");
@@ -353,6 +436,12 @@ TEST(the_major_tier_takes_areas_of_100_km2_and_wikidata_rivers_of_5) {
     for (size_t p = 0; p < layer.size(); p++)
         if (layer.major[p]) major.insert(name_of(layer, p));
     CHECK(major == std::set<std::string>({"Big Lake", "Wide River"}));
+    // The major dir holds them and no other.
+    const ScratchDir dir("water-major");
+    write(layer, dir.path());
+    std::vector<std::string> slots = slot_names(tree(dir.path()), "water/major/simplified");
+    std::sort(slots.begin(), slots.end());
+    CHECK(slots == std::vector<std::string>({"Big Lake", "Wide River"}));
     // The big lake holds whole cells: interior entries.
     size_t interior = 0;
     for (const CellItemPair& cell : layer.cells)
@@ -365,7 +454,7 @@ TEST(a_regions_share_holds_the_polygons_its_cells_list_whole_with_their_names) {
     // The cells of the lake alone.
     std::vector<uint8_t> kept(planet.cells.size(), 0);
     for (size_t i = 0; i < planet.cells.size(); i++) kept[i] = (planet.cells[i].item_id & ID_MASK) == 3;
-    const Layer region = subset_layer(planet, kept, 2);
+    const Layer region = subset_layer(planet, kept, 1, 2);
     REQUIRE(region.size() == 1u);
     CHECK(name_of(region, 0) == "Test Lake");
     CHECK(region.names == std::vector<char>({'T', 'e', 's', 't', ' ', 'L', 'a', 'k', 'e', '\0'}));
@@ -456,6 +545,27 @@ TEST(the_water_dirs_hold_every_file_and_keep_each_polygons_slot_the_next_day) {
     const std::string four = root.path() + "/four";
     CHECK(write(build(again, three), four, three).find("4 polygons in 4 slots (3 kept, 0 by fallback, 1 recycled)") !=
           std::string::npos);
+}
+
+TEST(the_previous_slots_of_a_regions_water_dirs_count_their_tombstones) {
+    const ScratchDir root("water-previous-slots");
+    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    CHECK_EQ(previous_slots(""), 0u);
+    CHECK_EQ(previous_slots(one), 0u);
+    write(build(fixture()), one);
+    CHECK_EQ(previous_slots(one), 4u);
+    // The pond gone, its slot a tombstone the next day's dirs keep.
+    Collected without_pond = fixture();
+    without_pond.closed_ways.erase(without_pond.closed_ways.begin());
+    const Layer day2 = build(without_pond, one);
+    REQUIRE(day2.size() == 3u);
+    write(day2, two, one);
+    CHECK_EQ(previous_slots(two), 4u);
+    // One that is no sidecar counts none, as the write refuses it.
+    fs::remove(two + "/water/major/simplified/admin_polygons.osm_ids");
+    CHECK_EQ(previous_slots(two), 4u);
+    std::ofstream(two + "/water/all/exact/admin_polygons.osm_ids", std::ios::binary | std::ios::trunc) << "no";
+    CHECK_EQ(previous_slots(two), 0u);
 }
 
 namespace {
@@ -569,7 +679,7 @@ TEST(a_water_dir_holding_a_marine_area_credits_marine_regions) {
     const Layer planet = build(with_marine());
     std::vector<uint8_t> kept(planet.cells.size(), 0);
     for (size_t i = 0; i < planet.cells.size(); i++) kept[i] = (planet.cells[i].item_id & ID_MASK) == 3;
-    Layer lake = subset_layer(planet, kept, 2);
+    Layer lake = subset_layer(planet, kept, 1, 2);
     REQUIRE(lake.size() == 1u);
     CHECK_EQ(int(lake.marine[0]), 0);
     {
@@ -612,9 +722,15 @@ TEST(a_regions_share_counts_the_cells_around_its_own_and_each_polygon_they_list_
     // no cells.
     const std::vector<uint64_t> shares = share_bytes(planet, masks, 3);
     for (int r = 0; r < 2; r++) {
+        // Its bit of the masks, as a continent's split reads them: the
+        // share of the entries that bit marks.
         std::vector<uint8_t> kept(planet.cells.size());
         for (size_t i = 0; i < kept.size(); i++) kept[i] = masks[i] >> r & 1;
-        Layer region = subset_layer(planet, kept, 2);
+        Layer region = subset_layer(planet, masks, uint8_t(1u << r), 2);
+        const Layer marked = subset_layer(planet, kept, 1, 2);
+        CHECK(region.identities == marked.identities);
+        CHECK(region.cells.size() == marked.cells.size());
+        CHECK(region.names == marked.names);
         {
             const gctest::CapturedStderr log;
             assign_region_arc_slots(region.arcs, "", "test", 0);
@@ -809,6 +925,56 @@ TEST(namesakes_apart_are_rivers_of_their_own_and_a_line_lends_its_wikidata_item_
     const auto [held, major] = ways_held(layer, {2101, 2102, 2103, 2104});
     CHECK(held == std::set<int64_t>({2101, 2102, 2103, 2104}));
     CHECK(major == std::set<int64_t>({2103}));
+}
+
+TEST(namesakes_that_share_a_shore_are_one_river) {
+    Collected c = fixture();
+    // Two unnamed river areas of about 61 km2, one north of the other along
+    // a shared side, each with a line of a local name alone, Mill Creek, in
+    // it and no wikidata item: one river of about 123 km2.
+    const int32_t lat = kLat - 3000000, side = 850000;
+    for (const auto& [way, south] : std::vector<std::pair<int64_t, int32_t>>{{2111, lat}, {2112, lat + side}}) {
+        c.closed_ways.push_back({way, tags(code::kRiver, "", true), square(south, kLng, side)});
+        LineIn line;
+        line.way = way + 1000;
+        line.key = "nMill Creek";
+        line.local = line.display = "Mill Creek";
+        line.vertices = {pt(south + side / 2, kLng + side / 10), pt(south + side / 2, kLng + side * 9 / 10)};
+        c.lines.push_back(line);
+    }
+    const auto [held, major] = ways_held(build(c), {2111, 2112});
+    CHECK(held == std::set<int64_t>({2111, 2112}));
+    CHECK(major == std::set<int64_t>({2111, 2112}));
+}
+
+TEST(a_named_river_area_takes_only_its_own_rivers_identity_from_the_line_of_most_length_in_it) {
+    // Two river areas of about 3 km2 far apart, each with a line of the
+    // Beta's relation (Q202) in it: one the Beta names, and the Alpha (Q101)
+    // of its own name. Joined, the two would be a wikidata river of 6 km2
+    // in the major tier; the Alpha is a river of its own, under 5 km2.
+    Collected c = fixture();
+    const int32_t side = 190000;
+    auto add_line = [&](int64_t way, int32_t lat) {
+        LineIn line;
+        line.way = way;
+        line.key = "r950";
+        line.local = line.display = "Beta";
+        line.qid = 202;
+        line.vertices = {pt(lat + side / 2, kLng + side / 10), pt(lat + side / 2, kLng + side * 9 / 10)};
+        c.lines.push_back(line);
+    };
+    c.closed_ways.push_back({2301, tags(code::kRiver, "Alpha", true, 101), square(kLat - 3000000, kLng, side)});
+    add_line(2311, kLat - 3000000);
+    c.closed_ways.push_back({2302, tags(code::kRiver, "", true), square(kLat - 4000000, kLng, side)});
+    add_line(2312, kLat - 4000000);
+    const auto [held, major] = ways_held(build(c), {2301, 2302});
+    CHECK(held == std::set<int64_t>({2301, 2302}));
+    CHECK(major.empty());
+    // An area of the Beta's own name, and no item, is the Beta's: the two
+    // Beta areas make 6 km2 together.
+    c.closed_ways.push_back({2303, tags(code::kRiver, "Beta", true), square(kLat - 5000000, kLng, side)});
+    add_line(2313, kLat - 5000000);
+    CHECK(ways_held(build(c), {2301, 2302, 2303}).second == std::set<int64_t>({2302, 2303}));
 }
 
 TEST(a_lake_the_major_tier_held_stays_in_it_at_95_km2_once_its_smallest_vertex_moves) {
@@ -1147,27 +1313,44 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
             }
         REQUIRE(names == client);
     }
+    // The kinds and credits the patch tests rely on, before any fixture dir
+    // is written.
+    for (const char* f : {"water_meta.json", "attribution.json"}) {
+        REQUIRE(days["day1"][f] == days["day2"][f]);
+        REQUIRE(days["day2"][f] != days["day3"][f]);
+    }
+    REQUIRE(text_of(days["day3"]["water_meta.json"]).find("\"type\": \"salt_pond\"") != std::string::npos);
+    REQUIRE(text_of(days["day3"]["attribution.json"]).find("marine-regions") != std::string::npos);
+    if (rewrite) {
+        // Every day written whole beside its dir first, then each swapped in:
+        // a write that fails leaves the fixture as it was.
+        for (const auto& [day, files] : days) {
+            const std::string staged = fixture_dir + "/" + day + ".staged";
+            fs::remove_all(staged);
+            for (const auto& [name, bytes] : files) {
+                const std::string path = staged + "/" + name;
+                fs::create_directories(fs::path(path).parent_path());
+                std::ofstream out(path, std::ios::binary);
+                out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                out.close();
+                REQUIRE(out.good());
+            }
+        }
+        for (const auto& [day, files] : days) {
+            const std::string day_dir = fixture_dir + "/" + day, old = day_dir + ".old";
+            fs::remove_all(old);
+            if (fs::exists(day_dir)) fs::rename(day_dir, old);
+            fs::rename(day_dir + ".staged", day_dir);
+            fs::remove_all(old);
+        }
+    }
     for (const auto& [day, files] : days) {
         // The day's fixture dir is those files and no other: the patch tests
         // copy it whole.
         const std::string day_dir = fixture_dir + "/" + day;
-        if (rewrite) {
-            fs::remove_all(day_dir);
-            for (const auto& [name, bytes] : files) {
-                const std::string path = day_dir + "/" + name;
-                fs::create_directories(fs::path(path).parent_path());
-                std::ofstream(path, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-            }
-        }
         REQUIRE(fs::is_directory(day_dir));
         CHECK(tree(day_dir) == files);
     }
-    for (const char* f : {"water_meta.json", "attribution.json"}) {
-        CHECK(days["day1"][f] == days["day2"][f]);
-        CHECK(days["day2"][f] != days["day3"][f]);
-    }
-    CHECK(text_of(days["day3"]["water_meta.json"]).find("\"type\": \"salt_pond\"") != std::string::npos);
-    CHECK(text_of(days["day3"]["attribution.json"]).find("marine-regions") != std::string::npos);
 }
 
 TEST(an_unnamed_riverbank_tagged_natural_water_too_takes_its_waterways_name) {
@@ -1320,6 +1503,21 @@ TEST(a_previous_water_build_whose_fallback_sidecar_is_there_but_cant_be_opened_s
     fs::remove(all);
     CHECK(write(build(fixture(), one), root.path() + "/three", one).find("4 polygons in 4 slots (4 kept") !=
           std::string::npos);
+}
+
+TEST(a_previous_water_build_whose_polygon_sidecar_is_there_but_cant_be_opened_stops_the_layers_build) {
+    // Its type codes hang on that build's water_meta.json, which the sidecar
+    // being there says it wrote: the layer's build stops before it numbers
+    // the water=* values afresh.
+    const ScratchDir root("water-unopenable");
+    const std::string one = root.path() + "/one";
+    write(build(with_kinds({"ganga_river"})), one);
+    const std::string all = one + "/water/all/exact/admin_polygons.osm_ids";
+    fs::remove(all);
+    fs::create_symlink(fs::path(all).filename(), all);
+    CHECK(refusal(with_kinds({"ganga_river"}), one).find(all + " is there but can't be opened") != std::string::npos);
+    fs::remove(all);
+    CHECK(refusal(with_kinds({"ganga_river"}), one).empty());
 }
 
 TEST(a_way_tagged_as_the_multipolygon_whose_outer_ring_it_is_leaves_the_island_out) {
@@ -1585,4 +1783,33 @@ TEST(a_namesake_cutting_a_marine_areas_corner_or_meeting_it_along_a_side_or_at_a
                                   pt(lat + 1850000, east + 50000), pt(lat + 1800000, east)}});
     const Layer layer = build(c);
     CHECK(ways_held(layer, {3003, 3004, 3005, 3006}).first == std::set<int64_t>({3003, 3004, 3005, 3006}));
+}
+
+TEST(a_namesake_inside_marine_areas_of_its_name_that_overlap_goes) {
+    Collected c = with_marine();
+    // Marine areas of one name and MRGIDs of their own: the Celtic Sea
+    // twice over one square, and the Bristol Channel over two squares that
+    // overlap by half.
+    const int32_t lat = kLat - 26000000;
+    auto rect = [](int32_t south, int32_t west, int32_t height, int32_t width) {
+        return Ring{pt(south, west), pt(south, west + width), pt(south + height, west + width), pt(south + height, west),
+                    pt(south, west)};
+    };
+    c.marine.push_back(marine_area(2370, marine::kSea, "Celtic Sea", {{square(lat, kLng, 2000000, 5)}}));
+    c.marine.push_back(marine_area(2371, marine::kSea, "Celtic Sea", {{square(lat, kLng, 2000000, 5)}}));
+    c.marine.push_back(marine_area(2372, marine::kSea, "Bristol Channel", {{square(lat, kLng + 3000000, 2000000, 5)}}));
+    c.marine.push_back(marine_area(2373, marine::kSea, "Bristol Channel", {{square(lat, kLng + 4000000, 2000000, 5)}}));
+    // Bays of their names: in the Celtic Sea's square, in the half both
+    // squares of the Bristol Channel hold, and across that half from one
+    // square's own half to the other's, all of which they hold. One
+    // reaching east past them stays.
+    c.closed_ways.push_back({3030, tags(code::kNaturalBay, "Celtic Sea"), rect(lat + 500000, kLng + 500000, 500000, 500000)});
+    c.closed_ways.push_back(
+        {3031, tags(code::kNaturalBay, "Bristol Channel"), rect(lat + 500000, kLng + 4200000, 500000, 500000)});
+    c.closed_ways.push_back(
+        {3032, tags(code::kNaturalBay, "Bristol Channel"), rect(lat + 500000, kLng + 3500000, 500000, 2000000)});
+    c.closed_ways.push_back(
+        {3033, tags(code::kNaturalBay, "Bristol Channel"), rect(lat + 500000, kLng + 4500000, 500000, 2000000)});
+    const Layer layer = build(c);
+    CHECK(ways_held(layer, {3030, 3031, 3032, 3033}).first == std::set<int64_t>({3033}));
 }

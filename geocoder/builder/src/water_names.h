@@ -1,8 +1,9 @@
 // How a river or canal area with no name of its own takes one: the waterway
 // with the most length inside it. Each candidate line is a waterway=river or
-// canal way (a run of one, where the input lacks a node of it), keyed by the
-// type=waterway relation it belongs to (the lowest relation id, where it
-// belongs to two) or else by its own local name (the name tag, not
+// canal way, or a member way of a waterway=river or canal relation whatever
+// its own waterway tag (a run of one, where the input lacks a node of it),
+// keyed by the type=waterway relation it belongs to (the lowest relation id,
+// where it belongs to two) or else by its own local name (the name tag, not
 // name:en), so a river whose ways vary in name:en is one key.
 // Each segment of a candidate line credits each area polygon the length of
 // its stretches inside the polygon's rings, in integer millimetres, to the
@@ -64,10 +65,43 @@ inline uint64_t segment_mm(PackedLocation a, PackedLocation b) {
 
 // Whether a segment's ends lie more than 180 degrees of longitude apart: a
 // way across the antimeridian, which OSM splits there, whose straight line
-// in longitude runs the other way round from its length. Such a segment
-// credits nothing.
+// in longitude runs the other way round from its length. The join cuts such
+// a segment there (cut_at_antimeridian).
 inline bool segment_wraps(PackedLocation a, PackedLocation b) {
     return std::abs(int64_t(b.lon_e7) - a.lon_e7) > 1800000000;
+}
+
+inline constexpr int32_t kAntimeridianE7 = 1800000000;
+
+// The latitude at which segment a-b, across the antimeridian
+// (segment_wraps), crosses it: its straight line in (lat, lng) the short
+// way round, rounded to the nearest e7 unit (a half to the north), the
+// same either way along it. Its southern end's for one along the
+// antimeridian.
+inline int32_t antimeridian_latitude(PackedLocation a, PackedLocation b) {
+    if (b.lat_e7 < a.lat_e7 || (b.lat_e7 == a.lat_e7 && b.lon_e7 < a.lon_e7)) std::swap(a, b);
+    const int64_t span = 2 * int64_t(kAntimeridianE7) - std::abs(int64_t(b.lon_e7) - a.lon_e7);
+    if (span <= 0) return a.lat_e7;
+    const int64_t to_seam = int64_t(kAntimeridianE7) - std::abs(int64_t(a.lon_e7));
+    const int64_t num = (int64_t(b.lat_e7) - a.lat_e7) * to_seam;
+    return static_cast<int32_t>(a.lat_e7 + (2 * num + span) / (2 * span));
+}
+
+// A line's `count` vertices from `v`, onto `out`, with each segment across
+// the antimeridian cut there: between its ends, the point at which it
+// crosses (antimeridian_latitude) on its first end's side, then on its
+// second's. The stretch between those two runs along the antimeridian and
+// wraps; each piece either side of it lies on one side.
+inline void cut_at_antimeridian(const PackedLocation* v, uint32_t count, std::vector<PackedLocation>& out) {
+    for (uint32_t i = 0; i < count; i++) {
+        if (i > 0 && segment_wraps(v[i - 1], v[i])) {
+            const int32_t lat = antimeridian_latitude(v[i - 1], v[i]);
+            const int32_t side = v[i - 1].lon_e7 > 0 ? kAntimeridianE7 : -kAntimeridianE7;
+            out.push_back({lat, side});
+            out.push_back({lat, -side});
+        }
+        out.push_back(v[i]);
+    }
 }
 
 // The share of a segment, a straight line in (lat, lng), inside rings

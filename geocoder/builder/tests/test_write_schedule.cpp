@@ -68,8 +68,33 @@ TEST(the_water_stage_holds_three_times_its_cells_beside_its_share_of_the_rest) {
     // The reservations carry it.
     const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
     CHECK_EQ(region_peak(bytes, counts, 0, RunOrder::Serial, all), kGiB + 3 * kGiB);
-    CHECK_EQ(continent_cost(bytes, counts, 0, UINT64_MAX, all).bytes,
-             region_peak(bytes, counts, 0, RunOrder::Concurrent, all));
+    // At once, the water stage beside the three modes; a byte short of that,
+    // one after another, the water stage the largest.
+    const uint64_t at_once = kGiB + 3 * kGiB + 3 * kModeBytes;
+    const RegionCost fits = continent_cost(bytes, counts, 0, at_once, all);
+    CHECK_EQ(fits.bytes, at_once);
+    CHECK(fits.order == RunOrder::Concurrent);
+    const RegionCost short_of_it = continent_cost(bytes, counts, 0, at_once - 1, all);
+    CHECK_EQ(short_of_it.bytes, kGiB + 3 * kGiB);
+    CHECK(short_of_it.order == RunOrder::Serial);
+}
+
+TEST(the_water_stage_holds_its_slot_arrays_for_every_slot_the_previous_build_left_tombstones_among_them) {
+    // A layer of 1 GiB over a previous build of 3 Mi slots: the write's
+    // records at their slots, each slot's polygon and the records it
+    // writes, 40 B a slot, past the share of the layer today's polygons
+    // take.
+    KindValues bytes = kinds(0, 0, 0, 0, 0, 0);
+    at(bytes, RecordKind::Waters) = kGiB;
+    const uint64_t pairs = kGiB / 4 / sizeof(CellItemPair), slots = uint64_t(3) << 20;
+    CHECK(kWaterSlotBytes >= sizeof(AdminPolygon) + sizeof(uint32_t) + sizeof(AdminPolygonRecord));
+    CHECK_EQ(stage_costs(bytes, pairs, slots).water, stage_costs(bytes, pairs).water + slots * kWaterSlotBytes);
+    // The reservations carry it.
+    const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
+    CHECK_EQ(region_peak(bytes, counts, 0, RunOrder::Serial, pairs, slots),
+             region_peak(bytes, counts, 0, RunOrder::Serial, pairs) + slots * kWaterSlotBytes);
+    CHECK_EQ(continent_cost(bytes, counts, 0, UINT64_MAX, pairs, slots).bytes,
+             region_peak(bytes, counts, 0, RunOrder::Concurrent, pairs, slots));
 }
 
 TEST(pair_counts_takes_the_water_cell_index_entries_for_the_waters_pairs) {
@@ -123,22 +148,17 @@ TEST(filter_cost_holds_the_planet_maps_and_half_the_subset_pairs) {
     const KindValues planet_counts = kinds(80, 160, 0, 0, 0, 0);
     const KindValues pairs = kinds(10, 0, 0, 0, 0, 0);
     // 240 records: 4 B id maps and 3 bits of marks, whatever the workers.
-    CHECK_EQ(filter_cost(planet_counts, kinds(100, 0, 0, 0, 0, 0), pairs), uint64_t(240 * 4 + 240 * 3 / 8 + 10 * 16 / 2));
+    CHECK_EQ(filter_cost(planet_counts, pairs), uint64_t(240 * 4 + 240 * 3 / 8 + 10 * 16 / 2));
 }
 
-TEST(filter_cost_holds_the_water_splits_marks_over_the_planets_water_cells) {
+TEST(filter_cost_holds_the_continents_water_pairs_among_the_pairs_the_workers_copy_and_no_marks_of_its_own) {
+    // The water split reads the planet's water masks, which the build holds
+    // with the other kinds' while the continents run: of the planet's water
+    // cells, nothing of its own.
     const KindValues planet_counts = kinds(80, 160, 0, 0, 0, 0);
-    KindValues planet_pairs = kinds(100, 0, 0, 0, 0, 0), pairs = kinds(10, 0, 0, 0, 0, 0);
-    at(planet_pairs, RecordKind::Waters) = 1000;
+    KindValues pairs = kinds(10, 0, 0, 0, 0, 0);
     at(pairs, RecordKind::Waters) = 40;
-    // Beside the rest, a planet water cell entry's mark (1 B), its cell's
-    // mark (1 B) and the cell's start at the peak (24 B), and the
-    // continent's water pairs among the pairs the workers copy.
-    CHECK_EQ(filter_cost(planet_counts, planet_pairs, pairs),
-             uint64_t(240 * 4 + 240 * 3 / 8 + 50 * 16 / 2 + 1000 * (1 + 1 + 3 * 8)));
-    // An entry a cell at most: its mark, the cell's mark, and the cell's
-    // start in the output beside the workers' parts, which grow to twice it.
-    CHECK(kFilterWaterBytesPerPair >= 1 + 1 + 8 + 2 * 8);
+    CHECK_EQ(filter_cost(planet_counts, pairs), uint64_t(240 * 4 + 240 * 3 / 8 + 50 * 16 / 2));
 }
 
 TEST(continent_cost_runs_steps_one_at_a_time_only_past_the_budget) {

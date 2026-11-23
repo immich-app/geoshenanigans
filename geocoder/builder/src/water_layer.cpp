@@ -582,27 +582,39 @@ struct Frac {
 
 bool frac_less(const Frac& a, const Frac& b) { return a.num * b.den < b.num * a.den; }
 
-// Whether the polygons `cover` (their rings together counted even-odd:
-// polygons that don't overlap, so their union) hold all the water of the
-// polygons `area` (theirs together, likewise): no open stretch of a
-// parallel that `area` holds and `cover` doesn't. Between two latitudes a
-// vertex of either lies on, each edge spans the band or misses it, and an
-// edge of `cover` and one of `area` along one line across it (a shared
-// shore), or two of `cover` (the side two of its polygons share), are taken
-// once each or cancel. An edge of `area` crossing one of `cover` (in one
-// order at the band's foot, the other at its top) has water of `area`
-// beside it that `cover` doesn't hold; two edges of one side crossing (rings
-// that aren't valid) are taken as alike. With no crossing, the edges keep
-// their order across the band, which holds just what its middle parallel
-// does. Edges east of the area's box hold nothing
-// of it, and those wholly west of it only whether its west side starts in
-// `cover`. Every value is exact: a longitude's numerator is under 2^65, its
-// denominator 2^32.
-bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& cover, const std::vector<uint32_t>& area) {
+// Whether the polygons `cover` (each object's of `object_of` its rings
+// together counted even-odd: polygons of one object that don't overlap, so
+// their union; then the union of the objects', which may overlap) hold all
+// the water of the polygons `area` (their rings together counted even-odd):
+// no open stretch of a parallel that `area` holds and no object of `cover`
+// does. Between two latitudes a vertex of either lies on, each edge spans
+// the band or misses it, and an edge of `cover` and one of `area` along one
+// line across it (a shared shore), or two of `cover`, are taken once each
+// or, two of one object's (the side two of its polygons share), cancel. An
+// edge of `area` crossing one of `cover` (in one order at the band's foot,
+// the other at its top) has water of `area` beside it that `cover` doesn't
+// hold; two edges of one side crossing (rings that aren't valid, or two
+// objects' that overlap there) are taken as alike. With no crossing, the
+// edges keep their order across the band, which holds just what its middle
+// parallel does. Edges east of the area's box hold nothing of it, and those
+// wholly west of it only whether its west side starts in `cover`. Every
+// value is exact: a longitude's numerator is under 2^65, its denominator
+// 2^32.
+bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& object_of,
+                    const std::vector<uint32_t>& cover, const std::vector<uint32_t>& area) {
     struct Edge {
         int64_t lat0, lat1, lng0, lng1;  // lat0 < lat1
         int of;                          // 0 for the area, 1 for the cover
+        uint32_t object;                 // of the cover: its object's place among the cover's objects
         bool west;                       // wholly west of the area's box
+    };
+    // The cover's objects, each in a place of its own.
+    std::vector<uint32_t> objects;
+    for (uint32_t p : cover) objects.push_back(object_of[p]);
+    std::sort(objects.begin(), objects.end());
+    objects.erase(std::unique(objects.begin(), objects.end()), objects.end());
+    auto place_of = [&](uint32_t p) {
+        return static_cast<uint32_t>(std::lower_bound(objects.begin(), objects.end(), object_of[p]) - objects.begin());
     };
     std::vector<Edge> edges;
     std::vector<int64_t> lats;
@@ -619,11 +631,12 @@ bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& c
             lat_lo = std::min<int64_t>(lat_lo, s.lat_e7), lat_hi = std::max<int64_t>(lat_hi, s.lat_e7);
             lng_lo = std::min<int64_t>(lng_lo, s.lon_e7), lng_hi = std::max<int64_t>(lng_hi, s.lon_e7);
             lats.push_back(s.lat_e7);
-            if (s.lat_e7 < t.lat_e7) edges.push_back({s.lat_e7, t.lat_e7, s.lon_e7, t.lon_e7, 0, false});
-            if (t.lat_e7 < s.lat_e7) edges.push_back({t.lat_e7, s.lat_e7, t.lon_e7, s.lon_e7, 0, false});
+            if (s.lat_e7 < t.lat_e7) edges.push_back({s.lat_e7, t.lat_e7, s.lon_e7, t.lon_e7, 0, 0, false});
+            if (t.lat_e7 < s.lat_e7) edges.push_back({t.lat_e7, s.lat_e7, t.lon_e7, s.lon_e7, 0, 0, false});
         });
     if (lat_lo >= lat_hi) return true;
-    for (uint32_t p : cover)
+    for (uint32_t p : cover) {
+        const uint32_t object = place_of(p);
         each_edge(p, [&](PackedLocation s, PackedLocation t) {
             if (s.lat_e7 == t.lat_e7 || std::max(s.lat_e7, t.lat_e7) <= lat_lo || std::min(s.lat_e7, t.lat_e7) >= lat_hi ||
                 std::min(s.lon_e7, t.lon_e7) > lng_hi)
@@ -631,9 +644,10 @@ bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& c
             const bool west = std::max(s.lon_e7, t.lon_e7) < lng_lo;
             for (const int32_t lat : {s.lat_e7, t.lat_e7})
                 if (lat > lat_lo && lat < lat_hi) lats.push_back(lat);
-            if (s.lat_e7 < t.lat_e7) edges.push_back({s.lat_e7, t.lat_e7, s.lon_e7, t.lon_e7, 1, west});
-            else edges.push_back({t.lat_e7, s.lat_e7, t.lon_e7, s.lon_e7, 1, west});
+            if (s.lat_e7 < t.lat_e7) edges.push_back({s.lat_e7, t.lat_e7, s.lon_e7, t.lon_e7, 1, object, west});
+            else edges.push_back({t.lat_e7, s.lat_e7, t.lon_e7, s.lon_e7, 1, object, west});
         });
+    }
     std::sort(lats.begin(), lats.end());
     lats.erase(std::unique(lats.begin(), lats.end()), lats.end());
     std::sort(edges.begin(), edges.end(), [](const Edge& x, const Edge& y) { return x.lat0 < y.lat0; });
@@ -646,6 +660,7 @@ bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& c
     struct Ends {
         Frac foot, top;
         int of;
+        uint32_t object;
     };
     auto less = [](const Ends& x, const Ends& y) {
         if (frac_less(x.foot, y.foot)) return true;
@@ -655,6 +670,13 @@ bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& c
     auto same = [&](const Ends& x, const Ends& y) { return !less(x, y) && !less(y, x); };
     std::vector<uint32_t> active;
     std::vector<Ends> band, once;
+    // Whether each object of the cover holds the stretch, and how many do.
+    std::vector<uint8_t> in_object(objects.size());
+    size_t in_cover = 0;
+    auto toggle = [&](uint32_t object) {
+        in_object[object] ^= 1;
+        in_cover = in_object[object] ? in_cover + 1 : in_cover - 1;
+    };
     size_t next = 0;
     for (size_t k = 0; k + 1 < lats.size() && lats[k] < lat_hi; k++) {
         const int64_t foot = lats[k], top = lats[k + 1];
@@ -662,20 +684,26 @@ bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& c
         active.erase(std::remove_if(active.begin(), active.end(), [&](uint32_t e) { return edges[e].lat1 <= foot; }),
                      active.end());
         if (top <= lat_lo) continue;
-        // In the cover west of the area's box, and the other edges, each
-        // line of one side across the band taken as often as it is, mod 2.
-        bool in_cover = false;
+        // In each object of the cover west of the area's box, and the other
+        // edges, each line of the area or of one object across the band
+        // taken as often as it is, mod 2.
+        std::fill(in_object.begin(), in_object.end(), 0);
+        in_cover = 0;
         band.clear();
         for (uint32_t e : active) {
-            if (edges[e].west) in_cover = !in_cover;
-            else band.push_back({at(edges[e], foot, 1), at(edges[e], top, 1), edges[e].of});
+            if (edges[e].west) toggle(edges[e].object);
+            else band.push_back({at(edges[e], foot, 1), at(edges[e], top, 1), edges[e].of, edges[e].object});
         }
-        std::sort(band.begin(), band.end(),
-                  [&](const Ends& x, const Ends& y) { return x.of != y.of ? x.of < y.of : less(x, y); });
+        std::sort(band.begin(), band.end(), [&](const Ends& x, const Ends& y) {
+            if (x.of != y.of) return x.of < y.of;
+            if (x.object != y.object) return x.object < y.object;
+            return less(x, y);
+        });
         once.clear();
         for (size_t i = 0; i < band.size();) {
             size_t j = i + 1;
-            while (j < band.size() && band[j].of == band[i].of && same(band[j], band[i])) j++;
+            while (j < band.size() && band[j].of == band[i].of && band[j].object == band[i].object && same(band[j], band[i]))
+                j++;
             if ((j - i) % 2) once.push_back(band[i]);
             i = j;
         }
@@ -683,8 +711,9 @@ bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& c
         bool in_area = false;
         for (size_t i = 0; i < once.size(); i++) {
             if (i + 1 < once.size() && frac_less(once[i + 1].top, once[i].top)) return false;
-            (once[i].of ? in_cover : in_area) ^= true;
-            if (i + 1 < once.size() && !same(once[i], once[i + 1]) && in_area && !in_cover) return false;
+            if (once[i].of) toggle(once[i].object);
+            else in_area = !in_area;
+            if (i + 1 < once.size() && !same(once[i], once[i + 1]) && in_area && in_cover == 0) return false;
         }
     }
     return true;
@@ -741,7 +770,7 @@ size_t drop_marine_namesakes(Build& b) {
                     cover.push_back(q);
                     named = std::min(named, m);
                 }
-        if (cover.empty() || !polygons_cover(b.rings, cover, area)) continue;
+        if (cover.empty() || !polygons_cover(b.rings, b.object_of, cover, area)) continue;
         keep[o] = 0;
         dropped++;
         log << "  Water: " << object_ref(obj) << " (" << obj.tags.name << ") left out as the namesake of marine area "
@@ -758,8 +787,16 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
     for (size_t o = 0; o < b.objects.size(); o++) {
         Object& obj = b.objects[o];
         if (o < choices.size() && choices[o].named()) {
-            obj.name_key = choices[o].key;
-            obj.key_qid = choices[o].qid;
+            // An area of a name of its own takes its line's river only where
+            // that is its own: of its wikidata item where it has one, else of
+            // its local name.
+            const NameChoice& c = choices[o];
+            const bool own = obj.tags.name.empty() ||
+                             (obj.tags.qid ? c.qid == obj.tags.qid : b.lines.key_local[c.key] == obj.tags.local_name);
+            if (own) {
+                obj.name_key = c.key;
+                obj.key_qid = c.qid;
+            }
             if (obj.tags.name.empty()) {
                 obj.tags.name = b.lines.displays[choices[o].display];
                 obj.tags.local_name = b.lines.key_local[choices[o].key];
@@ -828,6 +865,24 @@ void split_polygons(Build& b, unsigned threads) {
         }
     }, threads);
 
+    // The polygons kept whole and why, and what it cut.
+    auto report = [&](size_t cut, size_t cut_lines, size_t made, size_t kept_whole) {
+        std::ostringstream whole;
+        for (size_t h = 0; h < heavy.size(); h++)
+            if (refusals[h] != SplitRefusal::None)
+                whole << "  Water split: " << object_ref(b.objects[heavy_object[h]]) << " ("
+                      << b.objects[heavy_object[h]].tags.name << ", "
+                      << heavy_rings[h] - 1 << " holes) kept whole: " << refusal_name(refusals[h]) << "\n";
+        std::cerr << whole.str() << "  Water split: " << heavy.size() << " polygons of more than " << kSplitMaxHoles
+                  << " holes; " << cut << " cut along " << cut_lines << " lines into " << made << " pieces, "
+                  << kept_whole << " kept whole; " << b.rings.polygons.size() << " polygons" << std::endl;
+    };
+    // None cut: the store stays as it is, every piece key 0.
+    if (std::all_of(pieces.begin(), pieces.end(), [](const std::vector<SplitPolygon>& p) { return p.empty(); })) {
+        report(0, 0, 0, heavy.size());
+        return;
+    }
+
     // The store again: each cut polygon's pieces in its place.
     AdminExactRings out;
     std::vector<uint32_t> object_of, outer_rank;
@@ -889,15 +944,7 @@ void split_polygons(Build& b, unsigned threads) {
     b.object_of = std::move(object_of);
     b.outer_rank = std::move(outer_rank);
     b.piece_key = std::move(piece_key);
-    std::ostringstream whole;
-    for (size_t h = 0; h < heavy.size(); h++)
-        if (refusals[h] != SplitRefusal::None)
-            whole << "  Water split: " << object_ref(b.objects[heavy_object[h]]) << " ("
-                  << b.objects[heavy_object[h]].tags.name << ", "
-                  << heavy_rings[h] - 1 << " holes) kept whole: " << refusal_name(refusals[h]) << "\n";
-    std::cerr << whole.str() << "  Water split: " << heavy.size() << " polygons of more than " << kSplitMaxHoles
-              << " holes; " << cut << " cut along " << cut_lines << " lines into " << made << " pieces, " << kept_whole
-              << " kept whole; " << b.rings.polygons.size() << " polygons" << std::endl;
+    report(cut, cut_lines, made, kept_whole);
 }
 
 std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_planet_dir) {
@@ -907,8 +954,13 @@ std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_pl
     std::vector<MetaType> previous;
     const std::string dir = prev_planet_dir.empty() ? "" : prev_planet_dir + "/" + kWaterArcTiers[1].dir;
     // A previous build that wrote water dirs (its polygon sidecar there) has
-    // the codes its records carry in its water_meta.json.
-    if (!dir.empty() && std::ifstream(dir + "/admin_polygons.osm_ids").good()) {
+    // the codes its records carry in its water_meta.json. A sidecar there
+    // that can't be opened is no sign of a build without them.
+    const std::string sidecar = dir.empty() ? "" : dir + "/admin_polygons.osm_ids";
+    if (!sidecar.empty() && !path_absent(sidecar)) {
+        if (!std::ifstream(sidecar).good())
+            throw std::runtime_error(sidecar + " is there but can't be opened: whether its build wrote water dirs, "
+                                               "and so the water=* values' codes, is unknown");
         const std::string path = dir + "/water_meta.json";
         const std::optional<std::string> text = read_text(path);
         if (!text)
@@ -1151,15 +1203,15 @@ Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::
     return out;
 }
 
-Layer subset_layer(const Layer& planet, const std::vector<uint8_t>& kept, unsigned threads) {
+Layer subset_layer(const Layer& planet, const std::vector<uint8_t>& masks, uint8_t bit, unsigned threads) {
     if (threads == 0) threads = parallel_threads();
-    if (kept.size() != planet.cells.size()) throw std::logic_error("water cell marks out of step with the cells");
+    if (masks.size() != planet.cells.size()) throw std::logic_error("water cell marks out of step with the cells");
     Layer out;
     out.types = planet.types;
     std::vector<std::atomic<uint64_t>> used(planet.size() / 64 + 1);
-    parallel_for(kept.size(), [&](size_t begin, size_t end, unsigned) {
+    parallel_for(masks.size(), [&](size_t begin, size_t end, unsigned) {
         for (size_t i = begin; i < end; i++)
-            if (kept[i]) mark_bit(used, planet.cells[i].item_id & ID_MASK);
+            if (masks[i] & bit) mark_bit(used, planet.cells[i].item_id & ID_MASK);
     }, threads);
     const RankedBits polygons(planet.size(), used, threads);
     const std::vector<uint32_t> ids = polygons.ones(threads);
@@ -1173,12 +1225,12 @@ Layer subset_layer(const Layer& planet, const std::vector<uint8_t>& kept, unsign
         out.marine.push_back(planet.marine[id]);
         mark_bit(name_used, planet.records[id].name_id);
     }
-    const StringSubset names(planet.names, name_used);
+    StringSubset names(planet.names, name_used);
     for (AdminPolygon& r : out.records) r.name_id = names.offset_of(r.name_id);
-    out.names = names.bytes();
+    out.names = names.take_bytes();
     out.arcs = subset_admin_arcs(planet.arcs, ids, threads);
-    out.cells = parallel_collect<CellItemPair>(kept.size(), [&](size_t i, std::vector<CellItemPair>& found) {
-        if (!kept[i]) return;
+    out.cells = parallel_collect<CellItemPair>(masks.size(), [&](size_t i, std::vector<CellItemPair>& found) {
+        if (!(masks[i] & bit)) return;
         const CellItemPair& c = planet.cells[i];
         found.push_back({c.cell_id, static_cast<uint32_t>(polygons.index(c.item_id & ID_MASK)) | (c.item_id & INTERIOR_FLAG)});
     }, threads);
@@ -1494,6 +1546,19 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
               << std::endl;
     log_phase("      Water: major tier and records", t, cpu);
     return layer;
+}
+
+uint32_t previous_slots(const std::string& region_prev) {
+    if (region_prev.empty()) return 0;
+    uint32_t most = 0;
+    for (const char* dir : {kWaterArcTiers[1].dir, "water/major/simplified"}) {
+        std::ifstream f(region_prev + "/" + dir + "/admin_polygons.osm_ids", std::ios::binary);
+        uint32_t head[3];
+        if (f.read(reinterpret_cast<char*>(head), sizeof head) && head[0] == gc::id_alloc::SIDECAR_MAGIC &&
+            head[1] == gc::id_alloc::SIDECAR_VERSION)
+            most = std::max(most, head[2]);
+    }
+    return most;
 }
 
 void write_water_exact(const Layer& layer, const std::string& dir) {

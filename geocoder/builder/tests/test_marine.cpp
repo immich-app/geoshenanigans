@@ -16,8 +16,7 @@
 
 namespace {
 
-using gctest::bytes_of_hex;
-using gctest::kTwoAreasHex;
+using gctest::two_areas_bytes;
 
 std::string write(const ScratchDir& dir, const std::string& name, const std::string& bytes) {
     const std::string path = dir.path() + "/" + name;
@@ -58,43 +57,70 @@ std::set<uint64_t> way_ends(const std::vector<PackedLocation>& ring, const std::
     return out;
 }
 
-// Each stretch's way id and its edges, whichever vertex the ring starts at.
-std::map<int64_t, uint32_t> stretches(const std::vector<WayRun>& runs) {
-    std::map<int64_t, uint32_t> out;
-    for (const WayRun& r : runs) out[r.way] += r.edges;
+// Each stretch's way id and its edges by its cut vertices, the pair either
+// way round, whichever vertex the ring starts at: the ring's last run and
+// its first are one stretch when they are of one way.
+std::map<std::pair<uint64_t, uint64_t>, std::pair<int64_t, uint32_t>> stretches(const std::vector<PackedLocation>& ring,
+                                                                              const std::vector<WayRun>& runs) {
+    struct Stretch {
+        uint64_t from, to;
+        int64_t way;
+        uint32_t edges;
+    };
+    std::vector<Stretch> list;
+    uint32_t at = 0;
+    for (const WayRun& r : runs) {
+        const int64_t way = r.way;  // by value: WayRun packs it to 4 bytes
+        const uint32_t edges = r.edges;
+        list.push_back({vertex_key(ring[at]), vertex_key(ring[at + edges]), way, edges});
+        at += edges;
+    }
+    if (list.size() > 1 && list.front().way == list.back().way) {
+        list.front().from = list.back().from;
+        list.front().edges += list.back().edges;
+        list.pop_back();
+    }
+    std::map<std::pair<uint64_t, uint64_t>, std::pair<int64_t, uint32_t>> out;
+    for (const Stretch& s : list)
+        CHECK(out.emplace(std::make_pair(std::min(s.from, s.to), std::max(s.from, s.to)), std::make_pair(s.way, s.edges))
+                  .second);
     return out;
+}
+
+// A closed ring of the vertices, its first again at its end.
+std::vector<PackedLocation> closed(std::vector<PackedLocation> ring) {
+    ring.push_back(ring.front());
+    return ring;
 }
 
 }  // namespace
 
 TEST(marine_areas_read_as_marine_import_writes_them) {
     ScratchDir dir("marine");
-    const std::vector<marine::Area> areas = marine::read_areas(write(dir, "two.bin", bytes_of_hex(kTwoAreasHex)));
+    const std::vector<marine::Area> areas = marine::read_areas(write(dir, "two.bin", two_areas_bytes()));
     REQUIRE(areas.size() == 2);
     CHECK_EQ(areas[0].id, 1902u);
     CHECK_EQ(int(areas[0].kind), int(marine::kOcean));
     CHECK(areas[0].name == "North Atlantic Ocean");
-    REQUIRE(areas[0].polygons.size() == 2);
-    REQUIRE(areas[0].polygons[1].size() == 2);
-    // Each ring closed, its first vertex again at its end.
-    const std::vector<PackedLocation>& hole = areas[0].polygons[1][1];
-    REQUIRE(hole.size() == 4);
-    CHECK(hole[0] == pt(-5000000, -5000000));
-    CHECK(hole[2] == pt(0, 5000000));
-    CHECK(hole[3] == hole[0]);
     CHECK_EQ(areas[1].id, 2350u);
     CHECK_EQ(int(areas[1].kind), int(marine::kSea));
     CHECK(areas[1].name == "North Sea");
-    REQUIRE(areas[1].polygons.size() == 1);
-    REQUIRE(areas[1].polygons[0].size() == 1);
-    REQUIRE(areas[1].polygons[0][0].size() == 4);
-    CHECK(areas[1].polygons[0][0][1] == pt(530000000, 40000000));
+    // Every ring as test_marine_import.py gives it, closed: its first vertex
+    // again at its end.
+    using Polygons = std::vector<std::vector<std::vector<PackedLocation>>>;
+    CHECK(areas[0].polygons ==
+          Polygons({{closed({pt(0, -300000000), pt(0, -200000000), pt(100000000, -250000000)})},
+                    {closed({pt(-10000000, -10000000), pt(-10000000, 10000000), pt(10000000, 10000000),
+                             pt(10000000, -10000000)}),
+                     closed({pt(-5000000, -5000000), pt(5000000, -5000000), pt(0, 5000000)})}}));
+    CHECK(areas[1].polygons ==
+          Polygons({{closed({pt(530000000, 30000000), pt(530000000, 40000000), pt(540000000, 35000000)})}}));
     marine::check_file(dir.path() + "/two.bin");
 }
 
 TEST(a_marine_areas_file_of_another_shape_is_refused) {
     ScratchDir dir("marine");
-    const std::string good = bytes_of_hex(kTwoAreasHex);
+    const std::string good = two_areas_bytes();
     std::string magic = good;
     magic[2] = 'X';
     CHECK(error_of(write(dir, "magic.bin", magic)).find("not a marine areas file") != std::string::npos);
@@ -128,7 +154,7 @@ TEST(a_marine_areas_file_of_another_shape_is_refused) {
 
 TEST(a_marine_count_past_what_the_rest_of_the_file_can_hold_is_cut_short_where_it_stands) {
     ScratchDir dir("marine");
-    const std::string good = bytes_of_hex(kTwoAreasHex);
+    const std::string good = two_areas_bytes();
     // Each count set to 1000, more than the bytes after it hold: the object
     // count (at byte 12), the first area's polygon count (at 47) and its
     // first polygon's ring count (at 51). Refused as it is read, before
@@ -174,7 +200,7 @@ TEST(a_marine_ring_is_cut_into_stretches_by_its_own_vertices) {
     for (const auto& other : {turned, back}) {
         const std::vector<WayRun> r = marine::ring_runs(other);
         CHECK(way_ends(other, r) == ends);
-        CHECK(stretches(r) == stretches(runs));
+        CHECK(stretches(other, r) == stretches(ring, runs));
     }
 }
 
@@ -194,6 +220,10 @@ TEST(a_marine_ring_no_vertex_cuts_is_one_stretch) {
     // The same way from any vertex, either way round.
     const std::vector<PackedLocation> turned = {ring[2], ring[3], ring[0], ring[1], ring[2]};
     const std::vector<PackedLocation> back(ring.rbegin(), ring.rend());
-    CHECK_EQ(marine::ring_runs(turned)[0].way, runs[0].way);
-    CHECK_EQ(marine::ring_runs(back)[0].way, runs[0].way);
+    for (const auto& other : {turned, back}) {
+        const std::vector<WayRun> r = marine::ring_runs(other);
+        REQUIRE(r.size() == 1u);
+        CHECK_EQ(r[0].edges, 4u);
+        CHECK_EQ(r[0].way, runs[0].way);
+    }
 }
