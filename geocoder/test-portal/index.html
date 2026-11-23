@@ -396,6 +396,8 @@
   .answer-label { font-size: 11px; text-transform: uppercase; margin-bottom: 2px; }
   .answer-meta { font-size: 11px; color: var(--text-dim); overflow-wrap: anywhere; }
   .answer-name { font-size: 13px; color: var(--text-dim); margin-top: 4px; overflow-wrap: anywhere; }
+  .immich-how { font-size: 11px; color: var(--text-dim); margin-top: 4px; overflow-wrap: anywhere; }
+  .immich-how strong { color: var(--text); font-weight: 600; }
   .fields { width: 100%; border-collapse: collapse; font-size: 13px; }
   .fields tr { border-bottom: 1px solid var(--border); }
   .fields th { text-align: left; padding: 4px 8px; }
@@ -404,7 +406,123 @@
   .fields tr.differs, .fields tr.missing { background: rgba(217, 74, 74, 0.06); }
   .fields tr.differs td.value { color: var(--red); }
   .fields td.empty { color: var(--orange); }
+  .fields tr.shown td.field { color: var(--text); }
+  .fields tr.shown + tr:not(.shown) { border-top: 2px solid var(--border); }
   .detail-places tr.unshared td { color: var(--orange); }
+
+  /* The search: its box, each column's head and the matrix of their
+     results, which scrolls within a height of its own. */
+  .search-section { max-height: 45vh; min-height: 70px; overflow-y: auto; }
+  .search-input {
+    width: 100%;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    padding: 7px 8px;
+    font-size: 13px;
+  }
+  .search-input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  .search-heads { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; font-size: 11px; color: var(--text-dim); }
+  .search-head { border-left: 3px solid var(--accent); padding-left: 6px; overflow-wrap: anywhere; }
+  .search-none { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
+  .search-matrix { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; }
+  .search-matrix th { text-align: left; color: var(--text-dim); font-weight: 500; padding: 2px 4px; border-bottom: 1px solid var(--border); }
+  .search-matrix td { padding: 3px 4px; vertical-align: top; border-bottom: 1px solid var(--border); }
+  .search-matrix .rank { width: 24px; text-align: center; font-family: "SF Mono", "Fira Code", "Consolas", monospace; }
+  .search-matrix td.shifted { text-decoration: underline dotted; }
+  .search-matrix td.absent { color: var(--red); }
+  .search-matrix td.unanswered { color: var(--text-dim); }
+  .search-matrix tr.search-hit { cursor: pointer; }
+  .search-matrix tr.missing { background: rgba(217, 74, 74, 0.06); }
+  .search-matrix tr.search-hit:hover, .search-matrix tr.search-hit.hover { background: var(--surface2); }
+  .hit { overflow-wrap: anywhere; }
+  .hit-name { font-weight: 500; }
+  .hit-kind, .hit-type { font-size: 10px; color: var(--text-dim); margin-left: 6px; }
+  .hit-context { font-size: 11px; color: var(--text-dim); }
+  .hit-context .differs { color: var(--red); }
+  .search-more { margin-top: 6px; }
+  /* A dot of the search on the map: MapLibre places the outer element by
+     its transform, so the fill is what grows on hover. */
+  .search-dot { width: 14px; height: 14px; cursor: pointer; }
+  .search-dot-fill { width: 100%; height: 100%; border-radius: 50%; border: 1px solid rgba(0, 0, 0, 0.8); transition: transform 0.1s; }
+  .search-dot.hover .search-dot-fill { transform: scale(1.7); border-color: #fff; }
+
+  /* The form of a report, in a dialog over the page. */
+  .feedback-dialog {
+    margin: auto;
+    width: min(520px, 94vw);
+    max-height: 90vh;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    font-size: 13px;
+  }
+  .feedback-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+  .feedback-dialog h3 { font-size: 13px; margin-bottom: 4px; }
+  .feedback-about { font-size: 11px; color: var(--text-dim); overflow-wrap: anywhere; margin-bottom: 8px; }
+  .feedback-dialog details { margin-bottom: 8px; font-size: 12px; }
+  .feedback-dialog .json-block { max-height: 200px; overflow-y: auto; }
+  .feedback-row { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
+  .feedback-row span, .feedback-fields span { font-size: 11px; color: var(--text-dim); }
+  .feedback-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 10px; margin-bottom: 8px; }
+  .feedback-fields label { display: flex; flex-direction: column; gap: 2px; }
+  .feedback-dialog textarea, .feedback-dialog input:not([type]), .feedback-dialog select {
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 5px 6px;
+    font: inherit;
+  }
+  .feedback-dialog textarea { resize: vertical; }
+  .feedback-check { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+  .feedback-note { font-size: 11px; color: var(--text-dim); margin-bottom: 10px; }
+  .feedback-actions { display: flex; gap: 8px; }
+  .feedback-status { margin-top: 8px; font-size: 12px; }
+  .feedback-btn { margin-top: 4px; padding: 1px 8px; font-size: 11px; }
+
+  /* The credit of the data the answers come from: a line, kept in sight at
+     the panel's foot while the panel scrolls, and the sources in full in a
+     disclosure. Open, it takes its place at the end of the panel, which
+     scrolls to it, and its sources scroll within a height of their own: the
+     results keep their least height, and a window too short scrolls the
+     panel. */
+  .data-credit {
+    flex: none;
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: 10px;
+    padding: 5px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--bg);
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .data-credit:has(> details[open]) { position: static; }
+  .data-credit a { color: var(--accent); }
+  .credit-more { margin-left: auto; }
+  .credit-more[open] { flex-basis: 100%; margin-left: 0; }
+  .credit-more summary { cursor: pointer; }
+  .credit-body {
+    max-height: min(30vh, 220px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    margin-top: 4px;
+    padding-right: 4px;
+    line-height: 1.45;
+  }
+  .credit-group + .credit-group { margin-top: 8px; }
+  .credit-head { text-transform: uppercase; letter-spacing: 0.08em; font-size: 10px; }
+  .credit { margin-top: 4px; overflow-wrap: anywhere; }
+  .credit-source { color: var(--text); }
+  .credit ul { padding-left: 16px; }
 
   @media (max-width: 800px) {
     .layout { flex-direction: column; }
@@ -424,6 +542,12 @@
       <div class="banner" id="banner"></div>
       <div class="columns" id="columns"></div>
       <div class="status-line" id="status"></div>
+    </section>
+
+    <section class="search-section" id="searchSection" hidden>
+      <h3>Search</h3>
+      <input id="searchInput" class="search-input" type="search" placeholder="A place or a POI: searched as you type, Enter searches at once" autocomplete="off" spellcheck="false" />
+      <div id="searchOut"></div>
     </section>
 
     <section>
@@ -450,6 +574,7 @@
         <button id="nominatimBtn" class="tool" onclick="toggleNominatim()" title="Query Nominatim's public API for side-by-side comparison. Off by default — each query hits nominatim.openstreetmap.org so leave off unless you need the comparison.">Nominatim: Off</button>
         <button id="polygonsBtn" class="tool" onclick="togglePolygons()" title="Cycle the polygon overlay: Off, then the admin polygons of each column's dataset in turn. Use to compare which admin levels a smaller dataset drops.">Polygons: Off</button>
         <button id="linkBtn" class="tool" onclick="copyLink(this)" title="Copy a link to these columns, the selected point and the build that answered">Copy link</button>
+        <button id="feedbackBtn" class="tool" onclick="openGeneralFeedback()" title="Tell us what you think of the answers or the page" hidden>Feedback</button>
         <button id="retestBtn" onclick="retestAllResults()" style="padding:4px 12px;font-size:12px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;">Re-test</button>
         <button onclick="clearResults()" style="padding:4px 12px;font-size:12px;background:var(--red);color:#fff;border:none;border-radius:4px;cursor:pointer;">Clear</button>
       </div>
@@ -460,13 +585,25 @@
       <h3>Detail</h3>
       <div id="detailContent"></div>
     </div>
+
+    <footer class="data-credit">
+      <span class="credit-line">Data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>, <a href="https://opendatacommons.org/licenses/odbl/1-0/" target="_blank" rel="noopener">ODbL</a></span>
+      <details class="credit-more" id="creditMore">
+        <summary>Sources and licences</summary>
+        <div class="credit-body" id="creditBody"></div>
+      </details>
+    </footer>
   </div>
 </div>
+
+<dialog id="feedbackDialog" class="feedback-dialog"><form id="feedbackForm"></form></dialog>
 
 <script id="core">
 // The page's logic that reads no DOM: the link, the columns and the datasets
 // they name (the server's /datasets), the pacing of requests, the comparison
-// of answers and the HTML of each part. page.test.mjs runs it in node.
+// of answers, the place search and its matrix, the reports of those who
+// disagree with an answer, and the HTML of each part.
+// page.test.mjs runs it in node.
 
 // At most this many dataset columns.
 const MAX_COLUMNS = 4;
@@ -537,19 +674,21 @@ function buildOrder(a, b) {
 }
 
 // -- The link --
-// ?d=<dataset> for each column (a preset's id, or <mode>.<quality>.<poi_tier>),
-// at=<lat>,<lon> for each point to look up, and b=<build>, the build the
-// answers came from (its publication ID; a date alone still opens).
+// ?d=<dataset> for each column (a preset's id, <mode>.<quality>.<poi_tier>,
+// or the id of one of /datasets' others, immich-cities500),
+// at=<lat>,<lon> for each point to look up, b=<build>, the build the
+// answers came from (its publication ID; a date alone still opens), and
+// q=<text>, the search box's text as it was typed.
 function parseLink(search) {
-  const q = new URLSearchParams(search);
+  const params = new URLSearchParams(search);
   const points = [];
-  for (const at of q.getAll('at')) {
+  for (const at of params.getAll('at')) {
     const parts = at.split(',');
     if (parts.length !== 2 || parts.some((p) => p.trim() === '')) continue;
     const [lat, lng] = parts.map(Number);
     if (onGlobe(lat, lng)) points.push({ lat, lng });
   }
-  return { datasets: q.getAll('d').filter((d) => d).slice(0, MAX_COLUMNS), points, build: q.get('b') || null };
+  return { datasets: params.getAll('d').filter((d) => d).slice(0, MAX_COLUMNS), points, build: params.get('b') || null, q: params.get('q') || '' };
 }
 
 // The build a link to a result names (b=): the oldest that answered it in
@@ -563,10 +702,11 @@ function linkBuild(answers, keys, served) {
   return builds.find((build) => !served || !sameBuild(build, served)) || builds[0] || served;
 }
 
-function linkSearch({ datasets = [], point = null, build = null }) {
+function linkSearch({ datasets = [], point = null, build = null, q = '' }) {
   const parts = datasets.map((d) => `d=${encodeURIComponent(d).replace(/%2F/g, '/')}`);
   if (point) parts.push(`at=${point.lat},${point.lng}`);
   if (build) parts.push(`b=${encodeURIComponent(build)}`);
+  if (q) parts.push(`q=${encodeURIComponent(q)}`);
   return parts.length ? `?${parts.join('&')}` : '';
 }
 
@@ -622,9 +762,31 @@ function defaultDataset(catalog) {
   return catalog.datasets.find((d) => d.id === catalog.default) || catalog.datasets[0];
 }
 
+// The column of /datasets' others (no dataset of the build: the Immich
+// column, what Immich stores today) that `token` names, if one.
+function otherOf(catalog, token) {
+  return (catalog.others || []).find((o) => o.id === token) || null;
+}
+
+// Whether a column's `dataset` is none of the build's but one of the
+// others: it looks up points alone, with no search and no polygons.
+function pointsOnly(dataset) {
+  return Boolean(dataset && dataset.kind);
+}
+
+// The datasets the search asks: the columns', but those that look up
+// points alone.
+function searchDatasets(columns) {
+  return columns.filter((c) => c.dataset && !pointsOnly(c.dataset)).map((c) => c.dataset.id);
+}
+
 // The column `token` picks: its dataset, whether it is a custom pick (no
-// preset's id), the selection its axes show, and why it has no dataset.
+// preset's id), the selection its axes show, and why it has no dataset. One
+// of the others is no custom pick; its axes, were it made one, the default
+// dataset's.
 function resolveColumn(catalog, token) {
+  const other = otherOf(catalog, token);
+  if (other) return { token, dataset: other, custom: false, selection: { ...defaultDataset(catalog).selection }, error: null, note: null };
   const preset = catalog.presets.find((p) => p.id === token);
   const dataset = catalog.datasets.find((d) => d.id === (preset ? preset.dataset : token)) || null;
   const excluded = catalog.excluded.find((x) => x.id === token) || null;
@@ -707,13 +869,214 @@ function fieldRows(addresses) {
   const rank = (f) => (PREFERRED_ORDER.includes(f) ? PREFERRED_ORDER.indexOf(f) : PREFERRED_ORDER.length);
   fields.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
   return fields
-    .map((field) => {
-      const values = addresses.map((a) => (a && a[field] != null && a[field] !== '' ? String(a[field]) : ''));
-      const present = values.filter((v) => v);
-      const lacking = values.filter((v, i) => !v && addresses[i]);
-      return { field, values, differs: present.some((v) => v !== present[0]), missing: present.length > 0 && lacking.length > 0 };
-    })
+    .map((field) => compared(field, addresses.map((a) => (a && a[field] != null && a[field] !== '' ? String(a[field]) : '')), addresses))
     .filter((row) => row.values.some((v) => v));
+}
+
+// A row of the field table: `field`, its `values` ('' for none) by column,
+// whether two values disagree, and whether a column that answered (of
+// `answers`, null where it didn't) lacks one.
+function compared(field, values, answers) {
+  const present = values.filter((v) => v);
+  const lacking = values.filter((v, i) => !v && answers[i]);
+  return { field, values, differs: present.some((v) => v !== present[0]), missing: present.length > 0 && lacking.length > 0 };
+}
+
+// -- How Immich shows a place --
+// The location Immich's asset viewer shows of a photo, from what it stores
+// (city, state, country; landmark, of our integration):
+// web/src/lib/components/asset-viewer/DetailPanelLocation.svelte of
+// v3.4.2 shows nothing without a country (:33) and else the city, the state
+// and the country, each it has, in that order (:45-57), each on a line of
+// its own; that of our integration (immich-app/immich branch
+// feat/geoshenanigans-geocoder, :51-78) the landmark before them. One line
+// here, joined as Immich joins the same fields on one line, those it has by
+// ', ' (asset-viewer/SlideshowMetadataOverlay.svelte:27-29,
+// utils/duplicate-utils.ts:127).
+function immichShown({ landmark = null, city = null, state = null, country = null }) {
+  return country ? [landmark, city, state, country].filter(Boolean).join(', ') : '';
+}
+
+// Immich's city, state and country as it joins them on one line (as
+// immichShown, but whatever the country).
+function immichJoined({ city = null, state = null, country = null }) {
+  return [city, state, country].filter(Boolean).join(', ');
+}
+
+// What our Immich integration stores from an answer of ours, ported as
+// written from server/src/repositories/geocoding.repository.ts of branch
+// feat/geoshenanigans-geocoder (e0b6fe2ed): foldName (:64-69), the
+// dependent territories (DEPENDENT_TERRITORIES, server/src/constants.ts:
+// 67-147, and :71-75), getCountryCode (:82-96) and mapGeocoderAddress
+// (:105-128). Where the branch names the country with i18n-iso-countries'
+// getName(code, 'en') (:107), the names here are those Immich v3.4.2 stores
+// by the code (countryInfo.txt's, map.repository.ts:177), which /datasets
+// lists with the Immich column (`countryNames`, by ISO alpha-2 code); the
+// answer's own country where they have none, as the branch falls back.
+// None where there is no country: the integration then stores what
+// Immich's own lookup does (server/src/services/metadata.service.ts:
+// 264-266, the Immich column's).
+const DEPENDENT_TERRITORIES = {
+  AI: { sovereign: 'GB', names: ['Anguilla'] },
+  AS: { sovereign: 'US', names: ['American Samoa'] },
+  AW: { sovereign: 'NL', names: ['Aruba'] },
+  AX: { sovereign: 'FI', names: ['Åland', 'Åland Islands'] },
+  BL: { sovereign: 'FR', names: ['Saint Barthélemy', 'Saint-Barthélemy'] },
+  BM: { sovereign: 'GB', names: ['Bermuda', 'The Bermudas or Somers Isles'] },
+  CK: { sovereign: 'NZ', names: ['Cook Is.', 'Cook Islands'] },
+  CW: { sovereign: 'NL', names: ['Curaçao'] },
+  FK: { sovereign: 'GB', names: ['Falkland Is.', 'Falkland Islands', 'Falkland Islands / Malvinas', 'Islas Malvinas'] },
+  FO: { sovereign: 'DK', names: ['Faeroe Is.', 'Faeroe Islands', 'Faroe Islands', 'Føroyar Is. (Faeroe Is.)'] },
+  GG: { sovereign: 'GB', names: ['Bailiwick of Guernsey', 'Guernsey'] },
+  GI: { sovereign: 'GB', names: ['Gibraltar'] },
+  GL: { sovereign: 'DK', names: ['Greenland'] },
+  GS: {
+    sovereign: 'GB',
+    names: ['S. Geo. and the Is.', 'South Georgia and the Islands', 'South Georgia and the South Sandwich Islands'],
+  },
+  GU: { sovereign: 'US', names: ['Guam', 'Territory of Guam'] },
+  HK: {
+    sovereign: 'CN',
+    names: ['Hong Kong', 'Hong Kong S.A.R.', 'Hong Kong SAR, China', 'Hong Kong Special Administrative Region, PRC'],
+  },
+  HM: {
+    sovereign: 'AU',
+    names: [
+      'Heard I. and McDonald Is.',
+      'Heard I. and McDonald Islands',
+      'Heard Island and McDonald Islands',
+      'Territory of Heard Island and McDonald Islands',
+    ],
+  },
+  IM: { sovereign: 'GB', names: ['Isle of Man'] },
+  IO: { sovereign: 'GB', names: ['Br. Indian Ocean Ter.', 'British Indian Ocean Territory'] },
+  JE: { sovereign: 'GB', names: ['Bailiwick of Jersey', 'Jersey'] },
+  KY: { sovereign: 'GB', names: ['Cayman Is.', 'Cayman Islands'] },
+  MF: {
+    sovereign: 'FR',
+    names: ['Saint Martin', 'Saint-Martin', 'Saint-Martin (French part)', 'St. Martin (French part)'],
+  },
+  MO: {
+    sovereign: 'CN',
+    names: ['Macao', 'Macao S.A.R', 'Macao SAR, China', 'Macao Special Administrative Region, PRC', 'Macau'],
+  },
+  MP: {
+    sovereign: 'US',
+    names: ['Commonwealth of the Northern Mariana Islands', 'N. Mariana Is.', 'Northern Mariana Islands'],
+  },
+  MS: { sovereign: 'GB', names: ['Montserrat'] },
+  NC: { sovereign: 'FR', names: ['New Caledonia'] },
+  NF: { sovereign: 'AU', names: ['Norfolk Island', 'Territory of Norfolk Island'] },
+  NU: { sovereign: 'NZ', names: ['Niue'] },
+  PF: { sovereign: 'FR', names: ['Fr. Polynesia', 'French Polynesia'] },
+  PM: { sovereign: 'FR', names: ['Saint Pierre and Miquelon'] },
+  PN: { sovereign: 'GB', names: ['Pitcairn Is.', 'Pitcairn Islands', 'Pitcairn, Henderson, Ducie and Oeno Islands'] },
+  PR: { sovereign: 'US', names: ['Commonwealth of Puerto Rico', 'Puerto Rico'] },
+  SH: { sovereign: 'GB', names: ['Saint Helena'] },
+  SX: { sovereign: 'NL', names: ['Sint Maarten', 'Sint Maarten (Dutch part)', 'St. Maarten (Dutch part)'] },
+  TC: { sovereign: 'GB', names: ['Turks and Caicos Is.', 'Turks and Caicos Islands'] },
+  TF: {
+    sovereign: 'FR',
+    names: [
+      'Fr. S. Antarctic Lands',
+      'Fr. S. and Antarctic Lands',
+      'French Southern and Antarctic Lands',
+      'Territory of the French Southern and Antarctic Lands',
+    ],
+  },
+  UM: { sovereign: 'US', names: ['U.S. Minor Outlying Is.', 'United States Minor Outlying Islands'] },
+  VG: { sovereign: 'GB', names: ['British Virgin Is.', 'British Virgin Islands'] },
+  VI: {
+    sovereign: 'US',
+    names: [
+      'U.S. Virgin Is.',
+      'United States Virgin Islands',
+      'Virgin Islands (U.S.)',
+      'Virgin Islands of the United States',
+    ],
+  },
+  WF: { sovereign: 'FR', names: ['Wallis and Futuna', 'Wallis and Futuna Is.', 'Wallis and Futuna Islands'] },
+};
+
+// accents, case and the Saint/St. spelling are ignored, so OpenStreetMap's
+// 'Curacao' matches Natural Earth's 'Curaçao'
+function foldName(name) {
+  return name
+    .normalize('NFD')
+    .replaceAll(/\p{M}/gu, '')
+    .toLowerCase()
+    .replaceAll(/(^|[^\p{L}\p{N}])(?:saint|st\.?)(?=$|[^\p{L}\p{N}])/gu, '$1st');
+}
+
+const DEPENDENT_TERRITORY_CODES = new Map(
+  Object.entries(DEPENDENT_TERRITORIES).flatMap(([code, { sovereign, names }]) =>
+    names.map((name) => [`${sovereign}:${foldName(name)}`, code]),
+  ),
+);
+
+// A dependent territory that OpenStreetMap maps as a state or region of
+// its sovereign (Puerto Rico under the United States) reports its own
+// country code, as it does on the GeoNames path.
+function immichCountryCode({ country_code, state, region, province }) {
+  const countryCode = country_code?.toUpperCase();
+  if (!countryCode) {
+    return;
+  }
+  for (const name of [state, region, province]) {
+    const territoryCode = name && DEPENDENT_TERRITORY_CODES.get(`${countryCode}:${foldName(name)}`);
+    if (territoryCode) {
+      return territoryCode;
+    }
+  }
+  return countryCode;
+}
+
+function mapGeocoderAddress(address, countryNames = {}) {
+  const countryCode = immichCountryCode(address);
+  const named = countryCode && Object.hasOwn(countryNames, countryCode) ? countryNames[countryCode] : null;
+  const country = named || address.country || null;
+  if (!country) {
+    return null;
+  }
+  return {
+    country,
+    state: address.state ?? address.province ?? address.region ?? address.county ?? address.municipality ?? address.city ?? null,
+    city: address.city ?? address.town ?? address.village ?? address.hamlet ?? address.municipality ?? null,
+    landmark: address.landmark ?? null,
+  };
+}
+
+// The country names Immich stores by ISO alpha-2 code, as /datasets lists
+// them with the Immich column: none where the portal has no Immich geodata.
+function immichCountryNames(catalog) {
+  const immich = ((catalog && catalog.others) || []).find((o) => o.kind === 'immich');
+  return (immich && immich.country_names) || {};
+}
+
+// The field table's first rows, of each answer shown whole (`datas`, null
+// for a column without an answer): "Full address", the answer's
+// display_name (Nominatim's concatenation of its address), the Immich
+// column's what it stores joined as Immich joins it (immichJoined); and "In
+// Immich", the location a photo here would show in Immich (immichShown):
+// the Immich column's from what it stores, another's from what our
+// integration would store from the answer (mapGeocoderAddress), or, where
+// that is none, what Immich's own lookup stores, which the integration
+// falls back to: the Immich column's where it answered. Rows as fieldRows
+// gives them, "In Immich" with `fallback`, by column, true where it fell
+// back.
+function displayRows(datas, countryNames = {}) {
+  const immich = datas.find((d) => d && d.immich);
+  const fallback = datas.map(() => false);
+  const full = datas.map((d) => (!d ? '' : d.immich ? immichJoined(d.immich.stored || {}) : String(d.display_name || '')));
+  const shown = datas.map((d, i) => {
+    if (!d) return '';
+    if (d.immich) return immichShown(d.immich.stored || {});
+    const stored = mapGeocoderAddress(d.address || {}, countryNames);
+    if (stored) return immichShown(stored);
+    fallback[i] = true;
+    return immich ? immichShown(immich.immich.stored || {}) : '';
+  });
+  return [compared('Full address', full, datas), { ...compared('In Immich', shown, datas), fallback }];
 }
 
 function placeKey(p) {
@@ -853,6 +1216,377 @@ function abortable(promise, signal) {
   });
 }
 
+// -- Place search --
+// The search box's search of each column's dataset (/search, the portal's),
+// whose results go into one matrix: a row for each result, those of the
+// columns that name one place one row.
+
+// The results each column is asked for.
+const SEARCH_LIMIT = 10;
+// The quiet in the box, in ms, before its text is searched.
+const SEARCH_DEBOUNCE = 250;
+// The rows of the matrix shown until every one is asked for.
+const SEARCH_ROWS = 5;
+// The results of two columns are one where their names are equal, both or
+// neither is a POI (poiOrNot), and their points at most this many metres
+// apart; within AREA_MATCH_METRES where one is a boundary without a label
+// node, whose point is one on its ring's surface, which moves with the
+// boundary's precision.
+const MATCH_METRES = 1000;
+const AREA_MATCH_METRES = 20000;
+// The parts of a result's context, the smallest first.
+const SEARCH_CONTEXT = ['admin2name', 'admin1name', 'country'];
+// A result's kind (its letter in /search?debug=1) as the matrix names it.
+const SEARCH_KINDS = {
+  P: { label: 'place', title: 'a place node of a settlement' },
+  M: { label: 'place', title: 'a place node of a suburb, quarter or neighbourhood' },
+  B: { label: 'boundary', title: 'a boundary, at its label node' },
+  A: { label: 'boundary', title: 'a boundary without a label node, at a point on its surface' },
+  O: { label: 'POI', title: 'a point of interest' },
+};
+// A dot's slice of a column that lacks its result or has no answer.
+const DOT_ABSENT = '#555566';
+
+// Whether results of the kinds `a` and `b` can be one: a POI with a POI
+// only, however near a place or boundary of its name (a dataset without
+// POIs gives the town where another gives a memorial of the town's name).
+// A place and a boundary can: a dataset gives a place node where another
+// gives the boundary it labels.
+function poiOrNot(a, b) {
+  return (a === 'O') === (b === 'O');
+}
+
+// Whether the server searches: a portal whose /datasets names each
+// dataset's index. A production server has no /datasets.
+function searchOffered(mode, catalog) {
+  return mode === 'catalog' && Boolean(catalog) && catalog.datasets.length > 0
+    && catalog.datasets.every((d) => d.search && d.search.index);
+}
+
+// The search of `q` in `dataset`, its results with how each was found.
+function searchUrl(q, dataset, limit = SEARCH_LIMIT) {
+  return `/search?q=${encodeURIComponent(q)}&dataset=${encodeURIComponent(dataset)}&limit=${limit}&key=test&debug=1`;
+}
+
+// A search answer as the page keeps it, from a response of the server: its
+// results (best first) with the µs the search took in the server, the index
+// it searched (X-Geocoder-Search-Index), the build and the dataset; the
+// state of an index not open, building (asked again after `retry` s, its
+// Retry-After) or failed and why; or why there is none. With the ms it
+// took.
+function searchAnswerOf(status, header, body, ms) {
+  let json = null;
+  try {
+    json = JSON.parse(body);
+  } catch (e) {}
+  if (status === 200) {
+    if (!json || typeof json !== 'object' || !Array.isArray(json.results)) return { error: `not a search answer: ${body.slice(0, 300)}`, ms };
+    return { results: json.results, us: json.us, index: header('x-geocoder-search-index'), build: header('x-geocoder-build-id'), dataset: header('x-geocoder-dataset'), ms };
+  }
+  if (status === 503 && json && json.status === 'building') {
+    return { building: { index: json.index, since: json.since }, retry: Number(header('retry-after')) || 5, dataset: json.dataset, ms };
+  }
+  if (status === 503 && json && json.status === 'failed') {
+    return { failed: { index: json.index, since: json.since, reason: json.reason }, dataset: json.dataset, ms };
+  }
+  return { error: `HTTP ${status}${body ? `: ${body.slice(0, 300)}` : ''}`, ms };
+}
+
+// The metres between two points, along the globe.
+function metres(lat1, lng1, lat2, lng2) {
+  const rad = Math.PI / 180;
+  const h = Math.sin(((lat2 - lat1) * rad) / 2) ** 2
+    + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(((lng2 - lng1) * rad) / 2) ** 2;
+  return 2 * 6371008.8 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function formatMetres(m) {
+  return m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(1)} km`;
+}
+
+// The matrix's rows from each column's results (`lists`: null for a column
+// without an answer, which lacks none). A result joins the row of an earlier
+// column's result of its name and a kind it can be one with (poiOrNot)
+// within MATCH_METRES of it, the closest pairs first, each row and each
+// result once; else it makes a row of its own. A column's own results
+// never share one. Each row has the name, kind, type
+// and point of its first result; its cell of each column (the rank, the
+// result and its metres from that point; null where the column has none);
+// its best rank; whether a column that answered lacks it; whether the ranks
+// differ; the most it moved; whether the columns give another type or kind;
+// and its context, each part with the first result's value, each column's
+// (null where it has no cell) and whether they disagree. By best rank: of
+// rows of one, those of the earlier columns first.
+function searchRows(lists) {
+  const rows = [];
+  lists.forEach((list, c) => {
+    if (!list) return;
+    const before = rows.slice();
+    const pairs = [];
+    list.forEach((r, i) => before.forEach((row, n) => {
+      if (row.name !== r.name || !poiOrNot(row.kind, r.kind)) return;
+      const m = metres(row.lat, row.lng, r.latitude, r.longitude);
+      if (m <= (row.kind === 'A' || r.kind === 'A' ? AREA_MATCH_METRES : MATCH_METRES)) pairs.push({ m, i, n });
+    }));
+    pairs.sort((a, b) => a.m - b.m || a.i - b.i || a.n - b.n);
+    const placed = new Set();
+    for (const { m, i, n } of pairs) {
+      if (placed.has(i) || before[n].cells[c]) continue;
+      before[n].cells[c] = { rank: i + 1, result: list[i], metres: m };
+      placed.add(i);
+    }
+    list.forEach((r, i) => {
+      if (placed.has(i)) return;
+      const cells = lists.map(() => null);
+      cells[c] = { rank: i + 1, result: r, metres: 0 };
+      rows.push({ name: r.name, kind: r.kind, type: r.type, lat: r.latitude, lng: r.longitude, cells });
+    });
+  });
+  for (const row of rows) {
+    const cells = row.cells.filter(Boolean);
+    row.best = Math.min(...cells.map((x) => x.rank));
+    row.missing = lists.some((list, c) => list && !row.cells[c]);
+    row.ranksDiffer = cells.some((x) => x.rank !== row.best);
+    row.moved = Math.max(...cells.map((x) => x.metres));
+    row.typeDiffers = cells.some((x) => x.result.type !== row.type || x.result.kind !== row.kind);
+    row.context = SEARCH_CONTEXT.map((part) => {
+      const values = row.cells.map((x) => (x ? String(x.result[part] ?? '') : null));
+      const given = values.filter((v) => v !== null);
+      return { part, value: given[0], values, differs: given.some((v) => v !== given[0]) };
+    });
+  }
+  return rows.sort((a, b) => a.best - b.best);
+}
+
+// The background of a row's dot: a slice of each column, in the column's
+// colour where it has the result, else DOT_ABSENT; of one column, its
+// colour.
+function dotBackground(row, colors) {
+  const n = row.cells.length;
+  const color = (c) => (row.cells[c] ? colors[c] : DOT_ABSENT);
+  if (n === 1) return color(0);
+  const at = (k) => `${Number(((k * 100) / n).toFixed(2))}%`;
+  return `conic-gradient(${row.cells.map((_, c) => `${color(c)} ${at(c)} ${at(c + 1)}`).join(', ')})`;
+}
+
+// A row's dot's tooltip, as text: its name and type, and its rank in each
+// column (`labels`) that has it.
+function dotTitle(row, labels) {
+  const ranks = row.cells.map((x, c) => (x ? `#${x.rank} in ${labels[c]}` : null)).filter(Boolean);
+  return `${row.name} (${row.type}): ${ranks.join(', ')}`;
+}
+
+// Where a result picked from the matrix of the search `q` came from, as its
+// card says: its name, and its best rank in the first column of it.
+function searchSource(q, row, labels) {
+  const c = row.cells.findIndex((x) => x && x.rank === row.best);
+  return `search "${q}": ${row.name}, #${row.best} in ${labels[c]}`;
+}
+
+// The search box's search (the page's other script wires it to the box):
+// the text searched (q; '' for none) and each dataset's answer to it
+// (answers, by its id; { loading: true } while it is asked). typed(text)
+// searches the text once the box has kept it for `debounce` ms, but not the
+// search shown again; submit(text) (Enter) searches it at once; text of
+// spaces alone ends the search at once. A search asks each dataset of
+// `datasets()` (the columns') once, and cancels the requests of the one
+// before, whose answers it drops. ask() asks those datasets that have no
+// answer of the search shown (a column added, or another dataset picked),
+// again() searches every one anew (another build). A dataset whose index is
+// building is asked again after its Retry-After, its state shown meanwhile.
+// request(url, signal) asks the server (the pacer), changed() follows each
+// change, setTimer(fn, ms) and clearTimer(id) as setTimeout and
+// clearTimeout.
+class PlaceSearch {
+  constructor({ request, datasets, changed = () => {}, setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = (id) => clearTimeout(id),
+                debounce = SEARCH_DEBOUNCE, limit = SEARCH_LIMIT }) {
+    Object.assign(this, { request, datasets, changed, setTimer, clearTimer, debounce, limit });
+    this.q = '';
+    this.answers = {};
+    this.timer = null;
+    this.retries = new Map();
+    this.cancelling = null;
+  }
+
+  typed(text) {
+    this.clearTimer(this.timer);
+    this.timer = null;
+    if (!text.trim()) {
+      this.run('');
+      return;
+    }
+    this.timer = this.setTimer(() => {
+      this.timer = null;
+      if (text !== this.q) this.run(text);
+    }, this.debounce);
+  }
+
+  submit(text) {
+    this.clearTimer(this.timer);
+    this.timer = null;
+    this.run(text);
+  }
+
+  clear() {
+    this.submit('');
+  }
+
+  again() {
+    if (this.q) this.run(this.q);
+  }
+
+  // A new search of `text` ('' ends the search): the one before cancelled,
+  // its answers and its retries dropped.
+  run(text) {
+    if (this.cancelling) this.cancelling.abort();
+    for (const id of this.retries.values()) this.clearTimer(id);
+    this.retries.clear();
+    this.answers = {};
+    this.q = text.trim() ? text : '';
+    this.cancelling = this.q ? new AbortController() : null;
+    this.ask();
+    this.changed();
+  }
+
+  ask() {
+    if (!this.q) return;
+    for (const dataset of new Set(this.datasets())) {
+      if (!Object.hasOwn(this.answers, dataset)) this.askOne(dataset);
+    }
+  }
+
+  // Asks `dataset`, unless the search is cancelled before its answer comes;
+  // one asked again while its index builds keeps that state meanwhile.
+  async askOne(dataset) {
+    const { cancelling } = this;
+    if (!(this.answers[dataset] && this.answers[dataset].building)) {
+      this.answers[dataset] = { loading: true };
+      this.changed();
+    }
+    let answer;
+    try {
+      const got = await this.request(searchUrl(this.q, dataset, this.limit), cancelling.signal);
+      answer = searchAnswerOf(got.status, got.header, got.body, got.ms);
+    } catch (e) {
+      if (cancelling.signal.aborted) return;
+      answer = { error: e.message };
+    }
+    if (cancelling !== this.cancelling) return;
+    this.answers[dataset] = answer;
+    if (answer.building) {
+      this.retries.set(dataset, this.setTimer(() => {
+        this.retries.delete(dataset);
+        if (cancelling === this.cancelling) this.askOne(dataset);
+      }, answer.retry * 1000));
+    }
+    this.changed();
+  }
+}
+
+// The heads of the columns' searches (`views`: each column's label, colour,
+// dataset, error and answer to the search shown): its results' count, the ms
+// its request took and the time of the search in the server, and its index,
+// noted where an earlier column's is the same; its index queued or building
+// since when, with how many of the build's indexes /health (`health`) gives
+// ready; its index failed, and why; or why it has no answer. A dataset's
+// answer has a "Disagree?" button, named by its column (data-feedback-search).
+function searchHeadsHtml(views, health) {
+  const groups = health && health.search && Array.isArray(health.search.groups) ? health.search.groups : null;
+  let html = '<div class="search-heads">';
+  views.forEach((v, c) => {
+    const a = v.answer;
+    let state = '';
+    if (!a) {
+      if (v.error) state = `<span class="warn">${esc(v.error)}</span>`;
+      else if (pointsOnly(v.dataset)) state = '<span class="warn">no search</span>: this column looks up points alone, as Immich does; click the map or a result';
+    } else if (a.loading) {
+      state = '<span class="loading-spinner"></span>searching…';
+    } else if (a.building) {
+      const group = groups ? groups.find((g) => g.index === a.building.index) : null;
+      state = `<span class="loading-spinner"></span>index ${esc(a.building.index)} ${group && group.state === 'queued' ? 'queued' : 'building'}`
+        + ` since ${esc(shortTime(a.building.since))}`;
+      if (groups) state += ` · ${groups.filter((g) => g.state === 'ready').length} of ${groups.length} indexes ready`;
+    } else if (a.failed) {
+      state = `<span class="warn">search unavailable: ${esc(a.failed.reason)}</span> · index ${esc(a.failed.index)},`
+        + ` failed ${esc(shortTime(a.failed.since))}; the next sync round tries it again`;
+    } else if (a.error) {
+      state = `<span class="warn">${esc(a.error)}</span>`;
+    } else if (a.results) {
+      const n = a.results.length;
+      const index = a.index || (v.dataset && v.dataset.search ? v.dataset.search.index : '');
+      const parts = [`${n} result${n === 1 ? '' : 's'}`];
+      if (Number.isFinite(a.ms)) parts.push(`${Math.round(a.ms)} ms${Number.isFinite(a.us) ? `, ${(a.us / 1000).toFixed(2)} ms in the search` : ''}`);
+      parts.push(`index ${esc(index)}`);
+      state = parts.join(' · ');
+      const same = views.findIndex((w, d) => d < c && w.answer && w.answer.results && w.answer.index === a.index);
+      if (same >= 0) state += `, as ${same + 1}'s`;
+    }
+    const disagree = a && a.results && v.dataset
+      ? ` <button class="tool feedback-btn" data-feedback-search="${c}" title="Tell us what you expected this search to find">Disagree?</button>` : '';
+    html += `<div class="search-head" style="border-left-color:${v.color}"><span style="color:${v.color}">${c + 1}</span> ${esc(v.label)}${state ? `: ${state}` : ''}${disagree}</div>`;
+  });
+  return `${html}</div>`;
+}
+
+// The matrix of a search's `rows`: a column of ranks for each of `views`, in
+// its colour ('–' where it answered without the row's result, '·' where it
+// has no answer; a rank below the row's best marked), then the result: its
+// name, kind and type, how far it moved between the columns and whether
+// they give it another type, and its context, each part they disagree on
+// marked with each one's value. The first SEARCH_ROWS rows, or every one
+// where `expanded`, and the button that shows the others or hides them;
+// none until a column answers.
+function searchMatrixHtml(rows, views, expanded) {
+  const answered = views.map((v) => Boolean(v.answer && v.answer.results));
+  if (!answered.some(Boolean)) return '';
+  if (!rows.length) return '<div class="search-none">No results</div>';
+  let html = '<table class="search-matrix"><tr>';
+  views.forEach((v, c) => { html += `<th class="rank" style="color:${v.color}" title="${esc(v.label)}">${c + 1}</th>`; });
+  html += '<th>Result</th></tr>';
+  (expanded ? rows : rows.slice(0, SEARCH_ROWS)).forEach((row, n) => {
+    html += `<tr class="search-hit${row.missing ? ' missing' : ''}" data-row="${n}">`;
+    row.cells.forEach((cell, c) => {
+      const v = views[c];
+      if (cell) {
+        const r = cell.result;
+        const how = [`${v.label}: #${cell.rank}`];
+        if (Number.isFinite(r.score)) how.push(`score ${r.score.toFixed(3)}`);
+        if (Number.isFinite(r.text)) how.push(`text ${r.text.toFixed(3)}`);
+        if (r.context) how.push('its context matched');
+        html += `<td class="rank${cell.rank > row.best ? ' shifted' : ''}" style="color:${v.color}" title="${esc(how.join(' · '))}">${cell.rank}</td>`;
+      } else if (answered[c]) {
+        html += `<td class="rank absent" title="${esc(`${v.label}: not among its results`)}">–</td>`;
+      } else {
+        html += `<td class="rank unanswered" title="${esc(`${v.label}: ${pointsOnly(v.dataset) ? 'no search' : 'no answer'}`)}">·</td>`;
+      }
+    });
+    const kind = Object.hasOwn(SEARCH_KINDS, row.kind) ? SEARCH_KINDS[row.kind] : { label: row.kind, title: row.kind };
+    html += `<td class="hit"><div><span class="hit-name">${esc(row.name)}</span>`
+      + `<span class="hit-kind" title="${esc(kind.title)}">${esc(kind.label)}</span><span class="hit-type">${esc(row.type)}</span>`;
+    if (row.moved >= 1) html += `<span class="tag" title="The farthest of its points from the first column's">moved ${formatMetres(row.moved)}</span>`;
+    if (row.typeDiffers) {
+      const types = row.cells.map((x, c) => (x ? `${views[c].label}: ${x.result.type} (${x.result.kind})` : null)).filter(Boolean);
+      html += `<span class="tag" title="${esc(types.join(' · '))}">type differs</span>`;
+    }
+    const parts = row.context.filter((p) => p.value || p.differs).map((p) => {
+      if (!p.differs) return esc(p.value);
+      const each = p.values.map((value, c) => (value === null ? null : `${views[c].label}: ${value || '—'}`)).filter(Boolean);
+      return `<span class="differs" title="${esc(each.join(' · '))}">${esc(p.value || '—')}</span>`;
+    });
+    html += `</div><div class="hit-context">${parts.join(' · ')}</div></td></tr>`;
+  });
+  html += '</table>';
+  if (rows.length > SEARCH_ROWS) {
+    html += `<button class="tool search-more" data-action="more">${expanded ? `Show the first ${SEARCH_ROWS}` : `Show ${rows.length - SEARCH_ROWS} more`}</button>`;
+  }
+  return html;
+}
+
+// The search's part of the page: the columns' heads, then the matrix.
+function searchHtml(views, health, rows, expanded) {
+  return searchHeadsHtml(views, health) + searchMatrixHtml(rows, views, expanded);
+}
+
 // -- HTML --
 // The picker of the column `col`, the `index`th of `count`: a preset or a
 // custom pick by axis (a value the constraints rule out greyed, with their
@@ -865,6 +1599,9 @@ function pickerHtml(catalog, col, index, count) {
     const d = catalog.datasets.find((x) => x.id === p.dataset);
     const size = d ? ` · ${formatSize(d.size_disk)}` : '';
     html += `<option value="${esc(p.id)}"${!col.custom && col.token === p.id ? ' selected' : ''} title="${esc(p.description)}">${esc(p.label)}${size}</option>`;
+  }
+  for (const o of catalog.others || []) {
+    html += `<option value="${esc(o.id)}"${!col.custom && col.token === o.id ? ' selected' : ''} title="${esc(o.description)}">${esc(o.label)}</option>`;
   }
   html += `<option value=""${col.custom ? ' selected' : ''}>Custom…</option></select>`;
   if (count > 1) html += `<button class="picker-remove" data-col="${index}" data-action="remove" title="Remove this column">×</button>`;
@@ -887,7 +1624,11 @@ function pickerHtml(catalog, col, index, count) {
     for (const line of constraints) html += `<div class="picker-constraint">${esc(line)}</div>`;
   }
   const d = col.dataset;
-  if (d) {
+  if (pointsOnly(d)) {
+    html += `<div class="picker-name">${esc(d.label)}</div>`;
+    html += `<div class="picker-meta">${esc(otherMeta(d))} · ${esc(d.id)}</div>`;
+    if (d.description) html += `<div class="picker-desc">${esc(d.description)}</div>`;
+  } else if (d) {
     html += `<div class="picker-name">${esc(d.label)}</div>`;
     html += `<div class="picker-meta">${esc(selectionLabel(catalog, d.selection))} · ${esc(d.id)}</div>`;
     html += `<div class="picker-meta">${formatSize(d.size_disk)} on disk · ${formatSize(d.size_download)} download</div>`;
@@ -896,6 +1637,47 @@ function pickerHtml(catalog, col, index, count) {
   if (col.note) html += `<div class="picker-note">${esc(col.note)}</div>`;
   if (col.error) html += `<div class="picker-error">${esc(col.error)}</div>`;
   return `${html}</div>`;
+}
+
+// What one of the others is of: for the Immich column, its release and the
+// date of its geodata.
+function otherMeta(d) {
+  const m = d.immich || {};
+  return `Immich ${m.release || 'release'} · geodata of ${String(m.geodata_date || '?').slice(0, 10)}`;
+}
+
+// How Immich found what it stores (the JSON's immich, of the Immich
+// column's answer): the cities500 place, how far, among how many in the
+// box, and where its state and country come from; or the Natural Earth
+// country, which countryInfo.txt may not name; or why nothing. Then the
+// release and its geodata.
+function immichHtml(data) {
+  const m = data && data.immich;
+  if (!m) return '';
+  const km = Number(m.max_distance_m) / 1000;
+  const stored = m.stored || {};
+  const lines = [];
+  const p = m.place;
+  if (m.how === 'cities500' && p) {
+    lines.push(`cities500: <strong>${esc(p.name)}</strong> (${esc(p.feature_code)}, geonameid ${esc(p.geonameid)}) at`
+      + ` ${Number(p.latitude).toFixed(5)}, ${Number(p.longitude).toFixed(5)}, ${formatMetres(Number(p.distance_m))} away,`
+      + ` the nearest of ${esc(m.in_box)} in the ${km} km box`);
+    if (p.beyond_max_distance) {
+      lines.push(`<span class="tag" title="earth_box is a cube: Immich doesn't check the distance of what is in it">beyond ${km} km</span> in a corner of the box`);
+    }
+    lines.push(`state: admin1 ${esc(p.country_code)}.${esc(p.admin1_code)} → ${esc(p.admin1 ?? 'none')} · country: ${esc(p.country_code)} → ${esc(stored.country ?? 'none')}`
+      + ` · admin2 (not stored): ${esc(p.admin2 ?? '—')}`);
+  } else if (m.how === 'natural_earth' && m.natural_earth) {
+    const ne = m.natural_earth;
+    lines.push(`No cities500 place in the ${km} km box: Natural Earth's <strong>${esc(ne.admin)}</strong> (${esc(ne.adm0_a3)}, ${esc(ne.type)}) holds the point`);
+    if (!stored.country) lines.push(`countryInfo.txt has no ${esc(ne.adm0_a3)}: Immich stores no country`);
+  } else if (m.how === 'no_gps') {
+    lines.push('0, 0: Immich takes it for no GPS and stores no place');
+  } else {
+    lines.push(`No cities500 place in the ${km} km box and no Natural Earth country holds the point: Immich stores no place`);
+  }
+  lines.push(`Immich ${esc(m.release || 'release')} · geodata of ${esc(m.geodata_date)}`);
+  return `<div class="immich-how">${lines.map((l) => `<div>${l}</div>`).join('')}</div>`;
 }
 
 // The key of the control of the pickers whose element's data-* attributes
@@ -907,6 +1689,14 @@ function controlKey(data) {
   return [data.col, data.role, data.axis, data.action].map((v) => v ?? '').join('\u0000');
 }
 
+// What the field table's rows of the address shown whole (displayRows)
+// are, as their names' titles say it.
+const SHOWN_TITLES = {
+  'Full address': "The answer's display_name: Nominatim's concatenation of its address. The Immich column's: what it stores, joined as Immich joins it",
+  'In Immich': "What Immich's asset viewer would show of a photo here: the landmark, city, state and country our Immich integration stores"
+    + " from the answer (the Immich column's: what Immich stores today), only with a country",
+};
+
 // The least width of a column's places table in the detail, in px: its
 // three columns' padding and a few letters of each.
 const PLACES_WIDTH = 160;
@@ -916,13 +1706,16 @@ const PLACES_WIDTH = 160;
 // and time, flagged where a build other than the one `served` answered
 // (sameBuild: one published before it under its date among them), and the
 // sizes of its dataset in the build served, where that answered; the
-// address fields side by side, those the answers disagree on or lack
-// marked; the places, those not in every answer marked; the JSON, each
-// panel named by the place of its view (data-view).
-function detailHtml(views, served) {
+// address shown whole (displayRows: the full address, and what Immich
+// would show, the country named by `countryNames`, immichCountryNames) and
+// its fields side by side, those the answers disagree on or lack marked;
+// the places, those not in every answer marked; the JSON, each panel named
+// by the place of its view (data-view). An answer of a dataset has a
+// "Disagree?" button, named by the place of its view (data-feedback).
+function detailHtml(views, served, countryNames = {}) {
   const grid = `display:grid;grid-template-columns:repeat(${views.length},minmax(0,1fr));gap:12px`;
   let html = `<div style="${grid};margin-bottom:12px">`;
-  for (const v of views) {
+  for (const [i, v] of views.entries()) {
     const a = v.answer || {};
     html += `<div class="answer-head" style="border-top-color:${v.color}"><div class="answer-label" style="color:${v.color}">${esc(v.label)}</div>`;
     const meta = [];
@@ -931,7 +1724,9 @@ function detailHtml(views, served) {
     if (Number.isFinite(a.ms)) meta.push(`${Math.round(a.ms)} ms`);
     if (meta.length) html += `<div class="answer-meta">${meta.join(' · ')}</div>`;
     const stale = a.build && served && !sameBuild(a.build, served);
-    if (v.dataset && !stale) html += `<div class="answer-meta">${formatSize(v.dataset.size_disk)} on disk · ${formatSize(v.dataset.size_download)} download</div>`;
+    if (v.dataset && !pointsOnly(v.dataset) && !stale) {
+      html += `<div class="answer-meta">${formatSize(v.dataset.size_disk)} on disk · ${formatSize(v.dataset.size_download)} download</div>`;
+    }
     if (stale) {
       html += `<span class="tag stale" title="The server serves build ${esc(served)} now: Re-test asks it again">build ${esc(a.build)}, not ${esc(served)}</span>`;
     }
@@ -939,20 +1734,29 @@ function detailHtml(views, served) {
     else if (a.error) html += `<div class="result-error">${esc(a.error)}</div>`;
     else if (a.data) html += `<div class="answer-name">${a.data.display_name ? esc(a.data.display_name) : '—'}</div>`;
     else html += '<div class="answer-meta">not asked yet</div>';
+    if (pointsOnly(v.dataset) && a.data) html += immichHtml(a.data);
+    if (v.dataset && a.data) html += `<button class="tool feedback-btn" data-feedback="${i}" title="Tell us what you expected here">Disagree?</button>`;
     html += '</div>';
   }
   html += '</div>';
 
   const datas = views.map((v) => (v.answer && v.answer.data) || null);
+  const shown = datas.some((d) => d) ? displayRows(datas, countryNames) : [];
   const rows = fieldRows(datas.map((d) => (d ? d.address || {} : null)));
-  if (rows.length) {
+  if (shown.length || rows.length) {
     html += '<table class="fields"><tr><th style="color:var(--text-dim);width:140px">Field</th>';
     for (const v of views) html += `<th style="color:${v.color}">${esc(v.label)}</th>`;
     html += '</tr>';
-    for (const row of rows) {
-      html += `<tr class="${row.differs ? 'differs' : row.missing ? 'missing' : ''}"><td class="field">${esc(row.field)}</td>`;
+    const fellBack = ` <span class="tag" title="No country in this answer: our Immich integration stores what Immich's own lookup does, ${
+      datas.some((d) => d && d.immich) ? "the Immich column's" : 'as the Immich column shows it'}">GeoNames fallback</span>`;
+    for (const row of [...shown, ...rows]) {
+      const mark = row.differs ? 'differs' : row.missing ? 'missing' : '';
+      const display = shown.includes(row);
+      html += `<tr class="${[mark, display ? 'shown' : ''].filter(Boolean).join(' ')}">`
+        + `<td class="field"${display ? ` title="${esc(SHOWN_TITLES[row.field])}"` : ''}>${esc(row.field)}</td>`;
       row.values.forEach((value, i) => {
-        html += value ? `<td class="value">${esc(value)}</td>` : `<td class="empty">${datas[i] ? '—' : ''}</td>`;
+        const note = row.fallback && row.fallback[i] ? fellBack : '';
+        html += value ? `<td class="value">${esc(value)}${note}</td>` : `<td class="empty">${datas[i] ? '—' : ''}${note}</td>`;
       });
       html += '</tr>';
     }
@@ -1119,12 +1923,19 @@ function nextPolygons(current, count) {
   return next < count ? next : 'off';
 }
 
+// The key of the dataset whose polygons the overlay on the column `col`
+// shows: its columnKey; none for a column that looks up points alone.
+function polygonKey(col) {
+  return pointsOnly(col.dataset) ? null : columnKey(col);
+}
+
 // What the polygon overlay on the column `column` ('off', or a place in
 // `columns`) shows of a result: the dataset of that column (its key) in the
-// build `build`; none while it is off or its column has no dataset.
+// build `build`; none while it is off or its column has no dataset, or one
+// that looks up points alone.
 function overlayTarget(column, columns, build) {
   const col = column === 'off' ? null : columns[column];
-  const key = col ? columnKey(col) : null;
+  const key = col ? polygonKey(col) : null;
   return key === null ? null : { key, build };
 }
 
@@ -1186,6 +1997,296 @@ class PolygonOverlay {
     if (this.cancelling) this.cancelling.abort();
     this.cancelling = null;
   }
+}
+
+// -- Feedback --
+// A report of someone who disagrees with an answer, as the portal's POST
+// /feedback takes it: what it is of (its target: a column's reverse answer,
+// its search's results, or the page), what they expected and their
+// comment, and the page's link as it was. The page's other script opens the
+// form in a dialog and sends it.
+
+// The most bytes of the answer in a report's JSON: a longer one goes as the
+// start of its JSON, a string, flagged answer_trimmed, so that a report
+// keeps within the portal's 16 KiB.
+const FEEDBACK_ANSWER_MAX = 8192;
+// The fields of an address a report can say it expected, by name, and their
+// labels.
+const FEEDBACK_FIELDS = [['name', 'Name'], ['road', 'Road'], ['house_number', 'House number'], ['city', 'City'], ['postcode', 'Postcode'], ['country', 'Country']];
+// The most characters of the form's texts and of each field.
+const FEEDBACK_TEXT_MAX = 2000;
+const FEEDBACK_FIELD_MAX = 200;
+// The name or contact a report may carry (the portal's CONTACT_MAX), and
+// where this browser remembers it for the next report.
+const FEEDBACK_CONTACT_MAX = 200;
+const FEEDBACK_CONTACT_KEY = 'geocoder_feedback_contact';
+
+// The start of `s` of at most `max` bytes of UTF-8, or where `escaped` of
+// its JSON string, its quotes left out: cut between characters.
+function byteStart(s, max, escaped) {
+  let bytes = 0;
+  let end = 0;
+  for (const ch of s) {
+    const c = ch.codePointAt(0);
+    const n = escaped && (ch === '"' || ch === '\\' || '\b\f\n\r\t'.includes(ch)) ? 2
+      : escaped && (c < 0x20 || (c >= 0xd800 && c <= 0xdfff)) ? 6
+      : c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    if (bytes + n > max) break;
+    bytes += n;
+    end += ch.length;
+  }
+  return s.slice(0, end);
+}
+
+// What a report of a column's reverse answer (`view`, of the result
+// `entry`) is of: the column, the dataset and build that answered, the
+// point, and the JSON the detail shows.
+function reverseTarget(view, entry) {
+  const a = view.answer;
+  return {
+    kind: 'reverse', label: view.label, dataset: a.dataset || (view.dataset && view.dataset.id) || null, build: a.build || null,
+    point: { lat: entry.lat, lng: entry.lng }, q: null, results: null, answer: a.data,
+  };
+}
+
+// What a report of a column's search answer (`view`) to `q` is of: the
+// column, the dataset and build that answered, the search and its results,
+// one of which the form may name.
+function searchTarget(view, q) {
+  const a = view.answer;
+  return {
+    kind: 'search', label: view.label, dataset: a.dataset || (view.dataset && view.dataset.id) || null, build: a.build || null,
+    point: null, q, results: a.results, answer: a.results,
+  };
+}
+
+// What a general report is of: the page as the build `served` answers it,
+// at the selected result `entry`'s point where there is one.
+function generalTarget(entry, served) {
+  return {
+    kind: 'general', label: 'The page', dataset: null, build: served || null,
+    point: entry ? { lat: entry.lat, lng: entry.lng } : null, q: null, results: null, answer: null,
+  };
+}
+
+// The report of `target` from the form's values (`form`, by name: text, the
+// FEEDBACK_FIELDS, empty, comment, and a search's result: '' for its
+// results as a whole, else the index of one) and the page's link as it is
+// (`page`: the columns' tokens, the selected point and the search box's
+// text). Each text goes trimmed, one left empty as null; a search's report
+// is at the point of the result it names.
+function feedbackReport(target, form, page) {
+  const text = (v) => String(v ?? '').trim() || null;
+  const expected = { text: text(form.text) };
+  for (const [field] of FEEDBACK_FIELDS) expected[field] = text(form[field]);
+  expected.empty = Boolean(form.empty);
+  const index = target.kind === 'search' && form.result != null && form.result !== '' ? Number(form.result) : null;
+  const result = index === null ? null : target.results[index];
+  const point = result ? { lat: result.latitude, lng: result.longitude } : target.point;
+  let answer = target.answer ?? null;
+  let trimmed = false;
+  const json = JSON.stringify(answer);
+  if (byteStart(json, FEEDBACK_ANSWER_MAX, false) !== json) {
+    answer = byteStart(json, FEEDBACK_ANSWER_MAX, true);
+    trimmed = true;
+  }
+  return {
+    kind: target.kind,
+    lat: point ? point.lat : null,
+    lon: point ? point.lng : null,
+    q: target.q,
+    result_index: index,
+    dataset: target.dataset,
+    build: target.build,
+    answer,
+    answer_trimmed: trimmed,
+    expected,
+    comment: text(form.comment),
+    ...(text(form.contact) ? { contact: text(form.contact) } : {}),
+    page: { columns: page.columns.slice(), point: page.point ? { lat: page.point.lat, lon: page.point.lng } : null, q: page.q || null },
+  };
+}
+
+// Whether `report` says what was expected (in words, a field, or that the
+// answer should be empty) or comments: the portal takes none that doesn't.
+function feedbackSays(report) {
+  const e = report.expected;
+  return e.empty || Boolean(e.text || report.comment) || FEEDBACK_FIELDS.some(([field]) => e[field]);
+}
+
+// The form of a report of `target`: what it is of, the answer it sends, a
+// search's results to name one of, what was expected, a comment, and what
+// is kept of it.
+function feedbackFormHtml(target, contact = '') {
+  const about = [esc(target.label)];
+  if (target.dataset) about.push(esc(target.dataset));
+  if (target.build) about.push(`build ${esc(target.build)}`);
+  if (target.kind === 'search') about.push(`search “${esc(target.q)}”`);
+  else if (target.point) about.push(`${Number(target.point.lat).toFixed(5)}, ${Number(target.point.lng).toFixed(5)}`);
+  let html = `<h3>${target.kind === 'general' ? 'Feedback' : 'Disagree? Tell us what you expected'}</h3>`;
+  html += `<div class="feedback-about">${about.join(' · ')}</div>`;
+  if (target.answer != null) {
+    html += `<details><summary>The answer sent with it</summary><div class="json-block">${syntaxHighlight(target.answer)}</div></details>`;
+  }
+  if (target.kind === 'search') {
+    html += '<label class="feedback-row"><span>Which result</span><select name="result"><option value="">The results as a whole</option>';
+    (target.results || []).forEach((r, i) => {
+      html += `<option value="${i}">#${i + 1} ${esc(r.name)}${r.type ? ` (${esc(r.type)})` : ''}</option>`;
+    });
+    html += '</select></label>';
+  }
+  html += `<label class="feedback-row"><span>What did you expect?</span><textarea name="text" rows="2" maxlength="${FEEDBACK_TEXT_MAX}"></textarea></label>`;
+  html += '<div class="feedback-fields">';
+  for (const [field, label] of FEEDBACK_FIELDS) {
+    html += `<label><span>${label}</span><input name="${field}" maxlength="${FEEDBACK_FIELD_MAX}" autocomplete="off"></label>`;
+  }
+  html += '</div><label class="feedback-check"><input type="checkbox" name="empty"> The answer should be empty</label>';
+  html += `<label class="feedback-row"><span>Comment</span><textarea name="comment" rows="2" maxlength="${FEEDBACK_TEXT_MAX}"></textarea></label>`;
+  html += `<label class="feedback-row"><span>Your name or contact (optional, so we can ask you more about it)</span><input name="contact" maxlength="${FEEDBACK_CONTACT_MAX}" value="${esc(contact)}" autocomplete="on"></label>`;
+  html += '<div class="feedback-note">We keep what you write here with the answer, its dataset and build, and the page\'s link.'
+    + ' A name or contact you give is kept with your report, and this browser remembers it for your next one; no IP address is kept.</div>';
+  html += '<div class="feedback-actions"><button type="submit">Send</button><button type="button" class="tool" data-action="feedback-close">Cancel</button></div>';
+  return `${html}<div class="feedback-status" role="status"></div>`;
+}
+
+// The thanks once the portal has a report, with the reports of the day and
+// in all where /feedback/count told them (`count`; none where it didn't).
+function feedbackThanks(count) {
+  if (!count || !Number.isFinite(count.today) || !Number.isFinite(count.total)) return 'Thank you! We have your report.';
+  return `Thank you! That makes ${count.today} report${count.today === 1 ? '' : 's'} today, ${count.total} in all.`;
+}
+
+// Why a report wasn't taken, from the portal's answer: what to do about a
+// 413 or a 429, else its status and why.
+function feedbackError(status, body) {
+  if (status === 413) return 'Too long to send: shorten what you wrote.';
+  if (status === 429) return 'Too many reports from here just now: try again in a minute.';
+  return `Not sent: HTTP ${status}${body ? `: ${String(body).slice(0, 300)}` : ''}`;
+}
+
+// -- Credits --
+// The credit of the data the datasets' answers come from where the build
+// served carries none of its own (configurations.json's "attribution", which
+// /datasets passes on; the builds before it have none): its sources as
+// configurations.template.json lists them, and builder/src/attribution.h
+// writes them into each dataset's attribution.json, but for the datasets
+// each applies to.
+const DATA_CREDITS = [
+  {
+    id: 'osm',
+    text: '© OpenStreetMap contributors',
+    url: 'https://www.openstreetmap.org/copyright',
+    licence: 'ODbL 1.0',
+    licence_url: 'https://opendatacommons.org/licenses/odbl/1-0/',
+    notices: ['This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0.'],
+  },
+  {
+    id: 'geonames',
+    text: 'GeoNames',
+    url: 'https://www.geonames.org/',
+    licence: 'CC BY 4.0',
+    licence_url: 'https://creativecommons.org/licenses/by/4.0/',
+    notices: [
+      'UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.',
+      'The Data is provided "as is" without warranty or any representation of accuracy, timeliness or completeness.',
+      "Changes: this dataset holds the coordinates of the GB postcodes of GB_full.csv.zip that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the file's other fields.",
+    ],
+  },
+  {
+    id: 'codepoint-open',
+    text: 'Ordnance Survey Code-Point Open',
+    url: 'https://www.ordnancesurvey.co.uk/products/code-point-open',
+    licence: 'OGL v3.0',
+    licence_url: 'https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/',
+    notices: [
+      "GeoNames's GB_full.csv.zip is derived from Code-Point Open.",
+      'Contains Ordnance Survey data © Crown copyright and database right 2022.',
+      'Contains Royal Mail data © Royal Mail copyright and database right 2022.',
+      'Contains National Statistics data © Crown copyright and database right 2022.',
+    ],
+  },
+  {
+    id: 'tiger',
+    text: 'US Census Bureau TIGER/Line',
+    url: 'https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html',
+    licence: 'Public domain',
+    notices: ["Address ranges and ZIP codes in the United States from the US Census Bureau's TIGER/Line files, which are in the public domain."],
+  },
+  {
+    id: 'wikidata',
+    text: 'Wikidata',
+    url: 'https://www.wikidata.org/',
+    licence: 'CC0 1.0',
+    licence_url: 'https://creativecommons.org/publicdomain/zero/1.0/',
+    notices: ["POI importance from the sitelink counts of the POIs' Wikidata items; Wikidata's structured data is available under CC0 1.0."],
+  },
+];
+
+// The credit of the Immich column's geodata: the files of Immich's release
+// image it answers from as Immich does (server/src/portal/immich.rs).
+const IMMICH_CREDITS = [
+  {
+    id: 'geonames-cities500',
+    text: 'GeoNames',
+    url: 'https://www.geonames.org/',
+    licence: 'CC BY 4.0',
+    licence_url: 'https://creativecommons.org/licenses/by/4.0/',
+    notices: [
+      "The places of GeoNames's cities500.txt, with the names of admin1CodesASCII.txt, admin2Codes.txt and countryInfo.txt, as Immich's release image holds them.",
+      'The Data is provided "as is" without warranty or any representation of accuracy, timeliness or completeness.',
+      'Changes: none; the column shows what of them Immich stores for a photo, and the place it found.',
+    ],
+  },
+  {
+    id: 'natural-earth',
+    text: 'Natural Earth',
+    url: 'https://www.naturalearthdata.com/',
+    licence: 'Public domain',
+    licence_url: 'https://www.naturalearthdata.com/about/terms-of-use/',
+    notices: [
+      "The countries of Natural Earth's ne_10m_admin_0_countries.geojson, as Immich's release image holds it, where no GeoNames place is near.",
+      'Made with Natural Earth. Free vector and raster map data @ naturalearthdata.com.',
+    ],
+  },
+];
+
+// The credit of the build served: /datasets' attribution where it is a list
+// of entries each of a text, else DATA_CREDITS.
+function dataCredits(catalog) {
+  const listed = catalog ? catalog.attribution : null;
+  const reads = Array.isArray(listed) && listed.length > 0
+    && listed.every((e) => e && typeof e === 'object' && typeof e.text === 'string' && e.text !== '');
+  return reads ? listed : DATA_CREDITS;
+}
+
+// `text` as a link to `url`, opened in a tab of its own; the text alone
+// where the URL is none of http or https.
+function creditLink(url, text) {
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return esc(text);
+  return `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(text)}</a>`;
+}
+
+// An entry of a credit: its source, its licence and its notices (those that
+// are strings).
+function creditHtml(entry) {
+  const licence = typeof entry.licence === 'string' && entry.licence ? `, ${creditLink(entry.licence_url, entry.licence)}` : '';
+  const notices = (Array.isArray(entry.notices) ? entry.notices : []).filter((n) => typeof n === 'string' && n);
+  return `<div class="credit"><div class="credit-source">${creditLink(entry.url, entry.text)}${licence}</div>`
+    + (notices.length ? `<ul>${notices.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : '')
+    + '</div>';
+}
+
+// The sources in full, as the page's disclosure holds them: the build's
+// (dataCredits; data-from says whether the build's own or the page's), then
+// the Immich column's where /datasets lists it.
+function creditsHtml(catalog) {
+  const credits = dataCredits(catalog);
+  let html = `<div class="credit-group" data-from="${credits === DATA_CREDITS ? 'page' : 'build'}">`
+    + `<div class="credit-head">The datasets' answers</div>${credits.map(creditHtml).join('')}</div>`;
+  if (((catalog && catalog.others) || []).some((o) => o && o.kind === 'immich')) {
+    html += `<div class="credit-group" data-from="immich"><div class="credit-head">The Immich column's answers</div>${IMMICH_CREDITS.map(creditHtml).join('')}</div>`;
+  }
+  return html;
 }
 
 // `obj` as JSON, escaped, its keys, strings, numbers and literals marked for
@@ -1278,12 +2379,13 @@ let catalogRetry = null;
 let catalogLoads = 0;
 
 // Asks /datasets how the page answers, and lays out its columns: as they
-// were named (the link's or the pickers'), else OPENING_PRESETS. While the
-// portal waits for a build, it asks again every 30 s; once the build is in,
-// the points looked up meanwhile are asked in the columns. Where that moves
-// the polygon overlay (another dataset at its column, another build, or no
-// column), what it drew goes, and the selected result's polygons are asked
-// anew where its column still has a dataset.
+// were named (the link's or the pickers'), else OPENING_PRESETS, and the
+// search (updateSearch). While the portal waits for a build, it asks again
+// every 30 s; once the build is in, the points looked up meanwhile are asked
+// in the columns. Where that moves the polygon overlay (another dataset at
+// its column, another build, or no column), what it drew goes, and the
+// selected result's polygons are asked anew where its column still has a
+// dataset.
 async function loadCatalog() {
   const load = ++catalogLoads;
   clearTimeout(catalogRetry);
@@ -1313,10 +2415,13 @@ async function loadCatalog() {
     if (mode === 'waiting') catalogRetry = setTimeout(loadCatalog, 30000);
   }
   if (polygonsColumn !== 'off' && polygonsColumn >= columns.length) polygonsColumn = 'off';
+  document.getElementById('feedbackBtn').hidden = mode !== 'catalog';
   renderColumns();
   renderBanner();
+  renderCredits();
   updatePolygonsBtn();
   updateLink();
+  updateSearch();
   results.forEach(placeMarker);
   renderResults();
   const entry = selectedEntry();
@@ -1367,10 +2472,11 @@ function dismissMismatch() {
 }
 
 // A column picked anew, added or removed by `change`: the link, the polygon
-// button, the markers (coloured by the first column), the cards, and the
-// selected result's answers. Where that moves the polygon overlay (another
-// dataset at its column, or no column), what it drew goes at once, and the
-// selected result's polygons are asked anew where its column has a dataset.
+// button, the markers (coloured by the first column), the cards, the
+// selected result's answers, and the search (a dataset picked anew asked).
+// Where that moves the polygon overlay (another dataset at its column, or no
+// column), what it drew goes at once, and the selected result's polygons are
+// asked anew where its column has a dataset.
 function changeColumns(change) {
   const shown = overlayTarget(polygonsColumn, columns, servedBuild());
   change();
@@ -1390,6 +2496,8 @@ function changeColumns(change) {
   }
   renderResults();
   saveResults();
+  placeSearch.ask();
+  renderSearch();
 }
 
 function setColumn(i, col) {
@@ -1405,8 +2513,10 @@ columnsEl.addEventListener('change', (e) => {
     if (el.value) {
       setColumn(i, resolveColumn(catalog, el.value));
     } else {
-      // Custom: the axes of the dataset the column had.
-      const from = columns[i].dataset || datasetOf(catalog, columns[i].selection) || defaultDataset(catalog);
+      // Custom: the axes of the dataset the column had (of one of the
+      // others, those its selection keeps).
+      const had = pointsOnly(columns[i].dataset) ? null : columns[i].dataset;
+      const from = had || datasetOf(catalog, columns[i].selection) || defaultDataset(catalog);
       setColumn(i, resolveColumn(catalog, from.id));
     }
   } else if (el.dataset.axis) {
@@ -1432,11 +2542,11 @@ columnsEl.addEventListener('click', (e) => {
 });
 
 // The page's URL: the columns, the selected point and the build that
-// answered it (linkBuild; the build served without one), so that a copy of
-// it opens the same columns on the same point, flagged where another build
-// answers it then. Until the link's points are looked up (once the map is
-// in) it stays the link the page opened, so that a reload meanwhile opens
-// them still.
+// answered it (linkBuild; the build served without one), and the search
+// box's text while it has any, so that a copy of it opens the same columns
+// on the same point and search, flagged where another build answers it
+// then. Until the link's points are looked up (once the map is in) it stays
+// the link the page opened, so that a reload meanwhile opens them still.
 let linkRestored = false;
 function updateLink() {
   if (!linkRestored) return;
@@ -1447,6 +2557,7 @@ function updateLink() {
     datasets: mode === 'single' ? [] : wanted,
     point: entry ? { lat: entry.lat, lng: entry.lng } : null,
     build: entry ? linkBuild(entry.answers, keys, served) : served,
+    q: mode === 'single' || !searchBox.value.trim() ? '' : searchBox.value,
   });
   history.replaceState(null, '', location.pathname + search + location.hash);
 }
@@ -1456,16 +2567,157 @@ function copyLink(btn) {
   copyToClipboard(location.href, btn);
 }
 
+// -- Place search --
+// On a portal whose /datasets names the datasets' indexes, the search box
+// searches each column's dataset as one types (PlaceSearch), its requests
+// in a rate-limit scope of their own ('search'). Its results go into one
+// matrix, and on the map as a dot for each of its rows, coloured by the
+// columns that have it, until the next search or the box is emptied. A
+// click on a row or a dot looks up its point in every column, as a click on
+// the map does; hovering a row marks its dot, and hovering a dot its row.
+const searchSection = document.getElementById('searchSection');
+const searchBox = document.getElementById('searchInput');
+const searchOut = document.getElementById('searchOut');
+const placeSearch = new PlaceSearch({
+  request: (url, signal) => pacer.request(url, 'search', signal),
+  datasets: () => searchDatasets(columns),
+  changed: searchChanged,
+});
+searchBox.value = link.q;
+// The rows of the matrix (by data-row); the search whose matrix shows every
+// row; the dots on the map, and what they show; the row hovered; /health as
+// last asked; the search the link last carried; and whether the map is in.
+let searchShown = [];
+let searchExpanded = null;
+let searchDots = [];
+let dotsDrawn = '';
+let searchHovered = null;
+let lastHealth = null;
+let searchLinked = '';
+let mapReady = false;
+
+function searchViews() {
+  return columns.map((col, i) => ({
+    label: columnLabel(col),
+    color: COLUMN_COLORS[i],
+    dataset: col.dataset,
+    error: col.error,
+    answer: col.dataset ? placeSearch.answers[col.dataset.id] || null : null,
+  }));
+}
+
+function searchChanged() {
+  renderSearch();
+  if (placeSearch.q !== searchLinked) {
+    searchLinked = placeSearch.q;
+    updateLink();
+  }
+}
+
+function renderSearch() {
+  const views = searchViews();
+  searchShown = placeSearch.q ? searchRows(views.map((v) => (v.answer && v.answer.results) || null)) : [];
+  searchOut.innerHTML = placeSearch.q ? searchHtml(views, lastHealth, searchShown, searchExpanded === placeSearch.q) : '';
+  drawSearchDots(views);
+  // The row under the pointer, drawn anew, keeps its mark, and its dot.
+  const hovered = searchHovered;
+  searchHovered = undefined;
+  hoverSearchRow(hovered);
+}
+
+// Once /datasets is in: the search where the server offers it, of the box's
+// text (the link's q= at first), the search shown asked anew (of another
+// build); none where it doesn't offer it.
+function updateSearch() {
+  const offered = searchOffered(mode, catalog);
+  searchSection.hidden = !offered;
+  if (!offered) placeSearch.clear();
+  else if (placeSearch.q) placeSearch.again();
+  else if (searchBox.value.trim()) placeSearch.submit(searchBox.value);
+}
+
+// A dot for each row of the matrix, drawn anew only where they change.
+function drawSearchDots(views) {
+  if (!mapReady) return;
+  const colors = views.map((v) => v.color);
+  const labels = views.map((v) => v.label);
+  const dots = searchShown.map((row) => ({ row, background: dotBackground(row, colors), title: dotTitle(row, labels) }));
+  const drawn = JSON.stringify(dots.map((d) => [d.row.lat, d.row.lng, d.background, d.title]));
+  if (drawn === dotsDrawn) return;
+  dotsDrawn = drawn;
+  for (const dot of searchDots) dot.remove();
+  searchDots = dots.map((d, n) => {
+    const el = document.createElement('div');
+    el.className = 'search-dot';
+    el.title = d.title;
+    const fill = document.createElement('div');
+    fill.className = 'search-dot-fill';
+    fill.style.background = d.background;
+    el.appendChild(fill);
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      pickSearchRow(n);
+    });
+    el.addEventListener('mouseenter', () => hoverSearchRow(n));
+    el.addEventListener('mouseleave', () => hoverSearchRow(null));
+    return new maplibregl.Marker({ element: el }).setLngLat([d.row.lng, d.row.lat]).addTo(map);
+  });
+}
+
+// Marks the row `n` of the matrix and its dot (none: null).
+function hoverSearchRow(n) {
+  if (n === searchHovered) return;
+  searchHovered = n;
+  searchDots.forEach((dot, i) => dot.getElement().classList.toggle('hover', i === n));
+  searchOut.querySelectorAll('tr[data-row]').forEach((tr) => tr.classList.toggle('hover', Number(tr.dataset.row) === n));
+}
+
+// The row `n`'s point, looked up in every column.
+function pickSearchRow(n) {
+  const row = searchShown[n];
+  if (row) reverseGeocode(row.lat, row.lng, searchSource(placeSearch.q, row, columns.map(columnLabel)));
+}
+
+searchBox.addEventListener('input', () => placeSearch.typed(searchBox.value));
+searchBox.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    placeSearch.submit(searchBox.value);
+  }
+});
+searchOut.addEventListener('click', (e) => {
+  const disagree = e.target.closest('[data-feedback-search]');
+  if (disagree) {
+    const view = searchViews()[Number(disagree.dataset.feedbackSearch)];
+    if (view && view.answer && view.answer.results) openFeedback(searchTarget(view, placeSearch.q));
+    return;
+  }
+  if (e.target.closest('[data-action="more"]')) {
+    searchExpanded = searchExpanded === placeSearch.q ? null : placeSearch.q;
+    renderSearch();
+    return;
+  }
+  const tr = e.target.closest('tr[data-row]');
+  if (tr) pickSearchRow(Number(tr.dataset.row));
+});
+searchOut.addEventListener('mouseover', (e) => {
+  const tr = e.target.closest('tr[data-row]');
+  hoverSearchRow(tr ? Number(tr.dataset.row) : null);
+});
+searchOut.addEventListener('mouseleave', () => hoverSearchRow(null));
+
 // -- Status --
 // The portal's /health, every minute (every 5 s while a sync runs): the
-// status line, and the datasets anew once another build is served
-// (catalogStale).
+// status line, the progress of the indexes a column of the search waits
+// for, and the datasets anew once another build is served (catalogStale).
 async function pollHealth() {
   let health = null;
   try {
     health = await (await fetch('/health')).json();
   } catch (e) {}
   document.getElementById('status').innerHTML = statusHtml(health);
+  lastHealth = health;
+  if (Object.values(placeSearch.answers).some((a) => a && a.building)) renderSearch();
   if (catalogStale(health, mode, catalog)) await loadCatalog();
   setTimeout(pollHealth, health && health.sync && health.sync.running ? 5000 : 60000);
 }
@@ -1825,7 +3077,7 @@ const polygonOverlay = new PolygonOverlay({
   erase: erasePolygons,
   shown: () => {
     const col = polygonsColumn === 'off' ? null : columns[polygonsColumn];
-    const key = col ? columnKey(col) : null;
+    const key = col ? polygonKey(col) : null;
     return key === null || selectedId === null ? null : { id: selectedId, key };
   },
 });
@@ -1969,7 +3221,7 @@ function drawPolygons(fc) {
 function updatePolygonLayer(id) {
   const col = polygonsColumn === 'off' ? null : columns[polygonsColumn];
   const r = results.find(x => x.id === id);
-  if (!col || columnKey(col) === null || !r) { clearPolygonLayer(); return; }
+  if (!col || polygonKey(col) === null || !r) { clearPolygonLayer(); return; }
   ensurePolygonLayer();
   const dataset = col.dataset ? `&dataset=${encodeURIComponent(col.dataset.id)}` : '';
   polygonOverlay.show(id, columnKey(col), `/polygons?lat=${r.lat}&lon=${r.lng}&key=test${dataset}`)
@@ -1990,7 +3242,7 @@ function togglePolygons() {
 function updatePolygonsBtn() {
   const btn = document.getElementById('polygonsBtn');
   const col = polygonsColumn === 'off' ? null : columns[polygonsColumn];
-  btn.textContent = `Polygons: ${col ? columnLabel(col) : 'Off'}`;
+  btn.textContent = `Polygons: ${col ? columnLabel(col) : 'Off'}${col && polygonKey(col) === null ? ' (none)' : ''}`;
   btn.style.background = col ? COLUMN_COLORS[polygonsColumn] : 'var(--surface2)';
 }
 
@@ -2007,18 +3259,115 @@ function showDetail(id) {
   // An answer coming in keeps the JSON blocks of the result open, each by
   // the place of its view.
   const open = detailShown === id ? [...content.querySelectorAll('details')].filter((d) => d.open).map((d) => d.dataset.view) : [];
-  content.innerHTML = detailHtml(views, servedBuild());
+  content.innerHTML = detailHtml(views, servedBuild(), immichCountryNames(catalog));
   content.querySelectorAll('details').forEach((d) => { if (open.includes(d.dataset.view)) d.open = true; });
   detailShown = id;
 }
 
+// -- Feedback --
+// A column's "Disagree?" button, in the detail or the search, opens the
+// form of a report of its answer (feedbackFormHtml) in a dialog, and the
+// toolbar's Feedback one of the page; the portal only, which has /feedback.
+// Send posts the report and thanks, with /feedback/count, or says why the
+// portal didn't take it; Cancel or Escape closes the dialog.
+const feedbackDialog = document.getElementById('feedbackDialog');
+const feedbackForm = document.getElementById('feedbackForm');
+let feedbackTarget = null;
+
+function openFeedback(target) {
+  feedbackTarget = target;
+  let contact = '';
+  try { contact = localStorage.getItem(FEEDBACK_CONTACT_KEY) || ''; } catch (err) {}
+  feedbackForm.innerHTML = feedbackFormHtml(target, contact);
+  feedbackDialog.showModal();
+}
+
+function openGeneralFeedback() {
+  openFeedback(generalTarget(selectedEntry(), servedBuild()));
+}
+
+// The link's state as updateLink writes it: the columns, the selected
+// point and the search box's text.
+function feedbackPage() {
+  const entry = selectedEntry();
+  return {
+    columns: mode === 'single' ? [] : wanted,
+    point: entry ? { lat: entry.lat, lng: entry.lng } : null,
+    q: mode === 'single' || !searchBox.value.trim() ? '' : searchBox.value,
+  };
+}
+
+document.getElementById('detailContent').addEventListener('click', (e) => {
+  const disagree = e.target.closest('[data-feedback]');
+  const entry = selectedEntry();
+  if (!disagree || !entry) return;
+  const view = columnViews(entry)[Number(disagree.dataset.feedback)];
+  if (view && view.dataset && view.answer && view.answer.data) openFeedback(reverseTarget(view, entry));
+});
+
+feedbackForm.addEventListener('click', (e) => {
+  if (e.target.closest('[data-action="feedback-close"]')) feedbackDialog.close();
+});
+
+feedbackForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const status = feedbackForm.querySelector('.feedback-status');
+  const send = feedbackForm.querySelector('button[type="submit"]');
+  const report = feedbackReport(feedbackTarget, Object.fromEntries(new FormData(feedbackForm)), feedbackPage());
+  if (!feedbackSays(report)) {
+    status.innerHTML = '<span class="warn">Say what you expected, or add a comment.</span>';
+    return;
+  }
+  send.disabled = true;
+  status.textContent = 'Sending…';
+  let failed = null;
+  try {
+    const resp = await fetch('/feedback?key=test', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(report) });
+    if (resp.status !== 201) failed = feedbackError(resp.status, await resp.text());
+  } catch (err) {
+    failed = `Not sent: ${err.message}`;
+  }
+  if (failed) {
+    status.innerHTML = `<span class="warn">${esc(failed)}</span>`;
+    send.disabled = false;
+    return;
+  }
+  try {
+    if (report.contact) localStorage.setItem(FEEDBACK_CONTACT_KEY, report.contact);
+    else localStorage.removeItem(FEEDBACK_CONTACT_KEY);
+  } catch (err) {}
+  let count = null;
+  try {
+    count = await (await fetch('/feedback/count')).json();
+  } catch (err) {}
+  feedbackForm.innerHTML = `<p class="feedback-note">${esc(feedbackThanks(count))}</p>`
+    + '<div class="feedback-actions"><button type="button" data-action="feedback-close">Close</button></div>';
+});
+
+// -- Credits --
+const creditMore = document.getElementById('creditMore');
+
+// The sources in full of the build served, or the page's while it has none.
+function renderCredits() {
+  document.getElementById('creditBody').innerHTML = creditsHtml(catalog);
+}
+
+// Opened, the sources take their place at the end of the panel: it scrolls
+// to the whole foot.
+creditMore.addEventListener('toggle', () => {
+  if (creditMore.open) creditMore.closest('.data-credit').scrollIntoView({ block: 'nearest' });
+});
+
 // -- Start --
 updateNominatimBtn();
 updatePolygonsBtn();
+renderCredits();
 (async () => {
   await loadCatalog();
   if (mode !== 'single') pollHealth();
   await mapLoaded;
+  mapReady = true;
+  drawSearchDots(searchViews());
   loadResults();
   if (polygonsColumn !== 'off') ensurePolygonLayer();
   linkRestored = true;

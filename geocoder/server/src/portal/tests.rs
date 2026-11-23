@@ -19,8 +19,9 @@ use query_server::{
 };
 
 use crate::portal::catalog::{self, Object};
+use crate::portal::search;
 use crate::portal::sync::{self, BuildDir, BUILDS, COMPLETE, MANIFEST, REFUSED, SETS};
-use crate::portal::{load_dataset, lookup, router, Config, Loader, Portal, BUILD_VERSION, LOOKUPS_AT_ONCE};
+use crate::portal::{load_dataset, lookup, router, Config, Loader, Portal, BUILD_VERSION, LOOKUPS_AT_ONCE, SEARCHES_AT_ONCE};
 use crate::downloader::{basename, resolve_files, Configurations, RegionSelection};
 use crate::scratch_dir::ScratchDir;
 use crate::test_bucket::{self, TestBucket, DATE};
@@ -109,15 +110,24 @@ fn fixtures() -> (Arc<Fixtures>, Loader) {
 }
 
 fn config(bucket: &TestBucket, load: Loader) -> Config {
+    config_at(&bucket.url, load)
+}
+
+/// The portal's config of these tests, of the bucket at `url`.
+fn config_at(url: &str, load: Loader) -> Config {
     Config {
-        base_url: bucket.url.clone(),
+        base_url: url.to_string(),
         interval: Duration::from_millis(20),
         retry_after: Duration::from_millis(20),
         retry_delays: Vec::new(),
         fetches_at_once: 8,
         lookups_at_once: LOOKUPS_AT_ONCE,
+        searches_at_once: SEARCHES_AT_ONCE,
         load,
+        open_search: Arc::new(search::open_search),
+        search_jobs: 4,
         free_space: |_| Ok(u64::MAX),
+        immich: None,
     }
 }
 
@@ -1059,7 +1069,7 @@ async fn a_resumed_sync_removes_what_its_ledger_doesnt_name_before_it_weighs_the
     std::fs::File::create(&abandoned).unwrap().set_len(1 << 20).unwrap();
     let build: u64 = order.iter().flat_map(|o| &o.files).map(|f| bucket.manifest.files[f].size_raw).sum();
     let manifest = std::fs::metadata(root.join(MANIFEST)).unwrap().len();
-    VOLUME.store(sync::FREE_MARGIN + build + manifest + (64 << 10), std::sync::atomic::Ordering::SeqCst);
+    VOLUME.store(sync::FREE_MARGIN + sync::SEARCH_ROOM + build + manifest + (64 << 10), std::sync::atomic::Ordering::SeqCst);
     let mut roomy = config(&bucket, load);
     roomy.free_space = free_on_volume;
     let before = bucket.requests().len();
@@ -1093,12 +1103,12 @@ async fn a_resumed_sync_fetches_again_an_object_its_ledger_names_whose_bytes_cha
     tight.free_space = room;
     // Room for the objects the ledger doesn't name, but not for the one
     // whose bytes changed besides.
-    ROOM.store(sync::FREE_MARGIN + size(&order[3..]), std::sync::atomic::Ordering::SeqCst);
+    ROOM.store(sync::FREE_MARGIN + sync::SEARCH_ROOM + size(&order[3..]), std::sync::atomic::Ordering::SeqCst);
 
     let failed = portal(data.path(), tight).round(true).await.unwrap_err();
 
     assert!(failed.contains(&format!("needed to fetch build {DATE}: ")), "{failed}");
-    ROOM.store(sync::FREE_MARGIN + size(&order[3..]) + size(std::slice::from_ref(changed)), std::sync::atomic::Ordering::SeqCst);
+    ROOM.store(sync::FREE_MARGIN + sync::SEARCH_ROOM + size(&order[3..]) + size(std::slice::from_ref(changed)), std::sync::atomic::Ordering::SeqCst);
     let mut roomy = config(&bucket, load);
     roomy.free_space = room;
     let before = bucket.requests().len();
@@ -1541,6 +1551,31 @@ async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_excl
         }
     }
     assert!(t["axes"]["mode"]["values"]["full"]["description"].is_string());
+    // The build's credit, as its manifest has it (the template's): null where
+    // it has none.
+    assert_eq!(json["attribution"], t["attribution"]);
+}
+
+// /datasets passes on the credit of the build's data, its manifest's
+// attribution, as it is, for the page to show: null where the manifest has
+// none.
+#[tokio::test]
+async fn datasets_passes_on_the_builds_attribution_as_it_is() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let credit = serde_json::json!([{
+        "id": "osm", "text": "© OpenStreetMap contributors", "url": "https://www.openstreetmap.org/copyright",
+        "licence": "ODbL 1.0", "licence_url": "https://opendatacommons.org/licenses/odbl/1-0/",
+        "notices": ["This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0."],
+        "applies_to": ["mode.*"],
+    }]);
+    for (given, listed) in [(credit.clone(), credit), ("no list".into(), "no list".into())] {
+        let plan = plan_edited(&bucket, |m| m["attribution"] = given).await.unwrap();
+        assert_eq!(plan.json("id", "dir")["attribution"], listed);
+    }
+    let plan = plan_edited(&bucket, |m| {
+        m.as_object_mut().unwrap().remove("attribution");
+    }).await.unwrap();
+    assert_eq!(plan.json("id", "dir")["attribution"], serde_json::Value::Null);
 }
 
 // The lookups run a few at once over every client, each on a blocking
@@ -1856,8 +1891,9 @@ async fn a_try_that_leaves_a_temporary_file_it_cant_remove_is_not_made_again() {
     assert_eq!(count, 1);
 }
 
-// A sync that hasn't the room for a build's files and a margin beside them
-// fetches nothing and says how much it needs.
+// A sync that hasn't the room for a build's files, its place search
+// indexes and a margin beside them fetches nothing and says how much it
+// needs.
 #[tokio::test]
 async fn a_sync_without_room_for_the_build_fetches_nothing_and_says_what_it_needs() {
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
@@ -1869,7 +1905,10 @@ async fn a_sync_without_room_for_the_build_fetches_nothing_and_says_what_it_need
 
     let failed = p.round(true).await.unwrap_err();
 
-    assert!(failed.starts_with(&format!("1.00 GiB free in {}, 2.00 GiB needed to fetch build {DATE}: its files' 0.00 GiB and a margin of 2.00 GiB", data.path().display())), "{failed}");
+    assert!(failed.starts_with(&format!(
+        "1.00 GiB free in {}, 9.00 GiB needed to fetch build {DATE}: its files' 0.00 GiB, its place search indexes' 7.00 GiB and a margin of 2.00 GiB",
+        data.path().display()
+    )), "{failed}");
     assert_eq!(bucket.requests().len(), 0);
     assert!(!data.path().join(BUILDS).join(format!("{DATE}-1")).exists());
 }
@@ -2063,3 +2102,15 @@ fn times_are_iso_8601_in_utc() {
     assert_eq!(sync::iso(UNIX_EPOCH + Duration::from_secs(1_763_626_896)), "2025-11-20T08:21:36Z");
     assert_eq!(sync::iso(UNIX_EPOCH + Duration::from_secs(951_782_400)), "2000-02-29T00:00:00Z");
 }
+
+// The place search's tests, beside these, whose helpers they take.
+#[path = "search_tests.rs"]
+mod search_tests;
+
+// The feedback's tests, as the place search's.
+#[path = "feedback_tests.rs"]
+mod feedback_tests;
+
+// The Immich column's tests, as the place search's.
+#[path = "immich_tests.rs"]
+mod immich_tests;

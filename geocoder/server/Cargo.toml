@@ -3,8 +3,6 @@ name = "query-server"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
-# `cargo run` starts the query-server, as before the portal had a binary.
-default-run = "query-server"
 
 # Library: pure geocoding logic, used by both the HTTP binary and the
 # napi binding (geocoder/node). Lives in src/lib.rs.
@@ -17,16 +15,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "query-server"
 path = "src/main.rs"
-
-# Binary: the test portal's server, which syncs the whole planet build and
-# serves each selection of it (src/portal.rs). Its tests run in
-# query-server's (src/portal/tests.rs), beside the routes it answers as, so
-# it has no test target of its own; CI builds it as the image does. It runs
-# on Unix alone: elsewhere it builds to a binary that says so and exits.
-[[bin]]
-name = "query-portal"
-path = "src/portal_main.rs"
-test = false
 
 [features]
 # The arc fixture writer (src/arc_fixture.rs), for the tests of crates that read the arc files.
@@ -56,9 +44,12 @@ bytes = "1"
 http-body = "1"
 
 # The binary's tests (the download tests' bucket) build their datasets with the library's
-# fixture encoders.
+# fixture encoders. The test portal's server (src/portal.rs) is a bin of place-search, for the
+# place search it serves, and its tests run here, beside the routes it answers as: they take
+# place-search too, which only they compile.
 [dev-dependencies]
 query-server = { path = ".", features = ["fixtures"] }
+place-search = { path = "../search" }
 
 [profile.release]
 opt-level = 3

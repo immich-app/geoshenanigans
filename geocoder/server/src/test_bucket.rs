@@ -7,8 +7,9 @@
 //! path its components name, in each region of the template, each of bytes
 //! of its own: a dir's place, POI and arc files are a small dataset of that
 //! dir (the library's fixture encoders), the others made up, a region's JSON
-//! files alike as a build's are. A dir holding all the files of one of the
-//! template's transport units publishes the unit, the only form of them;
+//! files alike as a build's are; dirs a test names alike (serve_alike) hold
+//! the first one's bytes under each name. A dir holding all the files of one
+//! of the template's transport units publishes the unit, the only form of them;
 //! every other file goes as its .zst. A test can have it hold an object's
 //! body back half way (TestBucket::hold), or fail the next fetches of one
 //! (TestBucket::fail).
@@ -305,10 +306,22 @@ pub async fn serve(components: serde_json::Value) -> TestBucket {
     serve_tampered(components, |_, _| {}).await
 }
 
+/// Serves a build whose manifest has `components`, the dirs `alike` holding
+/// under each name the bytes the first of them holds, as the place files
+/// and core strings of the planet build's modes full, no-addresses and
+/// admin are.
+pub async fn serve_alike(components: serde_json::Value, alike: &[&str]) -> TestBucket {
+    serve_with(components, |_, _| {}, alike).await
+}
+
 /// Serves a build whose manifest has `components`, each object's bytes
 /// before zstd (a unit's stream, a file's bytes) given to `tamper` by its
 /// path, to change, the manifest still the true files'.
 pub async fn serve_tampered(components: serde_json::Value, tamper: impl Fn(&str, &mut Vec<u8>)) -> TestBucket {
+    serve_with(components, tamper, &[]).await
+}
+
+async fn serve_with(components: serde_json::Value, tamper: impl Fn(&str, &mut Vec<u8>), alike: &[&str]) -> TestBucket {
     let template: serde_json::Value = serde_json::from_str(TEMPLATE).unwrap();
     let regions: Vec<&String> = template["axes"]["region"]["values"].as_object().unwrap().keys().collect();
     let mut paths = BTreeSet::new();
@@ -328,9 +341,10 @@ pub async fn serve_tampered(components: serde_json::Value, tamper: impl Fn(&str,
     let (mut files, mut objects) = (BTreeMap::new(), HashMap::new());
     let (mut entries, mut units) = (serde_json::Map::new(), serde_json::Map::new());
     for (dir, names) in &by_dir {
-        let fixture = dataset(dir);
+        let of = if alike.contains(&dir.as_str()) { alike[0] } else { dir.as_str() };
+        let fixture = dataset(of);
         let bytes: BTreeMap<&str, Vec<u8>> =
-            names.iter().map(|n| (n.as_str(), fixture.get(n.as_str()).cloned().unwrap_or_else(|| made_up(&format!("{dir}/{n}"))))).collect();
+            names.iter().map(|n| (n.as_str(), fixture.get(n.as_str()).cloned().unwrap_or_else(|| made_up(&format!("{of}/{n}"))))).collect();
         let mut in_unit = BTreeSet::new();
         for u in template["transport"]["units"].as_array().unwrap() {
             let held: Vec<&str> = u["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).collect();
