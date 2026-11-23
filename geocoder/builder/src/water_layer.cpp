@@ -582,27 +582,39 @@ struct Frac {
 
 bool frac_less(const Frac& a, const Frac& b) { return a.num * b.den < b.num * a.den; }
 
-// Whether the polygons `cover` (their rings together counted even-odd:
-// polygons that don't overlap, so their union) hold all the water of the
-// polygons `area` (theirs together, likewise): no open stretch of a
-// parallel that `area` holds and `cover` doesn't. Between two latitudes a
-// vertex of either lies on, each edge spans the band or misses it, and an
-// edge of `cover` and one of `area` along one line across it (a shared
-// shore), or two of `cover` (the side two of its polygons share), are taken
-// once each or cancel. An edge of `area` crossing one of `cover` (in one
-// order at the band's foot, the other at its top) has water of `area`
-// beside it that `cover` doesn't hold; two edges of one side crossing (rings
-// that aren't valid) are taken as alike. With no crossing, the edges keep
-// their order across the band, which holds just what its middle parallel
-// does. Edges east of the area's box hold nothing
-// of it, and those wholly west of it only whether its west side starts in
-// `cover`. Every value is exact: a longitude's numerator is under 2^65, its
-// denominator 2^32.
-bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& cover, const std::vector<uint32_t>& area) {
+// Whether the polygons `cover` (each object's of `object_of` its rings
+// together counted even-odd: polygons of one object that don't overlap, so
+// their union; then the union of the objects', which may overlap) hold all
+// the water of the polygons `area` (their rings together counted even-odd):
+// no open stretch of a parallel that `area` holds and no object of `cover`
+// does. Between two latitudes a vertex of either lies on, each edge spans
+// the band or misses it, and an edge of `cover` and one of `area` along one
+// line across it (a shared shore), or two of `cover`, are taken once each
+// or, two of one object's (the side two of its polygons share), cancel. An
+// edge of `area` crossing one of `cover` (in one order at the band's foot,
+// the other at its top) has water of `area` beside it that `cover` doesn't
+// hold; two edges of one side crossing (rings that aren't valid, or two
+// objects' that overlap there) are taken as alike. With no crossing, the
+// edges keep their order across the band, which holds just what its middle
+// parallel does. Edges east of the area's box hold nothing of it, and those
+// wholly west of it only whether its west side starts in `cover`. Every
+// value is exact: a longitude's numerator is under 2^65, its denominator
+// 2^32.
+bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& object_of,
+                    const std::vector<uint32_t>& cover, const std::vector<uint32_t>& area) {
     struct Edge {
         int64_t lat0, lat1, lng0, lng1;  // lat0 < lat1
         int of;                          // 0 for the area, 1 for the cover
+        uint32_t object;                 // of the cover: its object's place among the cover's objects
         bool west;                       // wholly west of the area's box
+    };
+    // The cover's objects, each in a place of its own.
+    std::vector<uint32_t> objects;
+    for (uint32_t p : cover) objects.push_back(object_of[p]);
+    std::sort(objects.begin(), objects.end());
+    objects.erase(std::unique(objects.begin(), objects.end()), objects.end());
+    auto place_of = [&](uint32_t p) {
+        return static_cast<uint32_t>(std::lower_bound(objects.begin(), objects.end(), object_of[p]) - objects.begin());
     };
     std::vector<Edge> edges;
     std::vector<int64_t> lats;
@@ -619,11 +631,12 @@ bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& c
             lat_lo = std::min<int64_t>(lat_lo, s.lat_e7), lat_hi = std::max<int64_t>(lat_hi, s.lat_e7);
             lng_lo = std::min<int64_t>(lng_lo, s.lon_e7), lng_hi = std::max<int64_t>(lng_hi, s.lon_e7);
             lats.push_back(s.lat_e7);
-            if (s.lat_e7 < t.lat_e7) edges.push_back({s.lat_e7, t.lat_e7, s.lon_e7, t.lon_e7, 0, false});
-            if (t.lat_e7 < s.lat_e7) edges.push_back({t.lat_e7, s.lat_e7, t.lon_e7, s.lon_e7, 0, false});
+            if (s.lat_e7 < t.lat_e7) edges.push_back({s.lat_e7, t.lat_e7, s.lon_e7, t.lon_e7, 0, 0, false});
+            if (t.lat_e7 < s.lat_e7) edges.push_back({t.lat_e7, s.lat_e7, t.lon_e7, s.lon_e7, 0, 0, false});
         });
     if (lat_lo >= lat_hi) return true;
-    for (uint32_t p : cover)
+    for (uint32_t p : cover) {
+        const uint32_t object = place_of(p);
         each_edge(p, [&](PackedLocation s, PackedLocation t) {
             if (s.lat_e7 == t.lat_e7 || std::max(s.lat_e7, t.lat_e7) <= lat_lo || std::min(s.lat_e7, t.lat_e7) >= lat_hi ||
                 std::min(s.lon_e7, t.lon_e7) > lng_hi)
@@ -631,9 +644,10 @@ bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& c
             const bool west = std::max(s.lon_e7, t.lon_e7) < lng_lo;
             for (const int32_t lat : {s.lat_e7, t.lat_e7})
                 if (lat > lat_lo && lat < lat_hi) lats.push_back(lat);
-            if (s.lat_e7 < t.lat_e7) edges.push_back({s.lat_e7, t.lat_e7, s.lon_e7, t.lon_e7, 1, west});
-            else edges.push_back({t.lat_e7, s.lat_e7, t.lon_e7, s.lon_e7, 1, west});
+            if (s.lat_e7 < t.lat_e7) edges.push_back({s.lat_e7, t.lat_e7, s.lon_e7, t.lon_e7, 1, object, west});
+            else edges.push_back({t.lat_e7, s.lat_e7, t.lon_e7, s.lon_e7, 1, object, west});
         });
+    }
     std::sort(lats.begin(), lats.end());
     lats.erase(std::unique(lats.begin(), lats.end()), lats.end());
     std::sort(edges.begin(), edges.end(), [](const Edge& x, const Edge& y) { return x.lat0 < y.lat0; });
@@ -646,6 +660,7 @@ bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& c
     struct Ends {
         Frac foot, top;
         int of;
+        uint32_t object;
     };
     auto less = [](const Ends& x, const Ends& y) {
         if (frac_less(x.foot, y.foot)) return true;
@@ -655,6 +670,13 @@ bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& c
     auto same = [&](const Ends& x, const Ends& y) { return !less(x, y) && !less(y, x); };
     std::vector<uint32_t> active;
     std::vector<Ends> band, once;
+    // Whether each object of the cover holds the stretch, and how many do.
+    std::vector<uint8_t> in_object(objects.size());
+    size_t in_cover = 0;
+    auto toggle = [&](uint32_t object) {
+        in_object[object] ^= 1;
+        in_cover = in_object[object] ? in_cover + 1 : in_cover - 1;
+    };
     size_t next = 0;
     for (size_t k = 0; k + 1 < lats.size() && lats[k] < lat_hi; k++) {
         const int64_t foot = lats[k], top = lats[k + 1];
@@ -662,20 +684,26 @@ bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& c
         active.erase(std::remove_if(active.begin(), active.end(), [&](uint32_t e) { return edges[e].lat1 <= foot; }),
                      active.end());
         if (top <= lat_lo) continue;
-        // In the cover west of the area's box, and the other edges, each
-        // line of one side across the band taken as often as it is, mod 2.
-        bool in_cover = false;
+        // In each object of the cover west of the area's box, and the other
+        // edges, each line of the area or of one object across the band
+        // taken as often as it is, mod 2.
+        std::fill(in_object.begin(), in_object.end(), 0);
+        in_cover = 0;
         band.clear();
         for (uint32_t e : active) {
-            if (edges[e].west) in_cover = !in_cover;
-            else band.push_back({at(edges[e], foot, 1), at(edges[e], top, 1), edges[e].of});
+            if (edges[e].west) toggle(edges[e].object);
+            else band.push_back({at(edges[e], foot, 1), at(edges[e], top, 1), edges[e].of, edges[e].object});
         }
-        std::sort(band.begin(), band.end(),
-                  [&](const Ends& x, const Ends& y) { return x.of != y.of ? x.of < y.of : less(x, y); });
+        std::sort(band.begin(), band.end(), [&](const Ends& x, const Ends& y) {
+            if (x.of != y.of) return x.of < y.of;
+            if (x.object != y.object) return x.object < y.object;
+            return less(x, y);
+        });
         once.clear();
         for (size_t i = 0; i < band.size();) {
             size_t j = i + 1;
-            while (j < band.size() && band[j].of == band[i].of && same(band[j], band[i])) j++;
+            while (j < band.size() && band[j].of == band[i].of && band[j].object == band[i].object && same(band[j], band[i]))
+                j++;
             if ((j - i) % 2) once.push_back(band[i]);
             i = j;
         }
@@ -683,8 +711,9 @@ bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& c
         bool in_area = false;
         for (size_t i = 0; i < once.size(); i++) {
             if (i + 1 < once.size() && frac_less(once[i + 1].top, once[i].top)) return false;
-            (once[i].of ? in_cover : in_area) ^= true;
-            if (i + 1 < once.size() && !same(once[i], once[i + 1]) && in_area && !in_cover) return false;
+            if (once[i].of) toggle(once[i].object);
+            else in_area = !in_area;
+            if (i + 1 < once.size() && !same(once[i], once[i + 1]) && in_area && in_cover == 0) return false;
         }
     }
     return true;
@@ -741,7 +770,7 @@ size_t drop_marine_namesakes(Build& b) {
                     cover.push_back(q);
                     named = std::min(named, m);
                 }
-        if (cover.empty() || !polygons_cover(b.rings, cover, area)) continue;
+        if (cover.empty() || !polygons_cover(b.rings, b.object_of, cover, area)) continue;
         keep[o] = 0;
         dropped++;
         log << "  Water: " << object_ref(obj) << " (" << obj.tags.name << ") left out as the namesake of marine area "

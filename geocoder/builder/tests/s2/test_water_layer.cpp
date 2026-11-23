@@ -1665,3 +1665,32 @@ TEST(a_namesake_cutting_a_marine_areas_corner_or_meeting_it_along_a_side_or_at_a
     const Layer layer = build(c);
     CHECK(ways_held(layer, {3003, 3004, 3005, 3006}).first == std::set<int64_t>({3003, 3004, 3005, 3006}));
 }
+
+TEST(a_namesake_inside_marine_areas_of_its_name_that_overlap_goes) {
+    Collected c = with_marine();
+    // Marine areas of one name and MRGIDs of their own: the Celtic Sea
+    // twice over one square, and the Bristol Channel over two squares that
+    // overlap by half.
+    const int32_t lat = kLat - 26000000;
+    auto rect = [](int32_t south, int32_t west, int32_t height, int32_t width) {
+        return Ring{pt(south, west), pt(south, west + width), pt(south + height, west + width), pt(south + height, west),
+                    pt(south, west)};
+    };
+    c.marine.push_back(marine_area(2370, marine::kSea, "Celtic Sea", {{square(lat, kLng, 2000000, 5)}}));
+    c.marine.push_back(marine_area(2371, marine::kSea, "Celtic Sea", {{square(lat, kLng, 2000000, 5)}}));
+    c.marine.push_back(marine_area(2372, marine::kSea, "Bristol Channel", {{square(lat, kLng + 3000000, 2000000, 5)}}));
+    c.marine.push_back(marine_area(2373, marine::kSea, "Bristol Channel", {{square(lat, kLng + 4000000, 2000000, 5)}}));
+    // Bays of their names: in the Celtic Sea's square, in the half both
+    // squares of the Bristol Channel hold, and across that half from one
+    // square's own half to the other's, all of which they hold. One
+    // reaching east past them stays.
+    c.closed_ways.push_back({3030, tags(code::kNaturalBay, "Celtic Sea"), rect(lat + 500000, kLng + 500000, 500000, 500000)});
+    c.closed_ways.push_back(
+        {3031, tags(code::kNaturalBay, "Bristol Channel"), rect(lat + 500000, kLng + 4200000, 500000, 500000)});
+    c.closed_ways.push_back(
+        {3032, tags(code::kNaturalBay, "Bristol Channel"), rect(lat + 500000, kLng + 3500000, 500000, 2000000)});
+    c.closed_ways.push_back(
+        {3033, tags(code::kNaturalBay, "Bristol Channel"), rect(lat + 500000, kLng + 4500000, 500000, 2000000)});
+    const Layer layer = build(c);
+    CHECK(ways_held(layer, {3030, 3031, 3032, 3033}).first == std::set<int64_t>({3033}));
+}

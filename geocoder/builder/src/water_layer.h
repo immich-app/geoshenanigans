@@ -242,10 +242,11 @@ Build assemble(Collected& c, unsigned threads);
 // namesake, in place: its name or local name (name:en or name) is the
 // marine area's, ASCII case, spaces and punctuation aside, and the polygons
 // of the marine areas of its name hold all its water (polygons_cover: its
-// polygons' rings even-odd, its holes left out, within theirs, a shared
-// shore aside). Those marine areas answer there; every other bay and strait
-// stays, the water of one that reaches past them, or round an island they
-// leave out, among them. Logs each it leaves out and returns how many.
+// polygons' rings even-odd, its holes left out, within the union of the
+// areas', each area's rings even-odd, a shared shore aside). Those marine
+// areas answer there; every other bay and strait stays, the water of one
+// that reaches past them, or round an island they leave out, among them.
+// Logs each it leaves out and returns how many.
 size_t drop_marine_namesakes(Build& b);
 
 // Names each unnamed river or canal object by `choices` (pick_names, by
