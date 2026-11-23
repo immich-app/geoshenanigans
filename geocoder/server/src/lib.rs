@@ -6357,6 +6357,17 @@ mod pure_helper_tests {
     }
 
     #[test]
+    fn nested_ranks_stop_at_25_under_a_parent_of_24() {
+        // Upper Ward (admin_level 9, rank 18) takes its linked neighbourhood's 24, and Lower Ward
+        // (10, rank 20, a neighbourhood too) inside it 25, the most the admin-nested step gives
+        // under a parent of 24 or more (placex_triggers.sql:903-904): a boundary of 25 is still
+        // an admin-nested parent (ADMIN_PARENT_RANKS), one of 26 would not be.
+        let mut polys = [ranked(10, 20, 1.0, 5), ranked(9, 18, 10.0, 5)];
+        promote_nested_ranks(&mut polys, std::iter::empty::<&AdminPolygon>(), "", |_, _| true);
+        assert_eq!(levels_and_ranks(&polys), [(9, 24), (10, 25)]);
+    }
+
+    #[test]
     fn current_boundaries_fall_back_to_the_country() {
         // A Vatican point: Rome's boundaries are near but leave it out; the
         // country holds it and gates every place rank.

@@ -571,6 +571,38 @@ fn point_on_surface_is_in_the_widest_run_inside() {
 }
 
 #[test]
+fn a_centroid_is_the_outer_ring_s_less_its_holes_whichever_way_the_arcs_run() {
+    // ST_Centroid of a 10 by 10 degree square less a hole from 6 to 8: the square's centre (5, 5)
+    // weighted by its area, 100, less the hole's (7, 7) by its 4, over 96. Each side an arc of
+    // its own, and once with a side of each ring stored the other way round, which the ring
+    // walks backwards.
+    let want = (100.0 * 5.0 - 4.0 * 7.0) / 96.0;
+    let corners = |lo: f64, hi: f64| [(lo, lo), (lo, hi), (hi, hi), (hi, lo), (lo, lo)];
+    for reversed in [false, true] {
+        let mut s = Shapes::default();
+        let sides = |fx: &mut ArcFixture, ring: [(f64, f64); 5], back: usize| -> Vec<Ref> {
+            (0..4).map(|k| {
+                if reversed && k == back {
+                    Ref::rev(fx.arc(0, &ring_deg(&[ring[k + 1], ring[k]])))
+                } else {
+                    Ref::fwd(fx.arc(0, &ring_deg(&[ring[k], ring[k + 1]])))
+                }
+            }).collect()
+        };
+        let (outer, hole) = (corners(0.0, 10.0), corners(6.0, 8.0));
+        let refs = [sides(&mut s.fx, outer, 1), sides(&mut s.fx, hole, 2)];
+        let holed = s.polygon(8, &refs, vec![ring_deg(&outer), ring_deg(&hole)]);
+        let refs = [sides(&mut s.fx, outer, 3)];
+        let square = s.polygon(8, &refs, vec![ring_deg(&outer)]);
+        let (geom, polys) = s.geometry();
+        let (lat, lng) = geom.centroid(&polys[holed as usize]).unwrap();
+        assert!((lat - want).abs() < 1e-9 && (lng - want).abs() < 1e-9, "reversed {reversed}: ({lat}, {lng})");
+        let (lat, lng) = geom.centroid(&polys[square as usize]).unwrap();
+        assert!((lat - 5.0).abs() < 1e-9 && (lng - 5.0).abs() < 1e-9, "reversed {reversed}: ({lat}, {lng})");
+    }
+}
+
+#[test]
 fn point_on_surface_streams_what_the_builder_finds_over_the_rings() {
     // Wiggling edges cross a scan line many times, and in a lattice of mixed grids arcs of
     // different grids meet at their shared junctions.
