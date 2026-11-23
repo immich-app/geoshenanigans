@@ -147,6 +147,9 @@ case "$cmd" in
 esac
 """
 
+# unzip as the Fetch step runs it, `-p ZIP PATTERN`: prints the land polygons README's date line.
+FAKE_UNZIP = "#!/bin/sh\necho 'Date of the data used is 2026-11-20T00:00:00Z'\n"
+
 REPO = os.path.join(HERE, "..", "..", "..")
 
 
@@ -443,6 +446,42 @@ class MarineWorkflowTest(unittest.TestCase):
         self.assertIn("::error::", run.stdout)
         run = self.run_tests_step("FAILED (failures=1)", status=1)
         self.assertNotEqual(run.returncode, 0)
+
+    def run_fetch(self, layer):
+        """The Fetch step with the WFS serving `layer`, a GeoJSON document: the run."""
+        with tempfile.TemporaryDirectory() as t:
+            served, bin_dir = os.path.join(t, "served"), os.path.join(t, "bin")
+            for d in (served, bin_dir):
+                os.makedirs(d)
+            for name, text in [("curl", FAKE_CURL), ("unzip", FAKE_UNZIP)]:
+                with open(os.path.join(bin_dir, name), "w") as f:
+                    f.write(text)
+                os.chmod(os.path.join(bin_dir, name), 0o755)
+            with open(os.path.join(served, "eez_iho.json"), "w") as f:
+                json.dump(layer, f)
+            with open(os.path.join(served, "land.zip"), "wb") as f:
+                f.write(b"PK")
+            env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNNER_TEMP": t, "GITHUB_ENV": os.path.join(t, "env"),
+                   "EEZ_IHO_URL": "https://wfs.example/geocoder/eez_iho.json",
+                   "LAND_URL": "https://land.example/geocoder/land.zip", "FAKE_CURL_DIR": served}
+            return subprocess.run(["bash", "-e", "-c", script(read(MARINE_WORKFLOW), "Fetch the sources")], env=env,
+                                  capture_output=True, text=True, timeout=60)
+
+    def test_a_wfs_download_short_of_the_whole_layer_stops_the_run(self):
+        features = [{"type": "Feature", "properties": {}, "geometry": None}] * 3
+        whole = {"type": "FeatureCollection", "features": features, "numberMatched": 3, "numberReturned": 3}
+        run = self.run_fetch(whole)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        # A server that caps a request's features says so only in these counts; without them nothing does.
+        for why, layer in [("capped", {**whole, "numberMatched": 5}), ("returned less", {**whole, "numberReturned": 2}),
+                           ("features short", {**whole, "features": features[:2]}),
+                           ("matched unknown", {**whole, "numberMatched": "unknown"}),
+                           ("no matched", {k: v for k, v in whole.items() if k != "numberMatched"}),
+                           ("no returned", {k: v for k, v in whole.items() if k != "numberReturned"})]:
+            with self.subTest(why):
+                run = self.run_fetch(layer)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn("::error::", run.stdout)
 
     def run_build(self, summary):
         """The Build step with the tool's summary `summary`: the run, and whether it compressed the file."""
