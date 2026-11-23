@@ -24,7 +24,8 @@ import marine_import  # noqa: E402
 HAS_GEOMETRY = all(importlib.util.find_spec(m) for m in ("shapely", "numpy", "pyogrio"))
 
 # Two areas, by id: the ocean 1902 of two polygons (a triangle; a square with a triangular hole) and the sea
-# 2350 of one triangle. The builder's tests read the same bytes (tests/marine_test_file.h).
+# 2350 of one triangle. The bytes write_marine gives them are a file the builder's tests read too
+# (tests/marine_test_file.h).
 TWO_AREAS = [
     (1902, marine_import.KIND_OCEAN, "North Atlantic Ocean", [
         [[(0, -300000000), (0, -200000000), (100000000, -250000000)]],
@@ -33,11 +34,7 @@ TWO_AREAS = [
     ]),
     (2350, marine_import.KIND_SEA, "North Sea", [[[(530000000, 30000000), (530000000, 40000000), (540000000, 35000000)]]]),
 ]
-TWO_AREAS_HEX = (
-    "47434d4152494e4501000000020000006e070000000000000214004e6f7274682041746c616e746963204f6365616e020000000100000003"
-    "00000000000000005d1eee0000000000e1f50500e1f505800f05fd0200000004000000806967ff806967ff00000000002d3101002d310100"
-    "0000000000000000d3cefe03000000c0b4b3ffc0b4b3ff8096980000000000c0b4b3ff809698002e090000000000000109004e6f72746820"
-    "5365610100000001000000030000008028971f80c3c901000000008096980080969800c0b4b3ff")
+TWO_AREAS_FILE = os.path.join(HERE, "..", "..", "testdata", "marine_two_areas.bin")
 
 
 class FileTest(unittest.TestCase):
@@ -50,8 +47,8 @@ class FileTest(unittest.TestCase):
 
     def test_writes_the_bytes_the_builder_reads_by_id(self):
         marine_import.write_marine(self.path, list(reversed(TWO_AREAS)))
-        with open(self.path, "rb") as f:
-            self.assertEqual(f.read().hex(), TWO_AREAS_HEX)
+        with open(self.path, "rb") as f, open(TWO_AREAS_FILE, "rb") as want:
+            self.assertEqual(f.read(), want.read())
         self.assertFalse(os.path.exists(self.path + ".part"))
         self.assertEqual(marine_import.read_marine(self.path), TWO_AREAS)
 

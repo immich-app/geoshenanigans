@@ -274,8 +274,7 @@ TEST(a_way_only_the_water_layer_reads_stays_out_of_the_other_layers) {
 
 TEST(build_index_loads_the_marine_areas_it_is_given_into_the_water_dirs) {
     const ScratchDir root("water-marine-build");
-    const std::string marine = root.path() + "/marine_areas.bin";
-    std::ofstream(marine, std::ios::binary) << gctest::bytes_of_hex(gctest::kTwoAreasHex);
+    const std::string marine = gctest::two_areas_path();
     // The ocean and the sea beside the fixture's water, credited to Marine
     // Regions; without the file, neither.
     const std::string with = root.path() + "/with", without = root.path() + "/without";
