@@ -258,6 +258,14 @@ inline uint64_t mix_key(uint64_t key, uint64_t line, bool meridian, int side) {
     return mix64(key ^ mix64(line * 4 + (meridian ? 2 : 0) + uint64_t(side) + 0x51a1f00dull));
 }
 
+// A lobe's key: its side's (mix_key) with its outer ring's corner mixed in,
+// so that a lobe the side gains or loses moves no other's.
+inline uint64_t lobe_key(uint64_t side_key, const Corner& corner) {
+    uint64_t key = side_key;
+    for (const int32_t v : corner) key = mix64(key ^ (uint64_t(uint32_t(v)) + 0x9e3779b97f4a7c15ull));
+    return key;
+}
+
 // The negative way id of the cut along a line.
 inline int64_t cut_way_of(int64_t line, bool meridian) {
     return -static_cast<int64_t>((mix64(uint64_t(line) * 2 + (meridian ? 1 : 0)) >> 2) + 1);
@@ -524,15 +532,20 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
             std::vector<NestedPolygon<int64_t>> polygon_ways = nest_rings(std::move(ways), around, depth);
             // The side's polygons in the order of their outer rings'
             // corners, which neither the rings' start nor their direction
-            // moves: a piece's key is its own whichever order the cut met
-            // them in.
+            // moves: a piece's key is its own corner's (lobe_key) whichever
+            // order the cut met them in, and whichever other lobes the side
+            // holds. Lobes of one corner, which the rings of a side don't
+            // make, are told apart by their place among those.
             std::vector<Corner> corners;
             for (const NestedPolygon<PackedLocation>& q : polygons) corners.push_back(corner_of(q.outer));
             std::vector<size_t> order(polygons.size());
             for (size_t o = 0; o < order.size(); o++) order[o] = o;
             std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return corners[x] < corners[y]; });
+            const uint64_t side_key = mix_key(piece.key, static_cast<uint64_t>(line), meridian, s);
+            uint64_t twin = 0;
             for (size_t rank = 0; rank < order.size(); rank++) {
                 const size_t o = order[rank];
+                twin = rank > 0 && corners[o] == corners[order[rank - 1]] ? twin + 1 : 0;
                 SplitPolygon out;
                 auto back = [](std::vector<PackedLocation>& v, std::vector<int64_t>& w) {
                     SplitRing r;
@@ -544,7 +557,7 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
                 out.outer = back(polygons[o].outer, polygon_ways[o].outer);
                 for (size_t h = 0; h < polygons[o].holes.size(); h++)
                     out.holes.push_back(back(polygons[o].holes[h], polygon_ways[o].holes[h]));
-                out.key = mix_key(piece.key, static_cast<uint64_t>(line), meridian, s) + rank;
+                out.key = lobe_key(side_key, corners[o]) + twin;
                 todo.push_back(std::move(out));
             }
         }

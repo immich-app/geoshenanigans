@@ -267,6 +267,52 @@ TEST(each_lobe_a_cut_leaves_on_one_side_keeps_its_own_key_whatever_its_rings_sta
     }
 }
 
+TEST(a_lobe_a_lake_gains_on_one_side_of_a_cut_leaves_the_other_lobes_keys_as_they_were) {
+    // A lake shaped as an E open to the east, from (47, 8) to (48.6, 9.6):
+    // its back west of 8.2, islands in it, and arms east of it from 47.2 to
+    // 47.6 and from 48 to 48.6 north. The first cut, along the meridian of
+    // 8.388608, leaves the arms' ends east of it. The next day it gains an
+    // arm from 47 to 47.1 north, whose end sorts first among them.
+    const int32_t s = 470000000, w = 80000000, e = w + 16000000, back = w + 2000000;
+    auto lake = [&](bool new_arm) {
+        SplitPolygon p;
+        p.outer.v = {pt(s, w)};
+        if (new_arm) p.outer.v.insert(p.outer.v.end(), {pt(s, e), pt(s + 1000000, e), pt(s + 1000000, back)});
+        else p.outer.v.push_back(pt(s, back));
+        p.outer.v.insert(p.outer.v.end(), {pt(s + 2000000, back), pt(s + 2000000, e), pt(s + 6000000, e),
+                                           pt(s + 6000000, back), pt(s + 10000000, back), pt(s + 10000000, e),
+                                           pt(s + 16000000, e), pt(s + 16000000, w)});
+        for (size_t k = 0; k < p.outer.v.size(); k++) p.outer.way.push_back(100 + static_cast<int64_t>(k));
+        for (int i = 0; i < 40; i++)
+            for (int j = 0; j < 2; j++) {
+                SplitRing h = box_ring(s + 200000 + i * 390000, w + 300000 + j * 1000000, 100000, 100000,
+                                       1000 + 10 * (i * 2 + j));
+                std::reverse(h.v.begin(), h.v.end());
+                p.holes.push_back(h);
+            }
+        return p;
+    };
+    // The key of each piece east of the cut, by the smallest vertex of its
+    // outer ring.
+    auto east = [](const std::vector<SplitPolygon>& pieces) {
+        std::map<std::pair<int32_t, int32_t>, uint64_t> out;
+        for (const SplitPolygon& q : pieces) {
+            std::pair<int32_t, int32_t> least = {INT32_MAX, INT32_MAX};
+            for (const PackedLocation& v : q.outer.v) least = std::min(least, std::make_pair(v.lat_e7, v.lon_e7));
+            if (least.second >= 83886080) out[least] = q.key;
+        }
+        return out;
+    };
+    const auto day1 = east(split_polygon(lake(false), 64)), day2 = east(split_polygon(lake(true), 64));
+    REQUIRE(day1.size() == 2u);
+    REQUIRE(day2.size() == 3u);
+    CHECK(day2.count({s, 83886080}) == 1u);
+    for (const auto& [corner, key] : day1) {
+        REQUIRE(day2.count(corner) == 1u);
+        CHECK_EQ(day2.at(corner), key);
+    }
+}
+
 TEST(a_cut_puts_its_vertex_where_it_does_with_the_edge_run_the_other_way) {
     // Half way between two units it rounds away from zero, whichever end
     // the edge starts at and on either side of zero.
