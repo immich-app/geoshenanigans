@@ -171,6 +171,26 @@ fn a_house_the_street_that_won_has_near_names_its_own_postcode() {
 }
 
 #[test]
+fn a_house_tagged_a_placeholder_postcode_takes_its_street_s() {
+    // Nominatim's clean-postcodes sanitizer drops a postcode its country's pattern rejects, so a
+    // house tagged 00000 has none of its own (token_get_postcode) and takes its parent street's
+    // (placex_update), whether the house answers or the street that won takes its number from
+    // it.
+    let berlin = (52.52, 13.405);
+    let index = country_at(berlin, b"DE")
+        .street("Rungestraße", &[(0.0, -100.0), (0.0, 100.0)])
+        .way_postcode("10179")
+        .address("3", 30.0, 0.0)
+        .addr_postcode("00000")
+        .load();
+    for north in [2.0, 30.0] {
+        let address = address_from(&index, berlin, north, 0.0);
+        assert_eq!(address["house_number"], "3", "{north} m north");
+        assert_eq!(address["postcode"], "10179", "{north} m north");
+    }
+}
+
+#[test]
 fn a_house_without_a_postcode_of_its_own_takes_its_street_s() {
     // Grange View Road, Gedling: a rank-30 object takes its own addr:postcode, else that of its
     // parent street, else get_nearest_postcode at its own centroid (placex_update). House 30 on

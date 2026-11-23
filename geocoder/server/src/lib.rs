@@ -2896,10 +2896,17 @@ impl Index {
     pub fn resolve_postcode<'a>(&'a self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, postcode_area: Option<Cow<'a, str>>, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
         // 0. The house's own postcode (from addr_postcodes.bin)
         // Matches Nominatim's token_get_postcode — the feature's own
-        // addr:postcode tag is the highest-priority source.
+        // addr:postcode tag is the highest-priority source. The
+        // clean-postcodes sanitizer drops one in a country without
+        // postcodes or one its country's pattern rejects, and the house
+        // then takes its street's: one failing the answer's checks below
+        // (country_has_no_postcode, postcode_looks_valid) is passed over.
         if let (Some(apc), Some((addr_id, _))) = (self.addr_postcodes.as_ref(), addr) {
             if let Some(pid) = Self::sidecar_u32(apc, addr_id as u64) {
-                return Some(self.get_string(pid));
+                let own = self.get_string(pid);
+                if country_code.is_none_or(|cc| !country_has_no_postcode(&cc) && postcode_looks_valid(&cc, &own)) {
+                    return Some(own);
+                }
             }
         }
 
