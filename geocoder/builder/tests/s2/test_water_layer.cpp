@@ -1401,6 +1401,21 @@ TEST(a_previous_water_build_whose_fallback_sidecar_is_there_but_cant_be_opened_s
           std::string::npos);
 }
 
+TEST(a_previous_water_build_whose_polygon_sidecar_is_there_but_cant_be_opened_stops_the_layers_build) {
+    // Its type codes hang on that build's water_meta.json, which the sidecar
+    // being there says it wrote: the layer's build stops before it numbers
+    // the water=* values afresh.
+    const ScratchDir root("water-unopenable");
+    const std::string one = root.path() + "/one";
+    write(build(with_kinds({"ganga_river"})), one);
+    const std::string all = one + "/water/all/exact/admin_polygons.osm_ids";
+    fs::remove(all);
+    fs::create_symlink(fs::path(all).filename(), all);
+    CHECK(refusal(with_kinds({"ganga_river"}), one).find(all + " is there but can't be opened") != std::string::npos);
+    fs::remove(all);
+    CHECK(refusal(with_kinds({"ganga_river"}), one).empty());
+}
+
 TEST(a_way_tagged_as_the_multipolygon_whose_outer_ring_it_is_leaves_the_island_out) {
     Collected c = fixture();
     const int32_t lat = kLat - 1000000;

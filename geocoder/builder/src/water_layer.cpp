@@ -944,8 +944,13 @@ std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_pl
     std::vector<MetaType> previous;
     const std::string dir = prev_planet_dir.empty() ? "" : prev_planet_dir + "/" + kWaterArcTiers[1].dir;
     // A previous build that wrote water dirs (its polygon sidecar there) has
-    // the codes its records carry in its water_meta.json.
-    if (!dir.empty() && std::ifstream(dir + "/admin_polygons.osm_ids").good()) {
+    // the codes its records carry in its water_meta.json. A sidecar there
+    // that can't be opened is no sign of a build without them.
+    const std::string sidecar = dir.empty() ? "" : dir + "/admin_polygons.osm_ids";
+    if (!sidecar.empty() && !path_absent(sidecar)) {
+        if (!std::ifstream(sidecar).good())
+            throw std::runtime_error(sidecar + " is there but can't be opened: whether its build wrote water dirs, "
+                                               "and so the water=* values' codes, is unknown");
         const std::string path = dir + "/water_meta.json";
         const std::optional<std::string> text = read_text(path);
         if (!text)
