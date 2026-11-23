@@ -219,10 +219,10 @@ function writeFiles(dir, files) {
 }
 
 // A water dir as the builder writes one (builder/src/water_layer.h), the admin files of a set of
-// their own: Testsee, a lake (type code 2, water_meta.json's water/lake) around (10.5, 20.5),
-// listed in the admin cell of COUNTRY_CELL (about 10.47 to 10.56 by 20.43 to 20.52), not
-// interior: the cell holds points outside it, as (10.5, 20.45). Its record carries its type code
-// where a boundary's carries a country code.
+// their own: Testsee, a lake (type code 2, water_meta.json's water/lake) of 0.02 degrees around
+// (10.5, 20.5), listed in the admin cell of COUNTRY_CELL (about 10.47 to 10.56 by 20.43 to
+// 20.52), not interior: the cell holds points outside it, as (10.5, 20.45). Its record carries its
+// type code where a boundary's carries a country code; its one arc is no cut.
 function writeWater(dir) {
   mkdirSync(dir, { recursive: true });
   const [strings, [lake], size] = pool(['Testsee']);
@@ -236,6 +236,7 @@ function writeWater(dir) {
     'admin_entries.bin': entries,
     'strings_core.bin': fcc2(strings),
     'strings_layout.json': coreLayout(size),
+    'water_cut_arcs.bin': u32(0),
     'water_meta.json': JSON.stringify({ types: [{ code: 2, class: 'water', type: 'lake', rank: 20 }] }),
   });
 }
@@ -269,8 +270,11 @@ test('reverse geocoding finds the water of the dataset\'s water dir, last in the
 
   const wet = await geocoder.reverseGeocode(10.5, 20.5);
 
-  assert.equal(wet, `${dry.slice(0, -1)},"water":{"name":"Testsee","class":"water","type":"lake"}}`);
+  // Far inside its shore, the location line names it in its landmark's place.
+  assert.equal(wet, `${dry.slice(0, -1)},"water":{"name":"Testsee","class":"water","type":"lake","landmark":true}}`);
   assert.equal(JSON.parse(wet).address.country, 'Testland');
+  // 33 m inside its shore it is the water alone.
+  assert.deepEqual(JSON.parse(await geocoder.reverseGeocode(10.4903, 20.5)).water, { name: 'Testsee', class: 'water', type: 'lake' });
   // Beside the lake in the cell that lists it: the answer without water, byte for byte.
   assert.equal(await geocoder.reverseGeocode(10.5, 20.45), dryBeside);
 });

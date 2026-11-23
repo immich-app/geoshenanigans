@@ -670,9 +670,10 @@ mod tests {
         ]);
         let water = dir.join(WATER_DIR);
         let wet = water.is_dir() && std::fs::read_dir(&water).unwrap().next().is_some();
-        let meta = ("water_meta.json", br#"{"types": []}"#.to_vec());
-        for (d, extra) in [(dir.to_path_buf(), None), (water, Some(meta))] {
-            if extra.is_some() && !wet {
+        // A water dir's own files: its kinds, none, and the cut arcs of its no arc slots.
+        let own = vec![("water_meta.json", br#"{"types": []}"#.to_vec()), ("water_cut_arcs.bin", Vec::new())];
+        for (d, extra) in [(dir.to_path_buf(), Vec::new()), (water, own)] {
+            if !extra.is_empty() && !wet {
                 continue;
             }
             for e in std::fs::read_dir(&d).unwrap().map(|e| e.unwrap()) {
