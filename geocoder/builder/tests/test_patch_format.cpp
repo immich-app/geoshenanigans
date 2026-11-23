@@ -413,19 +413,19 @@ TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread_or_copies
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v20 = a water dir's cut arcs under file id 36 (v19:
-    // the postcode centroids' logical stream). The patcher accepts this
-    // version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(20));
+    // diff/patch tools. v23 = a water dir's cut arcs under file id 39 (v20 to
+    // v22 kept for other changes; v19: the postcode centroids' logical
+    // stream). The patcher accepts this version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(23));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
 
 TEST(patch_format_fileid_count_and_names_aligned) {
     // The names table must have exactly COUNT entries (one per PatchFileId).
-    CHECK_EQ(static_cast<uint32_t>(PatchFileId::COUNT), uint32_t(37));
+    CHECK_EQ(static_cast<uint32_t>(PatchFileId::COUNT), uint32_t(40));
     const size_t n_names = sizeof(patch_file_names) / sizeof(patch_file_names[0]);
-    CHECK_EQ(n_names, size_t(37));
+    CHECK_EQ(n_names, size_t(40));
     // Spot-check that index lines up with the enum value.
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::STRINGS)]) == "strings.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::POI_RECORDS)]) == "poi_records.bin");
@@ -435,8 +435,27 @@ TEST(patch_format_fileid_count_and_names_aligned) {
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::GEO_CELLS)]) == "geo_cells.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::GEO_ENTRIES)]) == "geo_entries.bin");
     for (PatchFileId fid : GEO_ENTRIES_FILES) CHECK(!has_suffix(patch_file_names[static_cast<uint32_t>(fid)], ".bin"));
-    // A water dir's cut arcs.
+    // A water dir's cut arcs, under file id 39.
+    CHECK_EQ(static_cast<uint32_t>(PatchFileId::WATER_CUT_ARCS), uint32_t(39));
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::WATER_CUT_ARCS)]) == "water_cut_arcs.bin");
+}
+
+// v23: file ids 36 to 38 are kept for other files. They name no file, so a
+// section naming one is refused, and no list of the format holds one.
+TEST(patch_format_v23_names_no_file_for_ids_36_to_38) {
+    for (const uint32_t id : {36u, 37u, 38u}) {
+        REQUIRE(id < uint32_t(PatchFileId::COUNT));
+        CHECK(names_no_file(id));
+        const std::string name = patch_file_names[id];
+        CHECK(name.find(".bin") == std::string::npos);
+        CHECK(sparse_delta_file(static_cast<PatchFileId>(id)) == nullptr);
+        CHECK(string_field_offsets(static_cast<PatchFileId>(id)).empty());
+        CHECK(!is_hashed_old_file(id));
+        for (const PatchFileId f : UNSECTIONED_OLD_FILES) CHECK(uint32_t(f) != id);
+        for (const auto& f : STRING_RECORD_FILES) CHECK(uint32_t(f.fid) != id);
+    }
+    CHECK(!names_no_file(uint32_t(PatchFileId::WATER_CUT_ARCS)));
+    CHECK(sparse_delta_file(PatchFileId::WATER_CUT_ARCS) != nullptr);
 }
 
 // --- node_byte_offset ---
@@ -831,7 +850,7 @@ TEST(patch_format_v19_names_no_file_for_ids_24_and_25) {
         for (const PatchFileId f : UNSECTIONED_OLD_FILES) CHECK(uint32_t(f) != id);
     }
     for (const uint32_t id : {0u, 9u, 10u, 11u}) CHECK(names_no_file(id));
-    for (const uint32_t id : {1u, 8u, 18u, 23u, 26u, 35u}) CHECK(!names_no_file(id));
+    for (const uint32_t id : {1u, 8u, 18u, 23u, 26u, 35u, 39u}) CHECK(!names_no_file(id));
     CHECK(!names_no_file(uint32_t(PatchFileId::COUNT)));
     CHECK(std::vector<std::string>(std::begin(POSTCODE_SIDE_FILES), std::end(POSTCODE_SIDE_FILES)) ==
           std::vector<std::string>({"postcode_centroid_cells.bin"}));

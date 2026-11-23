@@ -442,7 +442,7 @@ dirs must all be patched to the same date and swapped in together.
 The water layer (`src/water_layer.h`) writes three dirs under each region:
 `water/all/simplified/`, `water/all/exact/` and `water/major/simplified/`.
 Each is made of file names the patch format has a section for, the admin
-geometry's and one of its own (file id 36, GCPATCH v20):
+geometry's and one of its own (file id 39, GCPATCH v23):
 
 - `admin_polygons.bin` and `admin_rings.bin`: one 16-byte record per polygon
   (an outer ring of an OSM object, with the holes inside it), its name in the
@@ -743,7 +743,7 @@ build 23's unit of the old rows with their cells and entries files, and take
 257,858,727 B (245.91 MiB), and with-addresses and max-quality, whose full
 dir holds the same two files, 0.14 MiB more than above too.
 
-## Patch Format (.gcpatch, version 19)
+## Patch Format (.gcpatch, version 23)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -753,9 +753,9 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=20 (u32) + flags=0 (u32)
-  (a v20 patcher accepts only v20 patches; the v8 to v20 changes are marked
-  below)
+Header: "GCPATCH\0" (8) + version=23 (u32) + flags=0 (u32)
+  (a v23 patcher accepts only v23 patches; the v8 to v23 changes are marked
+  below, and versions 20 to 22 are kept for other changes)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   + n × {name_len:u16, name, size:u64, inline:u8, [bytes] if inline}
@@ -888,7 +888,7 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     remap_kind 0 raw, 2 a string offset, as its file's row of
     SPARSE_DELTA_FILES gives it, and the patcher refuses any other.
     v14: no kind 1, an admin id the patch remapped; v19: no kind 3, a
-    16-byte postcode centroid, whose file merges instead; v20: file id 36,
+    16-byte postcode centroid, whose file merges instead; v23: file id 39,
     a water dir's water_cut_arcs.bin, raw)
   stride=0xFA (v8): parallel delta for a per-record side file (way_parents,
     way_postcodes, addr_postcodes, interp_postcodes), rebuilt along its
@@ -1112,6 +1112,8 @@ writes the cells file beside the centroids, and the entries file is gone.
 | 29-33 | `strings_core.bin` … `strings_poi.bin` | the strings section, of the decoded pools; a tier the old dir lacks, whole (its FCC2 file) |
 | 34 | `interp_postcodes.bin` | parallel delta along interp_ways, remap kind 2 |
 | 35 | `geo_entries.bin` | the geo index's blocks, rebuilt with `geo_cells.bin` (8) |
+| 36-38 | none (v23; kept for other files) | never: a section naming one is refused ("Unknown file 36") |
+| 39 | `water_cut_arcs.bin` | a water dir's cut arcs: sparse delta of its u32 words, remap kind 0 (v23) |
 
 The four admin geometry files (`ADMIN_SLOT_FAMILIES`) follow the place nodes
 as arc_index, arc_vertices, admin_polygons, admin_rings, ahead of the admin

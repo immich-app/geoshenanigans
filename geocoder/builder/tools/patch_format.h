@@ -271,9 +271,11 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // postcode_centroids.bin and postcode_centroid_cells.bin. No sparse delta
 // carries them (remap kind 3 is gone), no cell list delta (stride 0xFB)
 // carries any index, and file ids 24 and 25 name no file.
-// v20: file id 36 names a water dir's water_cut_arcs.bin, a bit per arc slot
-// in u32 words, sent as a sparse delta of its words (SPARSE_DELTA_FILES).
-static constexpr uint32_t GCPATCH_VERSION = 20;
+// v23 (v20 to v22 are kept for other changes): file id 39 names a water
+// dir's water_cut_arcs.bin, a bit per arc slot in u32 words, sent as a sparse
+// delta of its words (SPARSE_DELTA_FILES). File ids 36 to 38, kept for other
+// files, name none.
+static constexpr uint32_t GCPATCH_VERSION = 23;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -330,9 +332,13 @@ enum class PatchFileId : uint32_t {
     INTERP_POSTCODES = 34,
     // The geo index's blocks, beside its top file (GEO_CELLS).
     GEO_ENTRIES = 35,
+    // No files: ids kept for other files.
+    KEPT_36 = 36,
+    KEPT_37 = 37,
+    KEPT_38 = 38,
     // A water dir's cut arcs: a bit per arc slot, in u32 words.
-    WATER_CUT_ARCS = 36,
-    COUNT = 37
+    WATER_CUT_ARCS = 39,
+    COUNT = 40
 };
 
 static const char* patch_file_names[] = {
@@ -350,6 +356,7 @@ static const char* patch_file_names[] = {
     "strings_postcode.bin", "strings_poi.bin",
     "interp_postcodes.bin",
     "geo_entries.bin",
+    "file id 36 (none)", "file id 37 (none)", "file id 38 (none)",
     "water_cut_arcs.bin"
 };
 
@@ -486,12 +493,14 @@ inline bool is_geo_list_id(uint32_t id) {
 }
 
 // Whether an id of the file table names no file, so no file section's: the
-// legacy strings.bin (no patch sends it), the geo index's lists, and (v19)
-// ids 24 and 25, the postcode centroid cells, which the patcher writes beside
-// postcode_centroids.bin, and the entries file the centroids had.
+// legacy strings.bin (no patch sends it), the geo index's lists, (v19) ids 24
+// and 25, the postcode centroid cells, which the patcher writes beside
+// postcode_centroids.bin, and the entries file the centroids had, and (v23)
+// ids 36 to 38, kept for other files.
 inline bool names_no_file(uint32_t id) {
     return id == uint32_t(PatchFileId::STRINGS) || is_geo_list_id(id) || id == uint32_t(PatchFileId::POSTCODE_CENTROID_CELLS) ||
-           id == uint32_t(PatchFileId::POSTCODE_CENTROID_ENTRIES);
+           id == uint32_t(PatchFileId::POSTCODE_CENTROID_ENTRIES) ||
+           (id >= uint32_t(PatchFileId::KEPT_36) && id <= uint32_t(PatchFileId::KEPT_38));
 }
 
 // Secondary ID remap marker: 0xFFFFFFF6
