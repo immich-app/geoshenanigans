@@ -61,7 +61,7 @@ std::set<uint64_t> way_ends(const std::vector<PackedLocation>& ring, const std::
 // Each stretch's way id and its edges, whichever vertex the ring starts at.
 std::map<int64_t, uint32_t> stretches(const std::vector<WayRun>& runs) {
     std::map<int64_t, uint32_t> out;
-    for (const WayRun& r : runs) out[r.way] += r.edges;
+    for (const WayRun& r : runs) out[int64_t(r.way)] += r.edges;  // by value: WayRun packs it to 4 bytes
     return out;
 }
 
