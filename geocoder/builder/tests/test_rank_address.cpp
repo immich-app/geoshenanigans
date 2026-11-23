@@ -115,6 +115,11 @@ struct World {
         return pn.name_id;
     }
 
+    // The boundary of polygon pid links the node (place_node_links).
+    void link(uint32_t node, uint32_t pid) {
+        data.place_node_links.push_back({node, admin_boundary_id(data.admin_osm_ids[pid])});
+    }
+
     RankStats rank(unsigned threads = 4) {
         RankLookups lookups;
         lookups.polygons_near = [this](PackedLocation, const std::function<void(uint32_t)>& visit) {
@@ -381,6 +386,29 @@ TEST(a_place_node_in_a_relation_of_its_rank_ranks_2_more_wherever_the_query_is) 
     CHECK_EQ(w.node_rank(neighbourhood), uint8_t(24));
     CHECK_EQ(w.node_rank(hamlet), uint8_t(22));
     CHECK_EQ(stats.nodes_promoted, size_t(2));
+}
+
+TEST(a_place_node_is_not_promoted_by_a_boundary_that_links_it) {
+    // A village node linked by its level 9 commune (18, 16 by the link) is that commune in an
+    // address, and a place of its own only where the commune is left out (admin-minimal): there
+    // it ranks 16, not 18 by the commune it stands for. A village linked by a level 10 boundary
+    // (20) is still promoted by the level 8 relation of 16 round it, which links nothing.
+    World w("FR");
+    w.relation(1, 4, Box{45, 2, 47, 4});
+    w.relation(2, 6, Box{45.5, 2.5, 46.5, 3.5});
+    const uint32_t commune = w.relation(3, 9, Box{45.6, 2.6, 45.7, 2.7}, {AdminPlaceType::NONE, AdminPlaceType::VILLAGE});
+    const uint32_t village = w.node(PlaceType::VILLAGE, 45.65, 2.65, true);
+    w.link(village, commune);
+    w.relation(4, 8, Box{46.0, 3.0, 46.2, 3.2});
+    const uint32_t l10 = w.relation(5, 10, Box{46.05, 3.05, 46.10, 3.10}, {AdminPlaceType::NONE, AdminPlaceType::VILLAGE});
+    const uint32_t in_l8 = w.node(PlaceType::VILLAGE, 46.07, 3.07, true);
+    w.link(in_l8, l10);
+    const RankStats stats = w.rank();
+    CHECK_EQ(w.of(commune), uint8_t(16));
+    CHECK_EQ(w.node_rank(village), uint8_t(16));
+    CHECK_EQ(w.of(l10), uint8_t(20));
+    CHECK_EQ(w.node_rank(in_l8), uint8_t(18));
+    CHECK_EQ(stats.nodes_promoted, size_t(1));
 }
 
 TEST(a_place_tagged_relation_promotes_a_node_by_its_place_rank_and_a_boundary_by_its_rank) {

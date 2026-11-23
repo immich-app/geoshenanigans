@@ -512,6 +512,10 @@ struct ParsedData {
     // relation workers under the mutex.
     std::vector<PlaceClaim> place_claims;
     std::unique_ptr<std::mutex> linked_pn_mutex = std::make_unique<std::mutex>();
+    // Every boundary that links each place node, whichever one the node
+    // names: no boundary promotes a node it stands for (rank_address.h),
+    // which reads it, then frees it.
+    PlaceNodeLinks place_node_links;
 
     // Post-canonical-sort: strings partitioned into per-consumer tiers.
     // Global offset space is contiguous: tier N occupies

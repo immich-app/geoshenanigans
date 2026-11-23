@@ -20,7 +20,9 @@
 //      place rank from its own up to 23 takes that polygon's rank + 2
 //      (:930-950); any other the rank of the place node it links.
 //   3. Place nodes of rank 16 to 23: two more where a relation of their rank
-//      holds them (:951-971).
+//      holds them (:951-971), other than a boundary that links them: a linked
+//      node is a place of its own only in a dir that leaves out the
+//      boundaries standing for it.
 //
 // Each step reads the others' ranks as the indexer leaves them when it runs:
 // a polygon indexed later still has its initial rank. Postal areas rank 0.
@@ -74,8 +76,8 @@ struct RankTrace {
 
 // Gives every admin polygon (AdminPolygon::rank_address) and place node
 // (PlaceNode::rank_address, a hidden one's as a place of its own) its
-// rank_address, reading admin_osm_ids (which rings make a boundary) and
-// admin_wikidata, which it frees. With `trace`, a RankTrace for each
-// boundary and place area, by id.
+// rank_address, reading admin_osm_ids (which rings make a boundary),
+// admin_wikidata and place_node_links, which it frees. With `trace`, a
+// RankTrace for each boundary and place area, by id.
 RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, unsigned threads,
                                  std::vector<RankTrace>* trace = nullptr);

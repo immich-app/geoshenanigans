@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -104,22 +105,34 @@ inline void flag_claimed_place_node(PlaceNode& pn, uint32_t polygon) {
 // Every claimant's polygon links (hide_claimed_place_nodes).
 inline bool every_polygon_links(uint32_t) { return true; }
 
+// (node, boundary id) of each boundary with a polygon that links a place
+// node, sorted, each pair once.
+using PlaceNodeLinks = std::vector<std::pair<uint32_t, uint64_t>>;
+
+inline void sort_place_node_links(PlaceNodeLinks& links) {
+    std::sort(links.begin(), links.end());
+    links.erase(std::unique(links.begin(), links.end()), links.end());
+}
+
 // Flags the place nodes (node_ids parallel to nodes) the label and wikidata
 // claims hit, each naming the polygon of the claimant claim_wins picks among
 // those with a polygon. A claim of a claimant whose polygon p does not link,
-// `links(p)` false (one of rank 0 in its country), is no claim. Returns how
-// many nodes it hid.
+// `links(p)` false (one of rank 0 in its country), is no claim. With
+// `linkers`, every claimant with a polygon that links a node is added there.
+// Returns how many nodes it hid.
 template <class Links = bool (*)(uint32_t)>
 inline size_t hide_claimed_place_nodes(std::vector<PlaceNode>& nodes, const std::vector<uint64_t>& node_ids,
                                        std::vector<PlaceClaim> claims, const std::vector<AdminPolygon>& polygons,
                                        const std::vector<uint64_t>& polygon_ids, unsigned threads = 0,
-                                       Links links = every_polygon_links) {
+                                       Links links = every_polygon_links, PlaceNodeLinks* linkers = nullptr) {
     if (claims.empty()) return 0;
     const auto boundaries = boundary_polygons(polygons, polygon_ids);
     std::sort(claims.begin(), claims.end(), [](const PlaceClaim& a, const PlaceClaim& b) { return a.node < b.node; });
     std::atomic<size_t> hidden{0};
+    std::mutex linkers_mutex;
     parallel_for(std::min(nodes.size(), node_ids.size()), [&](size_t begin, size_t end, unsigned) {
         size_t n = 0;
+        PlaceNodeLinks mine;
         for (size_t i = begin; i < end; i++) {
             auto it = std::lower_bound(claims.begin(), claims.end(), node_ids[i],
                                        [](const PlaceClaim& c, uint64_t node) { return c.node < node; });
@@ -132,6 +145,7 @@ inline size_t hide_claimed_place_nodes(std::vector<PlaceNode>& nodes, const std:
                 if (p != NO_DATA && !links(p)) continue;
                 claimed = true;
                 if (p == NO_DATA) continue;
+                if (linkers) mine.push_back({static_cast<uint32_t>(i), it->boundary});
                 const ClaimRank rank{it->label, polygons[p].admin_level, it->boundary};
                 if (best == NO_DATA || claim_wins(rank, best_rank)) {
                     best = p;
@@ -143,7 +157,12 @@ inline size_t hide_claimed_place_nodes(std::vector<PlaceNode>& nodes, const std:
             n++;
         }
         hidden += n;
+        if (!mine.empty()) {
+            std::lock_guard<std::mutex> lock(linkers_mutex);
+            linkers->insert(linkers->end(), mine.begin(), mine.end());
+        }
     }, threads);
+    if (linkers) sort_place_node_links(*linkers);
     return hidden;
 }
 
@@ -151,10 +170,11 @@ inline size_t hide_claimed_place_nodes(std::vector<PlaceNode>& nodes, const std:
 // step): `links` holds (node, polygon) for each boundary ring and its best
 // node. A node names its boundary's largest ring whichever ring matched, as
 // a label or wikidata claim does; a node several boundaries pick names the
-// one claim_wins picks.
+// one claim_wins picks. With `linkers`, every boundary that links a node is
+// added there.
 inline size_t hide_name_linked_place_nodes(std::vector<PlaceNode>& nodes, std::vector<std::pair<uint32_t, uint32_t>> links,
                                            const std::vector<AdminPolygon>& polygons,
-                                           const std::vector<uint64_t>& polygon_ids) {
+                                           const std::vector<uint64_t>& polygon_ids, PlaceNodeLinks* linkers = nullptr) {
     const auto boundaries = boundary_polygons(polygons, polygon_ids);
     if (!boundaries.empty()) {
         for (auto& link : links) {
@@ -171,6 +191,11 @@ inline size_t hide_name_linked_place_nodes(std::vector<PlaceNode>& nodes, std::v
         if (claim_wins(rank(b.second), rank(a.second))) return false;
         return a.second < b.second;
     });
+    if (linkers && polygon_ids.size() == polygons.size()) {
+        for (const auto& [node, p] : links)
+            if (polygon_ids[p] != 0) linkers->push_back({node, admin_boundary_id(polygon_ids[p])});
+        sort_place_node_links(*linkers);
+    }
     size_t hidden = 0;
     for (size_t k = 0; k < links.size(); k++) {
         if (k > 0 && links[k].first == links[k - 1].first) continue;

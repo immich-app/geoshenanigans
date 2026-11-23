@@ -141,6 +141,34 @@ TEST(place_claims_a_claimant_that_links_nothing_claims_nothing) {
     CHECK_EQ(nodes[1].parent_poly_id, 2u);  // relation 200
 }
 
+TEST(place_claims_list_every_boundary_that_links_a_node) {
+    // Whichever claimant a node names, every boundary with a polygon that links it is listed, by
+    // node: the rank pass lets none of them promote it. A claimant of rank 0 (relation 400 here)
+    // or without a polygon (999) links nothing.
+    Boundaries b;
+    std::vector<PlaceNode> nodes(3, place(7, NO_DATA));
+    const std::vector<uint64_t> ids{node_id(1), node_id(2), node_id(3)};
+    const std::vector<PlaceClaim> claims{{node_id(2), relation_boundary_id(500), true},
+                                         {node_id(1), relation_boundary_id(200), true},
+                                         {node_id(2), relation_boundary_id(200), false},
+                                         {node_id(2), relation_boundary_id(400), true},
+                                         {node_id(3), relation_boundary_id(999), true}};
+    const auto links = [&](uint32_t p) { return b.polygons[p].admin_level != 6 || p == 3; };
+    std::vector<std::pair<uint32_t, uint64_t>> linkers;
+    CHECK_EQ(hide_claimed_place_nodes(nodes, ids, claims, b.polygons, b.ids, 2, links, &linkers), 3u);
+    const std::vector<std::pair<uint32_t, uint64_t>> expected{
+        {0, relation_boundary_id(200)}, {1, relation_boundary_id(200)}, {1, relation_boundary_id(500)}};
+    CHECK(linkers == expected);
+
+    // The name links too, each boundary once whichever of its rings matched.
+    std::vector<PlaceNode> named{place(10, 2), place(11, 2)};
+    linkers.clear();
+    hide_name_linked_place_nodes(named, {{0, 5}, {1, 1}, {0, 4}, {1, 0}}, b.polygons, b.ids, &linkers);
+    const std::vector<std::pair<uint32_t, uint64_t>> by_name{
+        {0, relation_boundary_id(400)}, {0, relation_boundary_id(500)}, {1, relation_boundary_id(100)}};
+    CHECK(linkers == by_name);
+}
+
 TEST(place_claims_name_links_keep_the_name_and_pick_the_lowest_level) {
     Boundaries b;
     std::vector<PlaceNode> nodes{place(10, 2), place(11, 2), place(12, 2)};

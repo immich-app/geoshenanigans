@@ -870,7 +870,8 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg, const 
                                             poly.own_place_type) != 0;
             };
             const size_t hidden = hide_claimed_place_nodes(data.place_nodes, data.place_osm_ids,
-                std::move(data.place_claims), data.admin_polygons, data.admin_osm_ids, num_threads, links);
+                std::move(data.place_claims), data.admin_polygons, data.admin_osm_ids, num_threads, links,
+                &data.place_node_links);
             std::vector<PlaceClaim>().swap(data.place_claims);
             std::cerr << "find_linked_place label/wikidata: hid " << hidden
                       << " linked place nodes (" << claims << " claims)" << std::endl;
@@ -1031,8 +1032,11 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg, const 
         // Nominatim's linked_place_id. Deterministic regardless of worker
         // scheduling: the set of links is order-independent, and a node
         // several boundaries link names the one claim_wins picks.
+        PlaceNodeLinks name_links;
         const size_t name_hidden = hide_name_linked_place_nodes(data.place_nodes, std::move(linked_nodes),
-                                                                data.admin_polygons, data.admin_osm_ids);
+                                                                data.admin_polygons, data.admin_osm_ids, &name_links);
+        data.place_node_links.insert(data.place_node_links.end(), name_links.begin(), name_links.end());
+        sort_place_node_links(data.place_node_links);
         const size_t labelled = parallel_count(data.place_nodes.size(),
             [&](size_t i) { return (data.place_nodes[i]._pad1 & PLACE_FLAG_LABEL_OF) != 0; }, num_threads);
         std::cerr << "Hidden place nodes: " << name_hidden << " linked by name; " << labelled

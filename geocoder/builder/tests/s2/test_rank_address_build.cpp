@@ -230,7 +230,8 @@ TEST(the_ranks_are_the_same_in_every_dir_and_in_a_chained_build) {
     // Winsford's build with every region and variant, then a chained build of the same data:
     // each dir holding a level's records holds its rank, and each holding the village node of
     // Clive its promotion. The town node, Winsford's label, is a place of its own in
-    // admin-minimal, which keeps no level 10, at its rank as one: 18 in Winsford.
+    // admin-minimal, which keeps no level 10, at its type's 16: Winsford, which it stands for
+    // there, promotes it nowhere.
     const ScratchDir root("rank-dirs");
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
     write_test_pbf(pbf, winsford().objects(), 1000);
@@ -253,7 +254,7 @@ TEST(the_ranks_are_the_same_in_every_dir_and_in_a_chained_build) {
             for (const char* dir : {"admin-minimal", "admin-minimal-poi"}) {
                 const DirRanks ranks = ranks_in(at + dir);
                 CHECK(ranks.by_level == minimal_levels);
-                CHECK((ranks.by_place_type == std::multimap<uint8_t, uint8_t>{{village, 18}, {town, 18}}));
+                CHECK((ranks.by_place_type == std::multimap<uint8_t, uint8_t>{{village, 18}, {town, 16}}));
                 dirs++;
             }
             for (const char* dir : {"full", "no-addresses", "admin"}) {

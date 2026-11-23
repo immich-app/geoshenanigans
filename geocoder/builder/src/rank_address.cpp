@@ -408,8 +408,12 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
     }
 
     // Place nodes: their type's rank, two more inside a relation of that rank (:951-971): a
-    // boundary by its rank, a place polygon by its place rank.
+    // boundary by its rank, a place polygon by its place rank. A linked node is no place of its
+    // own; where a dir leaves out the boundaries standing for it, it answers as one, and none of
+    // them promotes it.
     auto& nodes = data.place_nodes;
+    PlaceNodeLinks& links = data.place_node_links;
+    sort_place_node_links(links);
     parallel_for(nodes.size(), [&](size_t begin, size_t end, unsigned) {
         std::vector<uint32_t> near;
         for (size_t i = begin; i < end; i++) {
@@ -418,13 +422,19 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
             bool promoted = false;
             if (place_node_promotable(base)) {
                 const PackedLocation p = point_e7(pn.lat, pn.lng);
+                const auto first = std::lower_bound(links.begin(), links.end(), std::make_pair(uint32_t(i), uint64_t(0)));
+                auto links_it = [&](const Object& o) {
+                    for (auto l = first; l != links.end() && l->first == i; ++l)
+                        if (l->second == o.id) return true;
+                    return false;
+                };
                 near.clear();
                 lookups.polygons_near(p, [&](uint32_t pid) { near.push_back(pid); });
                 for (uint32_t pid : near) {
                     const uint32_t q = pid < object_of.size() ? object_of[pid] : NO_DATA;
                     if (q == NO_DATA) continue;
                     const Object& o = objects[q];
-                    if (!o.relation || rank[q] < 1 || rank[q] > kMaxParentRank) continue;
+                    if (!o.relation || rank[q] < 1 || rank[q] > kMaxParentRank || links_it(o)) continue;
                     if (!((o.place_category && o.initial.address == base) || (o.boundary_category && rank[q] == base)))
                         continue;
                     if (lookups.holds(pid, p)) {
@@ -442,5 +452,6 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
     }, threads);
 
     std::vector<std::pair<uint64_t, std::string>>().swap(data.admin_wikidata);
+    PlaceNodeLinks().swap(links);
     return stats;
 }
