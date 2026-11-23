@@ -38,6 +38,17 @@ inline RelationKind area_relation_kind(const char* boundary, bool has_place) {
     return RelationKind::NONE;
 }
 
+// Whether a place area's boundary=* value is a category of Nominatim's row
+// beside its place one (presets.lua, MAIN_TAGS.all_boundaries): any named
+// area's value but place and land_area, which are deleted, protected_area, a
+// fallback, and administrative and postal_code, which make rows of their own.
+inline bool is_boundary_category(const char* boundary) {
+    if (!boundary || !boundary[0]) return false;
+    for (const char* other : {"administrative", "postal_code", "place", "land_area", "protected_area"})
+        if (std::strcmp(boundary, other) == 0) return false;
+    return true;
+}
+
 // The postcode of a boundary=postal_code relation, from the address tags
 // Nominatim reads it from (presets.lua, ADDRESS_TAGS.core postcode keys).
 // Null when it has none: Nominatim then makes no postcode area, and the name

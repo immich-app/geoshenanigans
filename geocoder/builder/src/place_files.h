@@ -22,19 +22,23 @@
 //   blocks of BLOCK_ROWS rows, the last one shorter:
 //   the blocks' bits, back to back, each block from a byte: per row, LSB
 //     first, its lat key less the block's lat base (wl bits), its lng key
-//     less its lng base (wg bits), place_type (TYPE_BITS) and name_id (wn
-//     bits); the last byte filled with zero bits. A coordinate's key is its
+//     less its lng base (wg bits), its type (TYPE_BITS: place_type in the
+//     low three bits, the top one set where the node is promoted) and
+//     name_id (wn bits); the last byte filled with zero bits. A visible
+//     node's rank_address is its type's (place_node_rank), PLACE_NODE_PROMOTION
+//     more where it is promoted. A coordinate's key is its
 //     f32 bit pattern ordered as the floats are (order_key). A block's bases
 //     are its least keys, wl and wg the widths of its largest differences
 //     from them and wn that of its largest name_id;
 //   the block table, TABLE_ENTRY_BYTES a block: the lat base and lng base
 //     (u32), the offset of the block's bits (u32), wl, wg, wn (u8) and 0;
-//   footer, FOOTER_BYTES: the rows (u32), "PNL3".
+//   footer, FOOTER_BYTES: the rows (u32), "PNL4".
 //   A bit reader's 8-byte loads past the last block's bits land in the table.
 // place_hidden.bin, HIDDEN_ROW_BYTES a hidden node, in the logical order: lat,
 //   lng (f32), name_id | place_type << 28 | (label) << 31 (u32, name_id below
-//   2^28), parent_poly_id (u32): a label's (PLACE_FLAG_LABEL_OF) boundary
-//   polygon, else NO_DATA.
+//   2^28, place_type below 2^HIDDEN_TYPE_BITS), parent_poly_id (u32): a
+//   label's (PLACE_FLAG_LABEL_OF) boundary polygon, else NO_DATA. A hidden
+//   node's logical rank_address is 0.
 #pragma once
 
 #include <algorithm>
@@ -45,14 +49,17 @@
 #include <string>
 #include <vector>
 
+#include "admin_rank_config.h"
 #include "types.h"
 
 namespace place_files {
 
 inline constexpr size_t LOGICAL_STRIDE = 24, BLOCK_ROWS = 64, TABLE_ENTRY_BYTES = 16, FOOTER_BYTES = 8,
                         CELL_ROW_BYTES = 8, HIDDEN_ROW_BYTES = 16;
-inline constexpr uint32_t TYPE_BITS = 3, HIDDEN_NAME_BITS = 28;
-inline constexpr char MAGIC[4] = {'P', 'N', 'L', '3'};
+inline constexpr uint32_t TYPE_BITS = 4, HIDDEN_TYPE_BITS = 3, HIDDEN_NAME_BITS = 28;
+// The type field's bit of a promoted node.
+inline constexpr uint32_t PROMOTED_BIT = 1u << HIDDEN_TYPE_BITS;
+inline constexpr char MAGIC[4] = {'P', 'N', 'L', '4'};
 inline constexpr const char* CELLS_FILE = "place_cells.bin";
 inline constexpr const char* NODES_FILE = "place_nodes.bin";
 inline constexpr const char* HIDDEN_FILE = "place_hidden.bin";
@@ -67,6 +74,21 @@ static_assert(sizeof(LogicalPlace) == LOGICAL_STRIDE, "LogicalPlace must be 24 b
 [[noreturn]] inline void malformed(const std::string& what) { throw std::runtime_error("Malformed place files: " + what); }
 
 inline bool is_visible(const PlaceNode& p) { return p._pad1 == 0 && p.parent_poly_id == NO_DATA; }
+
+// A visible row's type field: its place type and whether it is promoted, from
+// its rank, which must be its type's or a promoted one; and the rank back.
+inline uint32_t type_field(const PlaceNode& n) {
+    const uint8_t base = place_node_rank(n.place_type);
+    if (n.rank_address == base) return n.place_type;
+    if (n.rank_address != base + PLACE_NODE_PROMOTION)
+        malformed("a node of rank " + std::to_string(n.rank_address) + ", neither its type's nor a promoted one");
+    if (!place_node_promotable(base)) malformed("a node promoted from rank " + std::to_string(base));
+    return n.place_type | PROMOTED_BIT;
+}
+inline uint8_t rank_of_field(uint32_t field) {
+    const uint8_t base = place_node_rank(static_cast<uint8_t>(field & (PROMOTED_BIT - 1)));
+    return field & PROMOTED_BIT ? static_cast<uint8_t>(base + PLACE_NODE_PROMOTION) : base;
+}
 
 // The key of an admin cell id, which must end in 32 zero bits.
 inline uint32_t cell_key(uint64_t cell_id) {
@@ -138,7 +160,7 @@ public:
 
     void add(const LogicalPlace& p) {
         const PlaceNode& n = p.node;
-        if (n.place_type >= 1u << TYPE_BITS) malformed("a place type past " + std::to_string(TYPE_BITS) + " bits");
+        if (n.place_type >= 1u << HIDDEN_TYPE_BITS) malformed("a place type past " + std::to_string(HIDDEN_TYPE_BITS) + " bits");
         if (n._pad2) malformed("a node with its reserved bytes set");
         if (n.name_id == NO_DATA) malformed("a node without a name");
         if (uint64_t(rows_) + hidden_rows_ >= UINT32_MAX) malformed("more than 2^32 - 1 place nodes: their ids are u32");
@@ -146,6 +168,7 @@ public:
             if (hidden_rows_) malformed("a visible node after a hidden one");
             if (p.cell_key == NO_DATA) malformed("a visible node without a cell");
             if (rows_ && p.cell_key < last_key_) malformed("visible nodes out of cell order");
+            type_field(n);
             if (!rows_ || p.cell_key != last_key_) {
                 uint8_t row[CELL_ROW_BYTES];
                 put32(row, p.cell_key);
@@ -159,6 +182,7 @@ public:
             return;
         }
         if (p.cell_key != NO_DATA) malformed("a hidden node with a cell");
+        if (n.rank_address) malformed("a hidden node with a rank");
         if (!(n._pad1 & PLACE_FLAG_HIDDEN) || (n._pad1 & ~(PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF)))
             malformed("a node neither visible nor hidden");
         const bool label = n._pad1 & PLACE_FLAG_LABEL_OF;
@@ -231,7 +255,7 @@ private:
         for (size_t k = 0; k < block_.size(); k++) {
             add(lk[k] - e.lat_base, e.wl);
             add(gk[k] - e.lng_base, e.wg);
-            add(block_[k].place_type, TYPE_BITS);
+            add(type_field(block_[k]), TYPE_BITS);
             add(block_[k].name_id, e.wn);
         }
         if ((bit + 7) / 8 != bytes) throw std::logic_error("a place block's bytes don't add up");
@@ -277,7 +301,7 @@ struct Footer {
 };
 inline Footer read_footer(const uint8_t* footer, uint64_t size) {
     if (size < FOOTER_BYTES) malformed("place_nodes.bin is shorter than its footer");
-    if (std::memcmp(footer + 4, MAGIC, 4) != 0) malformed("place_nodes.bin's footer has no PNL3");
+    if (std::memcmp(footer + 4, MAGIC, 4) != 0) malformed("place_nodes.bin's footer has no PNL4");
     Footer f;
     f.rows = get32(footer);
     f.blocks = (size_t(f.rows) + BLOCK_ROWS - 1) / BLOCK_ROWS;
@@ -287,14 +311,15 @@ inline Footer read_footer(const uint8_t* footer, uint64_t size) {
     return f;
 }
 
-// The visible node of a row: lat, lng, place type and name; no flags, no
-// parent.
+// The visible node of a row: lat, lng, place type and rank (its type field)
+// and name; no flags, no parent.
 inline PlaceNode visible_node(uint32_t lat_bits, uint32_t lng_bits, uint32_t type, uint32_t name) {
     PlaceNode n{};
     n.lat = float_of(lat_bits);
     n.lng = float_of(lng_bits);
     n.name_id = name;
-    n.place_type = uint8_t(type);
+    n.place_type = uint8_t(type & (PROMOTED_BIT - 1));
+    n.rank_address = rank_of_field(type);
     n._pad1 = 0;
     n.parent_poly_id = NO_DATA;
     return n;
@@ -308,7 +333,7 @@ inline LogicalPlace hidden_place(const uint8_t* row) {
     n.lat = float_of(get32(row));
     n.lng = float_of(get32(row + 4));
     n.name_id = w & ((1u << HIDDEN_NAME_BITS) - 1);
-    n.place_type = uint8_t(w >> HIDDEN_NAME_BITS & ((1u << TYPE_BITS) - 1));
+    n.place_type = uint8_t(w >> HIDDEN_NAME_BITS & ((1u << HIDDEN_TYPE_BITS) - 1));
     n._pad1 = uint8_t(PLACE_FLAG_HIDDEN | (w >> 31 ? PLACE_FLAG_LABEL_OF : 0));
     n.parent_poly_id = get32(row + 12);
     if ((w >> 31) != (n.parent_poly_id != NO_DATA)) malformed("a hidden node's parent without its label, or its label without one");
@@ -383,6 +408,8 @@ void decode_block(size_t b, const BlockEntry& e, size_t rows, const uint8_t* p, 
         pl.node = visible_node(from_order_key(e.lat_base + dl), from_order_key(e.lng_base + dg), type, name);
         pl.cell_key = key(uint32_t(b * BLOCK_ROWS + k));
         if (pl.node.name_id == NO_DATA) malformed("a node without a name");
+        if ((type & PROMOTED_BIT) && !place_node_promotable(place_node_rank(pl.node.place_type)))
+            malformed("block " + std::to_string(b) + " promotes a node of rank " + std::to_string(place_node_rank(pl.node.place_type)));
         put(pl);
     }
     if (!lat_at_base || !lng_at_base || width_of(lat_max) != e.wl || width_of(lng_max) != e.wg || width_of(name_max) != e.wn)

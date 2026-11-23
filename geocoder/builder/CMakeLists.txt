@@ -88,6 +88,7 @@ add_executable(build-index
     src/continent_boundaries.cpp
     src/cell_index.cpp
     src/interpolation.cpp
+    src/rank_address.cpp
 )
 
 # Patch tools (no S2 dependency)
@@ -195,6 +196,7 @@ add_executable(geocoder-tests
     src/ring_assembly.cpp
     src/interpolation.cpp
     src/pbf_reader.cpp
+    src/rank_address.cpp
 )
 target_include_directories(geocoder-tests PRIVATE src tools tests)
 target_compile_definitions(geocoder-tests PRIVATE

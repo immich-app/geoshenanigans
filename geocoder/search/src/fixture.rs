@@ -71,7 +71,8 @@ impl Geo {
     /// A place node of PlaceNode type `place_type` (0 city .. 6 quarter); returns its index.
     pub fn place(&mut self, name: &str, place_type: u8, lat: f32, lng: f32) -> u32 {
         let name_id = self.string(name);
-        self.nodes.push(PlaceNode { lat, lng, name_id, place_type, _pad1: 0, _pad2: 0, parent_poly_id: NO_DATA });
+        let rank_address = query_server::PLACE_NODE_RANK[place_type as usize];
+        self.nodes.push(PlaceNode { lat, lng, name_id, place_type, _pad1: 0, rank_address, parent_poly_id: NO_DATA });
         self.nodes.len() as u32 - 1
     }
 
@@ -79,6 +80,7 @@ impl Geo {
     pub fn claim(&mut self, poly: u32, node: u32) {
         let pn = &mut self.nodes[node as usize];
         pn._pad1 |= PLACE_FLAG_LABEL_OF | PLACE_FLAG_HIDDEN;
+        pn.rank_address = 0;
         pn.parent_poly_id = poly;
     }
 

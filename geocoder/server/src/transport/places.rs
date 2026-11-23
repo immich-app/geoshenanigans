@@ -1,4 +1,4 @@
-//! The places unit: place_cells.bin and place_hidden.bin as rows, place_nodes.bin's L3 blocks
+//! The places unit: place_cells.bin and place_hidden.bin as rows, place_nodes.bin's L4 blocks
 //! unpacked (place_files.rs lays the files out). Decode packs each block's rows at its entry's
 //! widths, puts the entry, its offset where the blocks before it end, in a scratch file as it
 //! goes, and appends the table and the footer after the last block.
@@ -61,7 +61,7 @@ pub(super) fn encode(w: &mut impl Write, cells: &Source, nodes: &Source, hidden:
 fn encode_nodes(w: &mut impl Write, nodes: &Source) -> io::Result<()> {
     let n = nodes.bytes();
     if n.len() < FOOTER_BYTES || &n[n.len() - 4..] != MAGIC {
-        return Err(nodes.refuse("no PNL3 footer"));
+        return Err(nodes.refuse("no PNL4 footer"));
     }
     let rows = u32_at(n, n.len() - FOOTER_BYTES) as usize;
     let blocks = rows.div_ceil(BLOCK_ROWS);

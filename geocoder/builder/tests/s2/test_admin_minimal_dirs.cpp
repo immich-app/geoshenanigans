@@ -198,6 +198,7 @@ struct Region {
         pn.lng = 20.1f;
         pn.name_id = data.string_pool.intern(name);
         pn.place_type = pt(type);
+        pn.rank_address = place_node_rank(pn.place_type);
         pn._pad1 = flags;
         pn.parent_poly_id = parent;
         data.place_nodes.push_back(pn);

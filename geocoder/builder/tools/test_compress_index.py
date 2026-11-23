@@ -173,8 +173,8 @@ class CompressIndexTest(unittest.TestCase):
 
         self.assertEqual(sorted(cfg["units"]), sorted(self.units))
         for unit, (kind, members) in self.units.items():
-            self.assertEqual(cfg["units"][unit], {"kind": kind, "transport_version": 1, "size": os.path.getsize(self.path(unit)),
-                                                  "files": members}, unit)
+            self.assertEqual(cfg["units"][unit], {"kind": kind, "transport_version": load_template()["transport"]["version"],
+                                                  "size": os.path.getsize(self.path(unit)), "files": members}, unit)
             self.assertEqual(unit_members(self.path(unit)), {os.path.basename(m): self.files[m] for m in members}, unit)
             for m in members:
                 self.assertEqual(cfg["files"][m], {"size_raw": len(self.files[m]), "sha256": sha(self.files[m]), "unit": unit}, m)

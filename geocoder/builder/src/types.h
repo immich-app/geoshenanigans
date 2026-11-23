@@ -115,30 +115,42 @@ struct AdminPolygon {
     uint32_t name_id;
     uint8_t admin_level;
     uint8_t place_type_override = 0; // AdminPlaceType — overrides admin_level for field mapping
-    // A place area's own place tag (AdminPlaceType) where it links a place
-    // node of another type, whose type is its place_type_override and labels
-    // it (find_linked_place); 0 where its place type is its own.
+    // The polygon's own place tag (AdminPlaceType), 0 where it has none: a
+    // place area's (admin_level 15) is its place type. Its label is
+    // place_type_override, the type of a place node it links where it links
+    // one (find_linked_place).
     uint8_t own_place_type = 0;
-    uint8_t _pad3 = 0;
+    // Nominatim's rank_address of the polygon (rank_address.h); 0 for a
+    // postal area and a tombstone.
+    uint8_t rank_address = 0;
     float area;                   // of the exact rings, holes subtracted
     uint16_t country_code;
-    uint16_t _pad4 = 0;
+    uint8_t flags = 0;            // ADMIN_FLAG_* bits, which no dir holds
+    uint8_t _pad4 = 0;
 };
 static_assert(sizeof(AdminPolygon) == 20, "AdminPolygon must be 20 bytes");
+
+// AdminPolygon.flags bits.
+// place_type_override is the type of a place node the polygon links
+// (find_linked_place's label, wikidata or name step), not its own tag.
+static constexpr uint8_t ADMIN_FLAG_LINKED = 0x01;
+// A place area whose boundary tag Nominatim keeps as a category of its own
+// (boundary=historic, ceremonial: relation_import.h is_boundary_category).
+static constexpr uint8_t ADMIN_FLAG_BOUNDARY = 0x02;
 
 // An admin_polygons.bin record. Its ring block runs from its ring_offset to
 // the next record's (the last one's to the end of admin_rings.bin): every
 // record's offset is the running one, a tombstone's included, whose block is
 // empty, as is that of a polygon a tier left without rings. A tombstone's
 // name_id is NO_DATA. level_override is admin_level << 4 | the
-// place_type_override, both under 16, and own_place_type is the polygon's.
+// place_type_override, both under 16, and rank_address is the polygon's.
 struct AdminPolygonRecord {
     uint32_t ring_offset;
     uint32_t name_id;
     float area;
     uint16_t country_code;
     uint8_t level_override;
-    uint8_t own_place_type = 0;
+    uint8_t rank_address = 0;
 };
 static_assert(sizeof(AdminPolygonRecord) == 16, "AdminPolygonRecord must be 16 bytes");
 
@@ -151,14 +163,8 @@ inline AdminPolygonRecord admin_polygon_record(const AdminPolygon& p, uint32_t r
     r.area = p.area;
     r.country_code = p.country_code;
     r.level_override = static_cast<uint8_t>(p.admin_level << 4 | p.place_type_override);
-    r.own_place_type = p.own_place_type;
+    r.rank_address = p.rank_address;
     return r;
-}
-
-// The place type of a place area's own place tag: own_place_type where it
-// links a place node of another type, else place_type_override.
-inline uint8_t own_place_tag(const AdminPolygon& p) {
-    return p.own_place_type ? p.own_place_type : p.place_type_override;
 }
 
 struct NodeCoord {
@@ -368,6 +374,11 @@ struct CollectedRelation {
     // own place tag is only step 3, so we store it as a *fallback*
     // applied after label / wikidata have been checked.
     uint8_t fallback_place_type = 0;  // AdminPlaceType
+    // Its own place tag alone (AdminPlaceType), which ranks it, and whether a
+    // place area's boundary tag is a category of its own
+    // (is_boundary_category).
+    uint8_t own_place_type = 0;
+    bool boundary_category = false;
     std::string name;
     std::string country_code;
     bool is_postal;
@@ -402,7 +413,12 @@ struct PlaceNode {
     uint32_t name_id;       // into strings.bin
     uint8_t place_type;     // PlaceType
     uint8_t _pad1 = 0;      // PLACE_FLAG_* bits
-    uint16_t _pad2 = 0;
+    // Nominatim's rank_address of the node as a place of its own
+    // (rank_address.h): its type's (place_node_rank), two more where a
+    // relation of that rank holds it. A hidden node's row holds none
+    // (place_files.h), and an unhidden one has it.
+    uint8_t rank_address = 0;
+    uint8_t _pad2 = 0;
     // With PLACE_FLAG_LABEL_OF: the polygon of the boundary that claims
     // the node, which place search labels with it. Else NO_DATA.
     uint32_t parent_poly_id = NO_DATA;

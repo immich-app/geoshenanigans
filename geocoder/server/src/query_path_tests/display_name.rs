@@ -25,13 +25,13 @@ fn display_at(index: &Index, north_m: f64, east_m: f64) -> String {
 fn a_village_node_inside_a_township_of_its_rank_comes_before_the_township() {
     // Delaware County, Pennsylvania: Garrettford and Central Square are place=village nodes (rank
     // 16) inside Upper Darby and Newtown Township (admin_level 8, rank 16), so Nominatim ranks
-    // them 18 (placex_triggers.sql:951-971) and lists them before the township. Addingham, a
-    // hamlet (20), comes first.
+    // them 18 (placex_triggers.sql:951-971), as the builder marks them, and lists them before
+    // the township. Addingham, a hamlet (20), comes first.
     let index = TestIndex::country("United States", b"US")
         .boundary("Pennsylvania", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("Delaware County", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
         .boundary("Upper Darby", 8, 0, (-4000.0, -4000.0, 4000.0, 4000.0))
-        .place("Garrettford", 2, 600.0, 900.0)
+        .place("Garrettford", 2, 600.0, 900.0).promoted()
         .place("Addingham", 4, 300.0, -200.0)
         .street("Whalens Court", &[(0.0, -200.0), (0.0, 200.0)])
         .address("2", 10.0, 0.0)
@@ -44,7 +44,7 @@ fn a_village_node_inside_a_township_of_its_rank_comes_before_the_township() {
         .boundary("Pennsylvania", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("Delaware County", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
         .boundary("Newtown Township", 8, 0, (-4000.0, -4000.0, 4000.0, 4000.0))
-        .place("Central Square", 2, -700.0, 400.0)
+        .place("Central Square", 2, -700.0, 400.0).promoted()
         .street("Roberts Road", &[(0.0, -200.0), (0.0, 200.0)])
         .address("13", 10.0, 0.0)
         .addr_postcode("19073")
@@ -61,9 +61,9 @@ fn a_district_inside_its_city_comes_before_the_city() {
     // (W293814124, 20) names no field: Staré Mesto is the suburb.
     let index = TestIndex::country("Slovakia", b"SK")
         .boundary("Region of Bratislava", 4, 9, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
-        .boundary("Bratislava", 5, 1, (-10_000.0, -10_000.0, 10_000.0, 10_000.0))
-        .boundary("District of Bratislava I", 6, 11, (-2000.0, -2000.0, 2000.0, 2000.0))
-        .boundary("Bratislava-Staré Mesto", 9, 4, (-2000.0, -2000.0, 2000.0, 2000.0))
+        .boundary("Bratislava", 5, 1, (-10_000.0, -10_000.0, 10_000.0, 10_000.0)).rank(16)
+        .boundary("District of Bratislava I", 6, 11, (-2000.0, -2000.0, 2000.0, 2000.0)).rank(18)
+        .boundary("Bratislava-Staré Mesto", 9, 4, (-2000.0, -2000.0, 2000.0, 2000.0)).rank(20)
         .boundary("Bratislava", 15, 4, (-6000.0, -6000.0, 6000.0, 6000.0))
         .place("Tivoli", 5, 100.0, 100.0)
         .street("Hodžovo námestie", &[(0.0, -200.0), (0.0, 200.0)])
@@ -81,9 +81,9 @@ fn a_city_area_of_the_country_s_name_is_listed_apart_from_the_country() {
     // stay.
     let index = TestIndex::country("Singapore", b"SG")
         .boundary("Singapore", 15, 1, (-50_000.0, -50_000.0, 50_000.0, 50_000.0))
-        .boundary("Central Region", 5, 12, (-10_000.0, -10_000.0, 10_000.0, 10_000.0))
-        .boundary("River Valley", 6, 4, (-2000.0, -2000.0, 2000.0, 2000.0))
-        .boundary("One Tree Hill", 7, 5, (-500.0, -500.0, 500.0, 500.0))
+        .boundary("Central Region", 5, 12, (-10_000.0, -10_000.0, 10_000.0, 10_000.0)).rank(18)
+        .boundary("River Valley", 6, 4, (-2000.0, -2000.0, 2000.0, 2000.0)).rank(20)
+        .boundary("One Tree Hill", 7, 5, (-500.0, -500.0, 500.0, 500.0)).rank(24)
         .street("Jalan Tupai", &[(0.0, -100.0), (0.0, 100.0)])
         .centroid("247856", 50.0, 0.0)
         .load();
@@ -95,15 +95,15 @@ fn a_city_area_of_the_country_s_name_is_listed_apart_from_the_country() {
 fn a_suburb_area_comes_between_the_neighbourhood_and_the_city() {
     // Brussels: the Pentagon (R13729034, boundary=place, place=suburb) ranks 20 whatever the
     // boundaries round the point, so it comes after Quays Quarter (admin_level 10 linked to a
-    // neighbourhood: 24) and before Brussels (8, linked city: 16). Brussels-Capital, the region
-    // (4: rank 6) and the arrondissement (7: rank 12), is named once: the two are next to each
-    // other.
+    // neighbourhood: 24) and before Brussels (8, linked city: 16). Bruxelles - Brussel (9)
+    // repeats Brussels' wikidata and outline: rank 0. Brussels-Capital, the region (4: rank 6)
+    // and the arrondissement (7: rank 12), is named once: the two are next to each other.
     let index = TestIndex::country("Belgium", b"BE")
-        .boundary("Brussels-Capital", 4, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
-        .boundary("Brussels-Capital", 7, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Brussels-Capital", 4, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0)).rank(6)
+        .boundary("Brussels-Capital", 7, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0)).rank(12)
         .boundary("Brussels", 8, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
-        .boundary("Bruxelles - Brussel", 9, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
-        .boundary("Quays Quarter", 10, 5, (-300.0, -300.0, 300.0, 300.0))
+        .boundary("Bruxelles - Brussel", 9, 1, (-5000.0, -5000.0, 5000.0, 5000.0)).rank(0)
+        .boundary("Quays Quarter", 10, 5, (-300.0, -300.0, 300.0, 300.0)).rank(24)
         .boundary("Pentagon", 15, 4, (-1500.0, -1500.0, 1500.0, 1500.0))
         .street("Rue Melsens - Melsensstraat", &[(0.0, -100.0), (0.0, 100.0)])
         .load();
@@ -135,9 +135,9 @@ fn a_name_is_left_out_only_where_it_repeats_the_part_before_it() {
     let index = TestIndex::country("Turkey", b"TR")
         .boundary("Black Sea Region", 3, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("Trabzon", 4, 8, (-30_000.0, -30_000.0, 30_000.0, 30_000.0))
-        .boundary("Ortahisar", 6, 2, (-8000.0, -8000.0, 8000.0, 8000.0))
-        .boundary("Cumhuriyet Mahallesi", 8, 4, (-300.0, -300.0, 300.0, 300.0))
-        .place("Trabzon", 0, 1500.0, 1500.0)
+        .boundary("Ortahisar", 6, 2, (-8000.0, -8000.0, 8000.0, 8000.0)).rank(16)
+        .boundary("Cumhuriyet Mahallesi", 8, 4, (-300.0, -300.0, 300.0, 300.0)).rank(20)
+        .place("Trabzon", 0, 1500.0, 1500.0).promoted()
         .street("Kasım Sokak", &[(0.0, -100.0), (0.0, 100.0)])
         .load();
     assert_eq!(display_at(&index, 0.0, 0.0),
@@ -148,8 +148,8 @@ fn a_name_is_left_out_only_where_it_repeats_the_part_before_it() {
     let index = TestIndex::country("Netherlands", b"NL")
         .boundary("Netherlands", 3, 0, (-50_000.0, -50_000.0, 50_000.0, 50_000.0))
         .boundary("Drenthe", 4, 7, (-30_000.0, -30_000.0, 30_000.0, 30_000.0))
-        .boundary("Hoogeveen", 8, 0, (-8000.0, -8000.0, 8000.0, 8000.0))
-        .boundary("Alteveer", 10, 3, (-1000.0, -1000.0, 1000.0, 1000.0))
+        .boundary("Hoogeveen", 8, 0, (-8000.0, -8000.0, 8000.0, 8000.0)).rank(14)
+        .boundary("Alteveer", 10, 3, (-1000.0, -1000.0, 1000.0, 1000.0)).rank(16)
         .street("Hendrikus Zomerweg", &[(0.0, -100.0), (0.0, 100.0)])
         .centroid("7915 AB", 50.0, 0.0)
         .load();
@@ -166,7 +166,7 @@ fn a_place_area_inside_a_boundary_of_its_rank_comes_before_the_boundary() {
     let index = TestIndex::country("France", b"FR")
         .boundary("Bretagne", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("Rennes", 8, 0, (-5000.0, -5000.0, 5000.0, 5000.0))
-        .boundary("Saint-Laurent", 15, 3, (500.0, 500.0, 1500.0, 1500.0))
+        .boundary("Saint-Laurent", 15, 3, (500.0, 500.0, 1500.0, 1500.0)).rank(18)
         .street("Rue de Fougères", &[(1000.0, 900.0), (1000.0, 1100.0)])
         .load();
     assert_eq!(display_at(&index, 1000.0, 1000.0), "Rue de Fougères, Saint-Laurent, Rennes, Bretagne, France");
@@ -233,21 +233,19 @@ fn an_answer_with_no_locality_road_or_country_still_has_a_display_name() {
 }
 
 #[test]
-fn a_place_area_linked_to_a_place_node_of_another_type_keeps_its_own_rank() {
+fn a_place_area_labelled_by_a_linked_node_is_listed_at_its_own_rank() {
     // Weesp (R15419242, boundary=place, place=suburb) has the town node Weesp as its label member:
     // find_linked_place links it, and the link labels the area town, but placex_update keeps a
-    // place area of rank 16 to 23 at its own place type's rank (its branch leaves
-    // parent_address_level unset, placex_triggers.sql:930-950, :1129), here the suburb's 20. So
-    // Weesp comes before Driemond, a village node promoted to 18 inside Amsterdam (admin_level
-    // 10, linked city: 16, the ring round Driemond, which overlaps Weesp), and the two
-    // Amsterdams meet, as in Nominatim's line.
+    // place area of rank 16 to 23 at its own place type's rank, the suburb's 20, which the builder
+    // stores. So Weesp comes before Driemond, a village node promoted to 18 inside Amsterdam
+    // (admin_level 10, linked city: 16, the ring round Driemond, which overlaps Weesp), and the
+    // two Amsterdams meet, as in Nominatim's line.
     let mut dataset = TestIndex::country("Netherlands", b"NL");
     dataset.boundary("North Holland", 4, 7, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
-        .boundary("Amsterdam", 8, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
-        .boundary("Amsterdam", 10, 1, (-1500.0, -3000.0, 1500.0, 1000.0))
-        .boundary("Weesp", 15, 2, (-2000.0, -2000.0, 2000.0, 2000.0));
-    dataset.polygons.last_mut().unwrap().0.own_place_type = 4;
-    dataset.place("Driemond", 2, -400.0, 300.0)
+        .boundary("Amsterdam", 8, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0)).rank(14)
+        .boundary("Amsterdam", 10, 1, (-1500.0, -3000.0, 1500.0, 1000.0)).rank(16)
+        .boundary("Weesp", 15, 2, (-2000.0, -2000.0, 2000.0, 2000.0)).rank(20);
+    dataset.place("Driemond", 2, -400.0, 300.0).promoted()
         .street("Maanhof", &[(0.0, -100.0), (0.0, 100.0)]);
     let index = dataset.load();
     assert_eq!(display_at(&index, 0.0, 0.0), "Maanhof, Weesp, Driemond, Amsterdam, North Holland, Netherlands");

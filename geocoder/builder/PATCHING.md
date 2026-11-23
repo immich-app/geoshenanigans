@@ -517,7 +517,7 @@ same files, byte for byte. The on-disk formats, the patches, the patcher and
 the readers don't change: patches are made from the files and applied to
 them, whichever way a client got them.
 
-- **Kinds**: `places` (place_cells, place_nodes with its L3 blocks unpacked,
+- **Kinds**: `places` (place_cells, place_nodes with its L4 blocks unpacked,
   place_hidden), `pois` (R2's rows, poi_vertices with its V2 blocks
   unpacked), `arcs` (the arc blocks unpacked; arc_index is computed) and
   `cols` (one of admin_polygons, street_ways, interp_ways and addr_index,
@@ -525,7 +525,8 @@ them, whichever way a client got them.
   each unit and its files. postcode_centroids.bin is no unit: its PCC1
   blocks go as its `.zst`, within 0.14 MiB on the planet of what a unit of
   the old fixed-width rows downloaded (below). Dropping that unit changed no
-  other unit's stream, so the transport version stayed 1.
+  other unit's stream, so the transport version stayed 1. Version 2 decodes
+  the places unit to PNL4, whose type field holds a promoted node's bit.
 - **The stream**: `GTT1`, the transport version, the kind and the members'
   names and sizes, then each member's section: chunks of byte-aligned
   columns (at most 1 MiB, or one polygon or arc larger than that alone), each
@@ -553,7 +554,7 @@ them, whichever way a client got them.
   latest.json on the build before (the test portal fetches those files only
   as the unit) and pruning no build.
 - **Versioned**: the stream and configurations.json's `units` carry the
-  transport version, 1 (the template's `transport.version`, held to the
+  transport version, 2 (the template's `transport.version`, held to the
   library's `TRANSPORT_VERSION`). Setup builds fresh when yesterday's units
   are of another version, since the fetch of yesterday's index decodes them
   with tonight's `geocoder-transport`; a client refuses a version it doesn't
@@ -581,7 +582,7 @@ build 23's unit of the old rows with their cells and entries files, and take
 257,858,727 B (245.91 MiB), and with-addresses and max-quality, whose full
 dir holds the same two files, 0.14 MiB more than above too.
 
-## Patch Format (.gcpatch, version 19)
+## Patch Format (.gcpatch, version 24)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -591,9 +592,9 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=19 (u32) + flags=0 (u32)
-  (a v19 patcher accepts only v19 patches; the v8 to v19 changes are marked
-  below)
+Header: "GCPATCH\0" (8) + version=24 (u32) + flags=0 (u32)
+  (a v24 patcher accepts only v24 patches; the v8 to v24 changes are marked
+  below; versions 20 to 23 are other branches' formats)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   + n × {name_len:u16, name, size:u64, inline:u8, [bytes] if inline}
@@ -928,7 +929,7 @@ writes the cells file beside the centroids, and the entries file is gone.
 | 3 | `addr_points.bin` | merge at stride 28, with or without records (v18; a dir without any sent 16), string fields `housenumber_id` and `street_id` |
 | 4 | `interp_ways.bin` | merge at stride 24, string field `street_id` |
 | 5 | `interp_nodes.bin` | child stream of interp_ways, at stride 8 |
-| 6 | `admin_polygons.bin` | merge by slot at stride 16 (v16; v14–v15: 24), string field `name_id`, offset field `ring_offset` (v14) |
+| 6 | `admin_polygons.bin` | merge by slot at stride 16 (v16; v14–v15: 24), string field `name_id`, offset field `ring_offset` (v14); its last byte is the polygon's rank_address (v24; was a place area's own place type) |
 | 7 | `admin_rings.bin` | child stream of admin_polygons, at stride 1 (v14; v13: `admin_vertices.bin`) |
 | 8 | `geo_cells.bin` | geo cell changes (0xFFFFFFFB), rebuilt with `geo_entries.bin` (35) beside the geo entry deltas |
 | 9-11 | the geo index's street, address and interpolation lists (no files of their own since GXT2: a file section naming one is refused) | geo entry deltas (0xFFFFFFF0) |
@@ -936,7 +937,7 @@ writes the cells file beside the centroids, and the entries file is gone.
 | 14 | `poi_records.bin` | merge of the logical records (R2 decoded) at stride 36, string fields `name_id`, `parent_street_id` and `parent_postcode_id`; the client list gives the R2 file's size |
 | 15 | `poi_vertices.bin` | child stream of poi_records, of the logical vertex stream (V2 decoded), at stride 1 |
 | 16, 17 | `poi_cells.bin`, `poi_entries.bin` | POI cell changes (0xFFFFFFF5) and a cell index delta |
-| 18 | `place_nodes.bin` | merge of the place files' logical rows (`builder/src/place_files.h`, decoded) at stride 24 (v16; was 20), string field `name_id`; the patcher encodes `place_cells.bin`, `place_nodes.bin` and `place_hidden.bin` from them, whose sizes the client list gives |
+| 18 | `place_nodes.bin` | merge of the place files' logical rows (`builder/src/place_files.h`, decoded) at stride 24 (v16; was 20), string field `name_id`, byte 14 the node's rank_address (v24, PNL4); the patcher encodes `place_cells.bin`, `place_nodes.bin` and `place_hidden.bin` from them, whose sizes the client list gives |
 | 19 | `addr_postcodes.bin` | parallel delta along addr_points, remap kind 2 |
 | 20 | `admin_parents.bin` | sparse delta, remap kind 0 (v14; was 1) |
 | 21 | `way_parents.bin` | parallel delta along street_ways, remap kind 0 (v14; was 1) |

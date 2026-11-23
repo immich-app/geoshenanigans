@@ -1,6 +1,7 @@
 // The place files (place_files.h): the encoder's files decode to the logical
 // stream it took, one stream has one encoding, and the streams and files the
-// format can't hold are refused.
+// format can't hold are refused, a rank past a node's type's and its
+// promotion among them.
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -45,13 +46,15 @@ bool same(const std::vector<LogicalPlace>& a, const std::vector<LogicalPlace>& b
     return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(LogicalPlace)) == 0);
 }
 
-LogicalPlace visible(float lat, float lng, uint32_t name, uint8_t type, uint32_t key) {
+// A visible node of its type's rank, two more where `promoted`.
+LogicalPlace visible(float lat, float lng, uint32_t name, uint8_t type, uint32_t key, bool promoted = false) {
     LogicalPlace p;
     p.node = PlaceNode{};
     p.node.lat = lat;
     p.node.lng = lng;
     p.node.name_id = name;
     p.node.place_type = type;
+    p.node.rank_address = static_cast<uint8_t>(place_node_rank(type) + (promoted ? PLACE_NODE_PROMOTION : 0));
     p.cell_key = key;
     return p;
 }
@@ -59,6 +62,7 @@ LogicalPlace visible(float lat, float lng, uint32_t name, uint8_t type, uint32_t
 LogicalPlace hidden(float lat, float lng, uint32_t name, uint8_t type, uint32_t parent) {
     LogicalPlace p = visible(lat, lng, name, type, NO_DATA);
     p.node._pad1 = PLACE_FLAG_HIDDEN | (parent == NO_DATA ? 0 : PLACE_FLAG_LABEL_OF);
+    p.node.rank_address = 0;
     p.node.parent_poly_id = parent;
     return p;
 }
@@ -81,7 +85,8 @@ std::vector<LogicalPlace> random_stream(std::mt19937_64& rng, size_t n) {
         const uint64_t shift = 32 + rng() % 32;
         const uint32_t name = uint32_t(rng() >> shift);
         const uint8_t type = uint8_t(rng() % 8);
-        rows.push_back(visible(zero ? -0.0f : lat, lng, name, type, key));
+        const bool promoted = rng() % 3 == 0 && place_node_promotable(place_node_rank(type));
+        rows.push_back(visible(zero ? -0.0f : lat, lng, name, type, key, promoted));
     }
     for (size_t i = 0; i < n / 5; i++) {
         const uint32_t name = uint32_t(rng() % (1u << 28));
@@ -146,6 +151,11 @@ TEST(the_encoder_refuses_a_stream_the_files_cant_hold) {
         {{with(v, [](LogicalPlace& p) { p.node.name_id = NO_DATA; })}, "a node without a name"},
         {{with(v, [](LogicalPlace& p) { p.node.place_type = 8; })}, "a place type past 3 bits"},
         {{with(v, [](LogicalPlace& p) { p.node._pad2 = 1; })}, "a node with its reserved bytes set"},
+        {{with(v, [](LogicalPlace& p) { p.node.rank_address = 0; })}, "a node of rank 0, neither its type's nor a promoted one"},
+        {{with(v, [](LogicalPlace& p) { p.node.rank_address = 17; })}, "a node of rank 17"},
+        // A neighbourhood (24) is no rank a relation promotes.
+        {{visible(1, 1, 3, 5, 10, true)}, "a node promoted from rank 24"},
+        {{with(h, [](LogicalPlace& p) { p.node.rank_address = 16; })}, "a hidden node with a rank"},
         {{with(h, [](LogicalPlace& p) { p.node._pad1 |= PLACE_FLAG_LABEL_OF; })}, "a hidden node's parent without its label"},
         {{with(h, [](LogicalPlace& p) { p.node.parent_poly_id = 3; })}, "a hidden node's parent without its label"},
         {{with(h, [](LogicalPlace& p) { p.node.name_id = 1u << 28; })}, "a hidden node's name_id past 28 bits"},
@@ -159,6 +169,29 @@ TEST(the_encoder_refuses_a_stream_the_files_cant_hold) {
         if (got.find(c.refusal) == std::string::npos) std::printf("    want %s, got %s\n", c.refusal.c_str(), got.c_str());
     }
     CHECK_EQ(refusal({v, h}), std::string());
+    CHECK_EQ(refusal({visible(1, 1, 3, 1, 10, true), visible(1, 1, 3, 6, 10, true)}), std::string());
+}
+
+TEST(a_visible_rows_top_type_bit_promotes_the_node_by_2) {
+    // One row a block: no coordinate bits, the type field first. A town (16) with the bit reads
+    // as 18; a neighbourhood (24), which nothing promotes, is refused.
+    Files town = encode({visible(1, 1, 3, 1, 10)});
+    CHECK_EQ(town.nodes[0] & 0x0F, 1);
+    town.nodes[0] |= 0x08;
+    const std::vector<LogicalPlace> rows = decode(town);
+    REQUIRE(rows.size() == 1);
+    CHECK_EQ(rows[0].node.place_type, uint8_t(1));
+    CHECK_EQ(rows[0].node.rank_address, uint8_t(18));
+    CHECK(encode(rows) == town);
+    Files neighbourhood = encode({visible(1, 1, 3, 5, 10)});
+    neighbourhood.nodes[0] |= 0x08;
+    std::string said;
+    try {
+        decode(neighbourhood);
+    } catch (const std::runtime_error& e) {
+        said = e.what();
+    }
+    CHECK(said.find("promotes a node of rank 24") != std::string::npos);
 }
 
 // Every file a byte changed in, or cut short, either is refused or decodes
@@ -233,8 +266,9 @@ TEST(place_files_are_the_shared_vectors_byte_for_byte) {
         std::vector<LogicalPlace> rows;
         std::stringstream rs(field[1]);
         for (std::string r; std::getline(rs, r, ';');) {
-            unsigned lat, lng, name, type, flags, parent, key;
-            REQUIRE(std::sscanf(r.c_str(), "%x,%x,%u,%u,%u,%u,%u", &lat, &lng, &name, &type, &flags, &parent, &key) == 7);
+            unsigned lat, lng, name, type, flags, parent, key, rank;
+            REQUIRE(std::sscanf(r.c_str(), "%x,%x,%u,%u,%u,%u,%u,%u", &lat, &lng, &name, &type, &flags, &parent, &key,
+                                &rank) == 8);
             LogicalPlace p;
             p.node = PlaceNode{};
             p.node.lat = place_files::float_of(lat);
@@ -242,6 +276,7 @@ TEST(place_files_are_the_shared_vectors_byte_for_byte) {
             p.node.name_id = name;
             p.node.place_type = uint8_t(type);
             p.node._pad1 = uint8_t(flags);
+            p.node.rank_address = uint8_t(rank);
             p.node.parent_poly_id = parent;
             p.cell_key = key;
             rows.push_back(p);

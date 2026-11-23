@@ -413,10 +413,10 @@ TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread_or_copies
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v19 = the postcode centroids' logical stream (v18:
-    // the address footprints' stream in 2-byte units). The patcher accepts
+    // diff/patch tools. v24 = the polygons' and place nodes' rank_address
+    // (v19: the postcode centroids' logical stream). The patcher accepts
     // this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(19));
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(24));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }

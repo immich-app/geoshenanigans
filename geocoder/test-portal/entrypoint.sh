@@ -20,7 +20,7 @@ MINIMAL="${MINIMAL:-0}"
 # The build version of the files this server reads, the build.version of
 # configurations.template.json (builder/tools/test_build_search_indexes.py
 # holds it to that).
-BUILD_VERSION=24
+BUILD_VERSION=25
 
 # The planet files this server downloads, one "<dir> <file>" a line: those
 # of the template's selection (mode full or admin-minimal, $QUALITY,

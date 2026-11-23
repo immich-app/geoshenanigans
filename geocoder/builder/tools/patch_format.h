@@ -271,7 +271,11 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // postcode_centroids.bin and postcode_centroid_cells.bin. No sparse delta
 // carries them (remap kind 3 is gone), no cell list delta (stride 0xFB)
 // carries any index, and file ids 24 and 25 name no file.
-static constexpr uint32_t GCPATCH_VERSION = 19;
+// v24: admin_polygons.bin's last byte is the polygon's rank_address, and the
+// place files are PNL4: a visible row's type field is 4 bits, its top bit a
+// promoted node, so a logical place row's byte 14 is its rank_address (0 for
+// a hidden node). Versions 20 to 23 are other formats'.
+static constexpr uint32_t GCPATCH_VERSION = 24;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;

@@ -410,6 +410,10 @@ struct ParsedData {
     // polygons, OSM_WAY + way_id for closed-way polygons (stable ids since
     // #105). Strategy-2 IdAllocator keys on this.
     std::vector<uint64_t> admin_osm_ids;
+    // The wikidata tag of each boundary that has one, as (boundary id,
+    // value): admin_boundary_id of its polygons' admin_osm_ids. The rank pass
+    // (rank_address.h) reads it, then frees it.
+    std::vector<std::pair<uint64_t, std::string>> admin_wikidata;
     // A continent's admin polygons' planet ids, parallel to admin_polygons
     // (NO_DATA for a strategy-2 tombstone); empty for the planet.
     std::vector<uint32_t> admin_planet_ids;

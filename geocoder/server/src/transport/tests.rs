@@ -381,13 +381,16 @@ fn fixture_datasets_come_back_and_the_readers_read_them_as_before() {
             let (lat, lng) = (rng.range(-85.0, 85.0) as f32, rng.range(-180.0, 180.0) as f32);
             let hidden = i % 9 == 4;
             let label = hidden && i % 2 == 0;
+            let place_type = (rng.next() % 7) as u8;
+            let rank = crate::PLACE_NODE_RANK[place_type as usize];
+            let promoted = i % 5 == 1 && crate::PROMOTABLE_RANKS.contains(&rank);
             PlaceNode {
                 lat,
                 lng,
                 name_id: (rng.next() % (1 << 27)) as u32 >> (i % 20),
-                place_type: (rng.next() % 7) as u8,
+                place_type,
                 _pad1: if hidden { PLACE_FLAG_HIDDEN | if label { PLACE_FLAG_LABEL_OF } else { 0 } } else { 0 },
-                _pad2: 0,
+                rank_address: if hidden { 0 } else if promoted { rank + crate::PLACE_NODE_PROMOTION } else { rank },
                 parent_poly_id: if label { i * 3 } else { NO_DATA },
             }
         })
@@ -533,7 +536,7 @@ fn golden_sets() -> Vec<(&'static str, Kind, Option<&'static str>, Files)> {
     let mut polygons = Vec::new();
     for (ring_offset, name_id, area, country_code, admin_level) in [(0, 7, 0.5f32, 528u16, 2u8), (96, 11, 0.0625, 528, 8), (160, 12, 3.25, 36, 4)] {
         let p = AdminPolygon {
-            ring_offset, ring_bytes: 0, name_id, admin_level, place_type_override: (admin_level == 8) as u8, own_place_type: 0, area,
+            ring_offset, ring_bytes: 0, name_id, admin_level, place_type_override: (admin_level == 8) as u8, rank_address: 2 * admin_level, area,
             country_code,
         };
         polygons.extend(p.record_bytes());
@@ -629,9 +632,9 @@ fn a_unit_with_bytes_past_its_end_or_another_version_or_kind_is_refused() {
     let units = golden_units();
     let unit = &units[0].3;
     assert!(refusal(&[unit.as_slice(), &[0]].concat()).contains("bytes after the last section"));
-    let mut v2 = unit.clone();
-    v2[4] = 2;
-    assert_eq!(refusal(&v2), "transport: a unit of transport version 2: this build reads version 1 only");
+    let mut v3 = unit.clone();
+    v3[4] = 3;
+    assert_eq!(refusal(&v3), "transport: a unit of transport version 3: this build reads version 2 only");
     let mut k9 = unit.clone();
     k9[8] = 9;
     assert_eq!(refusal(&k9), "transport: a unit of kind 9, which this build doesn't know");
@@ -697,7 +700,7 @@ fn place_block(entry: [u64; 5], rows: &[[u64; 4]], nodes_size: u64) -> Vec<u8> {
     Stream::head(Kind::Places, &[("place_cells.bin", 0), ("place_nodes.bin", nodes_size), ("place_hidden.bin", 0)], None)
         .end(&[])
         .chunk(1, &cols)
-        .end(&[1, 0, 0, 0, b'P', b'N', b'L', b'3'])
+        .end(&[1, 0, 0, 0, b'P', b'N', b'L', b'4'])
         .end(&[])
         .0
 }
@@ -707,10 +710,10 @@ fn a_width_past_its_familys_most_or_a_value_past_its_width_is_refused() {
     // One row of a 7-bit name: a byte of bits, the 16-byte table entry, the footer.
     let ok = place_block([5, 6, 0, 0, 3], &[[0, 0, 2, 7]], 1 + 16 + 8);
     let (_, m) = decoded(&ok).unwrap_or_else(|(e, _)| panic!("{e}"));
-    assert_eq!(m[1].1, [&[0x3a][..], &5u32.to_le_bytes(), &6u32.to_le_bytes(), &[0, 0, 0, 0, 0, 0, 3, 0], &[1, 0, 0, 0], b"PNL3"].concat());
+    assert_eq!(m[1].1, [&[0x72][..], &5u32.to_le_bytes(), &6u32.to_le_bytes(), &[0, 0, 0, 0, 0, 0, 3, 0], &[1, 0, 0, 0], b"PNL4"].concat());
     assert_eq!(refusal(&place_block([5, 6, 33, 0, 3], &[[0, 0, 2, 7]], 25)), "transport: a place block's width past 32 bits");
     assert_eq!(refusal(&place_block([5, 6, 0, 0, 2], &[[0, 0, 2, 7]], 25)), "transport: a value of 7 in a field of 2 bits");
-    assert_eq!(refusal(&place_block([5, 6, 0, 0, 3], &[[0, 0, 8, 7]], 25)), "transport: a value of 8 in a field of 3 bits");
+    assert_eq!(refusal(&place_block([5, 6, 0, 0, 3], &[[0, 0, 16, 7]], 25)), "transport: a value of 16 in a field of 4 bits");
     // A polygon of encoding 0 at 17 bits a latitude: u16 vertices are 16 bits at most.
     // One vertex (1, 1): a 6-byte header, its bits, the pad.
     let polygon = |tag: u64, wl: u64| {
@@ -813,13 +816,13 @@ fn files_the_stream_cant_give_back_are_refused_by_encode() {
         e.to_string()
     };
     // A place block with a bit set past its last row.
-    let (p, _) = crate::place_files::encode(&[PlaceNode { lat: 1.0, lng: 2.0, name_id: 7, place_type: 1, _pad1: 0, _pad2: 0, parent_poly_id: NO_DATA }], 10);
+    let (p, _) = crate::place_files::encode(&[PlaceNode { lat: 1.0, lng: 2.0, name_id: 7, place_type: 1, _pad1: 0, rank_address: 16, parent_poly_id: NO_DATA }], 10);
     let mut nodes = p.nodes.clone();
     nodes[0] |= 0x80;
     assert_eq!(refused(Kind::Places, &members_of(Kind::Places, vec![p.cells.clone(), nodes, p.hidden.clone()])), "transport: place_nodes.bin: block 0 has bits set past its last row");
     let mut nodes = p.nodes.clone();
     nodes.truncate(nodes.len() - 1);
-    assert!(refused(Kind::Places, &members_of(Kind::Places, vec![p.cells.clone(), nodes, p.hidden.clone()])).contains("no PNL3 footer"));
+    assert!(refused(Kind::Places, &members_of(Kind::Places, vec![p.cells.clone(), nodes, p.hidden.clone()])).contains("no PNL4 footer"));
     // An arc block whose box is not its vertices', and slots out of order.
     let mut fx = ArcFixture::new();
     let line: Vec<PointE7> = (0..20).map(|i| PointE7 { lat: 100 * i, lng: -50 * i }).collect();

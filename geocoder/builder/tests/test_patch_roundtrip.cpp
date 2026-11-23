@@ -799,6 +799,7 @@ TEST(decode_logical_writes_the_poi_and_place_files_a_dir_holds_and_none_it_lacks
     const BuildDir pois = poi_polygons(false);
     PlaceNode hidden = place(NAME_4);
     hidden._pad1 = PLACE_FLAG_HIDDEN;
+    hidden.rank_address = 0;  // a hidden row holds none
     const std::vector<PlaceNode> visible = {place(NAME_2), place(NAME_4), place(NAME_2), place(NAME_4), place(NAME_2)};
     std::vector<PlaceNode> nodes = visible;
     nodes.insert(nodes.begin() + 2, hidden);

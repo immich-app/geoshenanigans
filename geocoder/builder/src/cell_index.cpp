@@ -1165,7 +1165,12 @@ void write_place_files(const std::string& dir, const std::vector<PlaceNode>& nod
     std::vector<uint8_t> cells, blocks, hidden;
     auto into = [](std::vector<uint8_t>& v) { return [&v](const uint8_t* p, size_t n) { v.insert(v.end(), p, p + n); }; };
     place_files::Encoder enc(into(cells), into(blocks), into(hidden));
-    for (const uint32_t i : order) enc.add({nodes[i], keys[i]});
+    for (const uint32_t i : order) {
+        // A hidden node's row holds no rank.
+        PlaceNode node = nodes[i];
+        if (!place_files::is_visible(node)) node.rank_address = 0;
+        enc.add({node, keys[i]});
+    }
     enc.finish();
     for (const auto& entry : enc.table()) blocks.insert(blocks.end(), entry.begin(), entry.end());
     const auto footer = enc.footer();
