@@ -552,8 +552,9 @@ TEST(a_water_dir_holding_a_marine_area_credits_marine_regions) {
         assign_region_arc_slots(lake.arcs, "", "test", 0);
     }
     write(lake, root.path() + "/lake");
-    CHECK(text_of(bytes_of(root.path() + "/lake/water/all/exact/attribution.json")).find("marine-regions") ==
-          std::string::npos);
+    const std::string credit = text_of(bytes_of(root.path() + "/lake/water/all/exact/attribution.json"));
+    CHECK(credit.find("\"id\": \"osm\"") != std::string::npos);
+    CHECK(credit.find("marine-regions") == std::string::npos);
 }
 
 TEST(a_regions_share_counts_the_cells_around_its_own_and_each_polygon_they_list_whole) {

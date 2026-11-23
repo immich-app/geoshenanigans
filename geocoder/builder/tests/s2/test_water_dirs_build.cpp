@@ -253,6 +253,7 @@ TEST(build_index_loads_the_marine_areas_it_is_given_into_the_water_dirs) {
     const std::vector<char> credited = bytes_of(with + "/planet/water/all/exact/attribution.json"),
                             uncredited = bytes_of(without + "/planet/water/all/exact/attribution.json");
     CHECK(std::string(credited.begin(), credited.end()).find("\"id\": \"marine-regions\"") != std::string::npos);
+    CHECK(std::string(uncredited.begin(), uncredited.end()).find("\"id\": \"osm\"") != std::string::npos);
     CHECK(std::string(uncredited.begin(), uncredited.end()).find("marine-regions") == std::string::npos);
 }
 
