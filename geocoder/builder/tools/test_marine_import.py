@@ -4,7 +4,9 @@
 The file format's tests need nothing past the standard library. The geometry's need shapely, numpy and
 pyogrio, as `build` does: they run where those are (the marine workflow installs them before it builds),
 and are skipped elsewhere."""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import struct
@@ -84,6 +86,24 @@ class FileTest(unittest.TestCase):
         self.assertEqual(marine_import.kind_of("North Sea"), marine_import.KIND_SEA)
         self.assertEqual(marine_import.kind_of("Mediterranean Sea - Eastern Basin"), marine_import.KIND_SEA)
         self.assertEqual(marine_import.kind_of("Bay of Biscay"), marine_import.KIND_SEA)
+
+
+class BoundsTest(unittest.TestCase):
+    def test_a_bbox_that_is_not_four_edges_in_order_is_refused_before_the_build(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "marine_areas.bin")
+            for bbox, said in [("10,50,12", "four"), ("10,50,12,51,13", "four"), ("10,50,east,51", "four"),
+                               ("10,50,nan,51", "four"), ("12,50,10,51", "antimeridian"),
+                               ("170,50,-170,51", "antimeridian"), ("-181,50,12,51", "antimeridian"),
+                               ("10,51,12,50", "south"), ("10,-91,12,50", "south")]:
+                with self.subTest(bbox=bbox):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                        marine_import.main(["build", "--eez-iho", os.path.join(d, "eez_iho.geojson"), "--land",
+                                            os.path.join(d, "land.zip"), "-o", out, f"--bbox={bbox}"])
+                    self.assertIn("--bbox", err.getvalue())
+                    self.assertIn(said, err.getvalue())
+                    self.assertFalse(os.path.exists(out))
 
 
 def feature(props, rings):

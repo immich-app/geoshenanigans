@@ -41,6 +41,7 @@ Output, little-endian:
 """
 import argparse
 import json
+import math
 import os
 import struct
 import sys
@@ -403,6 +404,27 @@ def _land_path(path):
     return f"/vsizip/{path}/{shp[0]}"
 
 
+def _bbox(text):
+    """--bbox's WEST,SOUTH,EAST,NORTH in degrees, or None for none: four finite numbers, west to east and
+    south to north."""
+    if not text:
+        return None
+    try:
+        box = tuple(float(v) for v in text.split(","))
+    except ValueError:
+        box = ()
+    if len(box) != 4 or not all(math.isfinite(v) for v in box):
+        raise argparse.ArgumentTypeError(f"{text!r} is not four numbers, WEST,SOUTH,EAST,NORTH")
+    west, south, east, north = box
+    if not -180 <= west <= east <= 180:
+        raise argparse.ArgumentTypeError(f"{text!r}: west and east lie from -180 to 180, west no further east than "
+                                         "east (a box across the antimeridian is not supported)")
+    if not -90 <= south <= north <= 90:
+        raise argparse.ArgumentTypeError(f"{text!r}: south and north lie from -90 to 90, south no further north "
+                                         "than north")
+    return box
+
+
 def build(opts):
     import multiprocessing
     import numpy as np
@@ -416,7 +438,7 @@ def build(opts):
 
     if opts.stats and os.path.realpath(opts.stats) == os.path.realpath(opts.output):
         raise ValueError(f"--stats {opts.stats} is the output, -o {opts.output}")
-    bbox = tuple(float(v) for v in opts.bbox.split(",")) if opts.bbox else None
+    bbox = opts.bbox
     ctx = multiprocessing.get_context("fork")
     tiles = {}
     with ctx.Pool(opts.workers) as pool:
@@ -494,7 +516,8 @@ def main(argv=None):
     b.add_argument("-o", "--output", required=True)
     b.add_argument("--stats", default="")
     b.add_argument("--workers", type=int, default=os.cpu_count())
-    b.add_argument("--bbox", default="", help="only the tiles whose centres are in WEST,SOUTH,EAST,NORTH")
+    b.add_argument("--bbox", default="", type=_bbox,
+                   help="only the tiles whose centres are in WEST,SOUTH,EAST,NORTH")
     s = sub.add_parser("stats")
     s.add_argument("path")
     opts = p.parse_args(argv)
