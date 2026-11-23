@@ -107,12 +107,12 @@ This ensures nested boundaries don't share the same address rank. Example:
 2. **Place area** (:912-929), for boundaries of rank 10 or more without a place type: the place area of the highest rank from the boundary's up to 23 that is larger and holds the boundary's point on surface lifts it to that rank + 2.
 3. **Linked place** (:1109-1170): a boundary's place type (from a linked node or its own `place` tag) replaces its rank where that is higher than both its own and its parent's.
 
-A place area (class='place': `boundary=place`, a place multipolygon or closed way, a `boundary=historic` or `ceremonial` with a place tag, such as County Antrim or Essex) keeps its place type's rank: Nominatim gives it neither step 1 nor step 2. A boundary whose level ranks 0 in its country stays out of the address whatever its place type (Cairns Regional, Regierungsbezirk Köln). Areas of rank 25 are in no street's or house's address (getNearFeatures takes ranks below 25), so they fill no field and take no rank from place nodes.
+A place area (class='place': `boundary=place`, a place multipolygon or closed way, a `boundary=historic` or `ceremonial` with a place tag, such as County Antrim or Essex) takes none of the three steps: one of rank 16 to 23 is lifted to an area's rank + 2 where a boundary or a place area whose own rank is the place area's or more, up to 23, contains it (:930-950), judged as in step 2 by the area being larger and holding the place area's point on surface; a place=village area inside a city of rank 16 ranks 18. A boundary whose level ranks 0 in its country stays out of the address whatever its place type (Cairns Regional, Regierungsbezirk Köln). Areas of rank 25 are in no street's or house's address (getNearFeatures takes ranks below 25), so they fill no field and take no rank from place nodes.
 
 What the polygons at a point cannot tell, and Nominatim decides on the whole geometry at index time:
 
 - The admin-nested parent is the boundary covering the child's centroid, which need not hold the query point (Bugisa sub-region round Mbale City ranks 12 in Nominatim, 18 here).
-- A place area is lifted when another area of its rank up to 23 contains it whole (`ST_Contains`); here never.
+- A place area is lifted where another area contains it whole (`ST_Contains`); here, where the other is larger and holds its point on surface.
 - A child with the parent's wikidata and an equal geometry ranks 0 (Poland's replicated boundaries, Bruxelles - Brussel at level 9).
 - A linked place or the boundary's own place tag can lower the rank; the builder keeps one place type per polygon, from either.
 - Every place type ranks a boundary (place=locality makes Northern Ireland's townlands rank 25); the builder keeps 14 types.
@@ -120,7 +120,7 @@ What the polygons at a point cannot tell, and Nominatim decides on the whole geo
 
 Two rules wait for those. Nominatim ranks every boundary holding the point; here only the smallest of each admin_level is ranked, as a larger one round a replicated boundary would rank too high (Brussels' level 10 boundary under Bruxelles - Brussel would take the suburb from the Pentagon). And a boundary labelled city, town or village holds rank 16 from place nodes whatever its own rank, standing in for the linked place's rank that Nominatim gives it even below its own (the parish of Winsford ranks 16, its admin_level 20): holding only its own rank lets villages such as Argir in Tórshavn into the address.
 
-Smallest-area-wins then settles polygons that still map to the same output field (if two polygons both map to "county", the smaller one wins).
+Smallest-area-wins then settles polygons that still map to the same output field (if two polygons both map to "county", the smaller one wins). The address names the winner, as Nominatim's keeps the first row of a label, and display_name lists the other at its rank as well, where no field's polygon has that rank (Nominatim's display_name joins every row): York County (rank 10, labelled county) beside the City of Fredericton (12). A polygon of the outline of the one that took its field is not listed, as Nominatim takes out a boundary repeating its parent's wikidata and geometry (Bruxelles - Brussel under Brussels).
 
 ## Step 5: Competing polygons
 
@@ -178,7 +178,7 @@ Where Nominatim's rank adjustment matters:
 | Postcodes from addr:postcode | addr_postcodes.bin (an address point's own addr:postcode) and postcode_centroids.bin (centroids of every addr:postcode, plus external ones) | ✅ Implemented — see "Postcode handling" section below |
 | border_type tag | Not used: Nominatim never reads this tag | ✅ Ignored, as in Nominatim |
 | Wikidata-based place linking | Part of find_linked_place() above: a boundary's wikidata matched against place node wikidata | ✅ Implemented |
-| Display name formatting (`display_name` in results.py) | `format_address`: the landmark, the house number with the road, the place parts finest first by the rank_address of the polygon or place node behind each field, then the postcode (rank 5) and the country (4); a part is left out only where it repeats the part just before it | ✅ Implemented — one part per field where Nominatim has one row per rank, the house number joined to the road as the country writes it |
+| Display name formatting (`display_name` in results.py) | `format_address`: the landmark, the house number with the road, the place parts finest first by the rank_address of the polygon or place node behind each field, with the polygons that lost their field to one of another rank, then the postcode (rank 5) and the country (4); a part is left out only where it repeats the part just before it, and every answer with a part has one | ✅ Implemented — the house number joined to the road as the country writes it |
 | Street/road resolution | Minor differences in closest street selection | ℹ️ Our point-to-segment distance vs Nominatim's pre-computed parent streets. Causes occasional one-off differences at intersections. |
 | Suburb/neighbourhood rank adjustment | Covered by the query-time rank adjustment above | ✅ Implemented |
 | TIGER address interpolation | `--tiger-data` loads Nominatim's TIGER export (address ranges, one CSV per county) as interpolation lines, with each line's ZIP in interp_postcodes.bin | ✅ Implemented — a US street that wins without an address point takes its house number from the nearest interpolation line of that street, as Nominatim's `_find_tiger_number_for_street` does |

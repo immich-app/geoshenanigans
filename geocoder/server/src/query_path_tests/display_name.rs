@@ -157,3 +157,77 @@ fn a_name_is_left_out_only_where_it_repeats_the_part_before_it() {
                "Hendrikus Zomerweg, Alteveer, Hoogeveen, Drenthe, Netherlands, 7915 AB, Netherlands");
     assert_eq!(address_at(&index, 0.0, 0.0).get("region"), None);
 }
+
+#[test]
+fn a_place_area_inside_a_boundary_of_its_rank_comes_before_the_boundary() {
+    // Nominatim lifts a place area of rank 16 to 23 that an area of its rank up to 23 contains
+    // whole to that area's rank + 2 (placex_triggers.sql:930-950): a place=village area inside a
+    // city (admin_level 8, rank 16) ranks 18 and comes before the city, still the village.
+    let index = TestIndex::country("France", b"FR")
+        .boundary("Bretagne", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Rennes", 8, 0, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Saint-Laurent", 15, 3, (500.0, 500.0, 1500.0, 1500.0))
+        .street("Rue de Fougères", &[(1000.0, 900.0), (1000.0, 1100.0)])
+        .load();
+    assert_eq!(display_at(&index, 1000.0, 1000.0), "Rue de Fougères, Saint-Laurent, Rennes, Bretagne, France");
+    assert_eq!(address_at(&index, 1000.0, 1000.0)["village"], "Saint-Laurent");
+
+    // One that reaches 400 m past the city's edge is not inside it (ST_Contains), though its
+    // middle is: it keeps 16, beside the city's.
+    let index = TestIndex::country("France", b"FR")
+        .boundary("Bretagne", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Rennes", 8, 0, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Saint-Laurent", 15, 3, (500.0, 3000.0, 1500.0, 5400.0))
+        .street("Rue de Fougères", &[(1000.0, 3900.0), (1000.0, 4100.0)])
+        .load();
+    assert_eq!(display_at(&index, 1000.0, 4000.0), "Rue de Fougères, Rennes, Saint-Laurent, Bretagne, France");
+
+    // A place=county area (rank 12) is not lifted, round a smaller boundary of its rank or not.
+    let index = TestIndex::country("United Kingdom", b"GB")
+        .boundary("England", 4, 7, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Kent", 6, 0, (-30_000.0, -30_000.0, 30_000.0, 30_000.0))
+        .boundary("Weald", 15, 10, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .street("High Street", &[(0.0, -100.0), (0.0, 100.0)])
+        .load();
+    assert_eq!(address_at(&index, 0.0, 0.0)["county"], "Kent");
+    assert_eq!(display_at(&index, 0.0, 0.0), "High Street, Kent, England, United Kingdom");
+}
+
+#[test]
+fn a_boundary_that_loses_its_field_to_one_of_another_rank_is_still_listed() {
+    // Fredericton, New Brunswick: York County (admin_level 5, linked to a place=county node)
+    // ranks 10, as place=county ranks 0 in Canada, and the City of Fredericton (6) ranks 12. Both
+    // are labelled county: the address names the finer, as Nominatim's keeps the first row of a
+    // label, and display_name lists every row (results.py), York County too.
+    let index = TestIndex::country("Canada", b"CA")
+        .boundary("New Brunswick", 4, 7, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("York County", 5, 10, (-30_000.0, -30_000.0, 30_000.0, 30_000.0))
+        .boundary("City of Fredericton", 6, 0, (-8000.0, -8000.0, 8000.0, 8000.0))
+        .street("Queen Street", &[(0.0, -100.0), (0.0, 100.0)])
+        .load();
+    assert_eq!(display_at(&index, 0.0, 0.0), "Queen Street, City of Fredericton, York County, New Brunswick, Canada");
+    assert_eq!(address_at(&index, 0.0, 0.0)["county"], "City of Fredericton");
+
+    // A boundary of the same outline as the one that takes its field is the same place tagged
+    // twice, as Nominatim takes out a boundary repeating its parent's wikidata and geometry
+    // (placex_triggers.sql:895-899): Bruxelles - Brussel stays out under Brussels.
+    let index = TestIndex::country("Belgium", b"BE")
+        .boundary("Brussels-Capital", 4, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Brussels", 8, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Bruxelles - Brussel", 9, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .street("Rue Melsens - Melsensstraat", &[(0.0, -100.0), (0.0, 100.0)])
+        .load();
+    assert_eq!(display_at(&index, 0.0, 0.0), "Rue Melsens - Melsensstraat, Brussels, Brussels-Capital, Belgium");
+}
+
+#[test]
+fn an_answer_with_no_locality_road_or_country_still_has_a_display_name() {
+    // Nominatim joins whatever address rows an answer has: a point where only a state and a
+    // county hold it, of a country without a polygon here, shows them.
+    let mut index = TestIndex { origin: ORIGIN, ..TestIndex::default() };
+    index.boundary("Xinjiang", 4, 7, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Emin County", 6, 10, (-20_000.0, -20_000.0, 20_000.0, 20_000.0));
+    let index = index.load();
+    assert_eq!(address_at(&index, 0.0, 0.0)["state"], "Xinjiang");
+    assert_eq!(display_at(&index, 0.0, 0.0), "Emin County, Xinjiang");
+}

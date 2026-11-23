@@ -120,6 +120,7 @@ pub struct AdminGeometry {
     arc_vertices: FileBytes,
     surfaces: Mutex<SurfaceMemo>,
     insides: Mutex<InsideMemo>,
+    withins: Mutex<InsideMemo>,
 }
 
 /// The answers `point_on_surface_in` gave, by the two ring blocks: a direct-mapped table of
@@ -186,7 +187,9 @@ pub const ADMIN_GEOMETRY_FILES: [&str; 3] = ["admin_rings.bin", "arc_index.bin",
 
 impl AdminGeometry {
     pub fn new(rings: FileBytes, arc_index: FileBytes, arc_vertices: FileBytes) -> Self {
-        AdminGeometry { rings, arc_index, arc_vertices, surfaces: Mutex::default(), insides: Mutex::default() }
+        AdminGeometry {
+            rings, arc_index, arc_vertices, surfaces: Mutex::default(), insides: Mutex::default(), withins: Mutex::default(),
+        }
     }
 
     /// The geometry files of the index in `dir`; the error names a file that is missing.
@@ -280,6 +283,24 @@ impl AdminGeometry {
         });
         memo().insert(poly_key, other_key, inside);
         inside
+    }
+
+    /// Whether `poly` lies within `other`, as Nominatim's ST_Contains(other, poly) of a place
+    /// area or a boundary: every vertex of its rings inside `other` or on its edges, the edges
+    /// between them taken to stay inside, as they do between areas nested along shared ways.
+    /// False when either has no rings.
+    pub fn polygon_within(&self, poly: &AdminPolygon, other: &AdminPolygon) -> bool {
+        let (Some(block), Some(other_block)) = (self.ring_block(poly), self.ring_block(other)) else { return false };
+        let (poly_key, other_key) = (Self::block_key(poly), Self::block_key(other));
+        // A poisoned lock is the memo of a thread that panicked: its answers are still sound.
+        let memo = || self.withins.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(within) = memo().get(poly_key, other_key) {
+            return within;
+        }
+        let mut test = VerticesWithin { arcs: self.arcs(), other: other_block, outside: false };
+        let within = walk_rings(block, &mut test).is_some() && !test.outside;
+        memo().insert(poly_key, other_key, within);
+        within
     }
 
     /// `surface_point` of `poly`'s ring block `block`, from the memo when it holds it.
@@ -485,6 +506,33 @@ impl RingVisitor for NearCentre<'_, '_> {
 
 /// Whether the ray from `p` crosses a ring block's edges an odd number of times, and whether `p`
 /// lies on one of them.
+/// AdminGeometry::polygon_within's walk: each vertex tested against the other polygon's rings,
+/// the walk stopped at the first outside them.
+struct VerticesWithin<'a> {
+    arcs: ArcFiles<'a>,
+    other: &'a [u8],
+    outside: bool,
+}
+
+impl RingVisitor for VerticesWithin<'_> {
+    fn wants_chunk(&mut self, _: &ChunkBox) -> bool {
+        true
+    }
+
+    fn arc(&mut self, r: ArcRef) -> Option<()> {
+        let (arcs, other) = (self.arcs, self.other);
+        let mut outside = false;
+        arc_vertices(arcs.block(r.slot)?, |v| {
+            if outside { return; }
+            let mut test = InsideOffEdges { arcs, p: v, odd: false, on_edge: false };
+            outside = walk_rings(other, &mut test).is_none() || !(test.odd || test.on_edge);
+        })?;
+        self.outside |= outside;
+        // An outside vertex ends the walk, which then reads as malformed.
+        (!outside).then_some(())
+    }
+}
+
 struct InsideOffEdges<'a> {
     arcs: ArcFiles<'a>,
     p: PointE7,
