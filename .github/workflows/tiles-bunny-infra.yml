@@ -1,0 +1,231 @@
+name: Tiles Bunny Infra
+# OpenTofu for the Bunny tiles zone (deployment/modules/bunny/tiles/README.md). The Bunny account is production only, so
+# pull requests plan prod, once a reviewer approves the run, and main applies it. The unit is left out of
+# tiles-worker.yml's `terragrunt run --all`. Its token (OP_TF_BUNNY_ENV, the service account that reads the tf_bunny
+# vault with the Bunny account key) is a secret of the tiles-bunny-plan and tiles-bunny environments only, never of the
+# repository: a run whose workflow drops the environment gets no token at all.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'deployment/modules/bunny/**'
+      - 'deployment/root.hcl'
+      - '.mise/config.toml'
+      - '.mise/mise.lock'
+      - '.github/workflows/tiles-bunny-infra.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'deployment/modules/bunny/**'
+      - 'deployment/root.hcl'
+      - '.mise/config.toml'
+      - '.mise/mise.lock'
+      - '.github/workflows/tiles-bunny-infra.yml'
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ENVIRONMENT: prod
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: token
+        uses: immich-app/devtools/actions/create-workflow-token@2760f037fd3707bb91b16e4c41dc62b8c512393e # create-workflow-token-action-v3.1.0
+        with:
+          client-id: ${{ secrets.PUSH_O_MATIC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
+          permission-contents: read
+
+      - name: Setup Mise
+        uses: immich-app/devtools/actions/use-mise@caac7f7e4298458a14238959504f411fc6cc7f06 # use-mise-action-v3.2.3
+        with:
+          github_token: ${{ steps.token.outputs.token }}
+
+      - name: Check formatting
+        run: |
+          terragrunt hcl fmt --check --diff --working-dir deployment/modules/bunny
+          tofu fmt -check -diff -recursive deployment/modules/bunny
+
+      # tofu test plans every gzip_mode against a mocked provider (tests/tiles.tftest.hcl).
+      - name: Validate
+        working-directory: deployment/modules/bunny/tiles
+        run: |
+          tofu init -backend=false -input=false
+          tofu validate
+          tofu test
+
+      # encryption.tf applied on a local backend: the state is ciphertext only the passphrase reads. use-mise puts only
+      # mise's shims on PATH, and the test's module is in a temporary directory outside the checkout, where a shim finds
+      # no version: mise exec puts the tools' own directories on PATH (and the test runs tofu from the checkout too).
+      - name: Test the state encryption
+        env:
+          REQUIRE_TOFU: 1
+        run: mise exec -- python3 -m unittest discover -s deployment/scripts -p 'test_tiles_workflows.py' -k BunnyStateTest
+
+  # The plan runs the branch's Terragrunt configuration with the Bunny token, so no branch run gets it by itself: the
+  # token is the tiles-bunny-plan environment's own secret, which GitHub releases once one of the environment's required
+  # reviewers approves the run, and with it the run's commit. The check job above needs no credentials.
+  plan:
+    name: Plan
+    needs: check
+    if: github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: tiles-bunny-plan
+    permissions:
+      actions: read # the environment's protection rules
+      contents: read
+    defaults:
+      run:
+        working-directory: deployment/modules/bunny/tiles
+    steps:
+      # GitHub creates an environment a job names without protection rules, which would let every run through:
+      # refuse before anything reads a secret until the environment has a reviewer (README.md).
+      - name: Check the environment requires approval
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN_ENVIRONMENT: tiles-bunny-plan
+        run: |
+          set -euo pipefail
+          environment=$(gh api "repos/$GITHUB_REPOSITORY/environments/$PLAN_ENVIRONMENT")
+          reviewers=$(jq '[.protection_rules[]? | select(.type == "required_reviewers") | (.reviewers // []) | length] | add // 0' <<<"$environment")
+          if [ "$reviewers" -lt 1 ]; then
+            echo "::error::The $PLAN_ENVIRONMENT environment has no required reviewers, so this plan would run with the Bunny token unapproved: add them (deployment/modules/bunny/tiles/README.md)"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: token
+        uses: immich-app/devtools/actions/create-workflow-token@2760f037fd3707bb91b16e4c41dc62b8c512393e # create-workflow-token-action-v3.1.0
+        with:
+          client-id: ${{ secrets.PUSH_O_MATIC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
+          permission-contents: read
+
+      - name: Setup Mise
+        uses: immich-app/devtools/actions/use-mise@caac7f7e4298458a14238959504f411fc6cc7f06 # use-mise-action-v3.2.3
+        with:
+          github_token: ${{ steps.token.outputs.token }}
+
+      # The provider doesn't mark the middleware script's deployment key sensitive, and a plan that replaces or deletes
+      # the script prints it (as does any later error showing it): masked for the rest of the job.
+      - name: Mask the middleware script's deployment key
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_BUNNY_ENV }}
+        run: |
+          set -euo pipefail
+          state=$(op run --env-file=bunny.env -- terragrunt run --non-interactive --tf-forward-stdout -- state pull)
+          jq -r '.resources[]? | select(.type == "bunnynet_compute_script") | .instances[]?.attributes.deployment_key // empty' <<<"$state" |
+            while IFS= read -r key; do
+              echo "::add-mask::$key"
+            done
+
+      - name: Plan
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_BUNNY_ENV }}
+        run: op run --env-file=bunny.env -- terragrunt run --non-interactive -- plan
+
+  # The tiles-bunny environment holds the token for main's applies (and the other jobs that read the Bunny account
+  # key): it deploys main only, so no branch's job can name it to get the token.
+  apply:
+    name: Apply
+    needs: check
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: tiles-bunny
+    permissions:
+      contents: read
+    # Applies of this state never overlap, whatever ran them.
+    concurrency:
+      group: tiles-bunny-apply
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: deployment/modules/bunny/tiles
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: token
+        uses: immich-app/devtools/actions/create-workflow-token@2760f037fd3707bb91b16e4c41dc62b8c512393e # create-workflow-token-action-v3.1.0
+        with:
+          client-id: ${{ secrets.PUSH_O_MATIC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
+          permission-contents: read
+
+      - name: Setup Mise
+        uses: immich-app/devtools/actions/use-mise@caac7f7e4298458a14238959504f411fc6cc7f06 # use-mise-action-v3.2.3
+        with:
+          github_token: ${{ steps.token.outputs.token }}
+
+      # The storage zones existed before this module: applied without them in the state, it would try to create zones
+      # whose names are taken. They are imported by hand once (README.md).
+      - name: Check the storage zones are imported
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_BUNNY_ENV }}
+        run: |
+          set -euo pipefail
+          state=$(op run --env-file=bunny.env -- terragrunt run --non-interactive --tf-forward-stdout -- state list)
+          for address in bunnynet_storage_zone.tiles bunnynet_storage_zone.state; do
+            if ! grep -qx "$address" <<<"$state"; then
+              echo "::error::$address is not in the state: import it first (deployment/modules/bunny/tiles/README.md)"
+              exit 1
+            fi
+          done
+
+      # The provider doesn't mark the middleware script's deployment key sensitive, and a plan that replaces or deletes
+      # the script prints it (as does any later error showing it): masked for the rest of the job.
+      - name: Mask the middleware script's deployment key
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_BUNNY_ENV }}
+        run: |
+          set -euo pipefail
+          state=$(op run --env-file=bunny.env -- terragrunt run --non-interactive --tf-forward-stdout -- state pull)
+          jq -r '.resources[]? | select(.type == "bunnynet_compute_script") | .instances[]?.attributes.deployment_key // empty' <<<"$state" |
+            while IFS= read -r key; do
+              echo "::add-mask::$key"
+            done
+
+      # A re-run of an older main run would put its configuration back over a newer one (dropping a hostname the newer
+      # commit attached, say). The newer commit's own run applies it, so an older commit stops here. Inside the apply
+      # concurrency group: a commit that reaches main after this check queues its apply behind this one.
+      - name: Check this commit has main's configuration
+        id: current
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          # The paths that trigger this workflow on main.
+          paths=(deployment/modules/bunny deployment/root.hcl .mise/config.toml .mise/mise.lock .github/workflows/tiles-bunny-infra.yml)
+          git fetch --quiet --depth=1 origin main
+          if git diff --quiet HEAD FETCH_HEAD -- "${paths[@]}"; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::main ($(git rev-parse FETCH_HEAD)) has another Bunny configuration than $GITHUB_SHA; skipping the apply, which main's own run makes"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply
+        if: steps.current.outputs.current == 'true'
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_BUNNY_ENV }}
+        run: op run --env-file=bunny.env -- terragrunt run --non-interactive -- apply -auto-approve

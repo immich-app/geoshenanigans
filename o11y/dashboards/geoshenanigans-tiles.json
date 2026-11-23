@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "tiles.immich.cloud: the Cloudflare worker that serves Immich's map tiles, TileJSON and styles. Metrics are per-minute sums from o11y's serverless ingest path, added up with sum_over_time; logs are the worker's errors and a 1% request sample.",
+  "description": "tiles.immich.cloud: the Cloudflare worker that serves Immich's map tiles, TileJSON and styles, and the Bunny storage zone and pull zone replacing it. Worker metrics are per-minute sums from o11y's serverless ingest path, added up with sum_over_time; the Bunny sections show the daily sync's runs (one point per run), the CDN request logs' per-minute counts and the synthetic probe. Logs are the worker's errors and a 1% request sample, and the sync's and its watchdog's lines.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -1400,13 +1400,2234 @@
     },
     {
       "type": "row",
+      "title": "Bunny: daily sync",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 59
+      },
+      "id": 27
+    },
+    {
+      "type": "stat",
+      "title": "Last sync",
+      "description": "The status of the latest Tiles Sync run in the past 26h (tiles-sync.yml, twice a day). skipped: the newest Protomaps build was live already, or the schedule is held (TILES_SYNC_HOLD). guard_rail: more positions changed than the guard rail allows; schema_changed: the build's schema version differs from the live one's. Both upload nothing. no_state: the state zone has no state.json (before the first load).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "success"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "skipped"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "guard_rail"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "schema_changed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "no_state"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "name",
+        "wideLayout": true,
+        "showPercentChange": false
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk(1, tlast_over_time(tiles_sync_runs{project=\"geoshenanigans\", cluster=\"tiles\"}[26h]))",
+          "legendFormat": "{{status}}",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 60
+      },
+      "id": 28
+    },
+    {
+      "type": "stat",
+      "title": "Live build age",
+      "description": "Hours since the live build's date, as the watchdog last read state.json (every 2h).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 36
+              },
+              {
+                "color": "red",
+                "value": 60
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true,
+        "showPercentChange": false
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_live_build_age_hours{project=\"geoshenanigans\", cluster=\"tiles\"}[6h])",
+          "legendFormat": "__auto",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 60
+      },
+      "id": 29
+    },
+    {
+      "type": "stat",
+      "title": "Live OSM data age",
+      "description": "Age of the OSM data in the live build, as the watchdog last read it. The tiles-osm-old alert fires above 48h.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 48
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true,
+        "showPercentChange": false
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_live_osm_age_hours{project=\"geoshenanigans\", cluster=\"tiles\"}[6h])",
+          "legendFormat": "__auto",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 60
+      },
+      "id": 30
+    },
+    {
+      "type": "stat",
+      "title": "Changed positions",
+      "description": "Tile positions whose tile changed in the latest sync that diffed. The diff-large alert fires above 1M; a day is usually 200-330k.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1000000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true,
+        "showPercentChange": false
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_positions_changed{project=\"geoshenanigans\", cluster=\"tiles\"}[26h])",
+          "legendFormat": "__auto",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 60
+      },
+      "id": 31
+    },
+    {
+      "type": "stat",
+      "title": "Last sync duration",
+      "description": "Time from first step to last, download included, of the most recent sync job that reported a duration in the past 26h. A run the resolver stops before the sync job (the build already live, syncs held, a schema change) reports no duration and leaves the previous job's shown. The sync-slow alert fires above 2h.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 7200
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true,
+        "showPercentChange": false
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_step_seconds{project=\"geoshenanigans\", cluster=\"tiles\", step=\"total\"}[26h])",
+          "legendFormat": "__auto",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 60
+      },
+      "id": 32
+    },
+    {
+      "type": "stat",
+      "title": "Replication",
+      "description": "Result of the most recent replication gate reported in the past 26h; runs that end before the gate report none and leave it shown. Complete means every file the run changed was stored with the right checksum and reached the regions that run waited for: every replica region by default, only those in the regions input or TILES_SYNC_REGIONS when set, or none (primary storage only) with regions set to none.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "incomplete",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "complete",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true,
+        "showPercentChange": false
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_replication_complete{project=\"geoshenanigans\", cluster=\"tiles\"}[26h])",
+          "legendFormat": "__auto",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 60
+      },
+      "id": 33
+    },
+    {
+      "type": "timeseries",
+      "title": "Sync runs by status",
+      "description": "One point per run of tiles-sync.yml, by status, over the last 14 days.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "timeFrom": "14d",
+      "interval": "1h",
+      "maxDataPoints": 400,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "always",
+            "pointSize": 5,
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (status) (count_over_time(tiles_sync_runs{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval]))",
+          "legendFormat": "{{status}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 64
+      },
+      "id": 34
+    },
+    {
+      "type": "timeseries",
+      "title": "Sync step durations",
+      "description": "Seconds per step of each sync: download (the workflow's), manifest, diff, upload, replication, static, purge and state (the sync CLI's), and the total. The dashed line is the sync-slow alert's 2h.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "timeFrom": "14d",
+      "interval": "1h",
+      "maxDataPoints": 400,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "always",
+            "pointSize": 5,
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 7200
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_step_seconds{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "{{step}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 64
+      },
+      "id": 35
+    },
+    {
+      "type": "timeseries",
+      "title": "Replication wait by region",
+      "description": "Seconds the sync's replication gates waited until each checked storage region held every file they checked: the tile gate's wait from its start plus the TileJSON and styles gate's, added up. A region with no point was not selected for that run (the regions input or TILES_SYNC_REGIONS) or did not catch up before one of the gates ended.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "timeFrom": "14d",
+      "interval": "1h",
+      "maxDataPoints": 400,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "always",
+            "pointSize": 5,
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_replication_wait_seconds{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "{{storage_region}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 64
+      },
+      "id": 36
+    },
+    {
+      "type": "timeseries",
+      "title": "Changed positions",
+      "description": "Positions whose tile changed against the live build, and the files the sync uploaded for them. The dashed line is the diff-large alert's 1M.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "timeFrom": "14d",
+      "interval": "1h",
+      "maxDataPoints": 400,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "always",
+            "pointSize": 5,
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1000000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_positions_changed{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "changed positions",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_files_uploaded{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "files uploaded",
+          "refId": "B",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 72
+      },
+      "id": 37
+    },
+    {
+      "type": "timeseries",
+      "title": "Bytes uploaded",
+      "description": "Tile bytes the sync uploaded to the storage zone (before replication).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "timeFrom": "14d",
+      "interval": "1h",
+      "maxDataPoints": 400,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decbytes",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "always",
+            "pointSize": 5,
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_bytes_uploaded{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "bytes uploaded",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 72
+      },
+      "id": 38
+    },
+    {
+      "type": "timeseries",
+      "title": "Retries and rate limits",
+      "description": "PUTs the uploader retried, and the 429s among them, per sync.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "timeFrom": "14d",
+      "interval": "1h",
+      "maxDataPoints": 400,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "always",
+            "pointSize": 5,
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_retries{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "retries",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_rate_limited{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "rate limited (429)",
+          "refId": "B",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 72
+      },
+      "id": 39
+    },
+    {
+      "type": "timeseries",
+      "title": "Live build and OSM data age",
+      "description": "The live build's age and its OSM data's, from the watchdog every 2h. The dashed line is the tiles-osm-old alert's 48h.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "timeFrom": "14d",
+      "interval": "2h",
+      "maxDataPoints": 400,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "always",
+            "pointSize": 5,
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 48
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_live_build_age_hours{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "build",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_live_osm_age_hours{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "OSM data",
+          "refId": "B",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 80
+      },
+      "id": 40
+    },
+    {
+      "type": "logs",
+      "title": "Sync and watchdog logs",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${logs}"
+      },
+      "timeFrom": "14d",
+      "description": "A line per sync run (status, build, changed positions, uploads, replication, step seconds and the run's URL) and its error, a line per watchdog tick, and a line per daily sample check (app tiles-sample-check: counts and example paths). Every sync line carries app, level and the sync's run_id, build and status.",
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": false,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${logs}"
+          },
+          "expr": "project:=\"geoshenanigans\" cluster:=\"tiles\" app:in(\"tiles-sync\", \"tiles-sync-watchdog\", \"tiles-sample-check\") | sort by (_time desc)",
+          "maxLines": 500,
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 80
+      },
+      "id": 41
+    },
+    {
+      "type": "timeseries",
+      "title": "Sample check: not yet in a region",
+      "description": "Of the daily sample of live positions (up to 100 per zoom), the files stored with the right bytes that each storage region does not hold yet; that region serves them from Frankfurt. After a seed this is the replication backlog draining, but zero only means no sampled file lacked the region: confirm the backlog has drained with the full zoom-15 listing in the go-live checklist (deployment/modules/bunny/tiles/README.md) before clearing TILES_SYNC_REGIONS or cutting over.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "timeFrom": "14d",
+      "interval": "1h",
+      "maxDataPoints": 400,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "always",
+            "pointSize": 5,
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_sample_lacking{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "{{storage_region}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 88
+      },
+      "id": 56
+    },
+    {
+      "type": "timeseries",
+      "title": "Sample check: missing or other bytes",
+      "description": "Of the daily sample of live positions, those with no file (a 404 for users) or with other bytes than the live manifest. Both should be zero; the sample check's log line names examples.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "timeFrom": "14d",
+      "interval": "1h",
+      "maxDataPoints": 400,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "always",
+            "pointSize": 5,
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "checked"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_sample_missing{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "missing",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_sample_mismatched{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "other bytes",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_sample_errors{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "DESCRIBE errors",
+          "refId": "C",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_sample_checked{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "checked",
+          "refId": "D",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 88
+      },
+      "id": 57
+    },
+    {
+      "type": "row",
+      "title": "Bunny: CDN requests",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 96
+      },
+      "id": 42
+    },
+    {
+      "type": "timeseries",
+      "title": "Bunny requests/s by status",
+      "description": "Every request in the pull zone's logs (the log reader's per-minute counts) by HTTP status.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "interval": "1m",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (status) (sum_over_time(tiles_bunny_requests{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])) / ($__interval_ms / 1000)",
+          "legendFormat": "{{status}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 97
+      },
+      "id": 43
+    },
+    {
+      "type": "timeseries",
+      "title": "Bunny requests/s by cache status",
+      "description": "Every request by the CDN's cache status (HIT, MISS...).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "interval": "1m",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (cache) (sum_over_time(tiles_bunny_requests{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])) / ($__interval_ms / 1000)",
+          "legendFormat": "{{cache}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 97
+      },
+      "id": 44
+    },
+    {
+      "type": "timeseries",
+      "title": "Bunny requests/s by type",
+      "description": "tile, tilejson, style or other.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "interval": "1m",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (kind) (sum_over_time(tiles_bunny_requests{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])) / ($__interval_ms / 1000)",
+          "legendFormat": "{{kind}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 97
+      },
+      "id": 45
+    },
+    {
+      "type": "timeseries",
+      "title": "Bunny requests/s by edge location",
+      "description": "Every request by the Bunny edge location (the log's edgeLocation, e.g. DE or UK) that served it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "interval": "1m",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (edge_location) (sum_over_time(tiles_bunny_requests{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])) / ($__interval_ms / 1000)",
+          "legendFormat": "{{edge_location}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 105
+      },
+      "id": 46
+    },
+    {
+      "type": "timeseries",
+      "title": "Bunny bytes/s by edge location",
+      "description": "Bytes sent to clients, by edge location.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "interval": "1m",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (edge_location) (sum_over_time(tiles_bunny_bytes{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])) / ($__interval_ms / 1000)",
+          "legendFormat": "{{edge_location}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 105
+      },
+      "id": 47
+    },
+    {
+      "type": "table",
+      "title": "Busiest countries (Bunny)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "The 25 client countries with the most requests in the dashboard's time range.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk(25, sum by (country) (sum_over_time(tiles_bunny_country_requests{project=\"geoshenanigans\", cluster=\"tiles\"}[$__range])))",
+          "legendFormat": "__auto",
+          "refId": "A",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value": "Requests"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Requests"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        },
+        "sortBy": [
+          {
+            "displayName": "Requests",
+            "desc": true
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 105
+      },
+      "id": 48
+    },
+    {
+      "type": "timeseries",
+      "title": "Bunny tile requests/s by zoom",
+      "description": "Tile requests by zoom level.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "interval": "1m",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (zoom) (sum_over_time(tiles_bunny_tile_requests{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])) / ($__interval_ms / 1000)",
+          "legendFormat": "z{{zoom}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 113
+      },
+      "id": 49
+    },
+    {
+      "type": "timeseries",
+      "title": "Bunny tile cache hits by zoom",
+      "description": "Share of each zoom level's tile requests the CDN answered from its cache: 0 when a zoom had requests but no hits (a cold cache after a purge), a gap when it had no requests.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "interval": "1m",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "(sum by (zoom) (sum_over_time(tiles_bunny_tile_requests{project=\"geoshenanigans\", cluster=\"tiles\", cache=~\"(?i)hit\"}[$__interval])) or on (zoom) (0 * sum by (zoom) (sum_over_time(tiles_bunny_tile_requests{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])))) / sum by (zoom) (sum_over_time(tiles_bunny_tile_requests{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval]))",
+          "legendFormat": "z{{zoom}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 113
+      },
+      "id": 50
+    },
+    {
+      "type": "timeseries",
+      "title": "Log reader",
+      "description": "Log rows per plotted interval, log-reader runs by result, and the lag: the age in seconds of the newest row the Logging API returned from the past 10 minutes, when the reader ran. On a quiet zone that is the age of the last request, not a delay; with no row in 10 minutes there is no lag point. The bunny-logs-silent alert fires when no minute has been processed (no tiles_bunny_log_rows sample) for 15 minutes while the Worker heartbeat arrives and the reader has reported in the past week, after a 5-minute pending period.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "interval": "1m",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(sum_over_time(tiles_bunny_log_rows{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval]))",
+          "legendFormat": "rows",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max(max_over_time(tiles_bunny_log_lag_seconds{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval]))",
+          "legendFormat": "lag (s)",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (result) (sum_over_time(tiles_bunny_log_reader_runs{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval]))",
+          "legendFormat": "runs {{result}}",
+          "refId": "C",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 113
+      },
+      "id": 51
+    },
+    {
+      "type": "row",
+      "title": "Bunny: synthetic probe",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 121
+      },
+      "id": 52
+    },
+    {
+      "type": "timeseries",
+      "title": "Probe first byte, misses",
+      "description": "The synthetic probe's time to first byte for tests the edge answered as a cache miss (a CDN-Cache other than HIT or STALE), by the continent of the Globalping probe: normally the random z15 tile, and the popular tile too after a purge or at a cold edge. A test without a CDN-Cache header counts as the tile it tested. The dashed line is the bunny-probe-slow alert's 1s.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "interval": "5m",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "always",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (continent) (sum_over_time(tiles_bunny_probe_ttfb_ms{project=\"geoshenanigans\", cluster=\"tiles\", kind=\"miss\"}[$__interval])) / sum by (continent) (count_over_time(tiles_bunny_probe_ttfb_ms{project=\"geoshenanigans\", cluster=\"tiles\", kind=\"miss\"}[$__interval]))",
+          "legendFormat": "{{continent}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 122
+      },
+      "id": 53
+    },
+    {
+      "type": "timeseries",
+      "title": "Probe first byte, hits",
+      "description": "The synthetic probe's time to first byte for tests the edge answered from its cache (CDN-Cache HIT or STALE), by the continent of the Globalping probe: normally the popular tile, and the random tile when that edge already held it. A test without a CDN-Cache header counts as the tile it tested.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "interval": "5m",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "always",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (continent) (sum_over_time(tiles_bunny_probe_ttfb_ms{project=\"geoshenanigans\", cluster=\"tiles\", kind=\"hit\"}[$__interval])) / sum by (continent) (count_over_time(tiles_bunny_probe_ttfb_ms{project=\"geoshenanigans\", cluster=\"tiles\", kind=\"hit\"}[$__interval]))",
+          "legendFormat": "{{continent}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 122
+      },
+      "id": 54
+    },
+    {
+      "type": "timeseries",
+      "title": "Probe errors",
+      "description": "Failed probe tests by continent and observed cache kind (the cache status the edge reported, as in the first-byte panels). \"worker tilejson\" is the Worker's own read of the TileJSON (v1.json), which gives the probe its tile URLs: it failed or named no usable tile URL. Plus runs with a measurement error: the TileJSON unreadable or without a usable tile URL (no tile measured that run), a Globalping measurement refused or unfinished at the deadline, none of a target's tests with a verdict (the other target can still have verdicts), or a continent without a verdict (named in the missing field of the probe's error line; the other continents' tests still count). The bunny-probe-errors alert requires a majority of verdicts in 30 minutes to be failures in a continent and kind, with the same target failing in at least two runs. The bunny-probe-failing alert requires at least two runs with a measurement error and a majority of runs to have one in 30 minutes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "interval": "5m",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 60,
+            "showPoints": "always",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (continent, kind) (sum_over_time(tiles_bunny_probe_errors{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval]))",
+          "legendFormat": "{{continent}} {{kind}}",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(sum_over_time(tiles_bunny_probe_runs{project=\"geoshenanigans\", cluster=\"tiles\", result=\"error\"}[$__interval]))",
+          "legendFormat": "runs with a measurement error",
+          "refId": "B",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 122
+      },
+      "id": 55
+    },
+    {
+      "type": "logs",
+      "title": "Probe tests",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${logs}"
+      },
+      "description": "Every synthetic probe test (logged at info, so not under Errors and warnings): continent, kind (hit or miss), the URL, the status, the PoP that answered (Server header), first byte and the verdict. Measurement errors are under Errors and warnings.",
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": false,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${logs}"
+          },
+          "expr": "project:=\"geoshenanigans\" cluster:=\"tiles\" kind:=\"probe\" | sort by (_time desc)",
+          "maxLines": 500,
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 130
+      },
+      "id": 58
+    },
+    {
+      "type": "row",
       "title": "Logs",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 59
+        "y": 138
       },
       "panels": [],
       "id": 25
@@ -1423,7 +3644,7 @@
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 60
+        "y": 139
       },
       "options": {
         "dedupStrategy": "none",

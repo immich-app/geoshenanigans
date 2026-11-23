@@ -240,6 +240,9 @@ jobs:
     name: Activate ${{ needs.resolve.outputs.key }} in ${{ inputs.environment }}
     needs: [resolve, publish]
     runs-on: ubuntu-latest
+    # Prod's apply puts the Bunny account key and the Globalping token on the worker (tiles-worker-bunny.env), which only
+    # the tiles-bunny environment's service account reads: that environment deploys main only. Dev needs neither.
+    environment: ${{ inputs.environment == 'prod' && 'tiles-bunny' || '' }}
     permissions:
       contents: read
     # Shared with the deploy job in tiles-worker.yml so the two never apply the same state at once.
@@ -320,16 +323,26 @@ jobs:
           done
           exit 1
 
+      # The tiles-bunny service account reads tf and tf_prod too, so it resolves both files in prod.
       - name: Apply tiles worker
         working-directory: deployment/modules/cloudflare/tiles-worker
         env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.environment == 'prod' && secrets.OP_TF_BUNNY_ENV || secrets.OP_TF_DEV_ENV }}
           TF_VAR_tiles_build_dir: ${{ github.workspace }}/tiles/dist
-        run: op run --env-file="$GITHUB_WORKSPACE/deployment/.env" -- terragrunt run --non-interactive -- apply -auto-approve
+        run: |
+          set -euo pipefail
+          env_files=(--env-file="$GITHUB_WORKSPACE/deployment/.env")
+          if [ "$ENVIRONMENT" = prod ]; then
+            env_files+=(--env-file="$GITHUB_WORKSPACE/deployment/tiles-worker-bunny.env")
+          fi
+          op run "${env_files[@]}" -- terragrunt run --non-interactive -- apply -auto-approve
 
+      # The worker's own hostname (tiles-served-key.sh): prod's public one may be Bunny's, which serves no deployment
+      # key, from the cutover on (deployment/modules/bunny/tiles/README.md).
       - name: Check live endpoint
         run: |
           set -euo pipefail
-          host=$([ "$ENVIRONMENT" = prod ] && echo tiles.immich.cloud || echo "tiles.$ENVIRONMENT.immich.cloud")
+          host="tiles.$ENVIRONMENT.immich.cloud"
           for _ in $(seq 1 30); do
             served=$(deployment/scripts/tiles-served-key.sh "$ENVIRONMENT" || true)
             if [ "$served" = "$DEPLOYMENT_KEY" ]; then

@@ -9,6 +9,13 @@
 # sum_over_time() adds up the minutes. Two aggregator replicas each sum part of
 # the traffic, so every query also adds up over their `aggregator` label.
 #
+# The Bunny path's series are plain gauges on /insert/0/. tiles-sync.yml's
+# report job pushes tiles_sync_* once per run (two scheduled runs a day), and
+# tiles-sync-watchdog.yml the live build's ages with its heartbeat every 2
+# hours, so those rules read the last sample in a window. The worker's cron
+# pushes the Bunny log reader's counts once per processed minute and the
+# synthetic probe's once per run (tiles_bunny_*); sum_over_time() adds them up.
+#
 # Every query uses VictoriaMetricsFleet: the default VictoriaMetrics datasource
 # only sees the o11y cluster's own tenant. `project: geoshenanigans` routes to
 # the rootly-geoshenanigans contact point; never add `heartbeat: rootly`.
@@ -277,6 +284,1506 @@ spec:
           queryType: ''
           relativeTimeRange:
             from: 900
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # tiles-sync.yml's report job pushes tiles_sync_runs{status} once per run,
+    # at the time it reports, so the latest run is the status series with the
+    # newest sample (tlast_over_time is MetricsQL: the sample's own timestamp).
+    # 26h holds a day of runs (10:07 and 16:07 UTC) plus slack; the afternoon
+    # run or a manual re-run resolves a failed morning one.
+    - uid: geoshenanigans-tiles-sync-failed
+      title: Tiles sync failed
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: critical
+      annotations:
+        summary: The latest Tiles Sync run failed.
+        description: >-
+          The latest tiles-sync.yml run in the past 26h ended with status failed. state.json still names the
+          build that was live before it; the storage zone may already hold some of the new build's changed
+          tiles, which only uncached requests see until a run completes its purge. The
+          Tiles dashboard's "Sync and watchdog logs" panel has the run's line with its URL and its error; a
+          failure before the sync CLI (reading the live state, the download or its MD5) says so there. Fix it and
+          dispatch Tiles Sync again, or let the next scheduled run retry: a run diffs against whatever is
+          live, so a missed day is caught up by the next. "Re-run failed jobs" on an old run syncs nothing once
+          the live build has moved on.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              tlast_over_time(tiles_sync_runs{project="geoshenanigans", cluster="tiles", env="prod", status="failed"}[26h])
+                >= on () group_left () max(tlast_over_time(tiles_sync_runs{project="geoshenanigans", cluster="tiles", env="prod"}[26h]))
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # A success or a skip (the newest build was live already, or the schedule
+    # is held) pushes tiles_sync_last_success_timestamp_seconds. None for 30h
+    # means two scheduled days without one: failed runs, runs that never
+    # reached their report (a runner that died), or a schedule GitHub stopped.
+    # Only once a build has been live in the past week (the watchdog reports
+    # its age only while state.json exists), so a zone before its first load
+    # stays quiet, and a state.json that disappears still pages.
+    - uid: geoshenanigans-tiles-sync-stale
+      title: No tiles sync succeeded for 30 hours
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: critical
+      annotations:
+        summary: No Tiles Sync run has succeeded for over 30 hours.
+        description: >-
+          No tiles-sync.yml run reported success or skipped in the past 30h, so the live tiles are falling
+          behind Protomaps' daily builds. Check the workflow's recent runs: failed ones (see
+          geoshenanigans-tiles-sync-failed and the Tiles dashboard's sync logs), runs stuck waiting for a
+          pokedex runner, a runner that died before the report job (the run shows the job as lost), or a
+          schedule GitHub disabled after 60 days without repository activity. A guard_rail or schema_changed
+          run blocks the sync until someone acts on it, and no_state runs mean state.json is gone from the
+          immich-tiles-state zone.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 604800
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              absent_over_time(tiles_sync_last_success_timestamp_seconds{project="geoshenanigans", cluster="tiles", env="prod"}[30h])
+              and on () (count(last_over_time(tiles_sync_live_build_age_hours{project="geoshenanigans", cluster="tiles", env="prod"}[7d])) > 0)
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 604800
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # tiles-sync-watchdog.yml pushes the heartbeat every 2 hours whenever it
+    # read the state zone, before the first load too (no state.json yet), so
+    # 5h empty means at least two missed or blind runs.
+    # Unguarded, as geoshenanigans-watchdog-silent is: the bundle loads in
+    # production only. `for` outlasts a dropped scheduled run followed by a
+    # late one.
+    - uid: geoshenanigans-tiles-watchdog-silent
+      title: Tiles sync watchdog stopped reporting
+      condition: B
+      for: 1h
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The tiles sync watchdog has not reported for over 5 hours.
+        description: >-
+          No tiles_sync_watchdog_heartbeat sample for 5h, so at least two 2-hourly tiles-sync-watchdog.yml
+          runs did not report or could not read the live state (npm run bunny:status, which reads state.json
+          from the immich-tiles-state storage zone). Without it geoshenanigans-tiles-sync-stale and
+          geoshenanigans-tiles-osm-old cannot fire. Check the workflow's recent runs (GitHub disables
+          scheduled workflows after 60 days without repository activity), its "Read the live build" step for a
+          storage or 1Password error, and the report step for a failed push to vmauth.futostatus.com.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 18000
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              absent_over_time(tiles_sync_watchdog_heartbeat{project="geoshenanigans", cluster="tiles", env="prod"}[5h])
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 18000
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # tiles_sync_replication_complete is pushed by every run that reached the
+    # replication gate: 0 when a storage region still lacked a changed file (or
+    # a changed TileJSON or style) at the gate's timeout, or DESCRIBE showed one
+    # missing or with other bytes. The latest such run in 26h counts; a later
+    # run that replicates resolves it.
+    - uid: geoshenanigans-tiles-sync-replication
+      title: Tiles sync replication gate failed
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: critical
+      annotations:
+        summary: The latest tiles sync's changed files did not all reach every storage region.
+        description: >-
+          The replication gate of the latest sync that reached it ended with changed files missing from some
+          storage regions, or with a file DESCRIBE shows missing or with other bytes than the build. Nothing
+          was purged and the build stays pending, so the next run checks those files again. The run's log line
+          (the dashboard's "Sync and watchdog logs") names the regions that never caught up ("never in SYD")
+          and the first files still not replicated ("still not replicated: v1/15/x/y.mvt (not in SYD)").
+          Bunny's replication queue is shared across the account: after a seed or a large forced sync the slow
+          regions (Sydney first) lag for days, and a region that lacks a file serves it from Frankfurt, slowly,
+          not as an error. While that drains, let syncs through by dispatching Tiles Sync with the regions
+          input, or setting the TILES_SYNC_REGIONS repository variable, to the regions that keep up (or none).
+          Clear it only once `npm run bunny:replication -- --listing --min-zoom 15 --max-zoom 15` (the live
+          prefix) shows 100% in every region and exits 0: geoshenanigans-tiles-sample-unreplicated resolving is
+          not enough, as the daily sample checks 100 positions a zoom and can miss a gap, and a check skipped
+          while a build is pending lets it resolve without checking anything. If the same few files stay
+          unreplicated run after run while everything else replicates, Bunny has dropped their ReplicatedZones
+          (an identical re-upload does that for good): each blocks every later sync. Check one with a DESCRIBE
+          of the named path, raise it with Bunny, and let syncs through with the regions input leaving out the
+          regions it lacks (deployment/modules/bunny/tiles/README.md, "A file that never replicates").
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              last_over_time(tiles_sync_replication_complete{project="geoshenanigans", cluster="tiles", env="prod"}[26h]) == bool 0
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # tiles-sync-watchdog.yml's sample job checks 100 random positions of each
+    # zoom of the live build once a day (bunny:replication --live) and pushes
+    # tiles_sync_sample_missing and _mismatched: positions with no file, or one
+    # whose Checksum is not the live manifest's hash. Under D1b every position is
+    # a file, so either is a 404 or a stale tile for users, which the sync's gate
+    # never sees (it checks only the files a sync changed). The latest check in
+    # 26h counts.
+    - uid: geoshenanigans-tiles-sample-wrong
+      title: Tiles sample check found missing or wrong tiles
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: critical
+      annotations:
+        summary: The daily sample check found tile positions missing from the Bunny zone or holding other bytes than the live build.
+        description: >-
+          The latest daily sample check of the live build found positions with no file in the tiles storage zone,
+          or with a file whose checksum is not the live manifest's. Its log line (app:="tiles-sample-check", in
+          the dashboard's "Sync and watchdog logs") gives the counts and example paths. Missing files serve 404s,
+          which nothing caches; other bytes serve another build's tile (a seed run over the live prefix with an
+          older archive, or a file written by hand), which the CDN keeps for a year once fetched, as only a sync
+          purges. Repair them as deployment/modules/bunny/tiles/README.md, "Repairs", "Missing or wrong files"
+          says. First hold scheduled syncs (set TILES_SYNC_HOLD) and wait until no Tiles Sync run is in progress
+          or queued, then dispatch none but a revert until the repair is checked: a sync beside the repair can
+          write the same files. `npm run bunny:status` names the live build, its prefix and any pending builds:
+          revert pending builds first (dispatch Tiles Sync with the live build as `build`) and let that run
+          finish. Check the whole zone with `npm run bunny:replication -- --listing` (the live prefix; presence
+          and regions), then repair the affected zooms from the live build's archive, under the live prefix and
+          with a new checkpoint directory: `npm run bunny:seed -- --archive <live build>.pmtiles --prefix <live
+          prefix> --min-zoom Z --max-zoom Z --verify-existing --state-dir <new dir>`. It DESCRIBEs every file,
+          writes only missing or wrong ones, and refuses any archive but the live build's. Without --prefix it
+          writes under v1, which is no longer live after a full rewrite, and a reused state dir skips the chunks
+          it completed before. Then, before purging, check that every region holds the repaired zooms: `npm run
+          bunny:replication -- --listing --prefix <live prefix> --min-zoom Z --max-zoom Z` exits 0 and `npm run
+          bunny:replication -- --live --sample 1000 --per-zoom` finds nothing missing or wrong (a purge before
+          that lets a PoP fetch a wrong tile again from a region that still holds it). Purge the pull zone (the
+          Bunny dashboard's Purge Cache, or the README's API call), check that the example paths answer 200
+          through the public hostname from several locations with a Last-Modified from the repair (an older one
+          is a PoP still serving the wrong tile: purge again), and only then clear TILES_SYNC_HOLD.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              sum(last_over_time(tiles_sync_sample_missing{project="geoshenanigans", cluster="tiles", env="prod"}[26h]))
+                + sum(last_over_time(tiles_sync_sample_mismatched{project="geoshenanigans", cluster="tiles", env="prod"}[26h]))
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # tiles_sync_sample_lacking{storage_region} counts the sampled positions
+    # stored with the right bytes that a region does not hold yet. Per region; a
+    # warning, as such a tile comes from Frankfurt, slowly, not as an error. It is
+    # how the replication backlog after a seed is seen to drain; a sample cannot
+    # show that it has drained, which takes the zoom-15 listing.
+    - uid: geoshenanigans-tiles-sample-unreplicated
+      title: Tiles sample check found tiles not yet in a storage region
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: Sampled positions of the live build are not in every storage region yet.
+        description: >-
+          The latest daily sample check found positions of the live build that the alert's storage region does
+          not hold yet, so they are served from Frankfurt there (350-530 ms instead of tens). After a seed this is
+          the replication backlog draining (Sydney takes longest; days for a planet), and it resolves by itself:
+          keep scheduled syncs held (TILES_SYNC_HOLD) or their gate on fewer regions (TILES_SYNC_REGIONS) until
+          `npm run bunny:replication -- --listing --min-zoom 15 --max-zoom 15` (the live prefix) shows 100% in
+          every region and exits 0. This alert resolving does not show that: a clean sample checks 100 positions
+          a zoom and can miss a gap, and a check skipped while a build is pending sends no counts, so the alert
+          resolves once the last counts age out. Later, it means the account's replication queue is backed up,
+          or files lost their replica list (an identical re-upload does that for good): the check's log line
+          (app:="tiles-sample-check") names examples only for missing files, so list the region's lag with the
+          same listing and raise lasting gaps with Bunny.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              last_over_time(tiles_sync_sample_lacking{project="geoshenanigans", cluster="tiles", env="prod"}[26h])
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # The sample job pushes tiles_sync_sample_runs{result} once a day: error when
+    # bunny:replication could not run (state zone, tiles zone or manifest
+    # unreadable), or when DESCRIBE failed for some positions (an incomplete
+    # check, which keeps its counts). Fires when the latest run in 26h is an error.
+    - uid: geoshenanigans-tiles-sample-failing
+      title: Tiles sample check could not run
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The daily sample check of the live Bunny tiles could not run, or left sampled positions unchecked.
+        description: >-
+          The latest run of tiles-sync-watchdog.yml's sample job did not check every sampled position of the live
+          build. Either bunny:replication failed before checking (a wrong BUNNY_STORAGE_PASSWORD or
+          BUNNY_STATE_PASSWORD, the live manifest unreadable, Bunny storage down), or it ran but the check is
+          incomplete: DESCRIBE failed after its retries for some positions (tiles_sync_sample_errors; all of them
+          when the tiles zone stops answering), and those went unchecked. Its error line
+          (app:="tiles-sample-check") and the job's log say which, with the unchecked count and example paths.
+          Until a check completes, geoshenanigans-tiles-sample-wrong and -sample-unreplicated see only the
+          positions that were checked, or none: zero missing then does not mean the zone is whole.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              tlast_over_time(tiles_sync_sample_runs{project="geoshenanigans", cluster="tiles", env="prod", result="error"}[26h])
+                >= on () group_left () max(tlast_over_time(tiles_sync_sample_runs{project="geoshenanigans", cluster="tiles", env="prod"}[26h]))
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # The sample job reports a result every day it runs: ok, error, or skipped
+    # while a build is pending. -sample-failing reads the errors; a job that
+    # never reaches its report step (a runner that died, a timeout, a schedule
+    # dropped, a broken job) sends nothing, which reads as OK to every sample
+    # rule. Fires on 26h (a day of runs plus slack) without a result of any kind,
+    # only while the watchdog's report job, in the same workflow, read a live
+    # build in the past 5h and 26-31h ago: a whole workflow that stops is
+    # geoshenanigans-tiles-watchdog-silent's, and a build that went live within
+    # the day has had no sample run to miss. `for` outlasts a late scheduled run.
+    - uid: geoshenanigans-tiles-sample-silent
+      title: Tiles sample check stopped reporting
+      condition: B
+      for: 1h
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The daily sample check of the live Bunny tiles has reported nothing for over 26 hours.
+        description: >-
+          No tiles_sync_sample_runs sample (ok, error or skipped) for 26h, while tiles-sync-watchdog.yml's
+          report job keeps reading a live build: the daily sample job did not reach its report step. Until it
+          does, nothing checks the live build for missing, wrong or unreplicated files, and
+          geoshenanigans-tiles-sample-wrong, -sample-unreplicated and -sample-failing stay quiet. Check the
+          workflow's runs for the 04:53 UTC schedule: a job that timed out or whose runner died (the run shows
+          it as cancelled or lost), a scheduled run GitHub dropped, or a "Report to o11y" step that could not
+          read the o11y token from 1Password (it warns and reports nothing) or failed to push to
+          vmauth.futostatus.com. Dispatch Tiles Sync Watchdog from main to run the check now.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 111600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              absent_over_time(tiles_sync_sample_runs{project="geoshenanigans", cluster="tiles", env="prod"}[26h])
+              and on () (count(last_over_time(tiles_sync_live_build_age_hours{project="geoshenanigans", cluster="tiles", env="prod"}[5h])) > 0)
+              and on () (count(last_over_time(tiles_sync_live_build_age_hours{project="geoshenanigans", cluster="tiles", env="prod"}[5h] offset 26h)) > 0)
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 111600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # The latest sync job's first step to its last (step="total"), pushed with
+    # the steps. A warning: a slow sync still switches over consistently.
+    - uid: geoshenanigans-tiles-sync-slow
+      title: Tiles sync took over 2 hours
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The latest tiles sync job took over 2 hours.
+        description: >-
+          The latest sync job took more than 2h from its first step to its last; a normal day is 30-60 minutes.
+          The Tiles dashboard's "Sync step durations" shows the slow step: download (Protomaps or the runner's
+          network), manifest (fewer cores than usual), upload (429s or retries, see "Retries and rate
+          limits"), or replication (Bunny's queue, see "Replication wait by region").
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              last_over_time(tiles_sync_step_seconds{project="geoshenanigans", cluster="tiles", env="prod", step="total"}[26h]) > 7200
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # A day changes about 200-330k positions, so over 1M is several days of
+    # catch-up or a change in the build itself. A guard_rail run uploaded
+    # nothing: more positions changed than --max-changed-fraction allows
+    # (0.5%, 2% forced: what one job uploads and replicates in time), which
+    # needs a full rewrite under a new prefix.
+    - uid: geoshenanigans-tiles-sync-diff-large
+      title: Tiles sync diff unusually large
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The latest tiles sync changed over 1M positions, or stopped at the guard rail.
+        description: >-
+          The latest sync's diff against the live build changed more than 1M tile positions (a day is
+          200-330k), or more than the guard rail's 0.5% (7.2M), in which case the run uploaded nothing and the
+          live build stays as it is. After days without a sync a large diff is expected and this resolves with
+          the next normal run. Otherwise compare the build's schema version and planetiler version with the
+          live one's (the run's log line): a basemap change that rewrites most tiles goes in as a full rewrite
+          under a new prefix (deployment/modules/bunny/tiles/README.md, "Full rewrites"), not in place. A
+          dispatch with force syncs up to 2% (29M) in place, in a job of up to 12 hours; more than that cannot
+          replicate within one job.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              (last_over_time(tiles_sync_positions_changed{project="geoshenanigans", cluster="tiles", env="prod"}[26h]) > 1000000)
+              or
+              (tlast_over_time(tiles_sync_runs{project="geoshenanigans", cluster="tiles", env="prod", status="guard_rail"}[26h])
+                >= on () group_left () max(tlast_over_time(tiles_sync_runs{project="geoshenanigans", cluster="tiles", env="prod"}[26h])))
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # The workflow compares the newest build's tiles schema version
+    # (major.minor, from builds.json) with the live build's and stops before
+    # the download when they differ. force skips that check, so the annotation
+    # keeps style compatibility (which force cannot see) apart from the diff's
+    # size (which its guard rail does).
+    - uid: geoshenanigans-tiles-sync-schema
+      title: Tiles sync stopped at a schema version change
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The newest Protomaps build has another tiles schema version than the live one.
+        description: >-
+          The latest tiles-sync.yml run found that the newest Protomaps build's schema version differs from
+          the live build's in its major or minor part, and synced nothing. Two questions decide what next, and
+          the diff's size answers only the second. First, whether the live styles can render the new tiles:
+          they come from map-styles' pinned @protomaps/basemaps release, which targets one schema, and a small
+          diff says nothing about that. Read the basemaps changelog for the new version and test the current
+          styles on the new build. Only a change known to be compatible may go in with force, which syncs it in
+          place, styles unchanged, when the diff is small (up to 2% of positions; a dry run first tells the
+          diff's size; new tiles meet the old styles on uncached requests until the run finishes). A change the
+          styles cannot render needs map-styles moved to a basemaps release for the new schema and tested
+          against the new build before switching: never force it. That, or a compatible diff over 2%, is a full
+          rewrite: seed the build under a new prefix, switch with bunny:sync --adopt --replace once it has
+          replicated, with STYLES_DIR the updated map-styles build (the switch writes the styles with the
+          TileJSON) and with scheduled syncs held (TILES_SYNC_HOLD) and no Tiles Sync run in progress or queued
+          (an in-place sync beside the switch can write v1.json or state.json after it), clear the hold once
+          bunny:status names the new prefix live, and delete the old prefix a week later
+          (deployment/modules/bunny/tiles/README.md, "Full rewrites"). Until then every run stops here.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              tlast_over_time(tiles_sync_runs{project="geoshenanigans", cluster="tiles", env="prod", status="schema_changed"}[26h])
+                >= on () group_left () max(tlast_over_time(tiles_sync_runs{project="geoshenanigans", cluster="tiles", env="prod"}[26h]))
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # The watchdog computes the live OSM data's age at each tick (state.json's
+    # osmDate), every 2 hours; 6h holds the last reading through two missed
+    # ticks, which geoshenanigans-tiles-watchdog-silent covers. Protomaps' OSM
+    # data is a few hours old at publication, so a day's sync keeps it under
+    # ~31h; 48h is a missed day.
+    - uid: geoshenanigans-tiles-osm-old
+      title: Live tiles built from OSM data over 48 hours old
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The live tiles were built from OSM data more than 48 hours old.
+        description: >-
+          The OSM replication time of the live build is more than 48h ago. Either the sync has not switched to
+          a newer build (see geoshenanigans-tiles-sync-failed and -sync-stale, and the Tiles dashboard's sync
+          panels) or Protomaps has not published one: check https://build-metadata.protomaps.dev/builds.json
+          for the newest key. Nothing on our side fixes the second.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 21600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              last_over_time(tiles_sync_live_osm_age_hours{project="geoshenanigans", cluster="tiles", env="prod"}[6h]) > 48
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 21600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # The Bunny log reader runs in the tiles worker's cron and pushes
+    # tiles_bunny_log_rows once per processed minute, 0 included. Only once it
+    # has reported in the past week (the pull zone is live) and while the
+    # worker's heartbeat arrives: without that, geoshenanigans-tiles-heartbeat
+    # pages for the whole worker.
+    - uid: geoshenanigans-tiles-bunny-logs-silent
+      title: Bunny log reader stopped reporting
+      condition: B
+      for: 5m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The Bunny log reader has processed no minute of request logs for 15 minutes.
+        description: >-
+          No tiles_bunny_log_rows sample for 15 minutes, while the worker's heartbeat still arrives, so the
+          Bunny request metrics (the Tiles dashboard's Bunny CDN panels) have stopped. The Logging API key
+          (BUNNY_API_KEY) or pull zone id may be wrong or rotated, or the Logging API may be failing (the
+          reader's tiles_bunny_log_reader_runs{result="error"}, which geoshenanigans-tiles-bunny-logs-failing
+          reads, and its error lines in the Logs panel say which; result="skipped" means its settings are gone
+          from the worker, and no run result at all that its runs end before their push). The reader keeps no
+          cursor: each cron run reads the minutes 3 and 4 behind it, so minutes missed while it failed are never
+          read, though the Logging API keeps them 3 days; the request panels have a gap there. Serving is not
+          affected.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 604800
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              (absent_over_time(tiles_bunny_log_rows{project="geoshenanigans", cluster="tiles", env="prod"}[15m])
+                and on () (count(last_over_time(tiles_bunny_log_rows{project="geoshenanigans", cluster="tiles", env="prod"}[7d])) > 0))
+              and on () (count(last_over_time(tiles_heartbeat_timestamp_seconds{project="geoshenanigans", cluster="tiles", env="prod"}[15m])) > 0)
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 604800
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # Every log reader run pushes tiles_bunny_log_reader_runs{result} at its
+    # newer minute's end: error when either read failed or was truncated (more
+    # rows than MAX_PAGES reach), skipped without its settings. A truncated read
+    # still pushes the rows it counted, and a key refused from the first run
+    # pushes no rows at all, so -bunny-logs-silent, which wants a week of rows
+    # and then none, sees neither. Fires on errors in most of the runs with a
+    # result other than skipped in 15 minutes (15 runs), at least 5 of them:
+    # the re-read a minute later makes up for a lone failed read, and the floor
+    # keeps the first runs after the settings arrive from firing on a couple.
+    # Gated on nothing else: a run result is itself proof the cron runs.
+    - uid: geoshenanigans-tiles-bunny-logs-failing
+      title: Bunny log reader runs are failing
+      condition: B
+      for: 10m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: Most Bunny log reader runs failed or were truncated, so the Bunny request metrics are missing or low.
+        description: >-
+          Over half of the Bunny log reader's runs in the past 15 minutes, and at least 5, ended with
+          result="error": a read of the Logging API failed after its retries, or a minute held more rows than
+          the reader's page limit (30 pages of 10,000) and its counts are low. The Tiles dashboard's Bunny CDN
+          panels undercount or have gaps meanwhile; serving is not affected. Its error lines in the Logs panel
+          (project:="geoshenanigans" cluster:="tiles" level:="error" job:="bunny_logs") say which: "Bunny log
+          reader failed" answering 401 or 403 is the BUNNY_API_KEY worker secret (wrong, rotated, or never
+          right since the reader was turned on) or a wrong BUNNY_PULL_ZONE_ID, a 429 or 5xx the Logging API
+          itself (check status.bunny.net), and "Bunny log window truncated" traffic beyond what one run reads
+          (raise MAX_PAGES in tiles/src/bunny-logs/log-reader.ts). Minutes the reader failed on are never read
+          again.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 900
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              (sum(sum_over_time(tiles_bunny_log_reader_runs{project="geoshenanigans", cluster="tiles", env="prod", result="error"}[15m])) >= 5)
+                / sum(sum_over_time(tiles_bunny_log_reader_runs{project="geoshenanigans", cluster="tiles", env="prod", result!="skipped"}[15m])) > 0.5
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 900
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # Each probe run pushes tiles_bunny_probe_errors{continent,kind,target} for
+    # every Globalping test with a verdict (1 for a failed or wrong response, 0
+    # for a good one) and tiles_bunny_probe_runs{result} once, all stamped at
+    # the run's minute. kind is the cache status the edge reported and target
+    # the tile tested, so after a purge the popular tile's miss is a miss
+    # beside the random tile's: the ratio adds up over target. Fires per
+    # continent and kind when over half the verdicts in 30 minutes were errors;
+    # tests without a verdict count in neither, so runs that saw nothing of a
+    # continent and kind do not dilute it. The gate takes errors in two runs:
+    # one probe per continent tests each target once a run, so a target's
+    # series holds one sample per run, and the largest of its sums is at least
+    # 2 only when two runs failed. Summed over target, one run after a purge
+    # (both tiles a miss, both failing) would be 2 already. The window must
+    # hold two runs at all times: 30m does at a BUNNY_PROBE_INTERVAL_MINUTES of
+    # up to 14 (10 by default; 15m never fired at 10, as a window held two
+    # runs only half the time and `for` restarted). `continent`, not `region`:
+    # region is an o11y identity label (world). Runs that failed at Globalping
+    # itself say nothing about Bunny: geoshenanigans-tiles-bunny-probe-failing.
+    # The Worker's own read of the TileJSON (/v1.json), which gives the probe
+    # its tile URLs, is a test too: one sample a run with continent="worker",
+    # kind="tilejson" (1 when it failed or named no usable tile URL, 0 when it
+    # did), so an outage that takes v1.json down with the tiles (the CDN, the
+    # storage zone, the hostname, a deleted v1.json), when no tile can be
+    # measured, fires here under the same gate, not only -probe-failing.
+    - uid: geoshenanigans-tiles-bunny-probe-errors
+      title: Bunny synthetic probe sees errors
+      condition: B
+      for: 5m
+      labels:
+        project: geoshenanigans
+        severity: critical
+      annotations:
+        summary: The synthetic probe gets errors from the Bunny pull zone.
+        description: >-
+          Over half of the synthetic probe's tests with a verdict in the past 30 minutes got a failed or wrong
+          response from its probe in the alert's continent, for tiles of the alert's kind, and one tile failed in
+          at least two runs (one run after a purge, when both tiles miss, is not enough). The kind is the
+          cache status the edge reported (hit: from the edge's cache, normally the popular tile; miss: from
+          storage, normally the random z15 position, and the popular tile after a purge; a test without a
+          CDN-Cache header counts as the tile it tested). Try the URLs from the probe's lines (the dashboard's
+          "Probe tests" panel: project:="geoshenanigans" cluster:="tiles" kind:="probe", with the PoP that answered)
+          and check status.bunny.net. A 404 for a tile means a missing file in the
+          storage zone (every position is uploaded, so none should be); corrupt or empty bodies in a few PoPs
+          are the gzip edge rule bug the middleware script works around. Continent "worker", kind "tilejson":
+          the Worker's own read of the TileJSON (v1.json), which every map loads first, failed or named no usable
+          tile URL, so no tile could be measured either: the probe's "Probe tile URLs unknown" lines in the Logs
+          panel give the reason (an HTTP status such as a 404 for a deleted v1.json or Bunny's "Domain suspended
+          or not configured", a timeout, a body with no tile template); try the zone's /v1.json yourself and
+          check status.bunny.net. The Tiles dashboard's "Probe errors" shows whether it is one continent or all
+          of them.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 1800
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              (
+                sum by (continent, kind) (sum_over_time(tiles_bunny_probe_errors{project="geoshenanigans", cluster="tiles", env="prod"}[30m]))
+                  / sum by (continent, kind) (count_over_time(tiles_bunny_probe_errors{project="geoshenanigans", cluster="tiles", env="prod"}[30m]))
+                > 0.5
+              )
+              and on (continent, kind)
+              (
+                max by (continent, kind) (sum_over_time(tiles_bunny_probe_errors{project="geoshenanigans", cluster="tiles", env="prod"}[30m]))
+                >= 2
+              )
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 1800
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # A probe run is result="error" when the TileJSON gave no tile URL to test
+    # (also a failed test for -probe-errors, as continent="worker"),
+    # Globalping refused a measurement (its hourly quota, which manual probe
+    # sets spend too, a bad token, a 5xx), one was unfinished at the run's
+    # deadline, none of its tests got a verdict, or a continent got none.
+    # Tests still in progress at the deadline have no verdict and count in
+    # neither tiles_bunny_probe_errors nor the TTFB, so a Bunny stall that
+    # keeps every test unfinished shows here, not as tile errors. Same window
+    # as geoshenanigans-tiles-bunny-probe-errors; a warning, as tiles may be
+    # fine: the probe is blind.
+    - uid: geoshenanigans-tiles-bunny-probe-failing
+      title: Bunny synthetic probe runs are failing
+      condition: B
+      for: 5m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: Most synthetic probe runs had a Globalping measurement error, so the probe sees little or nothing of the Bunny pull zone.
+        description: >-
+          Over half of the synthetic probe's runs in the past 30 minutes, and at least two, had a measurement
+          error (result="error"): the zone's TileJSON gave no tile URL to test, Globalping refused to create a
+          measurement, did not finish one in time, gave none of a target's tests a verdict, or gave no verdict
+          for some continent. Tests unfinished at the
+          deadline are not counted as tile errors, so a stall at Bunny itself also shows here: check
+          status.bunny.net and the "Probe tests" panel. The probe's error lines in
+          the Logs panel give the answer. "Probe tile URLs unknown": the TileJSON (v1.json) could not be read
+          or names no usable tile URL (each such run is also a failed test with continent "worker", kind
+          "tilejson", for geoshenanigans-tiles-bunny-probe-errors). "Globalping measurement not created": a 429 is the hourly quota (500
+          tests plus credits, also spent by manual probe sets; it recovers within the hour), a 401 or 403 the
+          GLOBALPING_TOKEN worker secret. "Globalping measurement has no verdict from some continents": its
+          missing field names them; Globalping had no probe there or its tests failed. "Unfinished at the
+          deadline" or "no test with a verdict": see the stall above. Until it recovers,
+          geoshenanigans-tiles-bunny-probe-errors and -probe-slow are blind.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 1800
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              (sum(sum_over_time(tiles_bunny_probe_runs{project="geoshenanigans", cluster="tiles", env="prod", result="error"}[30m])) >= 2)
+                / sum(sum_over_time(tiles_bunny_probe_runs{project="geoshenanigans", cluster="tiles", env="prod"}[30m])) > 0.5
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 1800
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # A miss is a tile the edge read from the nearest storage replica (a
+    # CDN-Cache other than HIT or STALE; normally the random z15 position):
+    # 18-78 ms per continent when measured, 350-530 ms when the replica lacks
+    # it and Frankfurt serves it. This fires at 1 s, for outages of the storage
+    # zone or the middleware script; a replica that lacks files (350-530 ms)
+    # stays under it and is geoshenanigans-tiles-sample-unreplicated's to find.
+    # Per continent over 30 minutes (three runs at the default 10-minute
+    # interval), adding up over target (the tile tested): the misses' average,
+    # only while one target took over 1 s in at least two runs (its series
+    # holds one sample per run), so neither a lone run (the only one when the
+    # next run is skipped, though both tiles miss in it after a purge) nor one
+    # outlier among fast ones starts the timer. A warning: slow misses degrade
+    # the map without breaking it.
+    - uid: geoshenanigans-tiles-bunny-probe-slow
+      title: Bunny synthetic probe sees slow misses
+      condition: B
+      for: 15m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The synthetic probe's uncached tiles take over 1 second to first byte.
+        description: >-
+          The synthetic probe's average time to first byte for tiles the edge read from storage (cache misses)
+          from the alert's continent has been above 1s for 15 minutes, over 30-minute windows in which one tile
+          took over 1s to miss in at least two runs. The Tiles dashboard's "Probe first byte, misses" shows
+          whether it is one continent (Bunny routing that continent to far PoPs, or its storage region down) or all
+          of them (the storage zone or the middleware script; check status.bunny.net). A region merely lacking
+          files is slower (350-530 ms, from Frankfurt) but under this threshold:
+          geoshenanigans-tiles-sample-unreplicated reports that.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 1800
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              (
+                sum by (continent, kind) (sum_over_time(tiles_bunny_probe_ttfb_ms{project="geoshenanigans", cluster="tiles", env="prod", kind="miss"}[30m]))
+                  / sum by (continent, kind) (count_over_time(tiles_bunny_probe_ttfb_ms{project="geoshenanigans", cluster="tiles", env="prod", kind="miss"}[30m]))
+                > 1000
+              )
+              and on (continent, kind)
+              (
+                max by (continent, kind) (count_gt_over_time(tiles_bunny_probe_ttfb_ms{project="geoshenanigans", cluster="tiles", env="prod", kind="miss"}[30m], 1000))
+                >= 2
+              )
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 1800
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # The worker binds the probe only when tiles-worker's bunny_public_url is
+    # set (with GLOBALPING_TOKEN); until then each probe run pushes
+    # result="skipped". Fires when the pull zone serves requests (the log reader
+    # counts rows) while every probe run in the past hour was skipped: the probe
+    # was left off, so -probe-errors, -probe-slow and -probe-failing are blind.
+    # No run result at all, skipped included, is -probe-silent's. The traffic
+    # gate applies to the whole "skipped unless other results" (bracketed, though
+    # `and` and `unless` share a precedence and group left to right): skipped
+    # runs alone, with no requests to the zone, never fire it.
+    - uid: geoshenanigans-tiles-bunny-probe-off
+      title: Bunny synthetic probe is off while the pull zone serves requests
+      condition: B
+      for: 30m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The Bunny pull zone serves requests but the synthetic probe is not configured.
+        description: >-
+          The Bunny log reader counts requests to the pull zone, yet every synthetic probe run in the past hour
+          was skipped: the worker has no BUNNY_PUBLIC_URL or GLOBALPING_TOKEN binding. Set bunny_public_url in
+          deployment/modules/cloudflare/tiles-worker/tiles.prod.tfvars.json to the hostname that serves the zone
+          (the test hostname before the DNS cutover, https://tiles.immich.cloud after; the same as tiles-sync.yml's
+          BUNNY_PUBLIC_URL) and check GLOBALPING_TOKEN in the tf_bunny vault, then run the Tiles Worker workflow
+          on main.
+          Probe runs that report nothing at all are geoshenanigans-tiles-bunny-probe-silent's.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 3600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              (
+                (sum(sum_over_time(tiles_bunny_probe_runs{project="geoshenanigans", cluster="tiles", env="prod", result="skipped"}[1h])) > 0)
+                  unless on () (sum(sum_over_time(tiles_bunny_probe_runs{project="geoshenanigans", cluster="tiles", env="prod", result!="skipped"}[1h])) > 0)
+              )
+                and on () (sum(sum_over_time(tiles_bunny_log_rows{project="geoshenanigans", cluster="tiles", env="prod"}[1h])) > 0)
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 3600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # Every probe run pushes tiles_bunny_probe_runs{result} at its end, skipped
+    # included. A run that ends before that push sends nothing: runProbe
+    # rejecting (the cron's guard logs "Bunny cron job failed"), the scheduled
+    # handler killed at a CPU, subrequest or wall time limit, or the push
+    # refused or lost. Then no probe rule fires: -probe-off wants skipped runs,
+    # the others measurements or errors. Fires on an hour without a run result
+    # of any kind, while the pull zone serves requests (as -probe-off) and the
+    # log reader, in the same cron, reported in the past 15 minutes: a cron
+    # that stops entirely is -bunny-logs-silent's or -heartbeat's. Not the
+    # interval: it is 5 to 14 minutes (tiles-worker's validation, and the
+    # Worker clamps it too), so the hour always holds at least four runs, each
+    # with its 45s measurement deadline (six at the default 10).
+    - uid: geoshenanigans-tiles-bunny-probe-silent
+      title: Bunny synthetic probe stopped reporting
+      condition: B
+      for: 15m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The synthetic probe has reported no run for an hour while the Bunny pull zone serves requests.
+        description: >-
+          No tiles_bunny_probe_runs sample of any result (ok, error or skipped) for an hour, while the Bunny log
+          reader, in the same cron, counts requests to the pull zone: probe runs end before they report, so
+          geoshenanigans-tiles-bunny-probe-errors, -probe-slow, -probe-failing and -probe-off are all blind. Look
+          for the worker's "Bunny cron job failed" line with job:="bunny_probe" in the Logs panel (runProbe
+          threw), and for tiles-prod's cron events in the Cloudflare dashboard that ended exceeding CPU,
+          subrequest or wall time limits, or whose logs show "o11y: /insert/0/prometheus/api/v1/import/prometheus
+          answered" or "failed" (the probe's push refused or lost). Not the probe interval:
+          BUNNY_PROBE_INTERVAL_MINUTES is 5 to 14 (tiles-worker checks it and the Worker clamps it), so every
+          hour holds at least four runs. Skipped runs mean the probe is not configured
+          (geoshenanigans-tiles-bunny-probe-off), not this.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 3600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              absent_over_time(tiles_bunny_probe_runs{project="geoshenanigans", cluster="tiles", env="prod"}[1h])
+                and on () (sum(sum_over_time(tiles_bunny_log_rows{project="geoshenanigans", cluster="tiles", env="prod"}[1h])) > 0)
+                and on () (count(last_over_time(tiles_bunny_log_rows{project="geoshenanigans", cluster="tiles", env="prod"}[15m])) > 0)
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 3600
             to: 0
           model:
             refId: B

@@ -1,4 +1,5 @@
 import { parse as parseDomain } from 'tldts';
+import { runBunnyCron } from './bunny-logs';
 import { handleD1ProxyRequest } from './d1-proxy';
 import { IMetricsRepository } from './interface';
 import { O11yLogger, O11yMetricsProvider, o11yConfig, sampleRequest, sendHeartbeat } from './o11y';
@@ -412,13 +413,17 @@ export default {
     return response;
   },
 
-  // tiles-worker's cron trigger runs this every minute: the heartbeat o11y's absence alert watches.
+  // tiles-worker's cron trigger runs this every minute: the heartbeat o11y's absence alert watches, and the Bunny CDN's
+  // request logs and synthetic probe (src/bunny-logs).
   async scheduled(controller, env): Promise<void> {
     const workerEnv = env as WorkerEnv;
     const o11y = o11yConfig(workerEnv);
     if (workerEnv.WORKER_TYPE === 'D1_PROXY' || !o11y) {
       return;
     }
-    await sendHeartbeat(o11y, workerEnv.DEPLOYMENT_KEY);
+    await Promise.all([
+      sendHeartbeat(o11y, workerEnv.DEPLOYMENT_KEY),
+      runBunnyCron(workerEnv, o11y, controller.scheduledTime),
+    ]);
   },
 } satisfies ExportedHandler<Env>;
