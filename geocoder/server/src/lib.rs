@@ -29,6 +29,7 @@ mod hex;
 pub use hex::lower_hex;
 pub mod place_files;
 pub mod poi_files;
+pub mod geography_box;
 pub mod postcode_files;
 pub mod side_blocks;
 pub mod strings;
@@ -183,6 +184,11 @@ pub fn vertex_scale(enc: u8) -> f64 {
 
 /// The admin level of a postcode area's record (boundary=postal_code).
 pub const POSTCODE_AREA_LEVEL: u8 = 11;
+
+/// The place type the builder gives a postal area whose postcode its country's pattern rejects:
+/// Nominatim makes no postcode area of it (postcodes.py _update_postcode_areas).
+pub const POSTAL_AREA_INVALID: u8 = 15;
+
 /// The admin level `/polygons` gives a postcode area, the one the test portal colours as postal.
 pub const POLYGONS_POSTAL_LEVEL: u8 = 99;
 
@@ -1671,9 +1677,9 @@ impl Index {
     // given a street that has just won primary selection, look up the
     // nearest address whose parent_way_id matches that street's
     // index, gated by `ST_DWithin(query, 0.001)` (~100m). Returns the
-    // address whose housenumber should refine the result.
+    // address whose housenumber should refine the result, with its record id.
     pub fn find_addr_on_way(&self, lat: f64, lng: f64, parent_way_idx: u32, max_dist_sq: f64)
-        -> Option<AddrRecord>
+        -> Option<(u32, AddrRecord)>
     {
         let addrs = self.addrs.as_ref()?;
 
@@ -1684,20 +1690,20 @@ impl Index {
         let addr_key = |a: &AddrRecord| self.addr_tie_key(a, lat, lng, cos_lat);
 
         let mut best_dist = max_dist_sq;
-        let mut best: Option<AddrRecord> = None;
+        let mut best: Option<(u32, AddrRecord)> = None;
         // Of an address under another way no more than its street and its parent is read.
         let ids = (0..cells.len()).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
         with_footprint(|footprint| {
-            addrs.for_ids_on_way(ids, parent_way_idx, |_, point| {
+            addrs.for_ids_on_way(ids, parent_way_idx, |id, point| {
                 let dlat = (point.lat as f64 - lat).to_radians();
                 let dlng = (point.lng as f64 - lng).to_radians();
                 let mut dist = dist_sq(dlat, dlng, cos_lat);
                 if point.is_building() && addrs.footprint(&point, footprint) {
                     dist = polygon_distance_sq(lat, lng, footprint, cos_lat);
                 }
-                if beats(dist, best_dist, || best.as_ref().map(|b| (addr_key(&point), addr_key(b)))) {
+                if beats(dist, best_dist, || best.as_ref().map(|(_, b)| (addr_key(&point), addr_key(b)))) {
                     best_dist = dist;
-                    best = Some(point);
+                    best = Some((id, point));
                 }
             })
         });
@@ -2022,20 +2028,22 @@ impl Index {
             boundaries.push((level as u64) << 56 | (poly.area.to_bits() as u64) << 24 | (place - 1));
         });
         // Each level's polygons from the smallest up: the first to hold the point is the level's
-        // best, and the larger ones, which take the longest to test, are never read.
+        // best, and the larger ones, which take the longest to test, are never read. Every postal
+        // area holding the point is a candidate for its postcode.
         boundaries.sort_unstable();
+        let mut postal_areas: Vec<AdminPolygon> = Vec::new();
         for key in boundaries {
             let level = (key >> 56) as usize;
-            if best_by_level[level].is_none() {
+            if best_by_level[level].is_none() || level == POSTCODE_AREA_LEVEL as usize {
                 let (id, poly) = scan.rings[(key & 0xff_ffff) as usize];
                 if scan.pip.holds(self, id, &poly) {
-                    best_by_level[level] = Some(poly);
+                    best_by_level[level].get_or_insert(poly);
+                    if level == POSTCODE_AREA_LEVEL as usize { postal_areas.push(poly); }
                 }
             }
         }
 
         let mut result = AdminResult::default();
-        result.postcode_area = best_by_level[POSTCODE_AREA_LEVEL as usize].map(|poly| self.get_string(poly.name_id));
 
         // Get country code from level 2 polygon
         let country_code_str: String = best_by_level[2]
@@ -2050,6 +2058,7 @@ impl Index {
                 }
             })
             .unwrap_or_default();
+        result.postcode_area = self.postal_area_postcode(&postal_areas, &country_code_str, scan.pip.point.degrees());
 
         // Map admin levels to address fields using country-specific config
         // Track best (smallest area) polygon per output field
@@ -2781,6 +2790,41 @@ impl Index {
     //
     // The postal areas feed tier 1 at BUILD time too (way_postcodes.bin,
     // PoiRecord.parent_postcode_id inheritance).
+    /// The postcode get_nearest_postcode takes from the postal areas holding the point (lat, lng)
+    /// of the country `country` (upper-case ISO, "" where unknown), the smallest first: of those of the
+    /// country, or of no country known, whose postcode the country has (Nominatim makes no
+    /// postcode area of another, postcodes.py _update_postcode_areas), the one whose centroid is
+    /// nearest the point in plain degrees (utils.sql: ORDER BY ST_Distance(p.centroid, geom)),
+    /// equals to the smaller. A postal area's country is the one its centroid lies in, as
+    /// get_country_code gives place_postcode's.
+    fn postal_area_postcode<'a>(&'a self, areas: &[AdminPolygon], country: &str, (lat, lng): (f64, f64)) -> Option<Cow<'a, str>> {
+        let cc: Option<[u8; 2]> = country.as_bytes().try_into().ok().map(|c: [u8; 2]| c.map(|b| b.to_ascii_lowercase()));
+        let eligible = |poly: &AdminPolygon| -> Option<Cow<'a, str>> {
+            if poly.place_type_override == POSTAL_AREA_INVALID { return None; }
+            let of_country = poly.country_code.to_be_bytes().map(|b| b.to_ascii_lowercase());
+            if let Some(cc) = cc {
+                if poly.country_code != 0 && of_country != cc { return None; }
+                if country_has_no_postcode(&cc) { return None; }
+            }
+            let postcode = self.get_string(poly.name_id);
+            let valid = centroid_postcode_ok(&postcode) && postcode_looks_valid(&cc.unwrap_or(of_country), &postcode);
+            valid.then_some(postcode)
+        };
+        let mut found = areas.iter().filter_map(|poly| eligible(poly).map(|postcode| (poly, postcode)));
+        let first = found.next()?;
+        let rest: Vec<_> = found.collect();
+        if rest.is_empty() {
+            return Some(first.1);
+        }
+        let distance = |poly: &AdminPolygon| {
+            self.admin_geometry.centroid(poly).map_or(f64::INFINITY, |(c_lat, c_lng)| postcode_files::distance(lat, lng, c_lat, c_lng))
+        };
+        std::iter::once(first).chain(rest)
+            .map(|(poly, postcode)| (distance(poly), poly.area, postcode))
+            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)).then_with(|| a.2.cmp(&b.2)))
+            .map(|(_, _, postcode)| postcode)
+    }
+
     /// Record `idx`'s value in a side file (way_parents / addr_postcodes /
     /// way_postcodes / interp_postcodes: a u32 per record, NO_DATA = absent).
     fn sidecar_u32(f: &SideBlocks, idx: u64) -> Option<u32> {
@@ -2865,8 +2909,10 @@ impl Index {
             (cc[0] as u16) << 8 | (cc[1] as u16)
         });
         if let Some(files) = &self.postcode_centroids {
-            // No centroid farther than its country's extent along either axis holds the point.
-            let reach_m = country_code.map_or(MAX_POSTCODE_EXTENT_M, |cc| postcode_extent_m(cc, ""));
+            // No centroid farther than its country's extent along either axis holds the point,
+            // the most expand_by_meters' box reaches. (A box across the antimeridian spans every
+            // longitude between its corners; it is taken only near its centroid here.)
+            let reach_m = country_code.map_or(MAX_POSTCODE_EXTENT_M, |cc| postcode_extent_m(cc, "")) * geography_box::BOX_REACH_FACTOR;
             let max_dist_sq = {
                 let dlat = reach_m / METRES_PER_DEGREE;
                 let metres_per_lng = METRES_PER_DEGREE * (lat.abs() + dlat).min(90.0).to_radians().cos();
@@ -2882,16 +2928,18 @@ impl Index {
                 // A centroid farther than the best so far can't win (nearer_postcode), so its
                 // postcode isn't read.
                 if best.as_ref().is_some_and(|&(best_d, _)| d > best_d) { return; }
-                // The box of expand_by_meters, which fuzzy_area_holds tests. A centroid of no
-                // country stands for one of the point's.
+                // The box of expand_by_meters. A centroid of no country stands for one of the
+                // point's.
                 let pc_country = match pc.country_code {
                     0 => country_code.unwrap_or([0, 0]),
                     cc => cc.to_be_bytes(),
                 };
-                if !fuzzy_area_holds(pc.lat, pc.lng, postcode_extent_m(pc_country, ""), lat, lng) { return; }
+                let (c_lat, c_lng) = (pc.lat as f64, pc.lng as f64);
+                if !geography_box::box_covers(c_lat, c_lng, postcode_extent_m(pc_country, ""), lat, lng) { return; }
                 let s = self.get_string(pc.postcode_id);
                 // A country's other postcode patterns may reach less far.
-                if !fuzzy_area_holds(pc.lat, pc.lng, postcode_extent_m(pc_country, &s), lat, lng) { return; }
+                let extent = postcode_extent_m(pc_country, &s);
+                if extent != postcode_extent_m(pc_country, "") && !geography_box::box_covers(c_lat, c_lng, extent, lat, lng) { return; }
                 if centroid_postcode_ok(&s) && nearer_postcode(d, &s, best.as_ref().map(|(bd, bs)| (*bd, &**bs))) {
                     *best = Some((d, s));
                 }
@@ -3117,6 +3165,9 @@ impl Index {
         // spurious house number on test points that sit on non-
         // residential ways.
         let mut house_number: Option<Cow<'_, str>> = None;
+        // The house a street that won takes its number from: Nominatim's answer is then the
+        // house, of the house's postcode.
+        let mut street_house: Option<(u32, AddrRecord)> = None;
         let mut road: Option<Cow<'_, str>> = None;
 
         // POI primary-feature candidate: Nominatim's
@@ -3329,9 +3380,10 @@ impl Index {
                     let r = 100.0_f64 / 6_371_000.0;
                     r * r
                 };
-                if let Some(addr_pt) = self.find_addr_on_way(lat, lng, way_idx, refine_max_sq) {
+                if let Some((id, addr_pt)) = self.find_addr_on_way(lat, lng, way_idx, refine_max_sq) {
                     if addr_pt.housenumber_id != NO_DATA {
                         house_number = Some(self.get_string(addr_pt.housenumber_id));
+                        street_house = Some((id, addr_pt));
                     }
                 }
                 // No address point: Nominatim falls back to TIGER in the US.
@@ -3383,13 +3435,17 @@ impl Index {
         let resolved_postcode = self.resolve_postcode(
             lat, lng,
             if poi_won_primary { None } else { street.as_ref().map(|(_, w, idx)| (*idx as usize, w)) },
-            if addr_won_primary { addr.as_ref().map(|(_, a, id)| (*id as usize, a)) } else { None },
+            if addr_won_primary {
+                addr.as_ref().map(|(_, a, id)| (*id as usize, a))
+            } else {
+                street_house.as_ref().map(|(id, a)| (*id as usize, a))
+            },
             if poi_won_primary { poi_primary.as_ref().map(|(_, p)| p) } else { None },
             // TIGER tier: only when the street itself won the primary.
             // Nominatim consults location_property_tiger only after the
             // street wins and no rank-30 housenumber row was found; a POI
             // or addr-point win routes the postcode through that feature.
-            if poi_won_primary || addr_won_primary { None } else {
+            if poi_won_primary || addr_won_primary || street_house.is_some() { None } else {
                 interp.as_ref().map(|(d, s, _, idx)| (*idx as usize, *d, &**s))
             },
             admin.postcode_area.clone(),
@@ -4265,7 +4321,7 @@ mod query_tests {
             .filter_map(|&(c_lat, c_lng, postcode, c_country)| {
                 let extent_m = postcode_extent_m(if c_country == [0, 0] { country.unwrap_or([0, 0]) } else { c_country }, postcode);
                 let d = postcode_files::distance(lat, lng, c_lat as f64, c_lng as f64);
-                (fuzzy_area_holds(c_lat, c_lng, extent_m, lat, lng) && centroid_postcode_ok(postcode)).then_some((d, postcode))
+                (geography_box::box_covers(c_lat as f64, c_lng as f64, extent_m, lat, lng) && centroid_postcode_ok(postcode)).then_some((d, postcode))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)))
             .map(|(_, postcode)| postcode)
@@ -4407,7 +4463,9 @@ mod query_tests {
     fn a_query_beside_the_antimeridian_answers_as_reading_every_centroid() {
         // Centroids a few hundred metres either side of the antimeridian, in the cells on both
         // sides, which are each other's neighbours; resolve_postcode measures across it the long
-        // way round, so none answers from the other side.
+        // way round, so none answers from the other side. Each box reaches across it, and
+        // ST_Envelope makes it of the longitudes between its corners the long way round, which
+        // leaves out the meridian: no centroid names a point on it.
         let centroids: Vec<(f32, f32, &str, [u8; 2])> = vec![
             (-16.75, 179.997, "F1", [0, 0]), (-16.751, 179.9995, "F2", [0, 0]), (-16.749, -179.998, "W1", [0, 0]),
             (-16.75, -179.9995, "W2", [0, 0]), (-16.76, 179.96, "F3", [0, 0]), (-16.74, -179.97, "W3", [0, 0]),
@@ -4427,7 +4485,8 @@ mod query_tests {
                 answered += usize::from(want.is_some());
             }
         }
-        assert_eq!(answered, 41 * 4);
+        assert_eq!(answered, 40 * 4);
+        assert_eq!(nearest_centroid(&centroids, -16.75, 180.0, None), None);
     }
 
     #[test]
@@ -4586,7 +4645,7 @@ mod query_tests {
                     let (c_lat, c_lng) = (c_lat as f32, c_lng as f32);
                     let extent_m = postcode_extent_m(if c_country == [0, 0] { country.unwrap_or([0, 0]) } else { c_country }, postcode);
                     let d = postcode_files::distance(lat, lng, c_lat as f64, c_lng as f64);
-                    (fuzzy_area_holds(c_lat, c_lng, extent_m, lat, lng) && centroid_postcode_ok(postcode)).then_some((d, postcode))
+                    (geography_box::box_covers(c_lat as f64, c_lng as f64, extent_m, lat, lng) && centroid_postcode_ok(postcode)).then_some((d, postcode))
                 })
                 .collect();
             found.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)));
@@ -6941,8 +7000,10 @@ mod query_path_tests {
             let at = |north_m, east_m| at_from(self.origin, north_m, east_m);
             let ring = vec![at(s, w), at(s, e), at(n, e), at(n, w), at(s, w)];
             let (lat_lo, lng_lo, lat_hi, lng_hi) = bounds(&ring);
+            // The builder gives a country to countries, and to postal areas the one their centroid
+            // lies in, which a test sets.
             let poly = AdminPolygon {
-                place_type_override, country_code: COUNTRY_CODE,
+                place_type_override, country_code: if admin_level == 2 { COUNTRY_CODE } else { 0 },
                 ..arc_fixture::record(self.string(name), admin_level, ((lat_hi - lat_lo) * (lng_hi - lng_lo)) as f32)
             };
             self.polygons.push((poly, ring));
@@ -7338,7 +7399,7 @@ mod query_path_tests {
     /// `max_m` of the point.
     fn house_number_on_way(index: &Index, north_m: f64, east_m: f64, way: u32, max_m: f64) -> Option<String> {
         let (lat, lng) = query_point(north_m, east_m);
-        index.find_addr_on_way(lat, lng, way, radians_sq(max_m)).map(|a| index.get_string(a.housenumber_id).into_owned())
+        index.find_addr_on_way(lat, lng, way, radians_sq(max_m)).map(|(_, a)| index.get_string(a.housenumber_id).into_owned())
     }
 
     /// The house number find_interp_on_way gives at the point for a street named `street`,
@@ -8366,8 +8427,10 @@ mod query_path_tests {
         assert_eq!(answer(29.0, -40.0), (some("Main Street"), some("5"), some("2020")));
         // House 9 has none either and Side Street runs nearer it than its own street does.
         assert_eq!(answer(59.0, 80.0), (some("Main Street"), some("9"), some("2121")));
-        // On the street: the street's, though house 7 gives the house number.
-        assert_eq!(answer(1.0, 0.0), (some("Main Street"), some("7"), some("2020")));
+        // On the street: house 7's, which gives the house number, as Nominatim answers with the
+        // house (reverse.py lookup_street_poi); on house 5's side, the street's.
+        assert_eq!(answer(1.0, 0.0), (some("Main Street"), some("7"), some("1010")));
+        assert_eq!(answer(1.0, -40.0), (some("Main Street"), some("5"), some("2020")));
         assert_eq!(answer(-999.0, 0.0), (some("Mill Lane"), None, some("2000")));
     }
 
@@ -8814,7 +8877,7 @@ mod query_path_tests {
                    (Some("7"), Some("Main Street"), Some("1010")));
         let on_street = address_at(&index, 1.0, 0.0);
         assert_eq!((on_street["house_number"].as_str(), on_street["road"].as_str(), on_street["postcode"].as_str()),
-                   (Some("7"), Some("Main Street"), Some("2020")));
+                   (Some("7"), Some("Main Street"), Some("1010")));
     }
 
     #[test]

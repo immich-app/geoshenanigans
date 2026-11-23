@@ -255,6 +255,17 @@ impl AdminGeometry {
         joined.rings.iter().map(|r| r.iter().map(lng_lat).collect()).collect()
     }
 
+    /// `poly`'s centroid as (lat, lng) degrees: ST_Centroid of its rings on lon/lat, the outer
+    /// ring's centre weighted by its area less its holes'. None without rings, with a malformed
+    /// ring block or of no area.
+    pub fn centroid(&self, poly: &AdminPolygon) -> Option<(f64, f64)> {
+        let block = self.ring_block(poly)?;
+        let mut c = Centroid { arcs: self.arcs(), origin: None, ring: RingSums::default(), ends: None, rings: 0, sums: RingSums::default() };
+        walk_rings(block, &mut c)?;
+        let (lng0, lat0) = c.origin?;
+        (c.sums.area > 0.0).then(|| (lat0 + c.sums.y / c.sums.area, lng0 + c.sums.x / c.sums.area))
+    }
+
     /// `poly`'s point on surface (the builder's interior_point) as (lat, lng); none without rings.
     pub fn point_on_surface(&self, poly: &AdminPolygon) -> Option<(f32, f32)> {
         self.point_on_surface_with(poly, &mut Vec::new())
@@ -383,6 +394,82 @@ impl AdminGeometry {
 }
 
 /// Joins each ring's arcs, reversed ones flipped, each junction vertex once.
+/// A ring's shoelace sums over its edges, in degrees from the block's first vertex: twice its
+/// signed area (the sum of each edge's cross product) and the sums of (x_i + x_i+1) and
+/// (y_i + y_i+1) times each cross product, which over 3 times the first sum give its centre.
+#[derive(Clone, Copy, Default)]
+struct RingSums {
+    area: f64,
+    x: f64,
+    y: f64,
+}
+
+impl RingSums {
+    fn edge(&mut self, a: (f64, f64), b: (f64, f64)) {
+        let cross = a.0 * b.1 - b.0 * a.1;
+        self.area += cross;
+        self.x += (a.0 + b.0) * cross;
+        self.y += (a.1 + b.1) * cross;
+    }
+}
+
+/// AdminGeometry::centroid's walk: each ring's sums, and over all rings each ring's centre times
+/// twice its area, added for the outer ring and taken off for a hole, and twice the area left.
+struct Centroid<'a> {
+    arcs: ArcFiles<'a>,
+    /// The first vertex, as (lng, lat) degrees, which the sums are taken from.
+    origin: Option<(f64, f64)>,
+    ring: RingSums,
+    /// The ring's first and last vertex so far, in ring order.
+    ends: Option<((f64, f64), (f64, f64))>,
+    rings: usize,
+    sums: RingSums,
+}
+
+impl RingVisitor for Centroid<'_> {
+    fn wants_chunk(&mut self, _: &ChunkBox) -> bool {
+        true
+    }
+
+    fn arc(&mut self, r: ArcRef) -> Option<()> {
+        // An arc walked backwards crosses each of its edges the other way: its sums change sign.
+        let (mut sums, mut first, mut prev) = (RingSums::default(), None, None::<(f64, f64)>);
+        let origin = &mut self.origin;
+        arc_vertices(self.arcs.block(r.slot)?, |v| {
+            let (lat, lng) = v.degrees();
+            let (lng0, lat0) = *origin.get_or_insert((lng, lat));
+            let p = (lng - lng0, lat - lat0);
+            if let Some(a) = prev {
+                sums.edge(a, p);
+            }
+            first.get_or_insert(p);
+            prev = Some(p);
+        })?;
+        let (Some(first), Some(last)) = (first, prev) else { return Some(()) };
+        let (sign, from, to) = if r.reversed { (-1.0, last, first) } else { (1.0, first, last) };
+        self.ring.area += sign * sums.area;
+        self.ring.x += sign * sums.x;
+        self.ring.y += sign * sums.y;
+        self.ends = Some((self.ends.map_or(from, |(start, _)| start), to));
+        Some(())
+    }
+
+    fn ring_end(&mut self) -> Option<()> {
+        let mut ring = std::mem::take(&mut self.ring);
+        if let Some((start, end)) = self.ends.take() {
+            ring.edge(end, start);
+        }
+        if ring.area != 0.0 {
+            let (weight, sign) = (ring.area.abs(), if self.rings == 0 { 1.0 } else { -1.0 });
+            self.sums.area += sign * weight;
+            self.sums.x += sign * weight * ring.x / (3.0 * ring.area);
+            self.sums.y += sign * weight * ring.y / (3.0 * ring.area);
+        }
+        self.rings += 1;
+        Some(())
+    }
+}
+
 struct RingJoiner<'a> {
     arcs: ArcFiles<'a>,
     rings: Vec<Vec<PointE7>>,

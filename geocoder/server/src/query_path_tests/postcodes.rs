@@ -39,18 +39,61 @@ fn a_postal_area_round_the_point_names_it_before_a_nearer_centroid() {
 }
 
 #[test]
-fn of_postal_areas_round_the_point_the_smallest_names_it() {
-    // A commune's postal area inside a larger one of its department's code: the smaller names the
-    // point. In Ille-et-Vilaine the centroid of 53540, across the departments' border, lies nearer
-    // than any of 35370, and Nominatim names the area round the point, 35370.
+fn of_postal_areas_round_the_point_the_one_whose_centroid_is_nearest_names_it() {
+    // get_nearest_postcode orders the postal areas covering the point by the distance from their
+    // centroids (utils.sql: ORDER BY osm_id is null, ST_Distance(p.centroid, geom)): round a point
+    // 1,200 m east of the middle of 35000 and 400 m west of the middle of 35370, which is inside
+    // it, 35370 names it, and 35000 names one 300 m east of its middle, if 35370 holds it too.
     let rennes = (48.02, -1.18);
     let index = country_at(rennes, b"FR")
-        .boundary("35000", POSTCODE_AREA_LEVEL, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
-        .boundary("35370", POSTCODE_AREA_LEVEL, 0, (-4000.0, -4000.0, 4000.0, 4000.0))
-        .centroid("53540", 0.0, 7000.0)
+        .boundary("35000", POSTCODE_AREA_LEVEL, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+        .boundary("35370", POSTCODE_AREA_LEVEL, 0, (-800.0, 0.0, 800.0, 3200.0))
+        .centroid("53540", 0.0, 1300.0)
         .load();
-    assert_eq!(postcode_from(&index, rennes, 0.0, 3000.0), "35370");
-    assert_eq!(postcode_from(&index, rennes, 0.0, 6000.0), "35000");
+    assert_eq!(postcode_from(&index, rennes, 0.0, 1200.0), "35370");
+    assert_eq!(postcode_from(&index, rennes, 0.0, 300.0), "35000");
+    assert_eq!(postcode_from(&index, rennes, 0.0, -2000.0), "35000");
+}
+
+#[test]
+fn a_postal_area_of_no_valid_postcode_leaves_the_point_to_another_or_a_centroid() {
+    // Nominatim makes postcode areas only of postcodes its country takes (postcodes.py
+    // _update_postcode_areas): a boundary=postal_code tagged 00000 round the point names
+    // nothing, and the area round it or else the nearest centroid does.
+    let berlin = (52.52, 13.405);
+    let index = country_at(berlin, b"DE")
+        .boundary("00000", POSTCODE_AREA_LEVEL, 0, (-300.0, -300.0, 300.0, 300.0))
+        .centroid("10178", 0.0, 500.0)
+        .load();
+    assert_eq!(postcode_from(&index, berlin, 0.0, 0.0), "10178");
+    let index = country_at(berlin, b"DE")
+        .boundary("00000", POSTCODE_AREA_LEVEL, 0, (-300.0, -300.0, 300.0, 300.0))
+        .boundary("10179", POSTCODE_AREA_LEVEL, 0, (-2000.0, -2000.0, 2000.0, 2000.0))
+        .centroid("10178", 0.0, 500.0)
+        .load();
+    assert_eq!(postcode_from(&index, berlin, 0.0, 0.0), "10179");
+}
+
+#[test]
+fn a_postal_area_of_another_country_names_no_point() {
+    // Büsingen am Hochrhein, a German exclave in Switzerland: get_nearest_postcode takes the
+    // postcode areas of the point's country only (p.country_code = country), and a postal area's
+    // country is the one its centroid lies in. A Swiss area round the point leaves it to the
+    // German centroid.
+    let busingen = (47.697, 8.69);
+    let mut dataset = country_at(busingen, b"DE");
+    dataset.boundary("8238", POSTCODE_AREA_LEVEL, 0, (-1000.0, -1000.0, 1000.0, 1000.0))
+        .centroid("78266", 0.0, 400.0);
+    dataset.polygons.last_mut().unwrap().0.country_code = u16::from_be_bytes(*b"CH");
+    assert_eq!(postcode_from(&dataset.load(), busingen, 0.0, 0.0), "78266");
+    // One of the point's country, or of a country not known, names it.
+    for code in [*b"DE", [0, 0]] {
+        let mut dataset = country_at(busingen, b"DE");
+        dataset.boundary("78266", POSTCODE_AREA_LEVEL, 0, (-1000.0, -1000.0, 1000.0, 1000.0))
+            .centroid("79999", 0.0, 100.0);
+        dataset.polygons.last_mut().unwrap().0.country_code = u16::from_be_bytes(code);
+        assert_eq!(postcode_from(&dataset.load(), busingen, 0.0, 0.0), "78266");
+    }
 }
 
 #[test]
@@ -107,4 +150,33 @@ fn a_centroid_of_another_country_names_no_point() {
     dataset.centroid("48599", 0.0, 3000.0).centroid("7586 AA", 0.0, -200.0);
     dataset.centroids.last_mut().unwrap().country_code = u16::from_be_bytes(*b"NL");
     assert_eq!(postcode_from(&dataset.load(), origin, 0.0, 0.0), "48599");
+}
+
+#[test]
+fn a_house_the_street_that_won_has_near_names_its_own_postcode() {
+    // Nominatim answers with the house nearest the point on the street that won, within 0.001°
+    // (reverse.py _find_housenumber_for_street), and the house's postcode is its own. Here the
+    // street is nearest the point, the house 30 m off has NG4 4AE and the centroid nearest the
+    // point is NG4 4AF's.
+    let gedling = (52.98, -1.07);
+    let index = country_at(gedling, b"GB")
+        .street("Yew Tree Lane", &[(0.0, -100.0), (0.0, 100.0)])
+        .address("3", 30.0, 0.0)
+        .addr_postcode("NG4 4AE")
+        .centroid("NG4 4AF", 5.0, 0.0)
+        .load();
+    let address = address_from(&index, gedling, 2.0, 0.0);
+    assert_eq!(address["house_number"], "3");
+    assert_eq!(address["postcode"], "NG4 4AE");
+}
+
+#[test]
+fn a_centroid_s_box_is_the_envelope_of_its_buffer_on_the_ellipsoid() {
+    // expand_by_meters buffers the centroid on the geography (geography_box): at 20° N a degree
+    // of latitude is 110,704 m, so a point 0.2255° north of a US centroid, 24,960 m off, is
+    // inside its 25 km box, though 0.2255 degrees of 111,320 m are 25,103 m.
+    let origin = (20.0, -75.4);
+    let index = country_at(origin, b"US").centroid("00601", 0.0, 0.0).load();
+    assert_eq!(postcode_from(&index, origin, 0.2255 * METRES_PER_DEGREE, 0.0), "00601");
+    assert_eq!(postcode_from(&index, origin, 0.2262 * METRES_PER_DEGREE, 0.0), serde_json::Value::Null);
 }
