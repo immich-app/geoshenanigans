@@ -215,6 +215,7 @@ covers.
 
 A web-based test tool is included for validating results:
 
+- Compare up to 4 datasets side by side (a preset, or a pick of POI tier, mode and boundary precision), the fields they disagree on marked
 - Click anywhere on the map to reverse geocode
 - Upload photos (EXIF GPS extracted in browser)
 - Paste coordinates (single or batch)
@@ -224,6 +225,7 @@ A web-based test tool is included for validating results:
 Run with Docker:
 ```bash
 cd geocoder/test-portal
-docker compose up --build
-# Open http://localhost:3002/test (the minimal-dataset server for comparison is on :3001)
+docker compose up --build --remove-orphans
+# Open http://localhost:3002/test (with street addresses beside the smallest
+# dataset; ?d=<dataset> per column picks others, e.g. ?d=with-addresses&d=immich-recommended)
 ```

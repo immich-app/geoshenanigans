@@ -325,8 +325,9 @@ The data is owed credit, and the dataset carries it in two places:
 
 A client shows the entries of the `attribution.json` and
 `poi_attribution.json` it holds wherever it credits map data; the test
-portal's page shows those of the datasets its servers loaded
-(`/test/credits`). Every reverse answer also carries Nominatim's `licence`
+portal's page shows the build's `attribution` list, which query-portal's
+`/datasets` passes on, and query-server's `/test/credits` gives those of the
+datasets it loaded. Every reverse answer also carries Nominatim's `licence`
 string (README.md).
 
 ## Client Decision Tree

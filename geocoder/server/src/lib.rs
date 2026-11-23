@@ -5453,7 +5453,7 @@ pub fn dir_credits(dir: &str) -> Vec<serde_json::Value> {
     credits
 }
 
-/// `credits` as the test page shows them (main.rs /test/credits): a disclosure whose summary
+/// `credits` as query-server's /test/credits gives them (main.rs): a disclosure whose summary
 /// names each source, and a paragraph of each, its text linked to its URL and its licence to the
 /// licence's, then its notices, all as text. A URL of no http(s) scheme links nothing. No
 /// credits, no disclosure.
