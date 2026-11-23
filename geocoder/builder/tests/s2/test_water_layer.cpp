@@ -1132,24 +1132,35 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     write(build(more, two), three, two);
     const std::string fixture_dir = std::string(GEOCODER_TESTDATA_DIR) + "/water_dir";
     const bool rewrite = std::getenv("GEOCODER_WRITE_TESTDATA") != nullptr;
+    // Every day's client files, each day all ten, before any fixture dir is
+    // compared or written.
+    const std::set<std::string> client = {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin",
+                                          "admin_cells.bin", "admin_entries.bin", "strings_core.bin",
+                                          "strings_layout.json", "water_meta.json", "attribution.json"};
     std::map<std::string, std::map<std::string, std::vector<char>>> days;
     for (const auto& [day, dir] : {std::pair<std::string, std::string>{"day1", one}, {"day2", two}, {"day3", three}}) {
+        std::set<std::string> names;
         for (const auto& [name, bytes] : tree(dir + "/water/all/exact"))
-            if (name.size() <= 8 || name.compare(name.size() - 8, 8, ".osm_ids") != 0) days[day][name] = bytes;
-        CHECK_EQ(days[day].size(), size_t(10));
+            if (name.size() <= 8 || name.compare(name.size() - 8, 8, ".osm_ids") != 0) {
+                days[day][name] = bytes;
+                names.insert(name);
+            }
+        REQUIRE(names == client);
+    }
+    for (const auto& [day, files] : days) {
         // The day's fixture dir is those files and no other: the patch tests
         // copy it whole.
         const std::string day_dir = fixture_dir + "/" + day;
         if (rewrite) {
             fs::remove_all(day_dir);
-            for (const auto& [name, bytes] : days[day]) {
+            for (const auto& [name, bytes] : files) {
                 const std::string path = day_dir + "/" + name;
                 fs::create_directories(fs::path(path).parent_path());
                 std::ofstream(path, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
             }
         }
         REQUIRE(fs::is_directory(day_dir));
-        CHECK(tree(day_dir) == days[day]);
+        CHECK(tree(day_dir) == files);
     }
     for (const char* f : {"water_meta.json", "attribution.json"}) {
         CHECK(days["day1"][f] == days["day2"][f]);
