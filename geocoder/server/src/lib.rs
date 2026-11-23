@@ -2203,7 +2203,8 @@ impl Index {
             if let Some(c) = c { result.ranks.set(field, c.rank); }
         }
         let winners = best_by_field.each_ref().map(|c| c.as_ref().map(|c| c.index));
-        result.unlabelled = unlabelled_rows(&ranked, &slots, &winners).into_iter()
+        let same_outline = |a: &AdminPolygon, b: &AdminPolygon| self.admin_geometry.same_outline(a, b);
+        result.unlabelled = unlabelled_rows(&ranked, &slots, &winners, same_outline).into_iter()
             .map(|k| (ranked[k].rank_address, self.get_string(ranked[k].poly.name_id)))
             .collect();
         if let Some(c) = best_by_field[0].take() {
@@ -2763,7 +2764,8 @@ impl Index {
             if let Some(c) = c { result.ranks.set(field, c.rank); }
         }
         let winners = best_by_field.each_ref().map(|c| c.as_ref().map(|c| c.index));
-        result.unlabelled = unlabelled_rows(&ranked, &slots, &winners).into_iter()
+        let same_outline = |a: &AdminPolygon, b: &AdminPolygon| self.admin_geometry.same_outline(a, b);
+        result.unlabelled = unlabelled_rows(&ranked, &slots, &winners, same_outline).into_iter()
             .map(|k| (ranked[k].rank_address, self.get_string(ranked[k].poly.name_id)))
             .collect();
         if let Some(c) = best_by_field[0].take() {
@@ -5706,17 +5708,17 @@ pub fn rank_bits(ranked: &[RankedPoly]) -> u32 {
 /// Nominatim's address has a row a rank and keeps the first row of each label, and its
 /// display_name joins every row (format_json.py, results.py). `slots[k]` is the field ranked[k]
 /// would fill and `winners[f]` the polygon filling field f. Of each rank no field's polygon has,
-/// the smallest polygon that lost its field, unless it has the outline of the one that took it:
-/// that is one place tagged twice, as a boundary repeating its parent's wikidata and geometry,
-/// which Nominatim takes out of addresses (placex_triggers.sql:895-899). Indices into `ranked`,
-/// the finest rank first.
-pub fn unlabelled_rows(ranked: &[RankedPoly], slots: &[Option<usize>], winners: &[Option<usize>]) -> Vec<usize> {
+/// the smallest polygon that lost its field, unless it has the outline of the one that took it
+/// (`same_outline`): that is one place tagged twice, as a boundary repeating its parent's
+/// wikidata and geometry, which Nominatim takes out of addresses (placex_triggers.sql:884-899);
+/// the records hold no wikidata. Indices into `ranked`, the finest rank first.
+pub fn unlabelled_rows(ranked: &[RankedPoly], slots: &[Option<usize>], winners: &[Option<usize>], same_outline: impl Fn(&AdminPolygon, &AdminPolygon) -> bool) -> Vec<usize> {
     let held = winners.iter().flatten().fold(0u32, |bits, &w| bits | 1u32.checked_shl(ranked[w].rank_address as u32).unwrap_or(0));
     let mut by_rank: [Option<usize>; u32::BITS as usize] = [None; u32::BITS as usize];
     for (k, (r, slot)) in ranked.iter().zip(slots).enumerate() {
         let Some(winner) = slot.and_then(|f| winners[f]) else { continue };
         let rank = r.rank_address as usize;
-        if winner == k || rank >= by_rank.len() || held & 1 << rank != 0 || ranked[winner].poly.area == r.poly.area { continue; }
+        if winner == k || rank >= by_rank.len() || held & 1 << rank != 0 || same_outline(&ranked[winner].poly, &r.poly) { continue; }
         if by_rank[rank].is_none_or(|b| r.poly.area < ranked[b].poly.area) {
             by_rank[rank] = Some(k);
         }

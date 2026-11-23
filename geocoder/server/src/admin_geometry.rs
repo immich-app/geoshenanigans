@@ -182,6 +182,10 @@ impl SurfaceMemo {
     }
 }
 
+/// How far apart, in degrees, the centroids of one outline can lie (`AdminGeometry::same_outline`):
+/// a tenth of a millimetre.
+const OUTLINE_SLACK_DEG: f64 = 1e-9;
+
 /// The files `AdminGeometry::load` maps, by name.
 pub const ADMIN_GEOMETRY_FILES: [&str; 3] = ["admin_rings.bin", "arc_index.bin", "arc_vertices.bin"];
 
@@ -264,6 +268,21 @@ impl AdminGeometry {
         walk_rings(block, &mut c)?;
         let (lng0, lat0) = c.origin?;
         (c.sums.area > 0.0).then(|| (lat0 + c.sums.y / c.sums.area, lng0 + c.sums.x / c.sums.area))
+    }
+
+    /// Whether `a` and `b` have one outline: the same area, and the same ring block or centroids
+    /// within OUTLINE_SLACK_DEG of each other, the most the sums' rounding moves one when its
+    /// rings start at another vertex. False when either has no rings.
+    pub fn same_outline(&self, a: &AdminPolygon, b: &AdminPolygon) -> bool {
+        if a.area != b.area {
+            return false;
+        }
+        let (Some(block_a), Some(block_b)) = (self.ring_block(a), self.ring_block(b)) else { return false };
+        if block_a == block_b {
+            return true;
+        }
+        let near = |p: f64, q: f64| (p - q).abs() <= OUTLINE_SLACK_DEG;
+        matches!((self.centroid(a), self.centroid(b)), (Some(p), Some(q)) if near(p.0, q.0) && near(p.1, q.1))
     }
 
     /// `poly`'s point on surface (the builder's interior_point) as (lat, lng); none without rings.
