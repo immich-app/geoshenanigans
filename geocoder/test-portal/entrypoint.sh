@@ -11,9 +11,10 @@ QUALITY="${QUALITY:-simplified}"
 # all (340k, 670 MB).  All by default.
 POI_TIER="${POI_TIER:-all}"
 # Minimal mode: admin-only with simplified boundaries + place nodes
-# (city/town/village/hamlet/...).  Skips streets, addresses,
-# interpolation, postcodes, postcode areas, POI data, and all string
-# tiers except strings_core (which covers admin + place names).
+# (city/town/village/hamlet/...) + the US postcode grid.  Skips
+# streets, addresses, interpolation, postcode centroids, postcode
+# areas, POI data, and all string tiers except strings_core (which
+# covers admin + place names).
 # Smallest possible deployable that resolves admin hierarchy + GeoNames
 # cities500-equivalent detail.
 MINIMAL="${MINIMAL:-0}"

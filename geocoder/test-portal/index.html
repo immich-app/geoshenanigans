@@ -858,9 +858,9 @@ function updateNominatimBtn() {
 }
 
 // Minimal-dataset side-by-side lookup — queries the second server
-// on port 3001 (no postcodes, no POIs, admin + streets + addresses
-// + place nodes only).  Off by default to avoid CORS noise when the
-// minimal server isn't running.
+// on port 3001 (admin + place nodes + US postcodes from the postcode
+// grid; no streets, addresses, other postcodes or POIs).  Off by
+// default to avoid CORS noise when the minimal server isn't running.
 let minimalEnabled = localStorage.getItem('minimal_enabled') === '1';
 function toggleMinimal() {
   minimalEnabled = !minimalEnabled;
