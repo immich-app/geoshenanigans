@@ -26,6 +26,13 @@ Class of(const char* natural, const char* water_tag = nullptr, const char* water
     return classify(t);
 }
 
+// A water_meta.json of `kinds`, laid out as meta_json lays it out.
+std::string meta(const std::vector<MetaType>& kinds) {
+    std::string out = "{\"types\": [\n";
+    for (size_t k = 0; k < kinds.size(); k++) out += (k ? ",\n" : "") + meta_entry(kinds[k]);
+    return out + "\n]}\n";
+}
+
 std::string kind_of(const Class& c, const TypeTable& table) {
     const MetaType k = table.kind(c.code ? c.code : table.verbatim_code(c.verbatim));
     return k.cls + "/" + k.type + " " + std::to_string(k.rank);
@@ -138,11 +145,6 @@ TEST(water_meta_json_round_trips_quotes_and_controls_and_refuses_what_it_did_not
 TEST(water_meta_json_of_a_code_twice_or_out_of_order_or_a_value_twice_is_no_table) {
     // Kinds as meta_json writes them: each code once, ascending, each value
     // outside the fixed table once.
-    auto meta = [](const std::vector<MetaType>& kinds) {
-        std::string out = "{\"types\": [\n";
-        for (size_t k = 0; k < kinds.size(); k++) out += (k ? ",\n" : "") + meta_entry(kinds[k]);
-        return out + "\n]}\n";
-    };
     const MetaType lake{code::kLake, "water", "lake", 20};
     const MetaType a{32769, "water", "a", 22}, b{32770, "water", "b", 22};
     CHECK(parse_meta_json(meta({lake, a, b})).has_value());
@@ -151,6 +153,20 @@ TEST(water_meta_json_of_a_code_twice_or_out_of_order_or_a_value_twice_is_no_tabl
     CHECK(!parse_meta_json(meta({a, lake})).has_value());
     CHECK(!parse_meta_json(meta({lake, lake})).has_value());
     CHECK(!parse_meta_json(meta({lake, a, {32770, "water", "a", 22}})).has_value());
+}
+
+TEST(water_meta_json_of_a_verbatim_kind_not_class_water_of_its_rank_or_of_a_code_past_the_fixed_table_is_no_table) {
+    // A verbatim code is the water class's, rank kVerbatimRank; no code
+    // lies between the fixed table and kVerbatimBase.
+    const MetaType last{kFixedKindCount, kFixedKinds[kFixedKindCount - 1].cls, kFixedKinds[kFixedKindCount - 1].type,
+                        kFixedKinds[kFixedKindCount - 1].rank};
+    const MetaType a{32769, "water", "a", kVerbatimRank};
+    CHECK(parse_meta_json(meta({last, a})).has_value());
+    CHECK(parse_meta_json(meta({{kVerbatimBase, "water", "a", kVerbatimRank}})).has_value());
+    CHECK(!parse_meta_json(meta({last, {32769, "natural", "a", kVerbatimRank}})).has_value());
+    CHECK(!parse_meta_json(meta({last, {32769, "water", "a", 20}})).has_value());
+    CHECK(!parse_meta_json(meta({{uint16_t(kFixedKindCount + 1), "water", "a", kVerbatimRank}})).has_value());
+    CHECK(!parse_meta_json(meta({{uint16_t(kVerbatimBase - 1), "water", "a", kVerbatimRank}})).has_value());
 }
 
 TEST(the_major_tier_takes_100_km2_and_wikidata_rivers_of_5_and_keeps_its_own_at_90_percent) {
