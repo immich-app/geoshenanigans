@@ -106,7 +106,8 @@ pub struct RegionState {
     /// share one inner Mutex; only the leader actually downloads, the
     /// rest wait on the lock and find the region already loaded.
     pub region_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    pub http: reqwest::Client,
+    /// The client of downloads, built by the first (`http`).
+    http: tokio::sync::OnceCell<reqwest::Client>,
 }
 
 impl RegionState {
@@ -126,11 +127,29 @@ impl RegionState {
             configurations: Mutex::new(None),
             configurations_ttl: CONFIGURATIONS_TTL,
             region_locks: Mutex::new(HashMap::new()),
-            http: reqwest::Client::builder()
-                .user_agent("geocoder-server/0.1")
-                .build()
-                .expect("failed to build reqwest client"),
+            http: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// The client of downloads. Building one loads the system's CA
+    /// certificates, which a host may lack, so the first download builds
+    /// it and a server without them still serves the regions on its disk.
+    /// A client that can't be built fails the download, naming why, and
+    /// the next download tries again.
+    async fn http(&self) -> Result<&reqwest::Client, DownloadError> {
+        self.http
+            .get_or_try_init(|| async {
+                reqwest::Client::builder().user_agent("geocoder-server/0.1").build().map_err(|e| {
+                    let mut why = e.to_string();
+                    let mut source = std::error::Error::source(&e);
+                    while let Some(s) = source {
+                        why += &format!(": {s}");
+                        source = s.source();
+                    }
+                    DownloadError::Http(format!("building the client: {why}"))
+                })
+            })
+            .await
     }
 
     /// Replace the active configuration. Persists to disk and kicks
@@ -189,9 +208,10 @@ impl RegionState {
         }
 
         let cfg = self.config.lock().await.clone();
+        let http = self.http().await?;
         // Resolve latest build date via latest.json.
         let latest_url = format!("{}/builds/latest.json", cfg.base_url.trim_end_matches('/'));
-        let latest: serde_json::Value = self.http.get(&latest_url).send().await
+        let latest: serde_json::Value = http.get(&latest_url).send().await
             .map_err(|e| DownloadError::Http(format!("{}: {}", latest_url, e)))?
             .error_for_status().map_err(|e| DownloadError::Http(format!("{}: {}", latest_url, e)))?
             .json().await
@@ -200,7 +220,7 @@ impl RegionState {
             .ok_or_else(|| DownloadError::Http(format!("{}: missing 'latest' field", latest_url)))?;
 
         let cfg_url = format!("{}/builds/{}/configurations.json", cfg.base_url.trim_end_matches('/'), date);
-        let configurations: Configurations = self.http.get(&cfg_url).send().await
+        let configurations: Configurations = http.get(&cfg_url).send().await
             .map_err(|e| DownloadError::Http(format!("{}: {}", cfg_url, e)))?
             .error_for_status().map_err(|e| DownloadError::Http(format!("{}: {}", cfg_url, e)))?
             .json().await
@@ -262,7 +282,7 @@ impl RegionState {
 
         let region_owned = region.to_string();
         download_region(
-            &self.http,
+            self.http().await?,
             &cfg.base_url,
             &configurations,
             &sel,
@@ -377,6 +397,56 @@ mod tests {
         assert_eq!(got, Err("this build has no quality \"q2.5\"; it offers quality: exact, simplified".to_string()));
         assert_eq!(bucket.files_served(), 0);
         assert!(!root.path().join("europe").exists());
+    }
+
+    /// Set for the process `a_host_without_ca_certificates_starts_and_its_downloads_fail_naming_why`
+    /// starts, which runs `without_ca_certificates` with no CA store.
+    const NO_CA_STORE: &str = "GEOCODER_TEST_NO_CA_STORE";
+
+    // A host without CA certificates (an image without a CA bundle) builds
+    // no HTTP client. A server there still starts and serves the regions on
+    // its disk; each download fails naming why, fetching nothing, and the
+    // first once the certificates are there builds it. The case runs in a
+    // process of its own, for SSL_CERT_FILE and SSL_CERT_DIR, which name the
+    // CA store in place of the system's, are the process's.
+    #[test]
+    fn a_host_without_ca_certificates_starts_and_its_downloads_fail_naming_why() {
+        let empty = ScratchDir::new();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["region_state::tests::without_ca_certificates", "--exact", "--ignored", "--test-threads=1"])
+            .env("SSL_CERT_FILE", empty.path().join("none.pem"))
+            .env("SSL_CERT_DIR", empty.path())
+            .env(NO_CA_STORE, "1")
+            .output()
+            .unwrap();
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && stdout.contains(" 1 passed;"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[tokio::test]
+    #[ignore = "run by a_host_without_ca_certificates_starts_and_its_downloads_fail_naming_why"]
+    async fn without_ca_certificates() {
+        if std::env::var_os(NO_CA_STORE).is_none() {
+            return;
+        }
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (root, state) = state_for(bucket.url.clone(), Duration::from_secs(3600)).await;
+        let state = Arc::new(state);
+
+        let got = state.ensure_loaded("europe").await.map_err(|e| e.to_string());
+
+        assert_eq!(
+            got,
+            Err("HTTP error: building the client: builder error: unexpected error: No CA certificates were loaded from the system".to_string())
+        );
+        assert_eq!(bucket.files_served(), 0);
+        assert!(!root.path().join("europe").exists());
+
+        // Safe to change: the process runs this case alone, on a runtime of one thread.
+        std::env::remove_var("SSL_CERT_FILE");
+        std::env::remove_var("SSL_CERT_DIR");
+        state.ensure_configurations().await.unwrap();
     }
 
     // With the build's manifest at hand, a configuration naming a value it
@@ -500,7 +570,7 @@ mod tests {
         let state = Arc::new(state);
         let sel = state.get_configuration().await.selection("europe");
         let whole = ScratchDir::new();
-        download_region(&state.http, &bucket.url, &bucket.manifest, &sel, whole.path(), |_| {}).await.unwrap();
+        download_region(state.http().await.unwrap(), &bucket.url, &bucket.manifest, &sel, whole.path(), |_| {}).await.unwrap();
         let (want, all) = (tree(&whole.path().join("europe")), bucket.files_served());
         let unit = crate::downloader::resolve_files(&bucket.manifest, &sel).unwrap().paths.iter()
             .find_map(|p| bucket.manifest.files.get(p)?.unit.clone())

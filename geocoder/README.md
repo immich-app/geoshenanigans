@@ -76,7 +76,11 @@ lands in it: `admin` mode, `simplified` boundaries and no POIs unless an admin s
 another selection with `PUT /admin/configuration` (a JSON body of `base_url`,
 `mode`, `quality`, `poi_tier` and the regions to `preload`). A value the build
 doesn't offer fails each download, naming those it does, and the PUT is refused
-with them (400) when the server has the build's manifest at hand. A continent
+with them (400) when the server has the build's manifest at hand. Downloads
+check the bucket's certificate against the system's CA store (`ca-certificates`
+on Debian; `SSL_CERT_FILE` or `SSL_CERT_DIR` name another): on a host without
+one the server starts and serves what its data dir holds, and each download
+fails, naming why. A continent
 dir keeps a ledger of what each of its files holds, `.file_sha256` (a line
 `<name> <sha256>` each, `-` while unknown), and a download skips a file only
 where the ledger names the build's sha256 for it. It removes the files its
