@@ -3814,7 +3814,7 @@ static int run(int argc, char* argv[]) {
                                 }
                                 // A place area keeps its own place tag beside the
                                 // linked node's type, which labels it: placex_update
-                                // ranks it by its own (linked_place_area_rank).
+                                // ranks it by its own (the server's place_area_ranks).
                                 const uint8_t own_place_type =
                                     rel.admin_level == 15 && pto != rel.fallback_place_type ? rel.fallback_place_type : 0;
 
@@ -4230,8 +4230,7 @@ static int run(int argc, char* argv[]) {
             std::vector<bool> in_minimal(data.admin_polygons.size());
             for (size_t p = 0; p < in_minimal.size(); p++)
                 in_minimal[p] = admin_minimal_keeps(data.admin_polygons[p].admin_level,
-                                                    data.admin_polygons[p].place_type_override,
-                                                    data.admin_polygons[p].own_place_type);
+                                                    data.admin_polygons[p].place_type_override);
             const AdminArcs arcs = build_admin_arcs(data.admin_exact_rings, in_minimal,
                                                     cfg.prev_output_dir.empty() ? "" : cfg.prev_output_dir + "/planet",
                                                     num_threads);
