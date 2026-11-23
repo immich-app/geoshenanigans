@@ -1368,6 +1368,54 @@ TEST(a_water_multipolygon_that_is_a_rank_30_poi_is_written_as_that_poi_and_answe
     if (!says(answers[0], "Badebucht Testdorf")) std::printf("    %s\n", answers[0].c_str());
 }
 
+// A named water area of highway=footway is a street in Nominatim, and the
+// server answers its own name inside it, but not one of footway=sidewalk,
+// crossing, link or traffic_aisle, which Nominatim takes as no main tag
+// (presets.lua filter_footways): that one is the water it is, out of the
+// primary slot, though it links Teststrasse as its parent street. Each area
+// is 60 m by 89 m across Teststrasse, which runs 6 m south of the point
+// asked inside it, nearer than its outline.
+TEST(a_water_area_of_a_sidewalk_crossing_link_or_traffic_aisle_footway_answers_no_road_of_its_own) {
+    const ScratchDir root("water-footway-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    const int32_t lat0 = 470000000, lng0 = 80000000, south = lat0 + 1396000, north = lat0 + 1404000;
+    const char* names[] = {"Uferweg Testdorf", "Seesteig Testdorf", "Seefurt Testdorf", "Seegang Testdorf",
+                           "Seegasse Testdorf"};
+    const char* footways[] = {nullptr, "sidewalk", "crossing", "link", "traffic_aisle"};
+    std::vector<TestObject> water;
+    std::vector<std::pair<double, double>> points;
+    for (int k = 0; k < 5; k++) {
+        std::vector<std::pair<std::string, std::string>> tags = {{"area", "yes"}};
+        if (footways[k]) tags.push_back({"footway", footways[k]});
+        tags.insert(tags.end(), {{"highway", "footway"}, {"name", names[k]}, {"natural", "water"}});
+        const int32_t west = lng0 + 1420000 + 15000 * k;
+        add_rectangle(water, 4040 + k, 990 + 4 * k, south, west, north, west + 8000, tags);
+        points.push_back({47.14005, (west + 4000) / 1e7});
+    }
+    write_fixture_with(pbf, water);
+    const std::string out = root.path() + "/single";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
+
+    const std::vector<PoiRecord> pois = poi_records_in(tree(out), "planet/poi/all");
+    REQUIRE(pois.size() == 5);
+    for (const PoiRecord& pr : pois) {
+        const bool street = std::abs(pr.lng - 8.1424) < 0.0004;
+        CHECK_EQ(int(pr.category), int(PoiCategory::NATURAL_WATER));
+        CHECK_EQ(int(pr.flags), street ? int(POI_FLAG_HIGHWAY) : 0);
+        CHECK(pr.parent_street_id != NO_DATA);
+    }
+
+    const std::string dataset = poi_dataset(out, "all", root.path() + "/dataset");
+    const std::vector<std::string> answers = server_answers(dataset, points, root.path() + "/q", log);
+    REQUIRE(answers.size() == points.size());
+    for (size_t k = 0; k < answers.size(); k++) {
+        const std::string road = k == 0 ? names[0] : "Teststrasse";
+        if (answer_string(answers[k], {"address", "road"}) != std::optional<std::string>(road))
+            std::printf("    %s\n", answers[k].c_str());
+        CHECK(answer_string(answers[k], {"address", "road"}) == std::optional<std::string>(road));
+    }
+}
+
 // A build logs, for each dir it writes with addresses and for each POI tier,
 // the bytes of the dir's logical vertex stream, the most a patch indexes of
 // them and their share of that: a STREAM_BYTES line, which the nightly's

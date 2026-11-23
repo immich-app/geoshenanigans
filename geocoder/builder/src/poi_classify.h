@@ -183,7 +183,7 @@ inline std::optional<PoiClassification> classify_poi(
     const char* t_building, const char* t_craft, const char* t_power,
     const char* t_place, const char* t_waterway, const char* t_office,
     const char* t_wikipedia, const char* t_wikidata, const char* t_highway,
-    const char* t_shop, const char* t_landuse, const char* t_emergency, bool area) {
+    const char* t_shop, const char* t_landuse, const char* t_emergency, const char* t_footway, bool area) {
     PoiCategory cat = PoiCategory::UNKNOWN;
 
     // The water rule runs before any category. A water kind is the object's
@@ -207,6 +207,12 @@ inline std::optional<PoiClassification> classify_poi(
     // below 26 ranks it, every one but place=square (26), which makes it no
     // street either.
     const PoiCategory kind = poi_water_kind(t_natural, t_landuse);
+    // highway=footway of footway=sidewalk, crossing, link or traffic_aisle is
+    // no main tag in Nominatim (presets.lua:23-33 filter_footways): beside
+    // water it neither ranks the object nor makes it a street.
+    if (kind != PoiCategory::UNKNOWN && t_highway && t_footway && std::strcmp(t_highway, "footway") == 0 &&
+        poi_tag_is(t_footway, {"sidewalk", "crossing", "link", "traffic_aisle"}))
+        t_highway = nullptr;
     const bool ranks_30 = !has_lower_rank_main_tag(t_place, t_landuse, t_highway, area);
     const char* t_place_below_streets = t_place && std::strcmp(t_place, "square") == 0 ? nullptr : t_place;
     const bool no_street =

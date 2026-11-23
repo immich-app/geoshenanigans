@@ -2255,7 +2255,8 @@ static int run(int argc, char* argv[]) {
                                                     rel.tag("man_made"), rel.tag("building"), rel.tag("craft"),
                                                     rel.tag("power"), r_place, rel.tag("waterway"), r_office,
                                                     rel.tag("wikipedia"), rel.tag("wikidata"), rel.tag("highway"),
-                                                    rel.tag("shop"), r_landuse, rel.tag("emergency"), /*area=*/true);
+                                                    rel.tag("shop"), r_landuse, rel.tag("emergency"), rel.tag("footway"),
+                                                    /*area=*/true);
                             auto taken = [](PoiCategory c) {
                                 return c == PoiCategory::BAY || c == PoiCategory::GLACIER;
                             };
@@ -2657,7 +2658,7 @@ static int run(int argc, char* argv[]) {
                                 n_man_made, n_building, n_craft, n_power, n_place, n_waterway,
                                 n_office,
                                 n_wikipedia, n_wikidata,
-                                n_highway, n_shop, n_landuse, n_emergency, /*area=*/false);
+                                n_highway, n_shop, n_landuse, n_emergency, /*footway=*/nullptr, /*area=*/false);
                             const char* name = poi_name(n_name_en, n_name);
                             if (cls && name) {
                                 PoiRecord pr{};
@@ -3141,7 +3142,7 @@ static int run(int argc, char* argv[]) {
                             t.man_made, t.building, t.craft, t.power, t.place, t.waterway,
                             t.office,
                             t.wikipedia, t.wikidata,
-                            t.highway, t.shop, t.landuse, t.emergency, /*area=*/true);
+                            t.highway, t.shop, t.landuse, t.emergency, t.footway, /*area=*/true);
                         if (cls) {
                             // Compute centroid
                             double sum_lat = 0, sum_lng = 0;

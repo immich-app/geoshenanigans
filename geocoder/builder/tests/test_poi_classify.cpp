@@ -36,6 +36,7 @@ struct Tags {
     const char* shop = nullptr;
     const char* landuse = nullptr;
     const char* emergency = nullptr;
+    const char* footway = nullptr;
     // A polygon (a closed way), not a node.
     bool area = false;
 };
@@ -45,7 +46,7 @@ std::optional<PoiClassification> classify(const Tags& t) {
                         t.natural, t.railway, t.aeroway, t.man_made, t.building,
                         t.craft, t.power, t.place, t.waterway, t.office,
                         t.wikipedia, t.wikidata, t.highway, t.shop, t.landuse,
-                        t.emergency, t.area);
+                        t.emergency, t.footway, t.area);
 }
 
 // `t` with its tag `key` set to `value`.
@@ -57,7 +58,7 @@ Tags with(Tags t, const char* key, const char* value) {
         {"building", &Tags::building}, {"craft", &Tags::craft},     {"power", &Tags::power},
         {"place", &Tags::place},     {"waterway", &Tags::waterway}, {"office", &Tags::office},
         {"highway", &Tags::highway}, {"shop", &Tags::shop},         {"landuse", &Tags::landuse},
-        {"emergency", &Tags::emergency}};
+        {"emergency", &Tags::emergency}, {"footway", &Tags::footway}};
     bool known = false;
     for (const auto& [name, member] : keys)
         if (!std::strcmp(name, key)) {
@@ -567,4 +568,34 @@ TEST(poi_classify_a_water_highway_area_takes_the_highway_flag_where_its_highway_
     square.place = "locality";
     square.area = true;
     CHECK_EQ(int(classify(square)->flags), int(POI_FLAG_HIGHWAY));
+}
+
+TEST(poi_classify_a_water_area_of_a_sidewalk_crossing_link_or_traffic_aisle_footway_is_no_street) {
+    // highway=footway of footway=sidewalk, crossing, link or traffic_aisle is
+    // no main tag in Nominatim (presets.lua filter_footways): beside water it
+    // neither ranks the object nor makes it a street. A plain water area is
+    // the water it is, of no highway flag, and one that is an attraction too
+    // is a rank-30 POI, an ATTRACTION. A footway of another kind ranks it a
+    // street.
+    for (const WaterKind& kind : kWaterKinds) {
+        for (const char* footway : {"sidewalk", "crossing", "link", "traffic_aisle"}) {
+            Tags t = with(with(water(kind), "highway", "footway"), "footway", footway);
+            t.area = true;
+            const auto plain = classify(t);
+            REQUIRE(plain.has_value());
+            if (plain->flags != 0) std::printf("    footway=%s\n", footway);
+            CHECK_EQ(uint8_t(plain->category), uint8_t(kind.category));
+            CHECK_EQ(int(plain->flags), 0);
+            const auto attraction = classify(with(t, "tourism", "attraction"));
+            REQUIRE(attraction.has_value());
+            CHECK_EQ(uint8_t(attraction->category), uint8_t(PoiCategory::ATTRACTION));
+            CHECK_EQ(int(attraction->flags & POI_FLAG_HIGHWAY), 0);
+        }
+        Tags aisle = with(with(water(kind), "highway", "footway"), "footway", "access_aisle");
+        aisle.area = true;
+        const auto street = classify(with(aisle, "tourism", "attraction"));
+        REQUIRE(street.has_value());
+        CHECK_EQ(uint8_t(street->category), uint8_t(kind.category));
+        CHECK_EQ(int(street->flags & POI_FLAG_HIGHWAY), int(POI_FLAG_HIGHWAY));
+    }
 }
