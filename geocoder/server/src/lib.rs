@@ -2805,9 +2805,10 @@ impl Index {
     //   0. A house's (rank 30) addr:postcode (token_get_postcode)
     //   1. The postcode of the street: a house's parent street, else the
     //      street that answers (way_postcodes.bin, the postal area the builder
-    //      finds the street in); a POI's parent_postcode_id (in-PoiRecord
-    //      field); then, for a US street, the ZIP of a TIGER line of that
-    //      street within ~100 m of the query (interp_postcodes.bin)
+    //      finds at the street's middle); a POI's parent_postcode_id
+    //      (in-PoiRecord field); then, for a US street, the ZIP of a TIGER
+    //      line of that street within ~100 m of the query
+    //      (interp_postcodes.bin)
     //   2. get_nearest_postcode's rule for a point (utils.sql:168-178,
     //      Nominatim 5.3), which Nominatim runs on the feature at index
     //      time: the postcode area covering the point (a boundary=postal_code
@@ -2816,12 +2817,13 @@ impl Index {
     //      holds it. A centroid's box reaches its country's postcode extent
     //      north, south, east and west of it (postcode_extent_m,
     //      expand_by_meters). The point is the street's centroid, halfway
-    //      along it (get_center_point), for the street and a house of it:
-    //      placex_update takes a house's postcode from its own tag, then its
-    //      parent street's, then get_nearest_postcode at the house. A street
-    //      none reaches has no postcode, nor has its answer. Without a street
-    //      the point is the house's, else the query point (postcode_area,
-    //      the postal area there).
+    //      along it (get_center_point), for the street and a house of it,
+    //      of the country there (get_country_code), which a house takes from
+    //      its street: placex_update takes a house's postcode from its own
+    //      tag, then its parent street's, then get_nearest_postcode at the
+    //      house. A street none reaches has no postcode, nor has its answer.
+    //      Without a street the point is the house's, else the query point
+    //      (postcode_area, the postal area there).
     //
     // The postal areas feed tier 1 at BUILD time too (way_postcodes.bin,
     // PoiRecord.parent_postcode_id inheritance).
@@ -2869,16 +2871,30 @@ impl Index {
     /// The postcode get_nearest_postcode takes from the postal areas holding the point (lat, lng)
     /// in the country `country_code` (postal_area_postcode), scanned there.
     fn postal_area_at<'a>(&'a self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
+        let (areas, point, _) = self.postal_areas_at(lat, lng);
+        self.postal_area_postcode(&areas, &upper_country(country_code), point)
+    }
+
+    /// The postal areas holding the point (lat, lng), the smallest first, the point as the scan
+    /// rounds it, and the country there (get_country_code): that of the smallest country polygon
+    /// holding it, the lower code of two as large; none where none holds it.
+    fn postal_areas_at(&self, lat: f64, lng: f64) -> (Vec<AdminPolygon>, (f64, f64), Option<[u8; 2]>) {
         let mut scan = AdminScan::new(self, lat, lng);
         let mut areas: Vec<AdminPolygon> = Vec::new();
+        let mut country: Option<(f32, u16)> = None;
         scan.for_each_entry(|pip, id, poly| {
-            if poly.admin_level == POSTCODE_AREA_LEVEL && poly.area > 0.0 && pip.holds(self, id, &poly) {
+            let is_country = poly.admin_level == 2 && poly.country_code != 0;
+            if !(is_country || poly.admin_level == POSTCODE_AREA_LEVEL && poly.area > 0.0) || !pip.holds(self, id, &poly) {
+                return;
+            }
+            if !is_country {
                 areas.push(poly);
+            } else if country.is_none_or(|(area, code)| poly.area < area || poly.area == area && poly.country_code < code) {
+                country = Some((poly.area, poly.country_code));
             }
         });
         areas.sort_by(|a, b| a.area.total_cmp(&b.area));
-        let country: String = country_code.map_or_else(String::new, |c| c.iter().map(|b| b.to_ascii_uppercase() as char).collect());
-        self.postal_area_postcode(&areas, &country, scan.pip.point.degrees())
+        (areas, scan.pip.point.degrees(), country.map(|(_, code)| code.to_be_bytes()))
     }
 
     /// The point halfway along street way `id`, Nominatim's centroid of a street (line_middle);
@@ -2959,12 +2975,16 @@ impl Index {
             }
         }
 
-        // 2. get_nearest_postcode at the street's centroid, for the street
-        // and a house of it; a street none reaches has no postcode. Then at
-        // the house; else at the query point, of its postcode area.
+        // 2. get_nearest_postcode at the street's centroid, of the country
+        // there (get_country_code), for the street and a house of it, which
+        // takes its street's country; a street none reaches has no postcode.
+        // Then at the house; else at the query point, of its postcode area.
+        let mut country_code = country_code;
         if let Some((way_id, _)) = street {
             if let Some((m_lat, m_lng)) = u32::try_from(way_id).ok().and_then(|id| self.street_middle(id)) {
-                let found = self.postal_area_at(m_lat, m_lng, country_code)
+                let (areas, point, country_there) = self.postal_areas_at(m_lat, m_lng);
+                country_code = country_there.or(country_code);
+                let found = self.postal_area_postcode(&areas, &upper_country(country_code), point)
                     .or_else(|| self.centroid_postcode(m_lat, m_lng, country_code));
                 if found.is_some() || addr.is_none() {
                     return found;
@@ -5636,6 +5656,11 @@ impl AdminResult<'_> {
          &self.city_district, &self.borough, &self.suburb, &self.quarter, &self.neighbourhood, &self.city_block]
             .iter().all(|f| f.is_none())
     }
+}
+
+/// A country code as postal_area_postcode takes it: upper case, "" where unknown.
+fn upper_country(country_code: Option<[u8; 2]>) -> String {
+    country_code.map_or_else(String::new, |c| c.iter().map(|b| b.to_ascii_uppercase() as char).collect())
 }
 
 /// The rank_address bits of the polygons in an address (AdminResult::boundary_ranks).

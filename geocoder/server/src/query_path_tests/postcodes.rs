@@ -228,6 +228,65 @@ fn a_house_whose_street_has_no_postcode_takes_the_one_nearest_the_house() {
 }
 
 #[test]
+fn a_house_takes_the_postcode_its_street_has_at_its_middle() {
+    // Neither the house nor its street has a postcode stored. The street's is get_nearest_postcode's
+    // at its middle, 1,450 m east, where NG4 4AF's centroid lies, and the house takes it, its
+    // parent street's (placex_update), not NG4 4AE's at the house.
+    let gedling = (52.98, -1.07);
+    let index = country_at(gedling, b"GB")
+        .street("Long Lane", &[(0.0, -100.0), (0.0, 3000.0)])
+        .address("7", 20.0, 0.0)
+        .centroid("NG4 4AE", 20.0, 0.0)
+        .centroid("NG4 4AF", 0.0, 1450.0)
+        .load();
+    let address = address_from(&index, gedling, 0.0, 0.0);
+    assert_eq!(address["house_number"], "7");
+    assert_eq!(address["postcode"], "NG4 4AF");
+}
+
+/// Germany west of `origin` and Switzerland east of it, each 50 km across.
+fn border_at(origin: (f64, f64)) -> TestIndex {
+    let mut index = TestIndex { origin, ..TestIndex::default() };
+    for (name, code, span) in [("Deutschland", b"DE", (-50_000.0, -50_000.0, 50_000.0, 0.0)), ("Schweiz", b"CH", (-50_000.0, 0.0, 50_000.0, 50_000.0))] {
+        index.boundary(name, 2, 0, span);
+        index.polygons.last_mut().unwrap().0.country_code = u16::from_be_bytes(*code);
+    }
+    index
+}
+
+#[test]
+fn a_street_across_a_border_takes_a_postcode_of_its_middle_s_country() {
+    // placex_update gives a street the country at its centroid (get_country_code) and
+    // get_nearest_postcode of that country there. Rheinweg runs from Germany, where the point
+    // is, 4 km east into Switzerland, its middle 1,500 m past the border: the Swiss postal area
+    // 8238 round the middle names it, though the box of the German centroid 78266 by the point
+    // reaches the middle too.
+    let origin = (47.69, 8.6);
+    let ch = u16::from_be_bytes(*b"CH");
+    let mut dataset = border_at(origin);
+    dataset.boundary("8238", POSTCODE_AREA_LEVEL, 0, (-500.0, 1000.0, 500.0, 2000.0));
+    dataset.polygons.last_mut().unwrap().0.country_code = ch;
+    dataset.street("Rheinweg", &[(0.0, -500.0), (0.0, 3500.0)]).centroid("78266", 0.0, -300.0);
+    let address = address_from(&dataset.load(), origin, 5.0, -400.0);
+    assert_eq!(address["road"], "Rheinweg");
+    assert_eq!(address["postcode"], "8238");
+
+    // A house takes its parent street's country, and where no postcode reaches the street's
+    // middle, get_nearest_postcode of that country at the house. Here Rheinweg runs 16 km east,
+    // and the box of the Swiss centroid 8200, 1.4 km from the house, reaches the house but not
+    // the middle: it names the German house, not the German centroid beside it.
+    let mut dataset = border_at(origin);
+    dataset.street("Rheinweg", &[(0.0, -500.0), (0.0, 15_500.0)])
+        .address("7", 20.0, -400.0)
+        .centroid("78266", 20.0, -450.0)
+        .centroid("8200", 0.0, 1000.0);
+    dataset.centroids.last_mut().unwrap().country_code = ch;
+    let address = address_from(&dataset.load(), origin, 5.0, -400.0);
+    assert_eq!(address["house_number"], "7");
+    assert_eq!(address["postcode"], "8200");
+}
+
+#[test]
 fn a_street_s_postcode_is_the_one_nearest_its_middle() {
     // A street answers with its own postcode, which placex_update takes with get_nearest_postcode
     // at the street's centroid, the point halfway along it (get_center_point,
