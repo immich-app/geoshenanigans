@@ -663,10 +663,97 @@ fn twice(p: PointE7) -> PointE7 {
 
 /// A point on surface (lat, lng) in degrees at twice its coordinates, on the grid there: its
 /// scan line, halfway between two vertex latitudes, exactly, and the middle of its widest run
-/// inside within a quarter of a unit, so inside the polygon for a run over half a unit wide.
-/// Rounded to the e7 grid itself, the middle of a run a unit or two wide can fall outside.
+/// inside within a quarter of a unit. Rounded to either grid, the middle of a narrow run can fall
+/// on the polygon's edges or outside it, so `SurfaceProbe::of` finds it exactly on that line.
 fn twice_surface(lat: f64, lng: f64) -> PointE7 {
     PointE7 { lat: to_e7(2.0 * lat), lng: to_e7(2.0 * lng) }
+}
+
+/// A polygon's point on surface held exactly for AdminGeometry::polygon_within, at twice the
+/// coordinates: on its scan line, latitude `lat`, at longitude `lng + frac / den` (0 <= frac <
+/// den), the middle of its widest run inside, so inside the polygon off its edges however narrow
+/// the run. It reads the other polygon's edges at twice theirs, as `edge_crosses` and `on_edge`
+/// read a point on the grid, the ray towards +lat.
+#[derive(Clone, Copy)]
+struct SurfaceProbe {
+    lat: i64,
+    lng: i64,
+    frac: i128,
+    den: i128,
+    odd: bool,
+    on_edge: bool,
+}
+
+impl SurfaceProbe {
+    /// The point on surface of the rings of `edges`, from `surface2`, the point `surface_point`
+    /// finds at twice its coordinates (`twice_surface`): each edge's crossing of its scan line, a
+    /// fraction at twice the coordinates, in order, the runs between them in pairs, and the middle
+    /// of the widest, the first of equal widths. `surface2` itself where a vertex lies on its line
+    /// (the first vertex, where no run has width) or no run has width.
+    ///
+    /// The ends of an edge are within i32, so at twice the coordinates within 2^32 and their
+    /// differences within 2^33: a crossing is n / d with |n| < 2^67 and 0 < d <= 2^33, and
+    /// comparing two takes 2^100.
+    fn of(edges: &[(PointE7, PointE7)], surface2: PointE7) -> SurfaceProbe {
+        let on_grid = SurfaceProbe { lat: surface2.lat, lng: surface2.lng, frac: 0, den: 1, odd: false, on_edge: false };
+        let scan = surface2.lat;
+        let mut crossings: Vec<(i128, i128)> = Vec::new();
+        for &(a, b) in edges {
+            let (a, b) = (twice(a), twice(b));
+            if a.lat == scan || b.lat == scan {
+                return on_grid;
+            }
+            if (a.lat < scan) == (b.lat < scan) {
+                continue;
+            }
+            let dy = (b.lat - a.lat) as i128;
+            let n = a.lng as i128 * dy + (scan - a.lat) as i128 * (b.lng - a.lng) as i128;
+            crossings.push(if dy < 0 { (-n, -dy) } else { (n, dy) });
+        }
+        crossings.sort_unstable_by(|&(n1, d1), &(n2, d2)| (n1 * d2).cmp(&(n2 * d1)));
+        let mut best = None;
+        let mut best_width = 0.0;
+        for run in crossings.chunks_exact(2) {
+            let [(n1, d1), (n2, d2)] = [run[0], run[1]];
+            // The width's numerator is exact, so a run of any width is wider than none.
+            let width = (n2 * d1 - n1 * d2) as f64 / (d1 * d2) as f64;
+            if width > best_width {
+                best_width = width;
+                best = Some((n1 * d2 + n2 * d1, 2 * d1 * d2));
+            }
+        }
+        let Some((n, den)) = best else { return on_grid };
+        SurfaceProbe { lat: scan, lng: n.div_euclid(den) as i64, frac: n.rem_euclid(den), den, odd: false, on_edge: false }
+    }
+
+    /// The sign of (lat - a.lat) * (b.lng - a.lng) - (b.lat - a.lat) * (x - a.lng), x the probe's
+    /// longitude: edge_crosses' lhs less its rhs. At the whole longitude `lng` it is `whole`, of at
+    /// most 2^67, and the fraction takes (b.lat - a.lat) * frac / den off it, less than
+    /// |b.lat - a.lat| either way, so only a `whole` smaller than that is taken in full.
+    fn side(&self, a: PointE7, b: PointE7) -> i128 {
+        let dlat = (b.lat - a.lat) as i128;
+        let whole = (self.lat - a.lat) as i128 * (b.lng - a.lng) as i128 - dlat * (self.lng - a.lng) as i128;
+        if self.frac == 0 || (whole != 0 && whole.abs() >= dlat.abs()) {
+            whole.signum()
+        } else {
+            (whole * self.den - dlat * self.frac).signum()
+        }
+    }
+
+    /// Reads the edge a-b, at twice the coordinates. As 0 <= frac / den < 1, a whole longitude
+    /// lies east of lng + frac / den where it lies east of lng, and at or east of it where it lies
+    /// east of lng or at lng with frac 0.
+    fn read(&mut self, a: PointE7, b: PointE7) {
+        if (a.lng > self.lng) != (b.lng > self.lng) {
+            let side = self.side(a, b);
+            self.odd ^= side != 0 && ((side < 0) != (b.lng < a.lng));
+        }
+        let (lng0, lng1) = (a.lng.min(b.lng), a.lng.max(b.lng));
+        self.on_edge |= (a.lat.min(b.lat)..=a.lat.max(b.lat)).contains(&self.lat)
+            && lng0 <= self.lng
+            && (self.lng < lng1 || (self.lng == lng1 && self.frac == 0))
+            && self.side(a, b) == 0;
+    }
 }
 
 /// A polygon's rings held whole for AdminGeometry::polygon_within: its vertices, each once and by
@@ -677,13 +764,13 @@ struct HeldRings {
     probes: Vec<Probe>,
     /// The probes on the edge read last but for its ends, which cut it into pieces.
     cuts: Vec<PointE7>,
-    /// The point on surface at twice its coordinates, which reads each edge at twice theirs.
-    surface: Probe,
+    /// The point on surface, held exactly at twice its coordinates.
+    surface: SurfaceProbe,
     edges: Vec<(PointE7, PointE7)>,
     /// The edges meeting strip s are edges[listed[k]] for k in starts[s]..starts[s + 1].
     starts: Vec<u32>,
     listed: Vec<u32>,
-    /// The corners of the box of the vertices and the point on surface.
+    /// The corners of the box of the vertices and `surface2`, which holds the point on surface.
     lo: PointE7,
     hi: PointE7,
     strip_width: i64,
@@ -697,7 +784,8 @@ impl HeldRings {
     const LISTED_PER_EDGE: usize = 8;
 
     /// The rings of ring block `block`, with `surface2` its point on surface at twice its
-    /// coordinates (`twice_surface`); none for a malformed block or one without vertices.
+    /// coordinates (`twice_surface`), held exactly (`SurfaceProbe::of`); none for a malformed
+    /// block or one without vertices.
     fn of(block: &[u8], arcs: ArcFiles<'_>, surface2: PointE7) -> Option<HeldRings> {
         let mut read = EdgeReader { arcs, edges: Vec::new(), vertices: Vec::new() };
         walk_rings(block, &mut read)?;
@@ -743,7 +831,8 @@ impl HeldRings {
             }
         }
         let probes = vertices.into_iter().map(Probe::at).collect();
-        Some(HeldRings { probes, cuts: Vec::new(), surface: Probe::at(surface2), edges, starts, listed, lo, hi, strip_width })
+        let surface = SurfaceProbe::of(&edges, surface2);
+        Some(HeldRings { probes, cuts: Vec::new(), surface, edges, starts, listed, lo, hi, strip_width })
     }
 
     /// The edges listed in the strips from the one of longitude `lng0` to the one of `lng1`

@@ -684,21 +684,75 @@ fn cross_inside_brute(a: PointE7, b: PointE7, c: PointE7, d: PointE7) -> bool {
     apart(cross(a, b, c), cross(a, b, d)) && apart(cross(c, d, a), cross(c, d, b))
 }
 
+/// A point at twice the coordinates whose longitude is a fraction: (lat, num, den), the
+/// longitude num / den, den > 0.
+type Exact2 = (i64, i128, i128);
+
+/// The point on surface of `rings` as given, exact at twice the coordinates, from `surface2`,
+/// surface_point's there: the middle of the widest run between the rings' crossings of the line
+/// of latitude `surface2.lat`, the first of equal widths; `surface2` where a vertex lies on the
+/// line or no run has width.
+fn exact_surface_brute(rings: &[Vec<PointE7>], surface2: PointE7) -> Exact2 {
+    let (scan, on_grid) = (surface2.lat, (surface2.lat, surface2.lng as i128, 1));
+    let mut crossings: Vec<(i128, i128)> = Vec::new();
+    for e in rings.iter().flat_map(|r| r.windows(2)) {
+        let (a, b) = (pt(2 * e[0].lat, 2 * e[0].lng), pt(2 * e[1].lat, 2 * e[1].lng));
+        if a.lat == scan || b.lat == scan {
+            return on_grid;
+        }
+        if (a.lat < scan) != (b.lat < scan) {
+            // a.lng + (scan - a.lat) * (b.lng - a.lng) / (b.lat - a.lat), over a positive divisor.
+            let (n, d) = (a.lng as i128 * (b.lat - a.lat) as i128 + (scan - a.lat) as i128 * (b.lng - a.lng) as i128, (b.lat - a.lat) as i128);
+            crossings.push(if d < 0 { (-n, -d) } else { (n, d) });
+        }
+    }
+    crossings.sort_by(|x, y| (x.0 * y.1).cmp(&(y.0 * x.1)));
+    let mut best = (0.0, on_grid);
+    for run in crossings.chunks_exact(2) {
+        let ((n1, d1), (n2, d2)) = (run[0], run[1]);
+        let width = (n2 * d1 - n1 * d2) as f64 / (d1 * d2) as f64;
+        if width > best.0 {
+            best = (width, (scan, n1 * d2 + n2 * d1, 2 * d1 * d2));
+        }
+    }
+    best.1
+}
+
+/// Whether the point `p` lies inside the rings `doubled` off their edges, both at twice the
+/// coordinates: the ray cast towards +lat of `brute` and `on_edge`, its products in fractions
+/// over `p`'s divisor, each checked.
+fn exact_inside_off_edges(doubled: &[Vec<PointE7>], (lat, num, den): Exact2) -> bool {
+    let m = |x: i128, y: i128| x.checked_mul(y).expect("the product fits in i128");
+    let mut odd = false;
+    for e in doubled.iter().flat_map(|r| r.windows(2)) {
+        let (a, b) = (e[0], e[1]);
+        // (lat - a.lat) * (b.lng - a.lng) - (b.lat - a.lat) * (num / den - a.lng), times den.
+        let side = m(m((lat - a.lat) as i128, (b.lng - a.lng) as i128), den) - m((b.lat - a.lat) as i128, num - m(a.lng as i128, den));
+        let (lng0, lng1) = (a.lng.min(b.lng) as i128, a.lng.max(b.lng) as i128);
+        if side == 0 && (a.lat.min(b.lat)..=a.lat.max(b.lat)).contains(&lat) && m(lng0, den) <= num && num <= m(lng1, den) {
+            return false;
+        }
+        let east = |c: i64| m(c as i128, den) > num;
+        odd ^= east(a.lng) != east(b.lng) && side != 0 && ((side < 0) != (b.lng < a.lng));
+    }
+    odd
+}
+
 /// polygon_within over rings as given, every edge against every edge: each vertex of `rings`
 /// inside `other` or on its edges, no edge of theirs crossing one of `other`'s inside both, no
-/// point of `other`'s edges inside them off their edges, and `surface2`, a point at twice the
-/// coordinates, inside `other` off its edges. An edge of `other`, cut at the vertices of `rings`
-/// on it, meets their edges only at the ends of its pieces, so each piece is inside them where
-/// its middle is: tested at twice the coordinates, where the middle of two e7 points is on the
-/// grid.
-fn within_brute(rings: &[Vec<PointE7>], other: &[Vec<PointE7>], surface2: PointE7) -> bool {
+/// point of `other`'s edges inside them off their edges, and `surface`, their exact point on
+/// surface at twice the coordinates, inside `other` off its edges. An edge of `other`, cut at the
+/// vertices of `rings` on it, meets their edges only at the ends of its pieces, so each piece is
+/// inside them where its middle is: tested at twice the coordinates, where the middle of two e7
+/// points is on the grid.
+fn within_brute(rings: &[Vec<PointE7>], other: &[Vec<PointE7>], surface: Exact2) -> bool {
     let edges = |rings: &[Vec<PointE7>]| -> Vec<(PointE7, PointE7)> { rings.iter().flat_map(|r| r.windows(2).map(|e| (e[0], e[1]))).collect() };
     let (own, others) = (edges(rings), edges(other));
     let on = |edges: &[(PointE7, PointE7)], p: PointE7| edges.iter().any(|&(a, b)| on_edge(a, b, p));
     let twice = |p: PointE7| pt(2 * p.lat, 2 * p.lng);
     let doubled = |rings: &[Vec<PointE7>]| -> Vec<Vec<PointE7>> { rings.iter().map(|r| r.iter().map(|&v| twice(v)).collect()).collect() };
     let (doubled, doubled_other) = (doubled(rings), doubled(other));
-    let (doubled_edges, doubled_others) = (edges(&doubled), edges(&doubled_other));
+    let doubled_edges = edges(&doubled);
     let inside_off_edges = |p2: PointE7| brute(&doubled, p2) && !on(&doubled_edges, p2);
     let enters = |&(a, b): &(PointE7, PointE7)| {
         let along = |v: &PointE7| (v.lat - a.lat) as i128 * (b.lat - a.lat) as i128 + (v.lng - a.lng) as i128 * (b.lng - a.lng) as i128;
@@ -710,7 +764,7 @@ fn within_brute(rings: &[Vec<PointE7>], other: &[Vec<PointE7>], surface2: PointE
         && !own.iter().any(|&(a, b)| others.iter().any(|&(c, d)| cross_inside_brute(a, b, c, d)))
         && !other.iter().flatten().any(|&v| inside_off_edges(twice(v)))
         && !others.iter().any(enters)
-        && brute(&doubled_other, surface2) && !on(&doubled_others, surface2)
+        && exact_inside_off_edges(&doubled_other, surface)
 }
 
 #[test]
@@ -755,7 +809,8 @@ fn a_polygon_is_within_another_only_where_no_part_of_it_is_outside() {
         assert_eq!(within(a, b), want, "{a} in {b}");
         let surface = geom.ring_block(&polys[a as usize]).and_then(|block| geom.surface_point(block, &mut Vec::new()));
         if let Some((lat, lng)) = surface.filter(|_| b != ringless) {
-            assert_eq!(within_brute(&s.rings[a as usize], &s.rings[b as usize], twice_surface(lat, lng)), want, "{a} in {b}");
+            let surface = exact_surface_brute(&s.rings[a as usize], twice_surface(lat, lng));
+            assert_eq!(within_brute(&s.rings[a as usize], &s.rings[b as usize], surface), want, "{a} in {b}");
         }
     }
 }
@@ -775,6 +830,43 @@ fn a_polygon_is_within_one_along_its_edge_by_its_point_on_surface_off_the_grid()
 }
 
 #[test]
+fn a_sliver_is_within_one_along_both_its_sides_by_its_exact_point_on_surface() {
+    // Triangles whose run at the scan line is half an e7 unit wide or less, each inside a larger
+    // one along both its sloped sides: at twice the coordinates the middle of the run still
+    // rounds onto one of those sides. A triangle 50000 units tall, its run at latitude 25000 from
+    // 1 to 1.5; one 1000 units tall, its run at 500.5 from 501 to 501.0005. Each near the origin,
+    // and near the poles and the antimeridian, where the products are largest.
+    for (lat0, lng0) in [(0, 0), (899_000_000, 1_799_000_000), (-899_000_000, -1_799_000_000)] {
+        let ring = |v: &[(i64, i64)]| -> Vec<PointE7> { v.iter().map(|&(lat, lng)| pt(lat0 + lat, lng0 + lng)).collect() };
+        let mut s = Shapes::default();
+        let sliver = ring(&[(0, 0), (1, 1), (1000, 1001), (0, 0)]);
+        let pairs = [
+            (ring_polygon(&mut s, vec![ring(&[(0, 0), (0, 1), (50000, 2), (0, 0)])]), ring_polygon(&mut s, vec![ring(&[(-50000, -2), (-50000, 0), (50000, 2), (-50000, -2)])])),
+            (ring_polygon(&mut s, vec![sliver.clone()]), ring_polygon(&mut s, vec![ring(&[(-1000, -1001), (-998, -999), (1000, 1001), (-1000, -1001)])])),
+        ];
+        // A square with the sliver as its hole, which the sliver fills.
+        let square = ring(&[(-5000, -5000), (-5000, 5000), (5000, 5000), (5000, -5000), (-5000, -5000)]);
+        let holed = ring_polygon(&mut s, vec![square.clone(), sliver.iter().rev().copied().collect()]);
+        let whole = ring_polygon(&mut s, vec![square]);
+        let (geom, polys) = s.geometry();
+        let within = |a: u32, b: u32| geom.polygon_within(&polys[a as usize], &polys[b as usize]);
+        for (child, parent) in pairs {
+            assert!(within(child, parent) && within(child, child), "({lat0}, {lng0}): {child} in {parent}");
+            assert!(!within(parent, child), "({lat0}, {lng0}): {parent} in {child}");
+        }
+        let sliver = pairs[1].0;
+        assert!(within(sliver, whole) && within(holed, whole), "({lat0}, {lng0})");
+        assert!(!within(sliver, holed) && !within(holed, sliver), "({lat0}, {lng0})");
+        // So do the rings as given, every edge against every edge.
+        for (a, b, want) in [(pairs[0].0, pairs[0].1, true), (sliver, pairs[1].1, true), (sliver, holed, false)] {
+            let (lat, lng) = geom.surface_point(geom.ring_block(&polys[a as usize]).unwrap(), &mut Vec::new()).unwrap();
+            let surface = exact_surface_brute(&s.rings[a as usize], twice_surface(lat, lng));
+            assert_eq!(within_brute(&s.rings[a as usize], &s.rings[b as usize], surface), want, "({lat0}, {lng0}): {a} in {b}");
+        }
+    }
+}
+
+#[test]
 fn polygon_within_answers_as_testing_every_edge_against_every_edge() {
     // Lattices of cells sharing their edges' arcs with their blocks and the whole, some cells
     // with a hole an island fills, edges of every grid read either way round.
@@ -787,9 +879,12 @@ fn polygon_within_answers_as_testing_every_edge_against_every_edge() {
         let mut held = 0;
         for &a in &ids {
             let (lat, lng) = geom.surface_point(geom.ring_block(&polys[a as usize]).unwrap(), &mut Vec::new()).unwrap();
-            let surface2 = twice_surface(lat, lng);
+            let rings = &l.shapes.rings[a as usize];
+            let surface = exact_surface_brute(rings, twice_surface(lat, lng));
+            let doubled: Vec<Vec<PointE7>> = rings.iter().map(|r| r.iter().map(|v| pt(2 * v.lat, 2 * v.lng)).collect()).collect();
+            assert!(exact_inside_off_edges(&doubled, surface), "{dims:?} {grids:?} {a}");
             for &b in &ids {
-                let want = within_brute(&l.shapes.rings[a as usize], &l.shapes.rings[b as usize], surface2);
+                let want = within_brute(rings, &l.shapes.rings[b as usize], surface);
                 held += want as usize;
                 assert_eq!(within(a, b), want, "{dims:?} {grids:?} {a} in {b}");
             }
