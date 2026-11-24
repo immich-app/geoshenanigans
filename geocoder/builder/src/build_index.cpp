@@ -2196,6 +2196,19 @@ static int run(int argc, char* argv[]) {
                       << " inputs" << std::endl;
             log_phase("Water relations of every input", _wt, _wc);
         }
+        // Way ids the relation member bitsets below reach.
+        static constexpr size_t MAX_WAY_ID = 2000000000ULL; // 2B, ~250 MiB
+        // The water layer's relation member ways: the areas' (the
+        // waterways' are in water_collected.waterway_of_way), marked once
+        // for every input's way passes, in the first input's: of several
+        // inputs, every one's relations are read before it. In pages, which
+        // only the member ways' ids allocate: an extract without water
+        // relations holds none.
+        PagedBits water_way_bits(MAX_WAY_ID);
+        // The member ways of ids the bits don't reach.
+        std::unordered_set<int64_t> water_ways_past;
+        size_t water_way_count = 0;
+        bool water_ways_marked = false;
         for (const auto& input_file : input_files) {
             std::cerr << "Processing " << input_file << "..." << std::endl;
 
@@ -2532,7 +2545,6 @@ static int run(int argc, char* argv[]) {
 
             // Build admin_way_ids as a bitset for O(1) lookup
             // Max way ID ~1.3B → ~162 MiB bitset (much faster than unordered_set)
-            static constexpr size_t MAX_WAY_ID = 2000000000ULL; // 2B, ~250 MiB
             std::vector<uint8_t> admin_way_bits(MAX_WAY_ID / 8 + 1, 0);
             size_t admin_way_count = 0;
             for (const auto& rel : data.collected_relations) {
@@ -2566,24 +2578,20 @@ static int run(int argc, char* argv[]) {
             };
             std::cerr << "  POI assembly needs " << poi_way_count << " way geometries." << std::endl;
 
-            // The water layer's relation member ways: the areas' (the
-            // waterways' are in water_collected.waterway_of_way).
+            // The water layer's relations, indexed, and their member ways
+            // marked, once.
             water::index_collected(water_collected);
-            // In pages, which only the member ways' ids allocate: an extract
-            // without water relations holds none.
-            PagedBits water_way_bits(MAX_WAY_ID);
-            // The member ways of ids the bits don't reach.
-            std::unordered_set<int64_t> water_ways_past;
-            size_t water_way_count = 0;
-            auto mark_water_way = [&](int64_t way_id) {
-                if (way_id > 0 && static_cast<size_t>(way_id) < MAX_WAY_ID)
-                    water_way_bits.set(static_cast<uint64_t>(way_id));
-                else
-                    water_ways_past.insert(way_id);
-                water_way_count++;
-            };
-            for (const auto& rel : water_collected.relations)
-                for (const auto& [way_id, role] : rel.members) mark_water_way(way_id);
+            if (!water_ways_marked) {
+                for (const auto& rel : water_collected.relations)
+                    for (const auto& [way_id, role] : rel.members) {
+                        if (way_id > 0 && static_cast<size_t>(way_id) < MAX_WAY_ID)
+                            water_way_bits.set(static_cast<uint64_t>(way_id));
+                        else
+                            water_ways_past.insert(way_id);
+                        water_way_count++;
+                    }
+                water_ways_marked = true;
+            }
             auto is_water_way = [&](int64_t id) -> bool {
                 if (id <= 0 || static_cast<size_t>(id) >= MAX_WAY_ID) return water_ways_past.count(id) > 0;
                 return water_way_bits.test(static_cast<uint64_t>(id));
@@ -4338,6 +4346,9 @@ static int run(int argc, char* argv[]) {
                 }
             }
         }
+        // The water member ways' marks, read by every input's way passes.
+        water_way_bits = PagedBits(0);
+        std::unordered_set<int64_t>().swap(water_ways_past);
 
         // The way geometries ring assembly read, a hash node per way, take
         // one core a second to free. Then the parse threads' freed buffers
