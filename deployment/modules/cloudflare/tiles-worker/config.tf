@@ -7,9 +7,5 @@ terraform {
       source  = "cloudflare/cloudflare"
       version = "5.29.0"
     }
-    grafana = {
-      source  = "grafana/grafana"
-      version = "4.54.0"
-    }
   }
 }
