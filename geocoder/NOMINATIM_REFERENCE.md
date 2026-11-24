@@ -59,6 +59,12 @@ A country's `place` entries (ca, de, es, id, ru, sa: CA and DE county 0, DE regi
 
 Country-specific overrides: Norway/Sweden have `(no/se, 3): State` and `(no/se, 4): County`.
 
+### The answer itself and the rows of its address
+
+A row of another place's address goes through `_result_row_to_address_row` (results.py:463-481), which puts `extratags['linked_place']` in `extratags['place']` before `get_label_tag` reads it: there a linked boundary is labelled by its node's type first, its own place tag second, which is the label the builder gives (`place_type_override`). The answer itself, and its own first row (`_setup_address_details`), keep their extratags, so a boundary that is the answer, where no street is near, is labelled by an own place tag in its extratags first. Bandar Seri Begawan (R8748136, `place=municipality`, `linked_place=city`) is the city of the addresses round it.
+
+The public server's rows mostly hold no own place tag in their extratags, though. A row keeps what the server's import made of the object when it last imported it, and the rows it imported before about October 2026 hold none: Arraias and Paranã (R336746, R336839, `place=municipality` in OSM since 2023, `linked_place=town`, no `place` in their extratags) answer "town" as the answer itself, as do Nossa Senhora do Livramento (R333615, last edited 2026-02) and Babinda (R5813924, `place=hamlet`, edited 2026-09, "suburb"). Rows imported since hold it: Curvelândia (R333654, edited 2026-10-17) and Barão de Melgaço (R333718) answer "municipality", Baralla (R342114) ranks by its tag. So the builder keeps the linked node's label for the answer itself too: labelling the 23,332 planet boundaries whose own tag and linked node differ by their own tag changes 9 of the saved answers, 7 of them for the worse. Which rows hold the tag is the server's history, not the data, and the same goes for the own-tag rank and type steps, which the builder applies to every boundary with a place tag.
+
 ### Key insight: extratags override
 
 The `place` and `linked_place` tags from OSM data end up in the `extratags` column. When present, they OVERRIDE the rank-based label. This is how:
