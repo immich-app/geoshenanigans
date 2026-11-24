@@ -29,6 +29,7 @@ mod hex;
 pub use hex::lower_hex;
 pub mod place_files;
 pub mod poi_files;
+pub mod geography_box;
 pub mod postcode_files;
 pub mod side_blocks;
 pub mod strings;
@@ -189,6 +190,21 @@ pub fn vertex_scale(enc: u8) -> f64 {
 
 /// The admin level of a postcode area's record (boundary=postal_code).
 pub const POSTCODE_AREA_LEVEL: u8 = 11;
+
+/// The place type the builder gives a postal area whose postcode its country's pattern rejects:
+/// Nominatim makes no postcode area of it (postcodes.py _update_postcode_areas).
+pub const POSTAL_AREA_INVALID: u8 = 15;
+
+/// The place type the builder gives a boundary (admin_level 4 to 10) that repeats its parent, the
+/// same wikidata and geometry, and links no place node: Nominatim takes it out of addresses
+/// (placex_update's is_same, placex_triggers.sql:909-931). One that links a place node keeps the
+/// node's type and has this as its own_place_type: it takes the node's rank back (:1161).
+pub const BOUNDARY_REPEATS_PARENT: u8 = 15;
+
+/// The top bit of an admin_polygons.bin record's last byte: the polygon is a closed way's
+/// (AdminPolygon::of_way); the bits below it are its own_place_type.
+pub const ADMIN_OF_WAY: u8 = 0x80;
+
 /// The admin level `/polygons` gives a postcode area, the one the test portal colours as postal.
 pub const POLYGONS_POSTAL_LEVEL: u8 = 99;
 
@@ -196,8 +212,8 @@ pub const POLYGONS_POSTAL_LEVEL: u8 = 99;
 /// ring block in admin_rings.bin, every record's the running one, a tombstone's included (whose
 /// block, like that of a polygon a tier left without rings, is empty); its u32 name_id, NO_DATA
 /// for a tombstone; its f32 area; its u16 country code; admin_level << 4 | place_type_override;
-/// a reserved byte. A ring block runs to the next record's offset, the last to the end of
-/// admin_rings.bin.
+/// own_place_type, ADMIN_OF_WAY set for a closed way's. A ring block runs to the next record's
+/// offset, the last to the end of admin_rings.bin.
 pub const ADMIN_POLYGON_RECORD_BYTES: u64 = 16;
 
 /// An admin polygon: its admin_polygons.bin record, with its ring block's length.
@@ -211,10 +227,18 @@ pub struct AdminPolygon {
     pub name_id: u32,
     pub admin_level: u8,
     pub place_type_override: u8,  // 0=none, 1=city, 2=town, 3=village, 4=suburb, 5=neighbourhood, 6=quarter
+    /// A place area's own place type where it links a place node of another type, whose type is
+    /// its place_type_override and labels it (find_linked_place); 0 where its place type is its
+    /// own.
+    pub own_place_type: u8,
     /// The exact shoelace of the polygon's rings, holes taken off, in square degrees: the same in
     /// every tier.
     pub area: f32,
     pub country_code: u16,
+    /// A closed way's polygon, not a ring of a relation (the record's last byte's top bit): it
+    /// raises no place node of its rank to a subpart, which placex_update does inside a relation
+    /// only (osm_type = 'R', placex_triggers.sql:984-1004).
+    pub of_way: bool,
 }
 
 impl AdminPolygon {
@@ -231,8 +255,10 @@ impl AdminPolygon {
             name_id: u32_at(4),
             admin_level: bytes[14] >> 4,
             place_type_override: bytes[14] & 15,
+            own_place_type: bytes[15] & !ADMIN_OF_WAY,
             area: f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
             country_code: u16::from_le_bytes([bytes[12], bytes[13]]),
+            of_way: bytes[15] & ADMIN_OF_WAY != 0,
         }
     }
 
@@ -244,7 +270,14 @@ impl AdminPolygon {
         b[8..12].copy_from_slice(&self.area.to_le_bytes());
         b[12..14].copy_from_slice(&self.country_code.to_le_bytes());
         b[14] = self.admin_level << 4 | self.place_type_override;
+        b[15] = self.own_place_type | if self.of_way { ADMIN_OF_WAY } else { 0 };
         b
+    }
+
+    /// The place type of a place area's own place tag: own_place_type where it links a node of
+    /// another type, else place_type_override.
+    pub fn own_place_tag(&self) -> u8 {
+        if self.own_place_type != 0 { self.own_place_type } else { self.place_type_override }
     }
 }
 
@@ -549,6 +582,38 @@ pub fn rank_to_field(rank: u8) -> Option<&'static str> {
     }
 }
 
+/// The address fields a polygon fills (AdminResult's), each in a slot of its own.
+pub const ADMIN_FIELDS: [&str; 18] = [
+    "country", "state", "province", "region", "state_district", "county", "district", "municipality", "city", "town",
+    "village", "hamlet", "city_district", "borough", "suburb", "quarter", "neighbourhood", "city_block",
+];
+
+/// The slot of an address field in ADMIN_FIELDS.
+pub fn admin_field_index(field: &str) -> Option<usize> {
+    ADMIN_FIELDS.iter().position(|f| *f == field)
+}
+
+/// The address fields a place node fills, by PlaceNode type.
+pub const PLACE_NODE_FIELDS: [&str; 7] = ["city", "town", "village", "suburb", "hamlet", "neighbourhood", "quarter"];
+
+/// The rank_address of the polygon or the place node behind each field of an
+/// address (ADMIN_FIELDS), 0 where none is known: display_name lists the
+/// place parts by it, as Nominatim lists its address rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FieldRanks([u8; ADMIN_FIELDS.len()]);
+
+impl FieldRanks {
+    pub fn get(&self, field: &str) -> u8 {
+        admin_field_index(field).map_or(0, |i| self.0[i])
+    }
+
+    pub fn set(&mut self, field: &str, rank: u8) {
+        if let Some(i) = admin_field_index(field) {
+            self.0[i] = rank;
+        }
+    }
+}
+
 /// Whether a place area (class=place polygon) only repeats an address entry
 /// already found: a polygon of the same name and rank_address, no larger.
 /// Nominatim keeps one entry per rank (address_havelevel); a namesake of
@@ -558,11 +623,24 @@ pub fn place_area_repeats<S: AsRef<str>>(found: impl IntoIterator<Item = (S, u8,
     found.into_iter().any(|(n, r, a)| n.as_ref() == name && r == rank && a <= area)
 }
 
-// Map an AdminPlaceType override to its Nominatim rank_address equivalent.
-// Drives the nested-boundary rank adjustment so linked / place=tagged
-// boundaries sit in the same rank hierarchy as admin_level-based ones.
-// Ranks come from settings/address-levels.json default section.
-pub fn place_type_to_rank(pt: u8) -> u8 {
+// Map an AdminPlaceType override to its Nominatim rank_address equivalent in
+// `country` (the upper-case ISO code, "" where unknown). Drives the
+// nested-boundary rank adjustment so linked / place=tagged boundaries sit in
+// the same rank hierarchy as admin_level-based ones, and ranks place areas.
+// Ranks come from settings/address-levels.json: a country's `place` entries,
+// then the default section.
+pub fn place_type_to_rank(pt: u8, country: &str) -> u8 {
+    // A country's own place ranks (address-levels.json: ca, de, es, id, ru,
+    // sa; its civil_parish is no type of ours).
+    match (country, pt) {
+        ("CA", 10) => return 0,              // county [12, 0]
+        ("DE", 9) | ("DE", 10) => return 0,  // region [10, 0], county [12, 0]
+        ("ES", 8) => return 10,              // province 10
+        ("ID", 14) | ("RU", 14) => return 18, // municipality 18
+        ("SA", 8) => return 12,              // province 12
+        ("SA", 14) => return 18,             // municipality 18
+        _ => {}
+    }
     // Values come from Nominatim's settings/address-levels.json —
     // specifically the rank_address (second element of [rank_search,
     // rank_address] pairs). place=state / province / region / country are
@@ -589,6 +667,21 @@ pub fn place_type_to_rank(pt: u8) -> u8 {
     }
 }
 
+/// A place area's (admin_level 15) compute_place_rank, its own place tag's rank, and its
+/// rank_address before an area containing it lifts it, in `country`: placex_update keeps a place
+/// area of rank 16 to 23 at its own rank whether it links a place node or not (that branch leaves
+/// parent_address_level unset, placex_triggers.sql:930-950, :1129), and gives any other the rank
+/// of the node it links where that is above 3 and below 26 (:1109-1133). One of rank 0 links
+/// nothing (find_linked_place, :285).
+pub fn place_area_ranks(poly: &AdminPolygon, country: &str) -> (u8, u8) {
+    let own = place_type_to_rank(poly.own_place_tag(), country);
+    if poly.own_place_type == 0 || own == 0 || PLACE_AREA_LIFTED_RANKS.contains(&own) {
+        return (own, own);
+    }
+    let linked = place_type_to_rank(poly.place_type_override, country);
+    (own, if (4..26).contains(&linked) { linked } else { own })
+}
+
 /// A polygon holding a query point with its rank_address in the point's
 /// address.
 #[derive(Clone, Copy)]
@@ -597,103 +690,157 @@ pub struct RankedPoly {
     pub rank_address: u8,
 }
 
-/// Nominatim's nested-boundary rank adjustment (placex_triggers.sql
-/// lines 910-1175) over the polygons holding a point, each at its initial
-/// rank_address: sorts them by admin_level ascending, ties (same
-/// admin_level) by area descending (the larger polygon is assumed to be
-/// the parent), then applies three promotions in order:
+/// Nominatim's rank_address of the polygons holding a point (placex_update,
+/// placex_triggers.sql:876-950 and :1109-1170), each given at its initial
+/// rank_address: its level's in the country for a boundary, the one before
+/// any lift (place_area_ranks) for a place area (admin_level 15). Nominatim
+/// indexes the coarser first; here they are sorted by admin_level ascending,
+/// ties (same admin_level) by area descending (the larger polygon is assumed
+/// to be the parent), and each boundary of a rank other than 0 is taken
+/// through three steps in that order, every polygon before it final:
 ///
-///   1. Admin nested: if a parent admin boundary (admin_level > 3
-///      AND admin_level < self) has rank_address >= self, push
-///      self to parent_rank + 2.
-///   2. Linked place override: if the linked place's rank >
-///      parent_address_level (the same "parent" computed above),
-///      replace self rank with the linked place rank.
-///   3. Place area containment, from rank 10 (:922): if a class='place'
-///      area (e.g. R9185096 "Nairobi" with place=city) with rank >= self
-///      contains self, push self to place_area_rank + 2.
+///   1. Admin nested (:876-910): the parent is the latest earlier polygon
+///      with admin_level in (3, self.admin_level) and a rank of 1 to 25,
+///      standing in for Nominatim's, the boundary of the highest admin_level
+///      round self's centroid. A parent of rank >= self lifts self to
+///      parent_rank + 2, or to 25 under a parent of 24 or more.
+///   2. Place area containment, from rank 10 (:912-929), for a boundary
+///      without a place type: the place area (class='place', e.g. R9185096
+///      "Nairobi" with place=city) of the highest rank from self's up to 23
+///      round self lifts it to place_area_rank + 2: one larger than self that
+///      self lies within (`within(self, place_area)`, ST_Contains).
+///   3. Linked place (:1109-1170): the rank of the place type, from the
+///      linked place node or the boundary's own place tag, replaces self's
+///      rank where it is higher than both self's and the parent's. Nominatim
+///      takes it where it is higher than the parent's alone, so it can lower
+///      a boundary too, but only from a link, or from the own tag where no
+///      node links: the place type here may be either, and only raises.
 ///
-/// `place_areas` are the class='place' polygons (admin_level 15) holding
-/// the point. We approximate class='place' polygons as any polygon with a
-/// non-zero place_type_override — that's the set the builder
-/// populates from place=X and linked_place=X tags. Because every
-/// polygon here contains the query point, we use
-/// (area > self.area) as a proxy for "contains self".
+/// A boundary that repeats its parent and links a place node (own_place_type
+/// BOUNDARY_REPEATS_PARENT) takes none of them: it ranks as its place node,
+/// above 3 and below 26, or 0 (is_same leaves parent_address_level 3).
 ///
-/// Order matters: admin nested must run before the place-area
-/// promotion for the ranks to stabilise. We iterate 3 times so the
-/// cascade can propagate through admin and place parents alike
-/// (Starehe L6 getting bumped to 18 then promoting CBD division L7
-/// from 14 to 20). The parent of rule 1 is the latest earlier polygon
-/// with admin_level in (3, self.admin_level).
+/// A place area (admin_level 15, after every boundary) takes none of them:
+/// one of rank 16 to 23 is lifted to an area's rank + 2 where that area, a
+/// boundary or a place area whose initial rank is the place area's or more
+/// up to 23, contains it (:930-950), the one of the highest initial rank:
+/// one larger than the place area that it lies within, as in step 2. `place_areas` are
+/// the class='place' polygons holding the point, any with a place type;
+/// `country` is the upper-case ISO code of the point's country, "" where
+/// unknown.
 ///
-/// Only polygons without their own place_type_override are eligible
-/// for place-area promotion (rule 3) — a Paris L6 boundary with
-/// linked_place=city should stay at rank 16 even though it's
-/// nested inside a larger polygon with an override.
-pub fn promote_nested_ranks<'a>(ranked: &mut [RankedPoly], place_areas: impl Iterator<Item = &'a AdminPolygon> + Clone) {
+/// A Paris L6 boundary with linked_place=city stays at rank 16 even though
+/// it's nested inside a larger polygon with a place type: it has a place
+/// type of its own, so it takes no place-area step.
+pub fn promote_nested_ranks<'a>(
+    ranked: &mut [RankedPoly],
+    place_areas: impl Iterator<Item = &'a AdminPolygon> + Clone,
+    country: &str,
+    within: impl Fn(&AdminPolygon, &AdminPolygon) -> bool,
+) {
     ranked.sort_by(|a, b| {
         a.poly.admin_level.cmp(&b.poly.admin_level)
             .then(b.poly.area.partial_cmp(&a.poly.area).unwrap_or(std::cmp::Ordering::Equal))
     });
+    // compute_place_rank's address_rank of each, which the place-area steps compare: a linked
+    // place area's own place type's.
+    let initial: Vec<u8> = ranked.iter()
+        .map(|r| if r.poly.admin_level == 15 && r.poly.own_place_type != 0 { place_area_ranks(&r.poly, country).0 } else { r.rank_address })
+        .collect();
 
-    for _ in 0..3 {
-        for i in 0..ranked.len() {
-            let self_al = ranked[i].poly.admin_level;
-            let self_area = ranked[i].poly.area;
-            let self_override = ranked[i].poly.place_type_override;
-
-            // Step 1: admin nested.
-            let mut admin_parent_rank: u8 = 0;
-            if self_al > 4 {
-                for j in (0..i).rev() {
-                    let al = ranked[j].poly.admin_level;
-                    if al > 3 && al < self_al {
-                        admin_parent_rank = ranked[j].rank_address;
-                        break;
-                    }
+    for i in 0..ranked.len() {
+        let RankedPoly { poly, mut rank_address } = ranked[i];
+        if poly.admin_level == 15 {
+            // A place area inside an area of its rank: every polygon before it is a boundary,
+            // or a larger place area, at its final rank.
+            if PLACE_AREA_LIFTED_RANKS.contains(&initial[i]) {
+                let lift = ranked[..i].iter().zip(&initial)
+                    .filter(|&(area, &prank)| {
+                        (initial[i]..=*PLACE_AREA_LIFT_RANKS.end()).contains(&prank)
+                            && ADMIN_PARENT_RANKS.contains(&area.rank_address) && area.poly.area > poly.area
+                    })
+                    .filter(|(area, _)| within(&poly, &area.poly))
+                    .max_by_key(|&(_, &prank)| prank)
+                    .map(|(area, _)| area.rank_address);
+                if let Some(area_rank) = lift {
+                    ranked[i].rank_address = area_rank + 2;
                 }
             }
-            if ranked[i].rank_address <= admin_parent_rank {
-                ranked[i].rank_address = admin_parent_rank + 2;
-            }
+            continue;
+        }
+        if rank_address == 0 { continue; }
+        // One that repeats its parent and links a place node ranks 0 there, parent_address_level
+        // staying 3, and takes the node's rank back where that is above 3 and below 26 (:1161).
+        if poly.own_place_type == BOUNDARY_REPEATS_PARENT {
+            let linked = place_type_to_rank(poly.place_type_override, country);
+            ranked[i].rank_address = if (4..26).contains(&linked) { linked } else { 0 };
+            continue;
+        }
 
-            // Step 2: linked place override.
-            if self_override > 0 {
-                let linked_rank = place_type_to_rank(self_override);
-                if linked_rank > admin_parent_rank && linked_rank > ranked[i].rank_address {
-                    ranked[i].rank_address = linked_rank;
-                }
-            }
-
-            // Step 3: place area containment — only for polygons
-            // without their own place_type_override. Uses the genuine
-            // class='place' polygons only. Admin boundaries
-            // with linked_place tags (Nairobi L3, BA L8, Paris L6)
-            // are NOT used here — Nominatim's SQL explicitly
-            // restricts this loop to class='place'.
-            if self_override == 0 && ranked[i].rank_address >= PLACE_AREA_MIN_RANK {
-                let mut place_parent_rank: u8 = 0;
-                for pa in place_areas.clone() {
-                    if pa.place_type_override == 0 { continue; }
-                    if pa.area <= self_area { continue; }
-                    let pa_rank = place_type_to_rank(pa.place_type_override);
-                    if pa_rank < ranked[i].rank_address { continue; }
-                    if pa_rank > place_parent_rank {
-                        place_parent_rank = pa_rank;
-                    }
-                }
-                if place_parent_rank > 0 && place_parent_rank >= ranked[i].rank_address {
-                    ranked[i].rank_address = place_parent_rank + 2;
-                }
+        // Step 1: admin nested.
+        let parent_rank = ranked[..i].iter().rev()
+            .find(|p| p.poly.admin_level > 3 && p.poly.admin_level < poly.admin_level && ADMIN_PARENT_RANKS.contains(&p.rank_address))
+            .map(|p| p.rank_address);
+        if let Some(parent) = parent_rank {
+            if parent >= rank_address {
+                rank_address = if parent >= 24 { MAX_NESTED_RANK } else { parent + 2 };
             }
         }
+
+        // Step 2: place area containment, over the genuine class='place'
+        // polygons only: admin boundaries with linked_place tags (Nairobi
+        // L3, BA L8, Paris L6) are NOT used here.
+        if poly.place_type_override == 0 && rank_address >= PLACE_AREA_MIN_RANK {
+            let lift = place_areas.clone()
+                .filter(|pa| pa.place_type_override != 0 && pa.area > poly.area)
+                .map(|pa| (place_area_ranks(pa, country), pa))
+                .filter(|&((prank, pa_rank), _)| PLACE_AREA_LIFT_RANKS.contains(&pa_rank) && prank >= rank_address)
+                .filter(|(_, pa)| within(&poly, pa))
+                .map(|(ranks, _)| ranks)
+                .max();
+            if let Some((_, pa_rank)) = lift {
+                rank_address = pa_rank + 2;
+            }
+        }
+
+        // Step 3: linked place. Nominatim's parent_address_level is 3 where
+        // no parent was found.
+        if poly.place_type_override > 0 {
+            let linked_rank = place_type_to_rank(poly.place_type_override, country);
+            if linked_rank > parent_rank.unwrap_or(3) && linked_rank > rank_address && linked_rank < 26 {
+                rank_address = linked_rank;
+            }
+        }
+        ranked[i].rank_address = rank_address;
     }
 }
 
 /// The lowest rank_address the place-area step promotes a boundary from
-/// (placex_triggers.sql:922).
+/// (placex_triggers.sql:912).
 pub const PLACE_AREA_MIN_RANK: u8 = 10;
+
+/// The ranks of the place areas that lift a boundary inside them
+/// (placex_triggers.sql:920: rank_address between 1 and 23), and the highest
+/// initial rank of an area that lifts a place area (:937, below 24).
+pub const PLACE_AREA_LIFT_RANKS: std::ops::RangeInclusive<u8> = 1..=23;
+
+/// The ranks of the place areas an area of their rank or more lifts when it
+/// contains them (placex_triggers.sql:932).
+pub const PLACE_AREA_LIFTED_RANKS: std::ops::RangeInclusive<u8> = 16..=23;
+
+/// The ranks a boundary's admin-nested parent can have (placex_triggers.sql:891).
+pub const ADMIN_PARENT_RANKS: std::ops::RangeInclusive<u8> = 1..=25;
+
+/// The rank_address the admin-nested step lifts a boundary to under a parent
+/// of rank 24 or more (placex_triggers.sql:903-904), the highest any boundary
+/// takes.
+pub const MAX_NESTED_RANK: u8 = 25;
+
+/// The ranks of the areas in a street's or a house's address: getNearFeatures
+/// takes only areas of rank_address below maxrank, 25 for those
+/// (placex_triggers.sql:1218-1226, partition-functions.sql:46). An area of
+/// rank 25 names nothing, nor does one of rank 0.
+pub const ADDRESS_AREA_RANKS: std::ops::Range<u8> = 1..25;
 
 // --- String pool (tiered) ---
 //
@@ -1592,9 +1739,9 @@ impl Index {
     // given a street that has just won primary selection, look up the
     // nearest address whose parent_way_id matches that street's
     // index, gated by `ST_DWithin(query, 0.001)` (~100m). Returns the
-    // address whose housenumber should refine the result.
+    // address whose housenumber should refine the result, with its record id.
     pub fn find_addr_on_way(&self, lat: f64, lng: f64, parent_way_idx: u32, max_dist_sq: f64)
-        -> Option<AddrRecord>
+        -> Option<(u32, AddrRecord)>
     {
         let addrs = self.addrs.as_ref()?;
 
@@ -1605,20 +1752,20 @@ impl Index {
         let addr_key = |a: &AddrRecord| self.addr_tie_key(a, lat, lng, cos_lat);
 
         let mut best_dist = max_dist_sq;
-        let mut best: Option<AddrRecord> = None;
+        let mut best: Option<(u32, AddrRecord)> = None;
         // Of an address under another way no more than its street and its parent is read.
         let ids = (0..cells.len()).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
         with_footprint(|footprint| {
-            addrs.for_ids_on_way(ids, parent_way_idx, |_, point| {
+            addrs.for_ids_on_way(ids, parent_way_idx, |id, point| {
                 let dlat = (point.lat as f64 - lat).to_radians();
                 let dlng = (point.lng as f64 - lng).to_radians();
                 let mut dist = dist_sq(dlat, dlng, cos_lat);
                 if point.is_building() && addrs.footprint(&point, footprint) {
                     dist = polygon_distance_sq(lat, lng, footprint, cos_lat);
                 }
-                if beats(dist, best_dist, || best.as_ref().map(|b| (addr_key(&point), addr_key(b)))) {
+                if beats(dist, best_dist, || best.as_ref().map(|(_, b)| (addr_key(&point), addr_key(b)))) {
                     best_dist = dist;
-                    best = Some(point);
+                    best = Some((id, point));
                 }
             })
         });
@@ -1907,8 +2054,14 @@ impl Index {
         // For each admin level, the smallest-area polygon holding the point, the first in
         // visiting order among equals (`ScanPip::holds`: an entry flagged interior holds it
         // without a test). Owned AdminPolygon values so the backing admin_polygons file can be a
-        // chunked source.
+        // chunked source. Nominatim ranks every boundary of a rank above 0 covering the point
+        // (getNearFeatures, placex_triggers.sql:1273): of levels 3 to 10 every larger one holding
+        // the point that the smallest lies within ranks too (`round_smallest`), Bruxelles -
+        // Brussel round Quays Quarter. One beside the smallest is left out, as the simplified
+        // presets' neighbours overlap along their shared borders, and of level 2 the smallest
+        // alone names the country.
         let mut best_by_level: [Option<AdminPolygon>; 12] = [None; 12];
+        let mut round_smallest: Vec<AdminPolygon> = Vec::new();
         // Class='place' polygons (admin_level=15 marker) that cover the query point. These
         // drive the second-nested-check rule (placex_triggers.sql lines 944-963) — Nominatim
         // uses only these, not admin boundaries with linked_place tags. Kept apart from
@@ -1936,17 +2089,32 @@ impl Index {
             // boundary closed ways) can never name a country.
             if level == 2 && poly.country_code == 0 { return; }
             if poly.area <= 0.0 { return; }
+            // One that repeats its parent ranks 0 and is no address area (placex_triggers.sql
+            // :915-932, :1273), so the next larger boundary of its level is tried in its place.
+            if poly.place_type_override == BOUNDARY_REPEATS_PARENT && level != POSTCODE_AREA_LEVEL as usize { return; }
             boundaries.push((level as u64) << 56 | (poly.area.to_bits() as u64) << 24 | (place - 1));
         });
         // Each level's polygons from the smallest up: the first to hold the point is the level's
-        // best, and the larger ones, which take the longest to test, are never read.
+        // best. The larger ones of levels 3 to 10 are tested too, as find_current_boundaries
+        // tests them on the same scan; those of level 2 are never read. Every postal area
+        // holding the point is a candidate for its postcode.
         boundaries.sort_unstable();
+        let within = |poly: &AdminPolygon, other: &AdminPolygon| self.admin_geometry.polygon_within(poly, other);
+        let mut postal_areas: Vec<AdminPolygon> = Vec::new();
         for key in boundaries {
             let level = (key >> 56) as usize;
-            if best_by_level[level].is_none() {
-                let (id, poly) = scan.rings[(key & 0xff_ffff) as usize];
-                if scan.pip.holds(self, id, &poly) {
-                    best_by_level[level] = Some(poly);
+            let postal = level == POSTCODE_AREA_LEVEL as usize;
+            let round = (3..=10).contains(&level);
+            if best_by_level[level].is_some() && !postal && !round { continue; }
+            let (id, poly) = scan.rings[(key & 0xff_ffff) as usize];
+            if !scan.pip.holds(self, id, &poly) { continue; }
+            match best_by_level[level] {
+                Some(smallest) if round => {
+                    if within(&smallest, &poly) { round_smallest.push(poly); }
+                }
+                _ => {
+                    best_by_level[level].get_or_insert(poly);
+                    if postal { postal_areas.push(poly); }
                 }
             }
         }
@@ -1966,6 +2134,7 @@ impl Index {
                 }
             })
             .unwrap_or_default();
+        result.postcode_area = self.postal_area_postcode(&postal_areas, &country_code_str, scan.pip.point.degrees());
 
         // Map admin levels to address fields using country-specific config
         // Track best (smallest area) polygon per output field
@@ -1973,50 +2142,25 @@ impl Index {
             area: f32,
             name: Cow<'b, str>,
             country_code: u16,
+            rank: u8,
+            /// The polygon's place in `ranked`.
+            index: usize,
         }
-        let mut best_by_field: [Option<FieldCandidate<'_>>; 19] = Default::default();
-        // 0 country 1 state 2 province 3 region 4 state_district
-        // 5 county 6 district 7 municipality
-        // 8 city 9 town 10 village 11 hamlet
-        // 12 city_district 13 borough 14 suburb 15 quarter 16 neighbourhood
-        // 17 city_block
-
-        let field_index = |field: &str| -> Option<usize> {
-            match field {
-                "country" => Some(0),
-                "state" => Some(1),
-                "province" => Some(2),
-                "region" => Some(3),
-                "state_district" => Some(4),
-                "county" => Some(5),
-                "district" => Some(6),
-                "municipality" => Some(7),
-                "city" => Some(8),
-                "town" => Some(9),
-                "village" => Some(10),
-                "hamlet" => Some(11),
-                "city_district" => Some(12),
-                "borough" => Some(13),
-                "suburb" => Some(14),
-                "quarter" => Some(15),
-                "neighbourhood" => Some(16),
-                "city_block" => Some(17),
-                _ => None,
-            }
-        };
+        // A slot per field of ADMIN_FIELDS.
+        let mut best_by_field: [Option<FieldCandidate<'_>>; ADMIN_FIELDS.len()] = Default::default();
 
         // Collect polygons at this point with their initial rank_address;
         // promote_nested_ranks then gives them their effective one.
         let mut ranked: Vec<RankedPoly> = Vec::new();
-        for level in 0..12 {
-            if let Some(poly) = best_by_level[level] {
-                if poly.admin_level == POSTCODE_AREA_LEVEL { continue; } // handled separately
+        for &poly in best_by_level.iter().flatten().chain(&round_smallest) {
+            if poly.admin_level == POSTCODE_AREA_LEVEL { continue; } // handled separately
 
-                let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
-                if initial_rank == 0 && poly.place_type_override == 0 { continue; }
+            // A boundary its level ranks 0 is in no address, whatever its place type: it takes
+            // neither the admin-nested step nor a place rank (placex_triggers.sql:877, :1158).
+            let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
+            if initial_rank == 0 { continue; }
 
-                ranked.push(RankedPoly { poly, rank_address: initial_rank });
-            }
+            ranked.push(RankedPoly { poly, rank_address: initial_rank });
         }
 
         // Add class='place' polygons (our admin_level=15 marker) to
@@ -2031,7 +2175,7 @@ impl Index {
         // when overlapping place areas share a name.
         for (_pid, poly) in &place_area_polygons {
             if poly.place_type_override == 0 { continue; }
-            let r = place_type_to_rank(poly.place_type_override);
+            let (_, r) = place_area_ranks(poly, &country_code_str);
             if r == 0 { continue; }
             let name = self.get_string(poly.name_id);
             if place_area_repeats(ranked.iter().map(|p| (self.get_string(p.poly.name_id), p.rank_address, p.poly.area)), &name, r, poly.area) {
@@ -2040,7 +2184,9 @@ impl Index {
             ranked.push(RankedPoly { poly: *poly, rank_address: r });
         }
 
-        promote_nested_ranks(&mut ranked, place_area_polygons.iter().map(|(_, pa)| pa));
+        promote_nested_ranks(&mut ranked, place_area_polygons.iter().map(|(_, pa)| pa), &country_code_str, within);
+        ranked.retain(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address));
+        one_boundary_a_rank(&mut ranked);
         result.boundary_ranks = rank_bits(&ranked);
 
         // Now assign each polygon to its field slot. Each rank yields one
@@ -2070,34 +2216,40 @@ impl Index {
                 rank_to_field(r.rank_address)
             }
         };
-        let candidate = |r: &RankedPoly| FieldCandidate {
-            area: r.poly.area, name: self.get_string(r.poly.name_id), country_code: r.poly.country_code
+        let candidate = |r: &RankedPoly, index: usize| FieldCandidate {
+            area: r.poly.area, name: self.get_string(r.poly.name_id), country_code: r.poly.country_code, rank: r.rank_address,
+            index,
         };
+        let slots: Vec<Option<usize>> = ranked.iter().map(|r| field_for(r).and_then(admin_field_index)).collect();
 
-        for r in &ranked {
+        for (k, r) in ranked.iter().enumerate() {
             if r.poly.admin_level == 15 { continue; } // skip place-area in first pass
-            if let Some(field) = field_for(r) {
-                if let Some(idx) = field_index(field) {
-                    if let Some(ref existing) = best_by_field[idx] {
-                        if r.poly.area >= existing.area { continue; }
-                    }
-                    best_by_field[idx] = Some(candidate(r));
+            if let Some(idx) = slots[k] {
+                if let Some(ref existing) = best_by_field[idx] {
+                    if r.poly.area >= existing.area { continue; }
                 }
+                best_by_field[idx] = Some(candidate(r, k));
             }
         }
         // Second pass: place-area polygons fill only empty fields.
-        for r in &ranked {
+        for (k, r) in ranked.iter().enumerate() {
             if r.poly.admin_level != 15 { continue; }
-            if let Some(field) = field_for(r) {
-                if let Some(idx) = field_index(field) {
-                    if best_by_field[idx].is_none() {
-                        best_by_field[idx] = Some(candidate(r));
-                    }
+            if let Some(idx) = slots[k] {
+                if best_by_field[idx].is_none() {
+                    best_by_field[idx] = Some(candidate(r, k));
                 }
             }
         }
 
         // Fill result
+        for (field, c) in ADMIN_FIELDS.iter().zip(&best_by_field) {
+            if let Some(c) = c { result.ranks.set(field, c.rank); }
+        }
+        let winners = best_by_field.each_ref().map(|c| c.as_ref().map(|c| c.index));
+        let same_outline = |a: &AdminPolygon, b: &AdminPolygon| self.admin_geometry.same_outline(a, b);
+        result.unlabelled = unlabelled_rows(&ranked, &slots, &winners, same_outline).into_iter()
+            .map(|k| (ranked[k].rank_address, self.get_string(ranked[k].poly.name_id)))
+            .collect();
         if let Some(c) = best_by_field[0].take() {
             result.country = Some(c.name);
             if c.country_code != 0 {
@@ -2158,6 +2310,9 @@ impl Index {
             match poly.admin_level {
                 // ISO-less level-2 polygons are maritime lines, not countries.
                 2 if poly.country_code == 0 => {}
+                // One that repeats its parent ranks 0: it promotes no place node, gates none and
+                // is no boundary's parent (placex_triggers.sql:924, :994, :1273).
+                2..=10 if poly.place_type_override == BOUNDARY_REPEATS_PARENT => {}
                 2..=10 => boundaries.push((poly.area, id, poly)),
                 15 if poly.place_type_override != 0 => place_areas.push((poly.area, id, poly)),
                 _ => {}
@@ -2170,10 +2325,11 @@ impl Index {
         };
         let ranked: Vec<RankedPoly> = holding(boundaries).into_iter()
             .map(|poly| RankedPoly { poly, rank_address: self.admin_config.to_rank(&cc, poly.admin_level) })
-            .filter(|r| r.rank_address != 0 || r.poly.place_type_override != 0)
+            .filter(|r| r.rank_address != 0)
             .collect();
         let inside = |poly: &AdminPolygon, current: &AdminPolygon| self.admin_geometry.point_on_surface_in(poly, current);
-        CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter(), inside)
+        let within = |poly: &AdminPolygon, other: &AdminPolygon| self.admin_geometry.polygon_within(poly, other);
+        CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter(), &cc, inside, within)
     }
 
     pub fn find_places(&self, feature: PlaceFeature<'_>, current_boundaries: &CurrentBoundaries, held_ranks: u32) -> PlaceResult<'_> {
@@ -2231,6 +2387,7 @@ impl Index {
                            &mut result.hamlet, &mut result.neighbourhood, &mut result.quarter].into_iter().enumerate() {
             if let Some(k) = accepted[pt] {
                 *slot = Some(self.get_string(candidates[k].0.name_id));
+                result.ranks.set(PLACE_NODE_FIELDS[pt], nodes[k].1);
             }
         }
 
@@ -2612,50 +2769,52 @@ impl Index {
             // can never name a country — see find_admin.
             if poly.admin_level == 2 && poly.country_code == 0 { continue; }
             let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
-            if initial_rank == 0 && poly.place_type_override == 0 { continue; }
+            if initial_rank == 0 { continue; }
+            if poly.place_type_override == BOUNDARY_REPEATS_PARENT { continue; }
             ranked.push(RankedPoly { poly, rank_address: initial_rank });
         }
         // Add place-area polygons
         for poly in &place_area_polygons {
             if poly.place_type_override == 0 { continue; }
-            let r = place_type_to_rank(poly.place_type_override);
+            let (_, r) = place_area_ranks(poly, &country_code_str);
             if r == 0 { continue; }
             ranked.push(RankedPoly { poly: *poly, rank_address: r });
         }
 
-        promote_nested_ranks(&mut ranked, place_area_polygons.iter());
+        let within = |poly: &AdminPolygon, other: &AdminPolygon| self.admin_geometry.polygon_within(poly, other);
+        promote_nested_ranks(&mut ranked, place_area_polygons.iter(), &country_code_str, within);
+        ranked.retain(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address));
         result.boundary_ranks = rank_bits(&ranked);
 
-        // Map to fields
-        struct FC<'b> { area: f32, name: Cow<'b, str>, country_code: u16 }
-        let mut best_by_field: [Option<FC<'_>>; 19] = Default::default();
-        let field_index = |field: &str| -> Option<usize> {
-            match field {
-                "country" => Some(0), "state" => Some(1), "province" => Some(2),
-                "region" => Some(3), "state_district" => Some(4), "county" => Some(5),
-                "district" => Some(6), "municipality" => Some(7), "city" => Some(8),
-                "town" => Some(9), "village" => Some(10), "hamlet" => Some(11),
-                "city_district" => Some(12), "borough" => Some(13), "suburb" => Some(14),
-                "quarter" => Some(15), "neighbourhood" => Some(16), "city_block" => Some(17),
-                _ => None,
-            }
-        };
-
-        for r in &ranked {
-            if let Some(field) = if r.poly.place_type_override > 0 {
+        // Map to fields, a slot per field of ADMIN_FIELDS.
+        struct FC<'b> { area: f32, name: Cow<'b, str>, country_code: u16, rank: u8, index: usize }
+        let mut best_by_field: [Option<FC<'_>>; ADMIN_FIELDS.len()] = Default::default();
+        let slots: Vec<Option<usize>> = ranked.iter()
+            .map(|r| if r.poly.place_type_override > 0 {
                 place_type_to_field(r.poly.place_type_override)
             } else {
                 rank_to_field(r.rank_address)
-            } {
-                if let Some(idx) = field_index(field) {
-                    if let Some(ref existing) = best_by_field[idx] {
-                        if r.poly.area >= existing.area { continue; }
-                    }
-                    best_by_field[idx] = Some(FC { area: r.poly.area, name: self.get_string(r.poly.name_id), country_code: r.poly.country_code });
+            })
+            .map(|field| field.and_then(admin_field_index))
+            .collect();
+
+        for (k, r) in ranked.iter().enumerate() {
+            if let Some(idx) = slots[k] {
+                if let Some(ref existing) = best_by_field[idx] {
+                    if r.poly.area >= existing.area { continue; }
                 }
+                best_by_field[idx] = Some(FC { area: r.poly.area, name: self.get_string(r.poly.name_id), country_code: r.poly.country_code, rank: r.rank_address, index: k });
             }
         }
 
+        for (field, c) in ADMIN_FIELDS.iter().zip(&best_by_field) {
+            if let Some(c) = c { result.ranks.set(field, c.rank); }
+        }
+        let winners = best_by_field.each_ref().map(|c| c.as_ref().map(|c| c.index));
+        let same_outline = |a: &AdminPolygon, b: &AdminPolygon| self.admin_geometry.same_outline(a, b);
+        result.unlabelled = unlabelled_rows(&ranked, &slots, &winners, same_outline).into_iter()
+            .map(|k| (ranked[k].rank_address, self.get_string(ranked[k].poly.name_id)))
+            .collect();
         if let Some(c) = best_by_field[0].take() {
             result.country = Some(c.name);
             if c.country_code != 0 {
@@ -2689,45 +2848,150 @@ impl Index {
     // --- Postcode resolution ---
     //
     // Nominatim answers with the winning feature's stored `placex.postcode`,
-    // which placex_triggers.sql resolves at index time. Tiers 0 and 1 read
-    // postcodes the builder stored; tier 2 searches around the query point:
-    //   0. addr:postcode on the primary feature itself (token_get_postcode)
-    //   1. Primary feature's calculated_postcode (inherited from containing
-    //      boundary=postal_code at build time):
-    //        - street → way_postcodes.bin
-    //        - POI    → poi.parent_postcode_id (in-PoiRecord field)
-    //      then, for a US street, the ZIP of a TIGER line of that street
-    //      within ~100 m of the query (interp_postcodes.bin)
-    //   2. The postcode centroid nearest the query point within 0.05°,
-    //      skipping other countries' centroids: get_nearest_postcode's point
-    //      rule before Nominatim 5.3, which Nominatim runs on the feature at
-    //      index time (since 5.3 it takes the postcode area covering it).
+    // which placex_update (placex_triggers.sql) resolves at index time. Tiers
+    // 0 and 1 read postcodes the builder stored; tier 2 searches around the
+    // feature:
+    //   0. A house's (rank 30) addr:postcode (token_get_postcode)
+    //   1. The postcode of the street: a house's parent street, else the
+    //      street that answers (way_postcodes.bin, the postal area the builder
+    //      finds at the street's middle); a POI's parent_postcode_id
+    //      (in-PoiRecord field); then, for a US street, the ZIP of a TIGER
+    //      line of that street within ~100 m of the query
+    //      (interp_postcodes.bin)
+    //   2. get_nearest_postcode's rule for a point (utils.sql:168-178,
+    //      Nominatim 5.3), which Nominatim runs on the feature at index
+    //      time: the postcode area covering the point (a boundary=postal_code
+    //      polygon, the level-11 admin polygons), else the postcode centroid
+    //      of the country nearest it in plain degrees among those whose box
+    //      holds it. A centroid's box reaches its country's postcode extent
+    //      north, south, east and west of it (postcode_extent_m,
+    //      expand_by_meters). The point is the street's centroid, halfway
+    //      along it (get_center_point), for the street and a house of it,
+    //      of the country there (get_country_code), which a house takes from
+    //      its street: placex_update takes a house's postcode from its own
+    //      tag, then its parent street's, then get_nearest_postcode at the
+    //      house. A street none reaches has no postcode, nor has its answer.
+    //      Without a street the point is the house's, else the query point
+    //      (postcode_area, the postal area there).
     //
-    // No query-time PIP on postal boundaries — Nominatim's postcode field
-    // comes straight from placex.postcode, which is populated via triggers
-    // at index time. The postcode areas (the level-11 admin polygons) are
-    // consumed at BUILD time only (for way_postcodes.bin /
-    // PoiRecord.parent_postcode_id inheritance); they are not consulted here.
+    // The postal areas feed tier 1 at BUILD time too (way_postcodes.bin,
+    // PoiRecord.parent_postcode_id inheritance).
+    /// The postcode get_nearest_postcode takes from the postal areas holding the point (lat, lng)
+    /// of the country `country` (upper-case ISO, "" where unknown), the smallest first: of those of the
+    /// country, any where it is unknown, whose postcode the country has (Nominatim makes no
+    /// postcode area of another, nor of one of no country, postcodes.py _update_postcode_areas),
+    /// the one whose centroid is nearest the point in plain degrees (utils.sql: ORDER BY
+    /// ST_Distance(p.centroid, geom)), equals to the smaller. A postal area's country is the one
+    /// its centroid lies in, as get_country_code gives place_postcode's.
+    fn postal_area_postcode<'a>(&'a self, areas: &[AdminPolygon], country: &str, (lat, lng): (f64, f64)) -> Option<Cow<'a, str>> {
+        let cc: Option<[u8; 2]> = country.as_bytes().try_into().ok().map(|c: [u8; 2]| c.map(|b| b.to_ascii_lowercase()));
+        let eligible = |poly: &AdminPolygon| -> Option<Cow<'a, str>> {
+            if poly.place_type_override == POSTAL_AREA_INVALID { return None; }
+            let of_country = poly.country_code.to_be_bytes().map(|b| b.to_ascii_lowercase());
+            if let Some(cc) = cc {
+                if of_country != cc || country_has_no_postcode(&cc) { return None; }
+            }
+            // The builder checked the postcode against its country's pattern, whatever its
+            // length; past that, one value and no placeholder.
+            let postcode = self.get_string(poly.name_id);
+            let valid = !postcode.contains(';') && postcode_looks_valid(&cc.unwrap_or(of_country), &postcode);
+            valid.then_some(postcode)
+        };
+        let mut found = areas.iter().filter_map(|poly| eligible(poly).map(|postcode| (poly, postcode)));
+        let first = found.next()?;
+        let rest: Vec<_> = found.collect();
+        if rest.is_empty() {
+            return Some(first.1);
+        }
+        let distance = |poly: &AdminPolygon| {
+            self.admin_geometry.centroid(poly).map_or(f64::INFINITY, |(c_lat, c_lng)| postcode_files::distance(lat, lng, c_lat, c_lng))
+        };
+        std::iter::once(first).chain(rest)
+            .map(|(poly, postcode)| (distance(poly), poly.area, postcode))
+            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)).then_with(|| a.2.cmp(&b.2)))
+            .map(|(_, _, postcode)| postcode)
+    }
+
     /// Record `idx`'s value in a side file (way_parents / addr_postcodes /
     /// way_postcodes / interp_postcodes: a u32 per record, NO_DATA = absent).
     fn sidecar_u32(f: &SideBlocks, idx: u64) -> Option<u32> {
         f.get(u32::try_from(idx).ok()?).filter(|&v| v != NO_DATA)
     }
 
-    pub fn resolve_postcode<'a>(&'a self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
-        // 0. Nearest addr_point's own postcode (from addr_postcodes.bin)
+    /// The postcode get_nearest_postcode takes from the postal areas holding the point (lat, lng)
+    /// in the country `country_code` (postal_area_postcode), scanned there.
+    fn postal_area_at<'a>(&'a self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
+        let (areas, point, _) = self.postal_areas_at(lat, lng, true);
+        self.postal_area_postcode(&areas, &upper_country(country_code), point)
+    }
+
+    /// The postal areas holding the point (lat, lng), the smallest first (none unless `postal`),
+    /// the point as the scan rounds it, and the country there (get_country_code): that of the
+    /// smallest country polygon holding it, the lower code of two as large; none where none
+    /// holds it.
+    fn postal_areas_at(&self, lat: f64, lng: f64, postal: bool) -> (Vec<AdminPolygon>, (f64, f64), Option<[u8; 2]>) {
+        let mut scan = AdminScan::new(self, lat, lng);
+        let mut areas: Vec<AdminPolygon> = Vec::new();
+        let mut country: Option<(f32, u16)> = None;
+        scan.for_each_entry(|pip, id, poly| {
+            let is_country = poly.admin_level == 2 && poly.country_code != 0;
+            if !(is_country || postal && poly.admin_level == POSTCODE_AREA_LEVEL && poly.area > 0.0) || !pip.holds(self, id, &poly) {
+                return;
+            }
+            if !is_country {
+                areas.push(poly);
+            } else if country.is_none_or(|(area, code)| poly.area < area || poly.area == area && poly.country_code < code) {
+                country = Some((poly.area, poly.country_code));
+            }
+        });
+        areas.sort_by(|a, b| a.area.total_cmp(&b.area));
+        (areas, scan.pip.point.degrees(), country.map(|(_, code)| code.to_be_bytes()))
+    }
+
+    /// The point halfway along street way `id`, Nominatim's centroid of a street (line_middle);
+    /// None for a way whose nodes can't be read.
+    fn street_middle(&self, id: u32) -> Option<(f64, f64)> {
+        let streets = self.streets.as_ref()?;
+        with_way_nodes(|nodes| if streets.way(id, nodes) { line_middle(nodes) } else { None })
+    }
+
+    /// The postcode of the answer at (lat, lng), as Nominatim stores it on the feature that
+    /// answers (the tiers above): `addr` the house that answers, `street` the street the
+    /// postcode comes from (a house's parent street, else the street that answers), `poi` the
+    /// POI that answers, `interp` the TIGER line near a street that answers, `postcode_area` the
+    /// postal area's postcode at the query point and `country_code` the answer's country.
+    pub fn resolve_postcode<'a>(&'a self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, postcode_area: Option<Cow<'a, str>>, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
+        self.resolve_postcode_in(lat, lng, street, addr, poi, interp, postcode_area, country_code).map(|(postcode, _)| postcode)
+    }
+
+    /// `resolve_postcode`'s postcode, with the country it is of: the one get_nearest_postcode
+    /// takes it in at a street's middle, and a house of the street, else `country_code`.
+    fn resolve_postcode_in<'a>(&'a self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, postcode_area: Option<Cow<'a, str>>, country_code: Option<[u8; 2]>) -> Option<(Cow<'a, str>, Option<[u8; 2]>)> {
+        // 0. The house's own postcode (from addr_postcodes.bin)
         // Matches Nominatim's token_get_postcode — the feature's own
-        // addr:postcode tag is the highest-priority source.
+        // addr:postcode tag is the highest-priority source. The
+        // clean-postcodes sanitizer drops one in a country without
+        // postcodes or one its country's pattern rejects, and the house
+        // then takes its street's: the builder stores none that the
+        // pattern of the house's country rejects, and one failing the
+        // answer's checks below (country_has_no_postcode,
+        // postcode_looks_valid) is passed over.
         if let (Some(apc), Some((addr_id, _))) = (self.addr_postcodes.as_ref(), addr) {
             if let Some(pid) = Self::sidecar_u32(apc, addr_id as u64) {
-                return Some(self.get_string(pid));
+                let own = self.get_string(pid);
+                if country_code.is_none_or(|cc| !country_has_no_postcode(&cc) && postcode_looks_valid(&cc, &own)) {
+                    return Some((own, country_code));
+                }
             }
         }
 
-        // 1. way_postcodes[street.way_id] — street's computed postcode
+        // 1. way_postcodes[street.way_id] — street's computed postcode,
+        // which the builder takes at its middle, of the country there.
         if let (Some(wpc), Some((way_id, _))) = (self.way_postcodes.as_ref(), street) {
             if let Some(pid) = Self::sidecar_u32(wpc, way_id as u64) {
-                return Some(self.get_string(pid));
+                let middle = u32::try_from(way_id).ok().and_then(|id| self.street_middle(id));
+                let country = middle.and_then(|(m_lat, m_lng)| self.postal_areas_at(m_lat, m_lng, false).2);
+                return Some((self.get_string(pid), country.or(country_code)));
             }
         }
 
@@ -2737,7 +3001,7 @@ impl Index {
         // memory locality.
         if let Some(p) = poi {
             if p.parent_postcode_id != NO_DATA {
-                return Some(self.get_string(p.parent_postcode_id));
+                return Some((self.get_string(p.parent_postcode_id), country_code));
             }
         }
 
@@ -2766,56 +3030,115 @@ impl Index {
                         && street_tokens_overlap(seg_street, &self.get_string(way.name))
                     {
                         if let Some(pid) = Self::sidecar_u32(ipc, iw_idx as u64) {
-                            return Some(self.get_string(pid));
+                            return Some((self.get_string(pid), country_code));
                         }
                     }
                 }
             }
         }
 
-        // 2. Nearest postcode centroid to the query point. Like
-        // get_nearest_postcode, filter by country_code: without it, a
-        // French "90012" can win over a US "90012" near the Maine/
-        // Quebec border or vice-versa — and the same digits often
-        // collide across countries. We use the country resolved by
-        // find_admin as the gate; if no country is known (ocean,
-        // Antarctica), fall back to unfiltered lookup so we still
-        // return something.
+        // 2. get_nearest_postcode at the street's centroid, of the country
+        // there (get_country_code), for the street and a house of it, which
+        // takes its street's country; a street none reaches has no postcode.
+        // Then at the house; else at the query point, of its postcode area.
+        let mut country_code = country_code;
+        if let Some((way_id, _)) = street {
+            if let Some((m_lat, m_lng)) = u32::try_from(way_id).ok().and_then(|id| self.street_middle(id)) {
+                let (areas, point, country_there) = self.postal_areas_at(m_lat, m_lng, true);
+                country_code = country_there.or(country_code);
+                let found = self.postal_area_postcode(&areas, &upper_country(country_code), point)
+                    .or_else(|| self.centroid_postcode(m_lat, m_lng, country_code));
+                if found.is_some() || addr.is_none() {
+                    return found.map(|postcode| (postcode, country_code));
+                }
+            }
+        }
+        if let Some((_, house)) = addr {
+            let (h_lat, h_lng) = (house.lat as f64, house.lng as f64);
+            return self.postal_area_at(h_lat, h_lng, country_code)
+                .or_else(|| self.centroid_postcode(h_lat, h_lng, country_code))
+                .map(|postcode| (postcode, country_code));
+        }
+        // The postcode area covering the point: get_nearest_postcode takes
+        // one before any centroid (ORDER BY osm_id is null).
+        postcode_area.or_else(|| self.centroid_postcode(lat, lng, country_code)).map(|postcode| (postcode, country_code))
+    }
+
+    /// The postcode of the postcode centroid nearest the point (lat, lng) whose box holds it,
+    /// get_nearest_postcode's after the postal areas. Like get_nearest_postcode, of the country
+    /// `country_code` only: without it, a French "90012" can win over a US "90012" near the
+    /// Maine/Quebec border or vice-versa — and the same digits often collide across countries.
+    /// Where no country is known (ocean, Antarctica), of any, so the point still has one.
+    fn centroid_postcode<'a>(&'a self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
         let country_gate: Option<u16> = country_code.map(|cc| {
             (cc[0] as u16) << 8 | (cc[1] as u16)
         });
         if let Some(files) = &self.postcode_centroids {
-            // 0.05 deg ~ 5.5km, get_nearest_postcode's radius before Nominatim 5.3
-            let max_dist_sq = (0.05_f64).to_radians().powi(2);
-            let cos_lat = lat.to_radians().cos();
+            // No centroid farther than its country's extent along either axis holds the point,
+            // the most expand_by_meters' box reaches, but for a box across the antimeridian (read
+            // below).
+            let reach_m = country_code.map_or(MAX_POSTCODE_EXTENT_M, |cc| postcode_extent_m(cc, "")) * geography_box::BOX_REACH_FACTOR;
+            let dlat = reach_m / METRES_PER_DEGREE;
+            let (max_dist_sq, dlng) = {
+                let metres_per_lng = METRES_PER_DEGREE * (lat.abs() + dlat).min(90.0).to_radians().cos();
+                let dlng = if metres_per_lng > reach_m / 360.0 { reach_m / metres_per_lng } else { 360.0 };
+                (postcode_files::distance(0.0, 0.0, dlat, dlng) * (1.0 + 1e-9), dlng)
+            };
             let mut best: Option<(f64, Cow<'a, str>)> = None;
             let consider = |pc: postcode_files::Centroid, best: &mut Option<(f64, Cow<'a, str>)>| {
                 if let Some(cc) = country_gate {
                     if pc.country_code != 0 && pc.country_code != cc { return; }
                 }
-                let d = postcode_files::distance(lat, lng, cos_lat, pc.lat as f64, pc.lng as f64);
-                if d >= max_dist_sq { return; }
+                let d = postcode_files::distance(lat, lng, pc.lat as f64, pc.lng as f64);
                 // A centroid farther than the best so far can't win (nearer_postcode), so its
                 // postcode isn't read.
                 if best.as_ref().is_some_and(|&(best_d, _)| d > best_d) { return; }
+                // The box of expand_by_meters. A centroid of no country stands for one of the
+                // point's.
+                let pc_country = match pc.country_code {
+                    0 => country_code.unwrap_or([0, 0]),
+                    cc => cc.to_be_bytes(),
+                };
+                let (c_lat, c_lng) = (pc.lat as f64, pc.lng as f64);
+                if !geography_box::box_covers(c_lat, c_lng, postcode_extent_m(pc_country, ""), lat, lng) { return; }
                 let s = self.get_string(pc.postcode_id);
+                // A country's other postcode patterns may reach less far.
+                let extent = postcode_extent_m(pc_country, &s);
+                if extent != postcode_extent_m(pc_country, "") && !geography_box::box_covers(c_lat, c_lng, extent, lat, lng) { return; }
                 if centroid_postcode_ok(&s) && nearer_postcode(d, &s, best.as_ref().map(|(bd, bs)| (*bd, &**bs))) {
                     *best = Some((d, s));
                 }
             };
-            // The blocks of the centroids of the query's cell and its neighbours, the nearest box
-            // first: no centroid is nearer than its block's box, so a block whose box is farther
-            // than the best so far holds none that can win, and is left undecoded.
-            let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
-            let mut cells = cell_neighbors_at_level(cell, self.admin_cell_level);
-            cells.push(cell);
-            NEAR_BLOCKS.with_borrow_mut(|near| {
-                files.blocks_near(&cells, lat, lng, max_dist_sq, near);
+            // The blocks of the centroids of `cells` nearer than `max_d`, the nearest box first:
+            // no centroid is nearer than its block's box, so a block whose box is farther than
+            // the best so far holds none that can win, and is left undecoded.
+            let read = |cells: &[u64], max_d: f64, best: &mut Option<(f64, Cow<'a, str>)>| NEAR_BLOCKS.with_borrow_mut(|near| {
+                files.blocks_near(cells, lat, lng, max_d, near);
                 for n in near.iter() {
                     if best.as_ref().is_some_and(|&(best_d, _)| n.d > best_d) { continue; }
-                    files.rows_of(n.block, n.rows, |_, pc| consider(pc, &mut best));
+                    files.rows_of(n.block, n.rows, |_, pc| consider(pc, best));
                 }
             });
+            // The cells a centroid holding the point can be in.
+            read(&cells_near_point(lat, lng, reach_m, self.admin_cell_level), max_dist_sq, &mut best);
+            // A box across the antimeridian spans every longitude between its corners the long
+            // way round (expand_by_meters), so a centroid within reach of the antimeridian at
+            // the point's latitude can hold the point however far off it lies, past the cells
+            // within reach. Those are read, at any distance, unless no centroid of the
+            // antimeridian's cells can be as near as the best so far: none lies closer to the
+            // point's longitude than `dlng` and a cell's diagonal (S2's kMaxDiag, 2.438 / 2^level
+            // radians) short of the antimeridian. Past 70° the polar projection's boxes and the
+            // cells reach farther round the pole than that, and the cells are always read.
+            let near_pole = lat.abs() + dlat > geography_box::POLAR_LAT;
+            let diagonal = (2.438 / (1u64 << self.admin_cell_level) as f64).to_degrees();
+            let cell_lng = diagonal / (lat.abs() + dlat + diagonal).min(90.0).to_radians().cos();
+            let gap = (180.0 - dlng - cell_lng - lng.abs()).max(0.0);
+            if near_pole || best.as_ref().is_none_or(|&(best_d, _)| postcode_files::distance(0.0, 0.0, 0.0, gap) <= best_d) {
+                let cells: Vec<u64> = [180.0, -180.0].into_iter()
+                    .flat_map(|edge| cells_near_point(lat, edge, reach_m, self.admin_cell_level))
+                    .collect();
+                read(&cells, f64::INFINITY, &mut best);
+            }
             return best.map(|(_, s)| s);
         }
 
@@ -2851,6 +3174,7 @@ impl Index {
         // along the Bern-Valais ridge is Kandersteg's in Nominatim, but
         // its point nearest Leukerbad answers Valais.
         let admin_chain = admin_chain.map(|chain| {
+            let mut street_ranks = None;
             let [state, region, province] = coarse_fields(
                 [chain.state, chain.region, chain.province],
                 [admin_pip.state.clone(), admin_pip.region.clone(), admin_pip.province.clone()],
@@ -2858,13 +3182,30 @@ impl Index {
                     let (_, _, way_idx) = street?;
                     let (plat, plng) = self.closest_point_on_way(*way_idx, lat, lng)?;
                     let at = self.find_admin(plat, plng);
+                    street_ranks = Some(at.ranks);
                     Some([at.state, at.region, at.province])
                 },
             );
-            AdminResult { state, region, province, ..chain }
+            // A field the street's point names has the rank it has there.
+            let mut ranks = chain.ranks;
+            if let Some(at) = street_ranks {
+                for field in ["state", "region", "province"] {
+                    if at.get(field) != 0 { ranks.set(field, at.get(field)); }
+                }
+            }
+            AdminResult { state, region, province, ranks, ..chain }
         });
         match admin_chain {
             Some(chain) => AdminResult {
+                // Each field's rank is that of the polygon it came from.
+                ranks: {
+                    let mut ranks = admin_pip.ranks;
+                    for (field, named) in [("country", chain.country.is_some()), ("state", chain.state.is_some()),
+                                           ("province", chain.province.is_some()), ("region", chain.region.is_some())] {
+                        if named { ranks.set(field, chain.ranks.get(field)); }
+                    }
+                    ranks
+                },
                 // Only country/state/region/province replace PIP from
                 // chain — at those ranks PIP false-positives are rare
                 // and chain walk rarely drifts vs query. For finer
@@ -2896,6 +3237,8 @@ impl Index {
                 city_block: admin_pip.city_block,
                 // The place-node ranks (16 and up) are PIP's.
                 boundary_ranks: admin_pip.boundary_ranks,
+                postcode_area: admin_pip.postcode_area,
+                unlabelled: admin_pip.unlabelled,
             },
             None => admin_pip,
         }
@@ -2977,7 +3320,12 @@ impl Index {
         // address_havelevel: the ranks the address's boundaries hold take no
         // place node. A boundary-derived city/town/village covers rank 16
         // whatever its rank, so place nodes must not fill (or fuzzy-anchor
-        // on) a competing rank-16 candidate.
+        // on) a competing rank-16 candidate. Nominatim gives a boundary its
+        // linked place's rank even below its own (placex_triggers.sql:1129):
+        // the parish of Winsford, linked to a town, ranks 16 where its
+        // admin_level gives 20. The place type here need not be the one
+        // Nominatim links, so promote_nested_ranks only raises, and the hold
+        // stands in for that rank.
         let rank16 = admin.city.is_some() || admin.town.is_some() || admin.village.is_some();
         let held_ranks = admin.boundary_ranks | if rank16 { 1 << CurrentBoundaries::CITY } else { 0 };
 
@@ -3001,6 +3349,9 @@ impl Index {
         // spurious house number on test points that sit on non-
         // residential ways.
         let mut house_number: Option<Cow<'_, str>> = None;
+        // The house a street that won takes its number from: Nominatim's answer is then the
+        // house, of the house's postcode.
+        let mut street_house: Option<(u32, AddrRecord)> = None;
         let mut road: Option<Cow<'_, str>> = None;
 
         // POI primary-feature candidate: Nominatim's
@@ -3213,9 +3564,10 @@ impl Index {
                     let r = 100.0_f64 / 6_371_000.0;
                     r * r
                 };
-                if let Some(addr_pt) = self.find_addr_on_way(lat, lng, way_idx, refine_max_sq) {
+                if let Some((id, addr_pt)) = self.find_addr_on_way(lat, lng, way_idx, refine_max_sq) {
                     if addr_pt.housenumber_id != NO_DATA {
                         house_number = Some(self.get_string(addr_pt.housenumber_id));
+                        street_house = Some((id, addr_pt));
                     }
                 }
                 // No address point: Nominatim falls back to TIGER in the US.
@@ -3254,27 +3606,47 @@ impl Index {
         let place = self.find_places(feature, &current_boundaries, held_ranks);
 
         // Resolve postcode: mirror Nominatim's stored placex.postcode chain
-        // (Tier 0 addr / Tier 1 primary feature's calculated_postcode /
-        // Tier 2 nearest centroid). Build-time postal-boundary inheritance
-        // feeds Tier 1 (way_postcodes.bin for streets, parent_postcode_id
-        // for POIs); no query-time postal-boundary PIP. Tier 0 and Tier 1
-        // are primary-feature-driven — only the winning feature's
-        // inherited postcode is consulted (poi_won_primary is set by the
-        // SAME cascade branch that picked the road above), so a POI win no
-        // longer leaks the street's inherited ZIP (Mexico City Zócalo
-        // 06060 leak).
-        let resolved_postcode = self.resolve_postcode(
+        // (Tier 0 the house's own / Tier 1 its street's or the primary
+        // feature's calculated_postcode / Tier 2 get_nearest_postcode at the
+        // street's centroid, the house or the point: the postal area round
+        // it, else the nearest centroid). Build-time postal-boundary
+        // inheritance feeds Tier 1 (way_postcodes.bin for streets,
+        // parent_postcode_id for POIs); at the query point Tier 2 takes the
+        // postal area find_admin found there. Tier 0 and Tier 1 are
+        // primary-feature-driven — only the winning feature's inherited
+        // postcode is consulted (poi_won_primary is set by the SAME cascade
+        // branch that picked the road above), so a POI win no longer leaks
+        // the street's inherited ZIP (Mexico City Zócalo 06060 leak).
+        // The street the postcode comes from: a house's parent street (placex_update takes the
+        // parent's postcode, find_parent_for_poi's street, else the nearest), else the street that
+        // won.
+        let postcode_street: Option<(u32, WayRow)> = if poi_won_primary {
+            None
+        } else if addr_won_primary {
+            addr.as_ref()
+                .and_then(|(_, point, _)| (point.parent_way_id != NO_DATA).then_some(point.parent_way_id))
+                .and_then(|id| Some((id, self.streets.as_ref()?.row(id)?)))
+                .or_else(|| street.as_ref().map(|(_, w, idx)| (*idx, *w)))
+        } else {
+            street.as_ref().map(|(_, w, idx)| (*idx, *w))
+        };
+        let resolved_postcode = self.resolve_postcode_in(
             lat, lng,
-            if poi_won_primary { None } else { street.as_ref().map(|(_, w, idx)| (*idx as usize, w)) },
-            if addr_won_primary { addr.as_ref().map(|(_, a, id)| (*id as usize, a)) } else { None },
+            postcode_street.as_ref().map(|(idx, w)| (*idx as usize, w)),
+            if addr_won_primary {
+                addr.as_ref().map(|(_, a, id)| (*id as usize, a))
+            } else {
+                street_house.as_ref().map(|(id, a)| (*id as usize, a))
+            },
             if poi_won_primary { poi_primary.as_ref().map(|(_, p)| p) } else { None },
             // TIGER tier: only when the street itself won the primary.
             // Nominatim consults location_property_tiger only after the
             // street wins and no rank-30 housenumber row was found; a POI
             // or addr-point win routes the postcode through that feature.
-            if poi_won_primary || addr_won_primary { None } else {
+            if poi_won_primary || addr_won_primary || street_house.is_some() { None } else {
                 interp.as_ref().map(|(d, s, _, idx)| (*idx as usize, *d, &**s))
             },
+            admin.postcode_area.clone(),
             admin.country_code,
         );
 
@@ -3332,54 +3704,73 @@ impl Index {
         let admin_chain_dense = admin.suburb.is_some() && admin.city_block.is_some();
         let allow_place_quarter = !admin_chain_dense;
         let allow_place_neighbourhood = !admin_chain_dense;
-        // Nominatim's insert_addresslines orders candidates by
-        // `rank_address, isguess asc, distance` (placex_triggers.sql
-        // :590). `isguess asc` puts admin boundaries (isguess=false)
-        // ahead of place nodes (isguess=true) at the same rank, so
-        // admin wins the address slot within a rank tie. Mirror that
-        // here for suburb / quarter / neighbourhood — earlier we did
-        // place-first, which surfaced "Tverskoy" (place=suburb node)
-        // instead of "Tverskoy District" (AL8 boundary), and similar
-        // for Beijing "Donghuamen" vs "Donghuamen Subdistrict".
-        // NYC still resolves as before because admin.suburb=Manhattan
-        // and place.suburb=Manhattan carry the same name.
+        // A field a boundary and a place node both fill names the finer
+        // (label_field): Nominatim's address keeps the first row of a
+        // label, its rows the finest first, and its insert_addresslines
+        // orders candidates by `rank_address, isguess asc, distance`
+        // (placex_triggers.sql:576), so at one rank the boundary's row
+        // (isguess=false) comes first: "Tverskoy District" (AL8
+        // boundary) over "Tverskoy" (place=suburb node), and Beijing's
+        // "Donghuamen Subdistrict" over "Donghuamen". A suburb node of
+        // rank 22 inside a parish of rank 20 is the suburb, and the
+        // parish's row stays in display_name. Each field's rank_address
+        // is that of the polygon or the place node it came from.
+        let mut ranks = admin.ranks;
+        let mut unlabelled = admin.unlabelled;
+        let mut label = |field: &str, boundary, node| {
+            let (named, lost) = label_field(boundary, admin.ranks.get(field), node, place.ranks.get(field));
+            if let Some((_, rank)) = &named { ranks.set(field, *rank); }
+            unlabelled.extend(lost);
+            named.map(|(name, _)| name)
+        };
+        let city = label("city", admin.city, place.city);
+        let town = label("town", admin.town, place.town);
+        let village = label("village", admin.village, place.village);
+        let hamlet = label("hamlet", admin.hamlet, place.hamlet);
+        let suburb = label("suburb", admin.suburb, place.suburb);
+        let quarter = label("quarter", admin.quarter, place.quarter.filter(|_| allow_place_quarter));
+        let neighbourhood = label("neighbourhood", admin.neighbourhood, place.neighbourhood.filter(|_| allow_place_neighbourhood));
+        // Same-name suppression, observed Nominatim behaviour: the Kingdom
+        // of the Netherlands (AL2) and the constituent country (AL3) are both
+        // named "Nederland"; Nominatim's address keeps one row per label and
+        // drops the duplicate, which would be region=Netherlands here. Its
+        // display_name joins every row, the region's too.
+        let (region, country_region) = match (admin.region, &admin.country) {
+            (Some(r), Some(c)) if r == *c => (None, Some((ranks.get("region"), r))),
+            (r, _) => (r, None),
+        };
         let address = AddressDetails {
+            ranks,
+            unlabelled: unlabelled.into_iter().chain(country_region).collect(),
             landmark: landmark_name,
             // A string in a tier this mode doesn't ship (admin mode has no
             // street or addr strings) resolves to "" — omit the field.
             house_number: house_number.filter(|s| !s.is_empty()),
             road: road.filter(|s| !s.is_empty()),
-            city: admin.city.or(place.city),
-            town: admin.town.or(place.town),
-            village: admin.village.or(place.village),
-            hamlet: admin.hamlet.or(place.hamlet),
+            city,
+            town,
+            village,
+            hamlet,
             municipality: admin.municipality,
             state: admin.state,
             province: admin.province,
-            // Same-name suppression, observed Nominatim behaviour: the
-            // Kingdom of the Netherlands (AL2) and the constituent country
-            // (AL3) are both named "Nederland"; Nominatim's addressline
-            // drops the duplicate, we surfaced it as region=Netherlands.
-            region: match (admin.region, &admin.country) {
-                (Some(r), Some(c)) if r == *c => None,
-                (r, _) => r,
-            },
+            region,
             state_district: admin.state_district,
             county: admin.county,
             district: admin.district,
             borough: admin.borough,
-            suburb: admin.suburb.or(place.suburb),
-            quarter: if allow_place_quarter { admin.quarter.or(place.quarter) } else { admin.quarter },
+            suburb,
+            quarter,
             city_district: admin.city_district,
-            neighbourhood: if allow_place_neighbourhood { admin.neighbourhood.or(place.neighbourhood) } else { admin.neighbourhood },
+            neighbourhood,
             city_block: admin.city_block,
             // Postcode from resolve_postcode(): 3-tier chain
-            // (way_postcodes → postal boundary PIP → nearest centroid).
-            // Reject if the country has no postal-code system or if
+            // (own → inherited → postal area or nearest centroid).
+            // Reject if its country has no postal-code system or if
             // the string doesn't match the country's pattern, then
             // normalise whitespace/separators per country.
             postcode: match resolved_postcode {
-                Some(pc) => match admin.country_code {
+                Some((pc, postcode_country)) => match postcode_country {
                     Some(cc) => {
                         if country_has_no_postcode(&cc) || !postcode_looks_valid(&cc, &pc) {
                             None
@@ -4121,15 +4512,15 @@ mod query_tests {
     }
 
     /// The postcode the centroid tier answers at (lat, lng) when reading every centroid's:
-    /// the nearest valid one of the country (or of none) within 0.05 degrees, as resolve_postcode
-    /// measures it, ties to the smaller postcode.
+    /// the nearest valid one in plain degrees of the country (or of none) whose box holds the
+    /// point, ties to the smaller postcode.
     fn nearest_centroid<'a>(centroids: &[(f32, f32, &'a str, [u8; 2])], lat: f64, lng: f64, country: Option<[u8; 2]>) -> Option<&'a str> {
-        let cos_lat = lat.to_radians().cos();
         centroids.iter()
             .filter(|c| country.is_none_or(|cc| c.3 == [0, 0] || c.3 == cc))
-            .filter_map(|&(c_lat, c_lng, postcode, _)| {
-                let d = postcode_files::distance(lat, lng, cos_lat, c_lat as f64, c_lng as f64);
-                (d < 0.05_f64.to_radians().powi(2) && centroid_postcode_ok(postcode)).then_some((d, postcode))
+            .filter_map(|&(c_lat, c_lng, postcode, c_country)| {
+                let extent_m = postcode_extent_m(if c_country == [0, 0] { country.unwrap_or([0, 0]) } else { c_country }, postcode);
+                let d = postcode_files::distance(lat, lng, c_lat as f64, c_lng as f64);
+                (geography_box::box_covers(c_lat as f64, c_lng as f64, extent_m, lat, lng) && centroid_postcode_ok(postcode)).then_some((d, postcode))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)))
             .map(|(_, postcode)| postcode)
@@ -4228,7 +4619,7 @@ mod query_tests {
         // centroids are read from the west: its postcode is the 17th read at most.
         let (lat, lng) = at(0.0, 6.0);
         let blocks_before = postcode_files::BLOCK_READS.with(|n| n.get());
-        let (postcode, read) = reads(|| idx.resolve_postcode(lat, lng, None, None, None, None, Some(*b"fr")));
+        let (postcode, read) = reads(|| idx.resolve_postcode(lat, lng, None, None, None, None, None, Some(*b"fr")));
         let blocks = postcode_files::BLOCK_READS.with(|n| n.get()) - blocks_before;
 
         assert_eq!(postcode.as_deref(), Some("11008"));
@@ -4258,7 +4649,7 @@ mod query_tests {
                     for (dlat, dlng) in [(0.0, 0.0), (-metre, 0.0), (metre, 0.0), (0.0, -metre), (0.0, metre)] {
                         let (lat, lng) = (lat + dlat, lng + dlng);
                         let want = nearest_centroid(&all, lat, lng, Some(*b"fr"));
-                        assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, Some(*b"fr")).as_deref(), want, "({lat}, {lng}) block {b}");
+                        assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, None, Some(*b"fr")).as_deref(), want, "({lat}, {lng}) block {b}");
                         queries += 1;
                     }
                 }
@@ -4271,7 +4662,9 @@ mod query_tests {
     fn a_query_beside_the_antimeridian_answers_as_reading_every_centroid() {
         // Centroids a few hundred metres either side of the antimeridian, in the cells on both
         // sides, which are each other's neighbours; resolve_postcode measures across it the long
-        // way round, so none answers from the other side.
+        // way round, so none answers from the other side. Each box reaches across it, and
+        // ST_Envelope makes it of the longitudes between its corners the long way round, which
+        // leaves out the meridian: no centroid names a point on it.
         let centroids: Vec<(f32, f32, &str, [u8; 2])> = vec![
             (-16.75, 179.997, "F1", [0, 0]), (-16.751, 179.9995, "F2", [0, 0]), (-16.749, -179.998, "W1", [0, 0]),
             (-16.75, -179.9995, "W2", [0, 0]), (-16.76, 179.96, "F3", [0, 0]), (-16.74, -179.97, "W3", [0, 0]),
@@ -4287,11 +4680,52 @@ mod query_tests {
             let lng = if lng > 180.0 { lng - 360.0 } else { lng };
             for lat in [-16.76, -16.75, -16.7495, -16.74] {
                 let want = nearest_centroid(&centroids, lat, lng, None);
-                assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, None).as_deref(), want, "({lat}, {lng})");
+                assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, None, None).as_deref(), want, "({lat}, {lng})");
                 answered += usize::from(want.is_some());
             }
         }
-        assert_eq!(answered, 41 * 4);
+        assert_eq!(answered, 40 * 4);
+        assert_eq!(nearest_centroid(&centroids, -16.75, 180.0, None), None);
+    }
+
+    #[test]
+    fn a_box_across_the_antimeridian_holds_points_far_from_its_centroid() {
+        // expand_by_meters' 25 km box of a US centroid at (10, 179.999) reaches across the
+        // antimeridian, and ST_Envelope makes it of every longitude between its corners the long
+        // way round (geography_box): it holds points of its latitudes 110 km west, across the
+        // antimeridian and half a world away where no nearer centroid's box does, as
+        // get_nearest_postcode finds them, and none of other latitudes or another country.
+        let centroids = [(10.0, 179.999, "96799", *b"us"), (10.0, 0.05, "96800", *b"us")];
+        let idx = centroids_at(&centroids);
+        for (lat, lng, country, want) in [
+            (10.0, 179.0, b"us", Some("96799")), (10.1, -170.0, b"us", Some("96799")), (10.2, 90.0, b"us", Some("96799")),
+            (10.0, 0.0, b"us", Some("96800")), (10.3, 90.0, b"us", None), (10.0, 179.0, b"fr", None),
+        ] {
+            assert_eq!(nearest_centroid(&centroids, lat, lng, Some(*country)), want, "({lat}, {lng})");
+            assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, None, Some(*country)).as_deref(), want, "({lat}, {lng})");
+        }
+        let idx = centroids_at(&centroids[..1]);
+        assert_eq!(idx.resolve_postcode(10.0, 0.0, None, None, None, None, None, Some(*b"us")).as_deref(), Some("96799"));
+        assert_eq!(idx.resolve_postcode(10.0, 0.0, None, None, None, None, None, None).as_deref(), Some("96799"));
+
+        // One can be nearer than a centroid within reach that holds the point: at (0, 179.69),
+        // 96801's box 0.22° south-west holds it and 96802's across the antimeridian, 0.30° east,
+        // whose cell is past the cells within reach.
+        let centroids = [(0.22, 179.47, "96801", *b"us"), (0.0, 179.99, "96802", *b"us")];
+        let reach = MAX_POSTCODE_EXTENT_M * geography_box::BOX_REACH_FACTOR;
+        let wrapping = cell_id_at_level(centroids[1].0 as f64, centroids[1].1 as f64, DEFAULT_ADMIN_CELL_LEVEL);
+        assert!(!cells_near_point(0.0, 179.69, reach, DEFAULT_ADMIN_CELL_LEVEL).contains(&wrapping));
+        assert_eq!(nearest_centroid(&centroids[..1], 0.0, 179.69, Some(*b"us")), Some("96801"));
+        assert_eq!(nearest_centroid(&centroids, 0.0, 179.69, Some(*b"us")), Some("96802"));
+        assert_eq!(centroids_at(&centroids).resolve_postcode(0.0, 179.69, None, None, None, None, None, Some(*b"us")).as_deref(), Some("96802"));
+
+        // Near a pole the cells read reach far past the reach in longitude, and the boxes of the
+        // polar projection farther still: at (-89.614, 4.095) two boxes hold the point, and the
+        // nearer centroid's cell is one of the antimeridian's.
+        let centroids = [(-89.803123, 91.400845, "AQ1", *b"us"), (-89.780914, -84.83687, "AQ2", *b"us")];
+        assert_eq!(nearest_centroid(&centroids[1..], -89.614027, 4.095063, None), Some("AQ2"));
+        assert_eq!(nearest_centroid(&centroids, -89.614027, 4.095063, None), Some("AQ1"));
+        assert_eq!(centroids_at(&centroids).resolve_postcode(-89.614027, 4.095063, None, None, None, None, None, None).as_deref(), Some("AQ1"));
     }
 
     #[test]
@@ -4308,7 +4742,7 @@ mod query_tests {
             (1500.0, 0.0, "75005", *b"fr"),  // farther: not read
         ]);
 
-        let (postcode, read) = reads(|| idx.resolve_postcode(origin().0, origin().1, None, None, None, None, Some(*b"fr")));
+        let (postcode, read) = reads(|| idx.resolve_postcode(origin().0, origin().1, None, None, None, None, None, Some(*b"fr")));
 
         assert_eq!(postcode.as_deref(), Some("75000"));
         assert_eq!(read, 4);
@@ -4439,18 +4873,18 @@ mod query_tests {
                 .map(|p| (p.name.clone(), p.category_id, p.distance_m.to_bits(), p.contained, p.is_point, p.score.to_bits(), p.area.to_bits()))
                 .collect()
         }
-        // Reading every centroid's postcode: the nearest valid one of the country, or of none,
-        // ties to the smaller postcode; and whether another postcode is as near.
+        // Reading every centroid's postcode: the nearest valid one in plain degrees of the
+        // country, or of none, whose box holds the point, ties to the smaller postcode; and
+        // whether another postcode is as near.
         let nearest = |lat: f64, lng: f64, country: Option<[u8; 2]>| {
-            let cos_lat = lat.to_radians().cos();
             let mut found: Vec<(f64, &str)> = centroids.iter()
                 .filter(|c| country.is_none_or(|cc| c.3 == [0, 0] || c.3 == cc))
-                .filter_map(|&(north, east, postcode, _)| {
+                .filter_map(|&(north, east, postcode, c_country)| {
                     let (c_lat, c_lng) = at(north, east);
-                    let dlat = (lat - c_lat as f32 as f64).to_radians();
-                    let dlng = (lng - c_lng as f32 as f64).to_radians();
-                    let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
-                    (d < 0.05_f64.to_radians().powi(2) && centroid_postcode_ok(postcode)).then_some((d, postcode))
+                    let (c_lat, c_lng) = (c_lat as f32, c_lng as f32);
+                    let extent_m = postcode_extent_m(if c_country == [0, 0] { country.unwrap_or([0, 0]) } else { c_country }, postcode);
+                    let d = postcode_files::distance(lat, lng, c_lat as f64, c_lng as f64);
+                    (geography_box::box_covers(c_lat as f64, c_lng as f64, extent_m, lat, lng) && centroid_postcode_ok(postcode)).then_some((d, postcode))
                 })
                 .collect();
             found.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)));
@@ -4467,7 +4901,7 @@ mod query_tests {
             nameless += read - read_named;
             for country in [None, Some(*b"fr"), Some(*b"de")] {
                 let (want, tie) = nearest(lat, lng, country);
-                assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, country).as_deref(), want, "({lat}, {lng}) {country:?}");
+                assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, None, country).as_deref(), want, "({lat}, {lng}) {country:?}");
                 tied += usize::from(tie);
             }
         }
@@ -4504,6 +4938,36 @@ fn address_score(a: &Address<'_>) -> i32 {
 // clean_postcodes sanitizer. We mirror that here at query time —
 // any OSM addr:postcode tag on a Dubai building (typically '000000'
 // or similar placeholder) gets filtered out.
+/// How far from a postcode centroid of `country` (its ISO code) the box it
+/// covers reaches north, south, east and west, in metres: the `extent` of the
+/// country's postcode pattern that `postcode` matches in Nominatim's
+/// settings/country_settings.yaml, 5000 where the pattern gives none
+/// (postcode_format.py). Nominatim's postcodes.py makes each artificial
+/// postcode's geometry expand_by_meters(centroid, extent). Nigeria's second
+/// pattern, of letters, has an extent of 1; a postcode of digits only (or "")
+/// has the largest extent of its country's.
+pub fn postcode_extent_m(country: [u8; 2], postcode: &str) -> f64 {
+    match &country.map(|b| b.to_ascii_uppercase()) {
+        b"CH" | b"EE" | b"JP" => 3000.0,
+        b"GB" | b"IM" => 700.0,
+        b"GG" | b"LU" | b"PT" => 1000.0,
+        b"IE" => 50.0,
+        b"LI" => 4000.0,
+        b"NL" => 800.0,
+        b"RO" => 2500.0,
+        b"US" => MAX_POSTCODE_EXTENT_M,
+        b"NG" if postcode.bytes().any(|b| b.is_ascii_alphabetic()) => 1.0,
+        _ => DEFAULT_POSTCODE_EXTENT_M,
+    }
+}
+
+/// The extent of a postcode whose country's pattern gives none
+/// (postcode_format.py: config.get('extent', 5000)).
+pub const DEFAULT_POSTCODE_EXTENT_M: f64 = 5000.0;
+
+/// The largest extent of any country's postcodes, the United States'.
+pub const MAX_POSTCODE_EXTENT_M: f64 = 25_000.0;
+
 pub fn country_has_no_postcode(country_code: &[u8; 2]) -> bool {
     let cc = std::str::from_utf8(country_code).unwrap_or("").to_ascii_lowercase();
     matches!(cc.as_str(),
@@ -4536,10 +5000,6 @@ pub fn postcode_looks_valid(_country_code: &[u8; 2], postcode: &str) -> bool {
     true
 }
 
-// Quick validation for postcode centroid candidates. Rejects
-// strings that are clearly not standalone postcodes — matches
-// the spirit of Nominatim's clean_postcodes sanitizer which
-// validates against per-country regex patterns at import.
 /// Whether a centroid at squared distance `d` beats the current best.
 /// Equally near centroids (GeoNames puts many PO-box ZIPs at one post
 /// office) are ordered by postcode, never by record order, which differs
@@ -4551,18 +5011,13 @@ pub fn nearer_postcode(d: f64, s: &str, best: Option<(f64, &str)>) -> bool {
     }
 }
 
+/// Whether a postcode centroid's postcode can name a point: not a list of values. The builder
+/// keeps a centroid only of the postcode its country's pattern makes (postcode_validation.h), of
+/// any length or shape, Iran's ddddd-ddddd among them; postcode_looks_valid drops placeholders
+/// (all zeros or dashes). There is no PO/Box filter: Nominatim has none, and the Portsmouth
+/// area's postcodes (PO1 1BA) are real.
 pub fn centroid_postcode_ok(s: &str) -> bool {
-    if s.len() > 10 { return false; }  // postcodes are short
-    if s.contains(';') { return false; } // multiple values
-    // NOTE: no PO/Box substring filter — Nominatim has none. It wrongly dropped
-    // every legitimate UK Portsmouth-area postcode (PO1 1BA, etc.). The
-    // per-country pattern is enforced at build time (postcode_validation.h) and
-    // placeholders (all-zeros/dashes) by postcode_looks_valid.
-    // Reject US zip+4 (5+4 digit format like "10001-2062")
-    if s.len() == 10 && s.as_bytes().get(5) == Some(&b'-') {
-        return false;
-    }
-    true
+    !s.contains(';')
 }
 
 // Per-country postcode formatter. Mirrors Nominatim's
@@ -4703,6 +5158,32 @@ pub fn closest_point_on_line(nodes: &[NodeCoord], lat: f64, lng: f64) -> Option<
         }
     }
     best.map(|(_, plat, plng)| (plat, plng))
+}
+
+/// The point halfway along a line, as (lat, lng): Nominatim's centroid of a line
+/// (get_center_point, utils.sql), ST_LineInterpolatePoint(geometry, 0.5) on placex's lon/lat
+/// geometry, planar in degrees, and ST_ReducePrecision to 1e-7 degrees. A line of no length is
+/// its first point; None for one without nodes.
+pub fn line_middle(nodes: &[NodeCoord]) -> Option<(f64, f64)> {
+    let first = nodes.first()?;
+    let point = |n: &NodeCoord| (n.lat as f64, n.lng as f64);
+    let length = |a: (f64, f64), b: (f64, f64)| (b.0 - a.0).hypot(b.1 - a.1);
+    let total: f64 = nodes.windows(2).map(|w| length(point(&w[0]), point(&w[1]))).sum();
+    let mut left = total / 2.0;
+    let mut middle = point(first);
+    for w in nodes.windows(2) {
+        let (a, b) = (point(&w[0]), point(&w[1]));
+        let step = length(a, b);
+        if step > 0.0 && left <= step {
+            let t = left / step;
+            middle = (a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1));
+            break;
+        }
+        left -= step;
+        middle = b;
+    }
+    let reduce = |v: f64| (v * 1e7).round() / 1e7;
+    Some((reduce(middle.0), reduce(middle.1)))
 }
 
 pub fn point_to_segment_distance(
@@ -5146,7 +5627,8 @@ pub fn place_node_rank(pn: &PlaceNode, promoting: &[(u8, AdminPolygon)], mut hol
 pub struct CurrentBoundaries {
     pub gates: [Option<AdminPolygon>; 5],
     /// (rank_address, polygon) of the boundaries, and (place rank, polygon)
-    /// of the place areas, holding the point at a PROMOTABLE_RANKS rank.
+    /// of the place areas, holding the point at a PROMOTABLE_RANKS rank, of
+    /// relations: a closed way's raises no place node.
     pub promoting: Vec<(u8, AdminPolygon)>,
 }
 
@@ -5166,22 +5648,36 @@ impl CurrentBoundaries {
     }
 
     /// Each rank's boundary from the boundaries holding the point at their
-    /// initial rank_address and the place areas holding it: the nested-
-    /// boundary promotions give each its rank_address (an admin_level 7
-    /// boundary in a level 6 one linked to a suburb is ranked 22, not 14),
-    /// then `walk` takes them as Nominatim's address walk does.
+    /// initial rank_address and the place areas holding it, in the point's
+    /// `country`: the nested-boundary promotions give each its rank_address
+    /// (an admin_level 7 boundary in a level 6 one linked to a suburb is
+    /// ranked 22, not 14), then `walk` takes them as Nominatim's address walk
+    /// does, over the ranks of address areas (ADDRESS_AREA_RANKS). A place
+    /// area is a row of that walk as a boundary is: the walk makes every row
+    /// it takes that is no place node the current_boundary (insert_addresslines,
+    /// placex_triggers.sql:622-632), so a place=suburb way in the address
+    /// holds the place nodes of finer ranks to itself. `inside(poly, other)`
+    /// tells whether poly's point on surface lies in other, `within(poly,
+    /// other)` whether poly lies within other.
     pub fn from_ranked<'a>(
         mut ranked: Vec<RankedPoly>,
         place_areas: impl Iterator<Item = &'a AdminPolygon> + Clone,
+        country: &str,
         inside: impl Fn(&AdminPolygon, &AdminPolygon) -> bool,
+        within: impl Fn(&AdminPolygon, &AdminPolygon) -> bool,
     ) -> Self {
-        promote_nested_ranks(&mut ranked, place_areas.clone());
+        // The place areas are rows of the walk at their rank_address, as find_admin_in ranks them.
+        ranked.extend(place_areas.clone().map(|p| RankedPoly { poly: *p, rank_address: place_area_ranks(p, country).1 }));
+        promote_nested_ranks(&mut ranked, place_areas.clone(), country, within);
         ranked.sort_by(|a, b| a.poly.area.total_cmp(&b.poly.area));
-        let promoting = ranked.iter().map(|r| (r.rank_address, r.poly))
-            .chain(place_areas.map(|p| (place_type_to_rank(p.place_type_override), *p)))
-            .filter(|(rank, _)| PROMOTABLE_RANKS.contains(rank))
+        // A place node is raised inside a relation of its rank alone, a boundary of its
+        // rank_address or a place area of its own place rank (placex_triggers.sql:984-1004).
+        let promoting = ranked.iter().filter(|r| r.poly.admin_level != 15).map(|r| (r.rank_address, r.poly))
+            .chain(place_areas.map(|p| (place_area_ranks(p, country).0, *p)))
+            .filter(|(rank, poly)| PROMOTABLE_RANKS.contains(rank) && !poly.of_way)
             .collect();
-        let gating = ranked.into_iter().filter(|r| !matches!(r.rank_address, 0 | 5 | 11));
+        let gating = ranked.into_iter()
+            .filter(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address) && !matches!(r.rank_address, 5 | 11));
         Self { promoting, ..Self::walk(gating.map(|r| (r.rank_address, r.poly)), inside) }
     }
 
@@ -5226,6 +5722,8 @@ pub struct PlaceResult<'a> {
     pub suburb: Option<Cow<'a, str>>,
     pub quarter: Option<Cow<'a, str>>,
     pub neighbourhood: Option<Cow<'a, str>>,
+    /// The rank_address of the node behind each field.
+    pub ranks: FieldRanks,
 }
 
 impl PlaceResult<'_> {
@@ -5260,6 +5758,14 @@ pub struct AdminResult<'a> {
     /// rank_address of the boundaries in the address, a bit per rank: the
     /// ranks they take before any place node (address_havelevel).
     pub boundary_ranks: u32,
+    /// The rank_address of the polygon behind each field.
+    pub ranks: FieldRanks,
+    /// The postcode of the eligible postal area (boundary=postal_code) holding the point
+    /// whose centroid is nearest, with ties going to the smaller area.
+    pub postcode_area: Option<Cow<'a, str>>,
+    /// The polygons in the address that fill no field (unlabelled_rows), as
+    /// (rank_address, name), the finest first: display_name lists them.
+    pub unlabelled: Vec<(u8, Cow<'a, str>)>,
 }
 
 impl AdminResult<'_> {
@@ -5272,6 +5778,11 @@ impl AdminResult<'_> {
     }
 }
 
+/// A country code as postal_area_postcode takes it: upper case, "" where unknown.
+fn upper_country(country_code: Option<[u8; 2]>) -> String {
+    country_code.map_or_else(String::new, |c| c.iter().map(|b| b.to_ascii_uppercase() as char).collect())
+}
+
 /// The rank_address bits of the polygons in an address (AdminResult::boundary_ranks).
 pub fn rank_bits(ranked: &[RankedPoly]) -> u32 {
     ranked.iter()
@@ -5279,8 +5790,75 @@ pub fn rank_bits(ranked: &[RankedPoly]) -> u32 {
         .fold(0, |bits, r| bits | 1 << r.rank_address)
 }
 
+/// Of the boundaries of `ranked` (admin_level below 15) of one rank_address, the smallest, the
+/// first of equals, the one find_current_boundaries' walk takes at that rank: Nominatim's address
+/// has a row a rank (insert_addresslines: address_havelevel), and only its rows fill a field or
+/// join display_name (format_json.py, results.py). The others go; the place areas stay.
+pub fn one_boundary_a_rank(ranked: &mut Vec<RankedPoly>) {
+    let mut kept: [Option<usize>; u32::BITS as usize] = [None; u32::BITS as usize];
+    for (k, r) in ranked.iter().enumerate() {
+        let rank = r.rank_address as usize;
+        if r.poly.admin_level == 15 || rank >= kept.len() { continue; }
+        if kept[rank].is_none_or(|b| r.poly.area < ranked[b].poly.area) {
+            kept[rank] = Some(k);
+        }
+    }
+    let mut k = 0;
+    ranked.retain(|r| {
+        let rank = r.rank_address as usize;
+        let keep = r.poly.admin_level == 15 || rank >= kept.len() || kept[rank] == Some(k);
+        k += 1;
+        keep
+    });
+}
+
+/// The polygons of `ranked` that fill no field but are rows of the address all the same:
+/// Nominatim's address has a row a rank and keeps the first row of each label, and its
+/// display_name joins every row (format_json.py, results.py). `slots[k]` is the field ranked[k]
+/// would fill and `winners[f]` the polygon filling field f. Of each rank no field's polygon has,
+/// the smallest polygon that lost its field, unless it has the outline of the one that took it
+/// (`same_outline`): that is one place tagged twice, as a boundary repeating its parent's
+/// wikidata and geometry, which Nominatim takes out of addresses (placex_triggers.sql:884-899);
+/// the records hold no wikidata. Indices into `ranked`, the finest rank first.
+pub fn unlabelled_rows(ranked: &[RankedPoly], slots: &[Option<usize>], winners: &[Option<usize>], same_outline: impl Fn(&AdminPolygon, &AdminPolygon) -> bool) -> Vec<usize> {
+    let held = winners.iter().flatten().fold(0u32, |bits, &w| bits | 1u32.checked_shl(ranked[w].rank_address as u32).unwrap_or(0));
+    let mut by_rank: [Option<usize>; u32::BITS as usize] = [None; u32::BITS as usize];
+    for (k, (r, slot)) in ranked.iter().zip(slots).enumerate() {
+        let Some(winner) = slot.and_then(|f| winners[f]) else { continue };
+        let rank = r.rank_address as usize;
+        if winner == k || rank >= by_rank.len() || held & 1 << rank != 0 || same_outline(&ranked[winner].poly, &r.poly) { continue; }
+        if by_rank[rank].is_none_or(|b| r.poly.area < ranked[b].poly.area) {
+            by_rank[rank] = Some(k);
+        }
+    }
+    by_rank.into_iter().rev().flatten().collect()
+}
+
+/// A field of the address a boundary of rank `boundary_rank` and a place node of rank `node_rank`
+/// may both fill: Nominatim's address keeps the first row of a label, its rows the finest first
+/// (format_json.py, results.py), and of rows of one rank the boundary's (isguess asc,
+/// placex_triggers.sql:576). The name filling it with its rank, and the boundary's row, as
+/// (rank, name), where the node takes the field: display_name still lists it.
+pub fn label_field<'a>(boundary: Option<Cow<'a, str>>, boundary_rank: u8, node: Option<Cow<'a, str>>, node_rank: u8)
+    -> (Option<(Cow<'a, str>, u8)>, Option<(u8, Cow<'a, str>)>) {
+    match (boundary, node) {
+        (Some(b), Some(n)) if node_rank > boundary_rank => (Some((n, node_rank)), Some((boundary_rank, b))),
+        (Some(b), _) => (Some((b, boundary_rank)), None),
+        (None, n) => (n.map(|n| (n, node_rank)), None),
+    }
+}
+
 #[derive(Serialize, Default)]
 pub struct AddressDetails<'a> {
+    /// The rank_address of the polygon or the place node behind each place
+    /// field, which display_name lists the parts by.
+    #[serde(skip)]
+    pub ranks: FieldRanks,
+    /// Parts of display_name that fill no field, with their rank_address: a
+    /// region of the country's own name (Nominatim's address keeps one row
+    /// per label, its display_name every row).
+    #[serde(skip)]
+    pub unlabelled: Vec<(u8, Cow<'a, str>)>,
     // Landmark field: set to the name of the smallest-area
     // polygon POI that contains the query point. Category details
     // (specific type, distance, …) live in places[], so a single
@@ -5370,28 +5948,28 @@ pub fn format_rules(country_code: Option<&str>) -> (bool, bool, bool) {
 }
 
 // Build display_name matching Nominatim's `BaseResult.display_name`
-// (`src/nominatim_api/results.py`): iterate address_rows sorted by
-// rank_address descending (fine → coarse), filtering by isaddress flag,
-// and dedup *consecutively* — only skip a row whose display_name matches
-// the previous pushed entry, not globally. Country and postcode are
-// appended at the end as pseudo-entries in Nominatim's _finalize_entry.
+// (`src/nominatim_api/results.py`): the address rows sorted by rank_address
+// descending (fine → coarse), joined, and a row left out only where its name
+// repeats the part just before it. The landmark (the result's own name)
+// leads, then the house number and road; the postcode (rank 5) and the
+// country (rank 4) close it, as _finalize_entry adds them.
 //
-// Iteration order below uses rank_address values read verbatim from
-// Nominatim's `settings/address-levels.json` — any future divergence
-// should only happen if Nominatim's upstream file changes.
+// A place part's rank is the rank_address of the polygon or the place node
+// behind its field (AddressDetails::ranks): a village node inside a township
+// of its own rank is promoted to 18 and comes before the township's 16. A
+// field without a known rank takes that of its label in Nominatim's
+// settings/address-levels.json, and parts of one rank keep this order:
 //
-//   30 = house_number, road
 //   25 = city_block
 //   24 = neighbourhood
 //   22 = quarter
 //   20 = hamlet, suburb
 //   18 = borough
-//   16 = city, town, village
+//   16 = city, city_district, town, village
 //   14 = municipality
-//   12 = county, district
-//    8 = state  (from boundary=administrative4, not place=state)
-//    5 = postcode
-//    4 = country
+//   12 = district, county
+//    8 = state
+//    6 = state_district, region, province
 //
 // Notes:
 // - place=state/province/region all have rank_address=0 in Nominatim
@@ -5399,113 +5977,66 @@ pub fn format_rules(country_code: Option<&str>) -> (bool, bool, bool) {
 //   comes from boundary=administrative4, which is rank 8.
 // - Our AddressDetails fields `region`, `province`, `state_district`
 //   are populated by our rank_to_field fallback for admin levels that
-//   don't map to a canonical Nominatim field. We place them between
-//   state and country — Nominatim's equivalent is admin_level=3 at
-//   rank 6, so between state (8) and country (4).
-// - `city_district` is not a Nominatim place-tag. We emit it at rank 16
-//   (next to city) as a practical fallback for our builder's output.
+//   don't map to a canonical Nominatim field; without a rank they sit
+//   between state and country, as Nominatim's admin_level=3 (rank 6).
+// - Every answer with a part has a display_name, as every one of
+//   Nominatim's with an address row: a state and a county without a
+//   locality, a road or a country too.
 pub fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
-    let has_locality = addr.city.is_some() || addr.town.is_some()
-        || addr.village.is_some() || addr.municipality.is_some()
-        || addr.hamlet.is_some() || addr.suburb.is_some()
-        || addr.borough.is_some();
-    if addr.road.is_none() && !has_locality && addr.country.is_none() {
-        return None;
-    }
-
     let (number_after, _, _) = format_rules(addr.country_code.as_deref());
 
-    // Collect (rank_address, value) tuples for every populated field.
-    // We emit in rank-descending order (fine → coarse) but dedupe by
-    // value, keeping only the COARSEST-rank occurrence of each string.
-    // This matches cases like NYC where city="New York" and state="New
-    // York" share a value — Nominatim's output retains the state slot
-    // and drops the duplicate city.
-    let mut entries: Vec<(u8, String)> = Vec::new();
+    // The house number and the road, one part.
+    let road = addr.road.as_ref().map(|road| match &addr.house_number {
+        Some(hn) if number_after => format!("{} {}", road, hn),
+        Some(hn) => format!("{} {}", hn, road),
+        None => road.to_string(),
+    });
 
-    // Rank 32: landmark name. Higher than road so the landmark
-    // leads the display line — "Eiffel Tower, 5 Avenue Gustave
-    // Eiffel, Paris, France" reads better than the road alone.
-    // The category / OSM type is carried on places[0] for clients
-    // that need it, so a single field here is enough.
-    if let Some(s) = &addr.landmark { entries.push((32, s.to_string())); }
-
-    // Rank 30: house_number + road
-    if let Some(road) = &addr.road {
-        let s = if let Some(ref hn) = addr.house_number {
-            if number_after {
-                format!("{} {}", road, hn)
-            } else {
-                format!("{} {}", hn, road)
-            }
-        } else {
-            road.to_string()
-        };
-        entries.push((30, s));
+    // The place parts, finest first: a stable sort keeps the order above
+    // among parts of one rank.
+    let fields: [(&str, &Option<Cow<'_, str>>, u8); 17] = [
+        ("city_block", &addr.city_block, 25),
+        ("neighbourhood", &addr.neighbourhood, 24),
+        ("quarter", &addr.quarter, 22),
+        ("hamlet", &addr.hamlet, 20),
+        ("suburb", &addr.suburb, 20),
+        ("borough", &addr.borough, 18),
+        ("city", &addr.city, 16),
+        ("city_district", &addr.city_district, 16),
+        ("town", &addr.town, 16),
+        ("village", &addr.village, 16),
+        ("municipality", &addr.municipality, 14),
+        ("district", &addr.district, 12),
+        ("county", &addr.county, 12),
+        ("state", &addr.state, 8),
+        ("state_district", &addr.state_district, 6),
+        ("region", &addr.region, 6),
+        ("province", &addr.province, 6),
+    ];
+    let mut places: Vec<(u8, &str)> = fields.iter()
+        .filter_map(|&(field, value, label_rank)| {
+            let rank = match addr.ranks.get(field) { 0 => label_rank, rank => rank };
+            value.as_deref().map(|v| (rank, v))
+        })
+        .collect();
+    // A part without a field is a row of a rank no field's part has: an address has a row a rank.
+    let labelled = places.len();
+    for (rank, v) in &addr.unlabelled {
+        if !places[..labelled].iter().any(|&(r, _)| r == *rank) {
+            places.push((*rank, v));
+        }
     }
+    places.sort_by(|a, b| b.0.cmp(&a.0));
 
-    // Rank 25: city_block
-    if let Some(s) = &addr.city_block { entries.push((25, s.to_string())); }
-    // Rank 24: neighbourhood
-    if let Some(s) = &addr.neighbourhood { entries.push((24, s.to_string())); }
-    // Rank 22: quarter
-    if let Some(s) = &addr.quarter { entries.push((22, s.to_string())); }
-    // Rank 20: hamlet, suburb
-    if let Some(s) = &addr.hamlet { entries.push((20, s.to_string())); }
-    if let Some(s) = &addr.suburb { entries.push((20, s.to_string())); }
-    // Rank 18: borough
-    if let Some(s) = &addr.borough { entries.push((18, s.to_string())); }
-    // Rank 16: city, town, village, city_district
-    if let Some(s) = &addr.city { entries.push((16, s.to_string())); }
-    if let Some(s) = &addr.city_district { entries.push((16, s.to_string())); }
-    if let Some(s) = &addr.town { entries.push((16, s.to_string())); }
-    if let Some(s) = &addr.village { entries.push((16, s.to_string())); }
-    // Rank 14: municipality
-    if let Some(s) = &addr.municipality { entries.push((14, s.to_string())); }
-    // Rank 12: county, district
-    if let Some(s) = &addr.district { entries.push((12, s.to_string())); }
-    if let Some(s) = &addr.county { entries.push((12, s.to_string())); }
-    // Rank 8: state + fallbacks (state_district, region, province come
-    // from admin polygons via rank_to_field — grouped with state here,
-    // but iterated in a coarser-than-state order below)
-    if let Some(s) = &addr.state { entries.push((8, s.to_string())); }
-    // state_district / region / province slot in between state and
-    // country at rank 6 (corresponds to boundary=administrative3 in
-    // Nominatim, which is rank_address=6).
-    if let Some(s) = &addr.state_district { entries.push((6, s.to_string())); }
-    if let Some(s) = &addr.region { entries.push((6, s.to_string())); }
-    if let Some(s) = &addr.province { entries.push((6, s.to_string())); }
-    // Rank 5: postcode
-    if let Some(ref pc) = addr.postcode { entries.push((5, pc.to_string())); }
-    // Rank 4: country
-    if let Some(s) = &addr.country { entries.push((4, s.to_string())); }
-
-    // Global value dedup: for each unique value, find the COARSEST
-    // (lowest rank) occurrence. Drop finer-rank duplicates. This mirrors
-    // Nominatim's behaviour of preferring the state/county "authority"
-    // over a finer duplicate like city=New York vs state=New York.
-    let mut coarsest: std::collections::HashMap<String, u8> =
-        std::collections::HashMap::new();
-    for (rank, val) in &entries {
-        coarsest
-            .entry(val.clone())
-            .and_modify(|r| if *rank < *r { *r = *rank })
-            .or_insert(*rank);
-    }
-
-    // Emit in rank-descending (fine → coarse) order, keeping only
-    // entries whose rank matches the coarsest rank for their value.
-    // Consecutive dedup is implicit — if two different entries at the
-    // same rank have different values, both are kept.
-    let mut parts: Vec<String> = Vec::new();
-    let mut emitted: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    for (rank, val) in &entries {
-        if val.is_empty() { continue; }
-        if coarsest[val] != *rank { continue; }
-        if !emitted.insert(val.clone()) { continue; }
-        parts.push(val.clone());
-        let _ = rank; // silence unused-binding warning
+    let mut parts: Vec<&str> = Vec::new();
+    let line = addr.landmark.as_deref().into_iter()
+        .chain(road.as_deref())
+        .chain(places.iter().map(|&(_, v)| v))
+        .chain(addr.postcode.as_deref())
+        .chain(addr.country.as_deref());
+    for part in line {
+        if part.is_empty() || parts.last() == Some(&part) { continue; }
+        parts.push(part);
     }
 
     if parts.is_empty() { None } else { Some(parts.join(", ")) }
@@ -5694,8 +6225,6 @@ mod pure_helper_tests {
     fn centroid_postcode_ok_rules() {
         assert!(centroid_postcode_ok("10001"));
         assert!(centroid_postcode_ok("SW1A 1AA"));
-        // > 10 chars rejected.
-        assert!(!centroid_postcode_ok("12345678901"));
         // semicolon (multiple values) rejected.
         assert!(!centroid_postcode_ok("10001;10002"));
         // No PO/Box substring filter: legitimate UK Portsmouth-area postcodes
@@ -5703,10 +6232,10 @@ mod pure_helper_tests {
         // filter. This was a real divergence (Portsmouth returned no postcode).
         assert!(centroid_postcode_ok("PO1 1BA"));
         assert!(centroid_postcode_ok("PO16 7GZ"));
-        // US zip+4 (len 10, dash at index 5) rejected.
-        assert!(!centroid_postcode_ok("10001-2062"));
-        // A 9-char dashed value is NOT caught by the len==10 zip+4 rule.
-        assert!(centroid_postcode_ok("1001-2062"));
+        // The builder keeps a centroid only of the postcode its country's pattern makes, of any
+        // length or shape: Iran's ddddd-ddddd and Saudi Arabia's ddddd-dddd.
+        assert!(centroid_postcode_ok("12345-67890"));
+        assert!(centroid_postcode_ok("12345-6789"));
     }
 
     #[test]
@@ -5747,6 +6276,16 @@ mod pure_helper_tests {
     }
 
     #[test]
+    fn label_field_names_the_finer_row_and_the_boundary_at_one_rank() {
+        let (parish, suburb) = (|| Some(Cow::Borrowed("Upton")), || Some(Cow::Borrowed("St Crispin's")));
+        assert_eq!(label_field(parish(), 20, suburb(), 22), (Some((Cow::Borrowed("St Crispin's"), 22)), Some((20, Cow::Borrowed("Upton")))));
+        assert_eq!(label_field(parish(), 22, suburb(), 22), (Some((Cow::Borrowed("Upton"), 22)), None));
+        assert_eq!(label_field(parish(), 22, suburb(), 20), (Some((Cow::Borrowed("Upton"), 22)), None));
+        assert_eq!(label_field(None, 0, suburb(), 20), (Some((Cow::Borrowed("St Crispin's"), 20)), None));
+        assert_eq!(label_field(parish(), 20, None, 0), (Some((Cow::Borrowed("Upton"), 20)), None));
+    }
+
+    #[test]
     fn rank_to_field_snapshot() {
         // Below 4 -> None.
         assert_eq!(rank_to_field(0), None);
@@ -5780,23 +6319,50 @@ mod pure_helper_tests {
 
     #[test]
     fn place_type_to_rank_snapshot() {
-        assert_eq!(place_type_to_rank(1), 16);
-        assert_eq!(place_type_to_rank(2), 16);
-        assert_eq!(place_type_to_rank(3), 16);
-        assert_eq!(place_type_to_rank(4), 20);
-        assert_eq!(place_type_to_rank(5), 24);
-        assert_eq!(place_type_to_rank(6), 22);
+        assert_eq!(place_type_to_rank(1, ""), 16);
+        assert_eq!(place_type_to_rank(2, ""), 16);
+        assert_eq!(place_type_to_rank(3, ""), 16);
+        assert_eq!(place_type_to_rank(4, ""), 20);
+        assert_eq!(place_type_to_rank(5, ""), 24);
+        assert_eq!(place_type_to_rank(6, ""), 22);
         // NOTE: state/province/region map to 0 (deliberately not in address chain).
-        assert_eq!(place_type_to_rank(7), 0);
-        assert_eq!(place_type_to_rank(8), 0);
-        assert_eq!(place_type_to_rank(9), 0);
-        assert_eq!(place_type_to_rank(10), 12);
-        assert_eq!(place_type_to_rank(11), 12);
-        assert_eq!(place_type_to_rank(12), 18);
-        assert_eq!(place_type_to_rank(13), 20);
-        assert_eq!(place_type_to_rank(14), 14);
-        assert_eq!(place_type_to_rank(0), 0);
-        assert_eq!(place_type_to_rank(255), 0);
+        assert_eq!(place_type_to_rank(7, ""), 0);
+        assert_eq!(place_type_to_rank(8, ""), 0);
+        assert_eq!(place_type_to_rank(9, ""), 0);
+        assert_eq!(place_type_to_rank(10, ""), 12);
+        assert_eq!(place_type_to_rank(11, ""), 12);
+        assert_eq!(place_type_to_rank(12, ""), 18);
+        assert_eq!(place_type_to_rank(13, ""), 20);
+        assert_eq!(place_type_to_rank(14, ""), 14);
+        assert_eq!(place_type_to_rank(0, ""), 0);
+        assert_eq!(place_type_to_rank(255, ""), 0);
+        // A country's own place ranks come first.
+        assert_eq!(place_type_to_rank(10, "CA"), 0);
+        assert_eq!(place_type_to_rank(10, "DE"), 0);
+        assert_eq!(place_type_to_rank(9, "DE"), 0);
+        assert_eq!(place_type_to_rank(8, "ES"), 10);
+        assert_eq!(place_type_to_rank(14, "ID"), 18);
+        assert_eq!(place_type_to_rank(14, "RU"), 18);
+        assert_eq!(place_type_to_rank(8, "SA"), 12);
+        assert_eq!(place_type_to_rank(14, "SA"), 18);
+        assert_eq!(place_type_to_rank(10, "GB"), 12);
+    }
+
+    #[test]
+    fn a_linked_place_area_ranks_by_its_own_tag_from_16_to_23_else_by_the_node() {
+        // (own place type, the linked node's, country) → (compute_place_rank, rank_address).
+        let ranks = |own: u8, linked: u8, country: &str| {
+            let poly = AdminPolygon { place_type_override: linked, own_place_type: own, ..arc_fixture::record(0, 15, 1.0) };
+            place_area_ranks(&poly, country)
+        };
+        assert_eq!(ranks(4, 2, ""), (20, 20));    // suburb linked to a town (Weesp)
+        assert_eq!(ranks(3, 13, ""), (16, 16));   // village linked to a hamlet
+        assert_eq!(ranks(14, 2, "RU"), (18, 18)); // municipality, 18 in Russia, linked to a town
+        assert_eq!(ranks(5, 6, ""), (24, 22));    // neighbourhood linked to a quarter
+        assert_eq!(ranks(14, 1, ""), (14, 16));   // municipality linked to a city
+        assert_eq!(ranks(5, 7, ""), (24, 24));    // neighbourhood linked to a state, rank 0
+        assert_eq!(ranks(10, 2, "CA"), (0, 0));   // county, 0 in Canada, links nothing
+        assert_eq!(ranks(0, 4, ""), (20, 20));    // a suburb of its own
     }
 
     #[test]
@@ -5939,7 +6505,8 @@ mod pure_helper_tests {
 
     fn boundary(name_id: u32, admin_level: u8) -> AdminPolygon {
         AdminPolygon {
-            ring_offset: 0, ring_bytes: 0, name_id, admin_level, place_type_override: 0, area: 1.0, country_code: 0,
+            ring_offset: 0, ring_bytes: 0, name_id, admin_level, place_type_override: 0, own_place_type: 0, area: 1.0,
+            country_code: 0, of_way: false,
         }
     }
 
@@ -5961,7 +6528,7 @@ mod pure_helper_tests {
         // Nairobi and becomes 18; CBD division (7, rank 14) inside it 20.
         let nairobi = AdminPolygon { area: 100.0, place_type_override: 1, ..boundary(0, 15) };
         let mut polys = [ranked(7, 14, 1.0, 0), ranked(6, 12, 10.0, 0), ranked(2, 4, 1000.0, 0)];
-        promote_nested_ranks(&mut polys, [nairobi].iter());
+        promote_nested_ranks(&mut polys, [nairobi].iter(), "", |_, _| true);
         assert_eq!(levels_and_ranks(&polys), [(2, 4), (6, 18), (7, 20)]);
     }
 
@@ -5971,7 +6538,7 @@ mod pure_helper_tests {
         // inside a larger place=city area; its arrondissement (9) goes below.
         let area = AdminPolygon { area: 100.0, place_type_override: 1, ..boundary(0, 15) };
         let mut polys = [ranked(9, 18, 1.0, 0), ranked(6, 12, 10.0, 1)];
-        promote_nested_ranks(&mut polys, [area].iter());
+        promote_nested_ranks(&mut polys, [area].iter(), "", |_, _| true);
         assert_eq!(levels_and_ranks(&polys), [(6, 16), (9, 18)]);
     }
 
@@ -5981,8 +6548,37 @@ mod pure_helper_tests {
         // rank; a county (level 6, rank 12) in it ranks 22.
         let area = AdminPolygon { area: 100.0, place_type_override: 4, ..boundary(0, 15) };
         let mut polys = [ranked(6, 12, 1.0, 0), ranked(4, 8, 10.0, 0)];
-        promote_nested_ranks(&mut polys, [area].iter());
+        promote_nested_ranks(&mut polys, [area].iter(), "", |_, _| true);
         assert_eq!(levels_and_ranks(&polys), [(4, 8), (6, 22)]);
+    }
+
+    #[test]
+    fn nested_ranks_stop_at_25_under_a_parent_of_24() {
+        // Upper Ward (admin_level 9, rank 18) takes its linked neighbourhood's 24, and Lower Ward
+        // (10, rank 20, a neighbourhood too) inside it 25, the most the admin-nested step gives
+        // under a parent of 24 or more (placex_triggers.sql:903-904): a boundary of 25 is still
+        // an admin-nested parent (ADMIN_PARENT_RANKS), one of 26 would not be.
+        let mut polys = [ranked(10, 20, 1.0, 5), ranked(9, 18, 10.0, 5)];
+        promote_nested_ranks(&mut polys, std::iter::empty::<&AdminPolygon>(), "", |_, _| true);
+        assert_eq!(levels_and_ranks(&polys), [(9, 24), (10, 25)]);
+    }
+
+    #[test]
+    fn nested_ranks_give_a_boundary_repeating_its_parent_its_place_nodes_rank() {
+        // is_same takes a boundary that repeats its parent out of addresses and leaves
+        // parent_address_level at 3, so the city node it links gives it 16 back (:1161) under a
+        // parent of 24, where it would rank 25, and a boundary inside it ranks under 16. One
+        // linking a place=state node, of rank 0, stays out.
+        let repeating = |admin_level: u8, rank_address: u8, place_type_override: u8| RankedPoly {
+            poly: AdminPolygon { own_place_type: BOUNDARY_REPEATS_PARENT, ..ranked(admin_level, rank_address, 10.0, place_type_override).poly },
+            rank_address,
+        };
+        let mut polys = [ranked(11, 22, 1.0, 0), repeating(10, 20, 1), ranked(8, 16, 10.0, 5)];
+        promote_nested_ranks(&mut polys, std::iter::empty::<&AdminPolygon>(), "", |_, _| true);
+        assert_eq!(levels_and_ranks(&polys), [(8, 24), (10, 16), (11, 22)]);
+        let mut polys = [repeating(10, 20, 7), ranked(8, 16, 10.0, 0)];
+        promote_nested_ranks(&mut polys, std::iter::empty::<&AdminPolygon>(), "", |_, _| true);
+        assert_eq!(levels_and_ranks(&polys), [(8, 16), (10, 0)]);
     }
 
     #[test]
@@ -6015,7 +6611,7 @@ mod pure_helper_tests {
             RankedPoly { poly: suburb, rank_address: 12 },
             RankedPoly { poly: country, rank_address: 4 },
         ];
-        let found = CurrentBoundaries::from_ranked(ranked, [].iter(), |_, _| true);
+        let found = CurrentBoundaries::from_ranked(ranked, [].iter(), "", |_, _| true, |_, _| true);
         assert_eq!(names(&found), [Some(3), Some(3), Some(1), Some(2), Some(2)]);
     }
 
@@ -6023,13 +6619,13 @@ mod pure_helper_tests {
     fn current_boundaries_rank_boundaries_inside_a_place_area() {
         // Starehe (admin_level 6, rank 12) inside Nairobi's place=city area
         // ranks 18, after the city's 16: it gates suburbs, quarters and
-        // neighbourhoods, no longer city, town and village nodes.
+        // neighbourhoods, and the city's area city, town and village nodes.
         let starehe = AdminPolygon { area: 10.0, ..boundary(1, 6) };
         let country = AdminPolygon { area: 1000.0, ..boundary(2, 2) };
         let nairobi = AdminPolygon { area: 100.0, place_type_override: 1, ..boundary(3, 15) };
         let ranked = vec![RankedPoly { poly: starehe, rank_address: 12 }, RankedPoly { poly: country, rank_address: 4 }];
-        let found = CurrentBoundaries::from_ranked(ranked, [nairobi].iter(), |_, _| true);
-        assert_eq!(names(&found), [Some(2), Some(1), Some(1), Some(1), Some(1)]);
+        let found = CurrentBoundaries::from_ranked(ranked, [nairobi].iter(), "", |_, _| true, |_, _| true);
+        assert_eq!(names(&found), [Some(3), Some(1), Some(1), Some(1), Some(1)]);
     }
 
     #[test]
@@ -6046,7 +6642,7 @@ mod pure_helper_tests {
             level(10, 20, 1.0, 0), level(9, 18, 2.0, 0), level(8, 16, 4.0, 0),
             level(7, 14, 8.0, 0), level(6, 12, 16.0, 1), level(2, 4, 1000.0, 0),
         ];
-        let found = CurrentBoundaries::from_ranked(ranked, [].iter(), |_, _| true);
+        let found = CurrentBoundaries::from_ranked(ranked, [].iter(), "", |_, _| true, |_, _| true);
         let gate = |rank| found.for_rank(rank).map(|p| p.admin_level);
         assert_eq!(gate(CurrentBoundaries::SUBURB), Some(8));
         assert_eq!(gate(CurrentBoundaries::QUARTER), Some(9));
@@ -6069,9 +6665,9 @@ mod pure_helper_tests {
             RankedPoly { poly: suburb, rank_address: 12 },
             RankedPoly { poly: country, rank_address: 4 },
         ];
-        let concentric = CurrentBoundaries::from_ranked(ranked(), [].iter(), |_, _| true);
+        let concentric = CurrentBoundaries::from_ranked(ranked(), [].iter(), "", |_, _| true, |_, _| true);
         assert_eq!(names(&concentric), [Some(2), Some(2), Some(1), Some(1), Some(1)]);
-        let overlapping = CurrentBoundaries::from_ranked(ranked(), [].iter(), |poly, _| poly.name_id != 1);
+        let overlapping = CurrentBoundaries::from_ranked(ranked(), [].iter(), "", |poly, _| poly.name_id != 1, |_, _| true);
         assert_eq!(names(&overlapping), [Some(2); 5]);
     }
 
@@ -6423,7 +7019,7 @@ mod pure_helper_tests {
             RankedPoly { poly: county, rank_address: 12 },
             RankedPoly { poly: country, rank_address: 4 },
         ];
-        let found = CurrentBoundaries::from_ranked(ranked, [suburb, neighbourhood].iter(), |_, _| true);
+        let found = CurrentBoundaries::from_ranked(ranked, [suburb, neighbourhood].iter(), "", |_, _| true, |_, _| true);
         let promoting: Vec<(u8, u32)> = found.promoting.iter().map(|(r, p)| (*r, p.name_id)).collect();
         assert_eq!(promoting, [(16, 1), (20, 4)]);
     }
@@ -6580,6 +7176,10 @@ mod query_path_tests {
     use s2::region::RegionCoverer;
     use crate::scratch_dir::ScratchDir;
     use std::collections::BTreeMap;
+
+    mod display_name;
+    mod postcodes;
+    mod ranks;
 
     /// The fixtures' origin unless one is given: everything sits metres
     /// north and east of it.
@@ -6761,11 +7361,24 @@ mod query_path_tests {
             let at = |north_m, east_m| at_from(self.origin, north_m, east_m);
             let ring = vec![at(s, w), at(s, e), at(n, e), at(n, w), at(s, w)];
             let (lat_lo, lng_lo, lat_hi, lng_hi) = bounds(&ring);
+            // The builder gives a country to countries, and to postal areas the one their centroid
+            // lies in: here the first country's, unless a test sets another.
+            let country_code = match admin_level {
+                2 => COUNTRY_CODE,
+                POSTCODE_AREA_LEVEL => self.polygons.first().map_or(0, |(country, _)| country.country_code),
+                _ => 0,
+            };
             let poly = AdminPolygon {
-                place_type_override, country_code: COUNTRY_CODE,
+                place_type_override, country_code,
                 ..arc_fixture::record(self.string(name), admin_level, ((lat_hi - lat_lo) * (lng_hi - lng_lo)) as f32)
             };
             self.polygons.push((poly, ring));
+            self
+        }
+
+        /// Makes the polygon added last a closed way's, not a relation's.
+        fn of_way(&mut self) -> &mut Self {
+            self.polygons.last_mut().unwrap().0.of_way = true;
             self
         }
 
@@ -7028,7 +7641,7 @@ mod query_path_tests {
         for (north, postcode) in [(0.0, "10115"), (2_100.0, "10117"), (-19_000.0, "12049")] {
             assert_eq!(address_at(&idx, north, 0.0)["postcode"], postcode, "{north} m north");
         }
-        // Nothing within 0.05 degrees (5.5 km) of the point.
+        // No centroid within 5 km of the point along either axis, the extent of its postcodes.
         assert_eq!(address_at(&idx, 10_000.0, 0.0)["postcode"], serde_json::Value::Null);
 
         // Without either file the dir has no centroids; one without the other is refused.
@@ -7158,7 +7771,7 @@ mod query_path_tests {
     /// `max_m` of the point.
     fn house_number_on_way(index: &Index, north_m: f64, east_m: f64, way: u32, max_m: f64) -> Option<String> {
         let (lat, lng) = query_point(north_m, east_m);
-        index.find_addr_on_way(lat, lng, way, radians_sq(max_m)).map(|a| index.get_string(a.housenumber_id).into_owned())
+        index.find_addr_on_way(lat, lng, way, radians_sq(max_m)).map(|(_, a)| index.get_string(a.housenumber_id).into_owned())
     }
 
     /// The house number find_interp_on_way gives at the point for a street named `street`,
@@ -8164,7 +8777,7 @@ mod query_path_tests {
     }
 
     #[test]
-    fn query_reads_the_postcode_of_the_address_that_won_then_of_the_nearest_street() {
+    fn query_reads_the_postcode_of_the_address_that_won_then_of_its_street() {
         let index = TestIndex::new()
             .street("Mill Lane", &parallel(-1000.0, 200.0)).way_postcode("2000")
             .street("Main Street", &parallel(0.0, 200.0)).way_postcode("2020")
@@ -8182,12 +8795,14 @@ mod query_path_tests {
 
         // On house 7: its own postcode.
         assert_eq!(answer(29.0, 0.0), (some("Main Street"), some("7"), some("1010")));
-        // On house 5, which has none: the nearest street's.
+        // On house 5, which has none: its street's.
         assert_eq!(answer(29.0, -40.0), (some("Main Street"), some("5"), some("2020")));
-        // House 9 has none either and Side Street runs nearer it than its own street does.
-        assert_eq!(answer(59.0, 80.0), (some("Main Street"), some("9"), some("2121")));
-        // On the street: the street's, though house 7 gives the house number.
-        assert_eq!(answer(1.0, 0.0), (some("Main Street"), some("7"), some("2020")));
+        // House 9 has none either: its street's, though Side Street runs nearer it.
+        assert_eq!(answer(59.0, 80.0), (some("Main Street"), some("9"), some("2020")));
+        // On the street: house 7's, which gives the house number, as Nominatim answers with the
+        // house (reverse.py lookup_street_poi); on house 5's side, the street's.
+        assert_eq!(answer(1.0, 0.0), (some("Main Street"), some("7"), some("1010")));
+        assert_eq!(answer(1.0, -40.0), (some("Main Street"), some("5"), some("2020")));
         assert_eq!(answer(-999.0, 0.0), (some("Mill Lane"), None, some("2000")));
     }
 
@@ -8634,7 +9249,7 @@ mod query_path_tests {
                    (Some("7"), Some("Main Street"), Some("1010")));
         let on_street = address_at(&index, 1.0, 0.0);
         assert_eq!((on_street["house_number"].as_str(), on_street["road"].as_str(), on_street["postcode"].as_str()),
-                   (Some("7"), Some("Main Street"), Some("2020")));
+                   (Some("7"), Some("Main Street"), Some("1010")));
     }
 
     #[test]
@@ -9585,30 +10200,39 @@ mod admin_scan_tests {
     }
 
     #[test]
-    fn a_levels_larger_boundaries_are_not_read_once_a_smaller_one_holds_the_point() {
+    fn a_countrys_larger_polygons_are_not_read_once_a_smaller_one_holds_the_point() {
         let around_q = (21.99, 27.5, 22.05, 27.6);
         let wider = (21.9, 27.4, 22.1, 27.7);
+        // The country and the state found, and the arcs read.
         let arcs_read = |rings: &[Ring]| {
             let idx = admin_index(rings);
             let mut scan = AdminScan::new(&idx, Q.0, Q.1);
-            let state = idx.find_admin_in(&mut scan).state.map(Cow::into_owned);
-            (state, scan.pip.memo.arcs_read())
+            let found = idx.find_admin_in(&mut scan);
+            ((found.country.map(Cow::into_owned), found.state.map(Cow::into_owned)), scan.pip.memo.arcs_read())
         };
         // Listed first, so visited first in a walk down the list.
-        let (state, read) = arcs_read(&[
+        let (found, read) = arcs_read(&[
+            ring("Large", 2, 5.0, wider, &[(0, false)]),
+            ring("Small", 2, 1.0, around_q, &[(0, false)]),
+        ]);
+        assert_eq!(found.0.as_deref(), Some("Small"));
+        assert_eq!((found, read), arcs_read(&[ring("Small", 2, 1.0, around_q, &[(0, false)])]));
+        // A smaller one that misses the point leaves the larger one to be read.
+        let elsewhere = (30.0, 27.5, 30.05, 27.6);
+        let (found, read) = arcs_read(&[
+            ring("Large", 2, 5.0, wider, &[(0, false)]),
+            ring("Small", 2, 1.0, elsewhere, &[(0, false)]),
+        ]);
+        assert_eq!(found.0.as_deref(), Some("Large"));
+        assert!(read > 0);
+        // A larger state is read, as one round the smaller one is in the address too; the
+        // smaller one names the state.
+        let (found, read) = arcs_read(&[
             ring("Large", 4, 5.0, wider, &[(0, false)]),
             ring("Small", 4, 1.0, around_q, &[(0, false)]),
         ]);
-        assert_eq!(state.as_deref(), Some("Small"));
-        assert_eq!((state, read), arcs_read(&[ring("Small", 4, 1.0, around_q, &[(0, false)])]));
-        // A smaller one that misses the point leaves the larger one to be read.
-        let elsewhere = (30.0, 27.5, 30.05, 27.6);
-        let (state, read) = arcs_read(&[
-            ring("Large", 4, 5.0, wider, &[(0, false)]),
-            ring("Small", 4, 1.0, elsewhere, &[(0, false)]),
-        ]);
-        assert_eq!(state.as_deref(), Some("Large"));
-        assert!(read > 0);
+        assert_eq!(found.1.as_deref(), Some("Small"));
+        assert!(read > arcs_read(&[ring("Small", 4, 1.0, around_q, &[(0, false)])]).1);
     }
 
     #[test]
