@@ -1611,6 +1611,53 @@ TEST(a_water_street_is_no_address_point_and_answers_its_own_name_as_a_street_doe
     }
 }
 
+// A named water way of a street's highway kind is a street in Nominatim, of
+// its polygon where it is area=yes, of its line else (init.lua process_way),
+// and no address point. The build writes no address of one where it holds
+// that street: the polygon of its POI, or the line of its street where the
+// street index takes its highway kind. It takes no highway=construction
+// (is_included_highway), so a lake of that kind and of no area=yes, 60 m by
+// 89 m across Teststrasse, which runs 6 m south of the point asked inside
+// it, keeps its address, whose house number answers there, on its
+// addr:street. One of area=yes is a street polygon, of no address: its own
+// name answers inside it.
+TEST(a_water_way_of_a_street_the_build_holds_nowhere_keeps_its_address) {
+    const ScratchDir root("water-construction-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    const int32_t lat0 = 470000000, lng0 = 80000000, south = lat0 + 1396000, north = lat0 + 1404000;
+    std::vector<TestObject> water;
+    add_rectangle(water, 4040, 990, south, lng0 + 1420000, north, lng0 + 1428000,
+                  {{"addr:housenumber", "5"}, {"addr:street", "Inselweg"}, {"highway", "construction"},
+                   {"name", "Bausee Testdorf"}, {"natural", "water"}});
+    add_rectangle(water, 4041, 994, south, lng0 + 1435000, north, lng0 + 1443000,
+                  {{"addr:housenumber", "6"}, {"addr:street", "Inselweg"}, {"area", "yes"},
+                   {"highway", "construction"}, {"name", "Baustellensee Testdorf"}, {"natural", "water"}});
+    write_fixture_with(pbf, water);
+    const std::string out = root.path() + "/single";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
+
+    // The addresses: the fixture's house 1, a node, and the lake's of no
+    // area=yes, its polygon.
+    const std::vector<AddrPoint> points = addresses_of(tree(out), "planet/").points;
+    if (points.size() != 2) std::printf("    %zu addresses\n", points.size());
+    CHECK_EQ(points.size(), size_t(2));
+    CHECK_EQ(std::count_if(points.begin(), points.end(), [](const AddrPoint& a) { return a.vertex_count != 0; }), 1);
+
+    const std::string dataset = poi_dataset(out, "all", root.path() + "/dataset");
+    const std::vector<std::string> answers =
+        server_answers(dataset, {{47.14005, 8.1424}, {47.14005, 8.1439}}, root.path() + "/q", log);
+    REQUIRE(answers.size() == 2);
+    const std::optional<std::string> roads[] = {"Inselweg", "Baustellensee Testdorf"};
+    const std::optional<std::string> numbers[] = {"5", std::nullopt};
+    for (size_t k = 0; k < answers.size(); k++) {
+        const auto road = answer_string(answers[k], {"address", "road"});
+        const auto number = answer_string(answers[k], {"address", "house_number"});
+        if (road != roads[k] || number != numbers[k]) std::printf("    %s\n", answers[k].c_str());
+        CHECK(road == roads[k]);
+        CHECK(number == numbers[k]);
+    }
+}
+
 // A landuse node ranks 30 in Nominatim (ranking.sql compute_place_rank), so
 // a named basin point is a rank-30 POI, in the POI lane: the build links it
 // Beckenweg, 17 m north of it, and at a point 11 m south of it, nearer

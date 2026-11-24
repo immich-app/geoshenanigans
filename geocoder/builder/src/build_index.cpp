@@ -3069,12 +3069,19 @@ static int run(int argc, char* argv[]) {
                     // (poi_water_street), and is a polygon in Nominatim of
                     // area=yes alone (init.lua process_way): of none it is
                     // the line the street index holds, which its POI's
-                    // polygon takes no highway flag beside.
+                    // polygon takes no highway flag beside. One whose street
+                    // the build holds nowhere, as that polygon or as a line
+                    // of the street index, which takes no
+                    // highway=construction (is_included_highway), keeps its
+                    // address.
                     const char* housenumber = t.housenumber;
+                    const bool street_line = t.highway && is_included_highway_full(t.highway, t.footway) &&
+                                             t_best_name && refs_size >= 2 && all_valid;
                     const bool water_street = t_best_name && refs_size >= 4 && refs_data[0] == refs_data[refs_size - 1] &&
                                               poi_water_street(t.natural, t.landuse, t.highway, t.footway, t.place);
                     const bool water_street_line = water_street && !(t.area && std::strcmp(t.area, "yes") == 0);
-                    if (housenumber && refs_size > 0 && !water_street) {
+                    const bool water_street_held = water_street && all_valid && (!water_street_line || street_line);
+                    if (housenumber && refs_size > 0 && !water_street_held) {
                         const char* street = t.street;
                         double sum_lat = 0, sum_lng = 0; int valid = 0;
                         for (const auto& loc : resolved_locs) {
@@ -3120,22 +3127,20 @@ static int run(int argc, char* argv[]) {
                     }
 
                     // Highway ways
-                    if (t.highway && is_included_highway_full(t.highway, t.footway)) {
-                        if (t_best_name && refs_size >= 2 && all_valid) {
-                            uint32_t wid = static_cast<uint32_t>(local.ways.size());
-                            uint32_t noff = static_cast<uint32_t>(local.street_nodes.size());
-                            for (const auto& loc : resolved_locs)
-                                local.street_nodes.push_back({static_cast<float>(loc.lat()), static_cast<float>(loc.lon())});
-                            WayHeader header{}; header.node_offset = noff;
-                            header.node_count = static_cast<uint16_t>(std::min(refs_size, size_t(MAX_NODE_COUNT)));
-                            local.ways.push_back(header);
-                            local.way_osm_ids.push_back(way_id);
-                            const char* orig_name = t.name ? t.name : (t_best_name ? t_best_name : "");
-                            local.way_strings.push_back(local.strings.add(t_best_name));
-                            local.way_orig_names.push_back(orig_name[0] ? local.strings.add(orig_name) : StringDict::kNone);
-                            local.deferred_ways.push_back({wid, noff, header.node_count});
-                            local.way_count++;
-                        }
+                    if (street_line) {
+                        uint32_t wid = static_cast<uint32_t>(local.ways.size());
+                        uint32_t noff = static_cast<uint32_t>(local.street_nodes.size());
+                        for (const auto& loc : resolved_locs)
+                            local.street_nodes.push_back({static_cast<float>(loc.lat()), static_cast<float>(loc.lon())});
+                        WayHeader header{}; header.node_offset = noff;
+                        header.node_count = static_cast<uint16_t>(std::min(refs_size, size_t(MAX_NODE_COUNT)));
+                        local.ways.push_back(header);
+                        local.way_osm_ids.push_back(way_id);
+                        const char* orig_name = t.name ? t.name : (t_best_name ? t_best_name : "");
+                        local.way_strings.push_back(local.strings.add(t_best_name));
+                        local.way_orig_names.push_back(orig_name[0] ? local.strings.add(orig_name) : StringDict::kNone);
+                        local.deferred_ways.push_back({wid, noff, header.node_count});
+                        local.way_count++;
                     }
 
                     auto valid_locs = [&] {
