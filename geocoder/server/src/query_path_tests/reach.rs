@@ -350,6 +350,24 @@ fn a_building_round_the_point_is_found_at_any_search_distance() {
 }
 
 #[test]
+fn a_search_distance_past_what_a_query_may_read_is_refused() {
+    // At the street cells' level, a query reads every cell within the search distance: 660 m
+    // (Nominatim's 0.006°) reads a few hundred, 100 km millions, which the server refuses to load
+    // with, as it does a distance that is no distance.
+    let dir = ScratchDir::new();
+    TestIndex::new().street("Main Street", &across(20.0, 0.0)).write(dir.path());
+    let path = dir.path().to_str().unwrap();
+    let load = |metres: f64| Index::load(path, DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, metres);
+    assert!(load(660.0).is_ok());
+    for metres in [100_000.0, f64::INFINITY, f64::NAN, 0.0, -5.0] {
+        let refused = load(metres).err().unwrap_or_default();
+        assert!(refused.contains("search distance"), "{metres}: {refused}");
+        let refused = MultiIndex::load(path, DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, metres).err().unwrap_or_default();
+        assert!(refused.contains("search distance"), "{metres}: {refused}");
+    }
+}
+
+#[test]
 fn no_two_points_of_a_cell_lie_farther_apart_than_s2s_longest_diagonal() {
     // The listing gap rests on S2's kMaxDiag: over cells on a face, by an edge and a corner of the
     // cube and by a pole, at the street level and others, no two corners of a cell (between which

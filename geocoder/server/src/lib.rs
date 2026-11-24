@@ -179,6 +179,14 @@ const CELL_REACH_SLACK: f64 = 1e-3;
 /// longer than this times 2^-k radians, nor, being convex, two points farther apart.
 const S2_MAX_DIAG: f64 = 2.438654594434021;
 
+/// S2's kMinArea for its quadratic projection (s2metrics.cc), 8√2/9: no cell of level k is
+/// smaller than this times 4^-k steradians.
+const S2_MIN_AREA: f64 = 1.257_078_722_109_418;
+
+/// The most street cells the geo lookups may read round a point (geo_cover): what bounds a
+/// query's work, and the lists GEO_LISTS keeps, whatever the search distance.
+const MAX_GEO_CELLS: f64 = 4096.0;
+
 /// How far across a street cell of `level` is at the most, in radians.
 fn cell_diameter(level: u64) -> f64 {
     S2_MAX_DIAG * (-(level as f64)).exp2()
@@ -210,6 +218,20 @@ fn geo_cover(reach: f64, level: u64) -> f64 {
 /// round the point lists its point.
 fn address_cover(reach: f64, level: u64) -> f64 {
     reach.max(cell_diameter(level))
+}
+
+/// Why the geo lookups can't reach `search_distance` metres at street level `level`: no
+/// distance, or more street cells round a point than MAX_GEO_CELLS; none where they can.
+fn geo_reach_refused(search_distance: f64, level: u64) -> Option<String> {
+    if !(search_distance > 0.0 && search_distance.is_finite()) {
+        return Some(format!("search distance {search_distance} m is no distance"));
+    }
+    // The cells within the cover lie within a cell's diameter past it, none smaller than kMinArea.
+    let disc = (geo_cover(search_distance / 6_371_000.0, level) + cell_diameter(level)).min(std::f64::consts::PI);
+    let cells = 4.0 * std::f64::consts::PI * (disc / 2.0).sin().powi(2) / (S2_MIN_AREA * (-2.0 * level as f64).exp2());
+    (cells > MAX_GEO_CELLS).then(|| format!(
+        "search distance {search_distance} m reads up to {cells:.0} street cells round a point at level {level}, \
+         more than the {MAX_GEO_CELLS} a query may read"))
 }
 
 /// The cells a lookup round a point reads (cells_within), nearest first: their ids, and the
@@ -1531,6 +1553,9 @@ thread_local! {
 
 impl Index {
     pub fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
+        if let Some(why) = geo_reach_refused(search_distance, street_cell_level) {
+            return Err(why);
+        }
         // The reach of the geo lookups and the primary-feature selection.
         // The internal distances are stored in radians² (via `to_radians()`
         // before squaring), so convert metres → radians → radians².
@@ -4175,6 +4200,10 @@ impl MultiIndex {
     /// like a flat layout. Either way, returns a MultiIndex whose query()
     /// behaves the same — single-region setups just see one slot.
     pub fn load(root: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
+        // Refused before any continent, each of which Index::load would refuse.
+        if let Some(why) = geo_reach_refused(search_distance, street_cell_level) {
+            return Err(why);
+        }
         // Flat-layout fast path: keep existing single-region deployments
         // working without changes. The "world" slot covers the globe.
         if std::path::Path::new(&format!("{}/admin_cells.bin", root)).exists() {
