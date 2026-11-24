@@ -63,20 +63,21 @@ uint16_t country_code_at_point(const ParsedData& data, const AdminRings& countri
 // the clean-postcodes sanitizer makes of it in the house's country
 // (match_postcode, the sanitizer's default for a country without a pattern),
 // interned, or none where the pattern rejects it: the house then takes its
-// street's (placex_update). A house of no country known keeps its tag. Runs
-// while the pool interns, before the addr points are ordered.
+// street's (placex_update). A house of no country known keeps its tag. One
+// whose tag makes a centroid of another postcode, update_postcodes matching
+// it by PostcodeFormatter's default, goes to data.house_centroids. Runs while
+// the pool interns, before the addr points are ordered.
 void normalise_addr_postcodes(ParsedData& data, unsigned threads = 0);
 
 // Fold the OSM addr:postcode points into data.postcode_accum per
-// (country, postcode), the houses' postcodes (normalise_addr_postcodes),
-// keeping external centroids only for the pairs OSM lacks and of a postcode
-// their country's pattern takes. Run once on the full data before the
-// continent split, so every region writes the same centroids (Nominatim's
-// location_postcode is one table) instead of recomputing them from its own
-// subset of addr points. In a country of a pattern, the postcodes the
-// sanitizer keeps are the ones update_postcodes sums; in one without, it
-// sums a tag the sanitizer's default rejects too, which none here makes a
-// centroid. The last reader of data.admin_exact_rings.
+// (country, postcode), each house by the postcode update_postcodes makes of
+// its tag: the one it keeps (normalise_addr_postcodes), or its
+// data.house_centroids entry's, which this frees. External centroids fill
+// only the pairs OSM lacks, of a postcode their country's pattern takes. Run
+// once on the full data before the continent split, so every region writes
+// the same centroids (Nominatim's location_postcode is one table) instead of
+// recomputing them from its own subset of addr points. The last reader of
+// data.admin_exact_rings.
 void collect_postcode_centroids(ParsedData& data);
 
 // Strategy-2 persistent dense IDs. Loads the previous build's

@@ -13,10 +13,11 @@
 // country, one for a relation, and of a postcode its country's pattern
 // takes, whatever its length, a US ZIP+4 its ZIP, a house, a centroid, a
 // postal area and an external centroid take the postcode their country's
-// pattern makes of their tag, a place area linked to a place node of another
-// type ranks by its own place tag, a boundary round the smallest of its
-// level at the point is in the address as well, and a place node ranked
-// above the boundary of its label names the field.
+// pattern makes of their tag, a house's tag makes its centroid whatever the
+// house keeps, a place area linked to a place node of another type ranks by
+// its own place tag, a boundary round the smallest of its level at the point
+// is in the address as well, and a place node ranked above the boundary of
+// its label names the field.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -727,6 +728,21 @@ TEST(a_house_and_a_centroid_take_the_postcode_their_countrys_pattern_makes_of_th
     CHECK(names(answers[1], "postcode", "10117"));
     CHECK(answers[2].find("10-115") == std::string::npos);
     CHECK(answers[2].find("10115") == std::string::npos);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_house_whose_own_postcode_the_sanitizer_rejects_still_makes_a_centroid_of_its_tag) {
+    // update_postcodes sums the houses' tags by the postcode PostcodeFormatter makes of them, of the
+    // default .* in a country without a pattern (_PostcodeCollector.add), whatever the
+    // clean-postcodes sanitizer, of the default [A-Z0-9- ]{3,12}, keeps for the house. Montserrat
+    // has no pattern: a house tagged 12.A keeps no postcode of its own, takes get_nearest_postcode's
+    // at itself (placex_update), and the centroid of 12.A its tag makes names it.
+    Fixture f;
+    f.country(16.6, -62.3, 16.9, -62.1, "Montserrat", "MS");
+    f.node(16.75, -62.2, {{"addr:postcode", "12.A"}, {"addr:housenumber", "1"}, {"addr:street", "Old Road"}});
+    const std::vector<std::string> answers = answers_of(f, "centroid-of-a-rejected-tag", {{16.75, -62.2}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "postcode", "12.A"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 

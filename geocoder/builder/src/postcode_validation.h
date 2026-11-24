@@ -341,6 +341,17 @@ inline const Matchers& matchers() {
 
 }  // namespace postcode_detail
 
+// Whether the country cc (pack_country_code of its upper-case code) has a
+// pattern of its own (kPostcodeFormats), which the clean-postcodes sanitizer
+// and update_postcodes both match by; one without takes each one's default
+// (PostcodeDefault).
+inline bool postcode_pattern_of_its_own(uint16_t cc) {
+    const auto& countries = postcode_detail::matchers().countries;
+    const auto it = std::lower_bound(countries.begin(), countries.end(), cc,
+                                     [](const auto& c, uint16_t key) { return c.first < key; });
+    return it != countries.end() && it->first == cc;
+}
+
 // The postcode Nominatim makes of the tag pc in the country cc
 // (pack_country_code of its upper-case code, 0 for none), or none where it
 // takes none, as PostcodeFormatter.match: none of no country or of one

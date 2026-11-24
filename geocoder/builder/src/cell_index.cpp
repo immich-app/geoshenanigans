@@ -600,64 +600,115 @@ void normalise_addr_postcodes(ParsedData& data, unsigned threads) {
         std::unordered_set<uint64_t>().swap(shard.keys);
     }
     parallel_sort(keys.begin(), keys.end(), std::less<uint64_t>(), threads);
-    // Each pair's postcode, matched on every core and interned in pair order.
-    std::vector<std::optional<std::string>> norms(keys.size());
+    // Each pair's postcode, matched on every core and interned in pair order,
+    // and the one update_postcodes sums the house's centroid by where that is
+    // another: in a country of no pattern of its own, where each has its
+    // default.
+    std::vector<std::optional<std::string>> norms(keys.size()), centroids(keys.size());
+    std::vector<uint8_t> apart(keys.size());
     {
         const char* pool = data.string_pool.data().data();
         parallel_for_dynamic(keys.size(), 1 << 8, [&](size_t begin, size_t end, unsigned) {
-            for (size_t k = begin; k < end; k++)
-                norms[k] = match_postcode(postcode_key_cc(keys[k]), pool + postcode_key_pc(keys[k]),
-                                          PostcodeDefault::Sanitizer);
+            for (size_t k = begin; k < end; k++) {
+                const uint16_t cc = postcode_key_cc(keys[k]);
+                const char* tag = pool + postcode_key_pc(keys[k]);
+                norms[k] = match_postcode(cc, tag, PostcodeDefault::Sanitizer);
+                if (postcode_pattern_of_its_own(cc)) continue;
+                centroids[k] = match_postcode(cc, tag, PostcodeDefault::Any);
+                apart[k] = centroids[k] != norms[k];
+            }
         }, threads);
     }
     std::vector<std::string_view> matched;
-    std::vector<size_t> matched_key;
-    for (size_t k = 0; k < keys.size(); k++)
+    std::vector<std::pair<size_t, bool>> matched_key;  // (pair, of its centroid)
+    for (size_t k = 0; k < keys.size(); k++) {
         if (norms[k]) {
             matched.push_back(*norms[k]);
-            matched_key.push_back(k);
+            matched_key.push_back({k, false});
         }
+        if (apart[k] && centroids[k]) {
+            matched.push_back(*centroids[k]);
+            matched_key.push_back({k, true});
+        }
+    }
     const std::vector<uint32_t> ids = data.string_pool.intern_all(matched, threads);
-    std::vector<uint32_t> postcode_of(keys.size(), NO_DATA);
-    for (size_t m = 0; m < matched.size(); m++) postcode_of[matched_key[m]] = ids[m];
+    std::vector<uint32_t> postcode_of(keys.size(), NO_DATA), centroid_of(keys.size(), NO_DATA);
+    for (size_t m = 0; m < matched.size(); m++)
+        (matched_key[m].second ? centroid_of : postcode_of)[matched_key[m].first] = ids[m];
+    for (size_t k = 0; k < keys.size(); k++)
+        if (!apart[k]) centroid_of[k] = postcode_of[k];
+    // A house whose centroid's postcode is another than its own goes to
+    // data.house_centroids by its osm id, which rides the ordering with it.
+    const bool by_id = data.addr_osm_ids.size() >= n;
     std::vector<uint64_t> renamed(threads), rejected(threads);
+    std::vector<std::vector<ParsedData::HouseCentroid>> apart_houses(threads);
     parallel_for_dynamic(n, 1 << 14, [&](size_t begin, size_t end, unsigned w) {
         for (size_t i = begin; i < end; i++) {
             uint32_t& pc_id = data.addr_postcode_ids[i];
             if (pc_id == NO_DATA) continue;
             const uint16_t cc = country(i);
             if (cc == 0) continue;
-            const uint32_t postcode =
-                postcode_of[std::lower_bound(keys.begin(), keys.end(), postcode_key(cc, pc_id)) - keys.begin()];
+            const size_t k = std::lower_bound(keys.begin(), keys.end(), postcode_key(cc, pc_id)) - keys.begin();
+            const uint32_t postcode = postcode_of[k];
+            if (centroid_of[k] != postcode && by_id)
+                apart_houses[w].push_back({data.addr_osm_ids[i], postcode,
+                                           centroid_of[k] == NO_DATA ? ParsedData::kNoCentroid
+                                                                     : postcode_key(cc, centroid_of[k])});
             rejected[w] += postcode == NO_DATA;
             renamed[w] += postcode != NO_DATA && postcode != pc_id;
             pc_id = postcode;
         }
     }, threads);
+    std::vector<ParsedData::HouseCentroid>& houses = data.house_centroids;
+    houses.clear();
+    for (auto& part : apart_houses) houses.insert(houses.end(), part.begin(), part.end());
+    std::sort(houses.begin(), houses.end());
+    houses.erase(std::unique(houses.begin(), houses.end()), houses.end());
     std::cerr << "House postcodes: " << keys.size() << " (country, tag) pairs; "
               << std::accumulate(renamed.begin(), renamed.end(), uint64_t(0)) << " tags renamed to their postcode, "
               << std::accumulate(rejected.begin(), rejected.end(), uint64_t(0))
-              << " rejected by their country's pattern" << std::endl;
+              << " rejected by their country's pattern; " << houses.size()
+              << " houses of another centroid's postcode" << std::endl;
 }
 
 void collect_postcode_centroids(ParsedData& data) {
     using Accums = std::unordered_map<uint64_t, ParsedData::PostcodeAccum>;
     size_t n = std::min(data.addr_points.size(), data.addr_postcode_ids.size());
     const AdminRings countries = border_country_rings(data);
+    // A house of data.house_centroids sums by its tag's centroid postcode
+    // (normalise_addr_postcodes), found by its osm id, the postcode it keeps
+    // and its country.
+    const auto& apart = data.house_centroids;
+    const bool by_id = !apart.empty() && data.addr_osm_ids.size() >= n;
     // Border cells cost a point-in-polygon each, so workers take small
     // ranges as they free up. The sums are integers: merging the workers'
     // maps in any order gives the same totals.
     std::vector<Accums> parts(parallel_threads());
     parallel_for_dynamic(n, 1 << 14, [&](size_t begin, size_t end, unsigned w) {
         for (size_t i = begin; i < end; i++) {
-            uint32_t pc_id = data.addr_postcode_ids[i];
-            if (pc_id == NO_DATA) continue;
+            const uint32_t pc_id = data.addr_postcode_ids[i];
+            auto first = apart.end(), last = apart.end();
+            if (by_id) {
+                const uint64_t id = data.addr_osm_ids[i];
+                first = std::lower_bound(apart.begin(), apart.end(), id,
+                                         [](const ParsedData::HouseCentroid& h, uint64_t v) { return h.osm_id < v; });
+                last = first;
+                while (last != apart.end() && last->osm_id == id) ++last;
+            }
+            if (pc_id == NO_DATA && first == last) continue;
             const auto& ap = data.addr_points[i];
             uint16_t cc = country_at(data, countries, ap.lat, ap.lng);
             if (cc == 0) continue;
-            parts[w][postcode_key(cc, pc_id)].add(ap.lat, ap.lng);
+            uint64_t key = pc_id == NO_DATA ? ParsedData::kNoCentroid : postcode_key(cc, pc_id);
+            for (auto h = first; h != last; ++h)
+                if (h->house == pc_id && (h->key == ParsedData::kNoCentroid || postcode_key_cc(h->key) == cc)) {
+                    key = h->key;
+                    break;
+                }
+            if (key != ParsedData::kNoCentroid) parts[w][key].add(ap.lat, ap.lng);
         }
     });
+    std::vector<ParsedData::HouseCentroid>().swap(data.house_centroids);
     // The workers' maps summed a shard of the keys per thread.
     constexpr size_t kShards = 64;
     std::vector<Accums> shards(kShards);

@@ -5,15 +5,17 @@
 // candidates don't depend on how a ring is written down. A street's postal
 // area covers its middle, its edges included, is of the street's country, or
 // of any where the street has none, and has a postcode the server takes. A
-// house keeps the postcode its country's pattern makes of its tag, by which
-// the centroids are summed. A boundary that repeats the closest boundary
-// relation round its point, the same outline whatever vertices lie along
-// its edges, and links no place node is in no address; one that links one
-// takes the node's rank.
+// house keeps the postcode its country's pattern makes of its tag, and the
+// centroids are summed by the one it makes of the tag for them, whatever the
+// house keeps. A boundary that repeats the closest boundary relation round
+// its point, the same outline whatever vertices lie along its edges, and
+// links no place node is in no address; one that links one takes the node's
+// rank.
 #include "admin_links.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <random>
 #include <string>
@@ -353,6 +355,53 @@ TEST(a_house_keeps_the_postcode_its_countrys_pattern_makes_of_its_tag) {
     REQUIRE(accum.count(postcode_key(de, kept[0])) && accum.count(postcode_key(us, kept[10])));
     CHECK_EQ(accum.at(postcode_key(de, kept[0])).count, uint64_t(4));
     CHECK_EQ(accum.at(postcode_key(us, kept[10])).count, uint64_t(3));
+    CHECK_EQ(accum.size(), size_t(2));
+}
+
+TEST(a_centroid_takes_the_postcode_the_countrys_pattern_makes_of_the_tag_whatever_the_house_keeps) {
+    // update_postcodes sums the houses' addr:postcode tags as it reads them (placex.address) by the
+    // postcode their country's pattern makes of them, PostcodeFormatter's default .* where the
+    // country has none (_PostcodeCollector.add); the clean-postcodes sanitizer's default for a
+    // house's own is [A-Z0-9- ]{3,12}. Montserrat has no pattern: two houses of 12.A and 12.a keep
+    // no postcode of their own, and the centroid of 12.A is theirs, halfway between them; MSR1110
+    // is the house's and the centroid's alike. A copy of a house of 12.A, deduplicated before the
+    // centroids are summed (reorder_addr_points), is summed once.
+    const uint16_t ms = pack_country_code('M', 'S');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Montserrat", ms);
+    a.map();
+    struct House {
+        double lat, lng;
+        const char* tag;
+        uint64_t osm_id;
+    };
+    const std::vector<House> houses = {
+        {0.2, 0.2, "12.A", 1}, {0.4, 0.4, "12.a", 2}, {0.6, 0.6, "MSR1110", 3}, {0.2, 0.2, "12.A", 1},
+    };
+    for (const House& h : houses) {
+        AddrPoint ap{};
+        ap.lat = static_cast<float>(h.lat);
+        ap.lng = static_cast<float>(h.lng);
+        ap.vertex_offset = NO_DATA;
+        a.data.addr_points.push_back(ap);
+        a.data.addr_postcode_ids.push_back(a.data.string_pool.intern(h.tag));
+        a.data.addr_osm_ids.push_back(pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, h.osm_id));
+    }
+    normalise_addr_postcodes(a.data, 1);
+    const uint32_t twelve = a.data.string_pool.intern("12.A"), msr = a.data.string_pool.intern("MSR1110");
+    CHECK_EQ(a.data.addr_postcode_ids[0], NO_DATA);
+    CHECK_EQ(a.data.addr_postcode_ids[1], NO_DATA);
+    CHECK_EQ(a.data.addr_postcode_ids[2], msr);
+    // The copy goes as reorder_addr_points takes it out.
+    a.data.addr_points.pop_back();
+    a.data.addr_postcode_ids.pop_back();
+    a.data.addr_osm_ids.pop_back();
+    collect_postcode_centroids(a.data);
+    const auto& accum = a.data.postcode_accum;
+    REQUIRE(accum.count(postcode_key(ms, twelve)) && accum.count(postcode_key(ms, msr)));
+    CHECK_EQ(accum.at(postcode_key(ms, twelve)).count, uint64_t(2));
+    CHECK(std::abs(accum.at(postcode_key(ms, twelve)).lat() - 0.3) < 1e-6);
+    CHECK_EQ(accum.at(postcode_key(ms, msr)).count, uint64_t(1));
     CHECK_EQ(accum.size(), size_t(2));
 }
 
