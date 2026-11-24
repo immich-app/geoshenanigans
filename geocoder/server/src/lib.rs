@@ -169,10 +169,10 @@ pub fn cell_neighbors_at_level(cell_id: u64, level: u64) -> Vec<u64> {
     cell.all_neighbors(level).into_iter().map(|c| c.0).collect()
 }
 
-/// How far the scans' distances (planar, a degree of longitude cos(lat) of one of latitude at the
-/// point) may stray from the sphere's within the search distance, relatively: well under 0.1 %,
-/// but within a degree of a pole. The cells round a point are read that much past the reach, and
-/// each counts that much nearer.
+/// How far the scans' distances (GeoOrigin) may stray from the sphere's round the point,
+/// relatively: planar ones by no more than half of it, as GeoOrigin measures on the gnomonic
+/// projection where they would stray more. The cells round a point are read that much past the
+/// reach, and each counts that much nearer.
 const CELL_REACH_SLACK: f64 = 1e-3;
 
 /// S2's kMaxDiag for its quadratic projection (s2metrics.cc): no cell of level k has a diagonal
@@ -232,6 +232,157 @@ fn geo_reach_refused(search_distance: f64, level: u64) -> Option<String> {
     (cells > MAX_GEO_CELLS).then(|| format!(
         "search distance {search_distance} m reads up to {cells:.0} street cells round a point at level {level}, \
          more than the {MAX_GEO_CELLS} a query may read"))
+}
+
+/// A point of the sphere as a unit vector.
+fn unit_vector(lat: f64, lng: f64) -> [f64; 3] {
+    let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
+    let (sin_lng, cos_lng) = lng.to_radians().sin_cos();
+    [cos_lat * cos_lng, cos_lat * sin_lng, sin_lat]
+}
+
+/// Where a geo lookup measures from, and on what plane, squared distances in radians² as
+/// `max_distance_sq` is: the plane where a degree of longitude is cos(lat) of a degree of latitude
+/// at the point (point_to_segment_distance), each longitude taken the short way round from the
+/// point's, so across the antimeridian too. Near a pole, where that plane would stray from the
+/// sphere by more than half CELL_REACH_SLACK within the cover round the point, the gnomonic
+/// projection about the point instead, where a point is as far as it is and an edge is its great
+/// circle, as the builder lists it.
+#[derive(Clone, Copy)]
+struct GeoOrigin {
+    lat: f64,
+    lng: f64,
+    cos_lat: f64,
+    /// Near a pole, the point and its directions east and north, as unit vectors.
+    polar: Option<[[f64; 3]; 3]>,
+}
+
+impl GeoOrigin {
+    /// The point (lat, lng), whose lookups read the cells within `cover` radians of it.
+    fn new(lat: f64, lng: f64, cover: f64) -> Self {
+        // The plane's scale strays by up to the cover times tan(lat) within the cover.
+        let polar = (cover * lat.abs().to_radians().tan() > CELL_REACH_SLACK / 2.0).then(|| {
+            let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
+            let (sin_lng, cos_lng) = lng.to_radians().sin_cos();
+            [unit_vector(lat, lng), [-sin_lng, cos_lng, 0.0], [-sin_lat * cos_lng, -sin_lat * sin_lng, cos_lat]]
+        });
+        GeoOrigin { lat, lng, cos_lat: lat.to_radians().cos(), polar }
+    }
+
+    /// `lng` the short way round from the point's: within 180° of it.
+    fn near_lng(&self, lng: f64) -> f64 {
+        let east = lng - self.lng;
+        if east > 180.0 { lng - 360.0 } else if east < -180.0 { lng + 360.0 } else { lng }
+    }
+
+    /// A node on the gnomonic projection about the point: None for one 84° or more away, where the
+    /// projection fails.
+    fn project(basis: &[[f64; 3]; 3], node: NodeCoord) -> Option<(f64, f64)> {
+        let v = unit_vector(node.lat as f64, node.lng as f64);
+        let dot = |a: &[f64; 3]| a[0] * v[0] + a[1] * v[1] + a[2] * v[2];
+        let toward = dot(&basis[0]);
+        (toward > 0.1).then(|| (dot(&basis[1]) / toward, dot(&basis[2]) / toward))
+    }
+
+    /// The squared distance to the point (lat, lng).
+    fn point_sq(&self, lat: f64, lng: f64) -> f64 {
+        match &self.polar {
+            None => dist_sq((lat - self.lat).to_radians(), (self.near_lng(lng) - self.lng).to_radians(), self.cos_lat),
+            Some(basis) => {
+                let v = unit_vector(lat, lng);
+                let (p, along) = (basis[0], v[0] * basis[0][0] + v[1] * basis[0][1] + v[2] * basis[0][2]);
+                let across = [p[1] * v[2] - p[2] * v[1], p[2] * v[0] - p[0] * v[2], p[0] * v[1] - p[1] * v[0]];
+                (across[0] * across[0] + across[1] * across[1] + across[2] * across[2]).sqrt().atan2(along).powi(2)
+            }
+        }
+    }
+
+    /// The squared distance to the edge from `a` to `b`, and the fraction along it of its point
+    /// nearest the point.
+    fn segment(&self, a: NodeCoord, b: NodeCoord) -> (f64, f64) {
+        match &self.polar {
+            None => {
+                let c = self.cos_lat;
+                point_to_segment_with_t(self.lat, self.lng * c, a.lat as f64, self.near_lng(a.lng as f64) * c,
+                                        b.lat as f64, self.near_lng(b.lng as f64) * c, PLANAR)
+            }
+            Some(basis) => match (Self::project(basis, a), Self::project(basis, b)) {
+                (Some(a), Some(b)) => {
+                    let (r, t) = nearest_to_origin(a, b);
+                    (r.atan().powi(2), t)
+                }
+                _ => (f64::MAX, 0.0),
+            },
+        }
+    }
+
+    /// The length of the edge from `a` to `b`, in radians.
+    fn length(&self, a: NodeCoord, b: NodeCoord) -> f64 {
+        match &self.polar {
+            None => {
+                let dlat = (b.lat as f64 - a.lat as f64).to_radians();
+                let dlng = (self.near_lng(b.lng as f64) - self.near_lng(a.lng as f64)).to_radians();
+                dist_sq(dlat, dlng, self.cos_lat).sqrt()
+            }
+            Some(_) => {
+                let (u, v) = (unit_vector(a.lat as f64, a.lng as f64), unit_vector(b.lat as f64, b.lng as f64));
+                let across = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                (across[0] * across[0] + across[1] * across[1] + across[2] * across[2]).sqrt()
+                    .atan2(u[0] * v[0] + u[1] * v[1] + u[2] * v[2])
+            }
+        }
+    }
+
+    /// The squared distance to the polygon through `vertices`: 0 for the point inside it, as
+    /// polygon_distance_sq measures one.
+    fn polygon_sq(&self, vertices: &[NodeCoord]) -> f64 {
+        let Some(basis) = &self.polar else {
+            let wraps = |v: &NodeCoord| self.near_lng(v.lng as f64) != v.lng as f64;
+            if !vertices.iter().any(wraps) {
+                return polygon_distance_sq(self.lat, self.lng, vertices, self.cos_lat);
+            }
+            // A vertex across the antimeridian, near the point's side of it: past 128° in f32 a
+            // turn of 360° is exact.
+            let near: Vec<NodeCoord> = vertices.iter()
+                .map(|v| NodeCoord { lat: v.lat, lng: self.near_lng(v.lng as f64) as f32 })
+                .collect();
+            return polygon_distance_sq(self.lat, self.lng, &near, self.cos_lat);
+        };
+        let Some(ring) = vertices.iter().map(|&v| Self::project(basis, v)).collect::<Option<Vec<_>>>() else {
+            return f64::MAX;
+        };
+        if ring.is_empty() {
+            return f64::MAX;
+        }
+        if origin_in_ring(&ring) {
+            return 0.0;
+        }
+        (0..ring.len()).map(|i| nearest_to_origin(ring[i], ring[(i + 1) % ring.len()]).0).fold(f64::MAX, f64::min).atan().powi(2)
+    }
+}
+
+/// How far the origin of a plane is from the segment from `a` to `b`, and the fraction along it
+/// of the segment's point nearest the origin.
+fn nearest_to_origin(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let length_sq = dx * dx + dy * dy;
+    let t = if length_sq > 0.0 { (-(a.0 * dx + a.1 * dy) / length_sq).clamp(0.0, 1.0) } else { 0.0 };
+    ((a.0 + t * dx).hypot(a.1 + t * dy), t)
+}
+
+/// Whether the origin of a plane lies inside the ring through `points`, by ray casting as
+/// point_in_polygon does.
+fn origin_in_ring(points: &[(f64, f64)]) -> bool {
+    let mut inside = false;
+    let mut j = points.len() - 1;
+    for (i, &(xi, yi)) in points.iter().enumerate() {
+        let (xj, yj) = points[j];
+        if (yi > 0.0) != (yj > 0.0) && 0.0 < (xj - xi) * (0.0 - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
 
 /// The cells a lookup round a point reads (cells_within), nearest first: their ids, and the
@@ -1350,19 +1501,15 @@ fn street_tokens_overlap(a: &str, b: &str) -> bool {
 /// even/odd grid relative to start_number and clamps into [min, max] of the
 /// range — the old open-coded version computed the offset in unsigned space,
 /// so descending ranges (start > end) saturated the negative offset to 0.
-/// Squared distance (radians²) from the point to an interpolation line and
+/// Squared distance (radians²) from `origin` to an interpolation line and
 /// the fraction along it, by length, of the closest point: the point nearest
-/// in metres, as a street's (point_to_segment_distance). None for a line
-/// without length.
-fn interp_position(nodes: &[NodeCoord], lat: f64, lng: f64, cos_lat: f64) -> Option<(f64, f64)> {
+/// in metres, as a street's (GeoOrigin::segment). None for a line without
+/// length.
+fn interp_position(nodes: &[NodeCoord], origin: &GeoOrigin) -> Option<(f64, f64)> {
     if nodes.len() < 2 { return None; }
-    let seg_len = |i: usize| {
-        let dlat = (nodes[i + 1].lat as f64 - nodes[i].lat as f64).to_radians();
-        let dlng = (nodes[i + 1].lng as f64 - nodes[i].lng as f64).to_radians();
-        // sqrt: dist_sq is squared length; accumulating squares
-        // skews the along-way fraction toward long segments.
-        dist_sq(dlat, dlng, cos_lat).sqrt()
-    };
+    // Lengths, not their squares: accumulating squares skews the along-way
+    // fraction toward long segments.
+    let seg_len = |i: usize| origin.length(nodes[i], nodes[i + 1]);
     let total_len: f64 = (0..nodes.len() - 1).map(seg_len).sum();
     if total_len == 0.0 { return None; }
 
@@ -1371,12 +1518,7 @@ fn interp_position(nodes: &[NodeCoord], lat: f64, lng: f64, cos_lat: f64) -> Opt
     let mut accumulated = 0.0;
     for i in 0..nodes.len() - 1 {
         let len = seg_len(i);
-        let (dist, seg_t) = point_to_segment_with_t(
-            lat, lng * cos_lat,
-            nodes[i].lat as f64, nodes[i].lng as f64 * cos_lat,
-            nodes[i + 1].lat as f64, nodes[i + 1].lng as f64 * cos_lat,
-            PLANAR,
-        );
+        let (dist, seg_t) = origin.segment(nodes[i], nodes[i + 1]);
         if dist < best_dist {
             best_dist = dist;
             best_t = (accumulated + seg_t * len) / total_len;
@@ -1748,11 +1890,16 @@ impl Index {
         cells.within(address_cover(self.max_distance_sq.sqrt(), self.street_cell_level))
     }
 
+    /// Where the geo lookups at (lat, lng) measure from.
+    fn geo_origin(&self, lat: f64, lng: f64) -> GeoOrigin {
+        GeoOrigin::new(lat, lng, geo_cover(self.max_distance_sq.sqrt(), self.street_cell_level))
+    }
+
     /// What decides between two address points at one exact distance (see
     /// `beats`): the distance of the point itself (a building's distance is
     /// its outline's), then its house number and street as text.
-    fn addr_tie_key(&self, a: &AddrRecord, lat: f64, lng: f64, cos_lat: f64) -> (f64, Cow<'_, str>, Cow<'_, str>) {
-        let d = dist_sq((a.lat as f64 - lat).to_radians(), (a.lng as f64 - lng).to_radians(), cos_lat);
+    fn addr_tie_key(&self, a: &AddrRecord, origin: &GeoOrigin) -> (f64, Cow<'_, str>, Cow<'_, str>) {
+        let d = origin.point_sq(a.lat as f64, a.lng as f64);
         (d, self.get_string(a.housenumber_id), self.get_string(a.street_id))
     }
 
@@ -1796,25 +1943,25 @@ impl Index {
         let mut lists = GEO_LISTS.with(std::cell::Cell::take);
         self.geo_index.lookup_many(&cells.ids, geo_index::ALL_TABLES, &mut lists);
 
-        let cos_lat = lat.to_radians().cos();
-        let addr_result = self.nearest_addr(&lists, &cells, lat, lng, cos_lat);
-        let street_result = self.nearest_street(streets, &lists, &cells, lat, lng, cos_lat);
-        let interp_result = self.nearest_interp(&lists, &cells, lat, lng, cos_lat);
+        let origin = self.geo_origin(lat, lng);
+        let addr_result = self.nearest_addr(&lists, &cells, &origin);
+        let street_result = self.nearest_street(streets, &lists, &cells, &origin);
+        let interp_result = self.nearest_interp(&lists, &cells, &origin);
 
         GEO_LISTS.with(|g| g.set(lists));
 
         (addr_result, interp_result, street_result)
     }
 
-    /// The address point nearest (lat, lng) within the search distance in `lists`, a lookup's
+    /// The address point nearest `origin` within the search distance in `lists`, a lookup's
     /// lists of `cells`: its squared distance, its record and its id. An exact tie goes by
     /// `addr_tie_key`, then to the point read first: cells are read in the order the lookup
     /// asked for them, a cell's ids in its list's.
-    fn nearest_addr(&self, lists: &GeoLists, cells: &NearCells, lat: f64, lng: f64, cos_lat: f64)
+    fn nearest_addr(&self, lists: &GeoLists, cells: &NearCells, origin: &GeoOrigin)
         -> Option<(f64, AddrRecord, u32)>
     {
         let addrs = self.addrs.as_ref()?;
-        let addr_key = |a: &AddrRecord| self.addr_tie_key(a, lat, lng, cos_lat);
+        let addr_key = |a: &AddrRecord| self.addr_tie_key(a, origin);
 
         let mut best_addr_dist = self.max_distance_sq;
         let mut best_addr: Option<AddrRecord> = None;
@@ -1826,13 +1973,11 @@ impl Index {
         let ids = (0..self.address_cells(cells)).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
         with_footprint(|footprint| {
             addrs.for_ids(ids, |id, point| {
-                let dlat = (point.lat as f64 - lat).to_radians();
-                let dlng = (point.lng as f64 - lng).to_radians();
-                let mut dist = dist_sq(dlat, dlng, cos_lat);
+                let mut dist = origin.point_sq(point.lat as f64, point.lng as f64);
                 // A building is as far as its outline, matching ST_Distance behaviour; one
                 // whose footprint can't be read, as its point.
                 if point.is_building() && addrs.footprint(&point, footprint) {
-                    dist = polygon_distance_sq(lat, lng, footprint, cos_lat);
+                    dist = origin.polygon_sq(footprint);
                 }
                 if beats(dist, best_addr_dist, || best_addr.as_ref().filter(|_| best_addr_id != id).map(|b| (addr_key(&point), addr_key(b)))) {
                     best_addr_dist = dist;
@@ -1844,10 +1989,10 @@ impl Index {
         best_addr.map(|p| (best_addr_dist, p, best_addr_id))
     }
 
-    /// The street way nearest (lat, lng) within the search distance in `lists`, read in
+    /// The street way nearest `origin` within the search distance in `lists`, read in
     /// `nearest_addr`'s order, from every cell: its squared distance, its row and its id. An exact
     /// tie goes by `street_tie_key`, then to the way read first.
-    fn nearest_street(&self, streets: &WayFiles, lists: &GeoLists, cells: &NearCells, lat: f64, lng: f64, cos_lat: f64)
+    fn nearest_street(&self, streets: &WayFiles, lists: &GeoLists, cells: &NearCells, origin: &GeoOrigin)
         -> Option<(f64, WayRow, u32)>
     {
         let mut best_street_dist = self.max_distance_sq;
@@ -1869,12 +2014,7 @@ impl Index {
                     // whose block can't be read.
                     if !streets.way(id, nodes) || nodes.len() < 2 { continue; }
                     for i in 0..nodes.len() - 1 {
-                        let dist = point_to_segment_distance(
-                            lat, lng,
-                            nodes[i].lat as f64, nodes[i].lng as f64,
-                            nodes[i + 1].lat as f64, nodes[i + 1].lng as f64,
-                            cos_lat,
-                        );
+                        let (dist, _) = origin.segment(nodes[i], nodes[i + 1]);
                         // A tie with the way's own earlier segment (the node two segments
                         // share is the nearest point) needs no key.
                         let keys = || best_street.filter(|&best| best != id).map(|best| (self.street_tie_key(streets, id), self.street_tie_key(streets, best)));
@@ -1890,11 +2030,11 @@ impl Index {
         Some((best_street_dist, streets.row(id)?, id))
     }
 
-    /// The interpolation way nearest (lat, lng) within the search distance in `lists`, read in
+    /// The interpolation way nearest `origin` within the search distance in `lists`, read in
     /// `nearest_addr`'s order, from every cell: its squared distance, its street, the house
-    /// number at the point of its line nearest (lat, lng), and its id. Equally near ways go to
-    /// the lesser `interp_tie_key`.
-    fn nearest_interp(&self, lists: &GeoLists, cells: &NearCells, lat: f64, lng: f64, cos_lat: f64)
+    /// number at the point of its line nearest `origin`, and its id. Equally near ways go to the
+    /// lesser `interp_tie_key`.
+    fn nearest_interp(&self, lists: &GeoLists, cells: &NearCells, origin: &GeoOrigin)
         -> Option<(f64, Cow<'_, str>, u32, u32)>
     {
         let interps = self.interps.as_ref()?;
@@ -1909,7 +2049,7 @@ impl Index {
                 // numbers costs no node.
                 let Some(iw) = interps.row(id) else { continue };
                 if iw.start_number == 0 || iw.end_number == 0 { continue; }
-                let Some((dist, t)) = self.interp_way_position(interps, id, lat, lng, cos_lat) else { continue };
+                let Some((dist, t)) = self.interp_way_position(interps, id, origin) else { continue };
                 // A line several cells list ties with itself, which needs no key.
                 let keys = || best_interp.as_ref().filter(|(best, _)| *best != id).map(|(best, b)| (self.interp_tie_key(interps, id, &iw), self.interp_tie_key(interps, *best, b)));
                 if beats(dist, best_interp_dist, keys) {
@@ -1941,8 +2081,8 @@ impl Index {
         let cells = self.geo_cells_around(lat, lng);
         let mut lists = GEO_LISTS.with(std::cell::Cell::take);
         self.geo_index.lookup_many(&cells.ids, 1 << geo_index::ADDRESSES, &mut lists);
-        let cos_lat = lat.to_radians().cos();
-        let addr_key = |a: &AddrRecord| self.addr_tie_key(a, lat, lng, cos_lat);
+        let origin = self.geo_origin(lat, lng);
+        let addr_key = |a: &AddrRecord| self.addr_tie_key(a, &origin);
 
         let mut best_dist = max_dist_sq.min(self.max_distance_sq);
         let mut best: Option<(u32, AddrRecord)> = None;
@@ -1951,11 +2091,9 @@ impl Index {
         let ids = (0..self.address_cells(&cells)).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
         with_footprint(|footprint| {
             addrs.for_ids_on_way(ids, parent_way_idx, |id, point| {
-                let dlat = (point.lat as f64 - lat).to_radians();
-                let dlng = (point.lng as f64 - lng).to_radians();
-                let mut dist = dist_sq(dlat, dlng, cos_lat);
+                let mut dist = origin.point_sq(point.lat as f64, point.lng as f64);
                 if point.is_building() && addrs.footprint(&point, footprint) {
-                    dist = polygon_distance_sq(lat, lng, footprint, cos_lat);
+                    dist = origin.polygon_sq(footprint);
                 }
                 if beats(dist, best_dist, || best.as_ref().map(|(_, b)| (addr_key(&point), addr_key(b)))) {
                     best_dist = dist;
@@ -1969,8 +2107,8 @@ impl Index {
 
     /// interp_position over interpolation way `id`'s nodes; None for a way
     /// whose nodes can't be read.
-    fn interp_way_position(&self, interps: &WayFiles, id: u32, lat: f64, lng: f64, cos_lat: f64) -> Option<(f64, f64)> {
-        with_way_nodes(|nodes| if interps.way(id, nodes) { interp_position(nodes, lat, lng, cos_lat) } else { None })
+    fn interp_way_position(&self, interps: &WayFiles, id: u32, origin: &GeoOrigin) -> Option<(f64, f64)> {
+        with_way_nodes(|nodes| if interps.way(id, nodes) { interp_position(nodes, origin) } else { None })
     }
 
     /// Nominatim's `_find_tiger_number_for_street` (reverse.py): when a US
@@ -1988,7 +2126,7 @@ impl Index {
         let cells = self.geo_cells_around(lat, lng);
         let mut lists = GEO_LISTS.with(std::cell::Cell::take);
         self.geo_index.lookup_many(&cells.ids, 1 << geo_index::INTERPOLATIONS, &mut lists);
-        let cos_lat = lat.to_radians().cos();
+        let origin = self.geo_origin(lat, lng);
         let max_dist_sq = max_dist_sq.min(self.max_distance_sq);
 
         let mut best: Option<(f64, u32, WayRow, f64)> = None;
@@ -1999,7 +2137,7 @@ impl Index {
                 let Some(iw) = interps.row(id) else { continue };
                 if iw.start_number == 0 || iw.end_number == 0 { continue; }
                 if !street_tokens_overlap(&self.get_string(iw.name), street_name) { continue; }
-                let Some((dist, t)) = self.interp_way_position(interps, id, lat, lng, cos_lat) else { continue };
+                let Some((dist, t)) = self.interp_way_position(interps, id, &origin) else { continue };
                 if dist >= max_dist_sq { continue; }
                 let range = |w: &WayRow| (w.start_number, w.interpolation);
                 let better = match &best {
@@ -2032,10 +2170,10 @@ impl Index {
         let to_m = |d2: f64| (d2.sqrt() * 6_371_000.0) as f64;
         let bits = |d: f64| format!("{:016x}", d.to_bits());
         let float_bits = |v: f32| format!("{:08x}", if v == 0.0 { 0 } else { v.to_bits() });
-        let cos_lat = lat.to_radians().cos();
+        let origin = self.geo_origin(lat, lng);
         serde_json::json!({
             "addr": addr.map(|(d, p, id)| {
-                let (point_dist, house_number, street) = self.addr_tie_key(&p, lat, lng, cos_lat);
+                let (point_dist, house_number, street) = self.addr_tie_key(&p, &origin);
                 serde_json::json!({
                     "dist_m": to_m(d),
                     "house_number": if p.housenumber_id != NO_DATA { self.get_string(p.housenumber_id) } else { Cow::Borrowed("") },
@@ -4345,17 +4483,18 @@ mod multi_index_tests {
     #[test]
     fn interp_position_measures_along_the_line() {
         let line = [NodeCoord { lat: 0.0, lng: 0.0 }, NodeCoord { lat: 0.0, lng: 0.002 }];
-        let (d, t) = interp_position(&line, 0.0001, 0.0005, 1.0).unwrap();
+        let origin = |lat: f64, lng: f64| GeoOrigin::new(lat, lng, geo_cover(DEFAULT_SEARCH_DISTANCE / 6_371_000.0, DEFAULT_STREET_CELL_LEVEL));
+        let (d, t) = interp_position(&line, &origin(0.0001, 0.0005)).unwrap();
         assert!((t - 0.25).abs() < 1e-6, "t={}", t);
         assert!((d.sqrt().to_degrees() - 0.0001).abs() < 1e-9);
 
         // Past the end clamps to the last node.
-        let (_, t_end) = interp_position(&line, 0.0, 0.01, 1.0).unwrap();
+        let (_, t_end) = interp_position(&line, &origin(0.0, 0.01)).unwrap();
         assert!((t_end - 1.0).abs() < 1e-9);
 
         // Degenerate lines have no position.
-        assert!(interp_position(&line[..1], 0.0, 0.0, 1.0).is_none());
-        assert!(interp_position(&[line[0], line[0]], 0.0, 0.0, 1.0).is_none());
+        assert!(interp_position(&line[..1], &origin(0.0, 0.0)).is_none());
+        assert!(interp_position(&[line[0], line[0]], &origin(0.0, 0.0)).is_none());
     }
 
     #[test]
@@ -7664,13 +7803,6 @@ mod query_path_tests {
             self.write(dir.path());
             Index::load(dir.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, search_distance).unwrap()
         }
-    }
-
-    /// A point of the sphere as a unit vector.
-    fn unit_vector(lat: f64, lng: f64) -> [f64; 3] {
-        let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
-        let (sin_lng, cos_lng) = lng.to_radians().sin_cos();
-        [cos_lat * cos_lng, cos_lat * sin_lng, sin_lat]
     }
 
     /// The street cells the builder lists an edge from `a` to `b` in (cover_edge,

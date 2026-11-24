@@ -334,6 +334,53 @@ fn a_long_edge_is_found_where_the_builder_lists_its_great_circle() {
 }
 
 #[test]
+fn streets_addresses_and_house_numbers_are_found_across_the_antimeridian() {
+    // On the equator, 8 steps of a node's longitude (2^-16°, 1.7 m) west of the antimeridian: a
+    // street along the meridian 5 steps east of it, an address node 12 steps east and a building
+    // from 2 to 8 steps east, each as near as it is across it; and an interpolation line along the
+    // street gives the street its house number.
+    let step = (-16f64).exp2();
+    let metres = |steps: f64| (steps * step).to_radians() * 6_371_000.0;
+    let q = (0.0, 180.0 - 8.0 * step);
+    let node = |lat: f64, steps_east: f64| NodeCoord { lat: lat as f32, lng: (-180.0 + steps_east * step) as f32 };
+    let street = vec![node(-0.0005, 5.0), node(0.0005, 5.0)];
+    let index = TestIndex::new()
+        .street_through("Date Line Road", street.clone())
+        .address_point("3", node(0.0, 12.0), None)
+        .interpolation_through("Date Line Road", (1, 99, 0), street)
+        .load();
+    let found = index.debug_primary(q.0, q.1);
+    assert!(found["street"]["name"] == "Date Line Road" && about(&found["street"]["dist_m"], metres(13.0)), "{found}");
+    assert!(found["addr"]["house_number"] == "3" && about(&found["addr"]["dist_m"], metres(20.0)), "{found}");
+    assert!(found["interp"]["number"] == 50 && about(&found["interp"]["dist_m"], metres(13.0)), "{found}");
+    assert_eq!(index.find_addr_on_way(q.0, q.1, 0, radians_sq(100.0)).map(|(id, _)| id), Some(0));
+    assert_eq!(index.find_interp_on_way(q.0, q.1, "Date Line Road", radians_sq(100.0)), Some(50));
+
+    let ring = [node(-0.00005, 2.0), node(-0.00005, 8.0), node(0.00005, 8.0), node(0.00005, 2.0), node(-0.00005, 2.0)];
+    let index = TestIndex::new().address_point("5", node(0.0, 5.0), Some(Footprint::of(&ring))).load();
+    let addr = &index.debug_primary(q.0, q.1)["addr"];
+    assert!(addr["house_number"] == "5" && about(&addr["dist_m"], metres(10.0)), "{addr}");
+}
+
+#[test]
+fn an_address_and_a_street_over_a_pole_are_as_far_as_they_are() {
+    // 64 steps of a node's latitude (2^-17°, 0.85 m) from the North Pole: an address node as far
+    // past it on the other side is 108.6 m off, where a degree of longitude of the point's would
+    // put it 171 m off; and a street from 90° E to 90° W across the pole passes 54.3 m off, though
+    // in degrees it runs through the point.
+    let lat = 90.0 - 64.0 * (-17f64).exp2();
+    let metres = |degrees: f64| degrees.to_radians() * 6_371_000.0;
+    let node = |lng: f32| NodeCoord { lat: lat as f32, lng };
+    let index = TestIndex::new()
+        .address_point("1", node(180.0), None)
+        .street_through("Pole Road", vec![node(90.0), node(-90.0)])
+        .load();
+    let found = index.debug_primary(lat, 0.0);
+    assert!(found["addr"]["house_number"] == "1" && about(&found["addr"]["dist_m"], metres(2.0 * (90.0 - lat))), "{found}");
+    assert!(found["street"]["name"] == "Pole Road" && about(&found["street"]["dist_m"], metres(90.0 - lat)), "{found}");
+}
+
+#[test]
 fn an_interpolation_line_is_as_far_as_its_point_nearest_in_metres() {
     // At 60° N, a line running north-east whose nearest point lies 95 m south-east of the point,
     // numbered 1 to 301 along its 300 m: a street of its name takes number 151 from it, within
