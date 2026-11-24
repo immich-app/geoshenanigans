@@ -771,14 +771,27 @@ size_t drop_marine_namesakes(Build& b) {
             box = {std::min(box.lat_lo, q.lat_lo), std::max(box.lat_hi, q.lat_hi), std::min(box.lng_lo, q.lng_lo),
                    std::max(box.lng_hi, q.lng_hi)};
         }
-        uint32_t named = UINT32_MAX;
-        for (uint32_t m : namesakes)
+        // Each namesake's alone first, which no other's edges cross, then
+        // all of theirs together.
+        std::vector<std::pair<uint32_t, std::vector<uint32_t>>> each;
+        for (uint32_t m : namesakes) {
+            std::vector<uint32_t> own;
             for (uint32_t q = first[m]; q < first[m + 1]; q++)
-                if (boxes_meet(box, box_of(q))) {
-                    cover.push_back(q);
-                    named = std::min(named, m);
-                }
-        if (cover.empty() || !polygons_cover(b.rings, b.object_of, cover, area)) continue;
+                if (boxes_meet(box, box_of(q))) own.push_back(q);
+            if (own.empty()) continue;
+            cover.insert(cover.end(), own.begin(), own.end());
+            each.emplace_back(m, std::move(own));
+        }
+        if (cover.empty()) continue;
+        uint32_t named = UINT32_MAX;
+        for (const auto& [m, own] : each)
+            if (polygons_cover(b.rings, b.object_of, own, area)) {
+                named = m;
+                break;
+            }
+        if (named == UINT32_MAX && each.size() > 1 && polygons_cover(b.rings, b.object_of, cover, area))
+            named = each.front().first;
+        if (named == UINT32_MAX) continue;
         keep[o] = 0;
         dropped++;
         log << "  Water: " << object_ref(obj) << " (" << obj.tags.name << ") left out as the namesake of marine area "

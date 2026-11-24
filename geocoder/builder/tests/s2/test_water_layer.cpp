@@ -1953,3 +1953,21 @@ TEST(a_namesake_inside_marine_areas_of_its_name_that_overlap_goes) {
     const Layer layer = build(c);
     CHECK(ways_held(layer, {3030, 3031, 3032, 3033}).first == std::set<int64_t>({3033}));
 }
+
+TEST(a_namesake_inside_one_marine_area_of_its_name_goes_though_another_of_its_name_crosses_it) {
+    Collected c = with_marine();
+    // The North Sea, as above, and a second area of its name over part of
+    // it, a triangle whose sloping side crosses the east side of a bay of
+    // its name that the North Sea's square holds whole, at lat + 0.1025:
+    // between two latitudes of a vertex of either.
+    const int32_t lat = kLat - 20000000;
+    c.marine.push_back(marine_area(2352, marine::kSea, "North Sea",
+                                   {{Ring{pt(lat + 500000, kLng + 2675000), pt(lat + 500000, kLng + 3675000),
+                                          pt(lat + 1500000, kLng + 3675000), pt(lat + 500000, kLng + 2675000)}}}));
+    c.closed_ways.push_back({3040, tags(code::kNaturalBay, "North Sea"),
+                             Ring{pt(lat + 800000, kLng + 2800000), pt(lat + 800000, kLng + 3200000),
+                                  pt(lat + 1200000, kLng + 3200000), pt(lat + 1200000, kLng + 2800000),
+                                  pt(lat + 800000, kLng + 2800000)}});
+    const Layer layer = build(c);
+    CHECK(ways_held(layer, {3040}).first.empty());
+}

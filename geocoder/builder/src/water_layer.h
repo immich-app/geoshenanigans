@@ -244,9 +244,11 @@ Build assemble(Collected& c, unsigned threads);
 // marine area's, ASCII case, spaces and punctuation aside, and the polygons
 // of the marine areas of its name hold all its water (polygons_cover: its
 // polygons' rings even-odd, its holes left out, within the union of the
-// areas', each area's rings even-odd, a shared shore aside). Those marine
-// areas answer there; every other bay and strait stays, the water of one
-// that reaches past them, or round an island they leave out, among them.
+// areas', each area's rings even-odd, a shared shore aside; each area's
+// polygons alone first, so that another area's edge across its water
+// doesn't keep it). Those marine areas answer there; every other bay and
+// strait stays, the water of one that reaches past them, or round an island
+// they leave out, among them.
 // Logs each it leaves out and returns how many.
 size_t drop_marine_namesakes(Build& b);
 
