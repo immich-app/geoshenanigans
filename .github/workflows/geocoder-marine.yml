@@ -55,18 +55,13 @@ jobs:
           "$RUNNER_TEMP/venv/bin/pip" install -q shapely==2.2.0 pyogrio==0.13.0 numpy==2.5.5
           "$RUNNER_TEMP/venv/bin/python" -I -c 'import shapely, pyogrio; print("shapely", shapely.__version__, "GEOS", shapely.geos_version_string, "pyogrio", pyogrio.__version__)'
 
-      - name: Configure credentials
-        run: |
-          set -euo pipefail
-          echo "AWS_ACCESS_KEY_ID=$KEY" >> "$GITHUB_ENV"
-          echo "AWS_SECRET_ACCESS_KEY=$SECRET" >> "$GITHUB_ENV"
-        env:
-          KEY: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
-          SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
-
+      # Only the two steps that list and upload to the bucket hold its write key, in their own env: the fetch
+      # and the build, which parse the sources from outside, run without it.
       - name: Version
         env:
           REQUESTED: ${{ inputs.version }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
         run: |
           set -euo pipefail
           VERSION=${REQUESTED:-$(date -u +%Y%m%d)}
@@ -143,6 +138,9 @@ jobs:
           zstd -19 -T0 -q "$OUT/marine_areas.bin" -o "$OUT/marine_areas.bin.zst"
 
       - name: Upload to Tigris
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
         run: |
           set -euo pipefail
           SRC="$RUNNER_TEMP/marine-src"

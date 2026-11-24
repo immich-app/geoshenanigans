@@ -457,6 +457,27 @@ class MarineWorkflowTest(unittest.TestCase):
         self.assertRegex(block.group(1), r"(?m)^  group: \S+$")
         self.assertRegex(block.group(1), r"(?m)^  cancel-in-progress: false$")
 
+    # Only the two steps that list and upload to the bucket hold its write key, in their own env: the fetch
+    # and the build, which parse the sources from outside, run without it, and no step puts it in $GITHUB_ENV,
+    # which every later step reads.
+    def test_only_the_steps_that_use_the_bucket_hold_its_write_key(self):
+        import yaml
+        workflow = yaml.safe_load(read(MARINE_WORKFLOW))
+        job = workflow["jobs"]["marine"]
+        # Nor does the workflow's env or the job's give it to every step.
+        self.assertNotIn("secrets.", json.dumps({k: v for k, v in workflow.items() if k != "jobs"}, default=str))
+        self.assertNotIn("secrets.", json.dumps({k: v for k, v in job.items() if k != "steps"}))
+        steps = job["steps"]
+        keys = {"AWS_ACCESS_KEY_ID": "${{ secrets.TIGRIS_WRITE_KEY_ID }}",
+                "AWS_SECRET_ACCESS_KEY": "${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}"}
+        for s in steps:
+            with self.subTest(step=s.get("name") or s.get("uses")):
+                self.assertNotRegex(s.get("run", ""), r"AWS_\w+=.*GITHUB_ENV")
+                if s.get("name") in ("Version", "Upload to Tigris"):
+                    self.assertEqual({k: v for k, v in s.get("env", {}).items() if k in keys}, keys)
+                else:
+                    self.assertNotIn("secrets.", json.dumps(s))
+
     def run_version(self, listed="", error=""):
         with tempfile.TemporaryDirectory() as t:
             bin_dir = os.path.join(t, "bin")
