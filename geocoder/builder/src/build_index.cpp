@@ -2231,23 +2231,24 @@ static int run(int argc, char* argv[]) {
                         // A water multipolygon (poi_water_kind), which
                         // Nominatim imports as it does a closed way, is
                         // classified as a closed way is (classify_poi), but
-                        // of the water kinds the scan takes bays and glaciers
-                        // alone: a lake, a wetland or a reservoir is no POI as
-                        // its water kind in any tier. One that is a rank-30
-                        // POI of another main tag is that POI. One that is the
-                        // water it is (a main tag of a lower rank ranks it, it
-                        // is a reservoir of a class the POI lane leaves out,
-                        // or no tier ships what its rank-30 tags make of it)
-                        // is a bay or a glacier, or else takes the scan's own
+                        // of the water kinds the scan takes bays, glaciers and
+                        // streets alone: a lake, a wetland or a reservoir that
+                        // is no street is no POI as its water kind in any
+                        // tier. One that is a rank-30 POI of another main tag
+                        // is that POI. One that is the water it is (a main tag
+                        // of a lower rank ranks it, it is a reservoir of a
+                        // class the POI lane leaves out, or no tier ships what
+                        // its rank-30 tags make of it) is a bay or a glacier,
+                        // or a street where a highway kind ranks it one, as it
+                        // ranks the closed way, or else takes the scan's own
                         // categories below, as before, but never the primary
-                        // slot (POI_FLAG_PLACES_ONLY), unless a highway kind
-                        // ranks it a street, as it ranks the closed way. One
-                        // the classifier makes one that could take it (a
-                        // rank-30 POI, or a street) but that has holes, which
-                        // its polygon of the outer rings alone would fill,
-                        // takes the scan's own categories instead, and never
-                        // the slot: one of none is no POI, whose name, or
-                        // address, a point in a hole would find.
+                        // slot (POI_FLAG_PLACES_ONLY). One the classifier
+                        // makes one that could take it (a rank-30 POI, or a
+                        // street) but that has holes, which its polygon of the
+                        // outer rings alone would fill, takes the scan's own
+                        // categories instead, and never the slot: one of none
+                        // is no POI, whose name, or address, a point in a hole
+                        // would find.
                         std::optional<PoiClassification> water_poi;
                         bool places_only = false;
                         const char* r_landuse = rel.tag("landuse");
@@ -2268,8 +2269,8 @@ static int run(int argc, char* argv[]) {
                                     cls->flags &= static_cast<uint8_t>(~POI_FLAG_WATER_MASK);
                                 water_poi = cls;
                             } else if (cls && cls->category == r_water) {
-                                if (taken(r_water)) water_poi = cls;
-                                else places_only = !(cls->flags & POI_FLAG_HIGHWAY);
+                                if (taken(r_water) || (cls->flags & POI_FLAG_HIGHWAY)) water_poi = cls;
+                                else places_only = true;
                             }
                             if (water_poi) {
                                 const bool could_lead =

@@ -238,21 +238,22 @@ with `amenity=fountain`).
   builder classifies a water multipolygon that is a rank-30 POI of another
   main tag as it does a closed way (a bay or a lake that is a swimming area
   is a `SWIMMING_AREA`). Otherwise its relation scan takes only some keys,
-  and of the water kinds bays and glaciers alone: a multipolygon bay or
-  glacier the classifier keeps water (a lower rank, or rank-30 tags no tier
-  ships) is the `BAY` or `GLACIER` it is; a lake, wetland or reservoir is no
-  POI as its water kind, nor in the tiers that don't ship the POI it is, and
-  one the scan's own keys take (`leisure=nature_reserve`,
-  `tourism=attraction`, `place=island`, ...) keeps that category in `places`
-  but never takes the primary slot (the builder links it no parent street),
-  unless a highway kind ranks it a street. A POI polygon of a multipolygon is
-  its outer rings, without its holes, so a water multipolygon with an `inner`
-  member the classifier makes one that could take the slot (a rank-30 POI, or
-  a street) takes the scan's own categories instead, and never the slot: one
-  the scan takes none of (a lake that is a swimming area) is no POI, so a
-  point on its island finds neither its name nor its road, nor the address
-  its `addr:*` tags give. A plain bay or glacier of holes keeps its parent
-  street.
+  and of the water kinds bays, glaciers and streets alone: a multipolygon bay
+  or glacier the classifier keeps water (a lower rank, or rank-30 tags no
+  tier ships) is the `BAY` or `GLACIER` it is, and a water multipolygon a
+  highway kind ranks a street the water it is, of the highway flag, as the
+  closed way is; a lake, wetland or reservoir of no street is no POI as its
+  water kind, nor in the tiers that don't ship the POI it is, and one the
+  scan's own keys take (`leisure=nature_reserve`, `tourism=attraction`,
+  `place=island`, ...) keeps that category in `places` but never takes the
+  primary slot (the builder links it no parent street). A POI polygon of a
+  multipolygon is its outer rings, without its holes, so a water
+  multipolygon with an `inner` member the classifier makes one that could
+  take the slot (a rank-30 POI, or a street) takes the scan's own categories
+  instead, and never the slot: one the scan takes none of (a lake that is a
+  swimming area) is no POI, so a point on its island finds neither its name
+  nor its road, nor the address its `addr:*` tags give. A plain bay or
+  glacier of holes keeps its parent street.
 - Where no boundary and no street anchors the address (a coast no boundary
   covers), Nominatim finds nothing; a water POI that would have won the slot
   but for the lane still gives the answer its `landmark` and `places`,
