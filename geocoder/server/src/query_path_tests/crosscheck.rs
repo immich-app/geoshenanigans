@@ -121,6 +121,33 @@ fn a_polygon_takes_its_rank_by_its_own_name_or_by_a_place_node_it_links() {
 }
 
 #[test]
+fn a_polygon_named_by_its_node_takes_its_rank_by_its_own_name_too() {
+    // The city area goes by its city node's English name, Yonkers, and keeps its own name, City
+    // of Yonkers (admin_own_names.bin): Nominatim's names of the area hold both, so a house named
+    // either takes the area, which is shown by the name it goes by.
+    let index = |city: Option<&str>| {
+        let mut index = united_states();
+        index
+            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Yonkers", 15, 1, (-1000.0, 100.0, 8000.0, 8000.0))
+            .own_name("City of Yonkers")
+            .linked_place("Yonkers", 0, 4000.0, 4000.0)
+            .street("Riverdale Avenue", &[(0.0, -200.0), (0.0, 200.0)])
+            .address("5", 10.0, 0.0);
+        if let Some(city) = city {
+            index.addr_city(city);
+        }
+        index.load()
+    };
+    for (city, part) in [(None, "Greenburgh"), (Some("Yonkers"), "Yonkers"), (Some("City of Yonkers"), "Yonkers"),
+                         (Some("Greenburgh"), "Greenburgh")] {
+        let (display, address) = answer_at(&index(city), 10.0, 0.0);
+        assert_eq!(display, format!("5 Riverdale Avenue, {part}, United States"), "{city:?}");
+        assert_eq!(address["city"], part, "{city:?}");
+    }
+}
+
+#[test]
 fn a_place_node_takes_a_rank_a_polygon_holds() {
     // Bywood, a place=neighbourhood area (rank 24), holds the rank, and the neighbourhood node
     // Kirklyn in it is a row of rank 24 that is no part; the house's addr:city makes it the part.

@@ -200,6 +200,13 @@ pub const POLYGONS_POSTAL_LEVEL: u8 = 99;
 /// admin_rings.bin.
 pub const ADMIN_POLYGON_RECORD_BYTES: u64 = 16;
 
+/// The file beside admin_polygons.bin of the polygons that go by the English name of the place
+/// node they link (builder types.h AdminOwnName): for each, its slot and its own name (a core
+/// string), each a u32, ascending by slot. Nominatim's addr:city crosscheck compares every name of
+/// a polygon, its own among its linked node's (results.py:606), and its search finds it by them.
+pub const ADMIN_OWN_NAMES_FILE: &str = "admin_own_names.bin";
+const ADMIN_OWN_NAME_BYTES: u64 = 8;
+
 /// An admin polygon: its admin_polygons.bin record, with its ring block's length.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AdminPolygon {
@@ -907,6 +914,8 @@ pub struct Index {
     pub interp_postcodes: Option<SideBlocks>,
     pub admin_index: CellPairs,
     pub admin_polygons: FileBytes,
+    /// admin_own_names.bin (ADMIN_OWN_NAMES_FILE); none in a dir without it.
+    pub admin_own_names: Option<FileBytes>,
     pub admin_geometry: AdminGeometry,
     pub poi_index: Option<CellPairs>,
     pub poi_records: Option<PoiRecords>,
@@ -933,7 +942,8 @@ pub struct Index {
     /// not the boundary's, ascending: Nominatim merges a linked node's names into its boundary's
     /// as `_place_*` (placex_indexing_prepare), which the crosscheck reads. A node labels one
     /// polygon of its boundary, the largest outer ring, and the key holds for every ring. From
-    /// place_hidden.bin's labels, on first use.
+    /// place_hidden.bin's labels, on first use; with them the own name of each polygon that goes
+    /// by its node's English name (admin_own_names.bin), one of its names to Nominatim too.
     pub linked_names: std::sync::OnceLock<Vec<(u64, u32)>>,
     /// (boundary_key, lat, lng) of the place node each boundary links, ascending: Nominatim
     /// takes the node for the boundary's centroid where it lies inside the boundary
@@ -1252,6 +1262,10 @@ impl Index {
         let addr_postcodes = load_side(dir, "addr_postcodes.bin", addr_files::POINTS_FILE, addr_records)?;
         let addr_cities = load_side(dir, "addr_cities.bin", addr_files::POINTS_FILE, addr_records)?;
         let interp_postcodes = load_side(dir, "interp_postcodes.bin", "interp_ways.bin", ways(&interps))?;
+        let admin_own_names = mmap_file_optional(&format!("{dir}/{ADMIN_OWN_NAMES_FILE}"));
+        if let Some(bytes) = admin_own_names.as_ref().filter(|b| b.len() % ADMIN_OWN_NAME_BYTES != 0) {
+            return Err(format!("{dir}/{ADMIN_OWN_NAMES_FILE}: {} bytes, not records of {ADMIN_OWN_NAME_BYTES}", bytes.len()));
+        }
 
         Ok(Index {
             geo_index,
@@ -1261,6 +1275,7 @@ impl Index {
             interp_postcodes,
             admin_index,
             admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
+            admin_own_names,
             admin_geometry: AdminGeometry::load(dir)?,
             poi_index,
             poi_records,
@@ -1358,6 +1373,36 @@ impl Index {
 
     pub fn admin_polygon(&self, idx: u32) -> Option<AdminPolygon> {
         self.admin_polygon_record(idx).filter(|ap| ap.name_id != NO_DATA)
+    }
+
+    /// Each (slot, own name) of admin_own_names.bin, in slot order: the polygons that go by the
+    /// English name of the place node they link.
+    pub fn admin_own_names(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        let bytes = self.admin_own_names.as_ref().map_or(&[][..], FileBytes::as_slice);
+        bytes.chunks_exact(ADMIN_OWN_NAME_BYTES as usize).map(|r| {
+            (u32::from_le_bytes([r[0], r[1], r[2], r[3]]), u32::from_le_bytes([r[4], r[5], r[6], r[7]]))
+        })
+    }
+
+    /// The own name of polygon `idx` where it goes by the English name of the place node it links
+    /// (admin_own_names.bin); None for every other.
+    pub fn admin_own_name(&self, idx: u32) -> Option<u32> {
+        let names = self.admin_own_names.as_ref()?;
+        let record = |k: u64| {
+            let r = names.read_chunk(k * ADMIN_OWN_NAME_BYTES, ADMIN_OWN_NAME_BYTES as usize);
+            (u32::from_le_bytes([r[0], r[1], r[2], r[3]]), u32::from_le_bytes([r[4], r[5], r[6], r[7]]))
+        };
+        let (mut lo, mut hi) = (0, names.len() / ADMIN_OWN_NAME_BYTES);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (slot, name) = record(mid);
+            match slot.cmp(&idx) {
+                std::cmp::Ordering::Equal => return Some(name),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        None
     }
 
     // --- Geo lookup (streets, addresses, interpolation from merged index) ---
@@ -3598,13 +3643,13 @@ impl Index {
     }
 
     /// Whether the boundary of polygon `poly` links a place node named `name` other than its own
-    /// name (linked_names).
+    /// name, or has the own name `name` beside the one it goes by (linked_names).
     fn links_name(&self, poly: &AdminPolygon, name: u32) -> bool {
         self.linked_names.get_or_init(|| self.read_linked_names()).binary_search(&(boundary_key(poly), name)).is_ok()
     }
 
     /// linked_names from place_hidden.bin: each label's boundary and name where the boundary has
-    /// another name.
+    /// another name; and from admin_own_names.bin each polygon's boundary and own name.
     fn read_linked_names(&self) -> Vec<(u64, u32)> {
         let mut linked = Vec::new();
         if let Some(places) = &self.places {
@@ -3613,6 +3658,11 @@ impl Index {
                     linked.push((boundary_key(&poly), node.name_id));
                 }
             });
+        }
+        for (slot, own) in self.admin_own_names() {
+            if let Some(poly) = self.admin_polygon(slot) {
+                linked.push((boundary_key(&poly), own));
+            }
         }
         linked.sort_unstable();
         linked.dedup();
@@ -4289,6 +4339,7 @@ mod query_tests {
             interp_postcodes: None,
             admin_index,
             admin_polygons: FileBytes::Owned(polygons),
+            admin_own_names: None,
             admin_geometry: AdminGeometry::new(FileBytes::Owned(rings), FileBytes::Owned(arc_index), FileBytes::Owned(arc_vertices)),
             poi_index: None,
             poi_records: None,
@@ -7252,6 +7303,9 @@ mod query_path_tests {
         interp_postcodes: Vec<(u32, u32)>,
         /// The postcode centroids, each one's point, postcode and country.
         centroids: Vec<postcode_files::Centroid>,
+        /// admin_own_names.bin: (polygon, own name) of each polygon that goes by its place node's
+        /// English name.
+        own_names: Vec<(u32, u32)>,
     }
 
     impl TestIndex {
@@ -7315,6 +7369,14 @@ mod query_path_tests {
         /// The rank_address of the last polygon, as the builder gives it (rank_address.h).
         fn rank(&mut self, rank_address: u8) -> &mut Self {
             self.polygons.last_mut().unwrap().0.rank_address = rank_address;
+            self
+        }
+
+        /// The own name of the polygon added last, a string of the pool's, where it goes by the
+        /// English name of the place node it links (admin_own_names.bin).
+        fn own_name(&mut self, name: &str) -> &mut Self {
+            let name_id = self.interned(name);
+            self.own_names.push((self.polygons.len() as u32 - 1, name_id));
             self
         }
 
@@ -7548,6 +7610,11 @@ mod query_path_tests {
             let (cells, entries) = cell_pairs::write(&admin_cells.into_iter().collect::<Vec<_>>(), cell_pairs::ADMIN);
             let mut files: Vec<(&'static str, Vec<u8>)> = arcs.files().into();
             files.extend([("admin_cells.bin", cells), ("admin_entries.bin", entries)]);
+            if !self.own_names.is_empty() {
+                let mut own_names = self.own_names.clone();
+                own_names.sort_unstable();
+                files.push((ADMIN_OWN_NAMES_FILE, own_names.iter().flat_map(|&(slot, name)| [slot, name]).flat_map(u32::to_le_bytes).collect()));
+            }
 
             if !self.place_nodes.is_empty() {
                 let (places, _) = place_files::encode(&self.place_nodes, DEFAULT_ADMIN_CELL_LEVEL);
@@ -7605,6 +7672,35 @@ mod query_path_tests {
 
     fn load_dir(dir: &std::path::Path) -> Index {
         Index::load(dir.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap()
+    }
+
+    #[test]
+    fn an_index_reads_the_own_name_of_a_polygon_named_by_its_node_by_its_slot() {
+        // Sosnovka goes by its town node's English name and keeps its own, Сосновка; Kirsanov
+        // and the country keep none, nor does a slot past the polygons.
+        let mut dataset = TestIndex::new();
+        dataset
+            .boundary("Sosnovka", 8, 2, (-1000.0, -1000.0, 1000.0, 1000.0))
+            .own_name("Сосновка")
+            .boundary("Kirsanov", 8, 2, (2000.0, 2000.0, 3000.0, 3000.0));
+        let dir = ScratchDir::new();
+        dataset.write(dir.path());
+        let idx = load_dir(dir.path());
+        assert_eq!(idx.admin_own_name(1).map(|id| idx.get_string(id).into_owned()), Some("Сосновка".to_owned()));
+        for slot in [0, 2, 3, NO_DATA] {
+            assert_eq!(idx.admin_own_name(slot), None, "{slot}");
+        }
+        assert_eq!(idx.admin_own_names().collect::<Vec<_>>(), [(1, idx.admin_own_name(1).unwrap())]);
+
+        // A file of a part record is no file the builder writes.
+        let path = dir.path().join(ADMIN_OWN_NAMES_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0);
+        std::fs::write(&path, bytes).unwrap();
+        let err = Index::load(dir.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE)
+            .err()
+            .unwrap();
+        assert!(err.ends_with("admin_own_names.bin: 9 bytes, not records of 8"), "{err}");
     }
 
     #[test]
@@ -10047,6 +10143,7 @@ mod admin_scan_tests {
             interps: None, interp_postcodes: None,
             admin_index: CellPairs::open(FileBytes::Owned(cells), FileBytes::Owned(entries), cell_pairs::ADMIN, DEFAULT_ADMIN_CELL_LEVEL).unwrap(),
             admin_polygons: FileBytes::Owned(polygons),
+            admin_own_names: None,
             admin_geometry: AdminGeometry::new(FileBytes::Owned(ring_blocks), FileBytes::Owned(arc_index), FileBytes::Owned(arc_vertices)),
             poi_index: None, poi_records: None, poi_vertices: None,
             poi_meta: PoiMeta { categories: std::collections::HashMap::new() },

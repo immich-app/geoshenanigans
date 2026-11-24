@@ -383,3 +383,35 @@ TEST(a_linked_boundary_keeps_its_own_name_beside_the_english_one_it_goes_by) {
         if (gctest::failures()) std::printf("    in %s\n", region);
     }
 }
+
+TEST(a_houses_addr_city_takes_a_boundary_by_the_own_name_it_no_longer_goes_by) {
+    // Улица Ленина runs from Кирсанов (Kirsanov, of a name:en of its own) into Сосновка, which
+    // goes by its town node's name:en, Sosnovka: both rank 16, Kirsanov the house's. Nominatim's
+    // names of Сосновка hold its own name beside the node's, so a house in Kirsanov tagged
+    // addr:city=Сосновка, as one tagged Sosnovka, puts Sosnovka first at its rank (CrosscheckNames,
+    // results.py:606), shown by the name it goes by; an untagged house answers Kirsanov.
+    Fixture f;
+    f.country(41, 19, 82, 180, "Россия", "RU");
+    f.boundary(51.5, 39.5, 54.0, 43.5, 4, "Тамбовская область", {{"name:en", "Tambov Oblast"}});
+    const int64_t kirsanov = f.node(53.24, 41.25, {{"place", "town"}, {"name", "Кирсанов"}, {"name:en", "Kirsanov Town"}});
+    f.boundary(53.20, 41.20, 53.30, 41.30, 8, "Кирсанов", {{"name:en", "Kirsanov"}}, {{OsmType::Node, kirsanov, "label"}});
+    const int64_t town = f.node(53.24, 41.37, {{"place", "town"}, {"name", "Сосновка"}, {"name:en", "Sosnovka"}});
+    f.boundary(53.20, 41.30, 53.30, 41.45, 8, "Сосновка", {}, {{OsmType::Node, town, "label"}});
+    f.line({{53.25, 41.28}, {53.25, 41.32}}, {{"highway", "residential"}, {"name", "улица Ленина"}});
+    const std::vector<std::pair<double, double>> houses = {{53.2502, 41.284}, {53.2502, 41.286}, {53.2502, 41.288}};
+    const char* cities[] = {"Сосновка", "Sosnovka", nullptr};
+    for (size_t i = 0; i < houses.size(); i++) {
+        Tags tags = {{"addr:housenumber", std::to_string(i + 1)}, {"addr:street", "улица Ленина"}};
+        if (cities[i]) tags.push_back({"addr:city", cities[i]});
+        f.node(houses[i].first, houses[i].second, tags);
+    }
+    const std::vector<std::string> answers = answers_of(f, "own-name-crosscheck", houses);
+    REQUIRE(answers.size() == 3);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+    for (size_t i = 0; i < 2; i++) {
+        CHECK(answers[i].find("\"Sosnovka\"") != std::string::npos);
+        CHECK(answers[i].find("\"Kirsanov\"") == std::string::npos);
+    }
+    CHECK(answers[2].find("\"Kirsanov\"") != std::string::npos);
+    CHECK(answers[2].find("\"Sosnovka\"") == std::string::npos);
+}
