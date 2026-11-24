@@ -12,7 +12,8 @@
 //! of the template's transport units publishes the unit, the only form of them;
 //! every other file goes as its .zst. A test can have it hold an object's
 //! body back half way (TestBucket::hold), or fail the next fetches of one
-//! (TestBucket::fail).
+//! (TestBucket::fail). A case of a host without CA certificates runs in a
+//! process of its own (without_ca_store).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -404,4 +405,55 @@ async fn serve_with(components: serde_json::Value, tamper: impl Fn(&str, &mut Ve
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     TestBucket { url: format!("http://{addr}"), manifest: serde_json::from_value(manifest).unwrap(), file_requests, files, hold, served }
+}
+
+/// Set for a process `without_ca_store` starts.
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+pub const NO_CA_STORE: &str = "GEOCODER_TEST_NO_CA_STORE";
+
+/// Runs the ignored test `name` of this binary alone, in a process of its
+/// own whose CA store is empty: SSL_CERT_FILE and SSL_CERT_DIR, which name
+/// the store in place of the system's where it is read from files (Unix but
+/// Apple's and Android's: elsewhere the verifier asks the system, which they
+/// don't change), name none, and NO_CA_STORE is set. The two are the
+/// process's, so it runs apart. Panics with its output unless it passed.
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+pub fn without_ca_store(name: &str) {
+    let empty = ScratchDir::new();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--ignored", "--test-threads=1"])
+        .env("SSL_CERT_FILE", empty.path().join("none.pem"))
+        .env("SSL_CERT_DIR", empty.path())
+        .env(NO_CA_STORE, "1")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && stdout.contains(" 1 passed;"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A CA certificate of no one's, self-signed, its key thrown away: a store
+/// the client builds with, and the bucket, of plain HTTP, never asks for it.
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+const TEST_CA: &str = "-----BEGIN CERTIFICATE-----
+MIIBfDCCASKgAwIBAgIUALXgKemIbz/MhEkVWAJ5pfbUXyIwCgYIKoZIzj0EAwIw
+GzEZMBcGA1UEAwwQZ2VvY29kZXIgdGVzdCBDQTAgFw0yNjExMjMyMDE3MDdaGA8y
+MTI2MTAzMDIwMTcwN1owGzEZMBcGA1UEAwwQZ2VvY29kZXIgdGVzdCBDQTBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABBsXpEgb5tuTIbszY0eKXGlLFQBAcJxwthjM
+37dCc0ANoKmnGL97NqFrNeuw1crik6vrHRZYbUavNONOB1t5+jmjQjBAMB0GA1Ud
+DgQWBBTaVqM64tlUtORGKJxgEMAF9tAjVzAPBgNVHRMBAf8EBTADAQH/MA4GA1Ud
+DwEB/wQEAwICBDAKBggqhkjOPQQDAgNIADBFAiEA0fpbsRDb6LEPJeV6GybFv76L
+pis9+k8eFkw/rp4JIuACIFgTRdGzU46T24xNttrCePT+/UVqgJKMkPn9UJa8fdOl
+-----END CERTIFICATE-----
+";
+
+/// Gives a process of `without_ca_store` its certificates: SSL_CERT_FILE
+/// names TEST_CA, written into `dir`, not the host's store, which may be
+/// none; SSL_CERT_DIR still names an empty dir. The process runs its case
+/// alone, on a runtime of one thread, so the change is safe there.
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+pub fn with_test_ca(dir: &std::path::Path) {
+    let file = dir.join("test-ca.pem");
+    std::fs::write(&file, TEST_CA).unwrap();
+    std::env::set_var("SSL_CERT_FILE", file);
 }

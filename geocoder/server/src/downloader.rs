@@ -283,6 +283,18 @@ pub async fn get(client: &reqwest::Client, url: &str) -> Result<reqwest::Respons
     Ok(resp)
 }
 
+/// The error of a client that can't be built (a host without CA
+/// certificates, whose loading builds it), naming why down its sources.
+pub fn client_error(e: reqwest::Error) -> DownloadError {
+    let mut why = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(s) = source {
+        why += &format!(": {s}");
+        source = s.source();
+    }
+    DownloadError::Http(format!("building the client: {why}"))
+}
+
 /// Fetch `{base_url}/builds/{date}/{path}.zst`, a file published as its own
 /// .zst, decompress, verify its size against `expected.size_raw` (no byte
 /// past it is written) and its sha256 against `expected.sha256`, write

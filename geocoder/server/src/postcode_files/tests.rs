@@ -262,7 +262,6 @@ fn the_walk_finds_the_nearest_centroid_every_row_gives() {
     for (lat, lng) in queries {
         let cell = cell_id_at_level(lat, lng, LEVEL);
         let nine: Vec<u64> = std::iter::once(cell).chain(cell_neighbors_at_level(cell, LEVEL)).collect();
-        let cos_lat = lat.to_radians().cos();
         let better = |best: Option<(f64, u32)>, d: f64, pid: u32| d < max_d && best.is_none_or(|b| (d, pid) < b);
         // Every row of the nine cells.
         let mut want: Option<(f64, u32)> = None;
@@ -272,7 +271,7 @@ fn the_walk_finds_the_nearest_centroid_every_row_gives() {
                 held += ((end - 1) / BLOCK_ROWS as u32 - first / BLOCK_ROWS as u32 + 1) as usize;
             }
             f.for_rows(first, end, |_, r| {
-                let d = distance(lat, lng, cos_lat, r.lat as f64, r.lng as f64);
+                let d = distance(lat, lng, r.lat as f64, r.lng as f64);
                 if better(want, d, r.postcode_id) {
                     want = Some((d, r.postcode_id));
                 }
@@ -291,7 +290,7 @@ fn the_walk_finds_the_nearest_centroid_every_row_gives() {
             }
             decoded += 1;
             f.rows_of(n.block, n.rows, |_, r| {
-                let d = distance(lat, lng, cos_lat, r.lat as f64, r.lng as f64);
+                let d = distance(lat, lng, r.lat as f64, r.lng as f64);
                 assert!(d >= n.d, "a row nearer than its box");
                 if better(got, d, r.postcode_id) {
                     got = Some((d, r.postcode_id));

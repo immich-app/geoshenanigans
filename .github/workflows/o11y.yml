@@ -52,9 +52,9 @@ jobs:
       # one caches, and zizmor's cache-poisoning audit flags a cache in a
       # workflow that publishes.
       - name: Set up mise
-        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
         with:
-          version: 2026.11.7
+          version: 2026.11.10
           install_args: --locked jq yq kustomize kubeconform
           cache: false
 
@@ -79,9 +79,9 @@ jobs:
           persist-credentials: false
 
       - name: Set up mise
-        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        uses: jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a # v5.2.10
         with:
-          version: 2026.11.7
+          version: 2026.11.10
           install_args: --locked jq yq kustomize kubeconform flux2 github:sigstore/cosign
           cache: false
 

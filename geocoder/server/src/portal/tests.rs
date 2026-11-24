@@ -707,6 +707,78 @@ async fn a_start_without_a_usable_build_answers_503_with_the_reason_and_keeps_sy
     assert_eq!(fetch(&format!("{url}/reverse?lat=10.5&lon=20.5&key=test")).await.status, 200);
 }
 
+// A host without CA certificates (an image without a CA bundle) builds no
+// HTTP client. A portal there still starts: /health answers 503 naming why
+// its rounds fail, /test answers, and nothing is fetched; the first round
+// once the certificates are there builds the client and serves the build.
+// Started again without them, it serves the build its volume holds and its
+// round fails naming why. The case runs in a process of its own
+// (test_bucket::without_ca_store).
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+#[test]
+fn a_portal_without_ca_certificates_starts_serves_its_volumes_build_and_its_rounds_fail_naming_why() {
+    test_bucket::without_ca_store("portal_tests::without_ca_certificates");
+}
+
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+#[tokio::test]
+#[ignore = "run by a_portal_without_ca_certificates_starts_serves_its_volumes_build_and_its_rounds_fail_naming_why"]
+async fn without_ca_certificates() {
+    if std::env::var_os(test_bucket::NO_CA_STORE).is_none() {
+        return;
+    }
+    // The case's own fetches, of plain HTTP, with a store of no certificate:
+    // one that loads no system's.
+    let client = reqwest::Client::builder().tls_certs_only(Vec::new()).build().unwrap();
+    let get = |url: String| {
+        let client = client.clone();
+        async move {
+            let resp = client.get(url).send().await.unwrap();
+            (resp.status().as_u16(), resp.text().await.unwrap())
+        }
+    };
+    let why = "HTTP error: building the client: builder error: unexpected error: No CA certificates were loaded from the system";
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let p = portal(data.path(), config(&bucket, load.clone()));
+    let running = tokio::spawn(p.clone().run());
+    let url = serve(router(p.clone(), db())).await;
+    until("a round", || p.status().last_result.is_some()).await;
+
+    let (status, health) = get(format!("{url}/health")).await;
+    assert_eq!(status, 503, "{health}");
+    let health: serde_json::Value = serde_json::from_str(&health).unwrap();
+    let reason = health["reason"].as_str().unwrap();
+    assert!(reason.ends_with(&format!("; the last sync: failed: {why}")), "{reason}");
+    assert!(health["sync"]["latest"].is_null(), "{health}");
+    let (status, page) = get(format!("{url}/test")).await;
+    assert_eq!((status, page.as_str()), (200, include_str!("../../../test-portal/index.html")));
+    assert_eq!(bucket.requests(), Vec::<String>::new());
+    assert!(!data.path().join(BUILDS).exists());
+
+    let none = std::env::var_os("SSL_CERT_FILE").unwrap();
+    let certificates = ScratchDir::new();
+    test_bucket::with_test_ca(certificates.path());
+    until("the build served", || p.served().is_some()).await;
+    let (status, health) = get(format!("{url}/health")).await;
+    assert_eq!(status, 200, "{health}");
+    running.abort();
+
+    // Safe to change: the process runs this case alone, on a runtime of one thread.
+    std::env::set_var("SSL_CERT_FILE", none);
+    let fetched = bucket.requests().len();
+    let again = portal(data.path(), config(&bucket, load));
+    assert_eq!(again.round(true).await, Err(why.to_string()));
+    assert_eq!(again.served().map(|s| s.dir.clone()), Some(format!("{DATE}-1")));
+    let url = serve(router(again, db())).await;
+    let (status, health) = get(format!("{url}/health")).await;
+    assert_eq!(status, 200, "{health}");
+    let (status, _) = get(format!("{url}/reverse?lat=10.5&lon=20.5&key=test")).await;
+    assert_eq!(status, 200);
+    assert_eq!(bucket.requests().len(), fetched);
+}
+
 // A portal started on a volume whose only build it can't serve says which
 // build it skipped and why in the reason it answers 503 with.
 #[tokio::test]

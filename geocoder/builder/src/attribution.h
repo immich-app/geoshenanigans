@@ -55,8 +55,9 @@ struct AttributionEntry {
 // them, verbatim, GB_full.csv.zip's where a GB centroid is there, then the
 // changes CC BY 4.0 asks a distributor to indicate (section 3(a)(1)(B)): the
 // nightly keeps each GB row's postcode and coordinates (geocoder-build.yml),
-// and the build those of a valid form (validate_postcode_for_country) whose
-// pair OSM has no centroid for (load_external_postcodes, write_index).
+// and the build those its country's pattern takes, as the postcode the
+// pattern makes of each (match_postcode, read_external_postcodes), whose pair
+// OSM has no centroid for (collect_postcode_centroids).
 // Code-Point Open's, owed for the GB centroids alone, are the attribution
 // statements of its licence.txt (Doc/licence.txt in its download), verbatim
 // but for the year, 2022, the one of GeoNames's Royal Mail notice, of the

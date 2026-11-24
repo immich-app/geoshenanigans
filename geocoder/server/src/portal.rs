@@ -15,7 +15,10 @@
 // which the portal's image copies), which /reverse answers with
 // dataset=immich-cities500, build or none. Without a build to serve it
 // starts all the same: those routes answer 503 with the reason while it
-// syncs; /feedback takes reports all the same.
+// syncs; /feedback takes reports all the same. So it does on a host without
+// CA certificates, which the sync's fetches check the bucket's against: it
+// serves the build its volume holds, and each round fails, naming why, until
+// they are there.
 
 // By path: query-portal, a bin of place-search, takes this file in by
 // #[path], from which a plain `mod` would look beside it.
@@ -255,7 +258,8 @@ pub struct Portal {
     pub searches: Arc<tokio::sync::Semaphore>,
     /// The Immich column's geodata, loaded at its first use (immich()).
     immich: std::sync::OnceLock<Result<Arc<immich::Geodata>, String>>,
-    http: reqwest::Client,
+    /// The client of the sync's fetches, built by the first (http()).
+    http: tokio::sync::OnceCell<reqwest::Client>,
 }
 
 impl Portal {
@@ -270,13 +274,26 @@ impl Portal {
             unusable: Mutex::new(Default::default()),
             started: Default::default(),
             immich: Default::default(),
-            http: reqwest::Client::builder()
-                .user_agent("geocoder-portal/0.1")
-                .connect_timeout(Duration::from_secs(30))
-                .read_timeout(Duration::from_secs(120))
-                .build()
-                .expect("failed to build reqwest client"),
+            http: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// The client of the sync's fetches. Building one loads the system's CA
+    /// certificates, which a host may lack, so the first fetch builds it,
+    /// after the start has served the build the volume holds, and a portal
+    /// without them still starts and serves. A client that can't be built
+    /// fails the round, naming why, and the next round tries again.
+    async fn http(&self) -> Result<&reqwest::Client, crate::downloader::DownloadError> {
+        self.http
+            .get_or_try_init(|| async {
+                reqwest::Client::builder()
+                    .user_agent("geocoder-portal/0.1")
+                    .connect_timeout(Duration::from_secs(30))
+                    .read_timeout(Duration::from_secs(120))
+                    .build()
+                    .map_err(crate::downloader::client_error)
+            })
+            .await
     }
 
     /// The build served, if any.

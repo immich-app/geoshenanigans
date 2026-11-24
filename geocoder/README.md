@@ -81,7 +81,13 @@ lands in it: `admin` mode, `simplified` boundaries and no POIs unless an admin s
 another selection with `PUT /admin/configuration` (a JSON body of `base_url`,
 `mode`, `quality`, `poi_tier` and the regions to `preload`). A value the build
 doesn't offer fails each download, naming those it does, and the PUT is refused
-with them (400) when the server has the build's manifest at hand. A continent
+with them (400) when the server has the build's manifest at hand. Downloads
+check the bucket's certificate against the system's CA store: on Linux and the
+other Unix systems but macOS, its certificate bundle (`ca-certificates` on
+Debian), or another that `SSL_CERT_FILE` or `SSL_CERT_DIR` names; on macOS and
+Windows, the system's trust store, which those variables don't change. On a
+host without one the server starts and serves what its data dir holds, and each
+download fails, naming why. A continent
 dir keeps a ledger of what each of its files holds, `.file_sha256` (a line
 `<name> <sha256>` each, `-` while unknown), and a download skips a file only
 where the ledger names the build's sha256 for it. It removes the files its
@@ -416,11 +422,11 @@ to the same files ([builder/PATCHING.md](builder/PATCHING.md#transport-units)).
 | `street_ways.bin`, `street_nodes.bin` | Street ways: a row per way (its name, where its nodes start) in groups of 16 ways, and the ways' nodes as deltas in a block per way (`builder/src/way_files.h`). A fresh build writes the ways in cell order: by the least street cell that lists a way, then by name and nodes, so the ways of one place sit together (a continent's files keep the planet's order) |
 | `way_parents.bin`, `way_postcodes.bin` | Per street: smallest containing admin polygon, postcode from its postal boundary; a value per street in blocks of 64 (`builder/src/side_blocks.h`) |
 | `addr_points.bin`, `addr_vertices.bin`, `addr_index.bin` | Address points (coordinates, house number, street) in blocks of 16 records, building outlines as a blob per building, and where each block and its blobs start (`builder/src/addr_files.h`); in cell order as the ways are, then by street and house number |
-| `addr_postcodes.bin` | Per address point: its own `addr:postcode`, in blocks as the streets' side files |
+| `addr_postcodes.bin` | Per address point: its own `addr:postcode` where its country's pattern takes it, in blocks as the streets' side files |
 | `interp_ways.bin`, `interp_nodes.bin` | Interpolation ways and their nodes, in the street ways' format; in cell order as the ways are, then by street and range |
 | `interp_postcodes.bin` | Per interpolation way: its TIGER ZIP (TIGER regions only), in blocks as the other side files |
 | `admin_cells.bin`, `admin_entries.bin` | S2 cell index for admin boundaries: lists in blocks of 8 cells, each against the one before (the cell pair layout, `builder/src/cell_pairs.h`) |
-| `admin_polygons.bin`, `admin_rings.bin` | Admin polygon records (postcode areas among them, at level 11) and their rings, as refs to arcs |
+| `admin_polygons.bin`, `admin_rings.bin` | Admin polygon records (postcode areas among them, at level 11; a place area linked to a place node of another type keeps its own place tag in the last byte, whose top bit marks a closed way's polygon) and their rings, as refs to arcs |
 | `arc_index.bin`, `arc_vertices.bin` | The boundary arcs those rings share, each border once (per boundary tier: `quality/simplified` or `quality/exact`) |
 | `admin_parents.bin` | Per admin polygon: the next larger polygon containing it |
 | `place_cells.bin`, `place_nodes.bin`, `place_hidden.bin` | Place nodes (city, town, village, suburb, ...): the visible ones in admin cell order, bit-packed in blocks of 64, with each cell's first row; the ones a boundary hides (its label for place search) beside them (`builder/src/place_files.h`) |

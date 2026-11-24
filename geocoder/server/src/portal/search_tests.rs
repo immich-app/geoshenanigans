@@ -13,23 +13,43 @@ use place_search::constants::{DEFAULT_LIMIT, META_FILE};
 use place_search::dataset::{Origin, PlaceSearch, Stamps, DATASET_FILES};
 use place_search::query::{debug_line, results_json};
 
-/// A gate the opens of a test wait at until it opens; it opens by itself
-/// after a minute, so that a test that fails before it opens it ends.
-struct Gate(Mutex<bool>, Condvar);
+/// A gate the opens of a test wait at (Gate::waiting) until the test opens
+/// it. It opens when it is dropped too, so that a test that fails before
+/// it opens it lets go of the opens it holds, and ends at once; it never
+/// opens by itself, however long a busy runner takes to reach what the
+/// test checks while it holds them.
+struct Gate(Arc<(Mutex<bool>, Condvar)>);
+
+/// What the opens of a gate wait at.
+#[derive(Clone)]
+struct Waiting(Arc<(Mutex<bool>, Condvar)>);
 
 impl Gate {
-    fn new() -> Arc<Gate> {
-        Arc::new(Gate(Mutex::new(false), Condvar::new()))
+    fn new() -> Gate {
+        Gate(Arc::new((Mutex::new(false), Condvar::new())))
     }
 
-    fn wait(&self) {
-        let open = self.0.lock().unwrap();
-        drop(self.1.wait_timeout_while(open, Duration::from_secs(60), |open| !*open).unwrap());
+    fn waiting(&self) -> Waiting {
+        Waiting(self.0.clone())
     }
 
     fn open(&self) {
-        *self.0.lock().unwrap() = true;
-        self.1.notify_all();
+        let (open, opened) = &*self.0;
+        *open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        opened.notify_all();
+    }
+}
+
+impl Drop for Gate {
+    fn drop(&mut self) {
+        self.open();
+    }
+}
+
+impl Waiting {
+    fn wait(&self) {
+        let (open, opened) = &*self.0;
+        drop(opened.wait_while(open.lock().unwrap(), |open| !*open).unwrap());
     }
 }
 
@@ -311,7 +331,7 @@ async fn a_search_checks_its_key_query_limit_and_rate() {
     let bucket = sharing().await;
     let (data, files) = (ScratchDir::new(), ScratchDir::new());
     let gate = Gate::new();
-    let waiting = gate.clone();
+    let waiting = gate.waiting();
     let mut cfg = config(&bucket, testland(&files));
     cfg.open_search = opener(move |group, _| {
         if group == "full.exact.none" {
@@ -338,8 +358,15 @@ async fn a_search_checks_its_key_query_limit_and_rate() {
         async move { p.round(true).await }
     });
     until("the build served", || p.served().is_some()).await;
-    until("the held group building", || p.served().unwrap().search.json()["groups"].as_array().unwrap()
-        .iter().any(|g| g["index"] == "full.exact.none" && g["state"] == "building")).await;
+    // A search is answered only once its group is open (503 before, ahead
+    // of the key and the query), and the cases search the default dataset:
+    // they wait for its group to open as well as for the held one to be
+    // building. Both open on threads of the lowest priority, which a busy
+    // runner keeps waiting while the test goes on.
+    until("the default dataset's group open and the held one building", || {
+        let search = p.served().unwrap().search.json();
+        state_of(&search, "full.simplified.all")["state"] == "ready" && state_of(&search, "full.exact.none")["state"] == "building"
+    }).await;
 
     let cases = [
         ("q=testville", 401, "Missing API key"),
@@ -386,7 +413,7 @@ async fn a_start_serves_at_once_and_its_place_search_answers_as_each_group_opens
     portal(data.path(), config(&bucket, testland(&files))).round(true).await.unwrap();
     std::fs::remove_dir_all(data.path().join(BUILDS).join(format!("{DATE}-1")).join(sync::SEARCH)).unwrap();
     let gate = Gate::new();
-    let waiting = gate.clone();
+    let waiting = gate.waiting();
     let mut cfg = config(&bucket, testland(&files));
     cfg.open_search = opener(move |group, _| match group {
         "full.simplified.all" => {
@@ -444,7 +471,7 @@ async fn a_sync_opens_the_place_search_of_its_build_before_it_switches_to_it() {
     let bucket = sharing().await;
     let (data, files) = (ScratchDir::new(), ScratchDir::new());
     let gate = Gate::new();
-    let waiting = gate.clone();
+    let waiting = gate.waiting();
     let mut cfg = config(&bucket, testland(&files));
     cfg.open_search = opener(move |_, dir| {
         if dir.to_str().unwrap().contains(NEXT) {
