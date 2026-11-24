@@ -261,3 +261,33 @@ TEST(a_marine_ring_no_vertex_cuts_is_one_stretch) {
         CHECK_EQ(r[0].way, runs[0].way);
     }
 }
+
+TEST(a_marine_ring_one_vertex_cuts_is_one_stretch_from_that_vertex_round_to_it) {
+    // A ring of five vertices, the third alone starting a stretch.
+    std::vector<PackedLocation> ring;
+    const PackedLocation corners[] = {pt(100000000, 50000000), pt(100000000, 50010000), pt(100005000, 50015000),
+                                      pt(100010000, 50010000), pt(100010000, 50000000)};
+    for (size_t i = 0; i < 5; i++) {
+        PackedLocation v = corners[i];
+        while (marine::starts_stretch(v) != (i == 2)) v.lat_e7++;
+        ring.push_back(v);
+    }
+    ring.push_back(ring.front());
+    // From the first vertex, the stretch runs through it: one run of every
+    // edge, not two of one way either side of the start.
+    const std::vector<WayRun> runs = marine::ring_runs(ring);
+    REQUIRE(runs.size() == 1u);
+    CHECK_EQ(runs[0].edges, 5u);
+    CHECK(runs[0].way < 0);
+    // The same from the vertex that cuts, from another, and the other way
+    // round.
+    const std::vector<PackedLocation> from_cut = {ring[2], ring[3], ring[4], ring[0], ring[1], ring[2]};
+    const std::vector<PackedLocation> turned = {ring[4], ring[0], ring[1], ring[2], ring[3], ring[4]};
+    const std::vector<PackedLocation> back(ring.rbegin(), ring.rend());
+    for (const auto& other : {from_cut, turned, back}) {
+        const std::vector<WayRun> r = marine::ring_runs(other);
+        REQUIRE(r.size() == 1u);
+        CHECK_EQ(r[0].edges, 5u);
+        CHECK_EQ(r[0].way, runs[0].way);
+    }
+}
