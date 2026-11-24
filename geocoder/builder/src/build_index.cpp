@@ -826,7 +826,7 @@ static void rank_admin_polygons(ParsedData& data, const AdminRings& countries, u
         const auto [first, last] = admin_cell_entries(data.admin_index_cells, admin_link_cell(p).id());
         for (const CellItemPair* e = first; e != last; ++e) visit(e->item_id & ID_MASK);
     };
-    lookups.holds = [&](uint32_t pid, PackedLocation p) { return rings.contains(pid, p); };
+    lookups.covers = [&](uint32_t pid, PackedLocation p) { return rings.covers(pid, p); };
     lookups.country_at = [&](PackedLocation p) { return country_code_at_point(data, countries, p.lat(), p.lon()); };
     std::vector<RankTrace> trace;
     const RankStats stats = compute_rank_addresses(data, lookups, threads, dump.empty() ? nullptr : &trace);
@@ -2333,6 +2333,7 @@ static int run(int argc, char* argv[]) {
                     // Place node data
                     std::vector<PlaceNode> place_nodes;
                     std::vector<int64_t> place_osm_node_ids; // parallel to place_nodes; strategy-2 stable identity
+                    std::vector<PackedLocation> place_points;  // parallel to place_nodes: OSM's e7 points
                     std::vector<uint32_t> place_names;
                     // The place nodes a boundary or place area may link.
                     LinkCandidates link_candidates;
@@ -2527,6 +2528,7 @@ static int run(int argc, char* argv[]) {
                                 pn.rank_address = place_node_rank(pn.place_type);
                                 tl_node_data->place_nodes.push_back(pn);
                                 tl_node_data->place_osm_node_ids.push_back(id);
+                                tl_node_data->place_points.push_back(point_e7(lat, lng));
                                 tl_node_data->place_names.push_back(tl_node_data->strings.add(place_name));
                             }
                         }
@@ -2632,6 +2634,7 @@ static int run(int argc, char* argv[]) {
                 const auto place_at = local_offsets(ntld, [](const auto& l) { return l.place_nodes.size(); });
                 const size_t place_base = grow_by(data.place_nodes, place_at.back());
                 const size_t place_osm_base = grow_by(data.place_osm_ids, place_at.back());
+                const size_t place_point_base = grow_by(data.place_points, place_at.back());
                 parallel_for_parts(place_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
                     const auto& local = ntld[k];
                     for (size_t j = begin; j < end; j++, at++) {
@@ -2643,6 +2646,7 @@ static int run(int argc, char* argv[]) {
                         int64_t place_node_id = j < local.place_osm_node_ids.size() ? local.place_osm_node_ids[j] : 0;
                         data.place_osm_ids[place_osm_base + at] =
                             pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, place_node_id);
+                        data.place_points[place_point_base + at] = local.place_points[j];
                     }
                 });
                 for (auto& local : ntld) data.link_candidates.append(std::move(local.link_candidates));
@@ -3950,6 +3954,7 @@ static int run(int argc, char* argv[]) {
             hide_linked_place_nodes(data, countries, num_threads);
             rank_admin_polygons(data, countries, num_threads, cfg.rank_dump, _pt, _cpu);
         }
+        std::vector<PackedLocation>().swap(data.place_points);
 
         // TIGER and GeoNames write only the string pool, interpolations and
         // postcode centroids, none of which the parent chains read, so they

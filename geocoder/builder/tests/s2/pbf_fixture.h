@@ -26,11 +26,16 @@ struct Fixture {
     int64_t next_node = 1, next_way = 1, next_relation = 1;
 
     int64_t node(double lat, double lng, Tags tags = {}) {
+        return node_e7(static_cast<int32_t>(lat * 1e7), static_cast<int32_t>(lng * 1e7), std::move(tags));
+    }
+
+    // A node at (lat, lng) in whole e7 units, as OSM holds it.
+    int64_t node_e7(int32_t lat, int32_t lng, Tags tags = {}) {
         TestObject o;
         o.type = OsmType::Node;
         o.id = next_node++;
-        o.lat = static_cast<int32_t>(lat * 1e7);
-        o.lon = static_cast<int32_t>(lng * 1e7);
+        o.lat = lat;
+        o.lon = lng;
         o.tags = std::move(tags);
         nodes.push_back(o);
         return o.id;

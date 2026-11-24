@@ -19,12 +19,14 @@
 //      place rank from its own up to 23 takes that polygon's rank + 2
 //      (:930-950); any other the rank of the place node it links.
 //   3. Place nodes of rank 16 to 23: two more where a relation of their rank
-//      holds them (:951-971), other than a boundary that links them: a linked
-//      node is a place of its own only in a dir that leaves out the
-//      boundaries standing for it.
+//      covers them, on their own e7 points (:951-971), other than a boundary
+//      that links them: a linked node is a place of its own only in a dir
+//      that leaves out the boundaries standing for it.
 //
 // Each step reads the others' ranks as the indexer leaves them when it runs:
 // a polygon indexed later still has its initial rank. Postal areas rank 0.
+// A point a polygon is asked about is in it where it lies inside or on its
+// border, as _ST_Covers, which the parent and node steps ask, has it.
 // The geometry is worked out on every core beforehand; only the rank reads
 // run in sequence, so the ranks don't depend on the thread count.
 #pragma once
@@ -46,8 +48,8 @@ struct RingPolygon;  // polygon_relations.h
 struct RankLookups {
     // Calls visit(polygon) for every admin polygon whose rings may hold p.
     std::function<void(PackedLocation p, const std::function<void(uint32_t)>& visit)> polygons_near;
-    // Whether the rings of polygon pid hold p.
-    std::function<bool(uint32_t pid, PackedLocation p)> holds;
+    // Whether the rings of polygon pid cover p: p inside them or on an edge.
+    std::function<bool(uint32_t pid, PackedLocation p)> covers;
     // The country at p (packed upper case), 0 where none is known.
     std::function<uint16_t(PackedLocation p)> country_at;
 };
@@ -119,7 +121,8 @@ struct RankTrace {
 // Gives every admin polygon (AdminPolygon::rank_address) and place node
 // (PlaceNode::rank_address, a hidden one's as a place of its own) its
 // rank_address, reading admin_osm_ids, admin_tags, admin_links (each
-// linking polygon's link) and place_node_links, which it frees. With
-// `trace`, a RankTrace for each boundary and place area, by id.
+// linking polygon's link), place_node_links and place_points (each node's
+// point), the last three of which it frees. With `trace`, a RankTrace for
+// each boundary and place area, by id.
 RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, unsigned threads,
                                  std::vector<RankTrace>* trace = nullptr);

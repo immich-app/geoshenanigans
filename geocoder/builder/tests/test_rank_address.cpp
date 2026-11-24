@@ -126,6 +126,7 @@ struct World {
         pn.parent_poly_id = NO_DATA;
         if (hidden) pn._pad1 = PLACE_FLAG_HIDDEN;
         data.place_nodes.push_back(pn);
+        data.place_points.push_back(point_e7(lat, lng));
         return pn.name_id;
     }
 
@@ -134,23 +135,29 @@ struct World {
         data.place_node_links.push_back({node, admin_boundary_id(data.admin_osm_ids[pid])});
     }
 
-    RankStats rank(unsigned threads = 4) {
-        RankLookups lookups;
-        lookups.polygons_near = [this](PackedLocation, const std::function<void(uint32_t)>& visit) {
+    // Every polygon a candidate at every point, which its rings cover where the point is inside
+    // them or on an edge (AdminRings::covers).
+    RankLookups lookups() {
+        RankLookups l;
+        l.polygons_near = [this](PackedLocation, const std::function<void(uint32_t)>& visit) {
             for (uint32_t pid = 0; pid < data.admin_polygons.size(); pid++) visit(pid);
         };
-        lookups.holds = [this](uint32_t pid, PackedLocation p) {
+        l.covers = [this](uint32_t pid, PackedLocation p) {
             const AdminExactRings& exact = data.admin_exact_rings;
             bool inside = false;
             for (uint32_t r = 0; r < exact.polygons[pid].ring_count; r++) {
                 const RingSpan& ring = exact.rings_of(pid)[r];
-                inside ^= exact_ring_contains(exact.vertices.data() + ring.begin, ring.count, p);
+                const PackedLocation* v = exact.vertices.data() + ring.begin;
+                if (exact_ring_on_edge(v, ring.count, p)) return true;
+                inside ^= exact_ring_contains(v, ring.count, p);
             }
             return inside;
         };
-        lookups.country_at = [this](PackedLocation) { return country; };
-        return compute_rank_addresses(data, lookups, threads);
+        l.country_at = [this](PackedLocation) { return country; };
+        return l;
     }
+
+    RankStats rank(unsigned threads = 4) { return compute_rank_addresses(data, lookups(), threads); }
 
     uint8_t of(uint32_t pid) const { return data.admin_polygons[pid].rank_address; }
     uint8_t node_rank(uint32_t node) const { return data.place_nodes[node].rank_address; }
@@ -427,6 +434,29 @@ TEST(a_place_node_in_a_relation_of_its_rank_ranks_2_more_wherever_the_query_is) 
     CHECK_EQ(stats.nodes_promoted, size_t(2));
 }
 
+TEST(a_place_node_is_promoted_on_its_own_point_where_a_relation_covers_it) {
+    // A level 8 relation (16) whose east edge lies at 138.9999998°: a village one e7 step inside
+    // it, whose f32 longitude rounds to 139°, east of the edge, a village on its north edge and
+    // one on the edge of its hole rank 18, as _ST_Covers holds them (placex_triggers.sql:
+    // 951-971); one a step beyond its west edge stays 16.
+    World w("DE");
+    w.relation(1, 4, Box{34, 138, 36, 140});
+    const Ring outer = {{352000000, 1389000000}, {352000000, 1389999998}, {352500000, 1389999998},
+                        {352500000, 1389000000}, {352000000, 1389000000}};
+    const Ring hole = {{352100000, 1389100000}, {352100000, 1389200000}, {352200000, 1389200000},
+                       {352200000, 1389100000}, {352100000, 1389100000}};
+    w.relation(2, 8, outer, {}, 0, {hole});
+    const uint32_t inside = w.node(PlaceType::VILLAGE, 35.22, 138.9999997);
+    const uint32_t north = w.node(PlaceType::VILLAGE, 35.25, 138.95);
+    const uint32_t on_hole = w.node(PlaceType::VILLAGE, 35.215, 138.91);
+    const uint32_t beyond = w.node(PlaceType::VILLAGE, 35.22, 138.8999999);
+    w.rank();
+    CHECK_EQ(w.node_rank(inside), uint8_t(18));
+    CHECK_EQ(w.node_rank(north), uint8_t(18));
+    CHECK_EQ(w.node_rank(on_hole), uint8_t(18));
+    CHECK_EQ(w.node_rank(beyond), uint8_t(16));
+}
+
 TEST(a_place_node_is_not_promoted_by_a_boundary_that_links_it) {
     // A village node linked by its level 9 commune (18, 16 by the link) is that commune in an
     // address, and a place of its own only where the commune is left out (admin-minimal): there
@@ -551,18 +581,7 @@ TEST(the_trace_tells_how_each_boundary_came_to_its_rank) {
     const uint32_t repeat = w.relation(5, 9, city, {AdminPlaceType::NONE, AdminPlaceType::NONE, "Q1"});
     const uint32_t village = w.place_area(6, AdminPlaceType::VILLAGE, Box{53.31, -2.89, 53.32, -2.88});
     std::vector<RankTrace> trace;
-    compute_rank_addresses(w.data, [&] {
-        RankLookups l;
-        l.polygons_near = [&](PackedLocation, const std::function<void(uint32_t)>& visit) {
-            for (uint32_t pid = 0; pid < w.data.admin_polygons.size(); pid++) visit(pid);
-        };
-        l.holds = [&](uint32_t pid, PackedLocation p) {
-            const RingSpan& ring = w.data.admin_exact_rings.rings_of(pid)[0];
-            return exact_ring_contains(w.data.admin_exact_rings.vertices.data() + ring.begin, ring.count, p);
-        };
-        l.country_at = [&](PackedLocation) { return w.country; };
-        return l;
-    }(), 2, &trace);
+    compute_rank_addresses(w.data, w.lookups(), 2, &trace);
     auto of = [&](uint32_t pid) {
         const uint64_t id = admin_boundary_id(w.data.admin_osm_ids[pid]);
         for (const RankTrace& t : trace)

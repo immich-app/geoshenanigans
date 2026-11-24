@@ -466,6 +466,10 @@ struct ParsedData {
     std::vector<PlaceNode> place_nodes;
     // Parallel: packed (OSM_NODE, osm_node_id). Strategy-2 IdAllocator uses this.
     std::vector<uint64_t> place_osm_ids;
+    // Parallel: each node's point as OSM has it on the e7 grid, which its f32
+    // coordinates round off by up to a metre: the rank pass tests it against
+    // the boundaries, then frees it.
+    std::vector<PackedLocation> place_points;
     // Each place node's admin cell, for the continent filter's place masks; no
     // dir ships a place cell index (a client derives one from place_nodes.bin).
     std::vector<CellItemPair> sorted_place_cells;

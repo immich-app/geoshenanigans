@@ -39,6 +39,10 @@ public:
                const std::function<bool(uint32_t)>& indexed = nullptr);
 
     bool contains(uint32_t pid, PackedLocation p) const;
+    // Whether p lies in polygon pid or on an edge of one of its rings, its
+    // border included as PostGIS's _ST_Covers includes it: a point on an edge
+    // two neighbours share is covered by both.
+    bool covers(uint32_t pid, PackedLocation p) const;
 
     // The polygon of the first of `ranked` (admin cell index entries, see
     // rank_candidates) containing p, or NO_DATA: an entry flagged

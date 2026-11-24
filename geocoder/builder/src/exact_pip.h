@@ -48,6 +48,25 @@ inline bool exact_ring_contains(const PackedLocation* v, uint32_t n, PackedLocat
     return inside;
 }
 
+// Whether p lies on the edge a-b, its ends included: inside the edge's box,
+// on its line (the cross product 0, its two products compared as
+// exact_edge_crosses compares them).
+inline bool exact_point_on_edge(PackedLocation a, PackedLocation b, PackedLocation p) {
+    if (p.lat_e7 < std::min(a.lat_e7, b.lat_e7) || p.lat_e7 > std::max(a.lat_e7, b.lat_e7) ||
+        p.lon_e7 < std::min(a.lon_e7, b.lon_e7) || p.lon_e7 > std::max(a.lon_e7, b.lon_e7))
+        return false;
+    return (int64_t(p.lat_e7) - a.lat_e7) * (int64_t(b.lon_e7) - a.lon_e7) ==
+           (int64_t(b.lat_e7) - a.lat_e7) * (int64_t(p.lon_e7) - a.lon_e7);
+}
+
+// Whether p lies on an edge of the ring v[0, n), its last vertex joined back
+// to its first: on its border, where exact_ring_contains may say either.
+inline bool exact_ring_on_edge(const PackedLocation* v, uint32_t n, PackedLocation p) {
+    for (uint32_t a = 0, b = n - 1; a < n; b = a++)
+        if (exact_point_on_edge(v[b], v[a], p)) return true;
+    return false;
+}
+
 // A ring's bounds, for a reject in front of exact_ring_contains.
 struct ExactRingBox {
     int32_t lat_lo, lat_hi, lng_lo, lng_hi;
@@ -86,6 +105,12 @@ public:
         return buckets_.odd_crossings(p.lon_e7, [&](uint32_t a, uint32_t b) {
             return exact_edge_crosses(verts_[b], verts_[a], p);
         });
+    }
+
+    // exact_ring_on_edge: an edge through p spans p's longitude, so it is in
+    // p's bucket.
+    bool on_edge(PackedLocation p) const {
+        return buckets_.any_edge(p.lon_e7, [&](uint32_t a, uint32_t b) { return exact_point_on_edge(verts_[b], verts_[a], p); });
     }
 
 private:

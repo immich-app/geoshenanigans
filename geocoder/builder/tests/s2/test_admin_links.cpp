@@ -244,3 +244,36 @@ TEST(a_poi_and_a_street_link_to_a_level_11_or_12_polygon_round_them) {
     CHECK_EQ(a.data.poi_records[0].parent_postcode_id, a.data.admin_polygons[postal].name_id);
     CHECK_EQ(a.data.way_parent_ids[0], l11);
 }
+
+TEST(admin_rings_cover_their_edges_and_contain_a_shared_edge_on_one_side) {
+    // Two squares sharing an edge, the west one with a hole and its outer ring of 200 vertices
+    // (behind an edge index), the east one of 4 (scanned): a point on the shared edge, on a
+    // vertex, on the hole's edge and on each outer edge is covered, as _ST_Covers has it; of
+    // the two squares only one contains the middle of the edge they share; a point a step
+    // outside either, or inside the hole, is not covered.
+    Admins a;
+    Ring west;
+    for (int k = 0; k < 50; k++) west.push_back({0, 20000 * k});
+    for (int k = 0; k < 50; k++) west.push_back({20000 * k, 1000000});
+    for (int k = 0; k < 50; k++) west.push_back({1000000, 1000000 - 20000 * k});
+    for (int k = 0; k < 50; k++) west.push_back({1000000 - 20000 * k, 0});
+    const Ring hole = closed({{400000, 400000}, {400000, 600000}, {600000, 600000}, {600000, 400000}});
+    const uint32_t w = a.add(8, closed(west), {hole});
+    const uint32_t e = a.add(8, closed({{0, 1000000}, {0, 2000000}, {1000000, 2000000}, {1000000, 1000000}}));
+    const AdminRings rings(a.data.admin_exact_rings, 1);
+    for (const PackedLocation p : {PackedLocation{500000, 1000000}, PackedLocation{0, 1000000}, PackedLocation{1000000, 1000000}}) {
+        CHECK(rings.covers(w, p));
+        CHECK(rings.covers(e, p));
+    }
+    CHECK(rings.contains(w, PackedLocation{500000, 1000000}) != rings.contains(e, PackedLocation{500000, 1000000}));
+    for (const PackedLocation p : {PackedLocation{0, 500000}, PackedLocation{1000000, 500000}, PackedLocation{500000, 0},
+                                   PackedLocation{0, 0}, PackedLocation{500000, 400000}, PackedLocation{600000, 500000}})
+        CHECK(rings.covers(w, p));
+    for (const PackedLocation p : {PackedLocation{1000000, 1500000}, PackedLocation{500000, 2000000}, PackedLocation{0, 1500000}})
+        CHECK(rings.covers(e, p));
+    for (const PackedLocation p : {PackedLocation{-1, 500000}, PackedLocation{500000, -1}, PackedLocation{1000001, 500000},
+                                   PackedLocation{500000, 500000}, PackedLocation{450000, 550000}})
+        CHECK(!rings.covers(w, p));
+    CHECK(!rings.covers(e, PackedLocation{500000, 2000001}));
+    CHECK(rings.covers(w, PackedLocation{300000, 300000}));
+}

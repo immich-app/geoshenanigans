@@ -3,6 +3,7 @@
 // placex_update gives it, which the builder computes (rank_address.h) and the
 // server reads, laid out as the objects each rule was found on. The ranks are
 // the same in every dir of a build, a chained one's too.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -39,6 +40,23 @@ void replicated(Fixture& f, double s, double w, double n, double e, const std::v
         o.members.insert(o.members.end(), members.begin(), members.end());
         f.relations.push_back(o);
     }
+}
+
+// A boundary relation round the box (south, west, north, east) in whole e7 units.
+int64_t boundary_e7(Fixture& f, int32_t s, int32_t w, int32_t n, int32_t e, int level, const std::string& name) {
+    const int64_t a = f.node_e7(s, w), b = f.node_e7(s, e), c = f.node_e7(n, e), d = f.node_e7(n, w);
+    TestObject way;
+    way.type = OsmType::Way;
+    way.id = f.next_way++;
+    way.refs = {a, b, c, d, a};
+    f.ways.push_back(way);
+    TestObject o;
+    o.type = OsmType::Relation;
+    o.id = f.next_relation++;
+    o.tags = {{"type", "boundary"}, {"boundary", "administrative"}, {"admin_level", std::to_string(level)}, {"name", name}};
+    o.members.emplace_back(OsmType::Way, way.id, "outer");
+    f.relations.push_back(o);
+    return o.id;
 }
 
 // The answer at the point from a build of the fixture.
@@ -314,4 +332,26 @@ TEST(place_nodes_rank_by_their_type_in_an_extract_without_boundaries) {
     REQUIRE(answers.size() == 1);
     std::printf("    %s\n", answers[0].c_str());
     CHECK(names(answers[0], "hamlet", "Aising"));
+}
+
+TEST(a_place_node_on_a_relations_edge_or_an_e7_step_inside_it_is_promoted) {
+    // Hayama (admin_level 7 in Japan: 16) holds the village node of Isshiki on its north edge,
+    // and that of Horiuchi one e7 step inside its east edge at 138.9999997°, whose f32 is 139°,
+    // east of the edge. Nominatim's _ST_Covers holds both on their own coordinates and promotes
+    // them to 18 (placex_triggers.sql:951-971). A village beyond its west edge stays 16.
+    Fixture f;
+    f.country(30, 128, 46, 146, "日本", "JP");
+    boundary_e7(f, 352000000, 1389000000, 352500000, 1389999998, 7, "Hayama");
+    f.node_e7(352500000, 1389500000, {{"place", "village"}, {"name", "Isshiki"}});
+    f.node_e7(352200000, 1389999997, {{"place", "village"}, {"name", "Horiuchi"}});
+    f.node_e7(352200000, 1388999999, {{"place", "village"}, {"name", "Nagae"}});
+    const ScratchDir root("rank-edges");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log", out = root.path() + "/out";
+    write_test_pbf(pbf, f.objects(), 1000);
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
+    std::vector<uint8_t> villages;
+    for (const auto& [type, rank] : ranks_in(out + "/planet").by_place_type)
+        if (type == uint8_t(PlaceType::VILLAGE)) villages.push_back(rank);
+    std::sort(villages.begin(), villages.end());
+    CHECK((villages == std::vector<uint8_t>{16, 18, 18}));
 }

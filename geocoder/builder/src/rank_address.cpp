@@ -187,7 +187,7 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
             for (uint32_t pid : near) {
                 const uint32_t q = pid < object_of.size() ? object_of[pid] : NO_DATA;
                 if (q == NO_DATA || q == k || std::find(at.begin(), at.end(), q) != at.end()) continue;
-                if (lookups.holds(pid, o.point)) at.push_back(q);
+                if (lookups.covers(pid, o.point)) at.push_back(q);
             }
             if (nests) {
                 auto& mine_parents = parents[k];
@@ -414,11 +414,14 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
         *trace = std::move(traced);
     }
 
-    // Place nodes: their type's rank, two more inside a relation of that rank (:951-971): a
+    // Place nodes: their type's rank, two more where a relation of that rank covers them, at
+    // OSM's point rather than its f32, which can round it across the border (:951-971): a
     // boundary by its rank, a place polygon by its place rank. A linked node is no place of its
     // own; where a dir leaves out the boundaries standing for it, it answers as one, and none of
     // them promotes it.
     auto& nodes = data.place_nodes;
+    const std::vector<PackedLocation>& points = data.place_points;
+    if (points.size() != nodes.size()) throw std::logic_error("the rank pass needs every place node's e7 point");
     PlaceNodeLinks& links = data.place_node_links;
     sort_place_node_links(links);
     parallel_for(nodes.size(), [&](size_t begin, size_t end, unsigned) {
@@ -428,7 +431,7 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
             const uint8_t base = place_node_rank(pn.place_type);
             bool promoted = false;
             if (place_node_promotable(base)) {
-                const PackedLocation p = point_e7(pn.lat, pn.lng);
+                const PackedLocation p = points[i];
                 const auto first = std::lower_bound(links.begin(), links.end(), std::make_pair(uint32_t(i), uint64_t(0)));
                 auto links_it = [&](const AdminObject& o) {
                     for (auto l = first; l != links.end() && l->first == i; ++l)
@@ -444,7 +447,7 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
                     if (!o.relation || rank[q] < 1 || rank[q] > kMaxParentRank || links_it(o)) continue;
                     if (!((o.place_category && o.initial.address == base) || (o.boundary_category && rank[q] == base)))
                         continue;
-                    if (lookups.holds(pid, p)) {
+                    if (lookups.covers(pid, p)) {
                         promoted = true;
                         break;
                     }
@@ -461,5 +464,6 @@ RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, u
     std::vector<AdminTags>().swap(data.admin_tags);
     std::vector<AdminLink>().swap(data.admin_links);
     PlaceNodeLinks().swap(links);
+    std::vector<PackedLocation>().swap(data.place_points);
     return stats;
 }

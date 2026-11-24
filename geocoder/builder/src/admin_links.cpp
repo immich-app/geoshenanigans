@@ -117,6 +117,21 @@ bool AdminRings::contains(uint32_t pid, PackedLocation p) const {
     return inside;
 }
 
+bool AdminRings::covers(uint32_t pid, PackedLocation p) const {
+    const auto& polygon = rings_.polygons[pid];
+    bool inside = false;
+    for (uint32_t r = polygon.first_ring; r < polygon.first_ring + polygon.ring_count; r++) {
+        const ExactRingBox& box = boxes_[r];
+        // Outside the ring's closed box, which holds its edges, the ring adds nothing.
+        if (p.lat_e7 < box.lat_lo || p.lat_e7 > box.lat_hi || p.lon_e7 < box.lng_lo || p.lon_e7 > box.lng_hi) continue;
+        const RingSpan& span = rings_.rings[r];
+        const PackedLocation* v = rings_.vertices.data() + span.begin;
+        if (edges_[r] ? edges_[r]->on_edge(p) : exact_ring_on_edge(v, span.count, p)) return true;
+        inside ^= edges_[r] ? edges_[r]->contains(p) : exact_ring_contains(v, span.count, p);
+    }
+    return inside;
+}
+
 uint32_t AdminRings::first_containing(const std::vector<uint32_t>& ranked, PackedLocation p) const {
     for (uint32_t id : ranked)
         if ((id & INTERIOR_FLAG) || contains(id & ID_MASK, p)) return id & ID_MASK;
