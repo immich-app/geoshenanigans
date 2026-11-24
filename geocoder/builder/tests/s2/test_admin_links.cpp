@@ -3,10 +3,11 @@
 // step inside one of two neighbours links to that one, a street takes the
 // postcode at its middle and a POI none of another country, and the
 // candidates don't depend on how a ring is written down. A street's postal
-// area covers its middle, its edges included, and has a postcode the server
-// takes. A boundary that repeats the closest boundary relation round its
-// point, the same outline whatever vertices lie along its edges, and links
-// no place node is in no address; one that links one takes the node's rank.
+// area covers its middle, its edges included, is of the street's country, or
+// of any where the street has none, and has a postcode the server takes. A
+// boundary that repeats the closest boundary relation round its point, the
+// same outline whatever vertices lie along its edges, and links no place
+// node is in no address; one that links one takes the node's rank.
 #include "admin_links.h"
 
 #include <algorithm>
@@ -197,6 +198,27 @@ TEST(of_the_postal_areas_at_a_streets_middle_the_one_of_its_country_whose_centro
     a.map();
     compute_way_parent_polygons(a.data, 1);
     CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[nearest].name_id);
+}
+
+TEST(a_postal_area_of_no_country_names_no_street_of_a_country) {
+    // Nominatim makes no postcode area of a postal area of no country (get_matcher(None) is None,
+    // postcodes.py _update_postcode_areas), and get_nearest_postcode takes an area only of the
+    // street's own country (p.country_code = country). An area of no country centred on a German
+    // street's middle leaves the street to the German area round it; outside every country, a
+    // street takes the area of no country centred on it.
+    const uint16_t de = pack_country_code('D', 'E');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Deutschland", de);
+    a.add(11, box(0.499, 0.499, 0.501, 0.502), {}, "AB123");
+    const uint32_t german = a.add(11, box(0.45, 0.46, 0.55, 0.56), {}, "10115", de);
+    a.add_way({at(0.5, 0.5), at(0.5, 0.501)});
+    const uint32_t countryless = a.add(11, box(-0.501, 0.499, -0.499, 0.502), {}, "AB124");
+    a.add(11, box(-0.55, 0.46, -0.45, 0.56), {}, "10117", de);
+    a.add_way({at(-0.5, 0.5), at(-0.5, 0.501)});
+    a.map();
+    compute_way_parent_polygons(a.data, 1);
+    CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[german].name_id);
+    CHECK_EQ(a.data.way_postcode_ids[1], a.data.admin_polygons[countryless].name_id);
 }
 
 TEST(a_streets_postal_area_is_none_of_a_placeholder_or_a_list_of_postcodes) {

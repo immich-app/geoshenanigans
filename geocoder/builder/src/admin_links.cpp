@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -22,7 +21,6 @@
 #include "parallel.h"
 #include "parent_linking.h"
 #include "polygon_rings.h"
-#include "postcode_validation.h"
 #include "s2_helpers.h"
 
 namespace {
@@ -111,15 +109,12 @@ bool postcode_taken(const char* postcode) {
 // takes it: get_nearest_postcode takes an area of the point's country only
 // (utils.sql: p.country_code = country), of a postcode that country's pattern
 // takes (not POSTAL_AREA_INVALID) and the server takes (postcode_taken). One
-// of no country known names a point of any country but one without
-// postcodes, the server having no pattern to test it by; any names a point
-// of no country known.
+// of no country known names no point of a country, Nominatim making no
+// postcode area of it (get_matcher(None) is None); any names a point of no
+// country known.
 bool postal_area_names(const AdminPolygon& area, uint16_t cc, const char* postcode) {
     if (area.place_type_override == POSTAL_AREA_INVALID || !postcode_taken(postcode)) return false;
-    if (cc == 0 || area.country_code == cc) return true;
-    if (area.country_code != 0) return false;
-    const char lower[3] = {static_cast<char>(std::tolower(cc >> 8)), static_cast<char>(std::tolower(cc & 0xFF)), 0};
-    return !country_without_postcodes(lower);
+    return cc == 0 || area.country_code == cc;
 }
 
 // The point halfway along a street's nodes, Nominatim's centroid of a line
