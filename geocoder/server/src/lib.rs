@@ -5649,7 +5649,7 @@ impl CurrentBoundaries {
     /// does, over the ranks of address areas (ADDRESS_AREA_RANKS). A place
     /// area is a row of that walk as a boundary is: the walk makes every row
     /// it takes that is no place node the current_boundary (insert_addresslines,
-    /// placex_triggers.sql:646-651), so a place=suburb way in the address
+    /// placex_triggers.sql:622-632), so a place=suburb way in the address
     /// holds the place nodes of finer ranks to itself. `inside(poly, other)`
     /// tells whether poly's point on surface lies in other, `within(poly,
     /// other)` whether poly lies within other.

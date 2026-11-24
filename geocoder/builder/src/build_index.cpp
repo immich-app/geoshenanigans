@@ -1127,7 +1127,7 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
 
         // The name step takes a node only where the boundary covers it
         // (ST_Covers(bnd.geometry, placex.geometry), placex_triggers.sql
-        // :362-379): the polygons of the boundary, a relation's rings or a
+        // :359-381): the polygons of the boundary, a relation's rings or a
         // closed way's one, each even-odd over its rings, their edges
         // included.
         const bool have_ids = data.admin_osm_ids.size() == data.admin_polygons.size();
@@ -1186,9 +1186,9 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                     // A place type here is the boundary's own place tag, as
                     // the label and wikidata steps linked nothing to it
                     // (links_already, below): find_linked_place still takes
-                    // its place-type step and its name step (:340-379), the
+                    // its place-type step and its name step (:338-381), the
                     // tag is the last resort where both find nothing
-                    // (placex_update, :1150-1165).
+                    // (placex_update, :1190-1205).
                     const uint8_t own_type = poly.place_type_override;
                     // AL11 slots hold boundary=postal_code polygons (their
                     // "name" is the postcode string) — Nominatim's
@@ -1216,7 +1216,7 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
 
                     // The nearest node to the outer ring's vertex average,
                     // one of the boundary's own place type first: the
-                    // place-type step comes before the name step (:340-361;
+                    // place-type step comes before the name step (:338-356;
                     // its names containing one another are taken here as
                     // the same name).
                     const LatLng centre = outer_vertex_average(data, static_cast<uint32_t>(i));

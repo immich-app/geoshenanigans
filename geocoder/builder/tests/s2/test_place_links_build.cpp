@@ -684,8 +684,8 @@ TEST(a_boundary_with_a_place_tag_of_its_own_links_a_place_node_of_its_name) {
     // Cetinje in planet-b (42.3931, 18.9115): a closed way, admin_level 8, tagged place=town,
     // round the city node Cetinje. find_linked_place's place-type step finds no town node of its
     // name, and its name step takes the city node, of its rank (16) and inside it
-    // (placex_triggers.sql:340-379); the boundary's own place tag is the last resort when nothing
-    // links (:1150-1165). The boundary is the city, labelled by the node, which it hides.
+    // (placex_triggers.sql:338-381); the boundary's own place tag is the last resort when nothing
+    // links (:1190-1205). The boundary is the city, labelled by the node, which it hides.
     Fixture f;
     f.country(41.8, 18.4, 43.6, 20.4, "Montenegro", "ME");
     f.boundary(42.2, 18.7, 42.6, 19.1, 6, "Old Royal Capital Cetinje");
@@ -703,7 +703,7 @@ TEST(a_boundary_links_no_place_node_of_its_name_outside_it) {
     // Salzweg (48.615515, 13.511634): the village node Witzmannsberg (N452414137) lies in the
     // Gemeinde Salzweg, about 10 km from the Gemeinde Witzmannsberg (R958107) of its name.
     // find_linked_place's name step takes only a node the boundary covers (ST_Covers,
-    // placex_triggers.sql:362-379), so the Gemeinde links nothing and the node is the village of
+    // placex_triggers.sql:359-381), so the Gemeinde links nothing and the node is the village of
     // the address round it.
     Fixture f;
     f.country(47.2, 5.8, 55.1, 15.1, "Germany", "DE");

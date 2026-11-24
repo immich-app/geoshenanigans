@@ -248,7 +248,7 @@ fn a_place_area_in_the_address_holds_the_place_nodes_of_finer_ranks_to_itself() 
     // suburb of the address, and the place=suburb node Al Khalidiyah north of it lies in the city
     // but not in that way. Nominatim's address walk sets current_boundary to every row it takes
     // that is no place node, a place area as much as a boundary, and passes over a place node
-    // outside it (insert_addresslines, placex_triggers.sql:600-602, :646-651). Here a
+    // outside it (insert_addresslines, placex_triggers.sql:583-586, :622-632). Here a
     // neighbourhood node 400 m north of the point, its fuzzy square round the point, lies in the
     // city and outside the suburb's area: it is in no address of the point.
     let index = TestIndex::in_country(b"AE")
