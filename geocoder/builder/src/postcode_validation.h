@@ -242,3 +242,35 @@ inline bool validate_postcode_for_country(const char* cc, const char* pc) {
         default: return len >= 3 && len <= 10;
     }
 }
+
+// Whether a postcode is a US ZIP+4, ddddd-dddd: the US pattern is
+// (ddddd)(?:-dddd)? with output \1 (country_settings.yaml), so Nominatim's
+// postcode is the ZIP's.
+inline bool is_zip_plus_4(const char* postcode) {
+    for (int k = 0; k < 10; k++)
+        if (k == 5 ? postcode[k] != '-' : !(postcode[k] >= '0' && postcode[k] <= '9')) return false;
+    return postcode[10] == 0;
+}
+
+// Whether a feature's own postcode tag pc is one the clean-postcodes
+// sanitizer keeps in the country cc (lower-case), as CountryPostcodeMatcher
+// matches it: past the spaces round it and an optional code of the country
+// with a space or a hyphen after it, a postcode the country's pattern takes,
+// a ZIP+4 in the US. One it rejects becomes an address term
+// (unofficial_postcode), no postcode of the feature's.
+inline bool postcode_tag_valid_for_country(const char* cc, const char* pc) {
+    if (!cc || !cc[0] || !cc[1] || !pc) return false;
+    auto white = [](char c) { return c == ' ' || (c >= '\t' && c <= '\r'); };
+    const char* begin = pc;
+    while (white(*begin)) begin++;
+    const char* end = begin + std::strlen(begin);
+    while (end > begin && white(end[-1])) end--;
+    const std::string tag(begin, end);
+    const bool us = cc[0] == 'u' && cc[1] == 's';
+    auto takes = [&](const char* p) { return validate_postcode_for_country(cc, p) || (us && is_zip_plus_4(p)); };
+    if (takes(tag.c_str())) return true;
+    auto upper = [](char c) { return c >= 'a' && c <= 'z' ? static_cast<char>(c - 32) : c; };
+    if (tag.size() < 2 || upper(tag[0]) != upper(cc[0]) || upper(tag[1]) != upper(cc[1])) return false;
+    const size_t rest = tag.size() > 2 && (tag[2] == ' ' || tag[2] == '-') ? 3 : 2;
+    return takes(tag.c_str() + rest);
+}

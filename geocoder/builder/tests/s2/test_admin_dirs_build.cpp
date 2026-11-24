@@ -1255,6 +1255,30 @@ TEST(a_build_writes_its_postcode_centroids_in_cell_order_and_the_server_answers_
         for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 
+TEST(a_house_whose_postcode_its_country_rejects_answers_its_streets) {
+    // Two houses of Teststrasse in Testland (CH) beside its middle, one tagged 8003 and one 80A1,
+    // which no Swiss postcode is like: the clean-postcodes sanitizer makes that tag an address
+    // term, so its house takes the street's postcode (placex_update), the centroid nearest the
+    // street's middle, 8003. The other house answers its own.
+    const ScratchDir root("rejected-house-postcode");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log", out = root.path() + "/out";
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    write_test_pbf(pbf, with_postcodes({{7010, lat0 + 1405000, lng0 + 1505000, "8003"}, {7011, lat0 + 1395000, lng0 + 1495000, "80A1"}}),
+                   1000);
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
+    const std::vector<std::pair<double, double>> points = {{47.1395, 8.1495}, {47.1405, 8.1505}};
+    const std::vector<std::string> answers = server_answers(out + "/planet", points, root.path() + "/q", log);
+    REQUIRE(answers.size() == points.size());
+    const int failures_before = gctest::failures();
+    for (const std::string& answer : answers) {
+        CHECK(answer_string(answer, {"address", "postcode"}) == std::string("8003"));
+        CHECK(answer_string(answer, {"address", "road"}) == std::string("Teststrasse"));
+    }
+    CHECK(answer_string(answers[0], {"address", "house_number"}) == std::string("7011"));
+    if (gctest::failures() != failures_before)
+        for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
 TEST(postcode_centroids_keep_no_slots_and_a_region_of_no_valid_postcode_has_files_of_none) {
     // The next day 8002's address is gone and 8007's is new. A build of that
     // day on the day before writes the files a fresh build of it does: a

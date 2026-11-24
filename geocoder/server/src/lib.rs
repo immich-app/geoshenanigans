@@ -2924,8 +2924,10 @@ impl Index {
         // addr:postcode tag is the highest-priority source. The
         // clean-postcodes sanitizer drops one in a country without
         // postcodes or one its country's pattern rejects, and the house
-        // then takes its street's: one failing the answer's checks below
-        // (country_has_no_postcode, postcode_looks_valid) is passed over.
+        // then takes its street's: the builder stores none that the
+        // pattern of the house's country rejects, and one failing the
+        // answer's checks below (country_has_no_postcode,
+        // postcode_looks_valid) is passed over.
         if let (Some(apc), Some((addr_id, _))) = (self.addr_postcodes.as_ref(), addr) {
             if let Some(pid) = Self::sidecar_u32(apc, addr_id as u64) {
                 let own = self.get_string(pid);

@@ -797,15 +797,6 @@ static uint16_t polygon_country(const ParsedData& data, const AdminRings& countr
     return country_code_at_point(data, countries, inside.first, inside.second);
 }
 
-// Whether a postal area's postcode is a US ZIP+4, ddddd-dddd: the US pattern
-// is (ddddd)(?:-dddd)? with output \1 (country_settings.yaml), so Nominatim's
-// postcode area is the ZIP's.
-static bool is_zip_plus_4(const char* postcode) {
-    for (int k = 0; k < 10; k++)
-        if (k == 5 ? postcode[k] != '-' : !(postcode[k] >= '0' && postcode[k] <= '9')) return false;
-    return postcode[10] == 0;
-}
-
 // Gives each postal area (admin_level 11) the country its centroid lies in,
 // as Nominatim gives a place_postcode row the country of its centroid
 // (postcodes.py update_postcodes, get_country_code). A relation is one row,

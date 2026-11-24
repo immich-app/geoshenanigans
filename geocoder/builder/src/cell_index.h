@@ -64,6 +64,8 @@ uint16_t country_code_at_point(const ParsedData& data, const AdminRings& countri
 // lacks. Run once on the full data before the continent split, so every
 // region writes the same centroids (Nominatim's location_postcode is one
 // table) instead of recomputing them from its own subset of addr points.
+// A house of a country whose pattern rejects its tag keeps no postcode of
+// its own in data.addr_postcode_ids (postcode_tag_valid_for_country).
 // The last reader of data.admin_exact_rings.
 void collect_postcode_centroids(ParsedData& data);
 

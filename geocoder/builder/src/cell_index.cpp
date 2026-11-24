@@ -559,6 +559,7 @@ void collect_postcode_centroids(ParsedData& data) {
     // ranges as they free up. The sums are integers: merging the workers'
     // maps in any order gives the same totals.
     std::vector<Accums> parts(parallel_threads());
+    const char* pool = data.string_pool.data().data();
     parallel_for_dynamic(n, 1 << 14, [&](size_t begin, size_t end, unsigned w) {
         for (size_t i = begin; i < end; i++) {
             uint32_t pc_id = data.addr_postcode_ids[i];
@@ -567,6 +568,12 @@ void collect_postcode_centroids(ParsedData& data) {
             uint16_t cc = country_at(data, countries, ap.lat, ap.lng);
             if (cc == 0) continue;
             parts[w][postcode_key(cc, pc_id)].add(ap.lat, ap.lng);
+            // The clean-postcodes sanitizer matches the tag in the house's
+            // own country (placex_insert's, at its centroid) and makes one
+            // the pattern rejects an address term: the house then takes its
+            // street's postcode (placex_update), so it keeps none of its own.
+            const char lower[3] = {static_cast<char>(std::tolower(cc >> 8)), static_cast<char>(std::tolower(cc & 0xFF)), 0};
+            if (!postcode_tag_valid_for_country(lower, pool + pc_id)) data.addr_postcode_ids[i] = NO_DATA;
         }
     });
     // The workers' maps summed a shard of the keys per thread.
