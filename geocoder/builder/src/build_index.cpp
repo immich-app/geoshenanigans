@@ -4326,9 +4326,11 @@ static int run(int argc, char* argv[]) {
         link_places_by_name(data, cfg, _pt, _cpu);
 
         // TIGER and GeoNames write only the string pool, interpolations and
-        // postcode centroids, none of which the parent chains read, so they
-        // load alongside them. The GeoNames file is read meanwhile; its rows
-        // go in after TIGER's, as they always have.
+        // postcode centroids, none of which the admin parent chain reads, so
+        // they load alongside it. The streets' pass reads the postal areas'
+        // postcodes from the pool, which interning grows and moves, so it
+        // waits for them. The GeoNames file is read meanwhile; its rows go in
+        // after TIGER's, as they always have.
         std::future<ExternalPostcodes> external_postcodes;
         if (!external_postcodes_path.empty())
             external_postcodes = std::async(std::launch::async, read_external_postcodes, external_postcodes_path);
@@ -4345,9 +4347,8 @@ static int run(int argc, char* argv[]) {
 
         compute_admin_parent_chain(data, num_threads);
 
-        compute_way_parent_polygons(data, num_threads);
-
         std::future<void> tiger_freed = external_data.get();
+        compute_way_parent_polygons(data, num_threads);
         arenas_trimmed.get();
 #ifdef __GLIBC__
         std::cerr << "Trimmed malloc arenas: " << rss_before_trim << " -> "
