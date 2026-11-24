@@ -237,7 +237,8 @@ pub fn record_bytes(p: &AdminPolygon) -> Vec<u8> {
 /// give its rings.
 pub fn record(name_id: u32, admin_level: u8, area: f32) -> AdminPolygon {
     AdminPolygon {
-        ring_offset: 0, ring_bytes: 0, name_id, admin_level, place_type_override: 0, area, country_code: 0,
+        ring_offset: 0, ring_bytes: 0, name_id, admin_level, place_type_override: 0, own_place_type: 0, area, country_code: 0,
+        of_way: false,
     }
 }
 

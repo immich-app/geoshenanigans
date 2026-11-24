@@ -1,19 +1,31 @@
 // The builder's admin links (admin_links.h) on the polygons' exact rings:
 // a ring S2 won't take as a loop still gets its candidates, a point one e7
-// step inside one of two neighbours links to that one, a street's postal
-// votes reach the cells of its vertices, and the candidates don't depend on
-// how a ring is written down.
+// step inside one of two neighbours links to that one, a street takes the
+// postcode at its middle and a POI none of another country, and the
+// candidates don't depend on how a ring is written down. A street's postal
+// area covers its middle, its edges included, is of the street's country, or
+// of any where the street has none, and has a postcode the server takes. A
+// house keeps the postcode its country's pattern makes of its tag, and the
+// centroids are summed by the one it makes of the tag for them, whatever the
+// house keeps. A boundary that repeats the closest boundary relation round
+// its point, the same outline whatever vertices lie along its edges, and
+// links no place node is in no address; one that links one takes the node's
+// rank.
 #include "admin_links.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "admin_arcs.h"
 #include "cell_index.h"
 #include "cell_walk.h"
 #include "country_code.h"
+#include "place_claims.h"
 #include "s2_helpers.h"
 #include "test_framework.h"
 
@@ -35,12 +47,15 @@ struct Admins {
     ParsedData data;
     AdminArcs arcs;
 
-    uint32_t add(uint8_t level, const Ring& outer, const std::vector<Ring>& holes = {}) {
+    // A polygon named `name`, "area <slot>" without one, of the country `cc`.
+    uint32_t add(uint8_t level, const Ring& outer, const std::vector<Ring>& holes = {}, const std::string& name = "",
+                 uint16_t cc = 0) {
         const uint32_t pid = static_cast<uint32_t>(data.admin_polygons.size());
         data.admin_exact_rings.append(outer, holes);
         AdminPolygon p{};
         p.admin_level = level;
-        p.name_id = pid;
+        p.name_id = data.string_pool.intern(name.empty() ? "area " + std::to_string(pid) : name);
+        p.country_code = cc;
         p.area = data.admin_exact_rings.area(pid);
         data.admin_polygons.push_back(p);
         data.admin_osm_ids.push_back(1000 + pid);
@@ -84,6 +99,9 @@ struct Admins {
         return std::any_of(first, last, [&](const CellItemPair& e) { return (e.item_id & ID_MASK) == pid; });
     }
 };
+
+// The closed ring round the box (south, west, north, east).
+Ring box(double s, double w, double n, double e) { return closed({at(s, w), at(s, e), at(n, e), at(n, w)}); }
 
 // The ring from its k-th vertex on, the same ring written from another start.
 Ring rotated(const Ring& ring, size_t k) {
@@ -143,24 +161,407 @@ TEST(a_poi_one_step_inside_one_of_two_neighbours_links_to_that_one) {
     }
 }
 
-TEST(a_streets_postcode_is_the_postal_polygon_holding_most_of_its_vertices_wherever_its_centroid_lies) {
-    // Level-10 cells meet along the equator here. Two of the street's three
-    // vertices lie in a postal polygon wholly north of it; the third vertex
-    // and the vertex average lie south of it, in another postal polygon or
-    // in none.
-    const Ring street{at(0.010, 0.03), at(0.012, 0.03), at(-0.060, 0.03)};
-    const PackedLocation centroid = at((0.010 + 0.012 - 0.060) / 3, 0.03);
-    for (const bool south_polygon : {false, true}) {
-        Admins a;
-        const uint32_t north = a.add(11, closed({at(0.005, 0.02), at(0.005, 0.04), at(0.015, 0.04), at(0.015, 0.02)}));
-        if (south_polygon) a.add(11, closed({at(-0.07, 0.02), at(-0.07, 0.04), at(-0.005, 0.04), at(-0.005, 0.02)}));
-        a.add_way(street);
-        a.map();
-        CHECK(a.listed(street[0], north));
-        CHECK(!a.listed(centroid, north));
-        compute_way_parent_polygons(a.data, 1);
-        CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[north].name_id);
+TEST(a_streets_postcode_is_the_postal_area_at_its_middle_wherever_most_of_its_vertices_lie) {
+    // Nominatim takes a street's postcode at its centroid, the point halfway
+    // along it (get_center_point). Ten of the street's eleven vertices lie
+    // close together in a postal area south of the equator, where their
+    // average lies too; its long first stretch reaches north of it, into
+    // another postal area, which holds its middle. Level-10 cells meet along
+    // the equator here: that one is listed in the middle's cell, not in the
+    // vertex average's.
+    Ring street{at(0.050, 0.03)};
+    for (int k = 0; k < 10; k++) street.push_back(at(-0.005 - 0.001 * k, 0.03));
+    const PackedLocation average = at((0.050 - 0.095) / 11, 0.03), middle = at(0.018, 0.03);
+    Admins a;
+    const uint32_t north = a.add(11, box(0.005, 0.02, 0.06, 0.04), {}, "1000");
+    a.add(11, box(-0.07, 0.02, -0.002, 0.04), {}, "2000");
+    a.add_way(street);
+    a.map();
+    REQUIRE(a.listed(middle, north));
+    REQUIRE(!a.listed(average, north));
+    compute_way_parent_polygons(a.data, 1);
+    CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[north].name_id);
+}
+
+TEST(of_the_postal_areas_at_a_streets_middle_the_one_of_its_country_whose_centroid_is_nearest_names_it) {
+    // get_nearest_postcode takes, of the postal areas of the street's country
+    // covering its centroid, the one whose own centroid is nearest it
+    // (ORDER BY ST_Distance(p.centroid, geom)), whatever their size. A
+    // Swiss area and one of a postcode Germany can't have, each centred on
+    // the middle, name no German street.
+    const uint16_t de = pack_country_code('D', 'E'), ch = pack_country_code('C', 'H');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Deutschland", de);
+    a.add(2, box(1, 0, 2, 1), {}, "Schweiz", ch);
+    a.add(11, box(0.499, 0.509, 0.501, 0.511), {}, "8000", ch);
+    const uint32_t invalid = a.add(11, box(0.498, 0.508, 0.502, 0.512), {}, "123", de);
+    a.data.admin_polygons[invalid].place_type_override = POSTAL_AREA_INVALID;
+    a.add(11, box(0.49, 0.505, 0.502, 0.53), {}, "10115", de);
+    const uint32_t nearest = a.add(11, box(0.45, 0.46, 0.55, 0.56), {}, "10117", de);
+    a.add_way({at(0.5, 0.5098), at(0.5, 0.5102)});
+    a.map();
+    compute_way_parent_polygons(a.data, 1);
+    CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[nearest].name_id);
+}
+
+TEST(a_postal_area_of_no_country_names_no_street_of_a_country) {
+    // Nominatim makes no postcode area of a postal area of no country (get_matcher(None) is None,
+    // postcodes.py _update_postcode_areas), and get_nearest_postcode takes an area only of the
+    // street's own country (p.country_code = country). An area of no country centred on a German
+    // street's middle leaves the street to the German area round it; outside every country, a
+    // street takes the area of no country centred on it.
+    const uint16_t de = pack_country_code('D', 'E');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Deutschland", de);
+    a.add(11, box(0.499, 0.499, 0.501, 0.502), {}, "AB123");
+    const uint32_t german = a.add(11, box(0.45, 0.46, 0.55, 0.56), {}, "10115", de);
+    a.add_way({at(0.5, 0.5), at(0.5, 0.501)});
+    const uint32_t countryless = a.add(11, box(-0.501, 0.499, -0.499, 0.502), {}, "AB124");
+    a.add(11, box(-0.55, 0.46, -0.45, 0.56), {}, "10117", de);
+    a.add_way({at(-0.5, 0.5), at(-0.5, 0.501)});
+    a.map();
+    compute_way_parent_polygons(a.data, 1);
+    CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[german].name_id);
+    CHECK_EQ(a.data.way_postcode_ids[1], a.data.admin_polygons[countryless].name_id);
+}
+
+TEST(a_streets_postal_area_is_none_of_a_placeholder_or_a_list_of_postcodes) {
+    // The server's postal_area_postcode passes over an area whose postcode lists several or, past
+    // its spaces and hyphens, repeats one character (postcode_looks_valid). A US area of 00000,
+    // which the US pattern takes, centred on a street's middle leaves the street to the larger
+    // area of 10001 round it; outside every country, an area of 12345;12346 leaves it to 12345.
+    const uint16_t us = pack_country_code('U', 'S');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "United States", us);
+    a.add(11, box(0.499, 0.499, 0.501, 0.502), {}, "00000", us);
+    const uint32_t zip = a.add(11, box(0.45, 0.46, 0.55, 0.56), {}, "10001", us);
+    a.add_way({at(0.5, 0.5), at(0.5, 0.501)});
+    a.add(11, box(-0.501, 0.499, -0.499, 0.502), {}, "12345;12346");
+    const uint32_t plain = a.add(11, box(-0.55, 0.46, -0.45, 0.56), {}, "12345");
+    a.add_way({at(-0.5, 0.5), at(-0.5, 0.501)});
+    a.map();
+    compute_way_parent_polygons(a.data, 1);
+    CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[zip].name_id);
+    CHECK_EQ(a.data.way_postcode_ids[1], a.data.admin_polygons[plain].name_id);
+}
+
+TEST(a_streets_postal_area_has_a_postcode_its_country_takes_whatever_its_length) {
+    // Nominatim makes a postcode area of every postcode its country's pattern takes
+    // (postcodes.py _update_postcode_areas): Saudi Arabia's ddddd(?:-dddd)? takes 12345-6789,
+    // kept whole, and Iran's (ddddd)[-_ ]?(ddddd) 12345-67890, of 11 characters. Each, centred on
+    // a street's middle, names the street over the larger area round it.
+    const uint16_t sa = pack_country_code('S', 'A'), ir = pack_country_code('I', 'R');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Saudi Arabia", sa);
+    a.add(2, box(1, 0, 2, 1), {}, "Iran", ir);
+    const uint32_t extended = a.add(11, box(0.499, 0.499, 0.501, 0.502), {}, "12345-6789", sa);
+    a.add(11, box(0.45, 0.46, 0.55, 0.56), {}, "12345", sa);
+    a.add_way({at(0.5, 0.5), at(0.5, 0.501)});
+    const uint32_t iranian = a.add(11, box(1.499, 0.499, 1.501, 0.502), {}, "12345-67890", ir);
+    a.add(11, box(1.45, 0.46, 1.55, 0.56), {}, "1234567891", ir);
+    a.add_way({at(1.5, 0.5), at(1.5, 0.501)});
+    a.map();
+    compute_way_parent_polygons(a.data, 1);
+    CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[extended].name_id);
+    CHECK_EQ(a.data.way_postcode_ids[1], a.data.admin_polygons[iranian].name_id);
+}
+
+TEST(a_streets_postal_area_holds_its_middle_on_its_edges_too) {
+    // get_nearest_postcode takes the postal areas covering the street's centroid (ST_Covers,
+    // utils.sql:172), their edges included: streets whose middles lie on a postal area's north
+    // edge, on a hole's south edge and on the north edge of a ring of 120 vertices, which an edge
+    // index tests, take their areas' postcodes.
+    Admins a;
+    const uint32_t north = a.add(11, box(0.49, 0.5, 0.5, 0.51), {}, "1000");
+    a.add_way({at(0.5, 0.502), at(0.5, 0.504)});
+    const uint32_t holed = a.add(11, box(0.6, 0.5, 0.7, 0.6), {reversed(box(0.64, 0.54, 0.66, 0.56))}, "2000");
+    a.add_way({at(0.64, 0.545), at(0.64, 0.555)});
+    Ring dense;
+    for (int k = 0; k < 30; k++) dense.push_back(at(0.3, 0.5 + 0.01 * k / 30));
+    for (int k = 0; k < 30; k++) dense.push_back(at(0.3 + 0.1 * k / 30, 0.51));
+    for (int k = 0; k < 30; k++) dense.push_back(at(0.4, 0.51 - 0.01 * k / 30));
+    for (int k = 0; k < 30; k++) dense.push_back(at(0.4 - 0.1 * k / 30, 0.5));
+    const uint32_t indexed = a.add(11, closed(dense), {}, "3000");
+    a.add_way({at(0.4, 0.502), at(0.4, 0.504)});
+    a.map();
+    compute_way_parent_polygons(a.data, 1);
+    CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[north].name_id);
+    CHECK_EQ(a.data.way_postcode_ids[1], a.data.admin_polygons[holed].name_id);
+    CHECK_EQ(a.data.way_postcode_ids[2], a.data.admin_polygons[indexed].name_id);
+}
+
+TEST(a_poi_takes_no_postcode_of_a_postal_area_of_another_country) {
+    // get_nearest_postcode takes a postcode only of the POI's own country
+    // (p.country_code = country): a Swiss area reaching over the border, its
+    // centroid in Switzerland, names the Swiss POI and not the German one,
+    // which takes the larger German area round it.
+    const uint16_t de = pack_country_code('D', 'E'), ch = pack_country_code('C', 'H');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Deutschland", de);
+    a.add(2, box(1, 0, 2, 1), {}, "Schweiz", ch);
+    const uint32_t swiss = a.add(11, box(0.99, 0.4, 1.2, 0.6), {}, "8000", ch);
+    const uint32_t german = a.add(11, box(0.8, 0.3, 1.0, 0.7), {}, "79539", de);
+    a.add_poi(0.995f, 0.5f);
+    a.add_poi(1.01f, 0.5f);
+    a.map();
+    a.link_pois();
+    CHECK_EQ(a.data.poi_records[0].parent_postcode_id, a.data.admin_polygons[german].name_id);
+    CHECK_EQ(a.data.poi_records[1].parent_postcode_id, a.data.admin_polygons[swiss].name_id);
+}
+
+TEST(a_house_keeps_the_postcode_its_countrys_pattern_makes_of_its_tag) {
+    // The clean-postcodes sanitizer matches a house's addr:postcode in the house's own country
+    // (PostcodeFormatter.match: upper-cased, after an optional country code and a space or a
+    // hyphen, the pattern's output) and makes one that fails an address term, so the house has no
+    // postcode of its own and takes its street's (placex_update). A house outside every country
+    // known keeps its tag. The centroids are summed by the postcodes the houses keep: Germany's
+    // 78462 of four tags, the US 10001 of three.
+    const uint16_t de = pack_country_code('D', 'E'), us = pack_country_code('U', 'S');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Deutschland", de);
+    a.add(2, box(1, 0, 2, 1), {}, "United States", us);
+    a.map();
+    struct House {
+        double lat, lng;
+        const char* tag;
+        const char* kept;
+    };
+    const std::vector<House> houses = {
+        {0.5, 0.5, "78462", "78462"},       {0.5, 0.5, "DE-78462", "78462"},    {0.5, 0.5, "de 78462", "78462"},
+        {0.5, 0.5, " DE78462 ", "78462"},   {0.5, 0.5, "12ABC", nullptr},       {0.5, 0.5, "7846", nullptr},
+        {0.5, 0.5, "DE-7846", nullptr},     {0.5, 0.5, "US-78462", nullptr},    {0.5, 0.5, "78-462", nullptr},
+        {0.5, 0.5, "D-E-78462", nullptr},   {1.5, 0.5, "10001", "10001"},       {1.5, 0.5, "10001-2062", "10001"},
+        {1.5, 0.5, "US 10001-2062", "10001"}, {1.5, 0.5, "100012062", nullptr}, {1.5, 0.5, "1000", nullptr},
+        {1.5, 0.5, "00000", nullptr},       {5.0, 5.0, "12ABC", "12ABC"},
+    };
+    for (const House& h : houses) {
+        AddrPoint ap{};
+        ap.lat = static_cast<float>(h.lat);
+        ap.lng = static_cast<float>(h.lng);
+        ap.vertex_offset = NO_DATA;
+        a.data.addr_points.push_back(ap);
+        a.data.addr_postcode_ids.push_back(a.data.string_pool.intern(h.tag));
     }
+    normalise_addr_postcodes(a.data, 1);
+    std::vector<uint32_t> kept;
+    for (const House& h : houses) kept.push_back(h.kept ? a.data.string_pool.intern(h.kept) : NO_DATA);
+    collect_postcode_centroids(a.data);
+    for (size_t i = 0; i < houses.size(); i++) {
+        CHECK_EQ(a.data.addr_postcode_ids[i], kept[i]);
+        if (a.data.addr_postcode_ids[i] != kept[i])
+            std::printf("    \"%s\" at (%g, %g)\n", houses[i].tag, houses[i].lat, houses[i].lng);
+    }
+    const auto& accum = a.data.postcode_accum;
+    REQUIRE(accum.count(postcode_key(de, kept[0])) && accum.count(postcode_key(us, kept[10])));
+    CHECK_EQ(accum.at(postcode_key(de, kept[0])).count, uint64_t(4));
+    CHECK_EQ(accum.at(postcode_key(us, kept[10])).count, uint64_t(3));
+    CHECK_EQ(accum.size(), size_t(2));
+}
+
+TEST(a_centroid_takes_the_postcode_the_countrys_pattern_makes_of_the_tag_whatever_the_house_keeps) {
+    // update_postcodes sums the houses' addr:postcode tags as it reads them (placex.address) by the
+    // postcode their country's pattern makes of them, PostcodeFormatter's default .* where the
+    // country has none (_PostcodeCollector.add); the clean-postcodes sanitizer's default for a
+    // house's own is [A-Z0-9- ]{3,12}. Montserrat has no pattern: two houses of 12.A and 12.a keep
+    // no postcode of their own, and the centroid of 12.A is theirs, halfway between them; MSR1110
+    // is the house's and the centroid's alike. A copy of a house of 12.A, deduplicated before the
+    // centroids are summed (reorder_addr_points), is summed once.
+    const uint16_t ms = pack_country_code('M', 'S');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Montserrat", ms);
+    a.map();
+    struct House {
+        double lat, lng;
+        const char* tag;
+        uint64_t osm_id;
+    };
+    const std::vector<House> houses = {
+        {0.2, 0.2, "12.A", 1}, {0.4, 0.4, "12.a", 2}, {0.6, 0.6, "MSR1110", 3}, {0.2, 0.2, "12.A", 1},
+    };
+    for (const House& h : houses) {
+        AddrPoint ap{};
+        ap.lat = static_cast<float>(h.lat);
+        ap.lng = static_cast<float>(h.lng);
+        ap.vertex_offset = NO_DATA;
+        a.data.addr_points.push_back(ap);
+        a.data.addr_postcode_ids.push_back(a.data.string_pool.intern(h.tag));
+        a.data.addr_osm_ids.push_back(pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, h.osm_id));
+    }
+    normalise_addr_postcodes(a.data, 1);
+    const uint32_t twelve = a.data.string_pool.intern("12.A"), msr = a.data.string_pool.intern("MSR1110");
+    CHECK_EQ(a.data.addr_postcode_ids[0], NO_DATA);
+    CHECK_EQ(a.data.addr_postcode_ids[1], NO_DATA);
+    CHECK_EQ(a.data.addr_postcode_ids[2], msr);
+    // The copy goes as reorder_addr_points takes it out.
+    a.data.addr_points.pop_back();
+    a.data.addr_postcode_ids.pop_back();
+    a.data.addr_osm_ids.pop_back();
+    collect_postcode_centroids(a.data);
+    const auto& accum = a.data.postcode_accum;
+    REQUIRE(accum.count(postcode_key(ms, twelve)) && accum.count(postcode_key(ms, msr)));
+    CHECK_EQ(accum.at(postcode_key(ms, twelve)).count, uint64_t(2));
+    CHECK(std::abs(accum.at(postcode_key(ms, twelve)).lat() - 0.3) < 1e-6);
+    CHECK_EQ(accum.at(postcode_key(ms, msr)).count, uint64_t(1));
+    CHECK_EQ(accum.size(), size_t(2));
+}
+
+TEST(a_boundary_relation_repeating_its_closest_parent_relation_is_taken_out) {
+    // placex_update (placex_triggers.sql:909-931): a boundary=administrative relation of a rank
+    // above 0 whose closest boundary relation round it, of a lower admin level above 3 and a rank
+    // between 1 and 25, has its wikidata and geometry is in no address. In the Netherlands, where
+    // admin_level 9 ranks 0: a woonplaats (10) along its gemeente's (8) outline, written from
+    // another vertex and the other way round, of its wikidata, is taken out; one that links a
+    // place node repeats it too but takes the node's rank back (:1161), its own_place_type
+    // marking it, and links a node of no rank here; one of another wikidata is not, nor one
+    // round another outline; one under a level 9 boundary of the same outline and wikidata is,
+    // by the gemeente past it; a level 9 boundary itself, of rank 0, is not; one under a closed
+    // way of its outline is not, the province past the way having no wikidata of its; and a
+    // province along the country's outline, of its wikidata, is not, the country's level being
+    // under 4.
+    const uint16_t nl = pack_country_code('N', 'L');
+    Admins a;
+    struct Boundary {
+        uint8_t level;
+        Ring ring;
+        int64_t relation;  // 0 for a closed way
+        uint64_t qid;
+        bool links, repeats;
+    };
+    const Ring square = box(0.2, 0.2, 0.3, 0.3);
+    const std::vector<Boundary> boundaries = {
+        {4, box(0.1, 0.1, 0.9, 0.9), 4, 0, false, false},
+        {8, square, 8, 1, false, false},
+        {10, reversed(rotated(square, 2)), 10, 1, false, true},
+        {8, box(0.2, 0.4, 0.3, 0.5), 18, 2, true, false},
+        {10, box(0.2, 0.4, 0.3, 0.5), 20, 2, true, true},
+        {8, box(0.2, 0.6, 0.3, 0.7), 28, 3, false, false},
+        {10, box(0.2, 0.6, 0.3, 0.7), 30, 4, false, false},
+        {8, box(0.4, 0.2, 0.5, 0.3), 38, 5, false, false},
+        {10, box(0.41, 0.21, 0.49, 0.29), 40, 5, false, false},
+        {8, box(0.4, 0.4, 0.5, 0.5), 48, 6, false, false},
+        {9, box(0.4, 0.4, 0.5, 0.5), 49, 6, false, false},
+        {10, box(0.4, 0.4, 0.5, 0.5), 50, 6, false, true},
+        {8, box(0.4, 0.6, 0.5, 0.7), 0, 0, false, false},
+        {10, box(0.4, 0.6, 0.5, 0.7), 60, 7, false, false},
+        {4, box(0, 0, 1, 1), 64, 8, false, false},
+    };
+    a.add(2, box(0, 0, 1, 1), {}, "Nederland", nl);
+    a.data.admin_osm_ids.back() = admin_ring_id(2, 0);
+    for (const Boundary& b : boundaries) {
+        const uint32_t pid = a.add(b.level, b.ring);
+        a.data.admin_osm_ids[pid] = b.relation ? admin_ring_id(b.relation, 0) : way_boundary_id(1000 + pid);
+        if (b.qid) a.data.boundary_wikidata.push_back({relation_boundary_id(b.relation), b.qid});
+        if (b.links) a.data.linking_boundaries.push_back(relation_boundary_id(b.relation));
+    }
+    a.data.boundary_wikidata.push_back({relation_boundary_id(2), 8});
+    a.map();
+    compute_admin_parent_chain(a.data, 1);
+    CHECK_EQ(take_out_repeated_boundaries(a.data, 1), 3u);
+    for (size_t k = 0; k < boundaries.size(); k++) {
+        const bool out = boundaries[k].repeats && !boundaries[k].links;
+        const bool back = boundaries[k].repeats && boundaries[k].links;
+        const AdminPolygon& poly = a.data.admin_polygons[k + 1];
+        CHECK_EQ(poly.place_type_override, out ? BOUNDARY_REPEATS_PARENT : 0);
+        CHECK_EQ(poly.own_place_type, back ? BOUNDARY_REPEATS_PARENT : 0);
+        if (poly.place_type_override != (out ? BOUNDARY_REPEATS_PARENT : 0) ||
+            poly.own_place_type != (back ? BOUNDARY_REPEATS_PARENT : 0))
+            std::printf("    boundary %zu\n", k);
+    }
+}
+
+TEST(a_boundary_repeats_the_closest_relation_round_its_own_point) {
+    // placex_update compares a boundary with the boundary relation of the highest admin level
+    // round its centroid, of a lower level above 3 and a rank of 1 to 25 (placex_triggers.sql:
+    // 916-931). A level 10 boundary along a level 8 one, of its wikidata, lies under a level 9
+    // closed way, and under a level 9 relation of rank 0 in the Netherlands, each holding its
+    // point but reaching far east, their own points outside the pair: both repeat their level 8
+    // parent, found round their own point.
+    const uint16_t nl = pack_country_code('N', 'L');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Nederland", nl);
+    a.data.admin_osm_ids.back() = admin_ring_id(2, 0);
+    auto relation = [&](uint8_t level, const Ring& ring, int64_t id, uint64_t qid) {
+        const uint32_t pid = a.add(level, ring);
+        a.data.admin_osm_ids[pid] = admin_ring_id(id, 0);
+        if (qid) a.data.boundary_wikidata.push_back({relation_boundary_id(id), qid});
+        return pid;
+    };
+    relation(4, box(0.1, 0.1, 0.9, 0.9), 4, 0);
+    relation(8, box(0.2, 0.2, 0.3, 0.3), 8, 1);
+    const uint32_t under_way = relation(10, rotated(box(0.2, 0.2, 0.3, 0.3), 1), 10, 1);
+    const uint32_t way = a.add(9, box(0.24, 0.24, 0.26, 0.8));
+    a.data.admin_osm_ids[way] = way_boundary_id(1);
+    relation(8, box(0.5, 0.2, 0.6, 0.3), 18, 2);
+    const uint32_t under_rank0 = relation(10, box(0.5, 0.2, 0.6, 0.3), 20, 2);
+    relation(9, box(0.54, 0.24, 0.56, 0.8), 19, 0);
+    a.map();
+    compute_admin_parent_chain(a.data, 1);
+    CHECK_EQ(take_out_repeated_boundaries(a.data, 1), 2u);
+    CHECK_EQ(a.data.admin_polygons[under_way].place_type_override, BOUNDARY_REPEATS_PARENT);
+    CHECK_EQ(a.data.admin_polygons[under_rank0].place_type_override, BOUNDARY_REPEATS_PARENT);
+}
+
+TEST(a_boundary_repeats_a_parent_whose_outline_has_more_vertices_along_its_edges) {
+    // ST_Equals compares the outlines: a vertex along a straight edge, or two in a row, adds no
+    // point. A level 10 boundary with one on its south edge and two on its east edge, and a hole
+    // with one more, repeats its level 8 parent; one with a vertex an e7 step off the edge
+    // does not.
+    const uint16_t pl = pack_country_code('P', 'L');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Polska", pl);
+    a.data.admin_osm_ids.back() = admin_ring_id(2, 0);
+    auto relation = [&](uint8_t level, const Ring& ring, const std::vector<Ring>& holes, int64_t id) {
+        const uint32_t pid = a.add(level, ring, holes);
+        a.data.admin_osm_ids[pid] = admin_ring_id(id, 0);
+        a.data.boundary_wikidata.push_back({relation_boundary_id(id), id < 20 ? 1u : 2u});
+        return pid;
+    };
+    relation(4, box(0.1, 0.1, 0.9, 0.9), {}, 4);
+    const Ring hole = reversed(box(0.24, 0.24, 0.26, 0.26));
+    relation(8, box(0.2, 0.2, 0.3, 0.3), {hole}, 8);
+    const Ring more = closed({at(0.2, 0.2), at(0.2, 0.25), at(0.2, 0.3), at(0.24, 0.3), at(0.27, 0.3), at(0.3, 0.3),
+                              at(0.3, 0.2)});
+    const Ring hole_more = closed({at(0.24, 0.24), at(0.26, 0.24), at(0.26, 0.26), at(0.25, 0.26), at(0.24, 0.26)});
+    const uint32_t repeats = relation(10, more, {hole_more}, 10);
+    relation(8, box(0.5, 0.2, 0.6, 0.3), {}, 28);
+    const Ring off = closed({at(0.5, 0.2), PackedLocation{at(0.5, 0.25).lat_e7 + 1, at(0.5, 0.25).lon_e7}, at(0.5, 0.3),
+                             at(0.6, 0.3), at(0.6, 0.2)});
+    const uint32_t differs = relation(10, off, {}, 30);
+    a.map();
+    compute_admin_parent_chain(a.data, 1);
+    CHECK_EQ(take_out_repeated_boundaries(a.data, 1), 1u);
+    CHECK_EQ(a.data.admin_polygons[repeats].place_type_override, BOUNDARY_REPEATS_PARENT);
+    CHECK_EQ(a.data.admin_polygons[differs].place_type_override, 0);
+}
+
+TEST(every_ring_of_a_boundary_that_repeats_its_parent_is_taken_out_and_only_of_equal_rings) {
+    // ST_Equals: a relation of two outer rings, one with a hole, repeats one of the same rings in
+    // another order, and every ring of it is taken out; one whose hole differs does not, nor one
+    // under it that lacks its other ring.
+    const uint16_t pl = pack_country_code('P', 'L');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Polska", pl);
+    a.data.admin_osm_ids.back() = admin_ring_id(2, 0);
+    const Ring west = box(0.2, 0.2, 0.4, 0.4), east = box(0.2, 0.5, 0.4, 0.7);
+    const Ring hole = reversed(box(0.25, 0.55, 0.3, 0.6)), other_hole = reversed(box(0.25, 0.55, 0.31, 0.6));
+    auto add = [&](uint8_t level, int64_t relation, uint16_t ring, const Ring& outer, const std::vector<Ring>& holes) {
+        const uint32_t pid = a.add(level, outer, holes);
+        a.data.admin_osm_ids[pid] = admin_ring_id(relation, ring);
+        return pid;
+    };
+    const uint32_t parent_west = add(6, 6, 0, west, {}), parent_east = add(6, 6, 1, east, {hole});
+    const uint32_t same_east = add(7, 7, 0, rotated(east, 1), {hole}), same_west = add(7, 7, 1, west, {});
+    const uint32_t holed_west = add(8, 8, 0, west, {}), holed_east = add(8, 8, 1, east, {other_hole});
+    const uint32_t lacking = add(9, 9, 0, east, {other_hole});
+    for (int64_t relation : {6, 7, 8, 9}) a.data.boundary_wikidata.push_back({relation_boundary_id(relation), 270});
+    a.data.linking_boundaries.push_back(relation_boundary_id(6));
+    a.map();
+    compute_admin_parent_chain(a.data, 1);
+    CHECK_EQ(take_out_repeated_boundaries(a.data, 1), 1u);
+    CHECK_EQ(a.data.admin_polygons[same_east].place_type_override, BOUNDARY_REPEATS_PARENT);
+    CHECK_EQ(a.data.admin_polygons[same_west].place_type_override, BOUNDARY_REPEATS_PARENT);
+    for (uint32_t pid : {parent_west, parent_east, holed_west, holed_east, lacking})
+        CHECK_EQ(a.data.admin_polygons[pid].place_type_override, 0);
 }
 
 TEST(a_point_finds_no_country_where_only_its_simplified_rings_reach_its_cell) {
