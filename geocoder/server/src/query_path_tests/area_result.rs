@@ -55,6 +55,12 @@ fn a_street_or_a_house_within_nominatims_reach_answers_instead() {
     // So does a house 600 m east (0.0055 degrees at 10 degrees north).
     let index = telfer(Some(5000.0)).address("12", 0.0, 600.0).load();
     assert_eq!(address_at(&index, 0.0, 0.0).get("locality"), None);
+    // And a named POI whose centre is 500 m north, which no street parents: a rank-30 row of
+    // placex, as near as the reach, whatever its street.
+    let mut dataset = telfer(Some(5000.0));
+    let name_id = dataset.string("Old Mine Museum");
+    let index = with_polygon_poi(dataset.load(), name_id, NO_DATA, (450.0, -50.0, 550.0, 50.0));
+    assert_eq!(address_at(&index, 0.0, 0.0).get("locality"), None);
 }
 
 #[test]
@@ -77,6 +83,17 @@ fn a_place_node_inside_the_locality_and_near_enough_answers_instead() {
     let address = address_at(&index, 0.0, 0.0);
     assert_eq!(address.get("locality"), None);
     assert_eq!(address["hamlet"], "Punmu");
+    // 1.5 km due north it lies outside its fuzzy area, which reaches 1 km, but within the
+    // diameter (0.0135 degrees): the hamlet answers, leading the answer.
+    let index = telfer(Some(5000.0)).place("Punmu", 4, 1500.0, 0.0).load();
+    let address = address_at(&index, 0.0, 0.0);
+    assert_eq!(address.get("locality"), None);
+    assert_eq!(address["hamlet"], "Punmu");
+    assert_eq!(display(&index, 0.0, 0.0), "Punmu, Western Australia, Testland");
+    // Of two nodes in reach, the one of the higher rank_search: a neighbourhood (24) 1.5 km off over
+    // a village (19) 2.5 km off, neither of whose fuzzy areas holds the point.
+    let index = telfer(Some(5000.0)).place("Punmu", 2, 2500.0, 0.0).place("Camp Seven", 5, -1500.0, 0.0).load();
+    assert_eq!(display(&index, 0.0, 0.0), "Camp Seven, Western Australia, Testland");
     let index = telfer(Some(5000.0)).place("Punmu", 4, 2000.0, 2200.0).load();
     assert_eq!(address_at(&index, 0.0, 0.0)["locality"], "Telfer");
     // Outside Telfer, a hamlet as near answers nothing for it.

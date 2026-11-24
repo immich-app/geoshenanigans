@@ -1966,17 +1966,17 @@ impl Index {
         result
     }
 
-    /// The area of AREA_RESULT_RANK that answers the point of `scan` itself, with its label (its
-    /// place type's field, else its rank's), where nothing nearer does: reverse.py's lookup_area
-    /// (_lookup_area_address). Of the areas round the point of rank_address 4 to 25 but 5 and 11
-    /// (a postal area or a country is none), named, it takes the one of the highest rank_search,
-    /// and the smallest of equal ones stands for the one Nominatim's order happens to take; only
-    /// one of AREA_RESULT_RANK, in no address of the others, needs an answer of its own. A place
-    /// node of a higher rank_search inside it, as near as its reverse_place_diameter in degrees,
-    /// answers instead (_place_inside_area_query), its own address leaving the area out.
-    /// `country` is the point's, upper case. The caller knows nothing nearer answers: no street,
-    /// house or POI.
-    pub fn area_result<'a>(&'a self, scan: &mut AdminScan, country: &str) -> Option<(&'static str, Cow<'a, str>)> {
+    /// What answers the point of `scan` where nothing nearer does, inside an area of
+    /// AREA_RESULT_RANK: reverse.py's lookup_area (_lookup_area_address). Of the areas round the
+    /// point of rank_address 4 to 25 but 5 and 11 (a postal area or a country is none), named, it
+    /// takes the one of the highest rank_search, and the smallest of equal ones stands for the
+    /// one Nominatim's order happens to take; only one of AREA_RESULT_RANK, in no address of the
+    /// others, needs an answer of its own. Of the place nodes inside it of a higher rank_search,
+    /// each as near as its reverse_place_diameter in degrees, the one of the highest rank_search,
+    /// then the nearest, answers instead (_place_inside_area_query), its own address leaving the
+    /// area out. `country` is the point's, upper case. The caller knows nothing nearer answers: no
+    /// street, house or POI.
+    pub fn area_result<'a>(&'a self, scan: &mut AdminScan, country: &str) -> Option<AreaAnswer<'a>> {
         let mut near: Vec<(u32, AdminPolygon)> = Vec::new();
         scan.for_each_entry(|_, id, poly| {
             let rank = poly.rank_address;
@@ -2003,20 +2003,28 @@ impl Index {
         if let Some(lowest) = PLACE_NODE_SEARCH_RANK.iter().copied().filter(|&r| r > rank_search).min() {
             let (lat, lng) = scan.pip.point.degrees();
             let cells = cells_near_point(lat, lng, reverse_place_diameter(lowest) * METRES_PER_DEGREE, self.admin_cell_level);
-            let mut nearer = false;
+            // The best node so far: (rank_search, distance, node).
+            let mut best: Option<(u8, f64, PlaceNode)> = None;
             self.for_each_place_in(cells, |pn| {
                 let Some(&node_search) = PLACE_NODE_SEARCH_RANK.get(pn.place_type as usize) else { return };
-                if nearer || node_search <= rank_search || pn.name_id == NO_DATA { return; }
-                let (dlat, dlng) = (f64::from(pn.lat) - lat, f64::from(pn.lng) - lng);
-                if (dlat * dlat + dlng * dlng).sqrt() >= reverse_place_diameter(node_search) { return; }
-                nearer = self.admin_geometry.contains_once(&area, AdminPoint::new(f64::from(pn.lat), f64::from(pn.lng)));
+                if node_search <= rank_search || pn.name_id == NO_DATA || pn.rank_address == 0 { return; }
+                let distance = (f64::from(pn.lat) - lat).hypot(f64::from(pn.lng) - lng);
+                if distance >= reverse_place_diameter(node_search) { return; }
+                if best.is_some_and(|(r, d, _)| (r, -d) >= (node_search, -distance)) { return; }
+                if self.admin_geometry.contains_once(&area, AdminPoint::new(f64::from(pn.lat), f64::from(pn.lng))) {
+                    best = Some((node_search, distance, pn));
+                }
             });
-            if nearer { return None; }
+            if let Some((_, _, node)) = best {
+                return Some(AreaAnswer::Node(AddressRow {
+                    rank: node.rank_address, name: self.get_string(node.name_id), label: Some(PLACE_NODE_FIELDS[node.place_type as usize]),
+                }));
+            }
         }
         let label = place_type_to_field(area.place_type_override)
             .or_else(|| rank_to_field(area.rank_address))
             .unwrap_or("city_block");
-        Some((label, name))
+        Some(AreaAnswer::Area(AddressRow { rank: AREA_RESULT_RANK, name, label: Some(label) }))
     }
 
     /// Nominatim's address walk (insert_addresslines) over the areas `ranked` of an address
@@ -2133,14 +2141,26 @@ impl Index {
         rows
     }
 
-    /// Whether a street or an address point lies within STREET_POI_REACH_DEG of (lat, lng), or
-    /// `poi` (the nearest of the POIs, with its squared distance): Nominatim answers with the
-    /// nearest of those (_find_closest_street_or_pois), whose address leaves an area of rank 25
-    /// out, where the street cells next to the point's, which our own search reads, hold none.
-    fn feature_within_reach(&self, lat: f64, lng: f64, poi: Option<&(f64, PoiRecord)>) -> bool {
+    /// Whether a street, an address point or a POI lies within STREET_POI_REACH_DEG of (lat,
+    /// lng): Nominatim answers with the nearest of those (_find_closest_street_or_pois), whose
+    /// address leaves an area of rank 25 out, where the street cells next to the point's, which
+    /// our own search reads, hold none. A street by its line; a house or a POI by its point, as
+    /// Nominatim takes an area's centroid; a POI of any class Nominatim makes a rank-30 row of but
+    /// a building (poi_category_to_osm_class), with a street of its own or not.
+    fn feature_within_reach(&self, lat: f64, lng: f64) -> bool {
         let near = |plat: f64, plng: f64| (plat - lat).hypot(plng - lng) <= STREET_POI_REACH_DEG;
-        if poi.is_some_and(|(d, p)| *d == 0.0 || near(f64::from(p.lat), f64::from(p.lng))) {
-            return true;
+        if let (Some(poi_index), true) = (self.poi_index.as_ref(), self.poi_records.is_some()) {
+            let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+            let mut found = false;
+            for c in std::iter::once(cell).chain(cell_neighbors_at_level(cell, self.admin_cell_level)) {
+                poi_index.for_each(c, |id| {
+                    if found { return; }
+                    let Some(poi) = self.poi_record(id & ID_MASK) else { return };
+                    found = poi_category_to_osm_class(poi.category).is_some_and(|class| class != "building")
+                        && poi.name_id != NO_DATA && near(f64::from(poi.lat), f64::from(poi.lng));
+                });
+                if found { return true; }
+            }
         }
         let Some(streets) = self.streets.as_ref() else { return false };
         let cells = cells_near_point(lat, lng, STREET_POI_REACH_DEG * METRES_PER_DEGREE, self.street_cell_level);
@@ -3423,7 +3443,7 @@ impl Index {
         // out.
         let area_result = if self.streets.is_some() && closest_feature_dist >= max_dist && landmark_name.is_none() {
             let country = admin.country_code.map(|c| String::from_utf8_lossy(&c).to_uppercase()).unwrap_or_default();
-            self.area_result(&mut admin_scan, &country).filter(|_| !self.feature_within_reach(lat, lng, poi_primary_raw.as_ref()))
+            self.area_result(&mut admin_scan, &country).filter(|_| !self.feature_within_reach(lat, lng))
         } else {
             None
         };
@@ -3494,9 +3514,15 @@ impl Index {
             country_code,
             ..AddressDetails::default()
         };
-        // The area that answers where nothing nearer does leads (area_result).
-        if let Some((label, name)) = area_result {
-            rows.insert(0, AddressRow { rank: AREA_RESULT_RANK, name, label: Some(label) });
+        // What answers where nothing nearer does leads (area_result): an area of AREA_RESULT_RANK,
+        // or a place node inside it, whose own address has only the rows of the ranks below its.
+        match area_result {
+            Some(AreaAnswer::Area(row)) => rows.insert(0, row),
+            Some(AreaAnswer::Node(row)) => {
+                rows.retain(|r| r.rank < row.rank);
+                rows.insert(0, row);
+            }
+            None => {}
         }
         address.label(rows);
         let display_name = format_address(&address);
@@ -5707,6 +5733,13 @@ impl<'a> AdminResult<'a> {
     pub fn is_empty(&self) -> bool {
         self.rows.iter().all(|row| row.label.is_none())
     }
+}
+
+/// What answers a point where no street, house or POI is near, inside an area of
+/// AREA_RESULT_RANK (Index::area_result): the area, or a place node inside it, each as its row.
+pub enum AreaAnswer<'a> {
+    Area(AddressRow<'a>),
+    Node(AddressRow<'a>),
 }
 
 /// A row of an address as Nominatim's complete_address_details shows it
