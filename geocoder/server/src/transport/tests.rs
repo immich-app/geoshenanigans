@@ -462,6 +462,16 @@ fn fixture_datasets_come_back_and_the_readers_read_them_as_before() {
 }
 
 #[test]
+fn a_place_area_s_own_place_type_comes_back() {
+    // A record's last byte is a column of its own: a place area (admin_level 15) of its own
+    // place=suburb (4), labelled town (2) by the node it links.
+    let record = AdminPolygon { place_type_override: 2, own_place_type: 4, ..crate::arc_fixture::record(3, 15, 0.25) };
+    let bytes = record.record_bytes().to_vec();
+    assert_eq!((bytes[14], bytes[15]), (15 << 4 | 2, 4));
+    round_trip(Kind::Cols, Some("admin_polygons.bin"), &[("admin_polygons.bin", bytes)]);
+}
+
+#[test]
 fn empty_members_of_every_kind_come_back() {
     let (places, _) = crate::place_files::encode(&[], crate::DEFAULT_ADMIN_CELL_LEVEL);
     round_trip(Kind::Places, None, &members_of(Kind::Places, vec![places.cells, places.nodes, places.hidden]));
@@ -534,7 +544,7 @@ fn golden_sets() -> Vec<(&'static str, Kind, Option<&'static str>, Files)> {
     for (ring_offset, name_id, area, country_code, admin_level) in [(0, 7, 0.5f32, 528u16, 2u8), (96, 11, 0.0625, 528, 8), (160, 12, 3.25, 36, 4)] {
         let p = AdminPolygon {
             ring_offset, ring_bytes: 0, name_id, admin_level, place_type_override: (admin_level == 8) as u8, own_place_type: 0, area,
-            country_code,
+            country_code, of_way: false,
         };
         polygons.extend(p.record_bytes());
     }

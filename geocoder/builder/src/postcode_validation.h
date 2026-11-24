@@ -1,244 +1,380 @@
 #pragma once
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <optional>
+#include <regex>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 #include "country_code.h"
 
-// Auto-generated from Nominatim settings/country_settings.yaml
-// Validates postcodes against per-country patterns.
-// cc must be lowercase 2-char country code.
-inline bool validate_postcode_for_country(const char* cc, const char* pc) {
-    if (!cc || !cc[0] || !cc[1] || !pc || !pc[0]) return false;
-    uint16_t key = pack_country_code(cc[0], cc[1]);
-    std::string bare;
-    for (const char* p = pc; *p; p++) {
-        char c = *p;
-        if (c >= 'a' && c <= 'z') c -= 32;
-        if (c != ' ' && c != '-') bare += c;
+// From Nominatim's settings/country_settings.yaml, matched as its
+// src/nominatim_db/data/postcode_format.py matches them.
+
+// Whether the country cc (a lower-case code) has no postcodes (postcode: no),
+// none of which Nominatim takes.
+inline bool country_without_postcodes(const char* cc) {
+    if (!cc || !cc[0] || !cc[1]) return false;
+    switch (pack_country_code(cc[0], cc[1])) {
+        case ('a' << 8 | 'e'):
+        case ('a' << 8 | 'g'):
+        case ('a' << 8 | 'o'):
+        case ('b' << 8 | 'f'):
+        case ('b' << 8 | 'i'):
+        case ('b' << 8 | 'j'):
+        case ('b' << 8 | 'o'):
+        case ('b' << 8 | 's'):
+        case ('b' << 8 | 'w'):
+        case ('b' << 8 | 'z'):
+        case ('c' << 8 | 'd'):
+        case ('c' << 8 | 'f'):
+        case ('c' << 8 | 'g'):
+        case ('c' << 8 | 'i'):
+        case ('c' << 8 | 'k'):
+        case ('c' << 8 | 'm'):
+        case ('d' << 8 | 'j'):
+        case ('d' << 8 | 'm'):
+        case ('e' << 8 | 'r'):
+        case ('f' << 8 | 'j'):
+        case ('g' << 8 | 'a'):
+        case ('g' << 8 | 'd'):
+        case ('g' << 8 | 'm'):
+        case ('g' << 8 | 'q'):
+        case ('g' << 8 | 'y'):
+        case ('j' << 8 | 'm'):
+        case ('k' << 8 | 'i'):
+        case ('k' << 8 | 'm'):
+        case ('k' << 8 | 'p'):
+        case ('l' << 8 | 'y'):
+        case ('m' << 8 | 'l'):
+        case ('m' << 8 | 'r'):
+        case ('m' << 8 | 'w'):
+        case ('n' << 8 | 'r'):
+        case ('n' << 8 | 'u'):
+        case ('q' << 8 | 'a'):
+        case ('r' << 8 | 'w'):
+        case ('s' << 8 | 'b'):
+        case ('s' << 8 | 'c'):
+        case ('s' << 8 | 'l'):
+        case ('s' << 8 | 'r'):
+        case ('s' << 8 | 's'):
+        case ('s' << 8 | 't'):
+        case ('s' << 8 | 'y'):
+        case ('t' << 8 | 'd'):
+        case ('t' << 8 | 'g'):
+        case ('t' << 8 | 'k'):
+        case ('t' << 8 | 'l'):
+        case ('t' << 8 | 'o'):
+        case ('t' << 8 | 'v'):
+        case ('u' << 8 | 'g'):
+        case ('v' << 8 | 'u'):
+        case ('y' << 8 | 'e'):
+        case ('z' << 8 | 'w'):
+            return true;
+        default:
+            return false;
     }
-    size_t len = bare.size();
-    if (len == 0 || len > 10) return false;
-    auto is_d = [](char c) { return c >= '0' && c <= '9'; };
-    auto is_l = [](char c) { return c >= 'A' && c <= 'Z'; };
-    (void)is_d; (void)is_l;
-    switch (key) {
-        case ('a' << 8 | 'e'): return false;
-        case ('a' << 8 | 'g'): return false;
-        case ('a' << 8 | 'o'): return false;
-        case ('b' << 8 | 'f'): return false;
-        case ('b' << 8 | 'i'): return false;
-        case ('b' << 8 | 'j'): return false;
-        case ('b' << 8 | 'o'): return false;
-        case ('b' << 8 | 's'): return false;
-        case ('b' << 8 | 'w'): return false;
-        case ('b' << 8 | 'z'): return false;
-        case ('c' << 8 | 'd'): return false;
-        case ('c' << 8 | 'f'): return false;
-        case ('c' << 8 | 'g'): return false;
-        case ('c' << 8 | 'i'): return false;
-        case ('c' << 8 | 'k'): return false;
-        case ('c' << 8 | 'm'): return false;
-        case ('d' << 8 | 'j'): return false;
-        case ('d' << 8 | 'm'): return false;
-        case ('e' << 8 | 'r'): return false;
-        case ('f' << 8 | 'j'): return false;
-        case ('g' << 8 | 'a'): return false;
-        case ('g' << 8 | 'd'): return false;
-        case ('g' << 8 | 'm'): return false;
-        case ('g' << 8 | 'q'): return false;
-        case ('g' << 8 | 'y'): return false;
-        case ('j' << 8 | 'm'): return false;
-        case ('k' << 8 | 'i'): return false;
-        case ('k' << 8 | 'm'): return false;
-        case ('k' << 8 | 'p'): return false;
-        case ('l' << 8 | 'y'): return false;
-        case ('m' << 8 | 'l'): return false;
-        case ('m' << 8 | 'r'): return false;
-        case ('m' << 8 | 'w'): return false;
-        case ('n' << 8 | 'r'): return false;
-        case ('n' << 8 | 'u'): return false;
-        case ('q' << 8 | 'a'): return false;
-        case ('r' << 8 | 'w'): return false;
-        case ('s' << 8 | 'b'): return false;
-        case ('s' << 8 | 'c'): return false;
-        case ('s' << 8 | 'l'): return false;
-        case ('s' << 8 | 'r'): return false;
-        case ('s' << 8 | 's'): return false;
-        case ('s' << 8 | 't'): return false;
-        case ('s' << 8 | 'y'): return false;
-        case ('t' << 8 | 'd'): return false;
-        case ('t' << 8 | 'g'): return false;
-        case ('t' << 8 | 'k'): return false;
-        case ('t' << 8 | 'l'): return false;
-        case ('t' << 8 | 'o'): return false;
-        case ('t' << 8 | 'v'): return false;
-        case ('u' << 8 | 'g'): return false;
-        case ('v' << 8 | 'u'): return false;
-        case ('y' << 8 | 'e'): return false;
-        case ('z' << 8 | 'w'): return false;
-        case ('a' << 8 | 'd'): return true; // (ddd)
-        case ('a' << 8 | 'f'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('a' << 8 | 'i'): return true; // 2640
-        case ('a' << 8 | 'l'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('a' << 8 | 'm'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('a' << 8 | 'r'): return true; // l?dddd(?:lll)?
-        case ('a' << 8 | 't'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('a' << 8 | 'u'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('a' << 8 | 'z'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('b' << 8 | 'a'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('b' << 8 | 'b'): return true; // (ddddd)
-        case ('b' << 8 | 'd'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('b' << 8 | 'e'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('b' << 8 | 'g'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('b' << 8 | 'h'): return (len == 4 || len == 5) && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('b' << 8 | 'm'): return true; // (ll)[ -]?(dd)
-        case ('b' << 8 | 'n'): return true; // (ll) ?(dddd)
-        case ('b' << 8 | 'r'): return len == 8 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('b' << 8 | 't'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('b' << 8 | 'y'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('c' << 8 | 'a'): return len == 6 && is_l(bare[0]) && is_d(bare[1]) && is_l(bare[2]) && is_d(bare[3]) && is_l(bare[4]) && is_d(bare[5]);
-        case ('c' << 8 | 'h'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('c' << 8 | 'l'): return len == 7 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('c' << 8 | 'n'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('c' << 8 | 'o'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('c' << 8 | 'r'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('c' << 8 | 'u'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('c' << 8 | 'v'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('c' << 8 | 'y'): return true; // (?:99|d)ddd
-        case ('c' << 8 | 'z'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('d' << 8 | 'e'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('d' << 8 | 'k'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('d' << 8 | 'o'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('d' << 8 | 'z'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('e' << 8 | 'c'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('e' << 8 | 'e'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('e' << 8 | 'g'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('e' << 8 | 's'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('e' << 8 | 't'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('f' << 8 | 'i'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('f' << 8 | 'k'): return true; // FIQQ 1ZZ
-        case ('f' << 8 | 'm'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('f' << 8 | 'o'): return len == 3 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('f' << 8 | 'r'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('g' << 8 | 'b'): return len >= 5 && len <= 7 && is_d(bare[len-3]) && is_l(bare[len-2]) && is_l(bare[len-1]);
-        case ('g' << 8 | 'e'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('g' << 8 | 'g'): return true; // (GYdd?) ?(dll)
-        case ('g' << 8 | 'h'): return true; // ll-d?ddd-dddd
-        case ('g' << 8 | 'i'): return true; // (GX11) ?(1AA)
-        case ('g' << 8 | 'l'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('g' << 8 | 'n'): return len == 3 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('g' << 8 | 'r'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('g' << 8 | 's'): return true; // (SIQQ) ?(1ZZ)
-        case ('g' << 8 | 't'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('g' << 8 | 'w'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('h' << 8 | 'n'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('h' << 8 | 'r'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('h' << 8 | 't'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('h' << 8 | 'u'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('i' << 8 | 'd'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('i' << 8 | 'e'): return true; // (ldd) ?([0123456789ACDEFHKNPRTVWXY]{4})
-        case ('i' << 8 | 'l'): return len == 7 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('i' << 8 | 'm'): return true; // (IMdd?) ?(dll)
-        case ('i' << 8 | 'n'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('i' << 8 | 'o'): return true; // (BBND) ?(1ZZ)
-        case ('i' << 8 | 'q'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('i' << 8 | 'r'): return true; // (ddddd)[-_ ]?(ddddd)
-        case ('i' << 8 | 's'): return len == 3 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('i' << 8 | 't'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('j' << 8 | 'e'): return true; // (JEdd?) ?(dll)
-        case ('j' << 8 | 'o'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('j' << 8 | 'p'): return len == 7 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('k' << 8 | 'e'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('k' << 8 | 'g'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('k' << 8 | 'h'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('k' << 8 | 'n'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('k' << 8 | 'r'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('k' << 8 | 'w'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('k' << 8 | 'y'): return true; // (d)-(dddd)
-        case ('k' << 8 | 'z'): return true; // (?:lddldld|dddddd)
-        case ('l' << 8 | 'a'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('l' << 8 | 'b'): return true; // (dddd)(?: ?dddd)?
-        case ('l' << 8 | 'c'): return true; // (dd) ?(ddd)
-        case ('l' << 8 | 'i'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('l' << 8 | 'k'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('l' << 8 | 'r'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('l' << 8 | 's'): return len == 3 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('l' << 8 | 't'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('l' << 8 | 'u'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('l' << 8 | 'v'): return true; // (dddd)
-        case ('m' << 8 | 'a'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('m' << 8 | 'c'): return true; // 980dd
-        case ('m' << 8 | 'd'): return true; // (dddd)
-        case ('m' << 8 | 'e'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('m' << 8 | 'g'): return len == 3 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('m' << 8 | 'h'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('m' << 8 | 'k'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('m' << 8 | 'm'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('m' << 8 | 'n'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('m' << 8 | 't'): return true; // (lll) ?(dddd)
-        case ('m' << 8 | 'u'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('m' << 8 | 'v'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('m' << 8 | 'x'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('m' << 8 | 'y'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('m' << 8 | 'z'): return true; // (dddd)(?:-dd)?
-        case ('n' << 8 | 'a'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('n' << 8 | 'e'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('n' << 8 | 'g'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('n' << 8 | 'i'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('n' << 8 | 'l'): return len == 6 && is_d(bare[0]) && is_d(bare[1]) && is_d(bare[2]) && is_d(bare[3]) && is_l(bare[4]) && is_l(bare[5]);
-        case ('n' << 8 | 'o'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('n' << 8 | 'p'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('n' << 8 | 'z'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('o' << 8 | 'm'): return len == 3 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('p' << 8 | 'a'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('p' << 8 | 'e'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('p' << 8 | 'g'): return len == 3 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('p' << 8 | 'h'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('p' << 8 | 'k'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('p' << 8 | 'l'): return true; // (dd)[ -]?(ddd)
-        case ('p' << 8 | 'n'): return true; // (PCRN) ?(1ZZ)
-        case ('p' << 8 | 's'): return len == 3 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('p' << 8 | 't'): return true; // dddd(?:-ddd)?
-        case ('p' << 8 | 'w'): return true; // 969(39|40)
-        case ('p' << 8 | 'y'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('r' << 8 | 'o'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('r' << 8 | 's'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('r' << 8 | 'u'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('s' << 8 | 'a'): return true; // ddddd(?:-dddd)?
-        case ('s' << 8 | 'd'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('s' << 8 | 'e'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('s' << 8 | 'g'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('s' << 8 | 'h'): return true; // (ASCN|STHL|TDCU) ?(1ZZ)
-        case ('s' << 8 | 'i'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('s' << 8 | 'k'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('s' << 8 | 'm'): return true; // 4789d
-        case ('s' << 8 | 'n'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('s' << 8 | 'o'): return true; // (ll) ?(ddddd)
-        case ('s' << 8 | 'v'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('s' << 8 | 'z'): return true; // lddd
-        case ('t' << 8 | 'c'): return true; // (TKCA) ?(1ZZ)
-        case ('t' << 8 | 'h'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('t' << 8 | 'j'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('t' << 8 | 'm'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('t' << 8 | 'n'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('t' << 8 | 'r'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('t' << 8 | 't'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('t' << 8 | 'w'): return true; // ddd(?:ddd?)?
-        case ('t' << 8 | 'z'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('u' << 8 | 'a'): return (len == 6 || len == 7) && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('u' << 8 | 's'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('u' << 8 | 'y'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('u' << 8 | 'z'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('v' << 8 | 'a'): return true; // 00120
-        case ('v' << 8 | 'c'): return true; // (dddd)
-        case ('v' << 8 | 'e'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('v' << 8 | 'g'): return true; // (dddd)
-        case ('v' << 8 | 'n'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('x' << 8 | 'k'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('z' << 8 | 'a'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('z' << 8 | 'm'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        default: return len >= 3 && len <= 10;
+}
+
+// A postcode entry of country_settings.yaml as written there: the country
+// (lower case), its pattern (d a digit, l a letter) and its output, null for
+// none (\g<0>, the match). A country of a list of patterns
+// (ListPostcodeMatcher) has an entry of each, in the list's order; a country
+// of no entry and of postcodes takes the default.
+struct PostcodeFormat {
+    const char* cc;
+    const char* pattern;
+    const char* output;
+};
+inline constexpr PostcodeFormat kPostcodeFormats[] = {
+    {"ad", "(ddd)", "AD\\1"},
+    {"af", "dddd", nullptr},
+    {"ai", "2640", "AI-2640"},
+    {"al", "dddd", nullptr},
+    {"am", "dddd", nullptr},
+    {"ar", "l?dddd(?:lll)?", nullptr},
+    {"at", "dddd", nullptr},
+    {"au", "dddd", nullptr},
+    {"az", "dddd", nullptr},
+    {"ba", "ddddd", nullptr},
+    {"bb", "(ddddd)", "BB\\1"},
+    {"bd", "dddd", nullptr},
+    {"be", "dddd", nullptr},
+    {"bg", "dddd", nullptr},
+    {"bh", "d?ddd", nullptr},
+    {"bm", "(ll)[ -]?(dd)", "\\1 \\2"},
+    {"bn", "(ll) ?(dddd)", "\\1\\2"},
+    {"br", "(ddddd)-?(ddd)", "\\1-\\2"},
+    {"bt", "ddddd", nullptr},
+    {"by", "dddddd", nullptr},
+    {"ca", "(ldl) ?(dld)", "\\1 \\2"},
+    {"ch", "dddd", nullptr},
+    {"cl", "ddddddd", nullptr},
+    {"cn", "dddddd", nullptr},
+    {"co", "dddddd", nullptr},
+    {"cr", "ddddd", nullptr},
+    {"cu", "ddddd", nullptr},
+    {"cv", "dddd", nullptr},
+    {"cy", "(?:99|d)ddd", nullptr},
+    {"cz", "(ddd) ?(dd)", "\\1 \\2"},
+    {"de", "ddddd", nullptr},
+    {"dk", "dddd", nullptr},
+    {"do", "ddddd", nullptr},
+    {"dz", "ddddd", nullptr},
+    {"ec", "dddddd", nullptr},
+    {"ee", "ddddd", nullptr},
+    {"eg", "ddddd", nullptr},
+    {"es", "ddddd", nullptr},
+    {"et", "dddd", nullptr},
+    {"fi", "ddddd", nullptr},
+    {"fk", "FIQQ ?1ZZ", "FIQQ 1ZZ"},
+    {"fm", "ddddd", nullptr},
+    {"fo", "ddd", nullptr},
+    {"fr", "ddddd", nullptr},
+    {"gb", "(l?ld[A-Z0-9]?) ?(dll)", "\\1 \\2"},
+    {"ge", "dddd", nullptr},
+    {"gg", "(GYdd?) ?(dll)", "\\1 \\2"},
+    {"gh", "ll-d?ddd-dddd", nullptr},
+    {"gi", "(GX11) ?(1AA)", "GX11 1AA"},
+    {"gl", "dddd", nullptr},
+    {"gn", "ddd", nullptr},
+    {"gr", "(ddd) ?(dd)", "\\1 \\2"},
+    {"gs", "(SIQQ) ?(1ZZ)", "\\1 \\2"},
+    {"gt", "ddddd", nullptr},
+    {"gw", "dddd", nullptr},
+    {"hn", "ddddd", nullptr},
+    {"hr", "ddddd", nullptr},
+    {"ht", "dddd", nullptr},
+    {"hu", "dddd", nullptr},
+    {"id", "ddddd", nullptr},
+    {"ie", "(ldd) ?([0123456789ACDEFHKNPRTVWXY]{4})", "\\1 \\2"},
+    {"il", "ddddddd", nullptr},
+    {"im", "(IMdd?) ?(dll)", "\\1 \\2"},
+    {"in", "(ddd) ?(ddd)", "\\1\\2"},
+    {"io", "(BBND) ?(1ZZ)", "\\1 \\2"},
+    {"iq", "ddddd", nullptr},
+    {"ir", "(ddddd)[-_ ]?(ddddd)", "\\1-\\2"},
+    {"is", "ddd", nullptr},
+    {"it", "ddddd", nullptr},
+    {"je", "(JEdd?) ?(dll)", "\\1 \\2"},
+    {"jo", "ddddd", nullptr},
+    {"jp", "(ddd)-?(dddd)", "\\1-\\2"},
+    {"ke", "ddddd", nullptr},
+    {"kg", "dddddd", nullptr},
+    {"kh", "dddddd", nullptr},
+    {"kn", "dddd", nullptr},
+    {"kr", "ddddd", nullptr},
+    {"kw", "ddddd", nullptr},
+    {"ky", "(d)-(dddd)", "KY\\1-\\2"},
+    {"kz", "(?:lddldld|dddddd)", nullptr},
+    {"la", "ddddd", nullptr},
+    {"lb", "(dddd)(?: ?dddd)?", nullptr},
+    {"lc", "(dd) ?(ddd)", "LC\\1 \\2"},
+    {"li", "dddd", nullptr},
+    {"lk", "ddddd", nullptr},
+    {"lr", "dddd", nullptr},
+    {"ls", "ddd", nullptr},
+    {"lt", "ddddd", nullptr},
+    {"lu", "dddd", nullptr},
+    {"lv", "(dddd)", "LV-\\1"},
+    {"ma", "ddddd", nullptr},
+    {"mc", "980dd", nullptr},
+    {"md", "(dddd)", "MD-\\1"},
+    {"me", "ddddd", nullptr},
+    {"mg", "ddd", nullptr},
+    {"mh", "ddddd", nullptr},
+    {"mk", "dddd", nullptr},
+    {"mm", "ddddd", nullptr},
+    {"mn", "ddddd", nullptr},
+    {"mt", "(lll) ?(dddd)", "\\1 \\2"},
+    {"mu", "ddddd", nullptr},
+    {"mv", "ddddd", nullptr},
+    {"mx", "ddddd", nullptr},
+    {"my", "ddddd", nullptr},
+    {"mz", "(dddd)(?:-dd)?", nullptr},
+    {"na", "ddddd", nullptr},
+    {"ne", "dddd", nullptr},
+    {"ng", "dddddd", nullptr},
+    {"ng", "(ll)[ -]?(dd)[ -]?([A-Z0-9]{3})[ -]?(ll)[ -]?(dd)", "\\1-\\2-\\3-\\4-\\5"},
+    {"ni", "ddddd", nullptr},
+    {"nl", "(dddd) ?(ll)", "\\1 \\2"},
+    {"no", "dddd", nullptr},
+    {"np", "ddddd", nullptr},
+    {"nz", "dddd", nullptr},
+    {"om", "ddd", nullptr},
+    {"pa", "dddd", nullptr},
+    {"pe", "ddddd", nullptr},
+    {"pg", "ddd", nullptr},
+    {"ph", "dddd", nullptr},
+    {"pk", "ddddd", nullptr},
+    {"pl", "(dd)[ -]?(ddd)", "\\1-\\2"},
+    {"pn", "(PCRN) ?(1ZZ)", "\\1 \\2"},
+    {"ps", "ddd", nullptr},
+    {"pt", "dddd(?:-ddd)?", nullptr},
+    {"pw", "969(39|40)", nullptr},
+    {"py", "dddddd", nullptr},
+    {"ro", "dddddd", nullptr},
+    {"rs", "ddddd", nullptr},
+    {"ru", "dddddd", nullptr},
+    {"sa", "ddddd(?:-dddd)?", nullptr},
+    {"sd", "ddddd", nullptr},
+    {"se", "(ddd) ?(dd)", "\\1 \\2"},
+    {"sg", "dddddd", nullptr},
+    {"sh", "(ASCN|STHL|TDCU) ?(1ZZ)", "\\1 \\2"},
+    {"si", "dddd", nullptr},
+    {"sk", "(ddd) ?(dd)", "\\1 \\2"},
+    {"sm", "4789d", nullptr},
+    {"sn", "ddddd", nullptr},
+    {"so", "(ll) ?(ddddd)", "\\1 \\2"},
+    {"sv", "dddd", nullptr},
+    {"sz", "lddd", nullptr},
+    {"tc", "(TKCA) ?(1ZZ)", "\\1 \\2"},
+    {"th", "ddddd", nullptr},
+    {"tj", "dddddd", nullptr},
+    {"tm", "dddddd", nullptr},
+    {"tn", "dddd", nullptr},
+    {"tr", "ddddd", nullptr},
+    {"tt", "dddddd", nullptr},
+    {"tw", "ddd(?:ddd?)?", nullptr},
+    {"tz", "ddddd", nullptr},
+    {"ua", "d?ddddd", nullptr},
+    {"us", "(ddddd)(?:-dddd)?", "\\1"},
+    {"uy", "ddddd", nullptr},
+    {"uz", "dddddd", nullptr},
+    {"va", "00120", nullptr},
+    {"vc", "(dddd)", "VC\\1"},
+    {"ve", "dddd", nullptr},
+    {"vg", "(dddd)", "VG\\1"},
+    {"vn", "ddddd", nullptr},
+    {"xk", "ddddd", nullptr},
+    {"za", "dddd", nullptr},
+    {"zm", "dddd", nullptr},
+};
+
+// The pattern of a country without one of its own: PostcodeFormatter's
+// default, .*, which update_postcodes keeps for postal areas and centroids,
+// or the clean-postcodes sanitizer's default-pattern, [A-Z0-9- ]{3,12}
+// (settings/sanitizers.yaml), for a feature's own tag.
+enum class PostcodeDefault : uint8_t { Any, Sanitizer };
+
+namespace postcode_detail {
+
+// Python's \s in a str pattern, over UTF-8: the ASCII white space and
+// \x1c-\x1f, U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F,
+// U+205F and U+3000.
+inline const std::string kWhite =
+    "(?:[\\t\\n\\v\\f\\r \\x1c-\\x1f]|\\xc2[\\x85\\xa0]|\\xe1\\x9a\\x80|"
+    "\\xe2\\x80[\\x80\\x81\\x82\\x83\\x84\\x85\\x86\\x87\\x88\\x89\\x8a\\xa8\\xa9\\xaf]|\\xe2\\x81\\x9f|\\xe3\\x80\\x80)*";
+
+// A SimplePostcodeMatcher: norm_pattern \s*(?:CC[ -]?)?(pattern)\s*, the
+// pattern, and the output.
+struct Matcher {
+    std::regex norm, pattern;
+    const char* output;  // null: the match
+};
+
+inline Matcher compile(const char* cc_upper, const char* pattern, const char* output) {
+    std::string pc;
+    for (const char* p = pattern; *p; p++) pc += *p == 'd' ? "[0-9]" : *p == 'l' ? "[A-Z]" : std::string(1, *p);
+    Matcher m{std::regex(kWhite + "(?:" + cc_upper + "[ -]?)?(" + pc + ")" + kWhite), std::regex(pc), output};
+    // The outputs refer to groups as \1 to \9, one digit, which expand reads.
+    for (const char* o = output ? output : ""; *o; o++) {
+        if (*o != '\\') continue;
+        if (o[1] < '1' || o[1] > '9' || (o[2] >= '0' && o[2] <= '9') ||
+            static_cast<unsigned>(o[1] - '0') > m.pattern.mark_count())
+            throw std::logic_error(std::string("postcode output of an unread escape: ") + output);
+        o++;
     }
+    return m;
+}
+
+// match.expand(output): the output with each \N its group N, empty where
+// the group took no part.
+inline std::string expand(const std::smatch& m, const char* output) {
+    if (!output) return m.str(0);
+    std::string out;
+    for (const char* o = output; *o; o++) {
+        if (*o == '\\') out += m.str(static_cast<size_t>(*++o - '0'));
+        else out += *o;
+    }
+    return out;
+}
+
+struct Matchers {
+    // By the country's pack_country_code in upper case, ascending.
+    std::vector<std::pair<uint16_t, std::vector<Matcher>>> countries;
+    std::vector<Matcher> any, sanitizer;
+
+    Matchers() {
+        for (const PostcodeFormat& f : kPostcodeFormats) {
+            const char upper[3] = {static_cast<char>(f.cc[0] - 32), static_cast<char>(f.cc[1] - 32), 0};
+            const uint16_t key = pack_country_code(upper[0], upper[1]);
+            if (countries.empty() || countries.back().first != key) countries.push_back({key, {}});
+            countries.back().second.push_back(compile(upper, f.pattern, f.output));
+        }
+        if (!std::is_sorted(countries.begin(), countries.end(),
+                            [](const auto& a, const auto& b) { return a.first < b.first; }))
+            throw std::logic_error("kPostcodeFormats out of country order");
+        // Python's . takes any character but a line feed.
+        any.push_back(compile("", "[^\\n]*", nullptr));
+        sanitizer.push_back(compile("", "[A-Z0-9- ]{3,12}", nullptr));
+    }
+
+    const std::vector<Matcher>& of(uint16_t cc, PostcodeDefault fallback) const {
+        const auto it = std::lower_bound(countries.begin(), countries.end(), cc,
+                                         [](const auto& c, uint16_t key) { return c.first < key; });
+        if (it != countries.end() && it->first == cc) return it->second;
+        return fallback == PostcodeDefault::Any ? any : sanitizer;
+    }
+};
+
+// Compiled once, at the first match.
+inline const Matchers& matchers() {
+    static const Matchers m;
+    return m;
+}
+
+}  // namespace postcode_detail
+
+// Whether the country cc (pack_country_code of its upper-case code) has a
+// pattern of its own (kPostcodeFormats), which the clean-postcodes sanitizer
+// and update_postcodes both match by; one without takes each one's default
+// (PostcodeDefault).
+inline bool postcode_pattern_of_its_own(uint16_t cc) {
+    const auto& countries = postcode_detail::matchers().countries;
+    const auto it = std::lower_bound(countries.begin(), countries.end(), cc,
+                                     [](const auto& c, uint16_t key) { return c.first < key; });
+    return it != countries.end() && it->first == cc;
+}
+
+// The postcode Nominatim makes of the tag pc in the country cc
+// (pack_country_code of its upper-case code, 0 for none), or none where it
+// takes none, as PostcodeFormatter.match: none of no country or of one
+// without postcodes; else, of the country's patterns in order (its default
+// where it has none), the first whose norm_pattern matches the tag in upper
+// case whole and whose pattern matches its group whole, neither all zeros,
+// hyphens and spaces (zero_pattern), its output of that match. Only the
+// ASCII letters go to upper case, all a pattern reads: the default .* keeps
+// the others of its match as they are, which Python's upper raises too.
+inline std::optional<std::string> match_postcode(uint16_t cc, std::string_view pc, PostcodeDefault fallback) {
+    const char lower[3] = {static_cast<char>(std::tolower(cc >> 8)), static_cast<char>(std::tolower(cc & 0xFF)), 0};
+    if (cc == 0 || country_without_postcodes(lower)) return std::nullopt;
+    std::string upper(pc);
+    for (char& c : upper)
+        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 32);
+    for (const postcode_detail::Matcher& f : postcode_detail::matchers().of(cc, fallback)) {
+        std::smatch norm;
+        if (!std::regex_match(upper, norm, f.norm)) continue;
+        const std::string group = norm.str(1);
+        std::smatch m;
+        if (!std::regex_match(group, m, f.pattern)) continue;
+        if (!group.empty() && group.find_first_not_of("0- ") == std::string::npos) continue;
+        return postcode_detail::expand(m, f.output);
+    }
+    return std::nullopt;
 }

@@ -25,11 +25,13 @@ fn a_place_area_keeps_its_place_rank_round_smaller_boundaries() {
 }
 
 #[test]
-fn a_place_area_lifts_a_boundary_only_from_rank_23_down_and_round_its_surface_point() {
-    // Prairie Township (R7238290, admin_level 7, rank 14) and Westland, a place=neighbourhood area
-    // (rank 24) a little larger, round the point but not round the township's middle. Nominatim
-    // lifts a boundary only into a place area of rank 1 to 23 that contains it (:912-929), so the
-    // township keeps 14 under either. A place=quarter area (22) round it lifts it to 24.
+fn a_place_area_lifts_a_boundary_only_from_rank_23_down_and_holding_all_of_it() {
+    // Prairie Township (R7238290, admin_level 7, rank 14) under Westland, a place=neighbourhood
+    // area (rank 24) a little larger round it, and under Lincoln Village, a place=quarter area
+    // (22) larger than it round its middle and the point, but not round its southern strip.
+    // Nominatim lifts a boundary only into a place area of rank 1 to 23 that contains it whole
+    // (:912-929, ST_Contains), so the township keeps 14 under either. A place=quarter area round
+    // it lifts it to 24.
     let township = |area: (&str, u8, Span)| {
         TestIndex::in_country(b"US")
             .boundary("Ohio", 4, 7, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
@@ -38,13 +40,13 @@ fn a_place_area_lifts_a_boundary_only_from_rank_23_down_and_round_its_surface_po
             .boundary(area.0, 15, area.1, area.2)
             .load()
     };
-    // Round the township's middle, rank 24.
+    // Round all of the township, rank 24.
     let index = township(("Westland", 5, (-3500.0, -3500.0, 3500.0, 3500.0)));
     let address = address_at(&index, 1000.0, 1000.0);
     assert_eq!(address["municipality"], "Prairie Township");
     assert_eq!(address["neighbourhood"], "Westland");
-    // Rank 22, larger, round the point but not round the township's middle.
-    let index = township(("Lincoln Village", 6, (500.0, 500.0, 7000.0, 7000.0)));
+    // Rank 22, larger, round the point and the township's middle, the strip south of 2,500 m out.
+    let index = township(("Lincoln Village", 6, (-2500.0, -4000.0, 3500.0, 3500.0)));
     let address = address_at(&index, 1000.0, 1000.0);
     assert_eq!(address["municipality"], "Prairie Township");
     assert_eq!(address["quarter"], "Lincoln Village");
@@ -135,4 +137,158 @@ fn the_admin_nested_step_stops_at_rank_25_which_no_address_shows() {
     let address = address_at(&index, 0.0, 0.0);
     assert_eq!(address["neighbourhood"], "Upper Ward");
     assert_eq!(address["city"], "Town");
+}
+
+#[test]
+fn a_boundary_that_repeats_its_parent_leaves_its_level_to_a_larger_one_round_the_point() {
+    // is_same gives a boundary that repeats its parent rank_address 0 (placex_triggers.sql:915-932),
+    // and a boundary of rank 0 is no address area (:1273): every other boundary covering the
+    // point is a candidate (getNearFeatures), a larger one of the same level too, which names the
+    // city round the repeat.
+    let index = TestIndex::new()
+        .boundary("Greater Town", 8, 0, (-10_000.0, -10_000.0, 10_000.0, 10_000.0))
+        .boundary("Old Town", 8, BOUNDARY_REPEATS_PARENT, (-2000.0, -2000.0, 2000.0, 2000.0))
+        .load();
+    let address = address_at(&index, 0.0, 0.0);
+    assert_eq!(address["city"], "Greater Town");
+}
+
+#[test]
+fn a_boundary_that_repeats_its_parent_gates_and_promotes_no_place_node() {
+    // A boundary of rank 0 promotes no place node (placex_triggers.sql:994, rank_address between
+    // 1 and 25) and is no address area (:1273), so it is never the boundary the address walk's
+    // later candidates must lie in: the town node 3 km off, outside the repeat round the point
+    // but inside the county, is the town.
+    let index = TestIndex::new()
+        .boundary("Some County", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Old Town", 8, BOUNDARY_REPEATS_PARENT, (-2000.0, -2000.0, 2000.0, 2000.0))
+        .place("Newtown", 1, 3000.0, 0.0)
+        .load();
+    let address = address_at(&index, 0.0, 0.0);
+    assert_eq!(address["town"], "Newtown");
+    assert_eq!(address["county"], "Some County");
+}
+
+#[test]
+fn every_boundary_of_a_level_round_the_smallest_holding_the_point_ranks() {
+    // Brussels centre (50.85045, 4.34878): Nominatim takes every boundary of a rank above 0
+    // covering the point (getNearFeatures, placex_triggers.sql:1273), one row a rank. The level 9
+    // boundary repeating the city ranks 0, so Bruxelles - Brussel (admin_level 10, 18 in Belgium)
+    // round Quays Quarter (10, place=neighbourhood, 24) has the city (8, linked to the city node,
+    // 16) for its parent, keeps 18 and is the city_district.
+    let index = TestIndex::in_country(b"BE")
+        .boundary("Brussels-Capital", 4, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Brussels", 8, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Brussels", 9, BOUNDARY_REPEATS_PARENT, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Bruxelles - Brussel", 10, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+        .boundary("Quays Quarter", 10, 5, (-500.0, -500.0, 500.0, 500.0))
+        .load();
+    let address = address_at(&index, 0.0, 0.0);
+    assert_eq!(address["city"], "Brussels");
+    assert_eq!(address["city_district"], "Bruxelles - Brussel");
+    assert_eq!(address["neighbourhood"], "Quays Quarter");
+}
+
+#[test]
+fn a_larger_boundary_of_the_level_beside_the_smallest_holding_the_point_takes_no_rank() {
+    // Simplified neighbours overlap along their shared border: at a point in the overlap the
+    // larger level 10 boundary, a suburb, holds the point but not the smaller one, a
+    // neighbourhood, round which it would be a row of its own.
+    let index = TestIndex::new()
+        .boundary("Town", 8, 0, (-10_000.0, -10_000.0, 10_000.0, 10_000.0))
+        .boundary("West End", 10, 5, (-1000.0, -2000.0, 1000.0, 20.0))
+        .boundary("Eastfield", 10, 4, (-1500.0, -20.0, 1500.0, 3000.0))
+        .load();
+    let address = address_at(&index, 0.0, 0.0);
+    assert_eq!(address["neighbourhood"], "West End");
+    assert_eq!(address.get("suburb"), None);
+    assert_eq!(address["city"], "Town");
+}
+
+#[test]
+fn a_place_node_ranked_above_the_boundary_of_its_label_names_the_field() {
+    // Upton (52.231927, -0.936684): the parish of Upton (R1638092, admin_level 10, rank 20) is
+    // labelled suburb by its rank, and the place=suburb node St Crispin's inside it ranks 22
+    // (placex_triggers.sql:984-1003). Nominatim's address keeps the first row of a label, its rows
+    // the finest first (format_json.py, results.py), so the node is the suburb; display_name joins
+    // every row, the parish's too. At an equal rank the boundary's row comes first (isguess asc,
+    // :576).
+    let index = TestIndex::in_country(b"GB")
+        .boundary("England", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("West Northamptonshire", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Upton", 10, 0, (-2000.0, -2000.0, 2000.0, 2000.0))
+        .place("St Crispin's", 3, 300.0, 200.0)
+        .load();
+    let answer = serde_json::to_value(index.query(at(0.0, 0.0).lat as f64, at(0.0, 0.0).lng as f64)).unwrap();
+    assert_eq!(answer["address"]["suburb"], "St Crispin's");
+    assert_eq!(answer["display_name"], "St Crispin's, Upton, West Northamptonshire, England, Testland");
+}
+
+#[test]
+fn of_two_boundaries_of_a_level_round_the_point_at_one_rank_the_smaller_alone_is_in_the_address() {
+    // Nominatim's address has a row a rank (insert_addresslines: address_havelevel), and only those
+    // rows fill fields and display_name (format_json.py, results.py). A level 8 town of rank 16,
+    // labelled city by its rank, inside a level 8 boundary tagged place=town, of rank 16 as well
+    // (placex_triggers.sql:1192), round the point by the town's middle: the town is the city, and
+    // the boundary round it names nothing.
+    let index = TestIndex::new()
+        .boundary("Some County", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Greater Town", 8, 2, (-10_000.0, -10_000.0, 10_000.0, 10_000.0))
+        .boundary("Old Town", 8, 0, (1000.0, 1000.0, 3000.0, 3000.0))
+        .load();
+    let answer = serde_json::to_value(index.query(at(2000.0, 2000.0).lat as f64, at(2000.0, 2000.0).lng as f64)).unwrap();
+    assert_eq!(answer["address"]["city"], "Old Town");
+    assert_eq!(answer["address"].get("town"), None);
+    assert_eq!(answer["display_name"], "Old Town, Some County, Testland");
+}
+
+#[test]
+fn a_place_area_in_the_address_holds_the_place_nodes_of_finer_ranks_to_itself() {
+    // Abu Dhabi (24.458103, 54.336461): the place=suburb way Al Bateen (W873221092, rank 20) is the
+    // suburb of the address, and the place=suburb node Al Khalidiyah north of it lies in the city
+    // but not in that way. Nominatim's address walk sets current_boundary to every row it takes
+    // that is no place node, a place area as much as a boundary, and passes over a place node
+    // outside it (insert_addresslines, placex_triggers.sql:583-586, :622-632). Here a
+    // neighbourhood node 400 m north of the point, its fuzzy square round the point, lies in the
+    // city and outside the suburb's area: it is in no address of the point.
+    let index = TestIndex::in_country(b"AE")
+        .boundary("Abu Dhabi Emirate", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Abu Dhabi", 8, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Al Bateen", 15, 4, (-300.0, -300.0, 300.0, 300.0))
+        .place("Al Khalidiyah", 5, 400.0, 0.0)
+        .load();
+    let address = address_at(&index, 0.0, 0.0);
+    assert_eq!(address["city"], "Abu Dhabi");
+    assert_eq!(address["suburb"], "Al Bateen");
+    assert_eq!(address.get("neighbourhood"), None);
+    // Inside the suburb's area the node is the neighbourhood.
+    let index = TestIndex::in_country(b"AE")
+        .boundary("Abu Dhabi Emirate", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Abu Dhabi", 8, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Al Bateen", 15, 4, (-300.0, -300.0, 500.0, 300.0))
+        .place("Al Khalidiyah", 5, 400.0, 0.0)
+        .load();
+    assert_eq!(address_at(&index, 0.0, 0.0)["neighbourhood"], "Al Khalidiyah");
+}
+
+#[test]
+fn a_place_area_of_a_closed_way_promotes_no_place_node_of_its_rank() {
+    // Bat Yam (32.012156, 34.756722): the place=suburb way בת ים (W1219784953, rank 20) holds the
+    // place=suburb node Ramat HaNasi (rank 20). placex_update raises a place node to a subpart,
+    // two ranks up, only inside a relation of its rank (osm_type = 'R',
+    // placex_triggers.sql:984-1004), so the node stays at 20, where the area's row comes first
+    // (isguess asc, :576): the area is the suburb. Inside a place=suburb relation the node ranks
+    // 22 and, the finer row, is the suburb.
+    let bat_yam = |way: bool| {
+        let mut index = TestIndex::in_country(b"IL");
+        index.boundary("Tel-Aviv District", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+            .boundary("Bat Yam", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Bat Yam West", 15, 4, (-1000.0, -1000.0, 1000.0, 1000.0));
+        if way { index.of_way(); }
+        index.place("Ramat HaNasi", 3, 300.0, 200.0).load()
+    };
+    let address = address_at(&bat_yam(true), 0.0, 0.0);
+    assert_eq!(address["suburb"], "Bat Yam West");
+    let address = address_at(&bat_yam(false), 0.0, 0.0);
+    assert_eq!(address["suburb"], "Ramat HaNasi");
 }

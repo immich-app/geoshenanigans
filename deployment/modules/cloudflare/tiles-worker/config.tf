@@ -5,11 +5,7 @@ terraform {
   required_providers {
     cloudflare = {
       source  = "cloudflare/cloudflare"
-      version = "4.52.10"
-    }
-    grafana = {
-      source  = "grafana/grafana"
-      version = "4.54.0"
+      version = "5.29.0"
     }
   }
 }
