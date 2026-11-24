@@ -15,11 +15,11 @@
 // water dir's layer as its index's water. The cells: of the polygons with the largest ring
 // blocks (200), the L10 cells they reach where their entry is not interior, scored by the rings
 // of every non-interior entry there; the `cells` best (default 40), each sampled at 5 x 5
-// points. Each point's answer with water names the water the lookup finds there, and the one
-// without names none. Each point is timed `rounds` times (default 200) warm, by each of the
-// three, and its medians kept. Prints each cell, then p50 and p99 over the points of the lookup
-// and of both answers, and of the answer with water against the one without, point by point and
-// as quantiles.
+// points. Each point's answer with water is the one without but for its water field, which
+// names the lookup's water there (name, class and type), and is absent where it finds none.
+// Each point is timed `rounds` times (default 200) warm, by each of the three, and its medians
+// kept. Prints each cell, then p50 and p99 over the points of the lookup and of both answers,
+// and of the answer with water against the one without, point by point and as quantiles.
 use query_server::{
     cell_id_at_level, cell_pairs, mmap_file, AdminGeometry, AdminPolygon, CellPairs, ContinentSlot, Index,
     MultiIndex, WaterLayer, ADMIN_POLYGON_RECORD_BYTES, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE,
@@ -87,10 +87,9 @@ fn world(dir: &str, water: Option<WaterLayer>) -> MultiIndex {
     }
 }
 
-/// The name of the water an answer's JSON holds, if it holds one.
-fn named_water(json: &str) -> Option<String> {
-    let answer: serde_json::Value = serde_json::from_str(json).expect("an answer's JSON");
-    answer.get("water").map(|w| w["name"].as_str().expect("a water name").to_string())
+/// An answer's JSON, parsed.
+fn parsed(json: &str) -> serde_json::Value {
+    serde_json::from_str(json).expect("an answer's JSON")
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -184,12 +183,16 @@ fn main() {
                 if cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL) != cell {
                     continue;
                 }
-                let water = layer.at(lat, lng).map(|w| w.name.into_owned());
-                held += usize::from(water.is_some());
-                let dry_water = named_water(&dry.query_json(lat, lng));
-                let wet_water = named_water(&wet.query_json(lat, lng));
-                assert_eq!(dry_water, None, "the water the answer without water at ({lat}, {lng}) names");
-                assert_eq!(wet_water, water, "the water the answer with water at ({lat}, {lng}) names");
+                // The answer with water is the one without, but for its water field: the
+                // lookup's name, class and type, absent where it finds none.
+                let water = serde_json::to_value(layer.at(lat, lng)).unwrap();
+                held += usize::from(!water.is_null());
+                let dry_answer = parsed(&dry.query_json(lat, lng));
+                let mut wet_answer = parsed(&wet.query_json(lat, lng));
+                let wet_water = wet_answer.as_object_mut().expect("an answer's object").remove("water");
+                assert_eq!(dry_answer.get("water"), None, "the water the answer without water at ({lat}, {lng}) names");
+                assert_eq!(wet_answer, dry_answer, "the answers with and without water at ({lat}, {lng}), but for the water");
+                assert_eq!(wet_water.unwrap_or_default(), water, "the water the answer with water at ({lat}, {lng}) names");
                 let (mut l, mut d, mut w) = (Vec::new(), Vec::new(), Vec::new());
                 for _ in 0..rounds {
                     let t = Instant::now();

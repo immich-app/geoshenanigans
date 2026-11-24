@@ -4231,10 +4231,17 @@ mod query_tests {
             assert_eq!(got.map(|g| g["water"].clone()), [named("Gulf of Aqaba", "natural", "bay"), named("Gulf of Aqaba", "natural", "bay")]);
         }
         // Water counts for nothing in the pick: of two empty addresses the first answers, with
-        // the water of the second.
+        // the water of the second, and so does the first of two that tie, a state each.
         let got = json(vec![("africa", index(&[], &[])), ("asia", with(index(&[], &[]), water("Gulf of Suez", BAY, gulf)))]);
         assert_eq!(got, serde_json::json!({"address": {}, "water": named("Gulf of Suez", "natural", "bay")}));
         assert_eq!(json(vec![("africa", index(&[], &[])), ("asia", index(&[], &[]))]), serde_json::json!({"address": {}}));
+        let north = ("North Sinai", 4, [27.5, 32.6, 29.5, 34.6]);
+        for (first, second) in [(egypt, north), (north, egypt)] {
+            let mut want = serde_json::to_value(index(&[first], &[]).query(lat, lng)).unwrap();
+            want["water"] = named("Gulf of Suez", "natural", "bay");
+            let got = json(vec![("africa", index(&[first], &[])), ("asia", with(index(&[second], &[]), water("Gulf of Suez", BAY, gulf)))]);
+            assert_eq!(got, want, "{}", first.0);
+        }
     }
 
     /// (metres north of `origin()`, metres east, name or None for a tombstone, category,
