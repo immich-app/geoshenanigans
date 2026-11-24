@@ -205,6 +205,33 @@ TEST(a_water_object_of_a_less_important_category_ships_as_its_water_kind_in_the_
     CHECK(select_poi_tier(dead, slot, MAJOR).indices.empty());
 }
 
+TEST(a_reservoir_point_a_tier_ships_in_place_of_its_poi_links_no_parent_street) {
+    // A generic rank-30 point of a wiki tag (tier 3) that is a reservoir
+    // (tier 2), linked to its parent street: poi/notable ships the
+    // RESERVOIR in its place, which never takes the primary slot, of no
+    // parent street, and poi/all the POI, of its parent street. A reservoir
+    // area, which the server keeps out of the lanes, keeps it, as a bay
+    // point does.
+    PoiRecord point = poi(PoiCategory::GENERIC_RANK30, 3);
+    point.flags = poi_flags_with_water(POI_FLAG_WIKIDATA, PoiCategory::RESERVOIR);
+    point.parent_street_id = 7;
+    const PoiRecord reservoir = poi_record_in_tier(point, NOTABLE);
+    CHECK_EQ(int(reservoir.category), int(PoiCategory::RESERVOIR));
+    CHECK_EQ(int(reservoir.tier), 2);
+    CHECK_EQ(reservoir.parent_street_id, NO_DATA);
+    const PoiRecord generic = poi_record_in_tier(point, ALL);
+    CHECK_EQ(int(generic.category), int(PoiCategory::GENERIC_RANK30));
+    CHECK_EQ(generic.parent_street_id, uint32_t(7));
+
+    PoiRecord area = point;
+    area.vertex_count = 5;
+    CHECK_EQ(poi_record_in_tier(area, NOTABLE).parent_street_id, uint32_t(7));
+    PoiRecord bay = point;
+    bay.flags = poi_flags_with_water(POI_FLAG_WIKIDATA, PoiCategory::BAY);
+    CHECK_EQ(int(poi_record_in_tier(bay, NOTABLE).category), int(PoiCategory::BAY));
+    CHECK_EQ(poi_record_in_tier(bay, NOTABLE).parent_street_id, uint32_t(7));
+}
+
 TEST(poi_flags_carry_each_water_kind_and_none) {
     CHECK(poi_water_of(0) == PoiCategory::UNKNOWN);
     CHECK(poi_water_of(POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA | POI_FLAG_HIGHWAY) == PoiCategory::UNKNOWN);

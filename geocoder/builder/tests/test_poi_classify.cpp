@@ -715,6 +715,41 @@ TEST(poi_classify_a_reservoir_point_kept_out_of_the_poi_lane_never_takes_the_pri
     }
 }
 
+TEST(poi_classify_a_reservoir_point_in_place_of_a_poi_no_dir_ships_never_takes_the_primary_slot) {
+    // A reservoir or basin point that is an emergency=suction_point too is a
+    // rank-30 POI of class emergency in Nominatim (landuse=* is a fallback
+    // main tag, init.lua process_tags), a generic rank-30 feature here, which
+    // no POI dir ships without a wiki tag: it ships as the RESERVOIR it is
+    // in its place, a label that never takes the primary slot
+    // (POI_FLAG_PLACES_ONLY), as no POI dir's lane holds the POI. Of a wiki
+    // tag poi/all ships the POI, of no such flag, and the tiers between ship
+    // its water kind (POI_FLAG_WATER_MASK). On an area, which the server
+    // keeps out of the lanes as a RESERVOIR, it carries no such flag.
+    for (const char* landuse : {"reservoir", "basin"})
+        for (const bool area : {false, true}) {
+            Tags t;
+            t.landuse = landuse;
+            t.emergency = "suction_point";
+            t.area = area;
+            const auto got = classify(t);
+            REQUIRE(got.has_value());
+            if (got->category != PoiCategory::RESERVOIR || ((got->flags & POI_FLAG_PLACES_ONLY) != 0) == area)
+                std::printf("    landuse=%s, category %d, flags %d, %s\n", landuse, int(got->category),
+                            int(got->flags), area ? "an area" : "a node");
+            CHECK_EQ(uint8_t(got->category), uint8_t(PoiCategory::RESERVOIR));
+            CHECK_EQ(int(got->tier), 3);
+            CHECK_EQ(int(got->flags), area ? 0 : int(POI_FLAG_PLACES_ONLY));
+
+            Tags wiki = t;
+            wiki.wikidata = "Q1";
+            const auto poi = classify(wiki);
+            REQUIRE(poi.has_value());
+            CHECK_EQ(uint8_t(poi->category), uint8_t(PoiCategory::GENERIC_RANK30));
+            CHECK_EQ(int(poi->tier), 3);
+            CHECK_EQ(int(poi->flags), int(poi_flags_with_water(POI_FLAG_WIKIDATA, PoiCategory::RESERVOIR)));
+        }
+}
+
 TEST(poi_classify_names_a_water_street_by_its_tags_alone) {
     // A water street: a water area a highway kind of rank 26 or 27 ranks,
     // where no place or landuse kind of a rank below 26 ranks it lower

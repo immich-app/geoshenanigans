@@ -1708,6 +1708,70 @@ TEST(a_reservoir_point_a_lower_rank_or_its_class_keeps_out_of_the_poi_lane_never
     }
 }
 
+// A basin point that is an emergency=suction_point too is a rank-30 POI in
+// Nominatim, in the POI lane, a generic rank-30 feature here, which no POI
+// dir ships without a wiki tag: the build writes it as the RESERVOIR it is
+// in its place, of no parent street, and at a point 11 m south of it,
+// nearer Teststrasse (22 m) than Beckenweg (28 m), Teststrasse answers, as
+// where no dir ships the POI. Of a wikidata tag poi/all ships the POI,
+// linked to Beckenweg, and answers it there, and poi/notable the RESERVOIR,
+// of no parent street: Teststrasse answers from it. A plain basin point
+// answers, on Beckenweg.
+TEST(a_reservoir_point_in_place_of_a_poi_no_dir_ships_never_takes_the_primary_slot) {
+    const ScratchDir root("reservoir-stand-in-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    std::vector<TestObject> objects;
+    objects.push_back(node(1200, lat0 + 1404500, lng0 + 1420000));
+    objects.push_back(node(1201, lat0 + 1404500, lng0 + 1490000));
+    objects.push_back(way(4070, {1200, 1201}, {{"highway", "residential"}, {"name", "Beckenweg"}}));
+    objects.push_back(node(1202, lat0 + 1403000, lng0 + 1430000, {{"landuse", "basin"}, {"name", "Becken Testdorf"}}));
+    objects.push_back(node(1203, lat0 + 1403000, lng0 + 1445000, {{"emergency", "suction_point"}, {"landuse", "basin"},
+                                                                  {"name", "Saugbecken Testdorf"}}));
+    objects.push_back(node(1204, lat0 + 1403000, lng0 + 1460000, {{"emergency", "suction_point"}, {"landuse", "basin"},
+                                                                  {"name", "Loeschbecken Testdorf"}, {"wikidata", "Q4242"}}));
+    write_fixture_with(pbf, objects);
+    const std::string out = root.path() + "/single";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
+    const auto files = tree(out);
+
+    struct Want {
+        double lng;
+        PoiCategory category;
+        bool parent;
+        const char* road;
+    };
+    struct Tier {
+        const char* name;
+        std::vector<Want> wants;
+    };
+    for (const Tier& t : {Tier{"all", {{8.1430, PoiCategory::RESERVOIR, true, "Beckenweg"},
+                                       {8.1445, PoiCategory::RESERVOIR, false, "Teststrasse"},
+                                       {8.1460, PoiCategory::GENERIC_RANK30, true, "Beckenweg"}}},
+                          Tier{"notable", {{8.1460, PoiCategory::RESERVOIR, false, "Teststrasse"}}}}) {
+        const std::vector<PoiRecord> pois = poi_records_in(files, std::string("planet/poi/") + t.name);
+        REQUIRE(pois.size() == t.wants.size());
+        std::vector<std::pair<double, double>> points;
+        for (const Want& w : t.wants) {
+            const auto pr = std::find_if(pois.begin(), pois.end(), [&](const PoiRecord& p) { return std::abs(p.lng - w.lng) < 0.0001; });
+            REQUIRE(pr != pois.end());
+            if (pr->category != uint8_t(w.category) || (pr->parent_street_id != NO_DATA) != w.parent)
+                std::printf("    poi/%s at %.4f: category %d, parent %u\n", t.name, w.lng, int(pr->category), pr->parent_street_id);
+            CHECK_EQ(int(pr->category), int(w.category));
+            CHECK_EQ(pr->parent_street_id != NO_DATA, w.parent);
+            points.push_back({47.1402, w.lng});
+        }
+        const std::string dataset = poi_dataset(out, t.name, root.path() + "/dataset-" + t.name);
+        const std::vector<std::string> answers = server_answers(dataset, points, root.path() + "/q-" + t.name, log);
+        REQUIRE(answers.size() == points.size());
+        for (size_t k = 0; k < answers.size(); k++) {
+            if (answer_string(answers[k], {"address", "road"}) != std::optional<std::string>(t.wants[k].road))
+                std::printf("    poi/%s: %s\n", t.name, answers[k].c_str());
+            CHECK(answer_string(answers[k], {"address", "road"}) == std::optional<std::string>(t.wants[k].road));
+        }
+    }
+}
+
 // A build logs, for each dir it writes with addresses and for each POI tier,
 // the bytes of the dir's logical vertex stream, the most a patch indexes of
 // them and their share of that: a STREAM_BYTES line, which the nightly's

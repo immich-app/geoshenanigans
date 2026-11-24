@@ -639,12 +639,16 @@ inline std::optional<PoiClassification> classify_poi(
     // rank-30 tags give a category no POI dir ships (a generic rank-30
     // feature without a wiki tag), which keeps its name in the POI tiers and
     // out of the primary slot, and those between the two tiers where its
-    // kind's is the lower (a bay, of tier 2, that is a pier, of tier 3).
+    // kind's is the lower (a bay, of tier 2, that is a pier, of tier 3). A
+    // reservoir point in place of its POI, which the server would let take
+    // the primary slot as it does any RESERVOIR point, never does
+    // (POI_FLAG_PLACES_ONLY, poi_record_in_tier).
     if (yielded != PoiCategory::UNKNOWN) {
         const uint8_t water_tier = poi_tier_of(yielded, flags);
         if (tier > POI_MAX_SHIPPED_TIER) {
             cat = yielded;
             tier = water_tier;
+            if (yielded == PoiCategory::RESERVOIR && !area) flags |= POI_FLAG_PLACES_ONLY;
         } else if (water_tier < tier) {
             flags = poi_flags_with_water(flags, yielded);
         }
