@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "admin_rank_config.h"
+#include "country_code.h"
 #include "parallel.h"
 #include "place_claims.h"
 #include "polygon_relations.h"
@@ -151,6 +152,26 @@ private:
 
 }  // namespace
 
+bool english_only_country(uint16_t cc) {
+    // country_settings.yaml's countries of `languages: en` alone.
+    static constexpr char kCodes[][3] = {
+        "AG", "AI", "AU", "BB", "BM", "BS", "BZ", "DM", "FJ", "FK", "FM", "GB", "GD", "GG", "GH", "GI", "GM", "GS", "GY",
+        "IM", "IO", "JE", "JM", "KI", "KN", "KY", "LC", "LR", "MS", "NG", "SB", "SH", "SL", "SS", "TC", "TO", "TT", "TV",
+        "US", "VC", "VG", "ZM",
+    };
+    for (const char* code : kCodes)
+        if (pack_country_code(code[0], code[1]) == cc) return true;
+    return false;
+}
+
+std::string_view linked_english_name(bool own_name_en, uint16_t polygon_country, std::string_view node_name_en,
+                                     std::string_view node_name, uint16_t node_country) {
+    if (own_name_en || english_only_country(polygon_country)) return {};
+    if (!node_name_en.empty()) return node_name_en;
+    if (english_only_country(node_country)) return node_name;
+    return {};
+}
+
 std::string lowercase_utf8(std::string_view s) {
     std::string out;
     out.reserve(s.size());
@@ -189,11 +210,14 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
     stats.candidates = nodes.size();
     stats.polygons = objects.size();
 
-    // Each node's ranks in its own country.
+    // Each node's country, and its ranks there.
+    std::vector<uint16_t> node_country(nodes.size());
     std::vector<PlaceRanks> ranks(nodes.size());
     parallel_for(nodes.size(), [&](size_t begin, size_t end, unsigned) {
-        for (size_t i = begin; i < end; i++)
-            ranks[i] = place_value_ranks(lookups.country_at(nodes[i].at), static_cast<PlaceValue>(nodes[i].value));
+        for (size_t i = begin; i < end; i++) {
+            node_country[i] = lookups.country_at(nodes[i].at);
+            ranks[i] = place_value_ranks(node_country[i], static_cast<PlaceValue>(nodes[i].value));
+        }
     }, threads);
 
     // The nodes by wikidata, by name and by place value and latitude, each in osm id order.
@@ -359,7 +383,7 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
     }
     stats.covers = covers_tests.load();
 
-    // The labels, the links, the claims and the place nodes' linking boundaries.
+    // The labels, the names, the links, the claims and the place nodes' linking boundaries.
     std::vector<std::pair<uint64_t, uint32_t>> place_at;  // (node osm id, place node)
     place_at.reserve(data.place_osm_ids.size());
     for (uint32_t i = 0; i < data.place_osm_ids.size(); i++) place_at.push_back({data.place_osm_ids[i], i});
@@ -375,6 +399,13 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
             const LinkCandidate& c = nodes[link.candidate];
             data.admin_links.push_back({o.id, c.node, c.value, ranks[link.candidate].address, link.step});
             label = place_label_of(static_cast<PlaceValue>(c.value));
+            const std::string_view name = linked_english_name(!o.tags || o.tags->name_en, o.country, text.at(c.name_en),
+                                                              text.at(c.name_tag), node_country[link.candidate]);
+            if (!name.empty()) {
+                const uint32_t name_id = data.string_pool.intern(std::string(name));
+                for (uint32_t m = o.first; m < o.first + o.count; m++) data.admin_polygons[all.members[m]].name_id = name_id;
+                stats.named++;
+            }
             const uint64_t node_id = pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, c.node);
             const auto p = std::lower_bound(place_at.begin(), place_at.end(), std::make_pair(node_id, uint32_t(0)));
             if (p != place_at.end() && p->first == node_id) data.place_node_links.push_back({p->second, o.id});

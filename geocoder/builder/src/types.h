@@ -388,8 +388,9 @@ struct CollectedRelation {
     bool boundary_category = false;
     std::string name;
     // Its name and wikidata tags, which it links a place node by
-    // (place_links.h).
+    // (place_links.h), and whether `name` is its own name:en.
     std::string name_tag, wikidata;
+    bool name_en = false;
     std::string country_code;
     bool is_postal;
     std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)

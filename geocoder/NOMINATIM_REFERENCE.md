@@ -83,7 +83,7 @@ Neither label comes from `border_type`, which Nominatim never reads (see below).
 3. **Place type match** — boundary has `extratags->'place'` and a node with matching type + name exists inside
 4. **Name match** — a place node with same name and appropriate rank inside the boundary
 
-When linked: the boundary adopts the place node's names. The place node itself gets `linked_place_id` set (effectively hidden from results, as it's represented by the boundary).
+When linked: the boundary takes the place node's names it lacks, or holds with another value, as `_place_*` names (`placex_indexing_prepare`, placex_triggers.sql:76-108); the node's `name` is also its `name:xx` for the default language of its country, where the country has one language (:86-90). An English answer reads `name:en`, then `_place_name:en`, then `name` (localization.py `Locales`, `_mingle_name_tags` showing a `_place_` name under its own key where the polygon lacks it), and `add_default_place_name` gives a polygon's `name` its `name:en` too in a country whose one language is English (:1271, utils.sql:121-139). So a linked boundary without a `name:en` of its own goes by its node's `name:en`, outside the English-only countries: Sosnovka (Tambov Oblast) and Kampala Capital City (R10546821, whose city node's `name:en` is Kampala). The place node itself gets `linked_place_id` set (effectively hidden from results, as it's represented by the boundary).
 
 **NOTE**: Linking primarily affects names and search, NOT the label/rank determination. The label comes from `get_label_tag()` via extratags (step 2), not from the linked node's category.
 
@@ -94,6 +94,7 @@ When linked: the boundary adopts the place node's names. The place node itself g
 - **Label members:** a node that a relation links as its label member is linked by no other polygon's steps 2 to 4, whatever runner it is in. On a fresh import a polygon of an earlier runner would take it first and the label relation take it over; the public server indexes each polygon again after its import and finds it linked then (Den Haag's level 8 boundary keeps its 14: its wikidata node is the label of its level 10 one). A polygon the public server has not indexed again since keeps its older link and the rank it gave: Ferraz de Vasconcelos' municipality (R298265, `place=municipality`) ranks 16 there and its city (R5683099, whose label is the city node) 18, Queluz (R298199) and Estiva Gerbi (R297955) 16, their extratags still naming the node's type as `linked_place`; the builder gives 14, 16, 14 and 14, as a re-index does.
 - **Candidates:** every place node of any value, named, of a wikidata or a relation's label member.
 - **Label:** the linked node's type where AdminPlaceType holds it, else the polygon's own place tag. AdminPlaceType holds 15 types, a locality's among them.
+- **Name:** a linking polygon without a `name:en` of its own, outside a country whose one language is English (country_settings.yaml), goes by its node's `name:en`, or by its node's `name` where the node's own country's one language is English (`linked_english_name`); about 26,000 polygons on the planet.
 
 ## Step 4: Rank adjustments for nested boundaries
 

@@ -29,6 +29,11 @@
 // tag, lower-cased; a value outside address-levels.json's (PlaceValue's
 // OTHER) links no node by step 3.
 //
+// A polygon that links a node takes the node's names it lacks as _place_
+// names (placex_indexing_prepare, :76-108), which an English answer reads
+// after its own name:en (localization.py Locales, _mingle_name_tags):
+// linked_english_name.
+//
 // A node that a relation links as its label member is linked to no other
 // polygon by steps 2 to 4, whichever runner it is in. On a fresh import a
 // polygon of an earlier runner would link it, and the label relation take it
@@ -55,7 +60,26 @@ struct LinkStats {
     size_t claimed = 0;                  // nodes linked
     size_t taken = 0;                    // links of a node a later runner's label link took
     size_t covers = 0;                   // covers tests
+    size_t named = 0;                    // linking polygons the node names (linked_english_name)
 };
+
+// Whether the country `cc` (packed upper case) has English for its one
+// language (country_settings.yaml), Nominatim's default language of the
+// country (country_info.py setup_country_tables), which gives a name tag
+// there its name:en too (add_default_place_name, utils.sql:121-139).
+bool english_only_country(uint16_t cc);
+
+// The name an English answer gives a polygon that links a place node, where
+// it is the node's; empty where the polygon keeps its own. The polygon goes
+// by its own name:en where it has one (`own_name_en`); in an English-only
+// country (english_only_country) its name tag is its name:en
+// (placex_update's add_default_place_name, placex_triggers.sql:1271); else
+// the node's name:en comes before its name tag, and failing that the node's
+// name tag where the node's country is English-only, which gives the node
+// that name:en (placex_indexing_prepare, :86-90). `node_name_en` and
+// `node_name` are the node's tags, empty for none.
+std::string_view linked_english_name(bool own_name_en, uint16_t polygon_country, std::string_view node_name_en,
+                                     std::string_view node_name, uint16_t node_country);
 
 // Links every boundary and place area of the admin polygons (rank_address.h's
 // objects) to its place node of data.link_candidates, which it frees, and
@@ -63,6 +87,8 @@ struct LinkStats {
 // type where AdminPlaceType holds it, else its own place tag's. It fills
 // data.admin_links (each linking polygon's link), data.place_claims (each
 // linked node's claimant, the polygon of the last link of it) and
-// data.place_node_links (every boundary linking each place node). Reads
+// data.place_node_links (every boundary linking each place node), and names
+// a linking polygon by its node where Nominatim's English answer does
+// (linked_english_name), interning the name in data.string_pool. Reads
 // admin_tags; `lookups.country_at` gives the nodes their countries.
 LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsigned threads);

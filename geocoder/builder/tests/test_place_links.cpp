@@ -39,6 +39,7 @@ struct Tags {
     std::string name;
     std::string wikidata;
     int64_t label = -1;
+    bool name_en = false;  // a name:en of its own names it
 };
 
 // Boundaries, place areas and place nodes, every point in `country`.
@@ -46,7 +47,8 @@ struct World {
     ParsedData data;
     uint16_t country = 0;
 
-    explicit World(const char* cc) : country(pack_country_code(cc[0], cc[1])) {}
+    // A polygon's name_id is its own index, below the offset of any name the pass interns.
+    explicit World(const char* cc) : country(pack_country_code(cc[0], cc[1])) { data.string_pool.intern(std::string(4096, '-')); }
 
     uint32_t add(uint64_t osm_id, uint8_t level, Box box, const Tags& tags) {
         const uint32_t pid = static_cast<uint32_t>(data.admin_polygons.size());
@@ -63,6 +65,7 @@ struct World {
         t.label = tags.label;
         t.name = lowercase_utf8(tags.name);
         t.wikidata = tags.wikidata;
+        t.name_en = tags.name_en;
         data.admin_tags.push_back(t);
         return pid;
     }
@@ -79,8 +82,8 @@ struct World {
 
     // A place node of osm id `id`; a PlaceNode too where it is a settlement.
     void node(int64_t id, PlaceValue type, double lat, double lng, const std::string& name,
-              const std::string& wikidata = "") {
-        data.link_candidates.add(id, point_e7(lat, lng), value(type), lowercase_utf8(name), wikidata);
+              const std::string& wikidata = "", const std::string& name_en = "") {
+        data.link_candidates.add(id, point_e7(lat, lng), value(type), lowercase_utf8(name), wikidata, name_en, name);
         PlaceType settlement = PlaceType::UNKNOWN;
         switch (type) {
             case PlaceValue::CITY: settlement = PlaceType::CITY; break;
@@ -120,6 +123,12 @@ struct World {
     }
     uint64_t boundary(uint32_t pid) const { return admin_boundary_id(data.admin_osm_ids[pid]); }
     AdminPlaceType label(uint32_t pid) const { return static_cast<AdminPlaceType>(data.admin_polygons[pid].place_type_override); }
+    // The polygon's name where the pass named it (an id of the string pool), else empty.
+    std::string name(uint32_t pid) const {
+        const uint32_t id = data.admin_polygons[pid].name_id;
+        if (id == pid) return "";
+        return std::string(data.string_pool.data().data() + id);
+    }
 };
 
 }  // namespace
@@ -367,4 +376,71 @@ TEST(the_links_dont_hang_on_the_thread_count) {
     CHECK_EQ(mitte, size_t(40));
     CHECK_EQ(many.claimant(1), admin_boundary_id(admin_ring_id(1000 + 7 * 39, 0)));
     CHECK(!one.data.admin_links.empty());
+}
+
+TEST(a_linking_polygon_goes_by_its_nodes_english_name_where_it_has_none_of_its_own) {
+    // Nominatim gives a polygon the names of the node it links that it lacks as _place_ names
+    // (placex_indexing_prepare), and an English answer reads name:en, then _place_name:en, then
+    // name (localization.py): Sosnovka (RU), whose boundary has no name:en, goes by its town
+    // node's, as Nominatim names it; a polygon of its own name:en keeps it, and one whose node
+    // has none keeps its name. A place area linking its namesake suburb node goes by the node's
+    // name:en too.
+    World w("RU");
+    w.node(1, PlaceValue::TOWN, 53.24, 41.37, "Сосновка", "", "Sosnovka");
+    const uint32_t sosnovka = w.relation(1, 8, Box{53.2, 41.3, 53.3, 41.4}, {PlaceValue::NONE, "Сосновка", "", 1});
+    w.node(2, PlaceValue::TOWN, 52.65, 42.73, "Кирсанов", "", "Kirsanov Town");
+    Tags own_en{PlaceValue::NONE, "Кирсанов", "", 2};
+    own_en.name_en = true;
+    const uint32_t kirsanov = w.relation(2, 8, Box{52.6, 42.7, 52.7, 42.8}, own_en);
+    w.node(3, PlaceValue::TOWN, 52.9, 40.5, "Уварово");
+    const uint32_t uvarovo = w.relation(3, 8, Box{52.85, 40.45, 52.95, 40.55}, {PlaceValue::NONE, "Уварово", "", 3});
+    w.node(4, PlaceValue::SUBURB, 53.25, 41.35, "Центральный", "", "Tsentralny");
+    const uint32_t centre = w.place_area(4, PlaceValue::SUBURB, Box{53.245, 41.345, 53.255, 41.355}, {PlaceValue::NONE, "Центральный"});
+    const LinkStats stats = w.link();
+    CHECK(w.link_of(centre).step != LinkStep::NONE);
+    CHECK_EQ(w.name(sosnovka), std::string("Sosnovka"));
+    CHECK_EQ(w.name(kirsanov), std::string(""));
+    CHECK_EQ(w.name(uvarovo), std::string(""));
+    CHECK_EQ(w.name(centre), std::string("Tsentralny"));
+    CHECK_EQ(stats.named, size_t(2));
+}
+
+TEST(a_linking_polygon_of_an_english_only_country_keeps_its_own_name) {
+    // Where English is the country's one language, Nominatim gives a polygon's name tag its
+    // name:en as well (add_default_place_name), which comes before the node's: the City of
+    // Testford keeps its name. Uganda has two languages, so Kampala Capital City (R10546821) goes
+    // by its city node's name:en, Kampala, as Nominatim's answer names it.
+    World gb("GB");
+    gb.node(1, PlaceValue::TOWN, 52.0, -1.0, "Testford", "", "Testford Town");
+    const uint32_t testford = gb.relation(1, 8, Box{51.9, -1.1, 52.1, -0.9}, {PlaceValue::NONE, "City of Testford", "", 1});
+    gb.link();
+    CHECK(gb.link_of(testford).step == LinkStep::LABEL);
+    CHECK_EQ(gb.name(testford), std::string(""));
+
+    World ug("UG");
+    ug.node(1, PlaceValue::CITY, 0.3177, 32.5814, "Kampala", "Q3894", "Kampala");
+    const uint32_t kcc = ug.relation(10546821, 6, Box{0.2, 32.5, 0.4, 32.7},
+                                     {PlaceValue::NONE, "Kampala Capital City", "Q3894", 1});
+    ug.link();
+    CHECK_EQ(ug.name(kcc), std::string("Kampala"));
+}
+
+TEST(the_english_name_of_a_linking_polygon_follows_nominatims_name_order) {
+    const uint16_t ru = pack_country_code('R', 'U'), gb = pack_country_code('G', 'B'), ug = pack_country_code('U', 'G');
+    CHECK(english_only_country(gb));
+    CHECK(english_only_country(pack_country_code('U', 'S')));
+    CHECK(!english_only_country(ug));
+    CHECK(!english_only_country(pack_country_code('C', 'A')));
+    CHECK(!english_only_country(0));
+    // Its own name:en first.
+    CHECK_EQ(linked_english_name(true, ru, "Sosnovka", "Сосновка", ru), std::string_view());
+    // In an English-only country its name tag, its name:en too.
+    CHECK_EQ(linked_english_name(false, gb, "Testford Town", "Testford", gb), std::string_view());
+    // Else the node's name:en.
+    CHECK_EQ(linked_english_name(false, ru, "Sosnovka", "Сосновка", ru), std::string_view("Sosnovka"));
+    // A node without one names it only where its own country is English-only, which gives its
+    // name tag its name:en.
+    CHECK_EQ(linked_english_name(false, ru, "", "Сосновка", ru), std::string_view());
+    CHECK_EQ(linked_english_name(false, ug, "", "Busia", pack_country_code('K', 'E')), std::string_view());
+    CHECK_EQ(linked_english_name(false, ru, "", "Ipswich", gb), std::string_view("Ipswich"));
 }

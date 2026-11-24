@@ -719,6 +719,7 @@ static AdminTags way_link_tags(const WayTags& t, int64_t way_id) {
     tags.boundary = way_boundary_id(way_id);
     if (t.name) tags.name = lowercase_utf8(t.name);
     if (t.wikidata) tags.wikidata = t.wikidata;
+    tags.name_en = t.name_en && t.name_en[0];  // best_name's
     return tags;
 }
 
@@ -768,7 +769,8 @@ static void link_admin_polygons(ParsedData& data, unsigned threads, std::chrono:
               << " by a label member, " << stats.by_step[size_t(LinkStep::WIKIDATA)] << " by wikidata, "
               << stats.by_step[size_t(LinkStep::TYPE)] << " by place type, " << stats.by_step[size_t(LinkStep::NAME)]
               << " by name; " << stats.claimed << " nodes claimed, " << stats.taken
-              << " taken over by a later label link; " << stats.covers << " covers tests; "
+              << " taken over by a later label link; " << stats.named << " named by their node's English name; "
+              << stats.covers << " covers tests; "
               << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() << " s" << std::endl;
     log_phase("Admin links", _pt, _cpu);
 }
@@ -1996,10 +1998,12 @@ static int run(int argc, char* argv[]) {
                                 AdminPlaceType pt = classify_place_override(place_tag);
                                 if (pt != AdminPlaceType::NONE) {
                                     const char* name = rel.tag("name:en");
+                                    const bool own_name_en = name != nullptr;
                                     if (!name) name = rel.tag("name");
                                     if (name) {
                                         CollectedRelation cr;
                                         cr.id = rel.id;
+                                        cr.name_en = own_name_en;
                                         cr.label_node_id = label_node_id;
                                         cr.admin_level = 15;  // special marker for boundary=place / place multipolygon
                                         cr.name = name;
@@ -2037,6 +2041,7 @@ static int run(int argc, char* argv[]) {
 
                         const char* name_en = rel.tag("name:en");
                         const char* name = rel.tag("name");
+                        const bool own_name_en = name_en != nullptr;
                         if (!name_en) name_en = name;
                         if (!name_en && is_admin) continue;
 
@@ -2075,6 +2080,7 @@ static int run(int argc, char* argv[]) {
                         cr.country_code = std::move(country_code);
                         cr.is_postal = is_postal;
                         cr.own_place_value = static_cast<uint8_t>(boundary_place_value(place_tag_on_admin));
+                        cr.name_en = own_name_en;
                         if (!is_postal) {
                             if (name) cr.name_tag = name;
                             if (const char* wd = rel.tag("wikidata")) cr.wikidata = wd;
@@ -2548,7 +2554,8 @@ static int run(int argc, char* argv[]) {
                             if (named || of_wikidata || wanted_label_nodes.count(id) > 0)
                                 tl_node_data->link_candidates.add(
                                     id, point_e7(lat, lng), static_cast<uint8_t>(place_value_of(n_place)),
-                                    named ? lowercase_utf8(n_name) : std::string(), of_wikidata ? n_wikidata : "");
+                                    named ? lowercase_utf8(n_name) : std::string(), of_wikidata ? n_wikidata : "",
+                                    n_name_en ? n_name_en : "", named ? n_name : "");
                         }
                     }
                 });
@@ -3549,6 +3556,7 @@ static int run(int argc, char* argv[]) {
                         tags.label = rel.label_node_id;
                         tags.name = lowercase_utf8(rel.name_tag);
                         tags.wikidata = std::move(rel.wikidata);
+                        tags.name_en = rel.name_en;
                         data.admin_tags.push_back(std::move(tags));
                     }
                     log_phase("    Admin: ring assembly", _pt, _cpu);

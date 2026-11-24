@@ -30,21 +30,28 @@ struct LinkText {
 
 // A place node a boundary or place area may link (find_linked_place,
 // placex_triggers.sql:271-391): one of any place value, named, of a
-// wikidata or a relation's label member.
+// wikidata or a relation's label member. Its name:en tag, else its name tag,
+// as written, are the names a polygon linking it may go by
+// (linked_english_name).
 struct LinkCandidate {
     int64_t node = 0;                     // its osm id
     PackedLocation at{0, 0};
     uint8_t value = 0;                    // PlaceValue of its place tag
     uint32_t name = LinkText::kNone;      // its name tag lower-cased (lowercase_utf8), in the text
     uint32_t wikidata = LinkText::kNone;  // its wikidata tag, in the text
+    uint32_t name_en = LinkText::kNone;   // its name:en tag, in the text
+    uint32_t name_tag = LinkText::kNone;  // its name tag where it has no name:en, in the text
 };
 
 struct LinkCandidates {
     std::vector<LinkCandidate> nodes;
     LinkText text;
 
-    void add(int64_t node, PackedLocation at, uint8_t value, std::string_view name, std::string_view wikidata) {
-        nodes.push_back({node, at, value, text.add(name), text.add(wikidata)});
+    void add(int64_t node, PackedLocation at, uint8_t value, std::string_view name, std::string_view wikidata,
+             std::string_view name_en = {}, std::string_view name_tag = {}) {
+        const uint32_t en = text.add(name_en);
+        nodes.push_back({node, at, value, text.add(name), text.add(wikidata), en,
+                         en == LinkText::kNone ? text.add(name_tag) : LinkText::kNone});
     }
     // Moves `other`'s candidates in after these.
     void append(LinkCandidates&& other) {
@@ -53,6 +60,8 @@ struct LinkCandidates {
         for (LinkCandidate c : other.nodes) {
             c.name = moved(c.name);
             c.wikidata = moved(c.wikidata);
+            c.name_en = moved(c.name_en);
+            c.name_tag = moved(c.name_tag);
             nodes.push_back(c);
         }
         text.bytes += other.text.bytes;
@@ -62,12 +71,13 @@ struct LinkCandidates {
 
 // What find_linked_place reads of a boundary or place area beyond its rings
 // and ranks: a relation's first label member, its name tag lower-cased and
-// its wikidata tag.
+// its wikidata tag; and whether a name:en tag of its own names it.
 struct AdminTags {
     uint64_t boundary = 0;  // admin_boundary_id of its polygons
     int64_t label = -1;     // the node of its first label member, -1 for none
     std::string name;       // empty for none
     std::string wikidata;   // empty for none
+    bool name_en = false;   // its polygons are named by a name:en tag of its own
 };
 
 // The step of find_linked_place that found a link.

@@ -307,3 +307,30 @@ TEST(a_place_area_admin_minimal_keeps_by_the_label_of_its_new_link) {
     }
     CHECK_EQ(towns, size_t(1));
 }
+
+TEST(a_linked_boundary_goes_by_its_nodes_english_name_where_it_has_none) {
+    // Sosnovka (Tambov Oblast): its boundary has no name:en and links its town node, whose
+    // name:en Nominatim's English answer gives it (_place_name:en after name:en); the node,
+    // hidden, names nothing else. A boundary of a name:en of its own keeps it, and so does the
+    // City of Ipswich, England being English-only (the name tag is its name:en there).
+    Fixture f;
+    f.country(41, 19, 82, 180, "Россия", "RU");
+    f.boundary(51.5, 39.5, 54.0, 43.5, 4, "Тамбовская область", {{"name:en", "Tambov Oblast"}});
+    const int64_t town = f.node(53.24, 41.37, {{"place", "town"}, {"name", "Сосновка"}, {"name:en", "Sosnovka"}});
+    f.boundary(53.20, 41.30, 53.30, 41.45, 8, "Сосновка", {}, {{OsmType::Node, town, "label"}});
+    const int64_t kirsanov = f.node(52.65, 42.73, {{"place", "town"}, {"name", "Кирсанов"}, {"name:en", "Kirsanov Town"}});
+    f.boundary(52.60, 42.70, 52.70, 42.80, 8, "Кирсанов", {{"name:en", "Kirsanov"}}, {{OsmType::Node, kirsanov, "label"}});
+    f.country(49, -8, 59, 2, "United Kingdom", "GB");
+    f.boundary(50, -6, 56, 1.9, 4, "England");
+    const int64_t ipswich = f.node(52.06, 1.15, {{"place", "town"}, {"name", "Ipswich"}, {"name:en", "Ipswich Town"}});
+    f.boundary(52.00, 1.05, 52.10, 1.25, 8, "City of Ipswich", {}, {{OsmType::Node, ipswich, "label"}});
+    const std::vector<std::string> answers =
+        answers_of(f, "linked-names", {{53.245, 41.375}, {52.655, 42.735}, {52.055, 1.155}});
+    REQUIRE(answers.size() == 3);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+    CHECK(names(answers[0], "town", "Sosnovka"));
+    CHECK(answers[0].find("Сосновка") == std::string::npos);
+    CHECK(names(answers[1], "town", "Kirsanov"));
+    CHECK(names(answers[2], "town", "City of Ipswich"));
+    CHECK(answers[2].find("Ipswich Town") == std::string::npos);
+}
