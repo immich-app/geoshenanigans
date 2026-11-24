@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "admin_rank_config.h"
 #include "id_allocator.h"
 #include "parallel.h"
 #include "types.h"
@@ -167,26 +168,51 @@ inline uint8_t wikidata_order(const std::string& node_name, const std::string& b
     return node_name == boundary_name ? 1 : 2;
 }
 
+// The rank_address of polygon `poly` (slot p) in no country known
+// (polygon_rank_address of country 0): link_wikidata_places' default rank.
+struct RankWithoutCountry {
+    uint8_t operator()(uint32_t, const AdminPolygon& poly) const {
+        return polygon_rank_address(0, poly.admin_level, own_place_tag(poly));
+    }
+};
+
+// Where a node of the place type `place_type` (AdminPlaceType) comes among
+// the nodes of a boundary's wikidata that wikidata_order leaves equal: by its
+// address rank, the default one of address-levels.json, one of rank 0 (in no
+// address) last.
+inline uint8_t candidate_rank_order(uint8_t place_type) {
+    const uint8_t rank = place_area_rank_address(place_type);
+    return rank == 0 ? UINT8_MAX : rank;
+}
+
 // find_linked_place's wikidata step for every boundary of a candidate (a
 // node of its wikidata it covers). The boundaries take their turns as
-// Nominatim indexes them, in the order claim_wins gives wikidata claims (the
-// lowest admin level first, place areas, level 15, after every boundary),
-// and each links the first of its nodes in wikidata_order, then node id,
-// that no boundary before it linked (placex.linked_place_id is null). Every
-// polygon of a boundary that links a node takes the node's place type, a
-// place area keeping its own place tag beside it (own_place_type); one that
-// links none keeps its own type for the steps after. The links go to
-// `claims` for hide_claimed_place_nodes. Returns how many boundaries link a
-// node.
+// Nominatim indexes them: by admin level (rank_search), the lowest first,
+// then the place areas (level 15), after every boundary, by their address
+// ranks (index_by_rank), equals by boundary id. `rank(p, polygons[p])` is the
+// rank_address of a boundary's polygon p in its country (its own place
+// tag's for a place area); one of rank 0 links nothing (find_linked_place
+// returns at once) and takes no turn. Each links the first of its nodes in
+// wikidata_order, then candidate_rank_order, then node id, that no boundary
+// before it linked (placex.linked_place_id is null). Every polygon of a
+// boundary that links a node takes the node's place type, a place area
+// keeping its own place tag beside it (own_place_type); one that links none
+// keeps its own type for the steps after. The links go to `claims` for
+// hide_claimed_place_nodes. Returns how many boundaries link a node.
+template <class Rank = RankWithoutCountry>
 inline size_t link_wikidata_places(std::vector<WikidataCandidate> candidates, std::vector<AdminPolygon>& polygons,
-                                   const std::vector<uint64_t>& polygon_ids, std::vector<PlaceClaim>& claims) {
+                                   const std::vector<uint64_t>& polygon_ids, std::vector<PlaceClaim>& claims,
+                                   Rank rank = {}) {
     const auto boundaries = boundary_polygons(polygons, polygon_ids);
     if (candidates.empty() || boundaries.empty()) return 0;
     std::sort(candidates.begin(), candidates.end(), [](const WikidataCandidate& a, const WikidataCandidate& b) {
-        return std::tie(a.boundary, a.order, a.node) < std::tie(b.boundary, b.order, b.node);
+        return std::make_tuple(a.boundary, a.order, candidate_rank_order(a.place_type), a.node) <
+               std::make_tuple(b.boundary, b.order, candidate_rank_order(b.place_type), b.node);
     });
     struct Turn {
-        ClaimRank rank;
+        uint8_t admin_level;
+        uint8_t place_rank;  // a place area's rank_address, 0 for a boundary
+        uint64_t boundary;
         size_t begin, end;  // the boundary's candidates
     };
     std::vector<Turn> turns;
@@ -194,10 +220,16 @@ inline size_t link_wikidata_places(std::vector<WikidataCandidate> candidates, st
         size_t end = k + 1;
         while (end < candidates.size() && candidates[end].boundary == candidates[k].boundary) end++;
         const uint32_t p = boundary_polygon(boundaries, candidates[k].boundary);
-        if (p != NO_DATA) turns.push_back({ClaimRank{false, polygons[p].admin_level, candidates[k].boundary}, k, end});
+        if (p != NO_DATA) {
+            const uint8_t r = rank(p, polygons[p]);
+            const uint8_t level = polygons[p].admin_level;
+            if (r != 0) turns.push_back({level, level == 15 ? r : uint8_t(0), candidates[k].boundary, k, end});
+        }
         k = end;
     }
-    std::sort(turns.begin(), turns.end(), [](const Turn& a, const Turn& b) { return claim_wins(a.rank, b.rank); });
+    std::sort(turns.begin(), turns.end(), [](const Turn& a, const Turn& b) {
+        return std::tie(a.admin_level, a.place_rank, a.boundary) < std::tie(b.admin_level, b.place_rank, b.boundary);
+    });
     std::unordered_set<uint64_t> linked;
     std::vector<std::pair<uint64_t, uint8_t>> links;  // (boundary, place type), a boundary's one link
     for (const Turn& turn : turns) {

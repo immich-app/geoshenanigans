@@ -797,6 +797,82 @@ static uint16_t polygon_country(const ParsedData& data, const AdminRings& countr
     return country_code_at_point(data, countries, inside.first, inside.second);
 }
 
+// The country of each of `polygons` as polygon_country finds it, before the
+// country cells exist (the wikidata step comes before the arcs, which read
+// the place types it gives): its own code where it has one, else that of the
+// smallest country polygon whose exact rings hold a point inside it, the
+// lower code among equals, as country_code_at_point picks between the
+// countries of a border cell; 0 where none holds it. As (polygon, country),
+// sorted by polygon, each once.
+static std::vector<std::pair<uint32_t, uint16_t>> countries_before_cells(const ParsedData& data,
+                                                                         std::vector<uint32_t> polygons,
+                                                                         unsigned int threads) {
+    std::sort(polygons.begin(), polygons.end());
+    polygons.erase(std::unique(polygons.begin(), polygons.end()), polygons.end());
+    const auto& rings = data.admin_exact_rings;
+    std::vector<std::pair<uint32_t, uint16_t>> out(polygons.size());
+    std::vector<PackedLocation> inside(polygons.size());
+    parallel_for(polygons.size(), [&](size_t begin, size_t end, unsigned) {
+        for (size_t k = begin; k < end; k++) {
+            const uint32_t p = polygons[k];
+            out[k] = {p, data.admin_polygons[p].country_code};
+            const uint32_t ring_count = rings.polygons[p].ring_count;
+            if (out[k].second != 0 || ring_count == 0) continue;
+            const LatLng at = interior_point(rings.vertices.data(), rings.rings_of(p), ring_count);
+            inside[k] = point_e7(at.first, at.second);
+        }
+    }, threads);
+    // The points to place, by latitude.
+    std::vector<std::pair<int32_t, uint32_t>> by_lat;
+    for (uint32_t k = 0; k < polygons.size(); k++)
+        if (out[k].second == 0 && rings.polygons[polygons[k]].ring_count != 0) by_lat.push_back({inside[k].lat_e7, k});
+    if (by_lat.empty()) return out;
+    std::sort(by_lat.begin(), by_lat.end());
+    std::vector<uint32_t> countries;
+    std::vector<bool> is_country(data.admin_polygons.size());
+    for (uint32_t p = 0; p < data.admin_polygons.size(); p++) {
+        const AdminPolygon& poly = data.admin_polygons[p];
+        if (poly.admin_level != 2 || poly.country_code == 0 || rings.polygons[p].ring_count == 0) continue;
+        countries.push_back(p);
+        is_country[p] = true;
+    }
+    // (point, country polygon) of each point in the box of a country's outer
+    // ring, a point's together.
+    using Pair = std::pair<uint32_t, uint32_t>;
+    std::vector<Pair> pairs = parallel_collect<Pair>(countries.size(), [&](size_t c, std::vector<Pair>& found) {
+        const RingSpan& outer = rings.rings_of(countries[c])[0];
+        const ExactRingBox box = exact_ring_box(rings.vertices.data() + outer.begin, outer.count);
+        for (auto it = std::lower_bound(by_lat.begin(), by_lat.end(), std::make_pair(box.lat_lo, uint32_t(0)));
+             it != by_lat.end() && it->first <= box.lat_hi; ++it) {
+            const PackedLocation q = inside[it->second];
+            if (q.lon_e7 >= box.lng_lo && q.lon_e7 <= box.lng_hi) found.push_back({it->second, countries[c]});
+        }
+    }, threads);
+    std::sort(pairs.begin(), pairs.end());
+    const AdminRings country_rings(rings, threads, [&](uint32_t p) { return is_country[p]; });
+    std::vector<size_t> starts;
+    for (size_t k = 0; k < pairs.size(); k++)
+        if (k == 0 || pairs[k].first != pairs[k - 1].first) starts.push_back(k);
+    starts.push_back(pairs.size());
+    parallel_for(starts.size() - 1, [&](size_t begin, size_t end, unsigned) {
+        for (size_t r = begin; r < end; r++) {
+            const uint32_t k = pairs[starts[r]].first;
+            float best_area = std::numeric_limits<float>::max();
+            uint16_t best = 0;
+            for (size_t j = starts[r]; j < starts[r + 1]; j++) {
+                const AdminPolygon& country = data.admin_polygons[pairs[j].second];
+                if (!country_rings.contains(pairs[j].second, inside[k])) continue;
+                if (country.area < best_area || (country.area == best_area && country.country_code < best)) {
+                    best_area = country.area;
+                    best = country.country_code;
+                }
+            }
+            out[k].second = best;
+        }
+    }, threads);
+    return out;
+}
+
 // Gives each postal area (admin_level 11) the country its centroid lies in,
 // as Nominatim gives a place_postcode row the country of its centroid
 // (postcodes.py update_postcodes, get_country_code). A relation is one row,
@@ -4193,11 +4269,27 @@ static int run(int argc, char* argv[]) {
 
         // find_linked_place's wikidata step, the boundaries in the order
         // Nominatim indexes them, once every input's are in; before anything
-        // reads the place types it gives them.
+        // reads the place types it gives them. A boundary's rank_address is
+        // its level's or own place tag's in its country, where one of rank 0
+        // links nothing.
         {
             const size_t candidates = data.wikidata_candidates.size();
+            std::vector<uint32_t> turn_polygons;
+            {
+                const auto boundaries = boundary_polygons(data.admin_polygons, data.admin_osm_ids);
+                for (const WikidataCandidate& c : data.wikidata_candidates) {
+                    const uint32_t p = boundary_polygon(boundaries, c.boundary);
+                    if (p != NO_DATA) turn_polygons.push_back(p);
+                }
+            }
+            const auto countries = countries_before_cells(data, std::move(turn_polygons), num_threads);
+            const auto rank = [&](uint32_t p, const AdminPolygon& poly) {
+                const auto it = std::lower_bound(countries.begin(), countries.end(), std::make_pair(p, uint16_t(0)));
+                const uint16_t cc = it != countries.end() && it->first == p ? it->second : 0;
+                return polygon_rank_address(cc, poly.admin_level, own_place_tag(poly));
+            };
             const size_t linked = link_wikidata_places(std::move(data.wikidata_candidates), data.admin_polygons,
-                                                       data.admin_osm_ids, data.place_claims);
+                                                       data.admin_osm_ids, data.place_claims, rank);
             std::vector<WikidataCandidate>().swap(data.wikidata_candidates);
             std::cerr << "find_linked_place wikidata: " << linked << " boundaries linked a place node of their wikidata ("
                       << candidates << " candidates)" << std::endl;

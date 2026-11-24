@@ -279,11 +279,11 @@ TEST(place_claims_a_wikidata_link_takes_one_node_in_the_steps_order) {
     std::vector<PlaceClaim> again_claims;
     candidates = {{relation_boundary_id(100), node_id(7), 1, town},
                   {relation_boundary_id(100), node_id(6), 0, village},
-                  {relation_boundary_id(100), node_id(5), 0, suburb}};
+                  {relation_boundary_id(100), node_id(5), 0, town}};
     CHECK_EQ(link_wikidata_places(candidates, again, {admin_ring_id(100, 0)}, again_claims), 1u);
     REQUIRE(again_claims.size() == 1u);
     CHECK_EQ(again_claims[0].node, node_id(5));
-    CHECK_EQ(again[0].place_type_override, suburb);
+    CHECK_EQ(again[0].place_type_override, town);
     CHECK_EQ(again[0].own_place_type, 0);
 }
 
@@ -319,4 +319,73 @@ TEST(place_claims_a_node_a_boundary_before_links_is_no_later_ones) {
         CHECK_EQ(claims[1].boundary, relation_boundary_id(100));
         std::reverse(candidates.begin(), candidates.end());
     }
+}
+
+TEST(place_claims_a_boundary_of_rank_0_reserves_no_node_of_its_wikidata) {
+    // find_linked_place returns at once for a boundary of rank_address 0 (placex_triggers.sql:284),
+    // so it links nothing and leaves the node to the boundaries after it: an Australian local
+    // government area (admin_level 6, rank 0 there), relation 100, and a place=suburb area,
+    // relation 200, both cover the town node 5 of their wikidata. The area links it.
+    const auto town = static_cast<uint8_t>(AdminPlaceType::TOWN), suburb = static_cast<uint8_t>(AdminPlaceType::SUBURB);
+    std::vector<AdminPolygon> polygons{polygon(6, 2.0f), polygon(15, 1.0f)};
+    polygons[1].place_type_override = suburb;
+    const std::vector<uint64_t> ids{admin_ring_id(100, 0), admin_ring_id(200, 0)};
+    const std::vector<WikidataCandidate> candidates{{relation_boundary_id(100), node_id(5), 2, town},
+                                                    {relation_boundary_id(200), node_id(5), 2, town}};
+    std::vector<PlaceClaim> claims;
+    const auto rank = [](uint32_t p, const AdminPolygon&) { return p == 0 ? uint8_t(0) : uint8_t(20); };
+    CHECK_EQ(link_wikidata_places(candidates, polygons, ids, claims, rank), 1u);
+    REQUIRE(claims.size() == 1u);
+    CHECK_EQ(claims[0].node, node_id(5));
+    CHECK_EQ(claims[0].boundary, relation_boundary_id(200));
+    CHECK_EQ(polygons[0].place_type_override, 0);
+    CHECK_EQ(polygons[1].place_type_override, town);
+    CHECK_EQ(polygons[1].own_place_type, suburb);
+}
+
+TEST(place_claims_place_areas_link_in_the_order_of_their_address_ranks) {
+    // Nominatim indexes the place areas after every boundary, one rank_address after another
+    // (indexer.py index_by_rank, RankRunner): a place=suburb area (rank 20), relation 300, takes
+    // the village node 5 of its wikidata before a place=quarter area (rank 22) of a lower id,
+    // relation 100, which links nothing and stays a quarter.
+    const auto village = static_cast<uint8_t>(AdminPlaceType::VILLAGE),
+               suburb = static_cast<uint8_t>(AdminPlaceType::SUBURB), quarter = static_cast<uint8_t>(AdminPlaceType::QUARTER);
+    std::vector<AdminPolygon> polygons{polygon(15, 1.0f), polygon(15, 2.0f)};
+    polygons[0].place_type_override = quarter;
+    polygons[1].place_type_override = suburb;
+    const std::vector<uint64_t> ids{admin_ring_id(100, 0), admin_ring_id(300, 0)};
+    const std::vector<WikidataCandidate> candidates{{relation_boundary_id(100), node_id(5), 2, village},
+                                                    {relation_boundary_id(300), node_id(5), 2, village}};
+    std::vector<PlaceClaim> claims;
+    CHECK_EQ(link_wikidata_places(candidates, polygons, ids, claims), 1u);
+    REQUIRE(claims.size() == 1u);
+    CHECK_EQ(claims[0].boundary, relation_boundary_id(300));
+    CHECK_EQ(polygons[1].place_type_override, village);
+    CHECK_EQ(polygons[1].own_place_type, suburb);
+    CHECK_EQ(polygons[0].place_type_override, quarter);
+    CHECK_EQ(polygons[0].own_place_type, 0);
+}
+
+TEST(place_claims_of_nodes_equal_in_the_steps_order_the_one_of_the_lowest_address_rank_links) {
+    // The step's ORDER BY leaves nodes of the same name unordered: Espanola (relation 100) covers
+    // the town node 20 and the hamlet node 10 of its wikidata, both named Española. The town, of
+    // address rank 16, comes before the hamlet's 20 whatever their ids, and equals go to the lower.
+    const auto town = static_cast<uint8_t>(AdminPlaceType::TOWN), hamlet = static_cast<uint8_t>(AdminPlaceType::HAMLET),
+               village = static_cast<uint8_t>(AdminPlaceType::VILLAGE);
+    std::vector<AdminPolygon> polygons{polygon(8, 1.0f)};
+    const std::vector<uint64_t> ids{admin_ring_id(100, 0)};
+    std::vector<WikidataCandidate> candidates{{relation_boundary_id(100), node_id(10), 2, hamlet},
+                                              {relation_boundary_id(100), node_id(20), 2, town}};
+    std::vector<PlaceClaim> claims;
+    CHECK_EQ(link_wikidata_places(candidates, polygons, ids, claims), 1u);
+    REQUIRE(claims.size() == 1u);
+    CHECK_EQ(claims[0].node, node_id(20));
+    CHECK_EQ(polygons[0].place_type_override, town);
+
+    polygons = {polygon(8, 1.0f)};
+    claims.clear();
+    candidates = {{relation_boundary_id(100), node_id(30), 2, town}, {relation_boundary_id(100), node_id(40), 2, village}};
+    CHECK_EQ(link_wikidata_places(candidates, polygons, ids, claims), 1u);
+    REQUIRE(claims.size() == 1u);
+    CHECK_EQ(claims[0].node, node_id(30));
 }

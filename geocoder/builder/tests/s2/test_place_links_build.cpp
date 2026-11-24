@@ -1,13 +1,13 @@
 // build-index's place links and postal areas, from a PBF to the server's
 // answers: a boundary of rank 0 in its country links no place node, its
-// country taken at a point inside it, a boundary or a place area links a
-// place node of its wikidata only where it covers it, its edges included,
-// and only one, one of its name first, that no boundary before it links, a
-// place=province area is an address area where its country ranks it, a
-// postal area names a point only of its own country, one for a relation, and
-// of a postcode its country takes, whatever its length, a US ZIP+4 its ZIP,
-// and a place area linked to a place node of another type ranks by its own
-// place tag.
+// country taken at a point inside it, and leaves a node of its wikidata to
+// the boundaries after it, a boundary or a place area links a place node of
+// its wikidata only where it covers it, its edges included, and only one, one
+// of its name first, that no boundary before it links, a place=province area
+// is an address area where its country ranks it, a postal area names a point
+// only of its own country, one for a relation, and of a postcode its country
+// takes, whatever its length, a US ZIP+4 its ZIP, and a place area linked to
+// a place node of another type ranks by its own place tag.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -373,6 +373,25 @@ TEST(a_place_node_a_boundary_links_is_no_wikidata_link_of_a_place_area) {
     REQUIRE(answers.size() == 1);
     CHECK(names(answers[0], "village", "Lent"));
     CHECK(names(answers[0], "quarter", "Lent"));
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_boundary_of_rank_0_in_its_country_leaves_the_place_node_of_its_wikidata_to_a_place_area) {
+    // find_linked_place returns at once for a boundary of rank_address 0 (placex_triggers.sql:284):
+    // Logan City, a local government area (admin_level 6, rank 0 in Australia), links nothing, and
+    // the place=suburb area Logan Central, of the same wikidata, links the town node Logan, which
+    // labels it town and leaves the results.
+    Fixture f;
+    f.country(-30, 140, -20, 154, "Australia", "AU");
+    f.boundary(-29, 151, -26, 153.9, 4, "Queensland");
+    f.boundary(-27.8, 152.9, -27.5, 153.3, 6, "Logan City", {{"wikidata", "Q700"}});
+    f.node(-27.64, 153.11, {{"place", "town"}, {"name", "Logan"}, {"wikidata", "Q700"}});
+    f.area(-27.66, 153.08, -27.62, 153.14,
+           {{"type", "multipolygon"}, {"place", "suburb"}, {"name", "Logan Central"}, {"wikidata", "Q700"}});
+    const std::vector<std::string> answers = answers_of(f, "rank0-wikidata", {{-27.645, 153.105}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "town", "Logan Central"));
+    CHECK(answers[0].find("\"Logan\"") == std::string::npos);
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 
