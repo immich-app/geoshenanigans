@@ -3486,8 +3486,9 @@ impl Index {
         // The boundaries place nodes must sit inside to be accepted in the
         // address walk (Nominatim's `current_boundary`).
         let mut current_boundaries = self.find_current_boundaries(&mut admin_scan, admin.country_code, feature);
-        // address_havelevel: the ranks the address's boundaries hold take no
-        // place node. A boundary-derived city/town/village covers rank 16
+        // address_havelevel: a rank an area shows at takes no place node row,
+        // and one the walk accepts an area at takes no node at all (the walk's
+        // had ranks). A boundary-derived city/town/village covers rank 16
         // whatever its rank, so place nodes must not fill (or fuzzy-anchor
         // on) a competing rank-16 candidate. Nominatim gives a boundary its
         // linked place's rank even below its own (placex_triggers.sql:1129):
