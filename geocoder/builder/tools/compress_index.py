@@ -24,17 +24,18 @@ UNIT_FAILED once all else is done, for the caller to fail the run at its end.
 
 configurations.json["component_sizes"] gives, per region, each component's
 bytes: "raw", its files on disk, and "wire", what downloading them costs (a
-unit's size once, or its share by its files' raw bytes when the component
-holds only some of them; each other file's .zst). A component counts only
+unit's size once; each other file's .zst). A component that holds only some
+of a unit's files has a share of the unit's size by their raw bytes, an
+estimate: a download of them takes the whole unit. A component counts only
 the files the region has, and a region lists only the components it has a
 file of. Each is that component's own files alone, so a selection's bytes
 are not the sum of its axes' components: one of variants alone
 (mode.admin-minimal) has none, and the files a variant replaces stay in
-the sizes of the components that list them. A client resolves a
-selection's variants first, as it does to download them, then adds up the
-components it downloads, the variant's among them, and leaves out the
-files the variant replaces (configurations.json["files"] and ["units"]
-give each file's and unit's bytes).
+the sizes of the components that list them. A selection's wire bytes,
+exactly, come from configurations.json["files"] and ["units"]: resolve its
+variants and the files they replace, as a download does, and take each
+file once; then count each unit they name once, at its size, and each
+other file at its size_zst.
 
 --upload streams each .zst and unit to DEST/<path> as soon as it exists,
 through one long-running CMD (an `s5cmd ... run` reading cp commands on
