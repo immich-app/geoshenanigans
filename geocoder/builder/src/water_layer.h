@@ -212,6 +212,7 @@ struct Build {
     std::vector<uint32_t> object_of;  // by polygon
     std::vector<uint32_t> outer_rank;  // by polygon: its place among its object's outer rings
     std::vector<uint64_t> piece_key;   // by polygon: its cut (water_split.h), 0 for an outer ring whole
+    std::vector<uint64_t> piece_path;  // by polygon: its cut's path alone (SplitPolygon::path), 0 for one whole
     NamingLines lines;
     size_t relations_missing_ways = 0, relations_without_rings = 0, marine_objects = 0;
     size_t outer_twins = 0;  // closed ways left to a relation of their names whose outer ring they are
@@ -264,7 +265,7 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices);
 
 // Cuts each polygon of more than kSplitMaxHoles holes into pieces along the
 // grid (water_split.h), in place: each piece a polygon of the same object
-// and outer rank, with its cut's key. Logs what it cut.
+// and outer rank, with its cut's key and path. Logs what it cut.
 void split_polygons(Build& b, unsigned threads);
 
 // The layer's type table: the water=* values outside the fixed table among
@@ -277,8 +278,9 @@ std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_pl
 
 // Each polygon's slot identity and fallback key, by polygon: a way's by its
 // id; a relation's outer ring, or a marine area's, by the object and the
-// ring's smallest vertex (and its cut), with a fallback key by the object
-// and the ring's place. Two polygons that still share an identity (rings
+// ring's smallest vertex (and its cut's key), with a fallback key by the
+// object and the ring's place (and its cut's path, which no vertex of the
+// shore moves). Two polygons that still share an identity (rings
 // alike at their corners) are told apart by their fallback keys, which no
 // two share: the one of the smaller keeps it, the other takes one of its own
 // key mixed in, the same from day to day; `told_apart` counts those.

@@ -545,6 +545,7 @@ void keep_objects(Build& b, const std::vector<uint8_t>& keep) {
         b.object_of[polygons] = o;
         b.outer_rank[polygons] = b.outer_rank[p];
         if (!b.piece_key.empty()) b.piece_key[polygons] = b.piece_key[p];
+        if (!b.piece_path.empty()) b.piece_path[polygons] = b.piece_path[p];
         polygons++;
     }
     r.polygons.resize(polygons);
@@ -557,6 +558,7 @@ void keep_objects(Build& b, const std::vector<uint8_t>& keep) {
     b.object_of.resize(polygons);
     b.outer_rank.resize(polygons);
     if (!b.piece_key.empty()) b.piece_key.resize(polygons);
+    if (!b.piece_path.empty()) b.piece_path.resize(polygons);
     r.polygons.shrink_to_fit();
     r.rings.shrink_to_fit();
     r.vertices.shrink_to_fit();
@@ -843,6 +845,7 @@ void split_polygons(Build& b, unsigned threads) {
     AdminExactRings& r = b.rings;
     const size_t n = r.polygons.size();
     b.piece_key.assign(n, 0);
+    b.piece_path.assign(n, 0);
     std::vector<uint32_t> heavy;
     for (uint32_t p = 0; p < n; p++)
         if (r.polygons[p].ring_count > kSplitMaxHoles + 1) heavy.push_back(p);
@@ -908,7 +911,7 @@ void split_polygons(Build& b, unsigned threads) {
     // The store again: each cut polygon's pieces in its place.
     AdminExactRings out;
     std::vector<uint32_t> object_of, outer_rank;
-    std::vector<uint64_t> piece_key;
+    std::vector<uint64_t> piece_key, piece_path;
     size_t cut = 0, made = 0, cut_lines = 0, kept_whole = 0;
     auto to_ring = [](const SplitRing& s, std::vector<PackedLocation>& v, std::vector<WayRun>& runs) {
         v = s.v;
@@ -938,6 +941,7 @@ void split_polygons(Build& b, unsigned threads) {
                 object_of.push_back(b.object_of[p]);
                 outer_rank.push_back(b.outer_rank[p]);
                 piece_key.push_back(piece.key);
+                piece_path.push_back(piece.path);
             }
             std::vector<SplitPolygon>().swap(pieces[k]);
         } else {
@@ -959,6 +963,7 @@ void split_polygons(Build& b, unsigned threads) {
             object_of.push_back(b.object_of[p]);
             outer_rank.push_back(b.outer_rank[p]);
             piece_key.push_back(0);
+            piece_path.push_back(0);
         }
         if (is_heavy) k++;
     }
@@ -966,6 +971,7 @@ void split_polygons(Build& b, unsigned threads) {
     b.object_of = std::move(object_of);
     b.outer_rank = std::move(outer_rank);
     b.piece_key = std::move(piece_key);
+    b.piece_path = std::move(piece_path);
     report(cut, cut_lines, made, kept_whole);
 }
 
@@ -1061,14 +1067,15 @@ PolygonIdentities polygon_identities(const Build& b) {
             }
             const RingSpan& outer = b.rings.rings_of(static_cast<uint32_t>(p))[0];
             const uint64_t piece = b.piece_key.empty() ? 0 : b.piece_key[p];
+            const uint64_t path = b.piece_path.empty() ? 0 : b.piece_path[p];
             const uint64_t corner = ring_corner(b.rings.vertices.data() + outer.begin, outer.count, piece);
             if (o.type == ObjectType::SYNTHETIC) {
                 ids[p] = marine_identity(static_cast<uint64_t>(o.id), corner);
-                fallbacks[p] = piece_fallback(marine_fallback(static_cast<uint64_t>(o.id), b.outer_rank[p]), piece);
+                fallbacks[p] = piece_fallback(marine_fallback(static_cast<uint64_t>(o.id), b.outer_rank[p]), path);
                 continue;
             }
             ids[p] = relation_ring_identity(o.id, corner);
-            fallbacks[p] = piece_fallback(relation_ring_fallback(o.id, b.outer_rank[p]), piece);
+            fallbacks[p] = piece_fallback(relation_ring_fallback(o.id, b.outer_rank[p]), path);
         }
     });
     std::vector<uint32_t> order(n);

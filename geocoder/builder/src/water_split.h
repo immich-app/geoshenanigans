@@ -35,7 +35,7 @@
 namespace water {
 
 inline constexpr uint32_t kSplitMaxHoles = 64;
-// The finest grid a cut takes: 2^16 e7 units, about 7 m.
+// The finest grid a cut takes: 2^16 e7 units, about 730 m in latitude.
 inline constexpr int kSplitFinestShift = 16;
 inline constexpr int kSplitCoarsestShift = 30;
 
@@ -50,6 +50,10 @@ struct SplitPolygon {
     SplitRing outer;
     std::vector<SplitRing> holes;
     uint64_t key = 0;  // the piece's cuts, hashed: 0 for a polygon never cut
+    // The piece's cuts alone, hashed: each one's line, the side and the
+    // piece's place among the side's lobes (by their corners), none of the
+    // shore's vertices; 0 for a polygon never cut.
+    uint64_t path = 0;
 };
 
 namespace split_detail {
@@ -266,6 +270,13 @@ inline uint64_t lobe_key(uint64_t side_key, const Corner& corner) {
     return key;
 }
 
+// A lobe's path: its side's (mix_key of the piece's path) with its place
+// among the side's lobes mixed in, so that an edit at its corner that
+// leaves the cuts as they were leaves it as it was.
+inline uint64_t lobe_path(uint64_t side_path, size_t rank) {
+    return mix64(side_path ^ mix64(uint64_t(rank) + 0x50415448ull));
+}
+
 // The negative way id of the cut along a line.
 inline int64_t cut_way_of(int64_t line, bool meridian) {
     return -static_cast<int64_t>((mix64(uint64_t(line) * 2 + (meridian ? 1 : 0)) >> 2) + 1);
@@ -474,7 +485,7 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
     using namespace split_detail;
     if (polygon.holes.size() <= max_holes) return refuse(SplitRefusal::FewHoles);
     std::vector<SplitPolygon> done, todo = {polygon};
-    todo[0].key = 0;
+    todo[0].key = todo[0].path = 0;
     size_t lines = 0;
     std::vector<int64_t> cut_ways;
     while (!todo.empty()) {
@@ -542,6 +553,7 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
             for (size_t o = 0; o < order.size(); o++) order[o] = o;
             std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return corners[x] < corners[y]; });
             const uint64_t side_key = mix_key(piece.key, static_cast<uint64_t>(line), meridian, s);
+            const uint64_t side_path = mix_key(piece.path, static_cast<uint64_t>(line), meridian, s);
             uint64_t twin = 0;
             for (size_t rank = 0; rank < order.size(); rank++) {
                 const size_t o = order[rank];
@@ -558,6 +570,7 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
                 for (size_t h = 0; h < polygons[o].holes.size(); h++)
                     out.holes.push_back(back(polygons[o].holes[h], polygon_ways[o].holes[h]));
                 out.key = lobe_key(side_key, corners[o]) + twin;
+                out.path = lobe_path(side_path, rank);
                 todo.push_back(std::move(out));
             }
         }

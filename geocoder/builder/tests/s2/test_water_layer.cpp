@@ -425,6 +425,49 @@ TEST(a_lake_of_many_islands_is_cut_into_pieces_that_each_carry_the_lakes_name_ty
     CHECK(std::abs(layer.records[pieces[0]].area - float(0.16 - 144 * 0.000004)) < 1e-5f);
 }
 
+TEST(each_piece_of_a_lake_of_many_islands_keeps_its_slot_once_a_pieces_corner_moves) {
+    // The lake of 12 x 12 islands, as above; the next day its south-west
+    // corner, the smallest vertex of the piece there, moves in, and the
+    // lake's box, so every cut, stays as it was.
+    const int32_t lat = kLat - 10000000, side = 4000000;
+    auto with_lake = [&](int32_t corner_in) {
+        Collected c = fixture();
+        Ring shore = square(lat, kLng, side, 8);
+        shore.front() = shore.back() = pt(lat + corner_in, kLng + corner_in);
+        add_geometry(c, 70, shore);
+        CollectedArea isles;
+        isles.id = 600;
+        isles.tags = tags(code::kLake, "Island Lake");
+        isles.members = {{70, "outer"}};
+        for (int i = 0; i < 12; i++)
+            for (int j = 0; j < 12; j++) {
+                const int64_t way = 1000 + i * 12 + j;
+                add_geometry(c, way, square(lat + 100000 + i * 320000, kLng + 100000 + j * 320000, 20000));
+                isles.members.push_back({way, "inner"});
+            }
+        c.relations.push_back(isles);
+        return c;
+    };
+    const ScratchDir root("water-piece-corner");
+    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    const Layer day1 = build(with_lake(0));
+    write(day1, one);
+    const Layer day2 = build(with_lake(5000), one);
+    REQUIRE(day2.size() == day1.size());
+    REQUIRE(day1.size() > 6u);
+    // The piece at the corner, and those cut from a piece whose corner it
+    // was, are of other identities, and keep their slots by their fallback
+    // keys; every polygon keeps its own.
+    std::set<uint64_t> ids1(day1.identities.begin(), day1.identities.end());
+    size_t moved = 0;
+    for (uint64_t id : day2.identities) moved += !ids1.count(id);
+    CHECK(moved >= 1u);
+    const std::string n = std::to_string(day2.size());
+    const std::string summary = write(day2, two, one);
+    CHECK(summary.find("water/all: " + n + " polygons in " + n + " slots (" + n + " kept, " + std::to_string(moved) +
+                       " by fallback, 0 recycled)") != std::string::npos);
+}
+
 TEST(a_lake_of_many_islands_the_grid_cant_cut_keeps_its_store_as_it_was) {
     // A lake of 0.0019 x 0.0019 degrees with 9 x 8 islands, between the
     // lines of the finest grid a cut takes (2^16 e7 units: 7171 and 7172 of
