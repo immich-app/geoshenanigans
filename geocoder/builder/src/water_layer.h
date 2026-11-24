@@ -166,11 +166,16 @@ struct Collected {
     WayGeometries member_geometries;
     // The marine areas (--marine), by id.
     std::vector<marine::Area> marine;
+    // How many relations and waterways index_collected left: no more since,
+    // nothing to index again.
+    size_t indexed_relations = SIZE_MAX, indexed_waterways = SIZE_MAX;
 };
 
 // Sorts the relations and waterways by id, each once (of copies, the first
 // input's), and indexes the waterways' member ways
-// (Collected::waterway_of_way).
+// (Collected::waterway_of_way); nothing where none were collected since it
+// last did (another input's pass over the relations every input's prepass
+// read, or key_lines after the relation pass).
 void index_collected(Collected& c);
 
 // The key and display name of a waterway=river or canal way or a waterway

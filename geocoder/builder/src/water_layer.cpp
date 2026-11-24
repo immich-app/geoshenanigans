@@ -212,11 +212,14 @@ void first_of_each_id(std::vector<T>& v, Id id_of) {
 }  // namespace
 
 void index_collected(Collected& c) {
+    if (c.relations.size() == c.indexed_relations && c.waterways.size() == c.indexed_waterways) return;
     first_of_each_id(c.relations, [](const CollectedArea& a) { return a.id; });
     first_of_each_id(c.waterways, [](const CollectedWaterway& w) { return w.id; });
     c.waterway_of_way.clear();
     for (uint32_t i = 0; i < c.waterways.size(); i++)
         for (int64_t way : c.waterways[i].ways) c.waterway_of_way.emplace(way, i);
+    c.indexed_relations = c.relations.size();
+    c.indexed_waterways = c.waterways.size();
 }
 
 bool line_key(const Collected& c, int64_t way, const char* name, const char* name_en, uint32_t way_qid, LineIn& line) {
@@ -1138,14 +1141,24 @@ std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const
             for (uint32_t k = arcs.ring_refs[r]; k < arcs.ring_refs[r + 1]; k++) arc_objects.push_back({arcs.refs[k].arc, o});
         }
         std::sort(arc_objects.begin(), arc_objects.end());
+        arc_objects.erase(std::unique(arc_objects.begin(), arc_objects.end()), arc_objects.end());
+        // On each arc, each object joins the one before it of its local
+        // name: the groups all pairs of one name would make.
+        auto local_of = [&](const std::pair<uint32_t, uint32_t>& e) -> const std::string& {
+            return b.objects[e.second].tags.local_name;
+        };
         for (size_t i = 0; i < arc_objects.size();) {
             size_t end = i + 1;
             while (end < arc_objects.size() && arc_objects[end].first == arc_objects[i].first) end++;
-            for (size_t a = i; a < end; a++)
-                for (size_t z = a + 1; z < end; z++) {
-                    const Object &x = b.objects[arc_objects[a].second], &y = b.objects[arc_objects[z].second];
-                    if (x.tags.local_name == y.tags.local_name) groups.join(arc_objects[a].second, arc_objects[z].second);
-                }
+            if (end - i > 2)
+                std::sort(arc_objects.begin() + static_cast<std::ptrdiff_t>(i),
+                          arc_objects.begin() + static_cast<std::ptrdiff_t>(end), [&](const auto& x, const auto& y) {
+                              const int by_name = local_of(x).compare(local_of(y));
+                              return by_name != 0 ? by_name < 0 : x.second < y.second;
+                          });
+            for (size_t a = i + 1; a < end; a++)
+                if (local_of(arc_objects[a]) == local_of(arc_objects[a - 1]))
+                    groups.join(arc_objects[a - 1].second, arc_objects[a].second);
             i = end;
         }
     }

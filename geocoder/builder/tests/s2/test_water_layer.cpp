@@ -1877,6 +1877,40 @@ TEST(the_lines_are_keyed_by_the_waterway_relations_of_every_input_once_all_are_r
     CHECK_EQ(c.lines[2].qid, 9u);
 }
 
+TEST(the_collected_relations_are_indexed_again_only_once_more_are_collected) {
+    Collected c;
+    CollectedWaterway river;
+    river.id = 4100;
+    river.name = river.local_name = "Limmat";
+    river.ways = {4001};
+    c.waterways.push_back(river);
+    index_collected(c);
+    REQUIRE(c.waterway_of_way.count(4001) == 1u);
+    // An entry the index never makes shows whether it is made again: not by
+    // another input's pass over the same relations, nor by key_lines.
+    c.waterway_of_way[99] = 0;
+    index_collected(c);
+    CHECK(c.waterway_of_way.count(99) == 1u);
+    key_lines(c);
+    CHECK(c.waterway_of_way.count(99) == 1u);
+    // A relation more, a waterway or an area: indexed again.
+    river.id = 4101;
+    river.ways = {4002};
+    c.waterways.push_back(river);
+    index_collected(c);
+    CHECK(c.waterway_of_way.count(99) == 0u);
+    CHECK(c.waterway_of_way.count(4002) == 1u);
+    c.waterway_of_way[99] = 0;
+    CollectedArea lake;
+    lake.id = 500;
+    lake.tags = tags(code::kLake, "See");
+    lake.members = {{11, "outer"}};
+    c.relations.push_back(lake);
+    index_collected(c);
+    CHECK(c.waterway_of_way.count(99) == 0u);
+    CHECK_EQ(c.waterway_of_way.size(), size_t(2));
+}
+
 TEST(a_namesake_inside_a_marine_area_along_its_side_goes_and_one_touching_or_crossing_it_stays) {
     Collected c = with_marine();
     // The North Sea: lat .. lat + 0.2 by lng .. lng + 0.2, a vertex each
