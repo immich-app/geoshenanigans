@@ -11,7 +11,7 @@ This document traces how Nominatim resolves admin boundaries to address fields, 
 | `lib-sql/functions/placex_triggers.sql` | `find_linked_place()` — links boundaries to place nodes. `placex_update()` — rank adjustments for nested boundaries |
 | `src/nominatim_api/v1/classtypes.py` | `get_label_tag()` — determines the output field name (city, state, county, etc.) |
 | `src/nominatim_api/v1/format_json.py` | `_write_typed_address()` — writes the address JSON using labels from get_label_tag |
-| `src/nominatim_api/reverse.py` | `ReverseGeocoder.lookup()` — the reverse steps; `_lookup_area_others()` — the `layer=natural` lookup that alone returns water |
+| `src/nominatim_api/reverse.py` | `ReverseGeocoder.lookup()` — the reverse steps; `_find_closest_street_or_pois()` — the nearby lookup, tried first; `_lookup_area_others()` — the area fallback, which returns the bodies of water of `layer=natural` |
 | `lib-lua/themes/nominatim/presets.lua` | Which tags import as which class/type (`natural`, `water`, `waterway`, `place`) |
 
 ## Step 1: admin_level → address_rank
@@ -164,20 +164,31 @@ Where Nominatim's rank adjustment matters:
 | Suburb/neighbourhood rank adjustment | Covered by the query-time rank adjustment above | ✅ Implemented |
 | TIGER address interpolation | `--tiger-data` loads Nominatim's TIGER export (address ranges, one CSV per county) as interpolation lines, with each line's ZIP in interp_postcodes.bin | ✅ Implemented — a US street that wins without an address point takes its house number from the nearest interpolation line of that street, as Nominatim's `_find_tiger_number_for_street` does |
 | Postal city names | Not implemented | ❌ Deferred — in the US, USPS assigns city names to ZIP codes that may differ from the actual municipal jurisdiction (e.g., "Cumming, GA" for unincorporated Forsyth County). Neither we nor Nominatim handle this — would require external USPS data or addr:city extraction. |
-| `layer=natural` water bodies | The `water` field beside the address, from an optional water dir: the smallest area holding the point, then rank; river and canal areas named by their waterway; seas and oceans from Marine Regions (see "Water" above) | ℹ️ Extension — Nominatim's default answer has no water, and its `layer=natural` order is rank first |
+| `layer=natural` water bodies | The `water` field beside the address, from an optional water dir: the smallest area holding the point, then rank; river and canal areas named by their waterway; seas and oceans from Marine Regions (see "Water" above) | ℹ️ Extension — Nominatim's default answer has no body of water, and its `layer=natural` area order is rank first |
 | Name localisation | Not implemented — we store one name per feature, `name:en` where present, else `name` | ❌ Deferred — Nominatim supports `accept-language` header to return locale-specific names (e.g., `name:en=Borough of Luton` instead of `name=Luton`). Builder would need to store `name:en`, `name:fr`, etc. in the string pool (or a separate name table), and server would need to select based on client language preference. |
 
 ## Water (an extension)
 
 ### Nominatim's approach
 
-- **No water in a default answer.** Every water feature has `rank_address = 0`, so
-  a default reverse (`layer` unset: address and POI) never returns a body of water
-  nor puts one in the address. A point in water gets the nearest street, address
-  or POI within 0.007°, else the admin polygon reaching into the water, else the
-  country of the static country grid (~12 nm offshore), else `Unable to geocode`.
-- **`layer=natural`** (`_lookup_area_others`) is the only lookup that returns
-  water: named features of class `natural`, `water` or `waterway` whose bounding
+- **No body of water in a default answer.** Bodies of water rank 19 to 24
+  (`rank_search`; `waterway=river` 19, `water=lake|reservoir` 20, `water=pond`
+  24, address-levels.json:83-99) with `rank_address = 0`, and a default reverse
+  (`layer` unset: address and POI) takes streets and addresses (`rank_address`
+  26 and up) and POIs of `rank_search` 30 only (reverse.py:187-195), so it never
+  returns one nor puts one in the address. Water features of rank 30,
+  `natural=spring` and `waterway=lock_gate|boatyard|access_point`
+  (address-levels.json:75, 96-98), are POIs there like any other. A point in
+  water gets the nearest street, address or POI within 0.007°, else the admin
+  polygon reaching into the water, else the country of the static country grid
+  (~12 nm offshore), else `Unable to geocode`.
+- **`layer=natural`** first tries the nearby lookup (`lookup()` calls
+  `lookup_street_poi()` at a max rank of 26 or more, reverse.py:618), which takes
+  the layer's features of `rank_search` 26 up to that rank with
+  `rank_address = 0` (`_find_closest_street_or_pois`, reverse.py:196-199): water
+  features of rank 30, never a body of water. Those come from its area fallback
+  (`_lookup_area_others`, reverse.py:461):
+  named features of class `natural`, `water` or `waterway` whose bounding
   box overlaps the point ± 0.007°, the top 50 by `rank_search` (highest first),
   then distance; an area must contain the point, a line need not. So the higher
   rank wins, not the area holding the point: the culverted Tyburn stream
@@ -200,9 +211,9 @@ Where Nominatim's rank adjustment matters:
 - **A field of its own.** Where the dataset has a water dir, the answer carries
   `water: {name, class, type}` last; `display_name`, `address` and `places` are
   this geocoder's answer without water, unchanged, and the field is absent
-  where no water holds the point. `class` and `type` are the category and type
-  Nominatim gives the feature, `type` the key its `layer=natural` address names
-  it by.
+  where no water holds the point. `class` and `type` are this dataset's
+  feature labels. They generally follow Nominatim's categories, with extensions
+  for features such as river areas and Marine Regions seas and oceans.
 - **The rule.** Of the water areas whose rings hold the point (holes honoured: a
   point on an island mapped as a hole of its lake is not in the lake), the
   smallest OSM object answers, its area that of all its outer rings with their
@@ -213,12 +224,15 @@ Where Nominatim's rank adjustment matters:
   continents overlap (Sinai, the Urals) and two loaded continents hold the
   point, the order runs over the water of both, the address's continent's
   winning a whole tie; the address is picked as without water.
-- **Where it differs from `layer=natural`.** Only where a larger area of higher
+- **Where it differs from `layer=natural`.** When a larger area of higher
   rank holds a smaller one of lower rank: a lake or reservoir (20) inside a
   wetland, glacier, bay or strait (22) answers the lake, where Nominatim gives
-  the larger area. An area always beats no area: lines are never answers, and
-  no bounding box stands in for a shape. Ties of one size and rank go to the
-  lower type code, then the smaller name, not to database order.
+  the larger area. Of areas of one rank holding the point the smaller answers,
+  where Nominatim's order (rank, then distance, 0 for each area holding the
+  point, reverse.py:476-479) leaves them to database order. An area always beats
+  no area: lines are never answers, and no bounding box stands in for a shape.
+  Ties of one size and rank go to the lower type code, then the smaller name,
+  not to database order.
 - **Seas and oceans** are Marine Regions' IHO sea areas (EEZ∩IHO v5, CC BY 4.0),
   cut to OpenStreetMap's land, as `place/sea` and `place/ocean`. `major` and
   `all` keep that shore only within 37.5 m (Precision, below), so a point that
@@ -229,11 +243,11 @@ Where Nominatim's rank adjustment matters:
   takes in.
 - **River naming.** River and canal areas are answers, as `waterway/river` and
   `waterway/canal`, named by themselves or by a waterway; an unnamed one that no
-  waterway names is left out. An unnamed one takes the river whose waterway has
-  the most length in it: the whole length of each of its segments whose midpoint
-  falls inside the area, in whole millimetres, summed. A way of a
-  `type=waterway` relation counts for that relation, any other for its own
-  local `name`, so one river under several `name:en` stays one. Its name
+  waterway names is left out. An unnamed one takes the waterway with the
+  greatest total length inside its rings, counting only the portions of each
+  segment inside the area, excluding holes, in whole millimetres. Ways belonging
+  to a `type=waterway` relation count for that relation; other ways count for
+  their local `name`, so one river under several `name:en` stays one. Its name
   follows the dataset's name rule, `name:en` else `name`: the relation's own
   `name:en`; else, where its river ways that carry a `name:en`
   hold more than half of its river length (whole millimetres, none counted
@@ -244,8 +258,8 @@ Where Nominatim's rank adjustment matters:
 - **Kinds out of scope**, as in Nominatim: unnamed water (but river and canal
   areas a waterway names, above), `water=stream|ditch|drain|fish_pass`, `water=*` without
   `natural=water`, `natural=coastline`. Left out for the Marine Regions areas:
-  OSM's `place=sea` areas, and its bays and straits that a Marine Regions area
-  of the same name overlaps.
+  OSM's `place=sea` areas, and OSM bays and straits whose water is fully
+  covered by Marine Regions areas of the same name.
 - **Precision.** `water=all-exact` holds every OSM point of every shore. `major`
   and `all` are simplified within 37.5 m, so a point within that of a shore can
   fall either side of it.

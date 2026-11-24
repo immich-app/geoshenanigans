@@ -82,19 +82,22 @@ lands in it: `admin` mode, `simplified` boundaries, no POIs and no water unless 
 admin sets another selection with `PUT /admin/configuration` (a JSON body of
 `base_url`, `mode`, `quality`, `poi_tier`, `water` and the regions to `preload`;
 a body without `water` takes `none`). A PUT downloads each loaded continent
-again for its selection, with the latest build, unless the server's last
-download of it was of that selection and it and the load after it went
-through, the load finding the `.build_date` that download left (not one of
-another server's download into the dir after it, on the same data dir), and
-loads it once that is in; till then, and where the download or the load
-fails, the continent answers from the files it had, and the next PUT, of
-whichever selection, downloads it again. A continent the server loaded from
-its dir as it started is downloaded again on the first PUT. A loaded continent whose dir holds
-neither the downloader's ledger nor its stamp (`.file_sha256`, `.build_date`,
-below) was laid out by other means, by hand or by the test portal, and is never
-downloaded again. A value the build doesn't offer fails each download, naming
-those it does, and the PUT is refused with them (400) when the
-server has the build's manifest at hand. Downloads check the bucket's
+again for its selection, with the latest build of its `base_url`, unless the
+`.build_date` (below) its dir held as its files loaded names that bucket and
+selection (its own download's, or that of another server's download into the
+dir after it, on the same data dir), and loads it once that is in. Until then,
+or if the download or load fails, the running process keeps serving the old
+index and retries the switch on the next PUT, of whichever selection. If the
+failed download removed `.build_date`, a restart leaves that continent
+unloaded until a download succeeds. A PUT writes its configuration to
+`configuration.json` before its downloads run: a server that starts with one
+downloads, as that PUT would, its preloads and each loaded continent whose
+`.build_date` names another bucket or selection. A loaded continent whose dir
+holds neither the downloader's ledger nor its stamp (`.file_sha256`,
+`.build_date`, below) was laid out by other means, by hand or by the test
+portal, and is never downloaded again. A value the build doesn't offer fails
+each download, naming those it does, and the PUT is refused with them (400)
+when the server has the build's manifest at hand. Downloads check the bucket's
 certificate against the system's CA store: on Linux and the other Unix systems
 but macOS, its certificate bundle (`ca-certificates` on Debian), or another
 that `SSL_CERT_FILE` or `SSL_CERT_DIR` names; on macOS and Windows, the
@@ -102,32 +105,39 @@ system's trust store, which those variables don't change. On a host without one
 the server starts and serves what its data dir holds, and each download fails,
 naming why. The files of a component with a `dir`
 (the water values') go in that sub-dir of the continent dir, `water/`, which the
-server loads with it. A continent dir keeps a ledger of what each of its files
-holds, `.file_sha256` (a line `<name> <sha256>` each, `-` while unknown, a water
-file's name `water/<name>`), and a download skips a file only where the ledger
+server loads with it; a `dir` that is not one plain name, or that starts with a
+dot as the downloader's own names do, fails the download before it fetches. A
+continent dir keeps a ledger of what each of its files holds, `.file_sha256`
+(a line `<name> <sha256>` each, `-` while unknown, a water file's name
+`water/<name>`), and a download skips a file only where the ledger
 names the build's sha256 for it. It removes the files its selection doesn't
 take (another selection's or build's) that the ledger names, or whose names
 files of the build have in the dir or in the sub-dir their component names, the
 ledger naming them or not; files of other names stay. A `water/` that is a link
-or a file fails the download before it writes anything: it writes nothing
+or a file fails the download before it writes dataset files: it writes nothing
 through a link, as the dir's lock guards only the continent dir. A fetch writes
 its file in `.fetching/` beside its place (the continent dir's, or `water/`'s),
 a dir of the downloader's own, which holds a `.downloader` file of the
 downloader's own text from when it is made, and renames it into place; a file
 at the name of one of the build's with `.tmp` after it
 (`water/admin_polygons.bin.tmp`, an operator's copy, say) is none of a
-download's, and stays. The dir names its build in `.build_date` once
-a whole selection of it is in and those are gone; a download that fetches or
-removes anything fails where a `.fetching` is a file, a link, or a dir holding
-files but no `.downloader` of the downloader's own text (an operator's, say; a
-`.downloader` holding only the start of that text, as a download killed while
+download's, and stays. The dir names its build, the bucket (`base_url`)
+and the selection in `.build_date` once a whole selection of it is in and those
+are gone (a download with nothing to fetch into a dir stamped otherwise, or not
+at all, stamps it, and removes the `.fetching/` dirs of the downloader's
+there); a download that fetches or removes anything fails where a `.fetching`
+is a file, a link, or a dir holding files but no `.downloader` of the
+downloader's own text (an operator's, say; a `.downloader` holding only the
+start of that text, as a download killed while
 it wrote it leaves, is the downloader's only where it is all the dir holds),
 before it changes the ledger or the stamp; else it removes the stamp first,
 once it has made the ledger where the dir has none (a dir holding neither was
 laid out by hand, and a server loads it), then removes each `.fetching/`, with
-what killed fetches left there, and again once its last fetch is in. Before it reads the dir a download finishes what a
-transport decode killed part way left there and in `water/`, which the water
-dirs' units decode into (PATCHING.md): such a decode would otherwise put back
+what killed fetches left there, its `.downloader` last (so that a kill part way
+leaves the dir the downloader's), and again once its last fetch is in. Before
+it reads the dir a download finishes what a transport decode killed part way
+left there and in `water/`, which the water dirs' units decode into
+(PATCHING.md): such a decode would otherwise put back
 the files it replaced once the download had listed the files to remove; one it
 can't finish fails the download.
 Downloads into a dir go one at a time, those of other servers on the data dir
@@ -148,9 +158,11 @@ left unloaded. A server that finds a ledger but no stamp in a dir leaves that
 continent unloaded until a query or a preload finishes its download. Queries
 need an API key from the dashboard (see Authentication below).
 
-Servers can share a data dir. Those that run as one user are safe side by
-side: their downloads into a dir go one at a time and their loads wait for
-them, by the lock on `.download.lock`. A server that can't write the data dir
+Servers on Unix can share a data dir; elsewhere a download takes no lock on
+the dirs it writes, so a data dir is one server's. Those that run as one user
+are safe side by side: their downloads into a dir go one at a time and their
+loads wait for them, by the lock on `.download.lock`. A server that can't write
+the data dir
 (a read-only mount, or a dir of another user) is safe beside one that
 downloads into it: it takes the lock where `.download.lock` is there, else
 loads the dir without it and drops what it loaded where a download ran
@@ -433,9 +445,11 @@ address, which it never changes (46.45, 6.55, in Lake Geneva):
 }
 ```
 
-`class` and `type` are the OSM category and type Nominatim gives the feature
-(`water/lake`, `water/reservoir`, `natural/bay`, `natural/wetland`,
-`place/sea`, `place/ocean`, `waterway/river`, `waterway/canal`, ...). The
+`class` and `type` are this dataset's feature labels. They generally follow
+Nominatim's categories (`water/lake`, `water/reservoir`, `natural/bay`,
+`natural/wetland`, ...), with extensions for features such as river areas
+(`waterway/river`, `waterway/canal`) and Marine Regions seas and oceans
+(`place/sea`, `place/ocean`). The
 smallest body of water holding the point answers: a lake in a wetland, a river
 in an estuary, a bay in a sea. A point at sea that no address reaches answers
 `{"address": {}, "water": {...}}`. A point on an island mapped as a hole of its

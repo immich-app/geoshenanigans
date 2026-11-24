@@ -157,7 +157,7 @@
     },
     "water": {
       "label": "Bodies of water",
-      "description": "Lakes, rivers, canals, bays, straits, wetlands and glaciers as areas, and the seas and oceans in builds that pin the marine areas: the files of a water/ dir of their own beside the dataset's, answered in a `water` field beside the address, which they never change. Any boundary precision takes any of them.",
+      "description": "Lakes, rivers, canals, bays, straits, wetlands and glaciers as areas, and the seas and oceans in builds that pin the marine areas. Install the files in `<dataset>/water/`. Reverse geocoding names the water holding the point in a `water` field without changing the address. Any boundary precision takes any water tier.",
       "order": 5,
       "values": {
         "none": {

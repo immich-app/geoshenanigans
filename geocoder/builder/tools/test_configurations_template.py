@@ -55,8 +55,9 @@ class WaterAxisTest(unittest.TestCase):
 
     def test_the_water_axis_offers_its_dirs_files_answered_in_a_water_field(self):
         description = load_template()["axes"]["water"]["description"]
-        self.assertIn("water/", description)
-        self.assertIn("answered in a `water` field beside the address", description)
+        self.assertIn("`<dataset>/water/`", description)
+        self.assertNotIn("beside the dataset", description)
+        self.assertIn("in a `water` field without changing the address", description)
         self.assertNotIn("yet", description)
 
     def test_the_seas_and_oceans_are_offered_as_in_builds_that_pin_the_marine_areas(self):
