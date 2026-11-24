@@ -1,5 +1,6 @@
-//! How far the street, address and interpolation lookups reach: every cell within the search
-//! distance of the point, wherever the point lies in its own cell, and nothing past it.
+//! How far the street, address and interpolation lookups reach: whatever lies within the search
+//! distance of the point, wherever the point lies in its own cell and however the builder lists
+//! it, and nothing past it.
 
 use super::*;
 use s2::latlng::LatLng;
@@ -172,6 +173,199 @@ fn cells_within_lists_every_cell_the_reach_meets_nearest_first() {
                 }
             }
             assert!(cells.ids.iter().all(|id| round.contains_key(id)), "{at}: a cell past twice the reach");
+        }
+    }
+}
+
+/// A point of Seattle's Blaine Street, whose edge there the builder lists only in the cells of its
+/// two ends, though it crosses the cell of this point.
+const BLAINE_STREET: (f64, f64) = (47.6347, -122.348584);
+
+/// A case by corner `k` of the street cell holding `origin`: a point 13 m into the cell along the
+/// corner's bisector; an edge square to the bisector 10 m from the corner, which crosses the cell
+/// there, from 0.5 m past one side to 10 m more past the other than it runs inside the cell, so
+/// that its middle lies in the cell of its far end; and an 8 m line square to the bisector 5 m past
+/// the point. The point as (lat, lng), and the nodes of the edge and of the line.
+fn corner_case(origin: (f64, f64), k: usize) -> ((f64, f64), [NodeCoord; 2], [NodeCoord; 2]) {
+    let cell = Cell::from(CellID(cell_id_at_level(origin.0, origin.1, DEFAULT_STREET_CELL_LEVEL)));
+    let vertex = |k: usize| {
+        let v = LatLng::from(cell.vertex(k % 4));
+        (v.lat.deg(), v.lng.deg())
+    };
+    let corner = vertex(k);
+    // (north, east) in metres from the corner, as at_from lays points out.
+    let metres = |(lat, lng): (f64, f64)| {
+        ((lat - corner.0) * METRES_PER_DEGREE, (lng - corner.1) * METRES_PER_DEGREE * corner.0.to_radians().cos())
+    };
+    let unit = |(n, e): (f64, f64)| (n / n.hypot(e), e / n.hypot(e));
+    let (u, w) = (unit(metres(vertex(k + 1))), unit(metres(vertex(k + 3))));
+    let bisector = unit((u.0 + w.0, u.1 + w.1));
+    let cross = |a: (f64, f64), b: (f64, f64)| a.0 * b.1 - a.1 * b.0;
+    // Square to the bisector, from w's side towards u's.
+    let mut square = (-bisector.1, bisector.0);
+    if square.0 * u.0 + square.1 * u.1 < 0.0 {
+        square = (-square.0, -square.1);
+    }
+    // The point `out` along the bisector and `along` square to it.
+    let point = |out: f64, along: f64| at_from(corner, out * bisector.0 + along * square.0, out * bisector.1 + along * square.1);
+    // How far along the edge's line, 10 m out, it meets the side through the corner along `side`.
+    let meets = |side: (f64, f64)| -10.0 * cross(bisector, side) / cross(square, side);
+    let (near, far) = (meets(w), meets(u));
+    let q = point(13.0, 0.0);
+    ((q.lat as f64, q.lng as f64), [point(10.0, near - 0.5), point(10.0, 2.0 * far - near + 10.0)], [point(18.0, -4.0), point(18.0, 4.0)])
+}
+
+#[test]
+fn a_way_listed_only_in_the_cells_of_its_ends_is_found_from_a_cell_it_crosses() {
+    // The builder lists an edge whose middle lies in the cell of one of its ends only in the cells
+    // of its two ends (cover_edge), though it may cross a third by their corner, as Blaine Street
+    // crosses the cell of BLAINE_STREET. From a point of that cell, by each of its corners: the
+    // edge 3 m off is the street, though the point's cell lists a line 5 m off and the cells of
+    // the edge's ends lie farther than that; and an interpolation line along the edge gives the
+    // house number, as the nearest line and as the line of the street's name.
+    for origin in [ORIGIN, CUBE_CORNER, BLAINE_STREET] {
+        let own = cell_id_at_level(origin.0, origin.1, DEFAULT_STREET_CELL_LEVEL);
+        for k in 0..4 {
+            let (q, edge, line) = corner_case(origin, k);
+            let at = format!("corner {k} of the cell of {origin:?}");
+            // The case: the point in the cell, the edge's ends listed alone and both farther from
+            // the point than the line, and its point nearest the point in the cell.
+            assert_eq!(cell_id_at_level(q.0, q.1, DEFAULT_STREET_CELL_LEVEL), own, "{at}");
+            let ends = edge_cells(edge[0], edge[1]);
+            assert!(ends.len() == 2 && !ends.contains(&own), "{at}: {ends:x?}");
+            let cos_lat = q.0.to_radians().cos();
+            let metres = |line: &[NodeCoord; 2]| {
+                let (a, b) = (line[0], line[1]);
+                point_to_segment_distance(q.0, q.1, a.lat as f64, a.lng as f64, b.lat as f64, b.lng as f64, cos_lat).sqrt() * 6_371_000.0
+            };
+            let p = s2::point::Point::from(LatLng::from_degrees(q.0, q.1));
+            for &end in &ends {
+                let off = s2_distance(&p, &Cell::from(CellID(end))) * 6_371_000.0;
+                assert!(off > metres(&line) + 0.5, "{at}: cell {end:x} {off} m off");
+            }
+            let (a, b) = ((edge[0].lat as f64, edge[0].lng as f64), (edge[1].lat as f64, edge[1].lng as f64));
+            let (d, t) = point_to_segment_with_t(q.0, q.1 * cos_lat, a.0, a.1 * cos_lat, b.0, b.1 * cos_lat, PLANAR);
+            let foot = (a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1));
+            assert_eq!(cell_id_at_level(foot.0, foot.1, DEFAULT_STREET_CELL_LEVEL), own, "{at}");
+            assert!(about(&serde_json::json!(d.sqrt() * 6_371_000.0), 3.0), "{at}");
+
+            let streets = TestIndex::around(q)
+                .street_through("Inner Street", line.to_vec())
+                .street_through("Corner Street", edge.to_vec())
+                .load();
+            let street = &streets.debug_primary(q.0, q.1)["street"];
+            assert!(street["name"] == "Corner Street" && about(&street["dist_m"], 3.0), "{at}: {street}");
+
+            let lines = TestIndex::around(q)
+                .interpolation_through("Main Street", (101, 199, 2), line.to_vec())
+                .interpolation_through("Main Street", (2, 100, 1), edge.to_vec())
+                .load();
+            let interp = &lines.debug_primary(q.0, q.1)["interp"];
+            assert!(interp["number"].as_u64().is_some_and(|n| n % 2 == 0) && about(&interp["dist_m"], 3.0), "{at}: {interp}");
+            let number = lines.find_interp_on_way(q.0, q.1, "Main Street", radians_sq(100.0));
+            assert!(number.is_some_and(|n| n % 2 == 0), "{at}: {number:?}");
+        }
+    }
+}
+
+#[test]
+fn the_street_found_is_the_nearest_of_every_way_within_the_search_distance() {
+    // Short ways listed as the builder lists them, round points by a corner of their cell all over
+    // the globe, against every way measured: the street query_geo finds is the nearest within the
+    // search distance, and none past it.
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        (z ^ (z >> 31)) as f64 / u64::MAX as f64
+    };
+    for trial in 0..300 {
+        let origin = (next() * 120.0 - 60.0, next() * 340.0 - 170.0);
+        let cell = Cell::from(CellID(cell_id_at_level(origin.0, origin.1, DEFAULT_STREET_CELL_LEVEL)));
+        let corner = LatLng::from(cell.vertex((next() * 4.0) as usize % 4));
+        let corner = (corner.lat.deg(), corner.lng.deg());
+        let q = at_from(corner, next() * 30.0 - 15.0, next() * 30.0 - 15.0);
+        let q = (q.lat as f64, q.lng as f64);
+        // Every other case close by the corner, where a way's edges join cells across it.
+        let (spread, longest) = if trial % 2 == 0 { (40.0, 60.0) } else { (170.0, 150.0) };
+        let mut dataset = TestIndex::around(q);
+        let mut ways = Vec::new();
+        for w in 0..1 + (next() * 6.0) as usize {
+            let (north, east) = (next() * 2.0 * spread - spread, next() * 2.0 * spread - spread);
+            let (length, bearing) = (2.0 + next() * longest, next() * 360.0);
+            let (dn, de) = along(length, bearing);
+            let nodes = vec![at_from(q, north, east), at_from(q, north + dn, east + de)];
+            dataset.street_through(&format!("Street {w}"), nodes.clone());
+            ways.push(nodes);
+        }
+        let index = dataset.load();
+        let cos_lat = q.0.to_radians().cos();
+        let nearest = ways.iter()
+            .map(|n| point_to_segment_distance(q.0, q.1, n[0].lat as f64, n[0].lng as f64, n[1].lat as f64, n[1].lng as f64, cos_lat))
+            .enumerate()
+            .filter(|&(_, d)| d < radians_sq(DEFAULT_SEARCH_DISTANCE))
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        let street = &index.debug_primary(q.0, q.1)["street"];
+        let at = format!("trial {trial} at {q:?}: {street}");
+        match nearest {
+            Some((id, _)) => assert_eq!(street["id"], id, "{at}"),
+            None => assert!(street.is_null(), "{at}"),
+        }
+    }
+}
+
+#[test]
+fn a_long_edge_is_found_where_the_builder_lists_its_great_circle() {
+    // The builder lists a long edge in the cells its great circle crosses, but the scans measure to
+    // its line in degrees: at 60° N, a way along the parallel from 0.55° W to 0.55° E bows 127 m
+    // north of it in the cells. On the parallel it is the road at no distance, though a street 1 m
+    // off is listed in the point's own cell and the long way is not.
+    let origin = (60.0, 0.0);
+    let mut dataset = TestIndex::around(origin);
+    dataset.street_through("Long Road", vec![NodeCoord { lat: 60.0, lng: -0.55 }, NodeCoord { lat: 60.0, lng: 0.55 }])
+        .street("Short Street", &across(1.0, 0.0));
+    let own = cell_id_at_level(origin.0, origin.1, DEFAULT_STREET_CELL_LEVEL);
+    assert!(!dataset.geo_cells[&own][geo_index::STREETS].contains(&0));
+    let index = dataset.load();
+    let street = &index.debug_primary(origin.0, origin.1)["street"];
+    assert!(street["name"] == "Long Road" && about(&street["dist_m"], 0.0), "{street}");
+}
+
+#[test]
+fn a_building_round_the_point_is_found_at_any_search_distance() {
+    // With a 30 m search distance, a building the point lies in whose own point lies 80 m east, in
+    // a cell past 30 m of the point: the address at no distance, as the cells round the point's
+    // own are read at any search distance.
+    let q = points_round_cell(ORIGIN)[4];
+    let mut dataset = TestIndex::around(q);
+    dataset.building("9", (-10.0, -10.0, 10.0, 170.0));
+    let index = dataset.load_reaching(30.0);
+    let middle = at_from(q, 0.0, 80.0);
+    let cells = cells_within(q.0, q.1, DEFAULT_STREET_CELL_LEVEL, 30.0 / 6_371_000.0);
+    assert!(!cells.ids.contains(&cell_id_at_level(middle.lat as f64, middle.lng as f64, DEFAULT_STREET_CELL_LEVEL)));
+    let addr = &index.debug_primary(q.0, q.1)["addr"];
+    assert!(addr["house_number"] == "9" && about(&addr["dist_m"], 0.0), "{addr}");
+}
+
+#[test]
+fn no_two_points_of_a_cell_lie_farther_apart_than_s2s_longest_diagonal() {
+    // The listing gap rests on S2's kMaxDiag: over cells on a face, by an edge and a corner of the
+    // cube and by a pole, at the street level and others, no two corners of a cell (between which
+    // its points lie farthest apart) are farther apart than S2_MAX_DIAG times 2^-level.
+    for (lat, lng) in [ORIGIN, CUBE_CORNER, (0.0, 45.0), (45.0, 0.0), (89.9995, 10.0), (-35.26, -135.0), (0.0, 0.0), (10.0, 44.99)] {
+        for level in [10, 14, 17, 20] {
+            let id = CellID(cell_id_at_level(lat, lng, level));
+            for cell in std::iter::once(id).chain(id.edge_neighbors()).map(Cell::from) {
+                let corners: Vec<_> = (0..4).map(|k| cell.vertex(k)).collect();
+                for a in &corners {
+                    for b in &corners {
+                        let apart = a.distance(b).rad();
+                        assert!(apart <= S2_MAX_DIAG * (-(level as f64)).exp2(), "({lat}, {lng}) level {level}: {apart}");
+                    }
+                }
+            }
         }
     }
 }

@@ -175,11 +175,57 @@ pub fn cell_neighbors_at_level(cell_id: u64, level: u64) -> Vec<u64> {
 /// each counts that much nearer.
 const CELL_REACH_SLACK: f64 = 1e-3;
 
+/// S2's kMaxDiag for its quadratic projection (s2metrics.cc): no cell of level k has a diagonal
+/// longer than this times 2^-k radians, nor, being convex, two points farther apart.
+const S2_MAX_DIAG: f64 = 2.438654594434021;
+
+/// How far across a street cell of `level` is at the most, in radians.
+fn cell_diameter(level: u64) -> f64 {
+    S2_MAX_DIAG * (-(level as f64)).exp2()
+}
+
+/// How far the point of an edge nearest a point can lie from every cell the builder lists the
+/// edge in, at the most, in radians at `level`: half a cell's diameter. The builder (cover_edge,
+/// builder/src/s2_helpers.cpp) lists an edge whose middle lies in the cell of one of its ends in
+/// the cells of its two ends alone, though the edge may cross a third by their corner. Its half
+/// from that end to its middle lies in that cell; the other half, as long and so no longer than
+/// the cell is across, lies within half of that of its middle or its other end.
+fn listing_gap(level: u64) -> f64 {
+    cell_diameter(level) / 2.0
+}
+
+/// How far round a point the geo lookups read the street cells, in radians, for a search
+/// distance of `reach` radians: every cell a way within the reach is listed in comes that near.
+/// The point of the way nearest the point lies in a cell the way is listed in, or on an edge square
+/// to the line to it, within the listing gap of a point of the edge in such a cell, so within
+/// √(reach² + gap²), on the scans' plane. And at the least the cells next to the point's own
+/// (address_cover).
+fn geo_cover(reach: f64, level: u64) -> f64 {
+    (reach.hypot(listing_gap(level)) * (1.0 + CELL_REACH_SLACK)).max(address_cover(reach, level))
+}
+
+/// How far round a point the address lookups read the cells' addresses, in radians: as far as
+/// the search distance, an address being listed in the cell of its point, but at the least the
+/// cells next to the point's own, which come within a cell's diameter of it, where a building
+/// round the point lists its point.
+fn address_cover(reach: f64, level: u64) -> f64 {
+    reach.max(cell_diameter(level))
+}
+
 /// The cells a lookup round a point reads (cells_within), nearest first: their ids, and the
 /// squared distance (radians², as the scans measure one) that nothing in each comes nearer than.
 struct NearCells {
     ids: Vec<u64>,
     near: Vec<f64>,
+}
+
+impl NearCells {
+    /// How many of the cells, nearest first, come within `reach` radians of the point, as
+    /// cells_within takes a cell in.
+    fn within(&self, reach: f64) -> usize {
+        let near_reach = reach * (1.0 + CELL_REACH_SLACK) * (1.0 - CELL_REACH_SLACK);
+        self.near.partition_point(|&near| near <= near_reach * near_reach)
+    }
 }
 
 /// The cells of `level` that come within `reach` radians of (lat, lng), nearest first, equally
@@ -1663,10 +1709,17 @@ impl Index {
 
     // --- Geo lookup (streets, addresses, interpolation from merged index) ---
 
-    /// The street-level cells within the search distance of the point, nearest first: the
-    /// cells every geo lookup reads, whose lists GEO_LISTS keeps for the lookups after the first.
+    /// The street-level cells every geo lookup reads round the point, nearest first, whose lists
+    /// GEO_LISTS keeps for the lookups after the first: those of the cover (geo_cover), which
+    /// every way within the search distance is listed in some of.
     fn geo_cells_around(&self, lat: f64, lng: f64) -> NearCells {
-        cells_within(lat, lng, self.street_cell_level, self.max_distance_sq.sqrt())
+        cells_within(lat, lng, self.street_cell_level, geo_cover(self.max_distance_sq.sqrt(), self.street_cell_level))
+    }
+
+    /// How many of a lookup's cells (geo_cells_around) the address scans read: those within the
+    /// address cover, which lists every address point within the search distance.
+    fn address_cells(&self, cells: &NearCells) -> usize {
+        cells.within(address_cover(self.max_distance_sq.sqrt(), self.street_cell_level))
     }
 
     /// What decides between two address points at one exact distance (see
@@ -1740,10 +1793,11 @@ impl Index {
         let mut best_addr_dist = self.max_distance_sq;
         let mut best_addr: Option<AddrRecord> = None;
         let mut best_addr_id: u32 = NO_DATA;
-        // One run over every cell's list: a building is listed in the cell of its point but is
-        // as far as its outline, which can come nearer than that cell. A corrupt cell entry
-        // reads as no record: an id past the last address, a record whose block can't be read.
-        let ids = (0..cells.ids.len()).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
+        // One run over the lists of every cell of the address cover: a building is listed in the
+        // cell of its point but is as far as its outline, which can come nearer than that cell. A
+        // corrupt cell entry reads as no record: an id past the last address, a record whose
+        // block can't be read.
+        let ids = (0..self.address_cells(cells)).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
         with_footprint(|footprint| {
             addrs.for_ids(ids, |id, point| {
                 let dlat = (point.lat as f64 - lat).to_radians();
@@ -1765,8 +1819,8 @@ impl Index {
     }
 
     /// The street way nearest (lat, lng) within the search distance in `lists`, read in
-    /// `nearest_addr`'s order: its squared distance, its row and its id. An exact tie goes by
-    /// `street_tie_key`, then to the way read first.
+    /// `nearest_addr`'s order, from every cell: its squared distance, its row and its id. An exact
+    /// tie goes by `street_tie_key`, then to the way read first.
     fn nearest_street(&self, streets: &WayFiles, lists: &GeoLists, cells: &NearCells, lat: f64, lng: f64, cos_lat: f64)
         -> Option<(f64, WayRow, u32)>
     {
@@ -1777,10 +1831,9 @@ impl Index {
         let mut seen_streets: [u32; 64] = [u32::MAX; 64];
 
         with_way_nodes(|nodes| {
-            for (i, &near) in cells.near.iter().enumerate() {
-                // A way is listed in every cell it crosses: one nearer than the best crosses a
-                // cell nearer than it, which comes before.
-                if best_street_dist < near { break; }
+            // Every cell of the cover: the builder lists a way in some of them, though not
+            // always in the cells it crosses (listing_gap).
+            for i in 0..cells.ids.len() {
                 for &id in lists.list(i, geo_index::STREETS) {
                     let slot = (id as usize) & 0x3F;
                     if seen_streets[slot] == id { continue; }
@@ -1812,9 +1865,9 @@ impl Index {
     }
 
     /// The interpolation way nearest (lat, lng) within the search distance in `lists`, read in
-    /// `nearest_addr`'s order: its squared distance, its street, the house number at the point
-    /// of its line nearest (lat, lng), and its id. Equally near ways go to the lesser
-    /// `interp_tie_key`.
+    /// `nearest_addr`'s order, from every cell: its squared distance, its street, the house
+    /// number at the point of its line nearest (lat, lng), and its id. Equally near ways go to
+    /// the lesser `interp_tie_key`.
     fn nearest_interp(&self, lists: &GeoLists, cells: &NearCells, lat: f64, lng: f64, cos_lat: f64)
         -> Option<(f64, Cow<'_, str>, u32, u32)>
     {
@@ -1823,9 +1876,8 @@ impl Index {
         let mut best_interp_dist = self.max_distance_sq;
         let mut best_interp: Option<(u32, WayRow)> = None;
         let mut best_interp_t: f64 = 0.0;
-        for (i, &near) in cells.near.iter().enumerate() {
-            // Listed in every cell it crosses, as a street is.
-            if best_interp_dist < near { break; }
+        // Every cell of the cover, as for a street.
+        for i in 0..cells.ids.len() {
             for &id in lists.list(i, geo_index::INTERPOLATIONS) {
                 // A corrupt cell entry reads as no way. The row comes first: a way without
                 // numbers costs no node.
@@ -1868,9 +1920,9 @@ impl Index {
 
         let mut best_dist = max_dist_sq.min(self.max_distance_sq);
         let mut best: Option<(u32, AddrRecord)> = None;
-        // Every cell's list, as nearest_addr reads them. Of an address under another way no
-        // more than its street and its parent is read.
-        let ids = (0..cells.ids.len()).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
+        // The lists nearest_addr reads. Of an address under another way no more than its street
+        // and its parent is read.
+        let ids = (0..self.address_cells(&cells)).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
         with_footprint(|footprint| {
             addrs.for_ids_on_way(ids, parent_way_idx, |id, point| {
                 let dlat = (point.lat as f64 - lat).to_radians();
@@ -1914,9 +1966,8 @@ impl Index {
         let max_dist_sq = max_dist_sq.min(self.max_distance_sq);
 
         let mut best: Option<(f64, u32, WayRow, f64)> = None;
-        for (i, &near) in cells.near.iter().enumerate() {
-            // Listed in every cell it crosses, as in nearest_interp.
-            if near >= max_dist_sq || best.as_ref().is_some_and(|(d, ..)| *d < near) { break; }
+        // Every cell of the cover, as in nearest_interp.
+        for i in 0..cells.ids.len() {
             for &id in lists.list(i, geo_index::INTERPOLATIONS) {
                 // The row comes first: only a line of the street's name costs its nodes.
                 let Some(iw) = interps.row(id) else { continue };
@@ -7342,22 +7393,31 @@ mod query_path_tests {
             if !ids.contains(&id) { ids.push(id); }
         }
 
-        /// A way of geo table `table` through points given as (north, east) metres, listed in
-        /// the street cells along it: its nodes.
-        fn way_along(&mut self, table: usize, id: usize, points_m: &[(f64, f64)]) -> Vec<NodeCoord> {
-            let nodes: Vec<NodeCoord> = points_m.iter().map(|&(n, e)| at_from(self.origin, n, e)).collect();
+        /// The nodes of a way through points given as (north, east) metres.
+        fn nodes_at(&self, points_m: &[(f64, f64)]) -> Vec<NodeCoord> {
+            points_m.iter().map(|&(n, e)| at_from(self.origin, n, e)).collect()
+        }
+
+        /// Lists record `id` of geo table `table`, a way through `nodes`, in the street cells
+        /// the builder lists each of its edges in (edge_cells).
+        fn list_way(&mut self, table: usize, id: usize, nodes: &[NodeCoord]) {
             for segment in nodes.windows(2) {
-                for cell in cells_meeting(segment, DEFAULT_STREET_CELL_LEVEL) {
+                for cell in edge_cells(segment[0], segment[1]) {
                     self.list(table, id as u32, cell);
                 }
             }
-            nodes
         }
 
         /// A named street through points given as (north, east) metres.
         fn street(&mut self, name: &str, points_m: &[(f64, f64)]) -> &mut Self {
+            let nodes = self.nodes_at(points_m);
+            self.street_through(name, nodes)
+        }
+
+        /// A named street through `nodes`.
+        fn street_through(&mut self, name: &str, nodes: Vec<NodeCoord>) -> &mut Self {
             let name_id = self.string(name);
-            let nodes = self.way_along(geo_index::STREETS, self.streets.len(), points_m);
+            self.list_way(geo_index::STREETS, self.streets.len(), &nodes);
             self.streets.push(Way { name_id, nodes, numbers: (0, 0, 0) });
             self
         }
@@ -7365,10 +7425,17 @@ mod query_path_tests {
         /// An interpolation way of the street named `street`, from house number `start` at its
         /// first point to `end` at its last; `interpolation` is 0 for every number, 1 for the
         /// even ones, 2 for the odd ones.
-        fn interpolation(&mut self, street: &str, (start, end, interpolation): (u32, u32, u8), points_m: &[(f64, f64)]) -> &mut Self {
+        fn interpolation(&mut self, street: &str, numbers: (u32, u32, u8), points_m: &[(f64, f64)]) -> &mut Self {
+            let nodes = self.nodes_at(points_m);
+            self.interpolation_through(street, numbers, nodes)
+        }
+
+        /// An interpolation way of the street named `street` through `nodes`, numbered as
+        /// `interpolation` numbers one.
+        fn interpolation_through(&mut self, street: &str, numbers: (u32, u32, u8), nodes: Vec<NodeCoord>) -> &mut Self {
             let name_id = self.string(street);
-            let nodes = self.way_along(geo_index::INTERPOLATIONS, self.interps.len(), points_m);
-            self.interps.push(Way { name_id, nodes, numbers: (start, end, interpolation) });
+            self.list_way(geo_index::INTERPOLATIONS, self.interps.len(), &nodes);
+            self.interps.push(Way { name_id, nodes, numbers });
             self
         }
 
@@ -7558,10 +7625,61 @@ mod query_path_tests {
         /// Writes the files into a fresh directory and loads them. The
         /// directory is removed once loaded; the maps keep the bytes.
         fn load(&self) -> Index {
+            self.load_reaching(DEFAULT_SEARCH_DISTANCE)
+        }
+
+        /// As load, the geo lookups reaching `search_distance` metres.
+        fn load_reaching(&self, search_distance: f64) -> Index {
             let dir = ScratchDir::new();
             self.write(dir.path());
-            load_dir(dir.path())
+            Index::load(dir.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, search_distance).unwrap()
         }
+    }
+
+    /// A point of the sphere as a unit vector.
+    fn unit_vector(lat: f64, lng: f64) -> [f64; 3] {
+        let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
+        let (sin_lng, cos_lng) = lng.to_radians().sin_cos();
+        [cos_lat * cos_lng, cos_lat * sin_lng, sin_lat]
+    }
+
+    /// The street cells the builder lists an edge from `a` to `b` in (cover_edge,
+    /// builder/src/s2_helpers.cpp): the cell of both ends where they share one; the cells of its
+    /// two ends alone where its middle in degrees lies in one of them, though it may cross a third
+    /// by their corner; else the cells its great circle crosses. Those are here the cells meeting
+    /// the edge's box, which hold its great circle as well as its line for an edge under a
+    /// kilometre away from the poles and the antimeridian; for any other, the cells of points of
+    /// its great circle 25 cm apart.
+    fn edge_cells(a: NodeCoord, b: NodeCoord) -> Vec<u64> {
+        let cell = |lat: f64, lng: f64| cell_id_at_level(lat, lng, DEFAULT_STREET_CELL_LEVEL);
+        let (alat, alng, blat, blng) = (a.lat as f64, a.lng as f64, b.lat as f64, b.lng as f64);
+        let (first, last) = (cell(alat, alng), cell(blat, blng));
+        if first == last {
+            return vec![first];
+        }
+        let middle = cell((alat + blat) / 2.0, (alng + blng) / 2.0);
+        if middle == first || middle == last {
+            return vec![first, last];
+        }
+        let (pa, pb) = (unit_vector(alat, alng), unit_vector(blat, blng));
+        let cross = [pa[1] * pb[2] - pa[2] * pb[1], pa[2] * pb[0] - pa[0] * pb[2], pa[0] * pb[1] - pa[1] * pb[0]];
+        let angle = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt()
+            .atan2(pa[0] * pb[0] + pa[1] * pb[1] + pa[2] * pb[2]);
+        if angle * 6_371_000.0 < 1_000.0 && (blng - alng).abs() < 90.0 && alat.abs().max(blat.abs()) < 80.0 {
+            return cells_meeting(&[a, b], DEFAULT_STREET_CELL_LEVEL);
+        }
+        let steps = (angle * 6_371_000.0 / 0.25).ceil() as usize;
+        let mut cells: Vec<u64> = (0..=steps)
+            .map(|k| {
+                let t = k as f64 / steps as f64;
+                let (wa, wb) = (((1.0 - t) * angle).sin(), (t * angle).sin());
+                let p = [wa * pa[0] + wb * pb[0], wa * pa[1] + wb * pb[1], wa * pa[2] + wb * pb[2]];
+                cell(p[2].atan2(p[0].hypot(p[1])).to_degrees(), p[1].atan2(p[0]).to_degrees())
+            })
+            .collect();
+        cells.sort_unstable();
+        cells.dedup();
+        cells
     }
 
     fn load_dir(dir: &std::path::Path) -> Index {
