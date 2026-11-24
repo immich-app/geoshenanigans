@@ -454,6 +454,34 @@ async fn a_builds_objects_cover_every_selection_it_serves_and_its_sync_fetches_e
     }
 }
 
+// The portal serves each selection without water (catalog::WATER): no
+// dataset takes a file of the build's water dirs, and no sync fetches one;
+// a preset of a selection with water names none of its datasets, as a
+// preset of another region names none.
+#[tokio::test]
+async fn the_portal_serves_the_selections_without_water() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let (cfg, _) = manifest_of(&bucket).await;
+    let plan = plan_edited(&bucket, |_| {}).await.unwrap();
+    let water: BTreeSet<&String> = cfg.files.keys().filter(|f| f.starts_with("planet/water/")).collect();
+    assert!(!water.is_empty());
+    for d in &plan.datasets {
+        assert!(d.files.iter().all(|f| !water.contains(f)), "{}", d.id);
+    }
+    assert!(plan.objects.iter().flat_map(|o| &o.files).all(|f| !water.contains(f)));
+
+    let wet = plan_edited(&bucket, |m| {
+        let mut wet = m["presets"][0].clone();
+        wet["id"] = "wet".into();
+        wet["selections"]["water"] = "all".into();
+        m["presets"].as_array_mut().unwrap().push(wet);
+    })
+    .await
+    .unwrap();
+    let presets = |plan: &catalog::Plan| plan.presets.iter().map(|(p, at)| (p.id.clone(), *at)).collect::<Vec<_>>();
+    assert_eq!(presets(&wet), presets(&plan));
+}
+
 // A build of another build version is refused once its manifest says so,
 // latest.json giving that version or none: nothing of it is fetched, the
 // build served stays, and the refusal is on record, with why, as long as
@@ -969,8 +997,8 @@ async fn a_sync_killed_part_way_resumes_in_its_dir_fetching_only_what_had_not_co
     let mut want: Vec<String> = order[3..].iter().map(|o| format!("{DATE}/{}", object_url(o))).collect();
     want.sort();
     assert_eq!(resumed, want);
-    let (cfg, _) = manifest_of(&bucket).await;
-    for f in cfg.files.keys().filter(|f| f.starts_with("planet/")) {
+    let (cfg, manifest) = manifest_of(&bucket).await;
+    for f in catalog::plan(&cfg, &manifest).unwrap().objects.iter().flat_map(|o| &o.files) {
         assert!(std::fs::read(root.join(f)).unwrap() == bucket.file(f), "{f}");
     }
 }

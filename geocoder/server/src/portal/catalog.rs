@@ -22,6 +22,11 @@ pub const REGIONS: [&str; 1] = ["planet"];
 /// dataset :3002 served before the portal had more than one.
 pub const DEFAULT_PRESET: &str = "with-addresses";
 
+/// The water of each selection the portal serves: none. Its datasets are
+/// those of the other axes (AXES), their ids and /datasets naming no water,
+/// and a preset with water names none of them.
+pub const WATER: &str = "none";
+
 /// What the portal reads of configurations.json besides what the
 /// downloader does (downloader::Configurations): the build, the axes, the
 /// constraints and the presets.
@@ -402,6 +407,9 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
     let mut presets = Vec::new();
     for preset in &manifest.presets {
         if !preset.selections.get("region").is_some_and(|r| REGIONS.contains(&r.as_str())) {
+            continue;
+        }
+        if preset.selections.get("water").is_some_and(|w| w != WATER) {
             continue;
         }
         let at = datasets.iter().position(|d| {
