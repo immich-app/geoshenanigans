@@ -321,8 +321,10 @@ std::vector<uint8_t> routed_cell_masks(const std::vector<CellItemPair>& cells, s
 // whole, with its record, identities, name, rings and ring blocks, every
 // arc of its rings with that arc's keys, slots and blocks in every tier,
 // and the entries. A name a few polygons share counts for each: a little
-// over, never under.
-std::vector<uint64_t> share_bytes(const Layer& planet, const std::vector<uint8_t>& masks, size_t regions);
+// over, never under. With `arcs`, each region's arcs there too, those of its
+// polygons and of its major tier's (arc_counts of its share).
+std::vector<uint64_t> share_bytes(const Layer& planet, const std::vector<uint8_t>& masks, size_t regions,
+                                  std::vector<ArcCounts>* arcs = nullptr);
 
 // The rows of the fame rule the major tier could take instead: objects of
 // kMajorAreaKm2 or more, and those whose wikidata item has `min_sitelinks`
@@ -357,6 +359,15 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
 // them, each of which write_water_dirs keeps: 0 for none there, and for one
 // that is no sidecar, which that write refuses.
 uint32_t previous_slots(const std::string& region_prev);
+
+// The slots of the previous build's arc sidecars of a region's water dirs
+// under region_prev, tombstones among them: water/all/exact's (the all set's)
+// and water/major/simplified's, each 0 for none there and for one that is no
+// sidecar.
+ArcCounts previous_arc_slots(const std::string& region_prev);
+
+// The arcs of a layer's polygons, and of its major tier's polygons.
+ArcCounts arc_counts(const Layer& layer);
 
 // The single-output build's water: the all set's exact tier, in dir (the
 // region's dir), as water/ beside its mode's files.

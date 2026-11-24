@@ -1257,7 +1257,8 @@ std::vector<uint8_t> routed_cell_masks(const std::vector<CellItemPair>& cells, s
     return masks;
 }
 
-std::vector<uint64_t> share_bytes(const Layer& planet, const std::vector<uint8_t>& masks, size_t regions) {
+std::vector<uint64_t> share_bytes(const Layer& planet, const std::vector<uint8_t>& masks, size_t regions,
+                                  std::vector<ArcCounts>* arcs) {
     if (regions > 8) throw std::logic_error("share_bytes: more than 8 regions");
     if (masks.size() != planet.cells.size()) throw std::logic_error("water cell masks out of step with the cells");
     std::vector<uint64_t> out(regions, 0);
@@ -1303,6 +1304,22 @@ std::vector<uint64_t> share_bytes(const Layer& planet, const std::vector<uint8_t
         for (size_t t = 0; t < stage.tier_count; t++)
             if (!planet.arcs.tiers[t].at.empty()) bytes += planet.arcs.tiers[t].bytes_of(a) + sizeof(uint32_t);
         add(of_arc[a], bytes);
+    }
+    if (arcs) {
+        // The regions of each arc the major tier's polygons use.
+        std::vector<uint8_t> of_major(set.arcs(), 0);
+        for (size_t p = 0; p < planet.size(); p++) {
+            if (!of_polygon[p] || !planet.major[p]) continue;
+            const AdminArcPolygon& poly = planet.arcs.polygons[p];
+            for (uint32_t r = poly.first_ring; r < poly.first_ring + poly.ring_count; r++)
+                for (uint32_t k = set.ring_refs[r]; k < set.ring_refs[r + 1]; k++) of_major[set.refs[k].arc] |= of_polygon[p];
+        }
+        arcs->assign(regions, ArcCounts{});
+        for (size_t a = 0; a < of_arc.size(); a++)
+            for (size_t r = 0; r < regions; r++) {
+                (*arcs)[r].all += of_arc[a] >> r & 1;
+                (*arcs)[r].major += of_major[a] >> r & 1;
+            }
     }
     return out;
 }
@@ -1548,17 +1565,45 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
     return layer;
 }
 
+namespace {
+
+// The slots of the sidecar (IdAllocator's) at `path`, from its header: 0 for
+// none there and for one that is no sidecar.
+uint32_t sidecar_slots(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    uint32_t head[3];
+    if (f.read(reinterpret_cast<char*>(head), sizeof head) && head[0] == gc::id_alloc::SIDECAR_MAGIC &&
+        head[1] == gc::id_alloc::SIDECAR_VERSION)
+        return head[2];
+    return 0;
+}
+
+}  // namespace
+
 uint32_t previous_slots(const std::string& region_prev) {
     if (region_prev.empty()) return 0;
     uint32_t most = 0;
-    for (const char* dir : {kWaterArcTiers[1].dir, "water/major/simplified"}) {
-        std::ifstream f(region_prev + "/" + dir + "/admin_polygons.osm_ids", std::ios::binary);
-        uint32_t head[3];
-        if (f.read(reinterpret_cast<char*>(head), sizeof head) && head[0] == gc::id_alloc::SIDECAR_MAGIC &&
-            head[1] == gc::id_alloc::SIDECAR_VERSION)
-            most = std::max(most, head[2]);
-    }
+    for (const char* dir : {kWaterArcTiers[1].dir, "water/major/simplified"})
+        most = std::max(most, sidecar_slots(region_prev + "/" + dir + "/admin_polygons.osm_ids"));
     return most;
+}
+
+ArcCounts previous_arc_slots(const std::string& region_prev) {
+    if (region_prev.empty()) return {};
+    return {sidecar_slots(region_prev + "/" + kWaterArcTiers[1].dir + "/arc_index.osm_ids"),
+            sidecar_slots(region_prev + "/water/major/simplified/arc_index.osm_ids")};
+}
+
+ArcCounts arc_counts(const Layer& layer) {
+    const ArcSetBlocks& set = layer.arcs.set(ArcSet::Full);
+    std::vector<uint8_t> major(set.arcs(), 0);
+    for (size_t p = 0; p < layer.size(); p++) {
+        if (!layer.major[p]) continue;
+        const AdminArcPolygon& poly = layer.arcs.polygons[p];
+        for (uint32_t r = poly.first_ring; r < poly.first_ring + poly.ring_count; r++)
+            for (uint32_t k = set.ring_refs[r]; k < set.ring_refs[r + 1]; k++) major[set.refs[k].arc] = 1;
+    }
+    return {set.arcs(), static_cast<uint64_t>(std::count(major.begin(), major.end(), uint8_t(1)))};
 }
 
 void write_water_exact(const Layer& layer, const std::string& dir) {

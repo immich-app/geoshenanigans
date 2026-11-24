@@ -568,6 +568,42 @@ TEST(the_previous_slots_of_a_regions_water_dirs_count_their_tombstones) {
     CHECK_EQ(previous_slots(two), 0u);
 }
 
+TEST(the_previous_arc_slots_of_a_regions_water_dirs_stay_past_the_arcs_a_day_of_less_water_has) {
+    const ScratchDir root("water-previous-arc-slots");
+    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    CHECK(previous_arc_slots("").all == 0u && previous_arc_slots("").major == 0u);
+    CHECK(previous_arc_slots(one).all == 0u && previous_arc_slots(one).major == 0u);
+    // The fixture and a lake of about 190 km2, the major tier's.
+    Collected c = fixture();
+    c.closed_ways.push_back({60, tags(code::kLake, "Big Lake"), square(kLat - 2000000, kLng, 1500000, 6)});
+    const Layer day1 = build(c);
+    const ArcCounts arcs1 = arc_counts(day1);
+    CHECK_EQ(arcs1.all, uint64_t(day1.arcs.set(ArcSet::Full).arcs()));
+    CHECK(arcs1.major > 0u && arcs1.major < arcs1.all);
+    write(day1, one);
+    const ArcCounts slots1 = previous_arc_slots(one);
+    CHECK_EQ(slots1.all, arcs1.all);
+    CHECK_EQ(slots1.major, arcs1.major);
+    // The next day holds the river areas alone: few arcs, none of the major
+    // tier's, and every slot of the day before kept.
+    Collected less = fixture();
+    less.closed_ways.erase(less.closed_ways.begin());
+    less.closed_ways.pop_back();
+    less.relations.clear();
+    const Layer day2 = build(less, one);
+    const ArcCounts arcs2 = arc_counts(day2);
+    CHECK(arcs2.all > 0u && arcs2.all < slots1.all);
+    CHECK_EQ(arcs2.major, uint64_t(0));
+    write(day2, two, one);
+    const ArcCounts slots2 = previous_arc_slots(two);
+    CHECK_EQ(slots2.all, slots1.all);
+    CHECK_EQ(slots2.major, slots1.major);
+    // One that is no sidecar counts none.
+    std::ofstream(two + "/water/major/simplified/arc_index.osm_ids", std::ios::binary | std::ios::trunc) << "no";
+    CHECK_EQ(previous_arc_slots(two).major, uint64_t(0));
+    CHECK_EQ(previous_arc_slots(two).all, slots1.all);
+}
+
 namespace {
 
 // A marine area as marine::read_areas gives it: each ring closed.
@@ -721,6 +757,19 @@ TEST(a_regions_share_counts_the_cells_around_its_own_and_each_polygon_they_list_
     // are made, the polygons its cells list whole, and none for a region of
     // no cells.
     const std::vector<uint64_t> shares = share_bytes(planet, masks, 3);
+    // And its arcs, those of its share's polygons and its major tier's.
+    std::vector<ArcCounts> arcs;
+    CHECK(share_bytes(planet, masks, 3, &arcs) == shares);
+    REQUIRE(arcs.size() == 3u);
+    CHECK(arcs[1].all == arc_counts(planet).all && arcs[1].major == arc_counts(planet).major);
+    CHECK(arcs[1].major > 0u && arcs[1].major < arcs[1].all);
+    CHECK(arcs[0].all > 0u && arcs[0].all < arcs[1].all);
+    CHECK(arcs[2].all == 0u && arcs[2].major == 0u);
+    for (int r = 0; r < 2; r++) {
+        const Layer share = subset_layer(planet, masks, uint8_t(1u << r), 2);
+        CHECK_EQ(arcs[r].all, arc_counts(share).all);
+        CHECK_EQ(arcs[r].major, arc_counts(share).major);
+    }
     for (int r = 0; r < 2; r++) {
         // Its bit of the masks, as a continent's split reads them: the
         // share of the entries that bit marks.

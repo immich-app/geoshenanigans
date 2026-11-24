@@ -46,6 +46,12 @@ struct Layer {
     }
 };
 
+// A region's water arcs, or the slots of them a build's sidecars hold: the
+// all set's, and the major tier's.
+struct ArcCounts {
+    uint64_t all = 0, major = 0;
+};
+
 // The slot identity of a closed way's polygon, and of a relation's outer
 // ring (or a piece of one, water_split.h) by the ring's corner (ring_corner):
 // another outer ring added to the relation leaves it as it is. Its fallback

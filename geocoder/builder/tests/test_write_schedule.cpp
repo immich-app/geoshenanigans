@@ -97,6 +97,37 @@ TEST(the_water_stage_holds_its_slot_arrays_for_every_slot_the_previous_build_lef
              region_peak(bytes, counts, 0, RunOrder::Concurrent, pairs, slots));
 }
 
+TEST(the_water_stage_holds_the_slot_allocation_of_each_previous_arc_slot_past_todays_arcs) {
+    // A previous build of 5 Mi all-set and 3 Mi major arc slots over a
+    // layer of 1 Mi arcs, 0.1 Mi of them the major tier's: the all set's
+    // 4 Mi past today's, the larger, as the two allocations run one after
+    // the other.
+    using water::ArcCounts;
+    const uint64_t Mi = uint64_t(1) << 20;
+    CHECK_EQ(water_arc_slots_past(ArcCounts{5 * Mi, 3 * Mi}, ArcCounts{Mi, Mi / 10}), 4 * Mi);
+    CHECK_EQ(water_arc_slots_past(ArcCounts{Mi, 3 * Mi}, ArcCounts{Mi, Mi / 10}), 3 * Mi - Mi / 10);
+    // As many slots as arcs, or fewer (water gained since): none past them.
+    CHECK_EQ(water_arc_slots_past(ArcCounts{Mi, Mi / 10}, ArcCounts{Mi, Mi / 10}), uint64_t(0));
+    CHECK_EQ(water_arc_slots_past(ArcCounts{Mi, Mi / 10}, ArcCounts{Mi + 5, Mi / 10 + 3}), uint64_t(0));
+    CHECK_EQ(water_arc_slots_past(ArcCounts{}, ArcCounts{Mi, Mi / 10}), uint64_t(0));
+    // Each slot past them: the slot as loaded and its key, the previous keys
+    // and their sort's copy, its fallback keys, a fallback pass's keys and
+    // their sort's copy, and its marks.
+    CHECK(kWaterArcSlotBytes >= sizeof(gc::id_alloc::SidecarSlot) + sizeof(uint64_t) + 4 * sizeof(gc::id_alloc::KeyIdx) +
+                                    sizeof(ArcFallbackKeys) + 2);
+    KindValues bytes = kinds(0, 0, 0, 0, 0, 0);
+    at(bytes, RecordKind::Waters) = kGiB;
+    const uint64_t pairs = kGiB / 4 / sizeof(CellItemPair), slots = uint64_t(3) << 20, past = 4 * Mi;
+    CHECK_EQ(stage_costs(bytes, pairs, slots, past).water, stage_costs(bytes, pairs, slots).water + past * kWaterArcSlotBytes);
+    CHECK_EQ(stage_costs(bytes, pairs, slots, 0).water, stage_costs(bytes, pairs, slots).water);
+    // The reservations carry it.
+    const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
+    CHECK_EQ(region_peak(bytes, counts, 0, RunOrder::Serial, pairs, slots, past),
+             region_peak(bytes, counts, 0, RunOrder::Serial, pairs, slots) + past * kWaterArcSlotBytes);
+    CHECK_EQ(continent_cost(bytes, counts, 0, UINT64_MAX, pairs, slots, past).bytes,
+             region_peak(bytes, counts, 0, RunOrder::Concurrent, pairs, slots, past));
+}
+
 TEST(pair_counts_takes_the_water_cell_index_entries_for_the_waters_pairs) {
     ParsedData d;
     d.sorted_way_cells.resize(3);
