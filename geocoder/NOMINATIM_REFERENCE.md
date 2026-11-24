@@ -199,10 +199,17 @@ reservoir or basin way of `area=yes` that is a street is a POI polygon of its
 own, with no POI main tag beside it (`way_tags.h` `has_poi_tags`). The
 server lets a water area of that flag compete as streets do, linked to a
 parent street or not, its own name the `road` wherever it wins
-(`Index::is_water_street`). Two differences stay: Nominatim's lane takes an
-area only where its centroid is within 0.007 degrees of the point too, and
-its answer for a street of `addr:housenumber` carries that house number
-(`results.py` `_setup_address_details`), which a POI record holds none of.
+(`Index::is_water_street`): no address node inside it takes its place, as a
+rank-30 one does in an area of `rank_search` above 27 alone
+(`lookup_street_poi`), nor does a tier-1 one take a landmark's head start. It
+reaches as far as a POI does (100 m), about as far as the street scan, of the
+query's street cell and its neighbours. Three differences stay: Nominatim's
+lane takes an area only where its centroid is within 0.007 degrees of the
+point too; its answer for a street of `addr:housenumber` carries that house
+number (`results.py` `_setup_address_details`), which a POI record holds none
+of, and its postcode is the street's own `addr:postcode` first
+(`placex_update`, `token_get_postcode`), where a street or POI here takes its
+postal boundary's, as below.
 Such a street ships in the POI tier of its water kind or in that of the
 category its tags give, whichever is lower: a lake that is an attraction is in
 `poi/notable`, as an attraction is.

@@ -3122,7 +3122,10 @@ impl Index {
         // We implement the real containment check: if the nearest
         // containing POI has a polygon and the nearest addr_point is a
         // node (no footprint) that point_in_polygon reports as
-        // inside, demote the POI so the node wins.
+        // inside, demote the POI so the node wins. A water street
+        // (is_water_street), of rank_search 26 or 27, takes no such node
+        // in its place: a street that wins refines to a house number it is
+        // the parent of alone (reverse.py lookup_street_poi).
         let mut effective_poi_dist = poi_dist;
         if poi_dist == 0.0 {
             if let (Some((_, addr_pt, _)), Some((_, poi))) = (addr.as_ref(), poi_primary.as_ref()) {
@@ -3133,7 +3136,7 @@ impl Index {
                 // (housenumber, street) drive the result.
                 if addr_dist == 0.0 {
                     effective_poi_dist = f64::MAX;
-                } else if !addr_pt.is_building() && poi.is_polygon() {
+                } else if !addr_pt.is_building() && poi.is_polygon() && !Self::is_water_street(poi) {
                     let mut inside = false;
                     if let Some(verts) = self.poi_verts(&poi) {
                         inside = point_in_polygon(addr_pt.lat, addr_pt.lng, &verts);
@@ -3183,6 +3186,8 @@ impl Index {
         // they typically lack parent_postcode and would drop the
         // address' postcode when they win — Moscow 109012 regressed
         // to '—' when the tier-1 boost applied to a point attraction.
+        // A water street is a street, which competes by its distance
+        // alone.
         let tier1_bonus_sq: f64 = {
             let r = 50.0_f64 / 6_371_000.0_f64;
             r * r
@@ -3190,6 +3195,7 @@ impl Index {
         let compare_poi_dist = match poi_primary.as_ref() {
             Some((_, poi)) if poi.tier == 1
                 && poi.is_polygon()
+                && !Self::is_water_street(poi)
                 && effective_poi_dist < max_dist => {
                 if effective_poi_dist > tier1_bonus_sq {
                     effective_poi_dist - tier1_bonus_sq
@@ -8941,7 +8947,12 @@ mod query_path_tests {
     }
 
     /// `index` with `pois`, each as with_poi takes one, record i the i-th.
-    fn with_pois(mut index: Index, pois: &[((u8, u8), u32, (u32, u32), Span, bool)]) -> Index {
+    fn with_pois(index: Index, pois: &[((u8, u8), u32, (u32, u32), Span, bool)]) -> Index {
+        with_pois_of_tier(index, pois, 0)
+    }
+
+    /// with_pois, every record of `tier`.
+    fn with_pois_of_tier(mut index: Index, pois: &[((u8, u8), u32, (u32, u32), Span, bool)], tier: u8) -> Index {
         let mut records = Vec::new();
         let mut cells = Vec::new();
         for (i, &((category, flags), name_id, (parent_street_id, parent_postcode_id), (s, w, n, e), polygon)) in pois.iter().enumerate() {
@@ -8953,7 +8964,7 @@ mod query_path_tests {
                 q: [at(s, w), at(s, e), at(n, e), at(n, w)].iter().map(|c| (steps(c.lat, low.lat), steps(c.lng, low.lng))).collect(),
             });
             let record = PoiRecord {
-                lat: middle.lat, lng: middle.lng, vertex_offset: if polygon { 0 } else { NO_DATA }, name_id, category, tier: 0, flags,
+                lat: middle.lat, lng: middle.lng, vertex_offset: if polygon { 0 } else { NO_DATA }, name_id, category, tier, flags,
                 importance: 0, parent_street_id, parent_postcode_id, parent_poly_id: NO_DATA,
             };
             records.push((record, outline));
@@ -9091,6 +9102,41 @@ mod query_path_tests {
         assert_eq!(answer(1, true, inside).as_deref(), Some("Seeplatz"));
         assert_eq!(answer(1, true, outside).as_deref(), Some("Mill Lane"));
         assert_eq!(answer(1, false, inside).as_deref(), Some("Main Street"));
+    }
+
+    #[test]
+    fn a_water_street_competes_by_the_rules_of_a_street_not_those_of_a_poi() {
+        // A water street is a street in Nominatim, of rank_address 26 or 27: a street that wins
+        // its street lane refines to a house number it is the parent of alone, and a rank-30 node
+        // inside the closest feature takes its place where that is an area of rank_search above
+        // 27 alone (reverse.py lookup_street_poi), nor does a street take a head start. The lake,
+        // 40 m by 60 m, of the highway flag, its parent street Mill Lane, holds the point asked
+        // and an address node on Main Street 28 m off, Main Street 70 m south: the lake answers,
+        // with no house number. Of tier 1, which gives a landmark polygon its head start of 50 m,
+        // and 30 m east of the point asked, with Main Street 10 m north, it leaves the answer to
+        // Main Street. An ATTRACTION of the flag keeps the POIs' rules: the node answers inside
+        // it, on its street, and of tier 1 it wins beside it, on its parent street.
+        let answer = |category: u8, tier: u8, address: bool, street_north: f64, (north, east): (f64, f64)| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Main Street", &parallel(street_north, 200.0));
+            if address {
+                dataset.address("1", 10.0, 30.0);
+            }
+            let (name, lane) = (dataset.string("Seeplatz"), dataset.string("Mill Lane"));
+            let pois = [((category, POI_FLAG_HIGHWAY), name, (lane, NO_DATA), (0.0, 0.0, 40.0, 60.0), true)];
+            let address = address_at(&with_pois_of_tier(dataset.load(), &pois, tier), north, east);
+            (address["road"].as_str().map(str::to_owned), address["house_number"].as_str().map(str::to_owned))
+        };
+        let road = |name: &str, house_number: Option<&str>| (Some(name.to_owned()), house_number.map(str::to_owned));
+        let (inside, beside) = ((30.0, 10.0), (20.0, -30.0));
+        // NATURAL_WATER, WETLAND, BAY, GLACIER and RESERVOIR.
+        for category in [99, 97, 91, 86, 148] {
+            assert_eq!(answer(category, 0, true, -40.0, inside), road("Seeplatz", None), "category {category}");
+            assert_eq!(answer(category, 1, false, 30.0, beside), road("Main Street", None), "category {category}");
+        }
+        // An ATTRACTION.
+        assert_eq!(answer(1, 0, true, -40.0, inside), road("Main Street", Some("1")));
+        assert_eq!(answer(1, 1, false, 30.0, beside), road("Mill Lane", None));
     }
 
     #[test]
