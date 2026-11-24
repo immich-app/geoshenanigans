@@ -35,6 +35,13 @@ inline bool poi_leisure_ranks_30(const char* v) {
     return !poi_tag_is(v, {"no", "park", "nature_reserve", "garden", "common"});
 }
 
+// Whether natural=`v` ranks 30 in Nominatim (address-levels.json:69-82):
+// tree, spring, cave_entrance, geyser, hot_spring, rock and stone; its other
+// values rank 22 or lower.
+inline bool poi_natural_ranks_30(const char* v) {
+    return v && poi_tag_is(v, {"tree", "spring", "cave_entrance", "geyser", "hot_spring", "rock", "stone"});
+}
+
 // Whether man_made=`v` is a POI main tag in Nominatim (presets.lua:228-237);
 // the other values are none.
 inline bool poi_man_made_is_main(const char* v) {
@@ -205,11 +212,13 @@ inline bool poi_water_street(const char* t_natural, const char* t_landuse, const
 // rank-30 feature where they have no category of their own. Where no POI dir
 // ships that, it stays water, and where its water kind ships in a lower tier
 // than its category, its flags carry the kind for the tiers in between
-// (POI_FLAG_WATER_MASK). An object a main tag of a lower positive rank ranks
-// is the water it is, whatever its other tags, and so is a reservoir whose
-// class the POI lane takes none of (reservoir_leaves_poi_lane); such a
-// reservoir point, which the server would let take the primary slot as it
-// does any RESERVOIR point, never does (POI_FLAG_PLACES_ONLY).
+// (POI_FLAG_WATER_MASK). A reservoir or basin beside a natural tag of rank
+// 30 alone (poi_natural_ranks_30) is a rank-30 POI of it too. An object a
+// main tag of a lower positive rank ranks is the water it is, whatever its
+// other tags, and so is a reservoir whose class the POI lane takes none of
+// (reservoir_leaves_poi_lane); such a reservoir point, which the server
+// would let take the primary slot as it does any RESERVOIR point, never
+// does (POI_FLAG_PLACES_ONLY).
 inline std::optional<PoiClassification> classify_poi(
     const char* t_tourism, const char* t_historic, const char* t_boundary,
     const char* t_amenity, const char* t_leisure, const char* t_natural,
@@ -234,7 +243,10 @@ inline std::optional<PoiClassification> classify_poi(
     // natural=wood, place=island, waterway=waterfall, man_made=dam and
     // power=*, nor shop=no, which the import drops, and which the shop branch
     // would take for a shop. `yielded` is the kind that yielded. A reservoir
-    // of the class building or place, which the lane leaves out, stays one.
+    // beside a natural tag of rank 30 alone yields too: natural=* is no
+    // fallback tag, so it is the class, and 30 its rank, the lowest positive
+    // one. A reservoir of the class building or place, which the lane leaves
+    // out, stays one.
     // A water object a highway kind of rank 26 or 27 ranks is a street there
     // (the street lane takes address ranks 26 to 29, reverse.py:187-189): on
     // an area it takes the highway flag below (poi_water_street), unless a
@@ -269,14 +281,13 @@ inline std::optional<PoiClassification> classify_poi(
                                                  t_railway, t_shop, t_tourism, t_waterway, area)))) {
         kept = kind;
     } else if (kind != PoiCategory::UNKNOWN &&
-               (poi_main_tag || (kind != PoiCategory::RESERVOIR && t_building && std::strcmp(t_building, "no") != 0))) {
+               (poi_main_tag || poi_natural_ranks_30(t_natural) ||
+                (kind != PoiCategory::RESERVOIR && t_building && std::strcmp(t_building, "no") != 0))) {
         yielded = kind;
         t_boundary = nullptr;
         if (area || kind == PoiCategory::RESERVOIR) t_landuse = nullptr;
         if (t_leisure && !poi_leisure_ranks_30(t_leisure)) t_leisure = nullptr;
-        // address-levels.json:69-82.
-        if (t_natural && !poi_tag_is(t_natural, {"tree", "spring", "cave_entrance", "geyser", "hot_spring", "rock", "stone"}))
-            t_natural = nullptr;
+        if (t_natural && !poi_natural_ranks_30(t_natural)) t_natural = nullptr;
         if (t_man_made && !poi_man_made_is_main(t_man_made)) t_man_made = nullptr;
         if (t_shop && std::strcmp(t_shop, "no") == 0) t_shop = nullptr;
         t_power = t_place = t_waterway = nullptr;

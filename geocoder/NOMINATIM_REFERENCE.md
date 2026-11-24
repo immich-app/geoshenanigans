@@ -177,7 +177,9 @@ server never lets those categories (`NATURAL_WATER`, `WETLAND`, `BAY`,
 or `postcode` from it (`Index::is_below_poi_rank`); a `RESERVOIR` point, a
 `landuse=reservoir|basin` node, is a rank-30 POI there and stays, but for one
 a main tag of a lower rank ranks, or whose class the lane takes none of
-(below), which the builder links no parent street.
+(below), which the builder links no parent street. A reservoir or basin
+beside a `natural=*` value of rank 30 alone (`spring`, `hot_spring`, ...) is a
+rank-30 POI of it, class `natural`.
 
 **Water streets.** A water area a `highway=*` kind of rank 26 or 27 ranks
 (`area=yes`, `highway=pedestrian`, `natural=water`, ...), where no place or

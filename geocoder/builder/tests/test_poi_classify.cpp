@@ -635,6 +635,44 @@ TEST(poi_classify_a_water_area_of_a_sidewalk_crossing_link_or_traffic_aisle_foot
     }
 }
 
+TEST(poi_classify_a_reservoir_of_a_rank_30_natural_tag_alone_is_a_rank_30_poi_of_it) {
+    // natural=spring, cave_entrance, geyser, hot_spring, tree, rock and stone
+    // rank 30 (address-levels.json:69-82), and landuse=* is a fallback main
+    // tag (presets.lua MAIN_TAGS.all_boundaries): beside one of them alone a
+    // reservoir or basin is a rank-30 POI of class natural (init.lua
+    // process_tags, ranking.sql compute_place_rank), on an area as on a node,
+    // the category of its natural tag. One of no category of its own is a
+    // generic rank-30 feature, which ships with a wiki tag alone: without
+    // one it stays the water it is.
+    struct Case {
+        const char* natural;
+        PoiCategory category;
+    };
+    const Case cases[] = {{"spring", PoiCategory::SPRING},
+                          {"cave_entrance", PoiCategory::CAVE_ENTRANCE},
+                          {"geyser", PoiCategory::GEYSER},
+                          {"hot_spring", PoiCategory::HOT_SPRING},
+                          {"tree", PoiCategory::GENERIC_RANK30},
+                          {"rock", PoiCategory::GENERIC_RANK30},
+                          {"stone", PoiCategory::GENERIC_RANK30}};
+    for (const char* landuse : {"reservoir", "basin"})
+        for (const Case& c : cases)
+            for (const bool area : {true, false}) {
+                Tags t;
+                t.landuse = landuse;
+                t.natural = c.natural;
+                t.area = area;
+                Tags wiki = t;
+                wiki.wikidata = "Q1";
+                const bool generic = c.category == PoiCategory::GENERIC_RANK30;
+                if (category_of(wiki) != c.category || category_of(t) != (generic ? PoiCategory::RESERVOIR : c.category))
+                    std::printf("    landuse=%s with natural=%s, %s\n", landuse, c.natural, area ? "an area" : "a node");
+                CHECK_EQ(uint8_t(category_of(wiki)), uint8_t(c.category));
+                CHECK_EQ(uint8_t(category_of(t)), uint8_t(generic ? PoiCategory::RESERVOIR : c.category));
+                CHECK_EQ(uint8_t(classify(t)->water), uint8_t(PoiCategory::RESERVOIR));
+            }
+}
+
 TEST(poi_classify_a_reservoir_point_kept_out_of_the_poi_lane_never_takes_the_primary_slot) {
     // A landuse node ranks 30 (ranking.sql compute_place_rank), so a plain
     // reservoir or basin point is a rank-30 POI, in the lane, and the server
