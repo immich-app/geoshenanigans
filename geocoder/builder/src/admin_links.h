@@ -82,12 +82,14 @@ void compute_admin_parent_chain(ParsedData& data, unsigned int num_threads);
 // level, then the smallest, of those covering a point inside the
 // boundary's largest ring (its admin cell entries, data.admin_index_cells),
 // the levels below settled first. Every ring of one that links no place
-// node (data.linking_boundaries) is marked BOUNDARY_REPEATS_PARENT, in no
-// address; every ring of one that links a node keeps the node's type and
-// has own_place_type BOUNDARY_REPEATS_PARENT: parent_address_level staying
-// 3, it takes the node's rank where that is above 3 and below 26 (:1161),
-// whatever its parent's, and is a parent of that rank. Returns how many
-// boundaries repeat their parent.
+// node (data.linking_boundaries), or a label member of a place type of no
+// rank between 4 and 25 (data.unranked_label_boundaries), is marked
+// BOUNDARY_REPEATS_PARENT, in no address; every ring of one that links
+// another node keeps the node's type and has own_place_type
+// BOUNDARY_REPEATS_PARENT: parent_address_level staying 3, it takes the
+// node's rank where that is above 3 and below 26 (:1161), whatever its
+// parent's, and is a parent of that rank. Returns how many boundaries
+// repeat their parent.
 size_t take_out_repeated_boundaries(ParsedData& data, unsigned int num_threads);
 
 void compute_way_parent_polygons(ParsedData& data, unsigned int num_threads);

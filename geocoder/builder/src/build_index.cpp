@@ -2726,6 +2726,12 @@ static int run(int argc, char* argv[]) {
 
             std::cerr << "  Pass 2: processing nodes with " << num_threads << " threads..." << std::endl;
             std::unordered_map<int64_t, uint8_t> label_node_to_place_type; // node_id → PlaceType
+            // label_node_to_place_type's value for a node of a place type the
+            // builder keeps none of whose rank_address lies outside 4 to 25 in
+            // every country (address-levels.json): locality, farm, square,
+            // island and the others but municipality, croft, subdivision,
+            // allotments and civil_parish.
+            constexpr uint8_t kLabelOfNoAddressRank = 254;
             // The place nodes of each QID, so a boundary of the QID links
             // the ones it covers and hides them like Nominatim's
             // linked_place_id does.
@@ -2990,7 +2996,12 @@ static int run(int argc, char* argv[]) {
                                                                lower_name(n_name)}});
                             }
                             if (is_label_member) {
-                                tl_node_data->label_hits.push_back({id, static_cast<uint8_t>(label_pt)});
+                                uint8_t hit = static_cast<uint8_t>(label_pt);
+                                if (label_pt == PlaceType::UNKNOWN && std::strcmp(n_place, "municipality") != 0 &&
+                                    std::strcmp(n_place, "croft") != 0 && std::strcmp(n_place, "subdivision") != 0 &&
+                                    std::strcmp(n_place, "allotments") != 0 && std::strcmp(n_place, "civil_parish") != 0)
+                                    hit = kLabelOfNoAddressRank;
+                                tl_node_data->label_hits.push_back({id, hit});
                             }
                         }
                     }
@@ -3973,7 +3984,9 @@ static int run(int argc, char* argv[]) {
                                         // The label step links any place node.
                                         std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
                                         data.linking_boundaries.push_back(relation_boundary_id(rel.id));
-                                        if (it->second != static_cast<uint8_t>(PlaceType::UNKNOWN)) {
+                                        if (it->second == kLabelOfNoAddressRank) {
+                                            data.unranked_label_boundaries.push_back(relation_boundary_id(rel.id));
+                                        } else if (it->second != static_cast<uint8_t>(PlaceType::UNKNOWN)) {
                                             pto = place_type_to_admin_override(it->second);
                                             if (pto != 0) label_linked_count.fetch_add(1);
                                             // The boundary claims this node

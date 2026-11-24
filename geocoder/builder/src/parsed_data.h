@@ -515,12 +515,14 @@ struct ParsedData {
     // The wikidata of the boundaries (admin levels 2 to 10), as (their
     // relation_boundary_id or way_boundary_id, its Q number) sorted at use,
     // and of the place nodes (parallel to place_nodes, 0 for none), which the
-    // name step compares; and the boundaries that link a place node (a label
-    // member, a node of their wikidata or name), for
-    // take_out_repeated_boundaries (build-time only).
+    // name step compares; the boundaries that link a place node (a label
+    // member, a node of their wikidata or name), and of those the ones whose
+    // label member is of a place type of no rank_address between 4 and 25,
+    // for take_out_repeated_boundaries (build-time only).
     std::vector<std::pair<uint64_t, uint64_t>> boundary_wikidata;
     std::vector<uint32_t> place_qids;
     std::vector<uint64_t> linking_boundaries;
+    std::vector<uint64_t> unranked_label_boundaries;
 
     // Post-canonical-sort: strings partitioned into per-consumer tiers.
     // Global offset space is contiguous: tier N occupies

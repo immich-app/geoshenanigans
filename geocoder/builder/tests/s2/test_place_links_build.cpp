@@ -6,12 +6,12 @@
 // only where it covers it, its edges included, and only one, one of its name
 // first, that no boundary before it links, and a node of its name only of no
 // other wikidata, a boundary that repeats its parent and links no place node
-// is in no address, one that links one takes the node's rank, a
-// place=province area is an address area where its country ranks it, a
-// postal area names a point only of its own country, one for a relation, and
-// of a postcode its country's pattern takes, whatever its length, a US ZIP+4
-// its ZIP, and a place area linked to a place node of another type ranks by
-// its own place tag.
+// is in no address, nor one whose label is a node of no address rank, one
+// that links another takes the node's rank, a place=province area is an
+// address area where its country ranks it, a postal area names a point only
+// of its own country, one for a relation, and of a postcode its country's
+// pattern takes, whatever its length, a US ZIP+4 its ZIP, and a place area
+// linked to a place node of another type ranks by its own place tag.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -536,6 +536,29 @@ TEST(a_boundary_that_repeats_its_parent_and_links_a_place_node_takes_the_nodes_r
     REQUIRE(answers.size() == 1);
     CHECK(names(answers[0], "city", "Nowe Miasto"));
     CHECK(names(answers[0], "neighbourhood", "Nowe Miasto"));
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_boundary_that_repeats_its_parent_and_labels_a_locality_is_in_no_address) {
+    // find_linked_place's label step links a node of any place type (placex_triggers.sql:296-309),
+    // so the boundary's own place tag counts only where nothing links (:1192). A town boundary
+    // tagged place=city along its gmina's ways, of its wikidata, whose label member is a
+    // place=locality node, takes the locality's rank, 25, back (:1161): no street or house has an
+    // address area of that rank (getNearFeatures' rank_address < maxrank), so it names no city.
+    Fixture f;
+    f.country(49, 14, 55, 24, "Polska", "PL");
+    f.boundary(51, 19, 53.5, 23.5, 4, "województwo mazowieckie");
+    const int64_t ways = f.square(52.00, 20.00, 52.10, 20.20);
+    Tags gmina = Fixture::boundary_tags(8, "Nowe Miasto"), town = Fixture::boundary_tags(10, "Stare Miasto");
+    gmina.insert(gmina.end(), {{"wikidata", "Q900"}, {"place", "neighbourhood"}});
+    town.insert(town.end(), {{"wikidata", "Q900"}, {"place", "city"}});
+    const int64_t locality = f.node(52.05, 20.10, {{"place", "locality"}, {"name", "Rynek"}});
+    f.relation(gmina, {ways});
+    f.relation(town, {ways}, {{OsmType::Node, locality, "label"}});
+    const std::vector<std::string> answers = answers_of(f, "repeated-locality", {{52.051, 20.101}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "neighbourhood", "Nowe Miasto"));
+    CHECK(answers[0].find("Stare Miasto") == std::string::npos);
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 

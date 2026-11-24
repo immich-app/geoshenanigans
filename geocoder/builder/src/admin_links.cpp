@@ -376,6 +376,8 @@ size_t take_out_repeated_boundaries(ParsedData& data, unsigned int num_threads) 
     auto& linking = data.linking_boundaries;
     std::sort(linking.begin(), linking.end());
     linking.erase(std::unique(linking.begin(), linking.end()), linking.end());
+    auto& unranked = data.unranked_label_boundaries;
+    std::sort(unranked.begin(), unranked.end());
     if (qids.empty()) return 0;
     auto qid_of = [&](uint64_t boundary) {
         const auto it = std::lower_bound(qids.begin(), qids.end(), std::make_pair(boundary, uint64_t(0)));
@@ -436,7 +438,10 @@ size_t take_out_repeated_boundaries(ParsedData& data, unsigned int num_threads) 
     // level's are marked after it, so the levels below a boundary are
     // settled when it looks for its parent. One that repeats its parent and
     // links a place node of a rank above 3 and below 26 takes that rank and
-    // stays a parent.
+    // stays a parent. One whose label member is of a place type of no such
+    // rank (data.unranked_label_boundaries) takes none, whatever its own
+    // place tag, which counts only where nothing links (:1192): it is in no
+    // address, as one that links nothing is.
     std::vector<uint8_t> out(n);
     size_t repeating = 0;
     for (uint8_t level = 5; level <= 10; level++) {
@@ -476,7 +481,8 @@ size_t take_out_repeated_boundaries(ParsedData& data, unsigned int num_threads) 
             }, num_threads);
         for (uint64_t boundary : repeated) {
             const auto [first, last] = slots_of(boundary);
-            const bool links = std::binary_search(linking.begin(), linking.end(), boundary);
+            const bool links = std::binary_search(linking.begin(), linking.end(), boundary) &&
+                               !std::binary_search(unranked.begin(), unranked.end(), boundary);
             for (auto it = first; it != last; ++it) {
                 AdminPolygon& poly = data.admin_polygons[it->second];
                 if (!links) {
