@@ -538,16 +538,20 @@ TEST(poi_classify_a_water_highway_area_takes_the_highway_flag_where_its_highway_
     // A water area of a highway kind of rank 26 or 27 (address-levels.json)
     // is a street in Nominatim, whose street lane takes address ranks 26 to
     // 29 (reverse.py _find_closest_street_or_pois): it stays water, of the
-    // highway flag, so the server answers its own name inside it. A place or
-    // landuse kind of a rank below 26 beside it ranks it lower, no street: no
-    // flag; place=square ranks 26, a street's. A POI that is no water keeps
-    // the flag as it was.
+    // highway flag, so the server answers its own name inside it, whichever
+    // kind of those it is. A place or landuse kind of a rank below 26 beside
+    // it ranks it lower, no street: no flag; place=square ranks 26, a
+    // street's. A POI that is no water keeps the flag as it was.
     for (const WaterKind& kind : kWaterKinds)
-        for (const char* highway : {"pedestrian", "footway"}) {
+        for (const char* highway :
+             {"service", "cycleway", "path", "footway", "steps", "bridleway", "motorway_link", "primary_link",
+              "trunk_link", "secondary_link", "tertiary_link", "residential", "track", "unclassified", "tertiary",
+              "secondary", "primary", "living_street", "trunk", "motorway", "pedestrian", "road", "construction"}) {
             Tags t = with(with(water(kind), "highway", highway), "tourism", "attraction");
             t.area = true;
             const auto street = classify(t);
             REQUIRE(street.has_value());
+            if (street->flags != POI_FLAG_HIGHWAY) std::printf("    highway=%s\n", highway);
             CHECK_EQ(uint8_t(street->category), uint8_t(kind.category));
             CHECK_EQ(int(street->flags), int(POI_FLAG_HIGHWAY));
             const auto square = classify(with(t, "place", "square"));

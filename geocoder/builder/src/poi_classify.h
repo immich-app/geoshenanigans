@@ -78,6 +78,16 @@ inline bool has_poi_main_tag(const char* t_amenity, const char* t_leisure, const
     return t_man_made && poi_man_made_is_main(t_man_made);
 }
 
+// Whether highway=`v` is a kind of address rank 26 or 27, a street's
+// (settings/address-levels.json:101-126), on an area: the street lane takes
+// address ranks 26 to 29 (reverse.py _find_closest_street_or_pois).
+inline bool poi_highway_ranks_street(const char* v) {
+    return v && poi_tag_is(v, {"service", "cycleway", "path", "footway", "steps", "bridleway", "motorway_link",
+                               "primary_link", "trunk_link", "secondary_link", "tertiary_link", "residential", "track",
+                               "unclassified", "tertiary", "secondary", "primary", "living_street", "trunk", "motorway",
+                               "pedestrian", "road", "construction"});
+}
+
 // Whether an object carries a main tag of a positive address rank below 30
 // (settings/address-levels.json, as of Nominatim's 5348a803), which then
 // ranks it whatever POI main tag it carries too (ranking.sql
@@ -87,10 +97,11 @@ inline bool has_poi_main_tag(const char* t_amenity, const char* t_leisure, const
 // MAIN_TAGS.all_boundaries, and square a street's, MAIN_TAGS_STREETS) and, on
 // an `area` (a polygon, not a node), landuse=residential and the other landuse
 // kinds of an address rank (:53-62; a landuse node ranks 30,
-// ranking.sql:178-180) and the highway kinds of rank 26 and 27 (:101-126; a
-// highway node ranks 30, ranking.sql:175-177). boundary=administrative ranks
-// by an admin_level the classifier doesn't read, and the country tables
-// (place=county in ca and de, ...) by a country: both are left out.
+// ranking.sql:178-180) and the highway kinds of rank 26 and 27
+// (poi_highway_ranks_street; a highway node ranks 30, ranking.sql:175-177).
+// boundary=administrative ranks by an admin_level the classifier doesn't
+// read, and the country tables (place=county in ca and de, ...) by a
+// country: both are left out.
 inline bool has_lower_rank_main_tag(const char* t_place, const char* t_landuse, const char* t_highway, bool area) {
     if (t_place && poi_tag_is(t_place, {"county", "district", "municipality", "city", "town", "borough", "village",
                                         "suburb", "hamlet", "croft", "subdivision", "subdistrict", "allotments",
@@ -101,11 +112,7 @@ inline bool has_lower_rank_main_tag(const char* t_place, const char* t_landuse, 
     if (t_landuse && poi_tag_is(t_landuse, {"residential", "farm", "farmyard", "industrial", "commercial", "allotments",
                                             "retail"}))
         return true;
-    return t_highway && poi_tag_is(t_highway, {"service", "cycleway", "path", "footway", "steps", "bridleway",
-                                               "motorway_link", "primary_link", "trunk_link", "secondary_link",
-                                               "tertiary_link", "residential", "track", "unclassified", "tertiary",
-                                               "secondary", "primary", "living_street", "trunk", "motorway",
-                                               "pedestrian", "road", "construction"});
+    return poi_highway_ranks_street(t_highway);
 }
 
 // Whether Nominatim's POI lane leaves out, by its class, a reservoir or basin
@@ -571,15 +578,18 @@ inline std::optional<PoiClassification> classify_poi(
     // Nominatim treats highway=pedestrian/footway/living_street/
     // path/service areas as rank_search=26 (road rank) rather
     // than rank_search=30. Mark so the server can surface the
-    // feature's own name as `road` rather than its parent street. Water a
-    // place or landuse kind of a lower rank ranks is no street (no_street).
+    // feature's own name as `road` rather than its parent street. A water
+    // area is a street of every highway kind that ranks it
+    // (poi_highway_ranks_street), and water a place or landuse kind of a
+    // lower rank ranks is no street (no_street).
     if (t_highway && !no_street && (
             std::strcmp(t_highway, "pedestrian") == 0 ||
             std::strcmp(t_highway, "footway") == 0 ||
             std::strcmp(t_highway, "living_street") == 0 ||
             std::strcmp(t_highway, "path") == 0 ||
             std::strcmp(t_highway, "cycleway") == 0 ||
-            std::strcmp(t_highway, "service") == 0)) {
+            std::strcmp(t_highway, "service") == 0 ||
+            (kind != PoiCategory::UNKNOWN && area && poi_highway_ranks_street(t_highway)))) {
         flags |= POI_FLAG_HIGHWAY;
     }
     uint8_t tier = poi_tier_of(cat, flags);
