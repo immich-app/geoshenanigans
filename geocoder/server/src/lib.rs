@@ -2144,7 +2144,7 @@ impl Index {
         promote_nested_ranks(&mut ranked, place_area_polygons.iter().map(|(_, pa)| pa), &country_code_str, within);
         ranked.retain(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address));
 
-        let shown = self.area_rows(&ranked, feature, &country_code_str);
+        let shown = self.area_rows(&ranked, feature, &country_code_str, true);
         result.boundary_ranks = rank_bits(shown.iter().map(|&k| &ranked[k]));
         result.country_code = shown.iter()
             .find(|&&k| polygon_field(&ranked[k]) == Some("country"))
@@ -2160,18 +2160,19 @@ impl Index {
     /// getNearFeatures' distance from `feature`) in walk order (CurrentBoundaries::accepted). The
     /// walk takes a rank's areas by that distance (area_row_distance) times their walk_weight, a
     /// quarter for a city-ranked area of rank_search 16 (area_search_rank); a rank of one area
-    /// needs no distance, and has 0. A polygon of the field and the outline of one before it in
-    /// `ranked` is none of the walk's: a boundary repeating its parent's wikidata and geometry,
-    /// which Nominatim takes out of addresses (placex_triggers.sql:895-899), Bruxelles - Brussel
-    /// under Brussels. Nor is, at a rank of two or more areas, one a street `feature` does not run
-    /// through (runs_through), as getNearFeatures takes none such for a street, where another of
-    /// the rank is one it runs through.
+    /// needs no distance, and has 0. The walk takes only the areas of `ranked` that are rows of
+    /// an address (address_areas), and, at a rank of two or more areas, not one a street `feature`
+    /// does not run through (runs_through), as getNearFeatures takes none such for a street, where
+    /// another of the rank is one it runs through. Every area of `ranked` holds the point of a
+    /// point `feature`.
     fn area_walk(&self, ranked: &[RankedPoly], feature: PlaceFeature<'_>, country: &str) -> Vec<(usize, bool, f64)> {
-        let repeats = |k: usize| {
-            let (field, area) = (polygon_field(&ranked[k]), ranked[k].poly.area);
-            field.is_some() && ranked[..k].iter().any(|r| polygon_field(r) == field && r.poly.area == area)
-        };
-        let mut kept: Vec<usize> = (0..ranked.len()).filter(|&k| !repeats(k)).collect();
+        self.area_walk_of(ranked, address_areas(ranked), feature, country, true)
+    }
+
+    /// area_walk over the areas `kept` of `ranked` (address_areas); `held` where every one holds
+    /// the point of a point `feature`, which then needs no test.
+    fn area_walk_of(&self, ranked: &[RankedPoly], mut kept: Vec<usize>, feature: PlaceFeature<'_>, country: &str, held: bool)
+        -> Vec<(usize, bool, f64)> {
         if let PlaceFeature::Line(line) = feature {
             let rank = |k: usize| ranked[k].rank_address;
             let shared: Vec<usize> = kept.iter().copied().filter(|&k| kept.iter().filter(|&&j| rank(j) == rank(k)).count() > 1).collect();
@@ -2183,7 +2184,10 @@ impl Index {
         let mut distances = vec![0.0; candidates.len()];
         let key = |c: usize| {
             let (rank, poly) = &candidates[c];
-            distances[c] = self.area_row_distance(poly, feature);
+            distances[c] = match feature {
+                PlaceFeature::Point(..) if held => 0.00001 * self.area_centre(poly).map_or(0.0, |(lat, lng)| feature_distance(feature, lat, lng)),
+                _ => self.area_row_distance(poly, feature),
+            };
             distances[c] * walk_weight(*rank, self.area_search_rank(poly, country))
         };
         let walked = CurrentBoundaries::accepted(&candidates, key, |poly, current| self.centre_in(poly, current));
@@ -2193,7 +2197,7 @@ impl Index {
     /// The centroid of the area `poly` as Nominatim has it: the place node its boundary links
     /// where that lies inside it (linked_centre), else its point on surface (get_center_point).
     fn area_centre(&self, poly: &AdminPolygon) -> Option<(f64, f64)> {
-        self.linked_centre(poly).or_else(|| self.admin_geometry.point_on_surface(poly).map(|(lat, lng)| (f64::from(lat), f64::from(lng))))
+        self.linked_centre(poly).or_else(|| self.admin_geometry.point_on_surface_memo(poly).map(|(lat, lng)| (f64::from(lat), f64::from(lng))))
     }
 
     /// The place node the boundary of `poly` links (linked_centres) where it lies inside `poly`,
@@ -2239,13 +2243,20 @@ impl Index {
     /// The polygon of `ranked` each rank shows, as Nominatim's complete_address_details orders
     /// a rank's rows (results.py:611-632): the address walk accepts one area a rank (area_walk),
     /// which scores 0, and another area holding the result's centroid scores 1, the one farthest
-    /// from `feature` by plain distance first, then the one of the higher rank_search. Every
-    /// polygon of `ranked` holds the point, so a rank of two or more shows the farthest the walk
-    /// does not accept: of County Dublin and the postal district Dublin 4 at rank 12, whose
-    /// centre is the nearer Mespil Road, County Dublin. Indices into `ranked`, in walk order;
-    /// `country` is the point's, upper case.
-    fn area_rows(&self, ranked: &[RankedPoly], feature: PlaceFeature<'_>, country: &str) -> Vec<usize> {
-        self.area_walk(ranked, feature, country)
+    /// from `feature` by plain distance first, then the one of the higher rank_search. A polygon
+    /// of `ranked` stands for one holding the result's centroid, so a rank of two or more shows
+    /// the farthest the walk does not accept: of County Dublin and the postal district Dublin 4
+    /// at rank 12, whose centre is the nearer Mespil Road, County Dublin. Indices into `ranked`;
+    /// `country` is the point's, upper case; `held` where every polygon of `ranked` holds the
+    /// point of a point `feature`. Where no two areas share a rank, each is its rank's row,
+    /// whichever the walk accepts, and the walk is not run.
+    fn area_rows(&self, ranked: &[RankedPoly], feature: PlaceFeature<'_>, country: &str, held: bool) -> Vec<usize> {
+        let kept = address_areas(ranked);
+        let rank = |k: usize| ranked[k].rank_address;
+        if kept.iter().enumerate().all(|(i, &k)| kept[..i].iter().all(|&j| rank(j) != rank(k))) {
+            return kept;
+        }
+        self.area_walk_of(ranked, kept, feature, country, held)
             .chunk_by(|a, b| ranked[a.0].rank_address == ranked[b.0].rank_address)
             .map(|rank| match rank {
                 [(k, _, _)] => *k,
@@ -2791,7 +2802,8 @@ impl Index {
         promote_nested_ranks(&mut ranked, place_area_polygons.iter(), &country_code_str, within);
         ranked.retain(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address));
 
-        let shown = self.area_rows(&ranked, feature, &country_code_str);
+        // The chain's polygons need not hold the point.
+        let shown = self.area_rows(&ranked, feature, &country_code_str, false);
         result.boundary_ranks = rank_bits(shown.iter().map(|&k| &ranked[k]));
         result.country_code = shown.iter()
             .find(|&&k| polygon_field(&ranked[k]) == Some("country"))
@@ -3483,8 +3495,6 @@ impl Index {
         // admin_level gives 20. The place type here need not be the one
         // Nominatim links, so promote_nested_ranks only raises, and the hold
         // stands in for that rank.
-        // The ranks an area shows at take no place node row; those the walk accepts an area at take
-        // no node at all.
         let rank16 = admin.ranked.iter().any(|r| matches!(polygon_field(r), Some("city" | "town" | "village")));
         let rank16_bit = if rank16 { 1 << CurrentBoundaries::CITY } else { 0 };
         let held_ranks = admin.boundary_ranks | rank16_bit;
@@ -3771,6 +3781,17 @@ impl Index {
         centres.shrink_to_fit();
         centres
     }
+}
+
+/// The areas of `ranked` that are rows of an address, as indices: but a polygon of the field and the
+/// outline of one before it, a boundary repeating its parent's wikidata and geometry, which Nominatim
+/// takes out of addresses (placex_triggers.sql:895-899), Bruxelles - Brussel under Brussels.
+pub fn address_areas(ranked: &[RankedPoly]) -> Vec<usize> {
+    let repeats = |k: usize| {
+        let (field, area) = (polygon_field(&ranked[k]), ranked[k].poly.area);
+        field.is_some() && ranked[..k].iter().any(|r| polygon_field(r) == field && r.poly.area == area)
+    };
+    (0..ranked.len()).filter(|&k| !repeats(k)).collect()
 }
 
 /// What the polygons of one boundary share: their record but for the ring and the area (name,
