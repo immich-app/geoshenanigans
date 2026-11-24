@@ -74,6 +74,9 @@ TEST(a_segment_credits_the_share_of_it_inside_the_rings_with_both_ends_and_its_m
     CHECK_EQ(share_mm({0, 0}, {10000, 0}, 1), segment_mm({0, 0}, {10000, 0}));
     CHECK_EQ(share_mm({0, 0}, {10000, 0}, 0.25L), uint64_t(std::llround(segment_length_mm({0, 0}, {10000, 0}) / 4)));
     CHECK_EQ(share_mm({0, 0}, {10000, 0}, 0), uint64_t(0));
+    // Rounded once, from its length: 95% of 11.1195 mm is 10.56, 11 mm,
+    // where 95% of the segment's whole 11 mm would be 10.
+    CHECK_EQ(share_mm({0, 0}, {1, 0}, 0.95L), uint64_t(11));
 }
 
 TEST(a_segment_through_a_vertex_or_along_an_edge_is_inside_where_the_side_to_its_left_is) {
@@ -120,12 +123,12 @@ TEST(a_segment_across_the_antimeridian_is_cut_there_at_the_latitude_it_crosses_a
     const std::vector<PackedLocation> line = {{0, 1799990000}, {100, 1799998000}, {3100, -1799999000}, {3200, -1799990000}};
     std::vector<PackedLocation> cut;
     cut_at_antimeridian(line.data(), static_cast<uint32_t>(line.size()), cut);
-    CHECK(cut == std::vector<PackedLocation>({{0, 1799990000},
-                                              {100, 1799998000},
-                                              {2100, 1800000000},
-                                              {2100, -1800000000},
-                                              {3100, -1799999000},
-                                              {3200, -1799990000}}));
+    REQUIRE(cut == std::vector<PackedLocation>({{0, 1799990000},
+                                                {100, 1799998000},
+                                                {2100, 1800000000},
+                                                {2100, -1800000000},
+                                                {3100, -1799999000},
+                                                {3200, -1799990000}}));
     // Each piece stays on its side; the stretch along the antimeridian wraps.
     CHECK(!segment_wraps(cut[1], cut[2]) && segment_wraps(cut[2], cut[3]) && !segment_wraps(cut[3], cut[4]));
     // West to east: the first end's side first.

@@ -46,8 +46,22 @@ std::vector<PackedLocation> round_ring(int32_t lat, int32_t lng, uint32_t n) {
     return r;
 }
 
+// Stops the test unless the runs cover the ring's edges, each run at least
+// one, so that every place the helpers below read is a vertex of the ring.
+void require_runs_cover(const std::vector<PackedLocation>& ring, const std::vector<WayRun>& runs) {
+    REQUIRE(!ring.empty());
+    uint64_t edges = 0;
+    for (const WayRun& r : runs) {
+        const uint32_t n = r.edges;  // by value: WayRun is packed
+        REQUIRE(n > 0);
+        edges += n;
+    }
+    REQUIRE(edges == ring.size() - 1);
+}
+
 // The vertices where a ring's runs change way (the arc stage's way ends).
 std::set<uint64_t> way_ends(const std::vector<PackedLocation>& ring, const std::vector<WayRun>& runs) {
+    require_runs_cover(ring, runs);
     std::set<uint64_t> out;
     uint32_t at = 0;
     for (size_t k = 0; k < runs.size(); k++) {
@@ -67,6 +81,7 @@ std::map<std::pair<uint64_t, uint64_t>, std::pair<int64_t, uint32_t>> stretches(
         int64_t way;
         uint32_t edges;
     };
+    require_runs_cover(ring, runs);
     std::vector<Stretch> list;
     uint32_t at = 0;
     for (const WayRun& r : runs) {
