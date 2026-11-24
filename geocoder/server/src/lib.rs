@@ -3294,13 +3294,14 @@ impl Index {
         // (results.py _get_address_lookup_id). That is the street that won,
         // the address point's parent way, or for a POI the nearest street
         // when it carries the POI's parent street name (POIs keep only the
-        // name). Without one, the query point stands in.
+        // name). Without one, the query point stands in, as it does for a
+        // water street, whose address is its own (rank_search <= 27).
         let address_street: Option<u32> = if closest_feature_dist >= max_dist {
             None
         } else if poi_won_primary {
             let (_, poi) = poi_primary.unwrap();
             street.as_ref().filter(|(_, w, _)| {
-                poi.parent_street_id != NO_DATA && w.name != NO_DATA
+                !Self::is_water_street(&poi) && poi.parent_street_id != NO_DATA && w.name != NO_DATA
                     && self.get_string(w.name) == self.get_string(poi.parent_street_id)
             }).map(|(_, _, id)| *id)
         } else if addr_won_primary {
@@ -9137,6 +9138,29 @@ mod query_path_tests {
         // An ATTRACTION.
         assert_eq!(answer(1, 0, true, -40.0, inside), road("Main Street", Some("1")));
         assert_eq!(answer(1, 1, false, 30.0, beside), road("Mill Lane", None));
+    }
+
+    #[test]
+    fn a_water_street_matches_place_nodes_against_the_point_not_its_parent_street() {
+        // Nominatim takes a street's address from the street itself, a rank-30 answer's from its
+        // parent street (results.py _get_address_lookup_id). The lake, 40 m by 60 m, of the
+        // highway flag, holds the point asked, 40 m east of Long Road, its parent street and the
+        // nearest street, whose line the hamlet's 1000 m square crosses 3 km north of the point,
+        // which it leaves out: the lake answers, and no hamlet. An ATTRACTION there answers on
+        // Long Road, in the hamlet.
+        let answer = |(category, flags): (u8, u8)| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Long Road", &[(-1000.0, 0.0), (5000.0, 0.0)]).place("Justice", 4, 3000.0, 200.0);
+            let (name, lane) = (dataset.string("Seeplatz"), dataset.string("Long Road"));
+            let index = with_poi(dataset.load(), (category, flags), name, (lane, NO_DATA), (-20.0, 20.0, 20.0, 80.0), true);
+            let address = address_at(&index, 0.0, 40.0);
+            (address["road"].as_str().map(str::to_owned), address["hamlet"].as_str().map(str::to_owned))
+        };
+        // NATURAL_WATER, WETLAND, BAY, GLACIER and RESERVOIR.
+        for category in [99, 97, 91, 86, 148] {
+            assert_eq!(answer((category, POI_FLAG_HIGHWAY)), (Some("Seeplatz".to_owned()), None), "category {category}");
+        }
+        assert_eq!(answer((1, 0)), (Some("Long Road".to_owned()), Some("Justice".to_owned())));
     }
 
     #[test]
