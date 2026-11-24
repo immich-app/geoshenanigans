@@ -507,6 +507,10 @@ struct ParsedData {
     // linked_place_id and name their claimant); filled from parallel
     // relation workers under the mutex.
     std::vector<PlaceClaim> place_claims;
+    // The place nodes of each boundary's wikidata that it covers (build-time
+    // only), which link_wikidata_places links once every input's boundaries
+    // are in; filled from parallel relation workers under the mutex too.
+    std::vector<WikidataCandidate> wikidata_candidates;
     std::unique_ptr<std::mutex> linked_pn_mutex = std::make_unique<std::mutex>();
 
     // Post-canonical-sort: strings partitioned into per-consumer tiers.

@@ -12,6 +12,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <string>
+#include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -91,6 +94,133 @@ inline bool claim_wins(const ClaimRank& a, const ClaimRank& b) {
     if (a.label != b.label) return a.label;
     if (a.admin_level != b.admin_level) return a.label ? a.admin_level > b.admin_level : a.admin_level < b.admin_level;
     return a.boundary < b.boundary;
+}
+
+// PostgreSQL's lower() of a name, which orders the nodes of a boundary's
+// wikidata (wikidata_order): the capital letters of the Latin-1, Latin
+// Extended-A, Greek, Cyrillic and Armenian blocks as Unicode's simple case
+// mapping lowers them, every other character as it is. Empty for none.
+inline std::string lower_name(const char* name) {
+    std::string out;
+    if (!name) return out;
+    auto put = [&](uint32_t cp) {  // below 0x800
+        if (cp < 0x80) {
+            out += static_cast<char>(cp);
+        } else {
+            out += static_cast<char>(0xC0 | cp >> 6);
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    };
+    auto lower = [](uint32_t cp) -> uint32_t {
+        auto pair = [&](uint32_t first, uint32_t last, uint32_t upper_parity) {
+            return cp >= first && cp <= last && (cp & 1) == upper_parity;
+        };
+        if (cp >= 'A' && cp <= 'Z') return cp + 32;
+        if (cp >= 0xC0 && cp <= 0xDE && cp != 0xD7) return cp + 32;
+        if (cp == 0x130) return 'i';
+        if (pair(0x100, 0x137, 0) || pair(0x139, 0x148, 1) || pair(0x14A, 0x177, 0) || pair(0x179, 0x17E, 1))
+            return cp + 1;
+        if (cp == 0x178) return 0xFF;
+        if (cp == 0x386) return 0x3AC;
+        if (cp >= 0x388 && cp <= 0x38A) return cp + 37;
+        if (cp == 0x38C) return 0x3CC;
+        if (cp == 0x38E || cp == 0x38F) return cp + 63;
+        if (cp >= 0x391 && cp <= 0x3AB && cp != 0x3A2) return cp + 32;
+        if (cp >= 0x400 && cp <= 0x40F) return cp + 80;
+        if (cp >= 0x410 && cp <= 0x42F) return cp + 32;
+        if (pair(0x460, 0x481, 0) || pair(0x48A, 0x4BF, 0) || pair(0x4C1, 0x4CE, 1) || pair(0x4D0, 0x52F, 0))
+            return cp + 1;
+        if (cp == 0x4C0) return 0x4CF;
+        if (cp >= 0x531 && cp <= 0x556) return cp + 48;
+        return cp;
+    };
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(name);
+    while (*p) {
+        // A character of two bytes, and ASCII, is lowered; every other byte
+        // is copied as it is.
+        if (p[0] >= 0xC2 && p[0] < 0xE0 && (p[1] & 0xC0) == 0x80) {
+            put(lower(static_cast<uint32_t>(p[0] & 0x1F) << 6 | (p[1] & 0x3F)));
+            p += 2;
+        } else {
+            out += static_cast<char>(*p < 0x80 ? lower(*p) : *p);
+            p++;
+        }
+    }
+    return out;
+}
+
+// A place node of a boundary's wikidata that the boundary covers, one that
+// find_linked_place's wikidata step can link (placex_triggers.sql).
+struct WikidataCandidate {
+    uint64_t boundary;   // relation_boundary_id or way_boundary_id
+    uint64_t node;       // pack_osm_id(OSM_NODE, id), as place_osm_ids holds it
+    uint8_t order;       // its place in the step's order (wikidata_order)
+    uint8_t place_type;  // the AdminPlaceType it labels its boundary with
+};
+
+// Where the step's ORDER BY lower(name->'name') = bnd_name desc puts a node
+// (lower_name of its name tag and its boundary's, empty for none): first
+// where either has none, the comparison null and nulls first descending,
+// then a node of the boundary's name, then any other.
+inline uint8_t wikidata_order(const std::string& node_name, const std::string& boundary_name) {
+    if (node_name.empty() || boundary_name.empty()) return 0;
+    return node_name == boundary_name ? 1 : 2;
+}
+
+// find_linked_place's wikidata step for every boundary of a candidate (a
+// node of its wikidata it covers). The boundaries take their turns as
+// Nominatim indexes them, in the order claim_wins gives wikidata claims (the
+// lowest admin level first, place areas, level 15, after every boundary),
+// and each links the first of its nodes in wikidata_order, then node id,
+// that no boundary before it linked (placex.linked_place_id is null). Every
+// polygon of a boundary that links a node takes the node's place type, a
+// place area keeping its own place tag beside it (own_place_type); one that
+// links none keeps its own type for the steps after. The links go to
+// `claims` for hide_claimed_place_nodes. Returns how many boundaries link a
+// node.
+inline size_t link_wikidata_places(std::vector<WikidataCandidate> candidates, std::vector<AdminPolygon>& polygons,
+                                   const std::vector<uint64_t>& polygon_ids, std::vector<PlaceClaim>& claims) {
+    const auto boundaries = boundary_polygons(polygons, polygon_ids);
+    if (candidates.empty() || boundaries.empty()) return 0;
+    std::sort(candidates.begin(), candidates.end(), [](const WikidataCandidate& a, const WikidataCandidate& b) {
+        return std::tie(a.boundary, a.order, a.node) < std::tie(b.boundary, b.order, b.node);
+    });
+    struct Turn {
+        ClaimRank rank;
+        size_t begin, end;  // the boundary's candidates
+    };
+    std::vector<Turn> turns;
+    for (size_t k = 0; k < candidates.size();) {
+        size_t end = k + 1;
+        while (end < candidates.size() && candidates[end].boundary == candidates[k].boundary) end++;
+        const uint32_t p = boundary_polygon(boundaries, candidates[k].boundary);
+        if (p != NO_DATA) turns.push_back({ClaimRank{false, polygons[p].admin_level, candidates[k].boundary}, k, end});
+        k = end;
+    }
+    std::sort(turns.begin(), turns.end(), [](const Turn& a, const Turn& b) { return claim_wins(a.rank, b.rank); });
+    std::unordered_set<uint64_t> linked;
+    std::vector<std::pair<uint64_t, uint8_t>> links;  // (boundary, place type), a boundary's one link
+    for (const Turn& turn : turns) {
+        for (size_t k = turn.begin; k < turn.end; k++) {
+            const WikidataCandidate& c = candidates[k];
+            if (!linked.insert(c.node).second) continue;
+            links.push_back({c.boundary, c.place_type});
+            claims.push_back({c.node, c.boundary, false});
+            break;
+        }
+    }
+    std::sort(links.begin(), links.end());
+    for (uint32_t p = 0; p < polygons.size(); p++) {
+        if (polygon_ids[p] == 0) continue;
+        const uint64_t boundary = admin_boundary_id(polygon_ids[p]);
+        const auto it = std::lower_bound(links.begin(), links.end(), std::make_pair(boundary, uint8_t(0)));
+        if (it == links.end() || it->first != boundary) continue;
+        AdminPolygon& poly = polygons[p];
+        const uint8_t own = poly.place_type_override;
+        poly.place_type_override = it->second;
+        poly.own_place_type = poly.admin_level == 15 && it->second != own ? own : 0;
+    }
+    return links.size();
 }
 
 // Hides a claimed node; names `polygon` (unless NO_DATA) as its claimant.

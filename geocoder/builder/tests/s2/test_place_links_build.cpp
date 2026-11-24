@@ -1,7 +1,8 @@
 // build-index's place links and postal areas, from a PBF to the server's
 // answers: a boundary of rank 0 in its country links no place node, its
 // country taken at a point inside it, a boundary or a place area links a
-// place node of its wikidata only where it covers it, its edges included, a
+// place node of its wikidata only where it covers it, its edges included,
+// and only one, one of its name first, that no boundary before it links, a
 // place=province area is an address area where its country ranks it, a
 // postal area names a point only of its own country, one for a relation, and
 // of a postcode its country takes, a US ZIP+4 its ZIP, and a place area
@@ -304,6 +305,46 @@ TEST(a_place_area_relation_links_a_place_node_of_its_wikidata) {
           std::string::npos);
     CHECK(names(answers[0], "town", "Weesp"));
     CHECK(answers[0].find("Weesp Town") == std::string::npos);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_place_area_links_the_one_place_node_of_its_wikidata_named_as_it) {
+    // find_linked_place's wikidata step links one node of the area's wikidata, the first it finds
+    // ORDER BY lower(name->'name') = bnd_name desc (placex_triggers.sql:323-336): Riverside, a
+    // place=suburb area of Q600, covers the town node Riverside Town and the village node
+    // Riverside, both of Q600. It links the village of its own name, which labels it, and the town
+    // stays a place of its own, which names the address just outside the area.
+    Fixture f;
+    f.country(-30, 140, -20, 150, "Australia", "AU");
+    f.node(-25.495, 145.0, {{"place", "town"}, {"name", "Riverside Town"}, {"wikidata", "Q600"}});
+    f.node(-24.8, 144.8, {{"place", "village"}, {"name", "Riverside"}, {"wikidata", "Q600"}});
+    f.area(-25.5, 144.5, -24.5, 145.5,
+           {{"type", "boundary"}, {"boundary", "place"}, {"place", "suburb"}, {"name", "Riverside"}, {"wikidata", "Q600"}});
+    const std::vector<std::string> answers = answers_of(f, "wikidata-one-node", {{-25.0, 145.0}, {-25.505, 145.0}});
+    REQUIRE(answers.size() == 2);
+    CHECK(names(answers[0], "village", "Riverside"));
+    CHECK(names(answers[1], "town", "Riverside Town"));
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_place_node_a_boundary_links_is_no_wikidata_link_of_a_place_area) {
+    // Lent: the wijk (admin_level 10, rank 16 in the Netherlands), the place=quarter area and the
+    // village node Lent all carry Q2068947, and both polygons cover the node. Nominatim indexes the
+    // boundaries before the place areas (indexer.py index_full): the wijk links the node, and the
+    // area's wikidata step passes it over (linked_place_id is null or = bnd.place_id,
+    // placex_triggers.sql:328). The area links nothing and stays a quarter.
+    Fixture f;
+    f.country(51, 5, 52.5, 6.5, "Netherlands", "NL");
+    f.boundary(51.5, 5.5, 52.2, 6.3, 4, "Gelderland");
+    f.boundary(51.8, 5.7, 51.95, 5.95, 8, "Nijmegen");
+    f.node(51.86, 5.86, {{"place", "village"}, {"name", "Lent"}, {"wikidata", "Q2068947"}});
+    f.boundary(51.85, 5.84, 51.88, 5.90, 10, "Lent", {{"wikidata", "Q2068947"}});
+    f.area(51.855, 5.85, 51.875, 5.89,
+           {{"type", "multipolygon"}, {"place", "quarter"}, {"name", "Lent"}, {"wikidata", "Q2068947"}});
+    const std::vector<std::string> answers = answers_of(f, "wikidata-linked-first", {{51.858, 5.87}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "village", "Lent"));
+    CHECK(names(answers[0], "quarter", "Lent"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 
