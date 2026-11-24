@@ -680,6 +680,44 @@ TEST(a_place_area_of_a_closed_way_raises_no_place_node_of_its_rank) {
     CHECK(names(of_relation[0], "suburb", "Ramat HaNasi"));
 }
 
+TEST(a_boundary_with_a_place_tag_of_its_own_links_a_place_node_of_its_name) {
+    // Cetinje in planet-b (42.3931, 18.9115): a closed way, admin_level 8, tagged place=town,
+    // round the city node Cetinje. find_linked_place's place-type step finds no town node of its
+    // name, and its name step takes the city node, of its rank (16) and inside it
+    // (placex_triggers.sql:340-379); the boundary's own place tag is the last resort when nothing
+    // links (:1150-1165). The boundary is the city, labelled by the node, which it hides.
+    Fixture f;
+    f.country(41.8, 18.4, 43.6, 20.4, "Montenegro", "ME");
+    f.boundary(42.2, 18.7, 42.6, 19.1, 6, "Old Royal Capital Cetinje");
+    f.square(42.38, 18.89, 42.40, 18.93, {{"type", "boundary"}, {"boundary", "administrative"}, {"admin_level", "8"},
+                                          {"name", "Cetinje"}, {"place", "town"}});
+    f.node(42.3896, 18.9246, {{"place", "city"}, {"name", "Cetinje"}});
+    const std::vector<std::string> answers = answers_of(f, "own-place-tag-name-link", {{42.3931, 18.9115}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "city", "Cetinje"));
+    CHECK(answers[0].find("\"town\"") == std::string::npos);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_boundary_links_no_place_node_of_its_name_outside_it) {
+    // Salzweg (48.615515, 13.511634): the village node Witzmannsberg (N452414137) lies in the
+    // Gemeinde Salzweg, about 10 km from the Gemeinde Witzmannsberg (R958107) of its name.
+    // find_linked_place's name step takes only a node the boundary covers (ST_Covers,
+    // placex_triggers.sql:362-379), so the Gemeinde links nothing and the node is the village of
+    // the address round it.
+    Fixture f;
+    f.country(47.2, 5.8, 55.1, 15.1, "Germany", "DE");
+    f.boundary(47.3, 8.9, 50.6, 13.9, 4, "Bavaria");
+    f.boundary(48.4, 13.2, 48.8, 13.8, 6, "Landkreis Passau");
+    f.boundary(48.58, 13.46, 48.65, 13.56, 8, "Salzweg");
+    f.boundary(48.66, 13.36, 48.72, 13.44, 8, "Witzmannsberg");
+    f.node(48.6175, 13.5150, {{"place", "village"}, {"name", "Witzmannsberg"}});
+    const std::vector<std::string> answers = answers_of(f, "name-link-covers", {{48.615515, 13.511634}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "village", "Witzmannsberg"));
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
 TEST(a_boundary_links_no_place_node_of_its_name_whose_wikidata_is_another) {
     // find_linked_place's name step takes a node of the boundary's name only where either has no
     // wikidata or both the same (placex_triggers.sql:376-377). Ottignies-Louvain-la-Neuve (admin

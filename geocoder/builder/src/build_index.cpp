@@ -1009,8 +1009,9 @@ static void assign_postal_area_countries(ParsedData& data, const AdminRings& cou
               << " renamed to the postcode it makes" << std::endl;
 }
 
-// find_linked_place step 4: name-based linking of admin boundaries to place nodes
-// (Nominatim find_linked_place name-match fallback).
+// find_linked_place steps 3 and 4: the place-type and name links of admin
+// boundaries to the place nodes they cover, for a boundary the label and
+// wikidata steps linked nothing to.
 static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                 std::chrono::steady_clock::time_point& _pt, CpuTicks& _cpu) {
     unsigned int num_threads = cfg.num_threads;
@@ -1124,6 +1125,40 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                    std::binary_search(linking.begin(), linking.end(), admin_boundary_id(data.admin_osm_ids[p]));
         };
 
+        // The name step takes a node only where the boundary covers it
+        // (ST_Covers(bnd.geometry, placex.geometry), placex_triggers.sql
+        // :362-379): the polygons of the boundary, a relation's rings or a
+        // closed way's one, each even-odd over its rings, their edges
+        // included.
+        const bool have_ids = data.admin_osm_ids.size() == data.admin_polygons.size();
+        std::vector<std::pair<uint64_t, uint32_t>> boundary_rings;
+        if (have_ids) {
+            for (uint32_t p = 0; p < data.admin_polygons.size(); p++) {
+                const uint8_t level = data.admin_polygons[p].admin_level;
+                if (level >= 8 && level <= 10) boundary_rings.push_back({admin_boundary_id(data.admin_osm_ids[p]), p});
+            }
+            std::sort(boundary_rings.begin(), boundary_rings.end());
+        }
+        const auto polygon_covers = [&](uint32_t p, PackedLocation at) {
+            const auto& polygon = data.admin_exact_rings.polygons[p];
+            bool inside = false;
+            for (uint32_t r = polygon.first_ring; r < polygon.first_ring + polygon.ring_count; r++) {
+                const RingSpan& span = data.admin_exact_rings.rings[r];
+                const PackedLocation* v = data.admin_exact_rings.vertices.data() + span.begin;
+                if (exact_ring_touches(v, span.count, at)) return true;
+                inside ^= exact_ring_contains(v, span.count, at);
+            }
+            return inside;
+        };
+        const auto boundary_covers = [&](uint32_t p, PackedLocation at) {
+            if (!have_ids) return polygon_covers(p, at);
+            const uint64_t boundary = admin_boundary_id(data.admin_osm_ids[p]);
+            for (auto it = std::lower_bound(boundary_rings.begin(), boundary_rings.end(), std::make_pair(boundary, uint32_t(0)));
+                 it != boundary_rings.end() && it->first == boundary; ++it)
+                if (polygon_covers(it->second, at)) return true;
+            return false;
+        };
+
         // Nominatim gates step 4 to boundaries with
         // rank_address 16-23 (admin_level 8-11 under the default
         // rank mapping al*2). Coarser boundaries never fall through
@@ -1148,7 +1183,13 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                     size_t i = pol_idx.fetch_add(1);
                     if (i >= data.admin_polygons.size()) break;
                     auto& poly = data.admin_polygons[i];
-                    if (poly.place_type_override != 0) continue;
+                    // A place type here is the boundary's own place tag, as
+                    // the label and wikidata steps linked nothing to it
+                    // (links_already, below): find_linked_place still takes
+                    // its place-type step and its name step (:340-379), the
+                    // tag is the last resort where both find nothing
+                    // (placex_update, :1150-1165).
+                    const uint8_t own_type = poly.place_type_override;
                     // AL11 slots hold boundary=postal_code polygons (their
                     // "name" is the postcode string) — Nominatim's
                     // find_linked_place only runs for boundary=administrative,
@@ -1173,24 +1214,32 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                     if (bnd_rank == 0) continue;  // not in this country's address chain
                     const uint64_t bnd_qid = boundary_qid(static_cast<uint32_t>(i));
 
-                    // The nearest node to the outer ring's vertex average.
+                    // The nearest node to the outer ring's vertex average,
+                    // one of the boundary's own place type first: the
+                    // place-type step comes before the name step (:340-361;
+                    // its names containing one another are taken here as
+                    // the same name).
                     const LatLng centre = outer_vertex_average(data, static_cast<uint32_t>(i));
                     const double clat = centre.first, clng = centre.second;
                     uint32_t best_idx = NO_DATA;
                     double best_dist_sq = max_dist_sq;
+                    bool best_of_type = false;
                     for (auto it = first; it != last; ++it) {
                         const uint32_t pidx = it->second;
                         const auto& pn = data.place_nodes[pidx];
                         uint8_t pr = place_addr_rank(pn.place_type);
                         if (pr == 255) continue;
+                        const bool of_type = own_type != 0 && place_type_to_admin_override(pn.place_type) == own_type;
+                        if (best_of_type && !of_type) continue;
                         // Nominatim's name-match branch requires the
                         // node's address rank to EQUAL the boundary's
                         // rank_address (find_linked_place in
                         // placex_triggers.sql). The previous ±2 window
                         // on rank_search linked NL gemeentes (rank 14)
                         // to their town nodes (16), relabelling
-                        // municipalities as towns.
-                        if (pr != bnd_rank) continue;
+                        // municipalities as towns. The place-type step
+                        // asks the type alone.
+                        if (!of_type && pr != bnd_rank) continue;
                         // Nor a node whose wikidata is another than the
                         // boundary's: either has none, or both the same.
                         const uint32_t node_qid = pidx < data.place_qids.size() ? data.place_qids[pidx] : 0;
@@ -1198,6 +1247,13 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                         double dlat = (double)pn.lat - clat;
                         double dlng = (double)pn.lng - clng;
                         double d2 = dlat * dlat + dlng * dlng;
+                        if (of_type && !best_of_type) {
+                            if (d2 >= max_dist_sq || !boundary_covers(static_cast<uint32_t>(i), point_e7(pn.lat, pn.lng))) continue;
+                            best_of_type = true;
+                            best_dist_sq = d2;
+                            best_idx = pidx;
+                            continue;
+                        }
                         if (d2 > best_dist_sq) continue;
                         if (d2 == best_dist_sq) {
                             // Preserve the original `>=` reject at the
@@ -1218,6 +1274,7 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                                 data.place_osm_ids[pidx] >= data.place_osm_ids[best_idx])
                                 continue;
                         }
+                        if (!boundary_covers(static_cast<uint32_t>(i), point_e7(pn.lat, pn.lng))) continue;
                         best_dist_sq = d2;
                         best_idx = pidx;
                     }
@@ -3980,9 +4037,10 @@ static int run(int argc, char* argv[]) {
                                 //      the boundary, not already linked elsewhere), its
                                 //      candidates linked by link_wikidata_places
                                 //   3. place type (boundary's own place=X tag with a
-                                //      matching-name place node — approximated here by
-                                //      the boundary's own place tag as a last resort)
-                                //   4. name match (not implemented)
+                                //      matching-name place node of that type) and
+                                //   4. name match, both in link_places_by_name; the
+                                //      boundary's own place tag stands meanwhile, the
+                                //      last resort where neither links a node
                                 // An authoritative label-role match stops us falling
                                 // through — even if the label is a non-settlement
                                 // (state/province/country) Nominatim inherits its
