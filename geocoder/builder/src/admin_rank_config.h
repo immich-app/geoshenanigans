@@ -1,9 +1,13 @@
 #pragma once
 // Nominatim's ranks of the boundaries and places the builder keeps:
-// settings/address-levels.json as the public server loads it (master), each
-// entry a (rank_search, rank_address) pair, a country's entries before the
-// default ones. rank_address.h gives every polygon and place node its final
-// rank_address from these, and the dirs carry it; nothing else ranks.
+// settings/address-levels.json as the public server ranks by it, master at
+// a382252 (2026-11-21), each entry a (rank_search, rank_address) pair, a
+// country's entries before the default ones. Master's next revision
+// (e7e7085) ranks place=square 26 and adds subdistrict (14), plot (25) and
+// archipelago (16, 0); the server doesn't rank by it yet, a square node it
+// first indexed on 2026-11-22 ranking 25. rank_address.h gives every polygon
+// and place node its final rank_address from these, and the dirs carry it;
+// nothing else ranks.
 #include <cstdint>
 #include <cstring>
 #include <utility>
