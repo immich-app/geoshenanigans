@@ -215,24 +215,29 @@ impl WaterLayer {
         }
         // Rounded once, as every ring test takes the point; its cell is the rounded point's.
         let point = AdminPoint::new(lat, lng);
+        let (lat, lng) = point.degrees();
         if point.e7().lng.abs() != SEAM_E7 {
-            return self.at_point(point, memo);
+            return self.at_point(point, cell_id_at_level(lat, lng, self.cell_level), memo);
         }
         // On the antimeridian, where an area that crosses it is cut: a ring test counts only
         // the edges east of the point, so no piece holds a point at 180 and only the east one
-        // at -180. The point is tested a step inside either side, each in its own cell, and of
-        // the two waters the one first in answering order answers.
-        let lat = point.degrees().0;
-        let east = self.at_point(AdminPoint::new(lat, -180.0 + 1e-7), memo);
-        let west = self.at_point(AdminPoint::new(lat, 180.0 - 1e-7), &mut PipMemo::new());
+        // at -180. Each side is read in the cell of a step inside it. The east side's
+        // candidates are tested at -180, which the pieces reaching the meridian there hold; the
+        // west side's a step short of 180, which the pieces reaching it from the west hold and
+        // one ending there doesn't, as a ring holds the points of its west edges but none of
+        // its east edges'. Of the two waters the one first in answering order answers.
+        let step = 1e-7;
+        let east = self.at_point(AdminPoint::new(lat, -180.0), cell_id_at_level(lat, -180.0 + step, self.cell_level), memo);
+        let west_point = AdminPoint::new(lat, 180.0 - step);
+        let (_, west_lng) = west_point.degrees();
+        let west = self.at_point(west_point, cell_id_at_level(lat, west_lng, self.cell_level), &mut PipMemo::new());
         east.into_iter().chain(west).min_by(WaterDetail::order)
     }
 
-    /// The water holding `point`, rounded already: the first candidate of its cell, in
-    /// answering order, that holds it.
-    fn at_point(&self, point: AdminPoint, memo: &mut PipMemo) -> Option<WaterDetail<'_>> {
-        let (lat, lng) = point.degrees();
-        let mut candidates: Vec<Candidate<'_>> = self.index.with_ids(cell_id_at_level(lat, lng, self.cell_level), |ids| {
+    /// The water holding `point`, rounded already, of the candidates of the cell `cell`: the
+    /// first of them, in answering order, that holds it.
+    fn at_point(&self, point: AdminPoint, cell: u64, memo: &mut PipMemo) -> Option<WaterDetail<'_>> {
+        let mut candidates: Vec<Candidate<'_>> = self.index.with_ids(cell, |ids| {
             ids.iter().for_each(|&id| self.polygons.prefetch(u64::from(id & ID_MASK) * ADMIN_POLYGON_RECORD_BYTES));
             ids.iter()
                 .filter_map(|&id| {
@@ -681,6 +686,17 @@ mod tests {
         assert_eq!(water(&west_only, 10.5, 179.5), sea);
         assert_eq!(west_only.at(10.5, -179.5), None);
         assert_eq!(east_only.at(10.5, 179.5), None);
+        // Only water that reaches the meridian holds a point on it: not an area a step short of it
+        // on either side, but a strip a step wide along it.
+        let short = WaterFixture::new()
+            .area("East Gap", SEA, (10.0, -179.9999999, 11.0, -179.0), &[])
+            .area("West Gap", SEA, (10.0, 179.0, 11.0, 179.9999999), &[])
+            .layer();
+        let strip = WaterFixture::new().area("Seam Strip", SEA, (10.0, -180.0, 11.0, -179.9999999), &[]).layer();
+        for lng in [180.0, -180.0] {
+            assert_eq!(short.at(10.5, lng), None, "(10.5, {lng})");
+            assert_eq!(water(&strip, 10.5, lng), named("Seam Strip", "place", "sea"), "(10.5, {lng})");
+        }
     }
 
     #[test]
