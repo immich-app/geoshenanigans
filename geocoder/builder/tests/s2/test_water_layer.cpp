@@ -12,6 +12,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -1511,13 +1512,18 @@ namespace {
 // keeping the old dirs until every day is in: a swap that fails puts back
 // each day it swapped (or removes it, for a day that had no dir) and
 // rethrows, so the dir holds the old days or the new ones, never some of
-// each.
+// each. A day's old dir already there, which a swap that stopped part way
+// leaves as the only copy of that day, stops it before it swaps any.
 void swap_in_staged(const std::string& dir, const std::vector<std::string>& days) {
+    for (const std::string& day : days) {
+        const std::string old = dir + "/" + day + ".old";
+        if (fs::exists(old))
+            throw std::runtime_error(old + " is left from a swap that stopped part way: put it back or remove it");
+    }
     std::vector<std::string> swapped;
     try {
         for (const std::string& day : days) {
             const std::string day_dir = dir + "/" + day, old = day_dir + ".old";
-            fs::remove_all(old);
             if (fs::exists(day_dir)) fs::rename(day_dir, old);
             swapped.push_back(day);
             fs::rename(day_dir + ".staged", day_dir);
@@ -1568,6 +1574,26 @@ TEST(a_fixture_swap_that_fails_part_way_puts_back_the_days_it_swapped) {
     CHECK(tree(dir) == (std::map<std::string, std::vector<char>>{{"day1/a", {'n', 'e', 'w', ' ', '1'}},
                                                                  {"day2/a", {'n', 'e', 'w', ' ', '2'}},
                                                                  {"day3/a", {'n', 'e', 'w', ' ', '3'}}}));
+}
+
+TEST(a_fixture_swap_that_finds_an_old_dir_a_stopped_one_left_swaps_nothing_and_keeps_it) {
+    // A swap stopped after it moved day 1 aside: day1.old is the only copy
+    // of day 1, beside its staged dir; day 2 has a staged dir too.
+    const ScratchDir root("water-fixture-swap-left");
+    const std::string dir = root.path();
+    write_file(dir + "/day1.old/a", "old 1");
+    write_file(dir + "/day1.staged/a", "new 1");
+    write_file(dir + "/day2.staged/a", "new 2");
+    std::string said;
+    try {
+        swap_in_staged(dir, {"day1", "day2"});
+    } catch (const std::runtime_error& e) {
+        said = e.what();
+    }
+    CHECK(said.find(dir + "/day1.old") != std::string::npos);
+    CHECK(tree(dir) == (std::map<std::string, std::vector<char>>{{"day1.old/a", {'o', 'l', 'd', ' ', '1'}},
+                                                                 {"day1.staged/a", {'n', 'e', 'w', ' ', '1'}},
+                                                                 {"day2.staged/a", {'n', 'e', 'w', ' ', '2'}}}));
 }
 
 // geocoder/testdata/water_dir: the client files of a water dir on three
