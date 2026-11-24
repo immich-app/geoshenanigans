@@ -686,17 +686,19 @@ fn cross_inside_brute(a: PointE7, b: PointE7, c: PointE7, d: PointE7) -> bool {
 
 /// polygon_within over rings as given, every edge against every edge: each vertex of `rings`
 /// inside `other` or on its edges, no edge of theirs crossing one of `other`'s inside both, no
-/// point of `other`'s edges inside them off their edges, and `surface` inside `other` off its
-/// edges. An edge of `other`, cut at the vertices of `rings` on it, meets their edges only at the
-/// ends of its pieces, so each piece is inside them where its middle is: tested at twice the
-/// coordinates, where the middle of two e7 points is on the grid.
-fn within_brute(rings: &[Vec<PointE7>], other: &[Vec<PointE7>], surface: PointE7) -> bool {
+/// point of `other`'s edges inside them off their edges, and `surface2`, a point at twice the
+/// coordinates, inside `other` off its edges. An edge of `other`, cut at the vertices of `rings`
+/// on it, meets their edges only at the ends of its pieces, so each piece is inside them where
+/// its middle is: tested at twice the coordinates, where the middle of two e7 points is on the
+/// grid.
+fn within_brute(rings: &[Vec<PointE7>], other: &[Vec<PointE7>], surface2: PointE7) -> bool {
     let edges = |rings: &[Vec<PointE7>]| -> Vec<(PointE7, PointE7)> { rings.iter().flat_map(|r| r.windows(2).map(|e| (e[0], e[1]))).collect() };
     let (own, others) = (edges(rings), edges(other));
     let on = |edges: &[(PointE7, PointE7)], p: PointE7| edges.iter().any(|&(a, b)| on_edge(a, b, p));
     let twice = |p: PointE7| pt(2 * p.lat, 2 * p.lng);
-    let doubled: Vec<Vec<PointE7>> = rings.iter().map(|r| r.iter().map(|&v| twice(v)).collect()).collect();
-    let doubled_edges = edges(&doubled);
+    let doubled = |rings: &[Vec<PointE7>]| -> Vec<Vec<PointE7>> { rings.iter().map(|r| r.iter().map(|&v| twice(v)).collect()).collect() };
+    let (doubled, doubled_other) = (doubled(rings), doubled(other));
+    let (doubled_edges, doubled_others) = (edges(&doubled), edges(&doubled_other));
     let inside_off_edges = |p2: PointE7| brute(&doubled, p2) && !on(&doubled_edges, p2);
     let enters = |&(a, b): &(PointE7, PointE7)| {
         let along = |v: &PointE7| (v.lat - a.lat) as i128 * (b.lat - a.lat) as i128 + (v.lng - a.lng) as i128 * (b.lng - a.lng) as i128;
@@ -708,7 +710,7 @@ fn within_brute(rings: &[Vec<PointE7>], other: &[Vec<PointE7>], surface: PointE7
         && !own.iter().any(|&(a, b)| others.iter().any(|&(c, d)| cross_inside_brute(a, b, c, d)))
         && !other.iter().flatten().any(|&v| inside_off_edges(twice(v)))
         && !others.iter().any(enters)
-        && brute(other, surface) && !on(&others, surface)
+        && brute(&doubled_other, surface2) && !on(&doubled_others, surface2)
 }
 
 #[test]
@@ -753,9 +755,23 @@ fn a_polygon_is_within_another_only_where_no_part_of_it_is_outside() {
         assert_eq!(within(a, b), want, "{a} in {b}");
         let surface = geom.ring_block(&polys[a as usize]).and_then(|block| geom.surface_point(block, &mut Vec::new()));
         if let Some((lat, lng)) = surface.filter(|_| b != ringless) {
-            assert_eq!(within_brute(&s.rings[a as usize], &s.rings[b as usize], AdminPoint::new(lat, lng).e7()), want, "{a} in {b}");
+            assert_eq!(within_brute(&s.rings[a as usize], &s.rings[b as usize], twice_surface(lat, lng)), want, "{a} in {b}");
         }
     }
+}
+
+#[test]
+fn a_polygon_is_within_one_along_its_edge_by_its_point_on_surface_off_the_grid() {
+    // A triangle a few e7 units across, and one larger along its edge from (0, 2) to (3, 0):
+    // its point on surface, the middle of its widest run at latitude 1.5, is (1.5, 0.5), which
+    // the grid would round to (2, 1), past that edge.
+    let mut s = Shapes::default();
+    let triangle = ring_polygon(&mut s, vec![vec![pt(0, 0), pt(0, 2), pt(3, 0), pt(0, 0)]]);
+    let larger = ring_polygon(&mut s, vec![vec![pt(0, -1), pt(0, 2), pt(3, 0), pt(3, -1), pt(0, -1)]]);
+    let (geom, polys) = s.geometry();
+    let within = |a: u32, b: u32| geom.polygon_within(&polys[a as usize], &polys[b as usize]);
+    assert!(within(triangle, larger) && within(triangle, triangle) && within(larger, larger));
+    assert!(!within(larger, triangle));
 }
 
 #[test]
@@ -771,9 +787,9 @@ fn polygon_within_answers_as_testing_every_edge_against_every_edge() {
         let mut held = 0;
         for &a in &ids {
             let (lat, lng) = geom.surface_point(geom.ring_block(&polys[a as usize]).unwrap(), &mut Vec::new()).unwrap();
-            let surface = AdminPoint::new(lat, lng).e7();
+            let surface2 = twice_surface(lat, lng);
             for &b in &ids {
-                let want = within_brute(&l.shapes.rings[a as usize], &l.shapes.rings[b as usize], surface);
+                let want = within_brute(&l.shapes.rings[a as usize], &l.shapes.rings[b as usize], surface2);
                 held += want as usize;
                 assert_eq!(within(a, b), want, "{dims:?} {grids:?} {a} in {b}");
             }

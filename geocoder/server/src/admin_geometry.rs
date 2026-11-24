@@ -280,7 +280,7 @@ impl AdminGeometry {
         }
         let held = |poly: &AdminPolygon, block: &[u8]| {
             let (lat, lng) = self.memo_surface_point(poly, block)?;
-            HeldRings::of(block, self.arcs(), AdminPoint::new(lat, lng).e7())
+            HeldRings::of(block, self.arcs(), twice_surface(lat, lng))
         };
         let (Some(held_a), Some(held_b)) = (held(a, block_a), held(b, block_b)) else { return false };
         let mut cuts = Vec::new();
@@ -335,7 +335,7 @@ impl AdminGeometry {
             return within;
         }
         let within = self.memo_surface_point(poly, block)
-            .and_then(|(lat, lng)| HeldRings::of(block, self.arcs(), AdminPoint::new(lat, lng).e7()))
+            .and_then(|(lat, lng)| HeldRings::of(block, self.arcs(), twice_surface(lat, lng)))
             .is_some_and(|held| held.within(self.arcs(), other_block));
         memo().insert(poly_key, other_key, within);
         within
@@ -661,6 +661,14 @@ fn twice(p: PointE7) -> PointE7 {
     PointE7 { lat: 2 * p.lat, lng: 2 * p.lng }
 }
 
+/// A point on surface (lat, lng) in degrees at twice its coordinates, on the grid there: its
+/// scan line, halfway between two vertex latitudes, exactly, and the middle of its widest run
+/// inside within a quarter of a unit, so inside the polygon for a run over half a unit wide.
+/// Rounded to the e7 grid itself, the middle of a run a unit or two wide can fall outside.
+fn twice_surface(lat: f64, lng: f64) -> PointE7 {
+    PointE7 { lat: to_e7(2.0 * lat), lng: to_e7(2.0 * lng) }
+}
+
 /// A polygon's rings held whole for AdminGeometry::polygon_within: its vertices, each once and by
 /// longitude, and its point on surface, as probes of the other polygon's edges; and its edges,
 /// each listed in every strip of longitude its own longitudes meet, so that a point or an edge
@@ -669,6 +677,7 @@ struct HeldRings {
     probes: Vec<Probe>,
     /// The probes on the edge read last but for its ends, which cut it into pieces.
     cuts: Vec<PointE7>,
+    /// The point on surface at twice its coordinates, which reads each edge at twice theirs.
     surface: Probe,
     edges: Vec<(PointE7, PointE7)>,
     /// The edges meeting strip s are edges[listed[k]] for k in starts[s]..starts[s + 1].
@@ -687,15 +696,17 @@ impl HeldRings {
     const MAX_STRIPS: usize = 1 << 14;
     const LISTED_PER_EDGE: usize = 8;
 
-    /// The rings of ring block `block`, with `surface` its point on surface; none for a malformed
-    /// block or one without vertices.
-    fn of(block: &[u8], arcs: ArcFiles<'_>, surface: PointE7) -> Option<HeldRings> {
+    /// The rings of ring block `block`, with `surface2` its point on surface at twice its
+    /// coordinates (`twice_surface`); none for a malformed block or one without vertices.
+    fn of(block: &[u8], arcs: ArcFiles<'_>, surface2: PointE7) -> Option<HeldRings> {
         let mut read = EdgeReader { arcs, edges: Vec::new(), vertices: Vec::new() };
         walk_rings(block, &mut read)?;
         let EdgeReader { edges, mut vertices, .. } = read;
         vertices.sort_unstable_by_key(|v| (v.lng, v.lat));
         vertices.dedup();
-        let (mut lo, mut hi) = (surface, surface);
+        let half = |c: i64, up: i64| (c + up).div_euclid(2);
+        let mut lo = PointE7 { lat: half(surface2.lat, 0), lng: half(surface2.lng, 0) };
+        let mut hi = PointE7 { lat: half(surface2.lat, 1), lng: half(surface2.lng, 1) };
         for v in &vertices {
             (lo.lat, lo.lng, hi.lat, hi.lng) = (lo.lat.min(v.lat), lo.lng.min(v.lng), hi.lat.max(v.lat), hi.lng.max(v.lng));
         }
@@ -732,7 +743,7 @@ impl HeldRings {
             }
         }
         let probes = vertices.into_iter().map(Probe::at).collect();
-        Some(HeldRings { probes, cuts: Vec::new(), surface: Probe::at(surface), edges, starts, listed, lo, hi, strip_width })
+        Some(HeldRings { probes, cuts: Vec::new(), surface: Probe::at(surface2), edges, starts, listed, lo, hi, strip_width })
     }
 
     /// The edges listed in the strips from the one of longitude `lng0` to the one of `lng1`
@@ -806,7 +817,7 @@ impl HeldRings {
                 cuts.push(q.p);
             }
         }
-        self.surface.read(a, b);
+        self.surface.read(twice(a), twice(b));
         let outside = !(a.lat.max(b.lat) <= self.lo.lat || a.lat.min(b.lat) >= self.hi.lat || lng1 <= self.lo.lng || lng0 >= self.hi.lng)
             && (self.edges_between(lng0, lng1).any(|(c, d)| cross_inside(a, b, c, d)) || {
                 cuts.sort_unstable_by_key(|v| along(a, b, *v));
