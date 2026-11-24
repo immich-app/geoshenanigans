@@ -583,6 +583,85 @@ pub fn sort_ranked(ranked: &mut [RankedPoly]) {
 /// rank 25 names nothing, nor does one of rank 0.
 pub const ADDRESS_AREA_RANKS: std::ops::Range<u8> = 1..25;
 
+/// The rank of the areas in no street's or house's address that answer a point themselves where
+/// nothing nearer does: reverse.py's lookup_area takes, where no street, house or POI is near,
+/// the area of the highest rank_search round the point of rank_address 4 to 25
+/// (_lookup_area_address, PlacexGeometryReverseLookuppolygon), and one of rank 25 then leads
+/// an answer none of the others has it in: an Australian boundary linking its locality node,
+/// "South Kumminin, Western Australia, 6368, Australia".
+pub const AREA_RESULT_RANK: u8 = 25;
+
+/// The rank_search of boundary=administrative at `level` in `country` (upper case, "" where
+/// unknown): address-levels.json's administrativeN, the first of its pair, the country's entry
+/// first, else twice the level from 2 to 12 (compute_place_rank, as the builder's admin_ranks).
+pub fn admin_search_rank(country: &str, level: u8) -> u8 {
+    let own = match (country, level) {
+        ("BE", 3) => 5, ("BE", 4) => 6, ("BE", 5) => 7, ("BE", 6) => 8, ("BE", 7) => 12, ("BE", 8) => 14,
+        ("BE", 9) => 16, ("BE", 10) => 18,
+        ("CZ", 5) => 12, ("CZ", 6) => 13, ("CZ", 8) => 14, ("CZ", 9) => 15, ("CZ", 10) => 16,
+        ("ES", 6) => 10, ("ES", 7) => 12, ("ES", 10) => 22,
+        ("ID", 5) => 12, ("ID", 6) => 14, ("ID", 7) => 16, ("ID", 8) => 20, ("ID", 9) => 22, ("ID", 10) => 24,
+        ("JP", 7) => 16, ("JP", 8) => 18, ("JP", 9) => 20, ("JP", 10) => 22, ("JP", 11) => 24,
+        ("NL", 7) => 13, ("NL", 8) => 14, ("NL", 9) => 15, ("NL", 10) => 16,
+        ("NO" | "SE", 3) => 8, ("NO" | "SE", 4) => 12,
+        ("RU", 7) => 13, ("RU", 8) => 14,
+        _ => 0,
+    };
+    match own {
+        0 if (2..=12).contains(&level) => 2 * level,
+        rank => rank,
+    }
+}
+
+/// The rank_search of a place area labelled AdminPlaceType `pt` in `country` (upper case):
+/// address-levels.json's `place` entries, the first of a [rank_search, rank_address] pair, the
+/// country's first. One without a type of ours (a locality's) is taken at its rank_address.
+pub fn place_type_search_rank(pt: u8, country: &str) -> u8 {
+    match (country, pt) {
+        ("DE", 9) | ("ES", 8) => return 10, // region [10, 0], province 10
+        ("ID" | "RU" | "SA", 14) => return 18, // municipality 18
+        ("SA", 8) => return 12,              // province 12
+        _ => {}
+    }
+    match pt {
+        1 => 16,       // city
+        2 | 12 => 18,  // town [18, 16], borough
+        3 | 4 => 19,   // village [19, 16], suburb [19, 20]
+        5 => 24,       // neighbourhood
+        6 | 13 => 20,  // quarter [20, 22], hamlet
+        7 | 8 => 8,    // state, province [8, 0]
+        9 => 18,       // region [18, 0]
+        10 | 11 => 12, // county, district
+        14 => 14,      // municipality
+        15 => 25,      // locality
+        _ => 0,
+    }
+}
+
+/// The rank_search of the polygon `poly` in `country` (upper case): a place area's by its label
+/// (place_type_search_rank), else its rank_address; a boundary's by its level (admin_search_rank).
+pub fn area_search_rank(poly: &AdminPolygon, country: &str) -> u8 {
+    match (poly.admin_level, place_type_search_rank(poly.place_type_override, country)) {
+        (15, 0) => poly.rank_address,
+        (15, rank) => rank,
+        (level, _) => admin_search_rank(country, level),
+    }
+}
+
+/// How far from a point, in degrees as ST_Distance measures them, a place node of `rank_search`
+/// answers it (reverse_place_diameter, ranking.sql:12-31).
+pub fn reverse_place_diameter(rank_search: u8) -> f64 {
+    match rank_search {
+        0..=4 => 5.0,
+        5..=8 => 1.8,
+        9..=12 => 0.6,
+        13..=17 => 0.16,
+        18 => 0.08,
+        19 => 0.04,
+        _ => 0.02,
+    }
+}
+
 // --- String pool (tiered) ---
 //
 // Strings are split into 5 files: core/street/addr/postcode/poi.  Record
@@ -1993,6 +2072,59 @@ impl Index {
         result
     }
 
+    /// The area of AREA_RESULT_RANK that answers the point of `scan` itself, with its label (its
+    /// place type's field, else its rank's), where nothing nearer does: reverse.py's lookup_area
+    /// (_lookup_area_address). Of the areas round the point of rank_address 4 to 25 but 5 and 11
+    /// (a postal area or a country is none), named, it takes the one of the highest rank_search,
+    /// and the smallest of equal ones stands for the one Nominatim's order happens to take; only
+    /// one of AREA_RESULT_RANK, in no address of the others, needs an answer of its own. A place
+    /// node of a higher rank_search inside it, as near as its reverse_place_diameter in degrees,
+    /// answers instead (_place_inside_area_query), its own address leaving the area out.
+    /// `country` is the point's, upper case. The caller knows nothing nearer answers: no street,
+    /// house or POI.
+    pub fn area_result<'a>(&'a self, scan: &mut AdminScan, country: &str) -> Option<(&'static str, Cow<'a, str>)> {
+        let mut near: Vec<(u32, AdminPolygon)> = Vec::new();
+        scan.for_each_entry(|_, id, poly| {
+            let rank = poly.rank_address;
+            if poly.area <= 0.0 || poly.name_id == NO_DATA || !(4..=AREA_RESULT_RANK).contains(&rank) || rank == 5 || rank == 11 {
+                return;
+            }
+            if !matches!(poly.admin_level, 3..=12 | 15) || near.iter().any(|(other, _)| other & ID_MASK == id & ID_MASK) { return; }
+            near.push((id, poly));
+        });
+        let mut top: Option<(u8, AdminPolygon)> = None;
+        for (id, poly) in near {
+            let rank_search = area_search_rank(&poly, country);
+            let better = top.is_none_or(|(r, best)| rank_search > r || (rank_search == r && poly.area < best.area));
+            if rank_search >= 5 && better && scan.pip.holds(self, id, &poly) {
+                top = Some((rank_search, poly));
+            }
+        }
+        let (rank_search, area) = top.filter(|(_, poly)| poly.rank_address == AREA_RESULT_RANK)?;
+        let name = self.get_string(area.name_id);
+        if name.is_empty() { return None; }
+
+        // The farthest a node can answer from: the diameter of the lowest rank_search above the
+        // area's that a place node has.
+        if let Some(lowest) = PLACE_NODE_SEARCH_RANK.iter().copied().filter(|&r| r > rank_search).min() {
+            let (lat, lng) = scan.pip.point.degrees();
+            let cells = cells_near_point(lat, lng, reverse_place_diameter(lowest) * METRES_PER_DEGREE, self.admin_cell_level);
+            let mut nearer = false;
+            self.for_each_place_in(cells, |pn| {
+                let Some(&node_search) = PLACE_NODE_SEARCH_RANK.get(pn.place_type as usize) else { return };
+                if nearer || node_search <= rank_search || pn.name_id == NO_DATA { return; }
+                let (dlat, dlng) = (f64::from(pn.lat) - lat, f64::from(pn.lng) - lng);
+                if (dlat * dlat + dlng * dlng).sqrt() >= reverse_place_diameter(node_search) { return; }
+                nearer = self.admin_geometry.contains_once(&area, AdminPoint::new(f64::from(pn.lat), f64::from(pn.lng)));
+            });
+            if nearer { return None; }
+        }
+        let label = place_type_to_field(area.place_type_override)
+            .or_else(|| rank_to_field(area.rank_address))
+            .unwrap_or("city_block");
+        Some((label, name))
+    }
+
     // --- Place node lookup (nearest city/town/village/suburb) ---
 
     // Nominatim's `current_boundary` (insert_addresslines in
@@ -3271,6 +3403,16 @@ impl Index {
         }
 
         let (landmark_name, places) = self.collect_landmark_and_places(lat, lng);
+        // Where no street, house or POI is near, Nominatim answers with an area round the point,
+        // and one of AREA_RESULT_RANK leads the answer (area_result). A dir without streets knows
+        // of none: its answers stand for those of a street at the point, which leave such an area
+        // out.
+        let area_result = if self.streets.is_some() && closest_feature_dist >= max_dist && landmark_name.is_none() {
+            let country = admin.country_code.map(|c| String::from_utf8_lossy(&c).to_uppercase()).unwrap_or_default();
+            self.area_result(&mut admin_scan, &country)
+        } else {
+            None
+        };
 
         // Note on name-suffix normalisation (previously considered as
         // Option 6): Nominatim does not normalise the localname it
@@ -3346,7 +3488,7 @@ impl Index {
             (Some(r), Some(c)) if r == *c => (None, Some((ranks.get("region"), r))),
             (r, _) => (r, None),
         };
-        let address = AddressDetails {
+        let mut address = AddressDetails {
             ranks,
             unlabelled: admin.unlabelled.into_iter().chain(country_region).collect(),
             landmark: landmark_name,
@@ -3371,6 +3513,7 @@ impl Index {
             city_district: admin.city_district,
             neighbourhood: if allow_place_neighbourhood { admin.neighbourhood.or(place.neighbourhood) } else { admin.neighbourhood },
             city_block: admin.city_block,
+            locality: None,
             // Postcode from resolve_postcode(): 3-tier chain
             // (own → inherited → postal area or nearest centroid).
             // Reject if the country has no postal-code system or if
@@ -3397,6 +3540,18 @@ impl Index {
             country: admin.country,
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
         };
+        // The area that answers leads: in its label's field where the address has none, else as a
+        // part of its own.
+        if let Some((label, name)) = area_result {
+            match label {
+                "locality" if address.locality.is_none() => address.locality = Some(name),
+                "city_block" if address.city_block.is_none() => {
+                    address.city_block = Some(name);
+                    address.ranks.set(label, AREA_RESULT_RANK);
+                }
+                _ => address.unlabelled.push((AREA_RESULT_RANK, name)),
+            }
+        }
         let display_name = format_address(&address);
         Address { display_name, address, places }
     }
@@ -5059,6 +5214,10 @@ pub fn coarse_fields<T: PartialEq>(chain: [Option<T>; 3], query: [Option<T>; 3],
 /// (22) and neighbourhood (24) are ranks of their own.
 pub const PLACE_NODE_RANK: [u8; 7] = [16, 16, 16, 20, 20, 24, 22];
 
+/// rank_search of each PlaceNode type, from address-levels.json: a town's 18, a village's and a
+/// suburb's 19, a hamlet's and a quarter's 20.
+pub const PLACE_NODE_SEARCH_RANK: [u8; 7] = [16, 18, 19, 19, 20, 24, 20];
+
 /// insert_addresslines' weight on a place node's distance by its
 /// rank_search (placex_triggers.sql:597-605): city (16) 0.25, town (18) 0.5,
 /// all others 1. (A capital, rank_search 15, weighs 0.2 there; place nodes
@@ -5403,6 +5562,10 @@ pub struct AddressDetails<'a> {
     pub neighbourhood: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub city_block: Option<Cow<'a, str>>,
+    /// The name of the area of AREA_RESULT_RANK that answers the point where nothing nearer
+    /// does, of a locality (Index::area_result).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locality: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postcode: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5492,7 +5655,8 @@ pub fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
 
     // The place parts, finest first: a stable sort keeps the order above
     // among parts of one rank.
-    let fields: [(&str, &Option<Cow<'_, str>>, u8); 17] = [
+    let fields: [(&str, &Option<Cow<'_, str>>, u8); 18] = [
+        ("locality", &addr.locality, 25),
         ("city_block", &addr.city_block, 25),
         ("neighbourhood", &addr.neighbourhood, 24),
         ("quarter", &addr.quarter, 22),
@@ -6523,6 +6687,7 @@ mod query_path_tests {
     use crate::scratch_dir::ScratchDir;
     use std::collections::BTreeMap;
 
+    mod area_result;
     mod display_name;
     mod postcodes;
     mod ranks;

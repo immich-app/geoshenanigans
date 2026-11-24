@@ -12,6 +12,7 @@
 #include <iterator>
 #include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "pbf_fixture.h"
@@ -154,7 +155,9 @@ TEST(a_boundary_with_a_place_tag_of_its_own_links_its_namesake_city_node_by_name
 TEST(a_townland_of_a_locality_ranks_25_and_leaves_the_address) {
     // Irish townlands: one whose label member is a place=locality node takes the node's 25
     // (placex_triggers.sql:1129), and one tagged place=locality itself its tag's 25 (:1157-1172):
-    // no address shows either. A third, linked to nothing, ranks 20 by its level.
+    // the address of a street in either shows neither. A third, linked to nothing, ranks 20 by
+    // its level. Far from every street the townland answers itself (reverse.py lookup_area),
+    // labelled a locality, by its node's type or its own tag.
     Fixture f;
     f.country(51, -11, 56, -5, "Ireland", "IE");
     f.boundary(53, -7, 54, -6, 6, "County Meath");
@@ -162,12 +165,27 @@ TEST(a_townland_of_a_locality_ranks_25_and_leaves_the_address) {
     f.boundary(53.5, -6.6, 53.6, -6.5, 10, "Rathmore", {}, {{OsmType::Node, locality, "label"}});
     f.boundary(53.5, -6.4, 53.6, -6.3, 10, "Town Parks", {{"place", "locality"}});
     f.boundary(53.7, -6.4, 53.8, -6.3, 10, "Ballyboy");
-    const std::vector<std::string> answers = answers_of(f, "locality-25", {{53.56, -6.56}, {53.55, -6.35}, {53.75, -6.35}});
-    REQUIRE(answers.size() == 3);
+    for (const auto& [lat, west, name] : {std::tuple{53.56, -6.57, "Bog Road"}, std::tuple{53.55, -6.36, "Main Street"}}) {
+        const int64_t a = f.node(lat, west), b = f.node(lat, west + 0.02);
+        TestObject street;
+        street.type = OsmType::Way;
+        street.id = f.next_way++;
+        street.refs = {a, b};
+        street.tags = {{"highway", "residential"}, {"name", name}};
+        f.ways.push_back(street);
+    }
+    const std::vector<std::string> answers = answers_of(
+        f, "locality-25", {{53.5601, -6.56}, {53.5501, -6.35}, {53.75, -6.35}, {53.51, -6.51}, {53.51, -6.31}});
+    REQUIRE(answers.size() == 5);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+    CHECK(answers[0].find("Bog Road") != std::string::npos);
     CHECK(answers[0].find("Rathmore") == std::string::npos);
+    CHECK(answers[1].find("Main Street") != std::string::npos);
     CHECK(answers[1].find("Town Parks") == std::string::npos);
     CHECK(answers[2].find("Ballyboy") != std::string::npos);
-    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+    CHECK(answers[3].find("\"locality\":\"Rathmore\"") != std::string::npos);
+    CHECK(answers[3].find("\"display_name\":\"Rathmore, County Meath, Ireland\"") != std::string::npos);
+    CHECK(answers[4].find("\"locality\":\"Town Parks\"") != std::string::npos);
 }
 
 TEST(a_boundary_links_one_node_of_its_wikidata_its_namesake_first) {

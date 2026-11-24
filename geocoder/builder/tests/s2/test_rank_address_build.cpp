@@ -379,3 +379,33 @@ TEST(a_place_node_on_a_relations_edge_or_an_e7_step_inside_it_is_promoted) {
     std::sort(villages.begin(), villages.end());
     CHECK((villages == std::vector<uint8_t>{16, 18, 18}));
 }
+
+TEST(a_boundary_of_rank_25_answers_where_nothing_nearer_does) {
+    // Telfer (R11690317, admin_level 9 in Australia, rank_search 18) links its locality node: 25,
+    // in no street's or house's address. Far from any street Nominatim answers with the area
+    // itself (reverse.py _lookup_area_address), labelled by the node it links: "Telfer, Western
+    // Australia, Australia". On a street in it the street's address leaves it out, and beside a
+    // hamlet node in it, of a higher rank_search and near enough, the node answers, its own
+    // address leaving it out too.
+    Fixture f;
+    f.country(-44, 112, -10, 154, "Australia", "AU");
+    f.boundary(-35, 112, -13, 129, 4, "Western Australia");
+    const int64_t locality = f.node(-21.71, 122.23, {{"place", "locality"}, {"name", "Telfer"}});
+    f.boundary(-23.5, 120.0, -19.5, 126.0, 9, "Telfer", {}, {{OsmType::Node, locality, "label"}});
+    const int64_t a = f.node(-22.0, 120.99), b = f.node(-22.0, 121.01);
+    TestObject road;
+    road.type = OsmType::Way;
+    road.id = f.next_way++;
+    road.refs = {a, b};
+    road.tags = {{"highway", "primary"}, {"name", "Telfer Road"}};
+    f.ways.push_back(road);
+    f.node(-20.0, 125.0, {{"place", "hamlet"}, {"name", "Punmu"}});
+    const std::vector<std::string> answers =
+        answers_of(f, "rank-area-answer", {{-20.512272, 123.338368}, {-22.0005, 121.0}, {-20.0005, 125.0005}});
+    REQUIRE(answers.size() == 3);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+    CHECK(displays(answers[0], "Telfer, Western Australia, Australia"));
+    CHECK(answers[0].find("\"locality\":\"Telfer\"") != std::string::npos);
+    CHECK(displays(answers[1], "Telfer Road, Western Australia, Australia"));
+    CHECK(displays(answers[2], "Punmu, Western Australia, Australia"));
+}
