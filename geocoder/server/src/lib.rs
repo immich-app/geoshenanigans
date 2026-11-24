@@ -3345,6 +3345,8 @@ impl Index {
         if !anchored && !place_nodes_only && !water_holds() {
             return Address::default();
         }
+        // Nor does the nearest postcode centroid give one where water alone holds the point.
+        let resolved_postcode = resolved_postcode.filter(|_| anchored || place_nodes_only);
 
         let (landmark_name, places) = self.collect_landmark_and_places(lat, lng);
 
@@ -9008,12 +9010,14 @@ mod query_path_tests {
     #[test]
     fn water_no_address_anchors_keeps_its_landmark_and_places_but_gives_no_road_nor_postcode() {
         // A glacier 60 km north, outside Testland, holds the query, its parent street Coast
-        // Road and its postcode 4510; no boundary holds the point and no street is near. Water
-        // never takes the primary slot, so its road and postcode don't answer, but where it
-        // would have taken the slot its name answers as the landmark and in `places`. One of
-        // no linked parent street never could, and the point finds nothing, as one in no POI.
+        // Road and its postcode 4510; no boundary holds the point and no street is near, and a
+        // postcode centroid, 4520, is 10 m off. Water never takes the primary slot, so its road
+        // and postcode don't answer, nor the centroid's, but where it would have taken the slot
+        // its name answers as the landmark and in `places`. One of no linked parent street
+        // never could, and the point finds nothing, as one in no POI.
         let answer = |linked: bool| {
             let mut dataset = TestIndex::new();
+            dataset.centroid("4520", 60_030.0, 20.0);
             let (name, road, postcode) = (dataset.string("Coast Glacier"), dataset.string("Coast Road"), dataset.string("4510"));
             let parents = if linked { (road, postcode) } else { (NO_DATA, NO_DATA) };
             let index = with_poi(dataset.load(), (86, 0), name, parents, (60_000.0, 0.0, 60_040.0, 60.0), true);
