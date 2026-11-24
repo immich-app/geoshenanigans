@@ -7,6 +7,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <optional>
+#include "geometry.h"
 #include "types.h"
 
 // The name a POI node goes by: name:en, else name. An empty value names
@@ -212,10 +213,10 @@ inline std::optional<PoiClassification> classify_poi(
     // poi/notable, where the server answers its own name inside it.
     const PoiCategory kind = poi_water_kind(t_natural, t_landuse);
     // highway=footway of footway=sidewalk, crossing, link or traffic_aisle is
-    // no main tag in Nominatim (presets.lua:23-33 filter_footways): beside
-    // water it neither ranks the object nor makes it a street.
-    if (kind != PoiCategory::UNKNOWN && t_highway && t_footway && std::strcmp(t_highway, "footway") == 0 &&
-        poi_tag_is(t_footway, {"sidewalk", "crossing", "link", "traffic_aisle"}))
+    // no main tag in Nominatim (is_excluded_footway): beside water it neither
+    // ranks the object nor makes it a street.
+    if (kind != PoiCategory::UNKNOWN && t_highway && std::strcmp(t_highway, "footway") == 0 &&
+        is_excluded_footway(t_footway))
         t_highway = nullptr;
     const bool ranks_30 = !has_lower_rank_main_tag(t_place, t_landuse, t_highway, area);
     const char* t_place_below_streets = t_place && std::strcmp(t_place, "square") == 0 ? nullptr : t_place;

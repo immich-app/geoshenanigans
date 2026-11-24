@@ -1391,7 +1391,10 @@ TEST(a_water_multipolygon_that_is_a_rank_30_poi_is_written_as_that_poi_and_answe
 // (presets.lua filter_footways): that one is the water it is, out of the
 // primary slot, though it links Teststrasse as its parent street. Each area
 // is 60 m by 89 m across Teststrasse, which runs 6 m south of the point
-// asked inside it, nearer than its outline.
+// asked inside it, nearer than its outline. Nor is its way a street of the
+// street index: at a point 1 m inside its outline, 33 m north of
+// Teststrasse, the road is Teststrasse, where the plain footway's is its own
+// name.
 TEST(a_water_area_of_a_sidewalk_crossing_link_or_traffic_aisle_footway_answers_no_road_of_its_own) {
     const ScratchDir root("water-footway-build");
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
@@ -1409,6 +1412,7 @@ TEST(a_water_area_of_a_sidewalk_crossing_link_or_traffic_aisle_footway_answers_n
         add_rectangle(water, 4040 + k, 990 + 4 * k, south, west, north, west + 8000, tags);
         points.push_back({47.14005, (west + 4000) / 1e7});
     }
+    for (int k = 0; k < 5; k++) points.push_back({47.1403, (lng0 + 1420000 + 15000 * k + 130) / 1e7});
     write_fixture_with(pbf, water);
     const std::string out = root.path() + "/single";
     REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
@@ -1426,7 +1430,7 @@ TEST(a_water_area_of_a_sidewalk_crossing_link_or_traffic_aisle_footway_answers_n
     const std::vector<std::string> answers = server_answers(dataset, points, root.path() + "/q", log);
     REQUIRE(answers.size() == points.size());
     for (size_t k = 0; k < answers.size(); k++) {
-        const std::string road = k == 0 ? names[0] : "Teststrasse";
+        const std::string road = k % 5 == 0 ? names[0] : "Teststrasse";
         if (answer_string(answers[k], {"address", "road"}) != std::optional<std::string>(road))
             std::printf("    %s\n", answers[k].c_str());
         CHECK(answer_string(answers[k], {"address", "road"}) == std::optional<std::string>(road));
