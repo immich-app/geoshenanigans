@@ -3689,31 +3689,32 @@ impl Index {
         let admin_chain_dense = admin.suburb.is_some() && admin.city_block.is_some();
         let allow_place_quarter = !admin_chain_dense;
         let allow_place_neighbourhood = !admin_chain_dense;
-        // Nominatim's insert_addresslines orders candidates by
-        // `rank_address, isguess asc, distance` (placex_triggers.sql
-        // :590). `isguess asc` puts admin boundaries (isguess=false)
-        // ahead of place nodes (isguess=true) at the same rank, so
-        // admin wins the address slot within a rank tie. Mirror that
-        // here for suburb / quarter / neighbourhood — earlier we did
-        // place-first, which surfaced "Tverskoy" (place=suburb node)
-        // instead of "Tverskoy District" (AL8 boundary), and similar
-        // for Beijing "Donghuamen" vs "Donghuamen Subdistrict".
-        // NYC still resolves as before because admin.suburb=Manhattan
-        // and place.suburb=Manhattan carry the same name.
-        // Each field's rank_address is that of the polygon or the place node it
-        // came from.
+        // A field a boundary and a place node both fill names the finer
+        // (label_field): Nominatim's address keeps the first row of a
+        // label, its rows the finest first, and its insert_addresslines
+        // orders candidates by `rank_address, isguess asc, distance`
+        // (placex_triggers.sql:576), so at one rank the boundary's row
+        // (isguess=false) comes first: "Tverskoy District" (AL8
+        // boundary) over "Tverskoy" (place=suburb node), and Beijing's
+        // "Donghuamen Subdistrict" over "Donghuamen". A suburb node of
+        // rank 22 inside a parish of rank 20 is the suburb, and the
+        // parish's row stays in display_name. Each field's rank_address
+        // is that of the polygon or the place node it came from.
         let mut ranks = admin.ranks;
-        for (field, from_node) in [
-            ("city", admin.city.is_none() && place.city.is_some()),
-            ("town", admin.town.is_none() && place.town.is_some()),
-            ("village", admin.village.is_none() && place.village.is_some()),
-            ("hamlet", admin.hamlet.is_none() && place.hamlet.is_some()),
-            ("suburb", admin.suburb.is_none() && place.suburb.is_some()),
-            ("quarter", allow_place_quarter && admin.quarter.is_none() && place.quarter.is_some()),
-            ("neighbourhood", allow_place_neighbourhood && admin.neighbourhood.is_none() && place.neighbourhood.is_some()),
-        ] {
-            if from_node { ranks.set(field, place.ranks.get(field)); }
-        }
+        let mut unlabelled = admin.unlabelled;
+        let mut label = |field: &str, boundary, node| {
+            let (named, lost) = label_field(boundary, admin.ranks.get(field), node, place.ranks.get(field));
+            if let Some((_, rank)) = &named { ranks.set(field, *rank); }
+            unlabelled.extend(lost);
+            named.map(|(name, _)| name)
+        };
+        let city = label("city", admin.city, place.city);
+        let town = label("town", admin.town, place.town);
+        let village = label("village", admin.village, place.village);
+        let hamlet = label("hamlet", admin.hamlet, place.hamlet);
+        let suburb = label("suburb", admin.suburb, place.suburb);
+        let quarter = label("quarter", admin.quarter, place.quarter.filter(|_| allow_place_quarter));
+        let neighbourhood = label("neighbourhood", admin.neighbourhood, place.neighbourhood.filter(|_| allow_place_neighbourhood));
         // Same-name suppression, observed Nominatim behaviour: the Kingdom
         // of the Netherlands (AL2) and the constituent country (AL3) are both
         // named "Nederland"; Nominatim's address keeps one row per label and
@@ -3725,16 +3726,16 @@ impl Index {
         };
         let address = AddressDetails {
             ranks,
-            unlabelled: admin.unlabelled.into_iter().chain(country_region).collect(),
+            unlabelled: unlabelled.into_iter().chain(country_region).collect(),
             landmark: landmark_name,
             // A string in a tier this mode doesn't ship (admin mode has no
             // street or addr strings) resolves to "" — omit the field.
             house_number: house_number.filter(|s| !s.is_empty()),
             road: road.filter(|s| !s.is_empty()),
-            city: admin.city.or(place.city),
-            town: admin.town.or(place.town),
-            village: admin.village.or(place.village),
-            hamlet: admin.hamlet.or(place.hamlet),
+            city,
+            town,
+            village,
+            hamlet,
             municipality: admin.municipality,
             state: admin.state,
             province: admin.province,
@@ -3743,10 +3744,10 @@ impl Index {
             county: admin.county,
             district: admin.district,
             borough: admin.borough,
-            suburb: admin.suburb.or(place.suburb),
-            quarter: if allow_place_quarter { admin.quarter.or(place.quarter) } else { admin.quarter },
+            suburb,
+            quarter,
             city_district: admin.city_district,
-            neighbourhood: if allow_place_neighbourhood { admin.neighbourhood.or(place.neighbourhood) } else { admin.neighbourhood },
+            neighbourhood,
             city_block: admin.city_block,
             // Postcode from resolve_postcode(): 3-tier chain
             // (own → inherited → postal area or nearest centroid).
@@ -5787,6 +5788,20 @@ pub fn unlabelled_rows(ranked: &[RankedPoly], slots: &[Option<usize>], winners: 
     by_rank.into_iter().rev().flatten().collect()
 }
 
+/// A field of the address a boundary of rank `boundary_rank` and a place node of rank `node_rank`
+/// may both fill: Nominatim's address keeps the first row of a label, its rows the finest first
+/// (format_json.py, results.py), and of rows of one rank the boundary's (isguess asc,
+/// placex_triggers.sql:576). The name filling it with its rank, and the boundary's row, as
+/// (rank, name), where the node takes the field: display_name still lists it.
+pub fn label_field<'a>(boundary: Option<Cow<'a, str>>, boundary_rank: u8, node: Option<Cow<'a, str>>, node_rank: u8)
+    -> (Option<(Cow<'a, str>, u8)>, Option<(u8, Cow<'a, str>)>) {
+    match (boundary, node) {
+        (Some(b), Some(n)) if node_rank > boundary_rank => (Some((n, node_rank)), Some((boundary_rank, b))),
+        (Some(b), _) => (Some((b, boundary_rank)), None),
+        (None, n) => (n.map(|n| (n, node_rank)), None),
+    }
+}
+
 #[derive(Serialize, Default)]
 pub struct AddressDetails<'a> {
     /// The rank_address of the polygon or the place node behind each place
@@ -6212,6 +6227,16 @@ mod pure_helper_tests {
         assert_eq!(place_type_to_field(0), None);
         assert_eq!(place_type_to_field(15), None);
         assert_eq!(place_type_to_field(255), None);
+    }
+
+    #[test]
+    fn label_field_names_the_finer_row_and_the_boundary_at_one_rank() {
+        let (parish, suburb) = (|| Some(Cow::Borrowed("Upton")), || Some(Cow::Borrowed("St Crispin's")));
+        assert_eq!(label_field(parish(), 20, suburb(), 22), (Some((Cow::Borrowed("St Crispin's"), 22)), Some((20, Cow::Borrowed("Upton")))));
+        assert_eq!(label_field(parish(), 22, suburb(), 22), (Some((Cow::Borrowed("Upton"), 22)), None));
+        assert_eq!(label_field(parish(), 22, suburb(), 20), (Some((Cow::Borrowed("Upton"), 22)), None));
+        assert_eq!(label_field(None, 0, suburb(), 20), (Some((Cow::Borrowed("St Crispin's"), 20)), None));
+        assert_eq!(label_field(parish(), 20, None, 0), (Some((Cow::Borrowed("Upton"), 20)), None));
     }
 
     #[test]

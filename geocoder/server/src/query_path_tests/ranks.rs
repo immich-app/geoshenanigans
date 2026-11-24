@@ -204,3 +204,22 @@ fn a_larger_boundary_of_the_level_beside_the_smallest_holding_the_point_takes_no
     assert_eq!(address.get("suburb"), None);
     assert_eq!(address["city"], "Town");
 }
+
+#[test]
+fn a_place_node_ranked_above_the_boundary_of_its_label_names_the_field() {
+    // Upton (52.231927, -0.936684): the parish of Upton (R1638092, admin_level 10, rank 20) is
+    // labelled suburb by its rank, and the place=suburb node St Crispin's inside it ranks 22
+    // (placex_triggers.sql:984-1003). Nominatim's address keeps the first row of a label, its rows
+    // the finest first (format_json.py, results.py), so the node is the suburb; display_name joins
+    // every row, the parish's too. At an equal rank the boundary's row comes first (isguess asc,
+    // :576).
+    let index = TestIndex::in_country(b"GB")
+        .boundary("England", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("West Northamptonshire", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Upton", 10, 0, (-2000.0, -2000.0, 2000.0, 2000.0))
+        .place("St Crispin's", 3, 300.0, 200.0)
+        .load();
+    let answer = serde_json::to_value(index.query(at(0.0, 0.0).lat as f64, at(0.0, 0.0).lng as f64)).unwrap();
+    assert_eq!(answer["address"]["suburb"], "St Crispin's");
+    assert_eq!(answer["display_name"], "St Crispin's, Upton, West Northamptonshire, England, Testland");
+}

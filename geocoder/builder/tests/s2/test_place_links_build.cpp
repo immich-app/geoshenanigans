@@ -13,8 +13,9 @@
 // pattern takes, whatever its length, a US ZIP+4 its ZIP, a house, a
 // centroid, a postal area and an external centroid take the postcode their
 // country's pattern makes of their tag, a place area linked to a place node
-// of another type ranks by its own place tag, and a boundary round the
-// smallest of its level at the point is in the address as well.
+// of another type ranks by its own place tag, a boundary round the smallest
+// of its level at the point is in the address as well, and a place node
+// ranked above the boundary of its label names the field.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -598,6 +599,25 @@ TEST(a_boundary_round_the_smallest_of_its_level_at_the_point_is_in_the_address) 
     CHECK(names(answers[0], "city", "Brussels"));
     CHECK(names(answers[0], "city_district", "Bruxelles - Brussel"));
     CHECK(names(answers[0], "neighbourhood", "Quays Quarter"));
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_place_node_ranked_above_the_boundary_of_its_label_names_the_field) {
+    // Upton's parish (admin_level 10, rank 20) is labelled suburb by its rank, and the
+    // place=suburb node St Crispin's inside it ranks 22 (placex_triggers.sql:984-1003). The
+    // address keeps the first row of a label, the finest first (format_json.py, results.py): the
+    // node is the suburb, and display_name joins the parish's row as well.
+    Fixture f;
+    f.country(50, -6, 55.8, 1.8, "United Kingdom", "GB");
+    f.boundary(50.5, -5.5, 55.5, 1.5, 4, "England");
+    f.boundary(52.0, -1.3, 52.5, -0.7, 6, "West Northamptonshire");
+    f.boundary(52.22, -0.96, 52.245, -0.91, 10, "Upton");
+    f.node(52.2325, -0.9335, {{"place", "suburb"}, {"name", "St Crispin's"}});
+    const std::vector<std::string> answers = answers_of(f, "label-by-rank", {{52.231927, -0.936684}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "suburb", "St Crispin's"));
+    CHECK(answers[0].find("\"display_name\":\"St Crispin's, Upton, West Northamptonshire, England, United Kingdom\"") !=
+          std::string::npos);
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 
