@@ -3,11 +3,12 @@
 // country taken at a point inside it, and leaves a node of its wikidata to
 // the boundaries after it, a boundary or a place area links a place node of
 // its wikidata only where it covers it, its edges included, and only one, one
-// of its name first, that no boundary before it links, a place=province area
-// is an address area where its country ranks it, a postal area names a point
-// only of its own country, one for a relation, and of a postcode its country
-// takes, whatever its length, a US ZIP+4 its ZIP, and a place area linked to
-// a place node of another type ranks by its own place tag.
+// of its name first, that no boundary before it links, and a node of its
+// name only of no other wikidata, a place=province area is an address area
+// where its country ranks it, a postal area names a point only of its own
+// country, one for a relation, and of a postcode its country takes, whatever
+// its length, a US ZIP+4 its ZIP, and a place area linked to a place node of
+// another type ranks by its own place tag.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -392,6 +393,26 @@ TEST(a_boundary_of_rank_0_in_its_country_leaves_the_place_node_of_its_wikidata_t
     REQUIRE(answers.size() == 1);
     CHECK(names(answers[0], "town", "Logan Central"));
     CHECK(answers[0].find("\"Logan\"") == std::string::npos);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_boundary_links_no_place_node_of_its_name_whose_wikidata_is_another) {
+    // find_linked_place's name step takes a node of the boundary's name only where either has no
+    // wikidata or both the same (placex_triggers.sql:376-377). Ottignies-Louvain-la-Neuve (admin
+    // level 8, Q329642) links the town node of its name and wikidata; the town node Louvain-la-
+    // Neuve, of Q329642 too, which it leaves, is no name link of the section Louvain-la-Neuve (9,
+    // Q665868). The section ranks 16, under the town of 16, and so 18, a city_district.
+    Fixture f;
+    f.country(49.5, 2.5, 51.5, 6.4, "Belgium", "BE");
+    f.boundary(50.5, 4.2, 50.9, 5.0, 6, "Walloon Brabant");
+    f.boundary(50.63, 4.52, 50.71, 4.65, 8, "Ottignies-Louvain-la-Neuve", {{"wikidata", "Q329642"}});
+    f.node(50.665, 4.57, {{"place", "town"}, {"name", "Ottignies-Louvain-la-Neuve"}, {"wikidata", "Q329642"}});
+    f.node(50.668, 4.612, {{"place", "town"}, {"name", "Louvain-la-Neuve"}, {"wikidata", "Q329642"}});
+    f.boundary(50.655, 4.59, 50.68, 4.63, 9, "Louvain-la-Neuve", {{"wikidata", "Q665868"}});
+    const std::vector<std::string> answers = answers_of(f, "name-link-wikidata", {{50.6684, 4.6005}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "town", "Ottignies-Louvain-la-Neuve"));
+    CHECK(names(answers[0], "city_district", "Louvain-la-Neuve"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 

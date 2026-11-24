@@ -512,6 +512,12 @@ struct ParsedData {
     // are in; filled from parallel relation workers under the mutex too.
     std::vector<WikidataCandidate> wikidata_candidates;
     std::unique_ptr<std::mutex> linked_pn_mutex = std::make_unique<std::mutex>();
+    // The wikidata of the boundaries (admin levels 2 to 10), as (their
+    // relation_boundary_id or way_boundary_id, its Q number) sorted at use,
+    // and of the place nodes (parallel to place_nodes, 0 for none), which the
+    // name step compares (build-time only).
+    std::vector<std::pair<uint64_t, uint64_t>> boundary_wikidata;
+    std::vector<uint32_t> place_qids;
 
     // Post-canonical-sort: strings partitioned into per-consumer tiers.
     // Global offset space is contiguous: tier N occupies
