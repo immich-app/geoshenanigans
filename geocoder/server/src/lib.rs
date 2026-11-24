@@ -2862,19 +2862,18 @@ impl Index {
     // PoiRecord.parent_postcode_id inheritance).
     /// The postcode get_nearest_postcode takes from the postal areas holding the point (lat, lng)
     /// of the country `country` (upper-case ISO, "" where unknown), the smallest first: of those of the
-    /// country, or of no country known, whose postcode the country has (Nominatim makes no
-    /// postcode area of another, postcodes.py _update_postcode_areas), the one whose centroid is
-    /// nearest the point in plain degrees (utils.sql: ORDER BY ST_Distance(p.centroid, geom)),
-    /// equals to the smaller. A postal area's country is the one its centroid lies in, as
-    /// get_country_code gives place_postcode's.
+    /// country, any where it is unknown, whose postcode the country has (Nominatim makes no
+    /// postcode area of another, nor of one of no country, postcodes.py _update_postcode_areas),
+    /// the one whose centroid is nearest the point in plain degrees (utils.sql: ORDER BY
+    /// ST_Distance(p.centroid, geom)), equals to the smaller. A postal area's country is the one
+    /// its centroid lies in, as get_country_code gives place_postcode's.
     fn postal_area_postcode<'a>(&'a self, areas: &[AdminPolygon], country: &str, (lat, lng): (f64, f64)) -> Option<Cow<'a, str>> {
         let cc: Option<[u8; 2]> = country.as_bytes().try_into().ok().map(|c: [u8; 2]| c.map(|b| b.to_ascii_lowercase()));
         let eligible = |poly: &AdminPolygon| -> Option<Cow<'a, str>> {
             if poly.place_type_override == POSTAL_AREA_INVALID { return None; }
             let of_country = poly.country_code.to_be_bytes().map(|b| b.to_ascii_lowercase());
             if let Some(cc) = cc {
-                if poly.country_code != 0 && of_country != cc { return None; }
-                if country_has_no_postcode(&cc) { return None; }
+                if of_country != cc || country_has_no_postcode(&cc) { return None; }
             }
             // The builder checked the postcode against its country's pattern, whatever its
             // length; past that, one value and no placeholder.
@@ -7316,9 +7315,14 @@ mod query_path_tests {
             let ring = vec![at(s, w), at(s, e), at(n, e), at(n, w), at(s, w)];
             let (lat_lo, lng_lo, lat_hi, lng_hi) = bounds(&ring);
             // The builder gives a country to countries, and to postal areas the one their centroid
-            // lies in, which a test sets.
+            // lies in: here the first country's, unless a test sets another.
+            let country_code = match admin_level {
+                2 => COUNTRY_CODE,
+                POSTCODE_AREA_LEVEL => self.polygons.first().map_or(0, |(country, _)| country.country_code),
+                _ => 0,
+            };
             let poly = AdminPolygon {
-                place_type_override, country_code: if admin_level == 2 { COUNTRY_CODE } else { 0 },
+                place_type_override, country_code,
                 ..arc_fixture::record(self.string(name), admin_level, ((lat_hi - lat_lo) * (lng_hi - lng_lo)) as f32)
             };
             self.polygons.push((poly, ring));

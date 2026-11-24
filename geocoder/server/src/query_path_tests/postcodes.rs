@@ -113,14 +113,42 @@ fn a_postal_area_of_another_country_names_no_point() {
         .centroid("78266", 0.0, 400.0);
     dataset.polygons.last_mut().unwrap().0.country_code = u16::from_be_bytes(*b"CH");
     assert_eq!(postcode_from(&dataset.load(), busingen, 0.0, 0.0), "78266");
-    // One of the point's country, or of a country not known, names it.
-    for code in [*b"DE", [0, 0]] {
-        let mut dataset = country_at(busingen, b"DE");
-        dataset.boundary("78266", POSTCODE_AREA_LEVEL, 0, (-1000.0, -1000.0, 1000.0, 1000.0))
-            .centroid("79999", 0.0, 100.0);
-        dataset.polygons.last_mut().unwrap().0.country_code = u16::from_be_bytes(code);
-        assert_eq!(postcode_from(&dataset.load(), busingen, 0.0, 0.0), "78266");
-    }
+    // One of the point's country names it.
+    let index = country_at(busingen, b"DE")
+        .boundary("78266", POSTCODE_AREA_LEVEL, 0, (-1000.0, -1000.0, 1000.0, 1000.0))
+        .centroid("79999", 0.0, 100.0)
+        .load();
+    assert_eq!(postcode_from(&index, busingen, 0.0, 0.0), "78266");
+}
+
+#[test]
+fn a_postal_area_of_no_country_known_names_no_point_of_a_country() {
+    // Nominatim makes no postcode area of a postal boundary of no country (get_matcher(None) is
+    // None, postcodes.py _update_postcode_areas), and the builder gives a postal area the country
+    // its centroid lies in: an area of none round a German point leaves it to the centroid of
+    // 79999, and to the German area 78266 round both, whose centroid is the farther.
+    let busingen = (47.697, 8.69);
+    let countryless = |dataset: &mut TestIndex| {
+        dataset.boundary("78999", POSTCODE_AREA_LEVEL, 0, (-300.0, -300.0, 300.0, 300.0));
+        dataset.polygons.last_mut().unwrap().0.country_code = 0;
+    };
+    let mut dataset = country_at(busingen, b"DE");
+    countryless(&mut dataset);
+    dataset.centroid("79999", 0.0, 100.0);
+    assert_eq!(postcode_from(&dataset.load(), busingen, 0.0, 0.0), "79999");
+    let mut dataset = country_at(busingen, b"DE");
+    countryless(&mut dataset);
+    dataset.boundary("78266", POSTCODE_AREA_LEVEL, 0, (-1000.0, -500.0, 1000.0, 3500.0));
+    assert_eq!(postcode_from(&dataset.load(), busingen, 0.0, 100.0), "78266");
+
+    // A street of no postcode stored takes get_nearest_postcode's at its middle, of the country
+    // there: the area of none round the middle names nothing, and the centroid by it does.
+    let mut dataset = country_at(busingen, b"DE");
+    countryless(&mut dataset);
+    dataset.street("Junkerstraße", &[(0.0, -1000.0), (0.0, 1000.0)]).centroid("79999", 0.0, 100.0);
+    let address = address_from(&dataset.load(), busingen, 5.0, -800.0);
+    assert_eq!(address["road"], "Junkerstraße");
+    assert_eq!(address["postcode"], "79999");
 }
 
 #[test]
