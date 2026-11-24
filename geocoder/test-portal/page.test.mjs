@@ -42,9 +42,10 @@ function core() {
 // the axes (of region, planet only) and their values in order, the presets,
 // each planet selection the constraints allow as a dataset (the preset's
 // label and description for a preset's, of size its place in GiB on disk and
-// half that to download) and those they rule out. As catalog.rs, a preset
-// names the dataset of its region, mode, quality and POI tier, and one with
-// water names none: the portal serves the selections without water.
+// half that to download) and those they rule out, and the ids of the
+// build's components. As catalog.rs, a preset names the dataset of its
+// region, mode, quality and POI tier, and one with water names none: the
+// portal serves the selections without water.
 function catalog(edit = () => {}) {
   const t = structuredClone(template);
   edit(t);
@@ -87,7 +88,8 @@ function catalog(edit = () => {}) {
   const presets = dry.map((p) => ({
     id: p.id, label: p.label, description: p.description, dataset: `${p.selections.mode}.${p.selections.quality}.${p.selections.poi_tier}`,
   }));
-  return { build: { date: '2026-11-20', version: 24, id: ID, dir: '2026-11-20-1' }, default: 'full.simplified.all', axes, presets, datasets, excluded };
+  const components = Object.keys(t.components).sort();
+  return { build: { date: '2026-11-20', version: 24, id: ID, dir: '2026-11-20-1' }, default: 'full.simplified.all', axes, presets, datasets, excluded, components };
 }
 
 // The publication IDs of two builds of 2026-11-20, the second published
@@ -2143,16 +2145,36 @@ test("a build's own credit of a source, as /datasets passes it on, is the one sh
   }
 });
 
-// Whether a credit of the template applies to the water alone: each
-// component it applies to one of water.*.
-const ofWaterAlone = (entry) => entry.applies_to.every((p) => p.startsWith('water.'));
+// An applies_to's patterns name the component ids that Python's
+// fnmatch.fnmatchcase matches them with (tools/test_configurations_template.py
+// resolves the template's so): of these ids, those it gives each pattern.
+test("a pattern of applies_to names the components a shell pattern matches, as fnmatchcase reads it", () => {
+  const { namesId } = core();
+  const ids = ['water.major', 'water.all', 'water.all-exact', 'water.none', 'mode.full', 'poi_tier.major', 'dir.admin-minimal'];
+  const water = ['water.major', 'water.all', 'water.all-exact', 'water.none'];
+  const named = [
+    ['water.major', ['water.major']], ['wate[r].major', ['water.major']], ['water*', water], ['[w]ater.*', water],
+    ['w?ter.all', ['water.all']], ['water.all-*', ['water.all-exact']], ['*.major', ['water.major', 'poi_tier.major']],
+    ['[wm]*', [...water, 'mode.full']], ['[!w]*', ['mode.full', 'poi_tier.major', 'dir.admin-minimal']], ['[!]*', []],
+    ['[a-z]ater.none', ['water.none']], ['[z-a]ater.none', []], ['[!z-a]ater.none', ['water.none']],
+    ['water.[a-m]*', ['water.major', 'water.all', 'water.all-exact']], ['water.all[-]exact', ['water.all-exact']],
+    ['water.all[]-]exact', ['water.all-exact']], ['water.all[a-]exact', ['water.all-exact']], ['water[.]all', ['water.all']],
+    ['water.al?', ['water.all']], ['*', ids], ['', []], ['[', []], ['water.[', []],
+    ['dir.admin-mini[a-c-m]al', ['dir.admin-minimal']], ['\\water.major', []], ['*.all*', ['water.all', 'water.all-exact']],
+    ['?????.*', water], ['water.*-exact', ['water.all-exact']],
+  ];
+  for (const [pattern, want] of named) {
+    assert.deepEqual(ids.filter((id) => namesId(pattern, id)), want, pattern);
+  }
+});
 
 // The page's credit holds the template's sources but those of the water
 // alone, in its order, each as the template has it but for the datasets it
 // applies to; until the template lists them all (PR 530), the page's others
 // besides.
 test("the page's credit holds the template's attribution but the water's own", { skip: !template.attribution && 'the template has no attribution yet' }, () => {
-  const { DATA_CREDITS } = core();
+  const { DATA_CREDITS, ofWaterAlone: of } = core();
+  const ofWaterAlone = (entry) => of(entry, Object.keys(template.components));
   const dry = template.attribution.filter((e) => !ofWaterAlone(e));
   const listed = new Set(dry.map((e) => e.id));
   assert.deepEqual(plain(DATA_CREDITS.filter((e) => listed.has(e.id))), dry.map(({ applies_to, ...entry }) => entry));
@@ -2173,12 +2195,25 @@ test('the disclosure credits no source of the water alone, which the portal serv
   // A list of the water's sources alone credits none of the answers: the
   // page's is shown.
   assert.ok(creditsHtml({ ...catalog(), attribution: [sea] }).startsWith('<div class="credit-group" data-from="page">'));
-  // A source of the water and of the rest is one of the answers.
-  for (const applies_to of [['water.*', 'mode.*'], ['*'], []]) {
+  // The patterns name the build's components as shell patterns do: those
+  // that name only water components are of the water alone, however they
+  // are written.
+  for (const applies_to of [['wate[r].major'], ['water*'], ['[w]ater.all', 'w?ter.all-*'], ['?????.*']]) {
+    const out = creditsHtml({ ...catalog(), attribution: [OSM, { ...sea, applies_to }] });
+    assert.ok(!text(out).includes('The seas, cut to the land.'), JSON.stringify(applies_to));
+  }
+  // A source of the water and of the rest is one of the answers, and so is
+  // one whose patterns name no component, or that doesn't read as a list of
+  // patterns.
+  for (const applies_to of [['water.*', 'mode.*'], ['*'], ['*.major'], ['[wm]*'], ['[!z]*'], [], ['seas.*'], ['water.major', 5], 'water.*']) {
     assert.ok(text(creditsHtml({ ...catalog(), attribution: [OSM, { ...sea, applies_to }] })).includes('The seas, cut to the land.'), JSON.stringify(applies_to));
   }
   const { applies_to, ...unscoped } = sea;
   assert.ok(text(creditsHtml({ ...catalog(), attribution: [OSM, unscoped] })).includes('The seas, cut to the land.'));
+  // A /datasets that lists no components names none: every source it lists
+  // is shown.
+  const { components, ...unlisted } = catalog();
+  assert.ok(text(creditsHtml({ ...unlisted, attribution: [OSM, sea] })).includes('The seas, cut to the land.'));
 });
 
 // configurations.json is a copy of the template (the nightly's

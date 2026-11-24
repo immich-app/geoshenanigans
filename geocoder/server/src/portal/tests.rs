@@ -1678,6 +1678,19 @@ async fn datasets_passes_on_the_builds_attribution_as_it_is() {
     assert_eq!(plan.json("id", "dir")["attribution"], serde_json::Value::Null);
 }
 
+// /datasets lists the ids of the build's components, sorted, which
+// the shell patterns of its attribution's applies_to name: the page tells a
+// credit of the water alone by the components its patterns match.
+#[tokio::test]
+async fn datasets_lists_the_ids_of_the_builds_components() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let mut ids: Vec<String> = template()["components"].as_object().unwrap().keys().cloned().collect();
+    ids.sort();
+    assert!(ids.contains(&"water.major".to_string()) && ids.contains(&"dir.admin-minimal".to_string()), "{ids:?}");
+    let plan = plan_edited(&bucket, |_| {}).await.unwrap();
+    assert_eq!(plan.json("id", "dir")["components"], serde_json::json!(ids));
+}
+
 // The lookups run a few at once over every client, each on a blocking
 // thread: one waits its turn while the others hold every place, /health
 // answers meanwhile, and it is answered once a place is free.
