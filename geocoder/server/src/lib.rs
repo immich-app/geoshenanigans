@@ -2845,8 +2845,10 @@ impl Index {
                 if poly.country_code != 0 && of_country != cc { return None; }
                 if country_has_no_postcode(&cc) { return None; }
             }
+            // The builder checked the postcode against its country's pattern, whatever its
+            // length; past that, one value and no placeholder.
             let postcode = self.get_string(poly.name_id);
-            let valid = centroid_postcode_ok(&postcode) && postcode_looks_valid(&cc.unwrap_or(of_country), &postcode);
+            let valid = !postcode.contains(';') && postcode_looks_valid(&cc.unwrap_or(of_country), &postcode);
             valid.then_some(postcode)
         };
         let mut found = areas.iter().filter_map(|poly| eligible(poly).map(|postcode| (poly, postcode)));

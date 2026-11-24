@@ -75,13 +75,12 @@ auto smallest_first(const ParsedData& data) {
 }
 
 // Whether the server's postal_area_postcode takes a postal area's postcode
-// (centroid_postcode_ok, postcode_looks_valid): at most 10 bytes, one value
-// (no ';'), not of a ZIP+4's shape (10 bytes, '-' the sixth), and past its
-// white space and hyphens neither empty nor one character repeated, as a
-// placeholder such as 00000 is.
+// (postcode_looks_valid), whatever its length, assign_postal_area_countries
+// having checked it against its country's pattern: one value (no ';'), and
+// past its white space and hyphens neither empty nor one character repeated,
+// as a placeholder such as 00000 is.
 bool postcode_taken(const char* postcode) {
-    const size_t len = std::strlen(postcode);
-    if (len > 10 || std::strchr(postcode, ';') || (len == 10 && postcode[5] == '-')) return false;
+    if (std::strchr(postcode, ';')) return false;
     auto white = [](uint32_t c) {  // Rust's char::is_whitespace
         return (c >= 0x09 && c <= 0x0D) || c == 0x20 || c == 0x85 || c == 0xA0 || c == 0x1680 ||
                (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F ||

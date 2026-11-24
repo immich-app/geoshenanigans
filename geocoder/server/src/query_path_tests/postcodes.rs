@@ -88,6 +88,20 @@ fn a_postal_area_of_no_valid_postcode_leaves_the_point_to_another_or_a_centroid(
 }
 
 #[test]
+fn a_postal_area_of_a_postcode_its_country_takes_names_the_point_whatever_its_length() {
+    // Nominatim makes a postcode area of every postcode its country's pattern takes, which the
+    // builder checks (POSTAL_AREA_INVALID): Saudi Arabia's ddddd(?:-dddd)? keeps 12345-6789 whole,
+    // and Iran's (ddddd)[-_ ]?(ddddd) writes 12345-67890, of 11 characters.
+    for (code, postcode, origin) in [(b"SA", "12345-6789", (24.7, 46.7)), (b"IR", "12345-67890", (35.7, 51.4))] {
+        let index = country_at(origin, code)
+            .boundary(postcode, POSTCODE_AREA_LEVEL, 0, (-300.0, -300.0, 300.0, 300.0))
+            .centroid("54321", 0.0, 500.0)
+            .load();
+        assert_eq!(postcode_from(&index, origin, 0.0, 0.0), postcode);
+    }
+}
+
+#[test]
 fn a_postal_area_of_another_country_names_no_point() {
     // Büsingen am Hochrhein, a German exclave in Switzerland: get_nearest_postcode takes the
     // postcode areas of the point's country only (p.country_code = country), and a postal area's

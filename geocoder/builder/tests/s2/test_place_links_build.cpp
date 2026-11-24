@@ -5,8 +5,9 @@
 // and only one, one of its name first, that no boundary before it links, a
 // place=province area is an address area where its country ranks it, a
 // postal area names a point only of its own country, one for a relation, and
-// of a postcode its country takes, a US ZIP+4 its ZIP, and a place area
-// linked to a place node of another type ranks by its own place tag.
+// of a postcode its country takes, whatever its length, a US ZIP+4 its ZIP,
+// and a place area linked to a place node of another type ranks by its own
+// place tag.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -46,6 +47,17 @@ struct Fixture {
         o.id = next_way++;
         for (const auto& [lat, lng] : points) o.refs.push_back(node(lat, lng));
         o.refs.push_back(o.refs.front());
+        o.tags = std::move(tags);
+        ways.push_back(o);
+        return o.id;
+    }
+
+    // An open way through the points (lat, lng).
+    int64_t line(const std::vector<std::pair<double, double>>& points, Tags tags = {}) {
+        TestObject o;
+        o.type = OsmType::Way;
+        o.id = next_way++;
+        for (const auto& [lat, lng] : points) o.refs.push_back(node(lat, lng));
         o.tags = std::move(tags);
         ways.push_back(o);
         return o.id;
@@ -234,6 +246,22 @@ TEST(a_postal_area_names_a_point_only_of_its_country_and_of_a_postcode_its_count
     CHECK(names(answers[0], "postcode", "60311"));
     CHECK(answers[1].find("8000") == std::string::npos);
     CHECK(names(answers[2], "postcode", "8000"));
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_postal_area_of_an_extended_postcode_its_country_takes_names_a_point_and_a_street) {
+    // Saudi Arabia's pattern ddddd(?:-dddd)? has no output, so Nominatim keeps 12345-6789 whole and
+    // makes a postcode area of it (postcodes.py _update_postcode_areas): it names a point inside it
+    // and the street through it.
+    Fixture f;
+    f.country(20, 40, 25, 45, "Saudi Arabia", "SA");
+    f.area(22.4, 42.4, 22.6, 42.6, {{"type", "boundary"}, {"boundary", "postal_code"}, {"postal_code", "12345-6789"}});
+    f.line({{22.5, 42.45}, {22.5, 42.55}}, {{"highway", "residential"}, {"name", "Shari Al Test"}});
+    const std::vector<std::string> answers = answers_of(f, "extended-postcode", {{22.45, 42.45}, {22.5002, 42.5}});
+    REQUIRE(answers.size() == 2);
+    CHECK(names(answers[0], "postcode", "12345-6789"));
+    CHECK(names(answers[1], "road", "Shari Al Test"));
+    CHECK(names(answers[1], "postcode", "12345-6789"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 

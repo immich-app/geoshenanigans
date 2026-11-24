@@ -197,11 +197,10 @@ TEST(of_the_postal_areas_at_a_streets_middle_the_one_of_its_country_whose_centro
 }
 
 TEST(a_streets_postal_area_is_none_of_a_placeholder_or_a_list_of_postcodes) {
-    // The server's postal_area_postcode passes over an area whose postcode is longer than 10
-    // characters, lists several or, past its spaces and hyphens, repeats one character
-    // (centroid_postcode_ok, postcode_looks_valid). A US area of 00000, which the US pattern
-    // takes, centred on a street's middle leaves the street to the larger area of 10001 round it;
-    // outside every country, areas of 12345;12346 and of 123456789012 leave it to 12345.
+    // The server's postal_area_postcode passes over an area whose postcode lists several or, past
+    // its spaces and hyphens, repeats one character (postcode_looks_valid). A US area of 00000,
+    // which the US pattern takes, centred on a street's middle leaves the street to the larger
+    // area of 10001 round it; outside every country, an area of 12345;12346 leaves it to 12345.
     const uint16_t us = pack_country_code('U', 'S');
     Admins a;
     a.add(2, box(0, 0, 1, 1), {}, "United States", us);
@@ -209,13 +208,33 @@ TEST(a_streets_postal_area_is_none_of_a_placeholder_or_a_list_of_postcodes) {
     const uint32_t zip = a.add(11, box(0.45, 0.46, 0.55, 0.56), {}, "10001", us);
     a.add_way({at(0.5, 0.5), at(0.5, 0.501)});
     a.add(11, box(-0.501, 0.499, -0.499, 0.502), {}, "12345;12346");
-    a.add(11, box(-0.502, 0.498, -0.498, 0.503), {}, "123456789012");
     const uint32_t plain = a.add(11, box(-0.55, 0.46, -0.45, 0.56), {}, "12345");
     a.add_way({at(-0.5, 0.5), at(-0.5, 0.501)});
     a.map();
     compute_way_parent_polygons(a.data, 1);
     CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[zip].name_id);
     CHECK_EQ(a.data.way_postcode_ids[1], a.data.admin_polygons[plain].name_id);
+}
+
+TEST(a_streets_postal_area_has_a_postcode_its_country_takes_whatever_its_length) {
+    // Nominatim makes a postcode area of every postcode its country's pattern takes
+    // (postcodes.py _update_postcode_areas): Saudi Arabia's ddddd(?:-dddd)? takes 12345-6789,
+    // kept whole, and Iran's (ddddd)[-_ ]?(ddddd) 12345-67890, of 11 characters. Each, centred on
+    // a street's middle, names the street over the larger area round it.
+    const uint16_t sa = pack_country_code('S', 'A'), ir = pack_country_code('I', 'R');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Saudi Arabia", sa);
+    a.add(2, box(1, 0, 2, 1), {}, "Iran", ir);
+    const uint32_t extended = a.add(11, box(0.499, 0.499, 0.501, 0.502), {}, "12345-6789", sa);
+    a.add(11, box(0.45, 0.46, 0.55, 0.56), {}, "12345", sa);
+    a.add_way({at(0.5, 0.5), at(0.5, 0.501)});
+    const uint32_t iranian = a.add(11, box(1.499, 0.499, 1.501, 0.502), {}, "12345-67890", ir);
+    a.add(11, box(1.45, 0.46, 1.55, 0.56), {}, "1234567891", ir);
+    a.add_way({at(1.5, 0.5), at(1.5, 0.501)});
+    a.map();
+    compute_way_parent_polygons(a.data, 1);
+    CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[extended].name_id);
+    CHECK_EQ(a.data.way_postcode_ids[1], a.data.admin_polygons[iranian].name_id);
 }
 
 TEST(a_streets_postal_area_holds_its_middle_on_its_edges_too) {
