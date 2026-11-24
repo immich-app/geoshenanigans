@@ -51,17 +51,20 @@ impl BoundarySlot {
     }
 }
 
-/// A labelled boundary's primary name: its label node's (when the node kept it), else its own.
+/// A boundary's names: its primary name, its label node's (when the node kept it) else the one
+/// its record goes by; and its own name where that is another, the record's, or for a polygon that
+/// goes by its node's English name the name it had (admin_own_names.bin).
 pub fn slot_name_ids(geo: &Index, s: &BoundarySlot) -> (u32, Option<u32>) {
-    let own = polygon_raw(geo, s.poly).map_or(NO_DATA, |ap| ap.name_id);
-    if s.linked() {
-        let n = place_node_raw(geo, s.node).map_or(NO_DATA, |pn| pn.name_id);
-        if n != NO_DATA && n != own {
-            return (n, Some(own));
-        }
+    let shown = polygon_raw(geo, s.poly).map_or(NO_DATA, |ap| ap.name_id);
+    let own = geo.admin_own_name(s.poly).unwrap_or(shown);
+    let node = if s.linked() { place_node_raw(geo, s.node).map_or(NO_DATA, |pn| pn.name_id) } else { NO_DATA };
+    let primary = if node != NO_DATA { node } else { shown };
+    if own != NO_DATA && own != primary {
+        return (primary, Some(own));
     }
-    (own, None)
+    (primary, None)
 }
+
 
 /// Place node `i`; None past the place nodes.
 pub fn place_node_raw(geo: &Index, i: u32) -> Option<PlaceNode> {
@@ -271,8 +274,10 @@ impl<'a> Entities<'a> {
         }
         if ord == crate::constants::ORD_BOUNDARY_NAME {
             if !Self::is_poi(e) && e >= self.n_place_nodes {
-                if let Some(ap) = self.slot(e - self.n_place_nodes).and_then(|s| polygon_raw(self.geo, s.poly)) {
-                    return self.geo.get_string(ap.name_id);
+                if let Some(s) = self.slot(e - self.n_place_nodes) {
+                    if let (_, Some(own)) = slot_name_ids(self.geo, &s) {
+                        return self.geo.get_string(own);
+                    }
                 }
             }
             return self.base_name(e);

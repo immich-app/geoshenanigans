@@ -65,7 +65,8 @@ pub const MAX_KEY_STEPS: usize = 1 << 24;
 /// Extra names of one entity a posting can point at (more get ordinal 15: shown by the base name).
 pub const MAX_NAME_ORD: u8 = 15;
 pub const MAX_EXTRA_ORD: u8 = 13;
-/// Ordinal of a labelled boundary's own name (its primary name is its label node's).
+/// Ordinal of a boundary's own name: a labelled one's (its primary name is its label node's), and
+/// the name a polygon had that goes by its node's English name (admin_own_names.bin).
 pub const ORD_BOUNDARY_NAME: u8 = 14;
 /// Admin levels whose boundaries are searchable without a label node (country .. municipality).
 pub const BOUNDARY_MIN_LEVEL: u8 = 2;

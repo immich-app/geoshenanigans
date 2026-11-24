@@ -2085,6 +2085,47 @@ mod tests {
     }
 
     #[test]
+    fn a_boundary_named_by_its_node_is_found_by_its_own_name_too() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        use crate::query::Searcher;
+        use crate::reader::SearchIndex;
+        // Sosnovka's boundary goes by its town node's English name and keeps its own name,
+        // Сосновка (admin_own_names.bin); Kirsanovka's too, Кирсановка, which no node labels.
+        // Each is found by either name, shown by the name the search matched.
+        let mut g = Geo::default();
+        let sosnovka = g.boundary("Sosnovka", 8, [10.0, 20.0, 10.2, 20.2]);
+        g.own_name(sosnovka, "Сосновка");
+        let kirsanovka = g.boundary("Kirsanovka", 8, [11.0, 21.0, 11.2, 21.2]);
+        g.own_name(kirsanovka, "Кирсановка");
+        let node = g.place("Sosnovka", 1, 10.1, 20.1);
+        g.claim(sosnovka, node);
+        g.place("Mill", 2, 10.05, 20.05);
+        g.place("Mill", 1, 11.1, 21.1);
+        let dir = TempDir::new("own-names");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
+        let s = Searcher::new(&idx);
+
+        // The boundaries are entities n_place_nodes (3) + their polygons.
+        for (q, entity) in [("Sosnovka", 3), ("Сосновка", 3), ("Kirsanovka", 4), ("Кирсановка", 4)] {
+            let (found, _) = s.search(q, 5);
+
+            assert!(!found.is_empty(), "{q}");
+            assert_eq!((found[0].hit.entity, found[0].name.as_str()), (entity, q), "{q}");
+        }
+        // Either name places a mill in its boundary: the village in Sosnovka before the town in
+        // Kirsanovka.
+        for (q, lat) in [("Mill, Sosnovka", 10.05), ("Mill, Сосновка", 10.05), ("Mill, Kirsanovka", 11.1), ("Mill, Кирсановка", 11.1)] {
+            let (found, _) = s.search(q, 5);
+
+            assert!(!found.is_empty(), "{q}");
+            assert_eq!((found[0].name.as_str(), found[0].lat), ("Mill", lat), "{q}");
+        }
+    }
+
+    #[test]
     fn an_unlinked_boundary_is_found_at_a_point_inside_it() {
         use crate::fixture::{build_search, Geo, TempDir};
         use crate::query::Searcher;

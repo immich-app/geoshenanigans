@@ -42,6 +42,9 @@ pub struct Geo {
     polygons: Vec<(AdminPolygon, Vec<Vec<(f32, f32)>>)>,
     nodes: Vec<PlaceNode>,
     pois: Vec<PoiRecord>,
+    /// admin_own_names.bin: (polygon, own name) of each polygon that goes by its place node's
+    /// English name.
+    own_names: Vec<(u32, u32)>,
 }
 
 impl Geo {
@@ -76,6 +79,12 @@ impl Geo {
         self.nodes.len() as u32 - 1
     }
 
+    /// Boundary `poly`'s own name, where it goes by the English name of the place node it links.
+    pub fn own_name(&mut self, poly: u32, name: &str) {
+        let name_id = self.string(name);
+        self.own_names.push((poly, name_id));
+    }
+
     /// Node `node` hidden as the label of boundary `poly`, as the builder flags a claimed node.
     pub fn claim(&mut self, poly: u32, node: u32) {
         let pn = &mut self.nodes[node as usize];
@@ -95,7 +104,8 @@ impl Geo {
     }
 
     /// The files as the builder writes them, by name. A boundary is listed in the admin cells of
-    /// a grid of points over its bounding box and of each place node and POI inside the box.
+    /// a grid of points over its bounding box and of each place node and POI inside the box; the
+    /// own names beside the polygons, empty without any.
     fn files(&self) -> Vec<(&'static str, Vec<u8>)> {
         let cell = |lat: f32, lng: f32| cell_id_at_level(lat as f64, lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
         let points: Vec<(f32, f32)> =
@@ -124,9 +134,13 @@ impl Geo {
         let tiers: Vec<String> = (0..STR_TIER_COUNT)
             .map(|t| format!("{{\"start\": {}, \"end\": {end}}}", if t == 0 { 0 } else { end }))
             .collect();
+        let mut own_names = self.own_names.clone();
+        own_names.sort_unstable();
+        let own_names = own_names.iter().flat_map(|&(poly, name)| [poly, name]).flat_map(u32::to_le_bytes).collect();
         let mut files: Vec<(&'static str, Vec<u8>)> = arcs.files().into();
         files.extend([
             ("admin_cells.bin", admin_cells), ("admin_entries.bin", admin_entries),
+            (query_server::ADMIN_OWN_NAMES_FILE, own_names),
             (place_files::CELLS_FILE, places.cells), (place_files::NODES_FILE, places.nodes),
             (place_files::HIDDEN_FILE, places.hidden),
             ("strings_core.bin", strings::encode(&self.strings)),
