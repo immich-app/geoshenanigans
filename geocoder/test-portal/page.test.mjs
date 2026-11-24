@@ -42,12 +42,16 @@ function core() {
 // the axes (of region, planet only) and their values in order, the presets,
 // each planet selection the constraints allow as a dataset (the preset's
 // label and description for a preset's, of size its place in GiB on disk and
-// half that to download) and those they rule out.
+// half that to download) and those they rule out. As catalog.rs, a preset
+// names the dataset of its region, mode, quality and POI tier, and one with
+// water names none: the portal serves the selections without water.
 function catalog(edit = () => {}) {
   const t = structuredClone(template);
   edit(t);
   const values = (axis) => Object.entries(t.axes[axis].values).sort((a, b) => a[1].order - b[1].order || a[0].localeCompare(b[0]));
-  const axes = ['region', 'mode', 'quality', 'poi_tier'].map((id) => ({
+  const served = ['region', 'mode', 'quality', 'poi_tier'];
+  const dry = t.presets.filter((p) => (p.selections.water ?? 'none') === 'none');
+  const axes = served.map((id) => ({
     id,
     label: t.axes[id].label,
     description: t.axes[id].description ?? null,
@@ -66,7 +70,7 @@ function catalog(edit = () => {}) {
           excluded.push({ id, selection, constraint: broken.id, message: broken.message, requires: broken.requires });
           continue;
         }
-        const preset = t.presets.find((x) => has(x.selections));
+        const preset = dry.find((x) => served.every((axis) => x.selections[axis] === selection[axis]));
         const n = datasets.length + 1;
         datasets.push({
           id,
@@ -80,7 +84,7 @@ function catalog(edit = () => {}) {
       }
     }
   }
-  const presets = t.presets.map((p) => ({
+  const presets = dry.map((p) => ({
     id: p.id, label: p.label, description: p.description, dataset: `${p.selections.mode}.${p.selections.quality}.${p.selections.poi_tier}`,
   }));
   return { build: { date: '2026-11-20', version: 24, id: ID, dir: '2026-11-20-1' }, default: 'full.simplified.all', axes, presets, datasets, excluded };
@@ -2079,7 +2083,7 @@ test('the sources in full are in a native disclosure, its body scrolling within 
 
 test("without the build's own credit, the disclosure holds the page's: each source, its licence and its notices", () => {
   const { creditsHtml, DATA_CREDITS } = core();
-  assert.deepEqual(plain(DATA_CREDITS.map((e) => e.id)), ['osm', 'geonames', 'codepoint-open', 'tiger', 'wikidata']);
+  assert.deepEqual(plain(DATA_CREDITS.map((e) => e.id)), ['osm', 'geonames', 'codepoint-open', 'tiger', 'wikidata', 'marine-regions']);
   assert.deepEqual(plain(DATA_CREDITS[0]), OSM);
   for (const [id, notices] of Object.entries(NOTICES)) {
     assert.deepEqual(plain(DATA_CREDITS.find((e) => e.id === id).notices), notices, id);
@@ -2134,9 +2138,11 @@ test("a build's own credit, as /datasets passes it on, is the one shown, escaped
   }
 });
 
-// Once the template lists the sources (PR 530), the page's credit is that
-// list but for the datasets each applies to.
-test("the page's credit is the template's attribution", { skip: !template.attribution && 'the template has no attribution yet' }, () => {
+// The page's credit holds the template's sources, in its order, each as
+// the template has it but for the datasets it applies to; until the
+// template lists them all (PR 530), the page's others besides.
+test("the page's credit holds the template's attribution", { skip: !template.attribution && 'the template has no attribution yet' }, () => {
   const { DATA_CREDITS } = core();
-  assert.deepEqual(plain(DATA_CREDITS), template.attribution.map(({ applies_to, ...entry }) => entry));
+  const listed = new Set(template.attribution.map((e) => e.id));
+  assert.deepEqual(plain(DATA_CREDITS.filter((e) => listed.has(e.id))), template.attribution.map(({ applies_to, ...entry }) => entry));
 });
