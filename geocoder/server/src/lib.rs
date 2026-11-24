@@ -2238,9 +2238,9 @@ impl Index {
 
     // Nominatim's `current_boundary` (insert_addresslines in
     // placex_triggers.sql): the address walk takes candidates by
-    // rank_address, boundaries before place nodes within a rank, and each
-    // boundary it accepts (rank_address other than 5 and 11) becomes the
-    // geometry later place nodes must sit in. A place node of rank R is so
+    // rank_address, areas before place nodes within a rank, and each area it
+    // accepts (rank_address other than 5 and 11), a boundary or a place area,
+    // becomes the geometry later place nodes must sit in. A place node of rank R is so
     // gated by the last boundary accepted before it, whatever its
     // admin_level: on a Vatican point that is the Vatican itself, which keeps
     // Rome's neighbourhood nodes out. The walk accepts one boundary per rank,
@@ -2275,13 +2275,25 @@ impl Index {
             polys.dedup_by_key(|p| p.1 & ID_MASK);
             polys.into_iter().filter(|(_, id, poly)| scan.pip.holds(self, *id, poly)).map(|(_, _, poly)| poly).collect()
         };
-        let ranked: Vec<RankedPoly> = holding(boundaries).into_iter()
+        let mut ranked: Vec<RankedPoly> = holding(boundaries).into_iter()
             .map(|poly| RankedPoly { poly, rank_address: self.admin_config.to_rank(&cc, poly.admin_level) })
             .filter(|r| r.rank_address != 0)
             .collect();
+        // The place areas, each at its rank before any lift, but one repeating an area of its
+        // name and rank, as find_admin_in ranks them.
+        let place_areas = holding(place_areas);
+        for poly in &place_areas {
+            let (_, rank) = place_area_ranks(poly, &cc);
+            if rank == 0 { continue; }
+            let name = self.get_string(poly.name_id);
+            if place_area_repeats(ranked.iter().map(|p| (self.get_string(p.poly.name_id), p.rank_address, p.poly.area)), &name, rank, poly.area) {
+                continue;
+            }
+            ranked.push(RankedPoly { poly: *poly, rank_address: rank });
+        }
         let within = |poly: &AdminPolygon, other: &AdminPolygon| self.admin_geometry.polygon_within(poly, other);
         let walk = |ranked: &[RankedPoly]| self.area_walk(ranked, feature, &cc).into_iter().map(|(k, accepted, _)| (k, accepted)).collect();
-        CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter(), &cc, within, walk)
+        CurrentBoundaries::from_ranked(ranked, place_areas.iter(), &cc, within, walk)
     }
 
     /// The place nodes of an address along `feature` (Nominatim's address walk, place_node_walk),
@@ -5649,9 +5661,10 @@ impl CurrentBoundaries {
         Self::RANKS.iter().position(|&r| r == rank).and_then(|g| self.gates[g].as_ref())
     }
 
-    /// Each rank's boundary from the boundaries holding the point at their
-    /// initial rank_address and the place areas holding it, in the point's
-    /// `country`: the nested-boundary promotions give each its rank_address
+    /// Each rank's boundary from the areas holding the point at their initial
+    /// rank_address, boundaries and place areas, and the place areas holding
+    /// it, in the point's `country`: the nested-boundary promotions give each
+    /// its rank_address
     /// (an admin_level 7 boundary in a level 6 one linked to a suburb is
     /// ranked 22, not 14), then `walk` takes those of the ranks of address
     /// areas (ADDRESS_AREA_RANKS) as Nominatim's address walk does, as
@@ -5665,7 +5678,7 @@ impl CurrentBoundaries {
         walk: impl FnOnce(&[RankedPoly]) -> Vec<(usize, bool)>,
     ) -> Self {
         promote_nested_ranks(&mut ranked, place_areas.clone(), country, within);
-        let promoting = ranked.iter().map(|r| (r.rank_address, r.poly))
+        let promoting = ranked.iter().filter(|r| r.poly.admin_level != 15).map(|r| (r.rank_address, r.poly))
             .chain(place_areas.map(|p| (place_area_ranks(p, country).0, *p)))
             .filter(|(rank, _)| PROMOTABLE_RANKS.contains(rank))
             .collect();

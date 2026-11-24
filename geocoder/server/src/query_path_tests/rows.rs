@@ -400,3 +400,19 @@ fn an_area_the_street_does_not_run_through_is_no_row_of_a_rank_it_shares() {
     assert_eq!(display, "Border Street, Westend, Testland");
     assert_eq!(address["suburb"], "Westend");
 }
+
+#[test]
+fn a_place_area_the_walk_accepts_is_the_boundary_of_finer_place_nodes() {
+    // The place=city area Metro holds the street, and the walk accepts it at rank 16: it becomes
+    // the current boundary (placex_triggers.sql:645-652), so the suburb node Outskirts, outside it
+    // though its fuzzy area reaches the street, is no row (:606-609).
+    let mut index = country("Testland", b"XX");
+    index
+        .boundary("Shire", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Metro", 15, 1, (-1000.0, -1000.0, 1000.0, 1000.0))
+        .place("Outskirts", 3, 1500.0, 0.0)
+        .street("High Street", &[(0.0, -200.0), (0.0, 200.0)]);
+    let (display, address) = answer_at(&index.load(), 10.0, 0.0);
+    assert_eq!(display, "High Street, Metro, Shire, Testland");
+    assert_eq!(address["suburb"], serde_json::Value::Null);
+}
