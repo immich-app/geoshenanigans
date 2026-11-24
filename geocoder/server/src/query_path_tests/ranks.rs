@@ -223,3 +223,21 @@ fn a_place_node_ranked_above_the_boundary_of_its_label_names_the_field() {
     assert_eq!(answer["address"]["suburb"], "St Crispin's");
     assert_eq!(answer["display_name"], "St Crispin's, Upton, West Northamptonshire, England, Testland");
 }
+
+#[test]
+fn of_two_boundaries_of_a_level_round_the_point_at_one_rank_the_smaller_alone_is_in_the_address() {
+    // Nominatim's address has a row a rank (insert_addresslines: address_havelevel), and only those
+    // rows fill fields and display_name (format_json.py, results.py). A level 8 town of rank 16,
+    // labelled city by its rank, inside a level 8 boundary tagged place=town, of rank 16 as well
+    // (placex_triggers.sql:1192), round the point by the town's middle: the town is the city, and
+    // the boundary round it names nothing.
+    let index = TestIndex::new()
+        .boundary("Some County", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Greater Town", 8, 2, (-10_000.0, -10_000.0, 10_000.0, 10_000.0))
+        .boundary("Old Town", 8, 0, (1000.0, 1000.0, 3000.0, 3000.0))
+        .load();
+    let answer = serde_json::to_value(index.query(at(2000.0, 2000.0).lat as f64, at(2000.0, 2000.0).lng as f64)).unwrap();
+    assert_eq!(answer["address"]["city"], "Old Town");
+    assert_eq!(answer["address"].get("town"), None);
+    assert_eq!(answer["display_name"], "Old Town, Some County, Testland");
+}

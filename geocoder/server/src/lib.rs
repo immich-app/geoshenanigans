@@ -2171,6 +2171,7 @@ impl Index {
 
         promote_nested_ranks(&mut ranked, place_area_polygons.iter().map(|(_, pa)| pa), &country_code_str, within);
         ranked.retain(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address));
+        one_boundary_a_rank(&mut ranked);
         result.boundary_ranks = rank_bits(&ranked);
 
         // Now assign each polygon to its field slot. Each rank yields one
@@ -5763,6 +5764,28 @@ pub fn rank_bits(ranked: &[RankedPoly]) -> u32 {
     ranked.iter()
         .filter(|r| (1..u32::BITS as u8).contains(&r.rank_address))
         .fold(0, |bits, r| bits | 1 << r.rank_address)
+}
+
+/// Of the boundaries of `ranked` (admin_level below 15) of one rank_address, the smallest, the
+/// first of equals, the one find_current_boundaries' walk takes at that rank: Nominatim's address
+/// has a row a rank (insert_addresslines: address_havelevel), and only its rows fill a field or
+/// join display_name (format_json.py, results.py). The others go; the place areas stay.
+pub fn one_boundary_a_rank(ranked: &mut Vec<RankedPoly>) {
+    let mut kept: [Option<usize>; u32::BITS as usize] = [None; u32::BITS as usize];
+    for (k, r) in ranked.iter().enumerate() {
+        let rank = r.rank_address as usize;
+        if r.poly.admin_level == 15 || rank >= kept.len() { continue; }
+        if kept[rank].is_none_or(|b| r.poly.area < ranked[b].poly.area) {
+            kept[rank] = Some(k);
+        }
+    }
+    let mut k = 0;
+    ranked.retain(|r| {
+        let rank = r.rank_address as usize;
+        let keep = r.poly.admin_level == 15 || rank >= kept.len() || kept[rank] == Some(k);
+        k += 1;
+        keep
+    });
 }
 
 /// The polygons of `ranked` that fill no field but are rows of the address all the same:
