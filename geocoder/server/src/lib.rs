@@ -3045,25 +3045,37 @@ impl Index {
         let Some(chain) = admin_chain else { return admin_pip };
         // The rows the chain gives the state, region and province, or those at the street's point
         // where the query point names others (coarse_fields), and its country: each in place of the
-        // query point's row of its label, at its own rank. Only these replace the query point's
-        // rows: at those ranks PIP false positives are rare and the chain walk rarely drifts from
-        // the query. For finer ranks (state_district, county, municipality, city and below) the
-        // chain walk picks the polygon holding the street's centroid, which regresses where that
-        // lies in another fine-grained polygon than the query (Buenos Aires Comuna 14 against
-        // Comuna 1, Chicago's West Chicago Township leaking as municipality).
+        // query point's row of its label and of any of its rank, at its own rank, and one a rank,
+        // the street point's before the chain's. Only these replace the query point's rows: at
+        // those ranks PIP false positives are rare and the chain walk rarely drifts from the
+        // query. For finer ranks (state_district, county, municipality, city and below) the chain
+        // walk picks the polygon holding the street's centroid, which regresses where that lies in
+        // another fine-grained polygon than the query (Buenos Aires Comuna 14 against Comuna 1,
+        // Chicago's West Chicago Township leaking as municipality).
         const COARSE: [&str; 3] = ["state", "region", "province"];
         let coarse = |admin: &AdminResult<'a>| COARSE.map(|label| admin.row(label).cloned());
+        let mut at_street: Option<[Option<AddressRow<'a>>; 3]> = None;
         let [state, region, province] = coarse_fields(coarse(&chain), coarse(&admin_pip), |row| row.name.clone(), || {
             let (_, _, way_idx) = street?;
             let (plat, plng) = self.closest_point_on_way(*way_idx, lat, lng)?;
-            Some(coarse(&self.find_admin(plat, plng)))
+            at_street = Some(coarse(&self.find_admin(plat, plng)));
+            at_street.clone()
         });
+        let of_street = |row: &AddressRow<'a>| at_street.iter().flatten().flatten().any(|r| r == row);
+        let (street_rows, chain_rows): (Vec<_>, Vec<_>) = [state, region, province].into_iter().flatten().partition(of_street);
+        let mut replacing: Vec<AddressRow<'a>> = Vec::with_capacity(4);
+        for row in chain.row("country").cloned().into_iter().chain(street_rows).chain(chain_rows) {
+            if !replacing.iter().any(|r| r.rank == row.rank) {
+                replacing.push(row);
+            }
+        }
         let mut rows = admin_pip.rows;
-        for row in [chain.row("country").cloned(), state, region, province].into_iter().flatten() {
+        for row in replacing {
             if let Some(k) = rows.iter().position(|r| r.label == row.label) {
                 rows.remove(k);
             }
-            let at = rows.partition_point(|r| r.rank >= row.rank);
+            rows.retain(|r| r.rank != row.rank);
+            let at = rows.partition_point(|r| r.rank > row.rank);
             rows.insert(at, row);
         }
         AdminResult { country_code: chain.country_code.or(admin_pip.country_code), rows, ..admin_pip }
@@ -9043,6 +9055,45 @@ mod query_path_tests {
         assert_eq!(answer(-20.0), (some("Border Road"), some("Northshire")));
         // From Northshire, which the chain does not name either.
         assert_eq!(answer(5.0), (some("Border Road"), some("Northshire")));
+    }
+
+    #[test]
+    fn query_keeps_the_street_point_s_row_of_a_rank_over_the_chain_s() {
+        // Border Road runs in Southmark, a province (admin_level 4 tagged place=province: rank 8),
+        // and its parent is Farshire, a state of rank 8 far from it. The chain names a state and
+        // the street's point nearest the query the province: of the two rows of rank 8 the
+        // address keeps the street point's, as it does for a state.
+        let mut dataset = TestIndex::new();
+        dataset
+            .boundary("Southmark", 4, 8, (-5000.0, -5000.0, 5000.0, 5000.0))
+            .boundary("Farshire", 4, 0, (60_000.0, 60_000.0, 70_000.0, 70_000.0))
+            .street("Border Road", &parallel(0.0, 200.0)).way_parent(2);
+        let mut index = dataset.load();
+        // Farshire's parent is Testland, the top of the chain.
+        index.admin_parents = Some(FileBytes::Owned([NO_DATA, NO_DATA, 0].iter().flat_map(|parent| parent.to_le_bytes()).collect()));
+        let p = at(5.0, ALONG_EAST_M);
+        let answer = serde_json::to_value(index.query(p.lat as f64, p.lng as f64)).unwrap();
+        assert_eq!(answer["display_name"], "Border Road, Southmark, Testland");
+        assert_eq!((&answer["address"]["province"], &answer["address"]["state"]), (&serde_json::json!("Southmark"), &serde_json::Value::Null));
+    }
+
+    #[test]
+    fn query_puts_a_chain_row_in_place_of_the_query_point_s_row_of_its_rank() {
+        // Mill Road's parent is Weirdshire, a boundary of admin_level 6 (rank 12) tagged
+        // place=state, and the query point lies in Midcounty, the county of rank 12 there, in no
+        // state. The chain's state takes rank 12 in place of the query point's county: an address
+        // has one row a rank.
+        let mut dataset = TestIndex::new();
+        dataset
+            .boundary("Midcounty", 6, 0, (-5000.0, -5000.0, 5000.0, 5000.0))
+            .boundary("Weirdshire", 6, 7, (60_000.0, 60_000.0, 70_000.0, 70_000.0))
+            .street("Mill Road", &parallel(0.0, 200.0)).way_parent(2);
+        let mut index = dataset.load();
+        index.admin_parents = Some(FileBytes::Owned([NO_DATA, NO_DATA, 0].iter().flat_map(|parent| parent.to_le_bytes()).collect()));
+        let p = at(5.0, ALONG_EAST_M);
+        let answer = serde_json::to_value(index.query(p.lat as f64, p.lng as f64)).unwrap();
+        assert_eq!(answer["display_name"], "Mill Road, Weirdshire, Testland");
+        assert_eq!((&answer["address"]["state"], &answer["address"]["county"]), (&serde_json::json!("Weirdshire"), &serde_json::Value::Null));
     }
 
     /// Two streets, two addresses and two interpolation ways, the first of each with a value in
