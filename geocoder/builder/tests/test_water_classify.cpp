@@ -142,6 +142,20 @@ TEST(water_meta_json_round_trips_quotes_and_controls_and_refuses_what_it_did_not
         CHECK(!parse_meta_json(with_type(other)).has_value());
 }
 
+TEST(water_meta_json_of_a_number_with_a_leading_zero_is_no_table) {
+    // Numbers as meta_json writes them, JSON's: no leading zero, but 0
+    // itself.
+    auto with = [](const std::string& code, const std::string& rank) {
+        return "{\"types\": [\n  {\"code\": " + code + ", \"class\": \"water\", \"type\": \"a\", \"rank\": " + rank +
+               "}\n]}\n";
+    };
+    CHECK(parse_meta_json(with("32769", "22")).has_value());
+    CHECK(parse_meta_json(with("1", "0")).has_value());
+    for (const auto& [code, rank] : std::vector<std::pair<std::string, std::string>>{
+             {"032769", "22"}, {"02", "20"}, {"32769", "022"}, {"1", "00"}, {"1", "020"}})
+        CHECK(!parse_meta_json(with(code, rank)).has_value());
+}
+
 TEST(water_meta_json_of_a_code_twice_or_out_of_order_or_a_value_twice_is_no_table) {
     // Kinds as meta_json writes them: each code once, ascending, each value
     // outside the fixed table once.
