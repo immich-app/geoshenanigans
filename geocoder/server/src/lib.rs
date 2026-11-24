@@ -316,6 +316,17 @@ impl GeoOrigin {
         }
     }
 
+    /// The squared distance to the point of the edge from `a` to `b` nearest in degrees (planar
+    /// in degrees, as PostGIS measures a lon/lat line), and the fraction along the edge of that
+    /// point. By a pole, where degrees are no plane, `segment`'s.
+    fn segment_in_degrees(&self, a: NodeCoord, b: NodeCoord) -> (f64, f64) {
+        match &self.polar {
+            None => point_to_segment_with_t(self.lat, self.lng, a.lat as f64, self.near_lng(a.lng as f64),
+                                            b.lat as f64, self.near_lng(b.lng as f64), self.cos_lat),
+            Some(_) => self.segment(a, b),
+        }
+    }
+
     /// The length of the edge from `a` to `b`, in radians.
     fn length(&self, a: NodeCoord, b: NodeCoord) -> f64 {
         match &self.polar {
@@ -1501,10 +1512,11 @@ fn street_tokens_overlap(a: &str, b: &str) -> bool {
 /// even/odd grid relative to start_number and clamps into [min, max] of the
 /// range — the old open-coded version computed the offset in unsigned space,
 /// so descending ranges (start > end) saturated the negative offset to 0.
-/// Squared distance (radians²) from `origin` to an interpolation line and
-/// the fraction along it, by length, of the closest point: the point nearest
-/// in metres, as a street's (GeoOrigin::segment). None for a line without
-/// length.
+/// Squared distance (radians²) from `origin` to an interpolation line, as far
+/// as its point nearest in metres, as a street is (GeoOrigin::segment); and
+/// the fraction along it, by length, of its point nearest in degrees, where
+/// Nominatim takes the house number (_locate_interpolation in reverse.py:
+/// ST_LineLocatePoint on the lon/lat line). None for a line without length.
 fn interp_position(nodes: &[NodeCoord], origin: &GeoOrigin) -> Option<(f64, f64)> {
     if nodes.len() < 2 { return None; }
     // Lengths, not their squares: accumulating squares skews the along-way
@@ -1514,13 +1526,15 @@ fn interp_position(nodes: &[NodeCoord], origin: &GeoOrigin) -> Option<(f64, f64)
     if total_len == 0.0 { return None; }
 
     let mut best_dist = f64::MAX;
-    let mut best_t = 0.0;
+    // The segment of the point nearest in degrees: the one least far at its own such point.
+    let (mut best_at, mut best_t) = (f64::MAX, 0.0);
     let mut accumulated = 0.0;
     for i in 0..nodes.len() - 1 {
         let len = seg_len(i);
-        let (dist, seg_t) = origin.segment(nodes[i], nodes[i + 1]);
-        if dist < best_dist {
-            best_dist = dist;
+        best_dist = best_dist.min(origin.segment(nodes[i], nodes[i + 1]).0);
+        let (at, seg_t) = origin.segment_in_degrees(nodes[i], nodes[i + 1]);
+        if at < best_at {
+            best_at = at;
             best_t = (accumulated + seg_t * len) / total_len;
         }
         accumulated += len;

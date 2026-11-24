@@ -383,20 +383,23 @@ fn an_address_and_a_street_over_a_pole_are_as_far_as_they_are() {
 #[test]
 fn an_interpolation_line_is_as_far_as_its_point_nearest_in_metres() {
     // At 60° N, a line running north-east whose nearest point lies 95 m south-east of the point,
-    // numbered 1 to 301 along its 300 m: a street of its name takes number 151 from it, within
-    // 100 m. In degrees its nearest point would lie 57 m along it, 111 m off. At 120 m it is the
-    // nearest line within the search distance, where in degrees it would be 140 m off.
+    // numbered 1 to 301 along its 300 m: a street of its name takes its number from it, within
+    // 100 m, though the line's point nearest in degrees lies 57 m along it and 111 m off. The
+    // number is the one at that point, 94, where Nominatim's ST_LineLocatePoint on the lon/lat
+    // line takes it. At 120 m the line is the nearest within the search distance, though 140 m
+    // off at its point nearest in degrees, which gives number 79.
     let origin = (60.0, 10.0);
-    for (metres, within) in [(95.0, 100.0), (120.0, DEFAULT_SEARCH_DISTANCE)] {
+    for (metres, within, expected) in [(95.0, 100.0, 94), (120.0, DEFAULT_SEARCH_DISTANCE, 79)] {
         let foot = along(metres, 135.0);
         let (dn, de) = along(150.0, 45.0);
         let index = TestIndex::around(origin)
             .interpolation("Main Street", (1, 301, 0), &[(foot.0 - dn, foot.1 - de), (foot.0 + dn, foot.1 + de)])
             .load();
         let number = index.find_interp_on_way(origin.0, origin.1, "Main Street", radians_sq(within));
-        assert_eq!(number, Some(151), "{metres} m");
+        assert_eq!(number, Some(expected), "{metres} m");
         let interp = &index.debug_primary(origin.0, origin.1)["interp"];
-        assert!(interp["number"] == 151 && about(&interp["dist_m"], metres * 6_371_000.0_f64.to_radians() / METRES_PER_DEGREE), "{metres} m: {interp}");
+        let off = metres * 6_371_000.0_f64.to_radians() / METRES_PER_DEGREE;
+        assert!(interp["number"] == expected && about(&interp["dist_m"], off), "{metres} m: {interp}");
     }
 }
 
