@@ -53,6 +53,12 @@ extern crate self as query_server;
 #[allow(dead_code)]
 #[path = "../examples/dump_logical.rs"]
 mod dump_logical;
+// The water layer's benchmark, as a module of the tests: its own tests run with them, and its
+// main is not run here.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../examples/water_bench.rs"]
+mod water_bench;
 
 // Byte-source abstraction.  Index files are memory-mapped; readers go
 // through `read_chunk(off, len)` and `read_at::<T>(idx)`.
