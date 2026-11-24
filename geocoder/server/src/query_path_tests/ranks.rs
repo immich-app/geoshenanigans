@@ -138,3 +138,33 @@ fn the_admin_nested_step_stops_at_rank_25_which_no_address_shows() {
     assert_eq!(address["neighbourhood"], "Upper Ward");
     assert_eq!(address["city"], "Town");
 }
+
+#[test]
+fn a_boundary_that_repeats_its_parent_leaves_its_level_to_a_larger_one_round_the_point() {
+    // is_same gives a boundary that repeats its parent rank_address 0 (placex_triggers.sql:915-932),
+    // and a boundary of rank 0 is no address area (:1273): every other boundary covering the
+    // point is a candidate (getNearFeatures), a larger one of the same level too, which names the
+    // city round the repeat.
+    let index = TestIndex::new()
+        .boundary("Greater Town", 8, 0, (-10_000.0, -10_000.0, 10_000.0, 10_000.0))
+        .boundary("Old Town", 8, BOUNDARY_REPEATS_PARENT, (-2000.0, -2000.0, 2000.0, 2000.0))
+        .load();
+    let address = address_at(&index, 0.0, 0.0);
+    assert_eq!(address["city"], "Greater Town");
+}
+
+#[test]
+fn a_boundary_that_repeats_its_parent_gates_and_promotes_no_place_node() {
+    // A boundary of rank 0 promotes no place node (placex_triggers.sql:994, rank_address between
+    // 1 and 25) and is no address area (:1273), so it is never the boundary the address walk's
+    // later candidates must lie in: the town node 3 km off, outside the repeat round the point
+    // but inside the county, is the town.
+    let index = TestIndex::new()
+        .boundary("Some County", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Old Town", 8, BOUNDARY_REPEATS_PARENT, (-2000.0, -2000.0, 2000.0, 2000.0))
+        .place("Newtown", 1, 3000.0, 0.0)
+        .load();
+    let address = address_at(&index, 0.0, 0.0);
+    assert_eq!(address["town"], "Newtown");
+    assert_eq!(address["county"], "Some County");
+}

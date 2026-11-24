@@ -2072,6 +2072,9 @@ impl Index {
             // boundary closed ways) can never name a country.
             if level == 2 && poly.country_code == 0 { return; }
             if poly.area <= 0.0 { return; }
+            // One that repeats its parent ranks 0 and is no address area (placex_triggers.sql
+            // :915-932, :1273), so the next larger boundary of its level is tried in its place.
+            if poly.place_type_override == BOUNDARY_REPEATS_PARENT && level != POSTCODE_AREA_LEVEL as usize { return; }
             boundaries.push((level as u64) << 56 | (poly.area.to_bits() as u64) << 24 | (place - 1));
         });
         // Each level's polygons from the smallest up: the first to hold the point is the level's
@@ -2132,8 +2135,6 @@ impl Index {
                 // :1158).
                 let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
                 if initial_rank == 0 { continue; }
-                // Nor is one that repeats its parent.
-                if poly.place_type_override == BOUNDARY_REPEATS_PARENT { continue; }
 
                 ranked.push(RankedPoly { poly, rank_address: initial_rank });
             }
@@ -2286,6 +2287,9 @@ impl Index {
             match poly.admin_level {
                 // ISO-less level-2 polygons are maritime lines, not countries.
                 2 if poly.country_code == 0 => {}
+                // One that repeats its parent ranks 0: it promotes no place node, gates none and
+                // is no boundary's parent (placex_triggers.sql:924, :994, :1273).
+                2..=10 if poly.place_type_override == BOUNDARY_REPEATS_PARENT => {}
                 2..=10 => boundaries.push((poly.area, id, poly)),
                 15 if poly.place_type_override != 0 => place_areas.push((poly.area, id, poly)),
                 _ => {}
