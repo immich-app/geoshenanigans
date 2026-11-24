@@ -147,23 +147,24 @@ TEST(the_water_tier_repairs_crossings_of_a_polygons_own_rings_and_none_between_p
     // The second lake's own hole: its shore gets the bow back.
     CHECK(water.counts.nesting_restored >= 1);
     CHECK_EQ(water.counts.rings_nest_introduced, size_t(0));
-    auto keeps = [&](const ArcTierState& state, PackedLocation p) {
+    // Whether a tier's state stores p, read through that tier.
+    auto keeps = [&](const ArcTierState& state, const ArcTier& tier, PackedLocation p) {
         for (uint32_t a = 0; a < arcs.arcs.size(); a++) {
             std::vector<StoredVertex> stored;
-            tier_vertices(arcs, store, water_simplified(), state, a, stored);
+            tier_vertices(arcs, store, tier, state, a, stored);
             for (const StoredVertex& v : stored)
                 if (v.at == p) return true;
         }
         return false;
     };
     // The vertices of the bow: one comes back where the repair counts it.
-    auto keeps_bow = [&](const ArcTierState& state, int32_t lat, int32_t shift) {
-        return keeps(state, pt(lat, 45000 + shift)) || keeps(state, pt(lat, 55000 + shift));
+    auto keeps_bow = [&](const ArcTierState& state, const ArcTier& tier, int32_t lat, int32_t shift) {
+        return keeps(state, tier, pt(lat, 45000 + shift)) || keeps(state, tier, pt(lat, 55000 + shift));
     };
-    CHECK(keeps_bow(admin, 3000, 0));
-    CHECK(!keeps_bow(water, 3000, 0));
-    CHECK(keeps_bow(water, -3000, at));
-    CHECK(keeps_bow(water, -3000, at3));
+    CHECK(keeps_bow(admin, kArcTiers[0], 3000, 0));
+    CHECK(!keeps_bow(water, water_simplified(), 3000, 0));
+    CHECK(keeps_bow(water, water_simplified(), -3000, at));
+    CHECK(keeps_bow(water, water_simplified(), -3000, at3));
 }
 
 TEST(the_water_stage_builds_and_encodes_its_two_tiers_with_no_minimal_set) {

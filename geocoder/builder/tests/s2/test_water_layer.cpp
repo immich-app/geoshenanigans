@@ -12,6 +12,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -474,6 +475,11 @@ TEST(each_piece_of_a_lake_of_many_islands_keeps_its_slot_once_a_pieces_corner_mo
     const std::string summary = write(day2, two, one);
     CHECK(summary.find("water/all: " + n + " polygons in " + n + " slots (" + n + " kept, " + std::to_string(moved) +
                        " by fallback, 0 recycled)") != std::string::npos);
+    // Each slot holds the fallback key it held the day before, every piece's
+    // its own: each piece is in its own slot.
+    for (const char* dir : {"/water/all/exact", "/water/major/simplified"})
+        CHECK(bytes_of(one + dir + "/admin_polygons.fallback.osm_ids") ==
+              bytes_of(two + dir + "/admin_polygons.fallback.osm_ids"));
 }
 
 TEST(a_lake_of_many_islands_the_grid_cant_cut_keeps_its_store_as_it_was) {
@@ -544,18 +550,18 @@ TEST(the_major_tier_takes_areas_of_100_km2_and_wikidata_rivers_of_5) {
     Bytes cells{files.at("water/major/simplified/admin_cells.bin")},
         entries{files.at("water/major/simplified/admin_entries.bin")};
     cell_pairs::Reader reader(cells, entries, cell_pairs::ADMIN);
-    size_t listed = 0, interior = 0;
+    size_t interior = 0;
+    std::set<std::string> listed;
     uint64_t cell;
     std::vector<uint32_t> ids;
     while (reader.next(cell, ids))
         for (uint32_t id : ids) {
             REQUIRE((id & ID_MASK) < by_slot.size());
             const std::string& name = by_slot[id & ID_MASK];
-            CHECK(name == "Big Lake" || name == "Wide River");
-            listed++;
+            listed.insert(name);
             interior += (id & INTERIOR_FLAG) && name == "Big Lake";
         }
-    CHECK(listed > 0);
+    CHECK(listed == std::set<std::string>({"Big Lake", "Wide River"}));
     CHECK(interior > 0);
 }
 
@@ -914,8 +920,13 @@ TEST(marine_areas_keep_their_slots_from_one_day_to_the_next) {
     CHECK(day2.identities[4] != day1.identities[4]);
     const std::string summary = write(day2, two, one);
     CHECK(summary.find("7 polygons in 7 slots (7 kept, 1 by fallback, 0 recycled)") != std::string::npos);
+    // Each slot holds the fallback key it held the day before, the moved
+    // polygon's among them (its own: the area's and its place), and the name
+    // it held.
     const auto a = tree(one), b = tree(two);
-    CHECK(a.at("water/all/exact/admin_polygons.bin") == b.at("water/all/exact/admin_polygons.bin"));
+    CHECK(a.at("water/all/exact/admin_polygons.fallback.osm_ids") ==
+          b.at("water/all/exact/admin_polygons.fallback.osm_ids"));
+    CHECK(slot_names(a, "water/all/exact") == slot_names(b, "water/all/exact"));
 }
 
 TEST(polygons_of_one_object_meeting_at_their_smallest_vertex_keep_slots_of_their_own) {
@@ -1165,6 +1176,18 @@ TEST(an_unnamed_river_area_of_a_wikidata_item_of_its_own_takes_a_lines_name_but_
     // It shows the line's name.
     for (size_t p = 0; p < layer.size(); p++)
         if (layer.identities[p] == way_identity(2402)) CHECK(name_of(layer, p) == "Beta");
+    // An unnamed area of about 1 km2 the Beta names along the north side of
+    // the unnamed Alpha area shares an arc with it, but no river: the Alpha
+    // is a river of 4 km2, the Beta of 4. Joined across the arc by the name
+    // the Alpha area shows, the four would be one of 8.
+    c.closed_ways.push_back({2404, tags(code::kRiver, "", true), square(kLat - 4000000 + small, kLng, small)});
+    add_line(2414, kLat - 4000000 + small, small);
+    const Layer beside = build(c);
+    const auto [held_beside, major_beside] = ways_held(beside, {2401, 2402, 2403, 2404});
+    CHECK(held_beside == std::set<int64_t>({2401, 2402, 2403, 2404}));
+    CHECK(major_beside.empty());
+    for (size_t p = 0; p < beside.size(); p++)
+        if (beside.identities[p] == way_identity(2402)) CHECK(name_of(beside, p) == "Beta");
 }
 
 TEST(a_lake_of_100_km2_far_from_its_boxs_middle_latitude_is_in_the_major_tier) {
@@ -1489,13 +1512,18 @@ namespace {
 // keeping the old dirs until every day is in: a swap that fails puts back
 // each day it swapped (or removes it, for a day that had no dir) and
 // rethrows, so the dir holds the old days or the new ones, never some of
-// each.
+// each. A day's old dir already there, which a swap that stopped part way
+// leaves as the only copy of that day, stops it before it swaps any.
 void swap_in_staged(const std::string& dir, const std::vector<std::string>& days) {
+    for (const std::string& day : days) {
+        const std::string old = dir + "/" + day + ".old";
+        if (fs::exists(old))
+            throw std::runtime_error(old + " is left from a swap that stopped part way: put it back or remove it");
+    }
     std::vector<std::string> swapped;
     try {
         for (const std::string& day : days) {
             const std::string day_dir = dir + "/" + day, old = day_dir + ".old";
-            fs::remove_all(old);
             if (fs::exists(day_dir)) fs::rename(day_dir, old);
             swapped.push_back(day);
             fs::rename(day_dir + ".staged", day_dir);
@@ -1546,6 +1574,26 @@ TEST(a_fixture_swap_that_fails_part_way_puts_back_the_days_it_swapped) {
     CHECK(tree(dir) == (std::map<std::string, std::vector<char>>{{"day1/a", {'n', 'e', 'w', ' ', '1'}},
                                                                  {"day2/a", {'n', 'e', 'w', ' ', '2'}},
                                                                  {"day3/a", {'n', 'e', 'w', ' ', '3'}}}));
+}
+
+TEST(a_fixture_swap_that_finds_an_old_dir_a_stopped_one_left_swaps_nothing_and_keeps_it) {
+    // A swap stopped after it moved day 1 aside: day1.old is the only copy
+    // of day 1, beside its staged dir; day 2 has a staged dir too.
+    const ScratchDir root("water-fixture-swap-left");
+    const std::string dir = root.path();
+    write_file(dir + "/day1.old/a", "old 1");
+    write_file(dir + "/day1.staged/a", "new 1");
+    write_file(dir + "/day2.staged/a", "new 2");
+    std::string said;
+    try {
+        swap_in_staged(dir, {"day1", "day2"});
+    } catch (const std::runtime_error& e) {
+        said = e.what();
+    }
+    CHECK(said.find(dir + "/day1.old") != std::string::npos);
+    CHECK(tree(dir) == (std::map<std::string, std::vector<char>>{{"day1.old/a", {'o', 'l', 'd', ' ', '1'}},
+                                                                 {"day1.staged/a", {'n', 'e', 'w', ' ', '1'}},
+                                                                 {"day2.staged/a", {'n', 'e', 'w', ' ', '2'}}}));
 }
 
 // geocoder/testdata/water_dir: the client files of a water dir on three

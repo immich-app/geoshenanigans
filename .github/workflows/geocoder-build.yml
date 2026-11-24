@@ -611,7 +611,10 @@ jobs:
             exit 1
           fi
           echo "[marine] Downloading marine areas $MARINE_VERSION..."
-          if ! curl -sL --fail --connect-timeout 30 --max-time 900 --retry 3 --retry-delay 10 \
+          # curl retries a timed-out attempt too: --retry-max-time starts no
+          # retry after 30 minutes, so a stalled bucket fails the step before
+          # its timeout cancels it, which the watchdog doesn't retry.
+          if ! curl -sL --fail --connect-timeout 30 --max-time 900 --retry 3 --retry-delay 10 --retry-max-time 1800 \
               -o "$WORKDIR/marine_areas.bin.zst" "$S3_PUBLIC_URL/geocoder/$MARINE_PATH"; then
             echo "::error::[marine] $S3_PUBLIC_URL/geocoder/$MARINE_PATH did not download — publish it (Update Marine Areas) or pin another"
             rm -f "$WORKDIR/marine_areas.bin.zst"

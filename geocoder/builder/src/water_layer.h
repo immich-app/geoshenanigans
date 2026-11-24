@@ -238,11 +238,11 @@ struct Build {
 // collected areas and geometries; moves the lines (keyed, key_lines) into
 // the build's NamingLines, keys and names sorted. The names follow the
 // dataset's (name:en, else name): a relation with a name:en of its own
-// shows that; the lines of a waterway relation of a local name alone show
-// the name:en its river ways carry (LineIn::way_en) over the most length
-// (the smaller of a tie) where the ways of one hold more than half of its
-// river ways' length, else the relation's name. Lengths are in whole
-// millimetres, none across a node the input lacks.
+// shows that; for a waterway relation with only a local name, the lines
+// show the name:en its river ways carry (LineIn::way_en) over the most
+// length (the smaller of a tie) if all its ways with a name:en together
+// cover more than half its river ways' length, else the relation's name.
+// Lengths are in whole millimetres, none across a node the input lacks.
 Build assemble(Collected& c, unsigned threads);
 
 // Leaves out each OSM natural=bay or strait that is a marine area's
@@ -263,9 +263,10 @@ size_t drop_marine_namesakes(Build& b);
 // sums each object's area. Each object takes its choice's key and wikidata
 // item, by which the major tier joins it to its river, only where they are
 // its own: the choice's item its own item where it has one, else (one of a
-// name of its own) the key's local name its local name; an unnamed one of
-// an item of its own takes the choice's name alone otherwise. Returns how
-// many objects it named.
+// name of its own) the key's local name its local name. An unnamed one
+// takes the choice's name, and its local name with the key alone: one of an
+// item of its own takes the name alone otherwise, and no local name to join
+// a river by. Returns how many objects it named.
 size_t apply_names(Build& b, const std::vector<NameChoice>& choices);
 
 // Cuts each polygon of more than kSplitMaxHoles holes into pieces along the
@@ -299,7 +300,8 @@ PolygonIdentities polygon_identities(const Build& b);
 // other object by its own area, and each river object by its river's, the
 // river objects grouped by their waterway relation (a naming key of one), by
 // wikidata item (theirs, or that of a line of their key in them) and by
-// local name along river polygons that share an arc. An object or river
+// local name (none of an object without one) along river polygons that
+// share an arc. An object or river
 // whose polygon the previous planet build's major tier held keeps it at
 // kMajorKeepPercent: the polygon (its `identities`) matched to a slot of the
 // sidecars under water/major/simplified/ of prev_planet_dir as that dir's

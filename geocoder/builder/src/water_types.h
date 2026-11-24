@@ -275,7 +275,7 @@ inline std::optional<std::vector<MetaType>> parse_meta_json(const std::string& t
         skip_space();
         size_t start = at;
         while (at < text.size() && text[at] >= '0' && text[at] <= '9') at++;
-        if (at == start || at - start > 6) return false;
+        if (at == start || at - start > 6 || (at - start > 1 && text[start] == '0')) return false;
         v = std::stol(text.substr(start, at - start));
         return true;
     };

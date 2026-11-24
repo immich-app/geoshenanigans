@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -26,7 +27,7 @@ out=""; url=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out=$2; shift 2 ;;
-    --connect-timeout|--max-time|--retry|--retry-delay) shift 2 ;;
+    --connect-timeout|--max-time|--retry|--retry-delay|--retry-max-time) shift 2 ;;
     -*) shift ;;
     *) url=$1; shift ;;
   esac
@@ -269,6 +270,26 @@ class NightlyTest(unittest.TestCase):
         self.assertIn("::error::[marine]", run.stdout)
         self.assertEqual(output, "")
 
+    # A bucket that stalls costs curl its --max-time an attempt, and curl retries a timeout: the fetch with its
+    # retries must end while the step has time left, as a step past its timeout is cancelled, and the watchdog
+    # retries no cancelled step. curl starts no retry once --retry-max-time (0: none) has passed, so its last
+    # attempt starts by then and a delay, and runs at most its --max-time; without it every retry may.
+    def test_the_fetch_with_its_retries_ends_before_the_step_times_out(self):
+        block = marine_block()
+        self.assertIsNotNone(block)
+        call = re.search(r"^if ! curl ((?:.*\\\n)*.*)", block, re.M)
+        args = shlex.split(call.group(1).replace("\\\n", " "))
+        limits = {a: int(v) for a, v in zip(args, args[1:])
+                  if a in ("--max-time", "--retry", "--retry-delay", "--retry-max-time")}
+        attempt, retries, delay = limits["--max-time"], limits.get("--retry", 0), limits.get("--retry-delay", 0)
+        longest = (retries + 1) * attempt + retries * delay
+        if retries and limits.get("--retry-max-time"):
+            longest = min(longest, limits["--retry-max-time"] + delay + attempt)
+        download = script(read(NIGHTLY), "Download PBF and previous indexes")
+        step_seconds = int(re.search(r"^STEP_SECONDS=(\d+)$", download, re.M).group(1))
+        # The 2 minutes the step leaves after the day's diff, for the waits and the decompression after it.
+        self.assertLessEqual(longest, step_seconds - 120, limits)
+
     def test_no_pin_builds_without_marine_areas(self):
         self.pin(None)
         run, output = self.run_block()
@@ -436,6 +457,27 @@ class MarineWorkflowTest(unittest.TestCase):
         self.assertRegex(block.group(1), r"(?m)^  group: \S+$")
         self.assertRegex(block.group(1), r"(?m)^  cancel-in-progress: false$")
 
+    # Only the two steps that list and upload to the bucket hold its write key, in their own env: the fetch
+    # and the build, which parse the sources from outside, run without it, and no step puts it in $GITHUB_ENV,
+    # which every later step reads.
+    def test_only_the_steps_that_use_the_bucket_hold_its_write_key(self):
+        import yaml
+        workflow = yaml.safe_load(read(MARINE_WORKFLOW))
+        job = workflow["jobs"]["marine"]
+        # Nor does the workflow's env or the job's give it to every step.
+        self.assertNotIn("secrets.", json.dumps({k: v for k, v in workflow.items() if k != "jobs"}, default=str))
+        self.assertNotIn("secrets.", json.dumps({k: v for k, v in job.items() if k != "steps"}))
+        steps = job["steps"]
+        keys = {"AWS_ACCESS_KEY_ID": "${{ secrets.TIGRIS_WRITE_KEY_ID }}",
+                "AWS_SECRET_ACCESS_KEY": "${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}"}
+        for s in steps:
+            with self.subTest(step=s.get("name") or s.get("uses")):
+                self.assertNotRegex(s.get("run", ""), r"AWS_\w+=.*GITHUB_ENV")
+                if s.get("name") in ("Version", "Upload to Tigris"):
+                    self.assertEqual({k: v for k, v in s.get("env", {}).items() if k in keys}, keys)
+                else:
+                    self.assertNotIn("secrets.", json.dumps(s))
+
     def run_version(self, listed="", error=""):
         with tempfile.TemporaryDirectory() as t:
             bin_dir = os.path.join(t, "bin")
@@ -496,8 +538,10 @@ class MarineWorkflowTest(unittest.TestCase):
         run = self.run_tests_step("OK (skipped=3)")
         self.assertNotEqual(run.returncode, 0)
         self.assertIn("::error::", run.stdout)
-        run = self.run_tests_step("FAILED (failures=1)", status=1)
-        self.assertNotEqual(run.returncode, 0)
+        # Tests that fail end the step with their status, whatever they wrote.
+        for said in ("FAILED (failures=1)", ""):
+            run = self.run_tests_step(said, status=3)
+            self.assertEqual(run.returncode, 3, run.stdout + run.stderr)
 
     def run_fetch(self, layer):
         """The Fetch step with the WFS serving `layer`, a GeoJSON document: the run."""

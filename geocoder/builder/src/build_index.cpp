@@ -1442,10 +1442,12 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                 water::write_water_exact(d.water, base_dir);
         };
 
+        // A continent's arc slots load the all set's sidecar of a previous
+        // build that wrote the water dirs whether this one does or not.
         const StageCosts costs =
             stage_costs(record_bytes(d), d.water.cells.size(), multi_output ? water::previous_slots(region_prev) : 0,
-                        multi_output ? water_arc_slots_past(water::previous_arc_slots(region_prev), water::arc_counts(d.water))
-                                     : 0);
+                        water_arc_slots_past(water::previous_arc_slots(region_prev), water::arc_counts(d.water),
+                                             multi_output));
         struct Stage {
             const char* name;
             std::function<void()> write;
@@ -1530,13 +1532,15 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
     // continent subsets build alongside.
     // The water stage keeps every slot of the previous build's water dirs,
     // and its slot allocations load the arc slots, those past today's arcs
-    // among them.
+    // among them: the all set's whether this build writes the water dirs or
+    // not (a continent's arc slots load them), the major tier's only where
+    // it does.
     auto water_slots_before = [&](const std::string& region) -> uint64_t {
         return multi_output && !prev_output_dir.empty() ? water::previous_slots(prev_output_dir + "/" + region) : 0;
     };
     auto water_arc_slots_before = [&](const std::string& region, const water::ArcCounts& today) -> uint64_t {
-        return multi_output && !prev_output_dir.empty()
-                   ? water_arc_slots_past(water::previous_arc_slots(prev_output_dir + "/" + region), today)
+        return !prev_output_dir.empty()
+                   ? water_arc_slots_past(water::previous_arc_slots(prev_output_dir + "/" + region), today, multi_output)
                    : 0;
     };
     const uint64_t planet_water_slots = water_slots_before("planet");
@@ -1698,6 +1702,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             std::thread::hardware_concurrency() / 8));
         const KindValues planet_bytes = record_bytes(data);
         const KindValues planet_counts = record_counts(data);
+        // The water split marks every planet water polygon and arc.
+        const uint64_t planet_water_polygons = data.water.size(),
+                       planet_water_arcs = data.water.arcs.set(ArcSet::Full).arcs();
         struct ContinentRun {
             size_t continent;
             RegionCost cost;
@@ -1707,7 +1714,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             const KindValues bytes = continent_share(planet_bytes, planet_pairs, continent_pairs[c],
                                                      c < water_shares.size() ? water_shares[c] : 0);
             const KindValues counts = continent_share(planet_counts, planet_pairs, continent_pairs[c]);
-            const uint64_t filter_bytes = filter_cost(planet_counts, continent_pairs[c]);
+            const uint64_t filter_bytes =
+                filter_cost(planet_counts, continent_pairs[c], planet_water_polygons, planet_water_arcs);
             // Its write runs without a budget (run_continent), so its
             // reservation holds every stage, the boundary tiers and both
             // admin-minimal dirs included.
@@ -2188,6 +2196,19 @@ static int run(int argc, char* argv[]) {
                       << " inputs" << std::endl;
             log_phase("Water relations of every input", _wt, _wc);
         }
+        // Way ids the relation member bitsets below reach.
+        static constexpr size_t MAX_WAY_ID = 2000000000ULL; // 2B, ~250 MiB
+        // The water layer's relation member ways: the areas' (the
+        // waterways' are in water_collected.waterway_of_way), marked once
+        // for every input's way passes, in the first input's: of several
+        // inputs, every one's relations are read before it. In pages, which
+        // only the member ways' ids allocate: an extract without water
+        // relations holds none.
+        PagedBits water_way_bits(MAX_WAY_ID);
+        // The member ways of ids the bits don't reach.
+        std::unordered_set<int64_t> water_ways_past;
+        size_t water_way_count = 0;
+        bool water_ways_marked = false;
         for (const auto& input_file : input_files) {
             std::cerr << "Processing " << input_file << "..." << std::endl;
 
@@ -2524,7 +2545,6 @@ static int run(int argc, char* argv[]) {
 
             // Build admin_way_ids as a bitset for O(1) lookup
             // Max way ID ~1.3B → ~162 MiB bitset (much faster than unordered_set)
-            static constexpr size_t MAX_WAY_ID = 2000000000ULL; // 2B, ~250 MiB
             std::vector<uint8_t> admin_way_bits(MAX_WAY_ID / 8 + 1, 0);
             size_t admin_way_count = 0;
             for (const auto& rel : data.collected_relations) {
@@ -2558,24 +2578,20 @@ static int run(int argc, char* argv[]) {
             };
             std::cerr << "  POI assembly needs " << poi_way_count << " way geometries." << std::endl;
 
-            // The water layer's relation member ways: the areas' (the
-            // waterways' are in water_collected.waterway_of_way).
+            // The water layer's relations, indexed, and their member ways
+            // marked, once.
             water::index_collected(water_collected);
-            // In pages, which only the member ways' ids allocate: an extract
-            // without water relations holds none.
-            PagedBits water_way_bits(MAX_WAY_ID);
-            // The member ways of ids the bits don't reach.
-            std::unordered_set<int64_t> water_ways_past;
-            size_t water_way_count = 0;
-            auto mark_water_way = [&](int64_t way_id) {
-                if (way_id > 0 && static_cast<size_t>(way_id) < MAX_WAY_ID)
-                    water_way_bits.set(static_cast<uint64_t>(way_id));
-                else
-                    water_ways_past.insert(way_id);
-                water_way_count++;
-            };
-            for (const auto& rel : water_collected.relations)
-                for (const auto& [way_id, role] : rel.members) mark_water_way(way_id);
+            if (!water_ways_marked) {
+                for (const auto& rel : water_collected.relations)
+                    for (const auto& [way_id, role] : rel.members) {
+                        if (way_id > 0 && static_cast<size_t>(way_id) < MAX_WAY_ID)
+                            water_way_bits.set(static_cast<uint64_t>(way_id));
+                        else
+                            water_ways_past.insert(way_id);
+                        water_way_count++;
+                    }
+                water_ways_marked = true;
+            }
             auto is_water_way = [&](int64_t id) -> bool {
                 if (id <= 0 || static_cast<size_t>(id) >= MAX_WAY_ID) return water_ways_past.count(id) > 0;
                 return water_way_bits.test(static_cast<uint64_t>(id));
@@ -4330,6 +4346,9 @@ static int run(int argc, char* argv[]) {
                 }
             }
         }
+        // The water member ways' marks, read by every input's way passes.
+        water_way_bits = PagedBits(0);
+        std::unordered_set<int64_t>().swap(water_ways_past);
 
         // The way geometries ring assembly read, a hash node per way, take
         // one core a second to free. Then the parse threads' freed buffers

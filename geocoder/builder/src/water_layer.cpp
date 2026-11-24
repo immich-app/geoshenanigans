@@ -430,9 +430,9 @@ Build assemble(Collected& c, unsigned threads) {
     // The candidate lines, by way (the first input's copy), their keys and
     // names as sorted indices.
     first_of_each_id(c.lines, [](const LineIn& l) { return l.way; });
-    // A waterway relation of a local name alone shows the name:en its river
-    // ways carry over the most length, the smaller of a tie, where the ways
-    // of one hold more than half of its river ways' length.
+    // A waterway relation with only a local name shows the name:en its river
+    // ways carry over the most length, the smaller of a tie, if all its ways
+    // with a name:en together cover more than half its river ways' length.
     {
         struct Lengths {
             std::map<std::string, uint64_t> en;  // name:en -> millimetres
@@ -816,7 +816,8 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
             // An area takes its line's river only where that is its own: of
             // its wikidata item where it has one, else of its local name;
             // any, of neither. One of no name takes the line's name all the
-            // same.
+            // same, and the line's local name, by which the major tier
+            // joins river areas along a shared arc, only with its river.
             const NameChoice& c = choices[o];
             const bool own = obj.tags.qid ? c.qid == obj.tags.qid
                                           : obj.tags.name.empty() || b.lines.key_local[c.key] == obj.tags.local_name;
@@ -826,7 +827,7 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
             }
             if (obj.tags.name.empty()) {
                 obj.tags.name = b.lines.displays[choices[o].display];
-                obj.tags.local_name = b.lines.key_local[choices[o].key];
+                if (own) obj.tags.local_name = b.lines.key_local[choices[o].key];
                 named++;
             }
         }
@@ -1143,7 +1144,8 @@ std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const
         std::sort(arc_objects.begin(), arc_objects.end());
         arc_objects.erase(std::unique(arc_objects.begin(), arc_objects.end()), arc_objects.end());
         // On each arc, each object joins the one before it of its local
-        // name: the groups all pairs of one name would make.
+        // name: the groups all pairs of one name would make. One of no
+        // local name (an area another river's line named) joins none.
         auto local_of = [&](const std::pair<uint32_t, uint32_t>& e) -> const std::string& {
             return b.objects[e.second].tags.local_name;
         };
@@ -1157,7 +1159,7 @@ std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const
                               return by_name != 0 ? by_name < 0 : x.second < y.second;
                           });
             for (size_t a = i + 1; a < end; a++)
-                if (local_of(arc_objects[a]) == local_of(arc_objects[a - 1]))
+                if (!local_of(arc_objects[a]).empty() && local_of(arc_objects[a]) == local_of(arc_objects[a - 1]))
                     groups.join(arc_objects[a - 1].second, arc_objects[a].second);
             i = end;
         }

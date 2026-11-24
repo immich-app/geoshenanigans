@@ -51,8 +51,8 @@ struct SplitPolygon {
     std::vector<SplitRing> holes;
     uint64_t key = 0;  // the piece's cuts, hashed: 0 for a polygon never cut
     // The piece's cuts alone, hashed: each one's line, the side and the
-    // piece's place among the side's lobes (by their corners), none of the
-    // shore's vertices; 0 for a polygon never cut.
+    // piece's place among the side's lobes along the line, none of the
+    // shore's vertices away from it; 0 for a polygon never cut.
     uint64_t path = 0;
 };
 
@@ -271,8 +271,9 @@ inline uint64_t lobe_key(uint64_t side_key, const Corner& corner) {
 }
 
 // A lobe's path: its side's (mix_key of the piece's path) with its place
-// among the side's lobes mixed in, so that an edit at its corner that
-// leaves the cuts as they were leaves it as it was.
+// among the side's lobes along the line mixed in, so that an edit of the
+// shore away from the line that leaves the cuts as they were, at its corner
+// or another lobe's, leaves it as it was.
 inline uint64_t lobe_path(uint64_t side_path, size_t rank) {
     return mix64(side_path ^ mix64(uint64_t(rank) + 0x50415448ull));
 }
@@ -552,6 +553,20 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
             std::vector<size_t> order(polygons.size());
             for (size_t o = 0; o < order.size(); o++) order[o] = o;
             std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return corners[x] < corners[y]; });
+            // A piece's path takes its place along the line instead: by the
+            // least point where its outer ring meets the line (by latitude
+            // along a meridian, by longitude along a parallel), a lobe that
+            // doesn't meet it after those that do, then by corner. An edit of
+            // the shore away from the line, which can move a lobe's corner
+            // past another's, moves none of those points.
+            std::vector<int64_t> along(polygons.size(), INT64_MAX);
+            for (size_t o = 0; o < polygons.size(); o++)
+                for (const PackedLocation& p : polygons[o].outer)
+                    if ((meridian ? p.lon_e7 : p.lat_e7) == line)
+                        along[o] = std::min<int64_t>(along[o], meridian ? p.lat_e7 : p.lon_e7);
+            std::vector<size_t> by_line = order, place(polygons.size());
+            std::stable_sort(by_line.begin(), by_line.end(), [&](size_t x, size_t y) { return along[x] < along[y]; });
+            for (size_t k = 0; k < by_line.size(); k++) place[by_line[k]] = k;
             const uint64_t side_key = mix_key(piece.key, static_cast<uint64_t>(line), meridian, s);
             const uint64_t side_path = mix_key(piece.path, static_cast<uint64_t>(line), meridian, s);
             uint64_t twin = 0;
@@ -570,7 +585,7 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
                 for (size_t h = 0; h < polygons[o].holes.size(); h++)
                     out.holes.push_back(back(polygons[o].holes[h], polygon_ways[o].holes[h]));
                 out.key = lobe_key(side_key, corners[o]) + twin;
-                out.path = lobe_path(side_path, rank);
+                out.path = lobe_path(side_path, place[o]);
                 todo.push_back(std::move(out));
             }
         }

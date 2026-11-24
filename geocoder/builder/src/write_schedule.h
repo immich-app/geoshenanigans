@@ -109,8 +109,9 @@ constexpr uint64_t kStrategy2BytesPerRecord = 56;
 // marks, and its RankedBits blocks of 16 B per 64 records); beside it, the
 // workers' copies of a share of the subset's cell pairs. The water split
 // reads the planet's water masks (a byte a water cell entry, held with the
-// other kinds' masks while the continents run), and marks no entry or cell
-// of its own.
+// other kinds' masks while the continents run), and marks each of the
+// planet's water polygons, and beside those each of its arcs, as the
+// records are marked: 3 bits each, with no id map.
 constexpr uint64_t kFilterMapBytesPerRecord = 4;
 constexpr uint64_t kFilterMarkBitsPerRecord = 3;
 constexpr uint64_t kFilterPairCopyDivisor = 2;
@@ -151,6 +152,17 @@ constexpr uint64_t kWaterStageCellTimes = 3;
 // gone since) leaves the rest to these.
 constexpr uint64_t kWaterSlotBytes = sizeof(AdminPolygon) + sizeof(uint32_t) + sizeof(AdminPolygonRecord);
 
+// What a water set's polygon slot allocation (polygon_slots) holds for each
+// slot of the previous build's sidecar it loads, tombstones among them,
+// before the arrays above exist: the slot as loaded, its key among the
+// previous keys and the sort's copy of them, a fallback pass's key of it
+// and the sort's copy, its fallback key, and its marks.
+constexpr uint64_t kWaterSlotAllocationBytes =
+    sizeof(gc::id_alloc::SidecarSlot) + 4 * sizeof(gc::id_alloc::KeyIdx) + sizeof(uint64_t) + 2;
+
+// Each slot of the previous build's water dirs: the more of the two.
+constexpr uint64_t kWaterPreviousSlotBytes = std::max(kWaterSlotBytes, kWaterSlotAllocationBytes);
+
 // What a water set's arc slot allocation (allocate_arc_slots) holds for
 // each slot of the previous build's sidecar it loads, tombstones among
 // them: the slot as loaded and the key it can be claimed by, its key among
@@ -165,11 +177,13 @@ constexpr uint64_t kWaterArcSlotBytes = sizeof(gc::id_alloc::SidecarSlot) + size
 
 // The previous build's arc slots of a region's water dirs past its arcs
 // today (water::previous_arc_slots, water::arc_counts): the larger of the
-// all set's and the major tier's, whose allocations run one after the other
-// (none past where today's are as many or more).
-inline uint64_t water_arc_slots_past(const water::ArcCounts& previous, const water::ArcCounts& today) {
+// all set's and, `with_major` (a build that writes the major tier), the
+// major tier's, whose allocations run one after the other (none past where
+// today's are as many or more).
+inline uint64_t water_arc_slots_past(const water::ArcCounts& previous, const water::ArcCounts& today,
+                                     bool with_major = true) {
     auto past = [](uint64_t slots, uint64_t arcs) { return slots > arcs ? slots - arcs : 0; };
-    return std::max(past(previous.all, today.all), past(previous.major, today.major));
+    return std::max(past(previous.all, today.all), with_major ? past(previous.major, today.major) : 0);
 }
 
 // What write_place_files holds beside the nodes it is given, as a multiple
@@ -235,10 +249,14 @@ inline uint64_t ordering_cost(const ParsedData& d) {
     return copies + (sum(counts) - at(counts, RecordKind::Admins)) * kReorderBytesPerRecord;
 }
 
-// What the continent split holds beyond the subset it builds.
-inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& continent_pairs) {
+// What the continent split holds beyond the subset it builds, of a planet
+// of `water_polygons` water polygons over `water_arcs` arcs, which
+// record_counts leaves out.
+inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& continent_pairs,
+                            uint64_t water_polygons = 0, uint64_t water_arcs = 0) {
     const uint64_t records = sum(planet_counts);
-    return records * kFilterMapBytesPerRecord + records * kFilterMarkBitsPerRecord / 8
+    return records * kFilterMapBytesPerRecord
+         + (records + water_polygons + water_arcs) * kFilterMarkBitsPerRecord / 8
          + sum(continent_pairs) * sizeof(CellItemPair) / kFilterPairCopyDivisor;
 }
 
@@ -257,8 +275,9 @@ struct StageCosts {
 // all of them, through the same writer. `water_pairs` are the water cell
 // index's entries, among the waters' bytes; `water_slots` the previous
 // build's slots of the water dirs (water::previous_slots), each of which
-// the write keeps; `water_arc_slots` the previous build's arc slots past
-// today's arcs (water_arc_slots_past), which the slot allocations load.
+// the slot allocation loads and the write keeps; `water_arc_slots` the
+// previous build's arc slots past today's arcs (water_arc_slots_past),
+// which the slot allocations load.
 inline StageCosts stage_costs(const KindValues& bytes, uint64_t water_pairs = 0, uint64_t water_slots = 0,
                               uint64_t water_arc_slots = 0) {
     StageCosts c;
@@ -271,7 +290,7 @@ inline StageCosts stage_costs(const KindValues& bytes, uint64_t water_pairs = 0,
     const uint64_t waters = at(bytes, RecordKind::Waters);
     const uint64_t cells = std::min<uint64_t>(waters, water_pairs * sizeof(CellItemPair));
     c.water = (waters - cells) * kWaterStageWaterTenths / 10 + cells * kWaterStageCellTimes +
-              water_slots * kWaterSlotBytes + water_arc_slots * kWaterArcSlotBytes;
+              water_slots * kWaterPreviousSlotBytes + water_arc_slots * kWaterArcSlotBytes;
     return c;
 }
 

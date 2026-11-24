@@ -10,9 +10,10 @@ on:
       - "geocoder/test-portal/**"
       - ".github/workflows/geocoder-tests.yml"
       # The tool tests read the nightly's package list, and run the nightly's
-      # steps and its watchdog's scripts.
+      # steps, its watchdog's scripts and the marine areas' workflow's steps.
       - ".github/workflows/geocoder-build.yml"
       - ".github/workflows/geocoder-build-watchdog.yml"
+      - ".github/workflows/geocoder-marine.yml"
 
 permissions:
   contents: read

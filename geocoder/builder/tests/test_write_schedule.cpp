@@ -82,20 +82,53 @@ TEST(the_water_stage_holds_three_times_its_cells_beside_its_share_of_the_rest) {
 TEST(the_water_stage_holds_its_slot_arrays_for_every_slot_the_previous_build_left_tombstones_among_them) {
     // A layer of 1 GiB over a previous build of 3 Mi slots: the write's
     // records at their slots, each slot's polygon and the records it
-    // writes, 40 B a slot, past the share of the layer today's polygons
-    // take.
+    // writes, 40 B a slot, or the slot allocation's working set of it where
+    // that is more, past the share of the layer today's polygons take.
     KindValues bytes = kinds(0, 0, 0, 0, 0, 0);
     at(bytes, RecordKind::Waters) = kGiB;
     const uint64_t pairs = kGiB / 4 / sizeof(CellItemPair), slots = uint64_t(3) << 20;
     CHECK(kWaterSlotBytes >= sizeof(AdminPolygon) + sizeof(uint32_t) + sizeof(AdminPolygonRecord));
-    CHECK_EQ(stage_costs(bytes, pairs, slots).water, stage_costs(bytes, pairs).water + slots * kWaterSlotBytes);
+    CHECK_EQ(kWaterPreviousSlotBytes, std::max(kWaterSlotBytes, kWaterSlotAllocationBytes));
+    CHECK_EQ(stage_costs(bytes, pairs, slots).water, stage_costs(bytes, pairs).water + slots * kWaterPreviousSlotBytes);
     // The reservations carry it.
     const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
     CHECK_EQ(region_peak(bytes, counts, 0, RunOrder::Serial, pairs, slots),
-             region_peak(bytes, counts, 0, RunOrder::Serial, pairs) + slots * kWaterSlotBytes);
+             region_peak(bytes, counts, 0, RunOrder::Serial, pairs) + slots * kWaterPreviousSlotBytes);
     const RegionCost at_once = continent_cost(bytes, counts, 0, UINT64_MAX, pairs, slots);
     CHECK(at_once.order == RunOrder::Concurrent);
-    CHECK_EQ(at_once.bytes, region_peak(bytes, counts, 0, RunOrder::Concurrent, pairs) + slots * kWaterSlotBytes);
+    CHECK_EQ(at_once.bytes,
+             region_peak(bytes, counts, 0, RunOrder::Concurrent, pairs) + slots * kWaterPreviousSlotBytes);
+}
+
+TEST(the_water_stage_holds_the_polygon_slot_allocation_of_each_slot_the_previous_build_left_past_a_small_layer) {
+    // A layer of 1 MiB over a previous build of 3 Mi slots, few polygons of
+    // it left today: the polygon slot allocation holds, for each slot, the
+    // slot as loaded, its key among the previous keys, a fallback pass's key
+    // of it and the sort's copy of them, its fallback key and its marks,
+    // more than the write's arrays of it, which come once it is done.
+    KindValues bytes = kinds(0, 0, 0, 0, 0, 0);
+    at(bytes, RecordKind::Waters) = uint64_t(1) << 20;
+    const uint64_t slots = uint64_t(3) << 20;
+    const uint64_t allocation =
+        sizeof(gc::id_alloc::SidecarSlot) + 3 * sizeof(gc::id_alloc::KeyIdx) + sizeof(uint64_t) + 2;
+    CHECK(allocation > sizeof(AdminPolygon) + sizeof(uint32_t) + sizeof(AdminPolygonRecord));
+    CHECK(stage_costs(bytes, 0, slots).water >= stage_costs(bytes).water + slots * allocation);
+    // The reservations carry it beside the other stages.
+    const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
+    CHECK(region_peak(bytes, counts, 0, RunOrder::Concurrent, 0, slots) >=
+          region_peak(bytes, counts, 0, RunOrder::Concurrent) + slots * allocation);
+}
+
+TEST(a_build_without_multi_output_holds_the_previous_arc_slots_of_the_all_set_past_todays_and_none_of_the_major_tiers) {
+    // Its continents' arc slots load the all set's sidecar of a previous
+    // build that wrote the water dirs; it writes no major tier, so loads
+    // none of that tier's.
+    using water::ArcCounts;
+    const uint64_t Mi = uint64_t(1) << 20;
+    CHECK_EQ(water_arc_slots_past(ArcCounts{5 * Mi, 3 * Mi}, ArcCounts{Mi, Mi / 10}, false), 4 * Mi);
+    CHECK_EQ(water_arc_slots_past(ArcCounts{Mi, 3 * Mi}, ArcCounts{Mi, Mi / 10}, false), uint64_t(0));
+    CHECK_EQ(water_arc_slots_past(ArcCounts{Mi, 3 * Mi}, ArcCounts{Mi, Mi / 10}, true), 3 * Mi - Mi / 10);
+    CHECK_EQ(water_arc_slots_past(ArcCounts{Mi, Mi / 10}, ArcCounts{Mi + 5, Mi / 10}, false), uint64_t(0));
 }
 
 TEST(the_water_stage_holds_the_slot_allocation_of_each_previous_arc_slot_past_todays_arcs) {
@@ -129,6 +162,12 @@ TEST(the_water_stage_holds_the_slot_allocation_of_each_previous_arc_slot_past_to
     CHECK(at_once.order == RunOrder::Concurrent);
     CHECK_EQ(at_once.bytes,
              region_peak(bytes, counts, 0, RunOrder::Concurrent, pairs, slots) + past * kWaterArcSlotBytes);
+    // A byte short of that, the steps run one after another, and the water
+    // stage still holds the slots past today's arcs.
+    const RegionCost one_by_one = continent_cost(bytes, counts, 0, at_once.bytes - 1, pairs, slots, past);
+    CHECK(one_by_one.order == RunOrder::Serial);
+    CHECK_EQ(one_by_one.bytes,
+             region_peak(bytes, counts, 0, RunOrder::Serial, pairs, slots) + past * kWaterArcSlotBytes);
 }
 
 TEST(pair_counts_takes_the_water_cell_index_entries_for_the_waters_pairs) {
@@ -185,11 +224,12 @@ TEST(filter_cost_holds_the_planet_maps_and_half_the_subset_pairs) {
     CHECK_EQ(filter_cost(planet_counts, pairs), uint64_t(240 * 4 + 240 * 3 / 8 + 10 * 16 / 2));
 }
 
-TEST(filter_cost_holds_the_continents_water_pairs_among_the_pairs_the_workers_copy_and_no_marks_of_its_own) {
+TEST(filter_cost_holds_the_continents_water_pairs_among_the_pairs_the_workers_copy_and_marks_of_the_planets_water) {
     // The water split reads the planet's water masks, which the build holds
-    // with the other kinds' while the continents run: of the planet's water
-    // records and cells, nothing of its own. The planet's counts as the build
-    // takes them, of a planet of 40 water records.
+    // with the other kinds' while the continents run, and marks each of the
+    // planet's water polygons and arcs, ranked, as the other kinds' records
+    // are marked: 3 bits each, and no id map. The planet's counts as the
+    // build takes them, of a planet of 40 water records over 60 arcs.
     ParsedData d;
     d.ways.resize(80);
     d.addr_points.resize(160);
@@ -198,6 +238,9 @@ TEST(filter_cost_holds_the_continents_water_pairs_among_the_pairs_the_workers_co
     KindValues pairs = kinds(10, 0, 0, 0, 0, 0);
     at(pairs, RecordKind::Waters) = 40;
     CHECK_EQ(filter_cost(planet_counts, pairs), uint64_t(240 * 4 + 240 * 3 / 8 + 50 * 16 / 2));
+    CHECK_EQ(filter_cost(planet_counts, pairs, 40, 60), uint64_t(240 * 4 + (240 + 100) * 3 / 8 + 50 * 16 / 2));
+    // A planet of water alone: its marks, no map.
+    CHECK_EQ(filter_cost(kinds(0, 0, 0, 0, 0, 0), kinds(0, 0, 0, 0, 0, 0), 1000, 3000), uint64_t(4000 * 3 / 8));
 }
 
 TEST(continent_cost_runs_steps_one_at_a_time_only_past_the_budget) {
