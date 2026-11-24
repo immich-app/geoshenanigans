@@ -241,3 +241,32 @@ fn of_two_boundaries_of_a_level_round_the_point_at_one_rank_the_smaller_alone_is
     assert_eq!(answer["address"].get("town"), None);
     assert_eq!(answer["display_name"], "Old Town, Some County, Testland");
 }
+
+#[test]
+fn a_place_area_in_the_address_holds_the_place_nodes_of_finer_ranks_to_itself() {
+    // Abu Dhabi (24.458103, 54.336461): the place=suburb way Al Bateen (W873221092, rank 20) is the
+    // suburb of the address, and the place=suburb node Al Khalidiyah north of it lies in the city
+    // but not in that way. Nominatim's address walk sets current_boundary to every row it takes
+    // that is no place node, a place area as much as a boundary, and passes over a place node
+    // outside it (insert_addresslines, placex_triggers.sql:600-602, :646-651). Here a
+    // neighbourhood node 400 m north of the point, its fuzzy square round the point, lies in the
+    // city and outside the suburb's area: it is in no address of the point.
+    let index = TestIndex::in_country(b"AE")
+        .boundary("Abu Dhabi Emirate", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Abu Dhabi", 8, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Al Bateen", 15, 4, (-300.0, -300.0, 300.0, 300.0))
+        .place("Al Khalidiyah", 5, 400.0, 0.0)
+        .load();
+    let address = address_at(&index, 0.0, 0.0);
+    assert_eq!(address["city"], "Abu Dhabi");
+    assert_eq!(address["suburb"], "Al Bateen");
+    assert_eq!(address.get("neighbourhood"), None);
+    // Inside the suburb's area the node is the neighbourhood.
+    let index = TestIndex::in_country(b"AE")
+        .boundary("Abu Dhabi Emirate", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Abu Dhabi", 8, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Al Bateen", 15, 4, (-300.0, -300.0, 500.0, 300.0))
+        .place("Al Khalidiyah", 5, 400.0, 0.0)
+        .load();
+    assert_eq!(address_at(&index, 0.0, 0.0)["neighbourhood"], "Al Khalidiyah");
+}

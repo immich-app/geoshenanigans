@@ -5636,9 +5636,13 @@ impl CurrentBoundaries {
     /// `country`: the nested-boundary promotions give each its rank_address
     /// (an admin_level 7 boundary in a level 6 one linked to a suburb is
     /// ranked 22, not 14), then `walk` takes them as Nominatim's address walk
-    /// does, over the ranks of address areas (ADDRESS_AREA_RANKS). `inside(
-    /// poly, other)` tells whether poly's point on surface lies in other,
-    /// `within(poly, other)` whether poly lies within other.
+    /// does, over the ranks of address areas (ADDRESS_AREA_RANKS). A place
+    /// area is a row of that walk as a boundary is: the walk makes every row
+    /// it takes that is no place node the current_boundary (insert_addresslines,
+    /// placex_triggers.sql:646-651), so a place=suburb way in the address
+    /// holds the place nodes of finer ranks to itself. `inside(poly, other)`
+    /// tells whether poly's point on surface lies in other, `within(poly,
+    /// other)` whether poly lies within other.
     pub fn from_ranked<'a>(
         mut ranked: Vec<RankedPoly>,
         place_areas: impl Iterator<Item = &'a AdminPolygon> + Clone,
@@ -5646,9 +5650,11 @@ impl CurrentBoundaries {
         inside: impl Fn(&AdminPolygon, &AdminPolygon) -> bool,
         within: impl Fn(&AdminPolygon, &AdminPolygon) -> bool,
     ) -> Self {
+        // The place areas are rows of the walk at their rank_address, as find_admin_in ranks them.
+        ranked.extend(place_areas.clone().map(|p| RankedPoly { poly: *p, rank_address: place_area_ranks(p, country).1 }));
         promote_nested_ranks(&mut ranked, place_areas.clone(), country, within);
         ranked.sort_by(|a, b| a.poly.area.total_cmp(&b.poly.area));
-        let promoting = ranked.iter().map(|r| (r.rank_address, r.poly))
+        let promoting = ranked.iter().filter(|r| r.poly.admin_level != 15).map(|r| (r.rank_address, r.poly))
             .chain(place_areas.map(|p| (place_area_ranks(p, country).0, *p)))
             .filter(|(rank, _)| PROMOTABLE_RANKS.contains(rank))
             .collect();
@@ -6595,13 +6601,13 @@ mod pure_helper_tests {
     fn current_boundaries_rank_boundaries_inside_a_place_area() {
         // Starehe (admin_level 6, rank 12) inside Nairobi's place=city area
         // ranks 18, after the city's 16: it gates suburbs, quarters and
-        // neighbourhoods, no longer city, town and village nodes.
+        // neighbourhoods, and the city's area city, town and village nodes.
         let starehe = AdminPolygon { area: 10.0, ..boundary(1, 6) };
         let country = AdminPolygon { area: 1000.0, ..boundary(2, 2) };
         let nairobi = AdminPolygon { area: 100.0, place_type_override: 1, ..boundary(3, 15) };
         let ranked = vec![RankedPoly { poly: starehe, rank_address: 12 }, RankedPoly { poly: country, rank_address: 4 }];
         let found = CurrentBoundaries::from_ranked(ranked, [nairobi].iter(), "", |_, _| true, |_, _| true);
-        assert_eq!(names(&found), [Some(2), Some(1), Some(1), Some(1), Some(1)]);
+        assert_eq!(names(&found), [Some(3), Some(1), Some(1), Some(1), Some(1)]);
     }
 
     #[test]
