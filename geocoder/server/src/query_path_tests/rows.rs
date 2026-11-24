@@ -438,3 +438,23 @@ fn an_area_the_walk_does_not_accept_leaves_the_place_nodes_fuzzy_area_in_force()
     assert_eq!(display, "High Street, Farfield, Longreach, Thornbury, Shire, Wessex, Testland");
     assert_eq!((&address["quarter"], &address["suburb"]), (&serde_json::json!("Farfield"), &serde_json::json!("Longreach")));
 }
+
+#[test]
+fn a_linked_boundary_s_centre_is_the_place_node_it_links() {
+    // Donegall Square North, Belfast (W1327257813): Belfast City District links the city node
+    // Belfast at the City Hall, beside the street, and Nominatim takes that node for the
+    // district's centroid where it lies inside it (placex_triggers.sql:1121-1125). So the walk
+    // takes the district first though its middle lies far up the city, accepts it, and the County
+    // Borough of Belfast, holding the house, is the rank's row.
+    let mut index = country("United Kingdom", b"GB");
+    index
+        .boundary("Northern Ireland", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("County Antrim", 15, 10, (-30_000.0, -30_000.0, 30_000.0, 30_000.0))
+        .boundary("Belfast City District", 7, 1, (-3000.0, -3000.0, 9000.0, 3000.0))
+        .linked_place("Belfast", 0, 100.0, 0.0)
+        .boundary("County Borough of Belfast", 15, 1, (-2500.0, -2000.0, 4300.0, 3500.0))
+        .street("Donegall Square North", &[(0.0, -100.0), (0.0, 100.0)]);
+    let (display, address) = answer_at(&index.load(), 0.0, 0.0);
+    assert_eq!(display, "Donegall Square North, County Borough of Belfast, County Antrim, Northern Ireland, United Kingdom");
+    assert_eq!(address["city"], "County Borough of Belfast");
+}

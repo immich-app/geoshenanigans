@@ -198,13 +198,12 @@ impl PlaceFiles {
         self.hidden_node(id)
     }
 
-    /// Calls `f` with the polygon and the name of each hidden node a polygon claims
-    /// (PLACE_FLAG_LABEL_OF: the boundary that links it), in row order.
-    pub fn for_each_label(&self, mut f: impl FnMut(u32, u32)) {
-        for r in self.hidden.as_slice().chunks_exact(HIDDEN_ROW_BYTES) {
-            let w = u32_at(r, 8);
-            if w >> 31 != 0 {
-                f(u32_at(r, 12), w & ((1 << HIDDEN_NAME_BITS) - 1));
+    /// Calls `f` with the polygon of each hidden node a polygon claims (PLACE_FLAG_LABEL_OF: the
+    /// boundary that links it) and the node, in row order.
+    pub fn for_each_label(&self, mut f: impl FnMut(u32, PlaceNode)) {
+        for k in 0..self.hidden.as_slice().len() / HIDDEN_ROW_BYTES {
+            if let Some(pn) = self.hidden_node(self.visible + k as u32).filter(|pn| pn._pad1 & PLACE_FLAG_LABEL_OF != 0) {
+                f(pn.parent_poly_id, pn);
             }
         }
     }

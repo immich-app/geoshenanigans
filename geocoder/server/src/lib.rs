@@ -1109,6 +1109,10 @@ pub struct Index {
     /// polygon of its boundary, the largest outer ring, and the key holds for every ring. From
     /// place_hidden.bin's labels, on first use.
     pub linked_names: std::sync::OnceLock<Vec<(u64, u32)>>,
+    /// (boundary_key, lat, lng) of the place node each boundary links, ascending: Nominatim
+    /// takes the node for the boundary's centroid where it lies inside the boundary
+    /// (placex_triggers.sql:1121-1125). From place_hidden.bin's labels, on first use.
+    pub linked_centres: std::sync::OnceLock<Vec<(u64, f32, f32)>>,
 }
 
 /// Normalised street-name token overlap, mirroring the builder's
@@ -1449,6 +1453,7 @@ impl Index {
             admin_cell_level,
             max_distance_sq,
             linked_names: Default::default(),
+            linked_centres: Default::default(),
         })
     }
 
@@ -2181,9 +2186,36 @@ impl Index {
             distances[c] = self.area_row_distance(poly, feature);
             distances[c] * walk_weight(*rank, self.area_search_rank(poly, country))
         };
-        let geometry = &self.admin_geometry;
-        let walked = CurrentBoundaries::accepted(&candidates, key, |poly, current| geometry.point_on_surface_in(poly, current));
+        let walked = CurrentBoundaries::accepted(&candidates, key, |poly, current| self.centre_in(poly, current));
         walked.into_iter().map(|(c, accepted)| (kept[c], accepted, distances[c])).collect()
+    }
+
+    /// The centroid of the area `poly` as Nominatim has it: the place node its boundary links
+    /// where that lies inside it (linked_centre), else its point on surface (get_center_point).
+    fn area_centre(&self, poly: &AdminPolygon) -> Option<(f64, f64)> {
+        self.linked_centre(poly).or_else(|| self.admin_geometry.point_on_surface(poly).map(|(lat, lng)| (f64::from(lat), f64::from(lng))))
+    }
+
+    /// The place node the boundary of `poly` links (linked_centres) where it lies inside `poly`,
+    /// which Nominatim takes for the boundary's centroid (placex_triggers.sql:1121-1125). A
+    /// namesake boundary elsewhere, of the same key, links none inside it.
+    fn linked_centre(&self, poly: &AdminPolygon) -> Option<(f64, f64)> {
+        let key = boundary_key(poly);
+        let centres = self.linked_centres.get_or_init(|| self.read_linked_centres());
+        let geometry = &self.admin_geometry;
+        centres[centres.partition_point(|&(k, _, _)| k < key)..].iter()
+            .take_while(|&&(k, _, _)| k == key)
+            .map(|&(_, lat, lng)| (f64::from(lat), f64::from(lng)))
+            .find(|&(lat, lng)| geometry.contains_once(poly, AdminPoint::new(lat, lng)))
+    }
+
+    /// Whether the centroid of the area `poly` (area_centre) lies inside `other`, the walk's test
+    /// of an area against the current boundary (placex_triggers.sql:629-632).
+    fn centre_in(&self, poly: &AdminPolygon, other: &AdminPolygon) -> bool {
+        match self.linked_centre(poly) {
+            Some((lat, lng)) => self.admin_geometry.contains_once(other, AdminPoint::new(lat, lng)),
+            None => self.admin_geometry.point_on_surface_in(poly, other),
+        }
     }
 
     /// Whether the street `line` runs through the area `poly` along a stretch, as getNearFeatures
@@ -3665,8 +3697,8 @@ impl Index {
     /// getNearFeatures' distance of the area `poly` from `feature` (partition-functions.sql:32-36),
     /// planar in degrees as ST_Distance is on lon/lat: the distance from the feature's centre to
     /// the area, none inside it, and a hundred-thousandth of the feature's to the area's centre as
-    /// a tie breaker. A street's centre is its middle (line_middle), an area's its point on
-    /// surface (get_center_point).
+    /// a tie breaker. A street's centre is its middle (line_middle), an area's its centroid
+    /// (area_centre).
     fn area_row_distance(&self, poly: &AdminPolygon, feature: PlaceFeature<'_>) -> f64 {
         let geometry = &self.admin_geometry;
         let centre = match feature {
@@ -3676,7 +3708,7 @@ impl Index {
         let to_area = centre.map_or(0.0, |(lat, lng)| {
             if geometry.contains_once(poly, AdminPoint::new(lat, lng)) { 0.0 } else { rings_distance(&geometry.rings(poly), lat, lng) }
         });
-        let to_centre = geometry.point_on_surface(poly).map_or(0.0, |(lat, lng)| feature_distance(feature, lat as f64, lng as f64));
+        let to_centre = self.area_centre(poly).map_or(0.0, |(lat, lng)| feature_distance(feature, lat, lng));
         to_area + 0.00001 * to_centre
     }
 
@@ -3712,9 +3744,9 @@ impl Index {
     fn read_linked_names(&self) -> Vec<(u64, u32)> {
         let mut linked = Vec::new();
         if let Some(places) = &self.places {
-            places.for_each_label(|polygon, name| {
-                if let Some(poly) = self.admin_polygon(polygon).filter(|p| p.name_id != name) {
-                    linked.push((boundary_key(&poly), name));
+            places.for_each_label(|polygon, node| {
+                if let Some(poly) = self.admin_polygon(polygon).filter(|p| p.name_id != node.name_id) {
+                    linked.push((boundary_key(&poly), node.name_id));
                 }
             });
         }
@@ -3722,6 +3754,22 @@ impl Index {
         linked.dedup();
         linked.shrink_to_fit();
         linked
+    }
+
+    /// linked_centres from place_hidden.bin: each label's boundary and position.
+    fn read_linked_centres(&self) -> Vec<(u64, f32, f32)> {
+        let mut centres = Vec::new();
+        if let Some(places) = &self.places {
+            places.for_each_label(|polygon, node| {
+                if let Some(poly) = self.admin_polygon(polygon) {
+                    centres.push((boundary_key(&poly), node.lat, node.lng));
+                }
+            });
+        }
+        centres.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.total_cmp(&b.2)));
+        centres.dedup();
+        centres.shrink_to_fit();
+        centres
     }
 }
 
@@ -4393,6 +4441,7 @@ mod query_tests {
             admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
             max_distance_sq: (DEFAULT_SEARCH_DISTANCE / 6_371_000.0).powi(2),
             linked_names: Default::default(),
+            linked_centres: Default::default(),
         }
     }
 
@@ -10255,6 +10304,7 @@ mod admin_scan_tests {
             admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
             max_distance_sq: 1.0,
             linked_names: Default::default(),
+            linked_centres: Default::default(),
         }
     }
 
