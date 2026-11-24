@@ -738,6 +738,12 @@ impl StringPool {
     }
 
     pub fn load(dir: &str) -> Result<Self, String> {
+        Self::load_tiers(dir, STR_TIER_COUNT)
+    }
+
+    /// `load`, opening only the first `count` tiers' files: the strings of a later tier read as
+    /// "", whether its file is there or not.
+    pub fn load_tiers(dir: &str, count: usize) -> Result<Self, String> {
         let layout_path = format!("{}/strings_layout.json", dir);
         let layout_src = std::fs::read_to_string(&layout_path)
             .map_err(|e| format!("Failed to read {}: {}", layout_path, e))?;
@@ -756,6 +762,9 @@ impl StringPool {
             let end   = entry.get("end").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             bases[t] = start;
             bases[t + 1] = end;
+            if t >= count {
+                continue;
+            }
             let path = format!("{}/{}", dir, STR_TIER_FILENAMES[t]);
             tiers[t] = mmap_file_optional(&path)
                 .map(strings::Tier::open)
