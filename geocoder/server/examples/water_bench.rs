@@ -414,6 +414,36 @@ mod tests {
         assert_eq!(key(1.0, 22, 7, 1).order(&key(1.0, 22, 7, 1)), Ordering::Equal);
     }
 
+    // The water fixture's lake given the type code `lake`, and a twin of it of the code `twin`
+    // (the lake's rings, so of its area, a polygon after the fixture's polygons), both listed not
+    // interior in the cell of a point of the lake off its island: the water, the point and the
+    // two ids.
+    fn twins(lake: u16, twin: u16) -> (Water, (f64, f64), u32, u32) {
+        let mut water = Water::load(WATER_DIR);
+        let at = water.records.iter().position(|p| p.country_code == 2 && p.ring_bytes > 0).expect("the fixture's lake");
+        water.records[at].country_code = lake;
+        water.records.push(AdminPolygon { country_code: twin, ..water.records[at] });
+        let (lake_id, twin_id) = (at as u32, water.records.len() as u32 - 1);
+        let point = (47.002, 8.002);
+        let cell = cell_id_at_level(point.0, point.1, DEFAULT_ADMIN_CELL_LEVEL);
+        water.index = cell_pairs::from_pairs([(cell, lake_id), (cell, twin_id)], cell_pairs::ADMIN);
+        (water, point, lake_id, twin_id)
+    }
+
+    #[test]
+    fn at_a_point_of_two_areas_of_one_size_the_higher_rank_answers() {
+        // Of a lake (2, rank 20) and a pond (4, rank 24) the pond, whichever polygon is which,
+        // though its code is the higher; of a lake and a river (29, rank 19) the lake; of two of
+        // rank 22 (50492, 64461) the lower code; of two of one code the lower id.
+        for (lake, twin, twin_answers) in [(2, 4, true), (4, 2, false), (2, 29, false), (64461, 50492, true), (2, 2, false)] {
+            let (water, (lat, lng), lake_id, twin_id) = twins(lake, twin);
+            assert_eq!(water.at(lat, lng), Some(if twin_answers { twin_id } else { lake_id }), "{lake} {twin}");
+        }
+        // A code water_meta.json lists no rank for answers nothing: of two such, neither.
+        let (water, (lat, lng), _, _) = twins(7, 8);
+        assert_eq!(water.at(lat, lng), None);
+    }
+
     #[test]
     fn a_water_dir_gives_each_type_code_its_rank() {
         let water = Water::load(WATER_DIR);
