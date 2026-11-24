@@ -445,18 +445,42 @@ TEST(a_pieces_path_stays_when_its_corner_moves_and_the_cuts_stay_where_they_were
             }
         return p;
     };
-    auto keys = [](const std::vector<SplitPolygon>& pieces) {
-        std::set<uint64_t> out;
-        for (const SplitPolygon& q : pieces) out.insert(q.key);
+    auto keys_by_path = [](const std::vector<SplitPolygon>& pieces) {
+        std::map<uint64_t, uint64_t> out;
+        for (const SplitPolygon& q : pieces) out[q.path] = q.key;
         return out;
     };
     const std::vector<SplitPolygon> day1 = split_polygon(lake_of(0), 64), day2 = split_polygon(lake_of(5000), 64);
     REQUIRE(day1.size() > 2);
     REQUIRE(day2.size() == day1.size());
-    // The piece at the corner takes a key of its own corner the next day,
-    // and keeps its path, as every other piece does.
-    CHECK(keys(day1) != keys(day2));
+    // Every piece keeps its path.
     CHECK(holes_by_path(day1) == holes_by_path(day2));
+    // A piece's key comes down the cuts, from the key of the piece it was
+    // cut from and its own corner. The first cut runs along a meridian of
+    // the lake's box: the side west of it, whose corner moved, takes a key
+    // of its new corner, and so does every piece cut from it; each piece
+    // east of it keeps its key.
+    int64_t first = 0;
+    REQUIRE(split_detail::coarsest_line(80000000, 96000000, first));
+    const std::map<uint64_t, uint64_t> keys1 = keys_by_path(day1), keys2 = keys_by_path(day2);
+    size_t west = 0, east = 0;
+    for (const SplitPolygon& q : day1) {
+        int64_t lo = INT64_MAX, hi = INT64_MIN;
+        for (const PackedLocation& v : q.outer.v) {
+            lo = std::min<int64_t>(lo, v.lon_e7);
+            hi = std::max<int64_t>(hi, v.lon_e7);
+        }
+        REQUIRE(hi <= first || lo >= first);
+        REQUIRE(keys2.count(q.path));
+        if (hi <= first) {
+            CHECK(keys2.at(q.path) != keys1.at(q.path));
+            west++;
+        } else {
+            CHECK_EQ(keys2.at(q.path), keys1.at(q.path));
+            east++;
+        }
+    }
+    CHECK(west > 1 && east > 1);
 }
 
 TEST(a_pieces_path_stays_when_an_edit_away_from_its_cut_moves_another_lobes_corner_below_its_own) {

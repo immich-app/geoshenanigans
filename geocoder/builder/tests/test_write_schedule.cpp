@@ -162,6 +162,12 @@ TEST(the_water_stage_holds_the_slot_allocation_of_each_previous_arc_slot_past_to
     CHECK(at_once.order == RunOrder::Concurrent);
     CHECK_EQ(at_once.bytes,
              region_peak(bytes, counts, 0, RunOrder::Concurrent, pairs, slots) + past * kWaterArcSlotBytes);
+    // A byte short of that, the steps run one after another, and the water
+    // stage still holds the slots past today's arcs.
+    const RegionCost one_by_one = continent_cost(bytes, counts, 0, at_once.bytes - 1, pairs, slots, past);
+    CHECK(one_by_one.order == RunOrder::Serial);
+    CHECK_EQ(one_by_one.bytes,
+             region_peak(bytes, counts, 0, RunOrder::Serial, pairs, slots) + past * kWaterArcSlotBytes);
 }
 
 TEST(pair_counts_takes_the_water_cell_index_entries_for_the_waters_pairs) {
