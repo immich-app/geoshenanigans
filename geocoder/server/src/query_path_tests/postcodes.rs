@@ -144,6 +144,17 @@ fn a_centroid_names_a_point_only_inside_its_countrys_extent() {
 }
 
 #[test]
+fn a_centroid_of_a_postcode_its_country_makes_names_a_point_whatever_its_length() {
+    // Iran's pattern makes every postcode ddddd-ddddd, eleven characters ((ddddd)[-_ ]?(ddddd),
+    // output \1-\2), and Saudi Arabia's, ddddd(?:-dddd)?, keeps the four digits after the hyphen
+    // (country_settings.yaml): each centroid names a point inside its country's extent.
+    for (code, postcode, origin) in [(b"IR", "13145-11111", (35.7, 51.4)), (b"SA", "12271-2422", (24.7, 46.7))] {
+        let index = country_at(origin, code).centroid(postcode, 0.0, 0.0).load();
+        assert_eq!(postcode_from(&index, origin, 300.0, 0.0), postcode, "{}", String::from_utf8_lossy(code));
+    }
+}
+
+#[test]
 fn the_nearest_centroid_is_the_nearest_in_plain_degrees() {
     // Nominatim orders the centroids covering the point by ST_Distance on lon/lat geometry, in
     // plain degrees. At 52° N a centroid 0.006° north (668 m) is nearer than one 0.009° east

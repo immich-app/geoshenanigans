@@ -4977,10 +4977,6 @@ pub fn postcode_looks_valid(_country_code: &[u8; 2], postcode: &str) -> bool {
     true
 }
 
-// Quick validation for postcode centroid candidates. Rejects
-// strings that are clearly not standalone postcodes — matches
-// the spirit of Nominatim's clean_postcodes sanitizer which
-// validates against per-country regex patterns at import.
 /// Whether a centroid at squared distance `d` beats the current best.
 /// Equally near centroids (GeoNames puts many PO-box ZIPs at one post
 /// office) are ordered by postcode, never by record order, which differs
@@ -4992,18 +4988,13 @@ pub fn nearer_postcode(d: f64, s: &str, best: Option<(f64, &str)>) -> bool {
     }
 }
 
+/// Whether a postcode centroid's postcode can name a point: not a list of values. The builder
+/// keeps a centroid only of the postcode its country's pattern makes (postcode_validation.h), of
+/// any length or shape, Iran's ddddd-ddddd among them; postcode_looks_valid drops placeholders
+/// (all zeros or dashes). There is no PO/Box filter: Nominatim has none, and the Portsmouth
+/// area's postcodes (PO1 1BA) are real.
 pub fn centroid_postcode_ok(s: &str) -> bool {
-    if s.len() > 10 { return false; }  // postcodes are short
-    if s.contains(';') { return false; } // multiple values
-    // NOTE: no PO/Box substring filter — Nominatim has none. It wrongly dropped
-    // every legitimate UK Portsmouth-area postcode (PO1 1BA, etc.). The
-    // per-country pattern is enforced at build time (postcode_validation.h) and
-    // placeholders (all-zeros/dashes) by postcode_looks_valid.
-    // Reject US zip+4 (5+4 digit format like "10001-2062")
-    if s.len() == 10 && s.as_bytes().get(5) == Some(&b'-') {
-        return false;
-    }
-    true
+    !s.contains(';')
 }
 
 // Per-country postcode formatter. Mirrors Nominatim's
@@ -6166,8 +6157,6 @@ mod pure_helper_tests {
     fn centroid_postcode_ok_rules() {
         assert!(centroid_postcode_ok("10001"));
         assert!(centroid_postcode_ok("SW1A 1AA"));
-        // > 10 chars rejected.
-        assert!(!centroid_postcode_ok("12345678901"));
         // semicolon (multiple values) rejected.
         assert!(!centroid_postcode_ok("10001;10002"));
         // No PO/Box substring filter: legitimate UK Portsmouth-area postcodes
@@ -6175,10 +6164,10 @@ mod pure_helper_tests {
         // filter. This was a real divergence (Portsmouth returned no postcode).
         assert!(centroid_postcode_ok("PO1 1BA"));
         assert!(centroid_postcode_ok("PO16 7GZ"));
-        // US zip+4 (len 10, dash at index 5) rejected.
-        assert!(!centroid_postcode_ok("10001-2062"));
-        // A 9-char dashed value is NOT caught by the len==10 zip+4 rule.
-        assert!(centroid_postcode_ok("1001-2062"));
+        // The builder keeps a centroid only of the postcode its country's pattern makes, of any
+        // length or shape: Iran's ddddd-ddddd and Saudi Arabia's ddddd-dddd.
+        assert!(centroid_postcode_ok("12345-67890"));
+        assert!(centroid_postcode_ok("12345-6789"));
     }
 
     #[test]
