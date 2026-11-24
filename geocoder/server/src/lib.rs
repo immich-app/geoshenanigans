@@ -2223,11 +2223,13 @@ impl Index {
     }
 
     /// Whether the street `line` runs through the area `poly` along a stretch, as getNearFeatures
-    /// takes an area for a street (line_runs_through); never for an area without rings.
+    /// takes an area for a street (line_runs_through); never for an area without rings. The rings
+    /// are read only where no node of the line lies inside the area.
     fn runs_through(&self, poly: &AdminPolygon, line: &[NodeCoord]) -> bool {
         let geometry = &self.admin_geometry;
         geometry.has_rings(poly)
-            && line_runs_through(line, &geometry.rings(poly), |lat, lng| geometry.contains_once(poly, AdminPoint::new(lat, lng)))
+            && (line.iter().any(|n| geometry.contains_once(poly, AdminPoint::new(f64::from(n.lat), f64::from(n.lng))))
+                || line_runs_through(line, &geometry.rings(poly), |_, _| false))
     }
 
     /// The rank_search of the area `poly` in `country` (compute_place_rank): a boundary's is its
