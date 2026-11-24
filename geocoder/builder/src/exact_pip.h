@@ -12,6 +12,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 #include "packed_location.h"
 #include "polygon_rings.h"
@@ -64,6 +65,30 @@ inline bool exact_point_on_edge(PackedLocation a, PackedLocation b, PackedLocati
 inline bool exact_ring_on_edge(const PackedLocation* v, uint32_t n, PackedLocation p) {
     for (uint32_t a = 0, b = n - 1; a < n; b = a++)
         if (exact_point_on_edge(v[b], v[a], p)) return true;
+    return false;
+}
+
+// Whether the ring v[0, n) covers p, as PostGIS's ST_Covers: p is inside it
+// or on its edges, which exact_ring_contains leaves to one side or the other.
+inline bool exact_ring_covers(const PackedLocation* v, uint32_t n, PackedLocation p) {
+    return exact_ring_on_edge(v, n, p) || exact_ring_contains(v, n, p);
+}
+
+// Whether the polygons (each an outer ring and its holes; a ring of fewer
+// than 3 vertices is none) cover p, as ST_Covers of their multipolygon: p is
+// on an edge of one of their rings, a hole's too, or inside an outer ring and
+// none of its holes.
+inline bool exact_polygons_cover(const std::vector<NestedPolygon<PackedLocation>>& polygons, PackedLocation p) {
+    auto touches = [&](const std::vector<PackedLocation>& ring) {
+        return ring.size() >= 3 && exact_ring_on_edge(ring.data(), static_cast<uint32_t>(ring.size()), p);
+    };
+    auto contains = [&](const std::vector<PackedLocation>& ring) {
+        return ring.size() >= 3 && exact_ring_contains(ring.data(), static_cast<uint32_t>(ring.size()), p);
+    };
+    for (const auto& polygon : polygons) {
+        if (touches(polygon.outer) || std::any_of(polygon.holes.begin(), polygon.holes.end(), touches)) return true;
+        if (contains(polygon.outer) && std::none_of(polygon.holes.begin(), polygon.holes.end(), contains)) return true;
+    }
     return false;
 }
 
@@ -149,14 +174,18 @@ inline float exact_polygon_area(const PackedLocation* v, const RingSpan* rings, 
 inline LatLng exact_polygon_centroid(const PackedLocation* v, const RingSpan* rings, uint32_t ring_count) {
     if (ring_count == 0 || rings[0].count == 0) return {0, 0};
     const PackedLocation origin = v[rings[0].begin];
+    // A vertex's degrees from the origin, widened first: two longitudes lie up
+    // to 3.6e9 e7 units apart.
+    auto lat_of = [&](const PackedLocation& p) { return (int64_t(p.lat_e7) - origin.lat_e7) * 1e-7; };
+    auto lng_of = [&](const PackedLocation& p) { return (int64_t(p.lon_e7) - origin.lon_e7) * 1e-7; };
     double area = 0, lat = 0, lng = 0;
     for (uint32_t r = 0; r < ring_count; r++) {
         const PackedLocation* ring = v + rings[r].begin;
         const uint32_t n = rings[r].count;
         double a2 = 0, sum_lat = 0, sum_lng = 0;
         for (uint32_t a = 0, b = n - 1; a < n; b = a++) {
-            const double y0 = (ring[b].lat_e7 - origin.lat_e7) * 1e-7, x0 = (ring[b].lon_e7 - origin.lon_e7) * 1e-7;
-            const double y1 = (ring[a].lat_e7 - origin.lat_e7) * 1e-7, x1 = (ring[a].lon_e7 - origin.lon_e7) * 1e-7;
+            const double y0 = lat_of(ring[b]), x0 = lng_of(ring[b]);
+            const double y1 = lat_of(ring[a]), x1 = lng_of(ring[a]);
             const double cross = x0 * y1 - x1 * y0;
             a2 += cross;
             sum_lat += (y0 + y1) * cross;

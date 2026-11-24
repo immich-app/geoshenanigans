@@ -178,15 +178,22 @@ TEST(polygons_are_equal_with_the_same_rings_whatever_their_rotation_and_directio
     const uint32_t reversed = p.add(ring_of({{1000, 0}, {1000, 1000}, {0, 1000}, {0, 0}}),
                                     {ring_of({{700, 300}, {700, 700}, {300, 700}, {300, 300}})});
     const uint32_t no_hole = p.add(square(0, 0, 1000, 1000));
-    // An extra vertex on a side makes the same area a different ring: PostGIS's ST_Equals would
-    // call them equal, the rank pass doesn't.
+    // An extra vertex on a side, or two in a row, adds no point: ST_Equals takes the outline,
+    // as the rank pass does. One a step off the side is another ring.
     const uint32_t extra_vertex = p.add(ring_of({{0, 0}, {0, 500}, {0, 1000}, {1000, 1000}, {1000, 0}}),
                                         {square(300, 300, 700, 700)});
+    const uint32_t extra_vertices = p.add(ring_of({{0, 0}, {0, 1000}, {400, 1000}, {400, 1000}, {700, 1000}, {1000, 1000},
+                                                   {1000, 0}, {500, 0}}),
+                                          {ring_of({{300, 300}, {300, 700}, {700, 700}, {700, 500}, {700, 300}})});
+    const uint32_t off_side = p.add(ring_of({{0, 0}, {1, 500}, {0, 1000}, {1000, 1000}, {1000, 0}}),
+                                    {square(300, 300, 700, 700)});
     const uint32_t moved = p.add(ring_of({{0, 0}, {0, 1000}, {1000, 1000}, {1000, 1}}), {square(300, 300, 700, 700)});
     CHECK(p.equal({a}, {rotated}));
     CHECK(p.equal({a}, {reversed}));
     CHECK(!p.equal({a}, {no_hole}));
-    CHECK(!p.equal({a}, {extra_vertex}));
+    CHECK(p.equal({a}, {extra_vertex}));
+    CHECK(p.equal({extra_vertices}, {a}));
+    CHECK(!p.equal({a}, {off_side}));
     CHECK(!p.equal({a}, {moved}));
     // Multipolygons: the same parts in another order.
     const uint32_t far = p.add(square(5000, 5000, 6000, 6000)), far_again = p.add(square(5000, 5000, 6000, 6000));

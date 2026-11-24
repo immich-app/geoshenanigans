@@ -15,8 +15,10 @@
 //   1. a relation's first label member that is a place node, of any value,
 //      linked already or not (:291-312);
 //   2. a place node of its wikidata, which it covers, of rank_search below 26
-//      and not linked yet; one named as it is first, then the lower osm id
-//      (:323-337);
+//      and not linked yet; an unnamed one first, then one named as it is,
+//      then the others; of those the one of the lowest address rank in its
+//      country, one of rank 0 last (the query leaves them unordered:
+//      Espanola's town before its hamlet), then the lower osm id (:323-337);
 //   3. with a name and a place value of its own, a place node of that value
 //      whose name holds its name or lies in it, both lower-cased, covered, of
 //      rank_search below 26, unlinked, and of its wikidata or none

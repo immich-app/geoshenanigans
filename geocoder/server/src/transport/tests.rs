@@ -465,6 +465,16 @@ fn fixture_datasets_come_back_and_the_readers_read_them_as_before() {
 }
 
 #[test]
+fn a_place_area_s_rank_comes_back() {
+    // A record's last byte is a column of its own: a place area (admin_level 15) labelled town
+    // (2) by the node it links, of the rank of its own place=suburb, 20 (rank_address).
+    let record = AdminPolygon { place_type_override: 2, rank_address: 20, ..crate::arc_fixture::record(3, 15, 0.25) };
+    let bytes = record.record_bytes().to_vec();
+    assert_eq!((bytes[14], bytes[15]), (15 << 4 | 2, 20));
+    round_trip(Kind::Cols, Some("admin_polygons.bin"), &[("admin_polygons.bin", bytes)]);
+}
+
+#[test]
 fn empty_members_of_every_kind_come_back() {
     let (places, _) = crate::place_files::encode(&[], crate::DEFAULT_ADMIN_CELL_LEVEL);
     round_trip(Kind::Places, None, &members_of(Kind::Places, vec![places.cells, places.nodes, places.hidden]));

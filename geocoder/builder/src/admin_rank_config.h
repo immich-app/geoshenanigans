@@ -284,11 +284,16 @@ inline PlaceRanks polygon_ranks(uint16_t cc, uint8_t admin_level, PlaceValue own
 // place areas (admin_level 15) of those ranks, by the type that labels them (a
 // place area linked to a town node is a town there, whatever its own place
 // tag). Singapore's city is its place=city area (R17140517), not a boundary.
+// A place=province area ranks 10 in Spain and 12 in Saudi Arabia, so it is
+// kept wherever it lies (the arcs come before the countries), as
+// is_address_place_type keeps it; the server ranks the others 0.
 inline bool admin_minimal_keeps(uint8_t admin_level, uint8_t place_type) {
     if (admin_level >= 2 && admin_level <= 8) return true;
+    if (admin_level != 15) return false;
+    if (static_cast<AdminPlaceType>(place_type) == AdminPlaceType::PROVINCE) return true;
     const uint8_t rank = place_area_rank_address(place_type);
 
-    return admin_level == 15 && rank > 0 && rank <= 16;
+    return rank > 0 && rank <= 16;
 }
 
 // Admin-minimal's place nodes: cities, towns, villages and hamlets; no

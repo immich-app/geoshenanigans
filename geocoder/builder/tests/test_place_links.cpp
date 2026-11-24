@@ -469,3 +469,153 @@ TEST(a_polygon_named_by_its_node_keeps_its_own_name_aside) {
     CHECK_EQ(w.data.admin_polygons[kirsanov].own_name_id, NO_DATA);
     CHECK_EQ(stats.named, size_t(1));
 }
+
+// The cases of #533's wikidata step (place_claims.h's link_wikidata_places there), on the link pass.
+
+TEST(lowercase_utf8_lowers_the_capitals_postgres_lower_lowers_in_the_wikidata_steps_order) {
+    // lower(name->'name') = bnd_name orders the nodes of a boundary's wikidata.
+    CHECK(lowercase_utf8("").empty());
+    CHECK_EQ(lowercase_utf8("Lent"), std::string("lent"));
+    CHECK_EQ(lowercase_utf8("ÉVORA"), std::string("évora"));
+    CHECK_EQ(lowercase_utf8("ŁÓDŹ"), std::string("łódź"));
+    CHECK_EQ(lowercase_utf8("İZMİR"), std::string("izmir"));
+    CHECK_EQ(lowercase_utf8("ΆΘΗΝΑ"), std::string("άθηνα"));
+    CHECK_EQ(lowercase_utf8("МОСКВА"), std::string("москва"));
+    CHECK_EQ(lowercase_utf8("ЁЛКИ"), std::string("ёлки"));
+    CHECK_EQ(lowercase_utf8("ԵՐԵՎԱՆ"), std::string("երեվան"));
+    CHECK_EQ(lowercase_utf8("Straße ×2 東京"), std::string("straße ×2 東京"));
+}
+
+TEST(a_wikidata_link_takes_one_node_in_the_steps_order) {
+    // find_linked_place's wikidata step: ORDER BY lower(name->'name') = bnd_name desc, nulls
+    // first, the first node found linked. A place=suburb area, relation 100, covers the town node
+    // 1 and the village node 2 of its wikidata; node 2 has the area's name and node 3, outside it,
+    // none. The area links node 2, its label, and keeps its own place tag.
+    World w("GB");
+    const uint32_t area = w.place_area(100, PlaceValue::SUBURB, Box{0, 0, 1, 1}, {PlaceValue::NONE, "Riverside", "Q1"});
+    w.node(1, PlaceValue::TOWN, 0.5, 0.5, "Riverside Town", "Q1");
+    w.node(2, PlaceValue::VILLAGE, 0.6, 0.6, "Riverside", "Q1");
+    w.node(3, PlaceValue::VILLAGE, 5, 5, "", "Q1");
+    w.link();
+    CHECK(w.link_of(area).step == LinkStep::WIKIDATA);
+    CHECK_EQ(w.link_of(area).node, int64_t(2));
+    CHECK_EQ(w.claimant(2), w.boundary(area));
+    CHECK(w.label(area) == AdminPlaceType::VILLAGE);
+    CHECK_EQ(w.data.admin_polygons[area].own_place_value, value(PlaceValue::SUBURB));
+
+    // A node without a name comes first, and equals go to the lower node id.
+    World v("GB");
+    const uint32_t town = v.relation(100, 8, Box{0, 0, 1, 1}, {PlaceValue::NONE, "Riverside", "Q1"});
+    v.node(7, PlaceValue::TOWN, 0.5, 0.5, "Riverside", "Q1");
+    v.node(6, PlaceValue::VILLAGE, 0.5, 0.6, "", "Q1");
+    v.node(5, PlaceValue::TOWN, 0.5, 0.7, "", "Q1");
+    v.link();
+    CHECK_EQ(v.link_of(town).node, int64_t(5));
+    CHECK(v.label(town) == AdminPlaceType::TOWN);
+}
+
+TEST(a_node_a_boundary_before_links_is_no_later_ones) {
+    // Nominatim indexes the boundaries by rank, the place areas after them: the wijk, relation 200
+    // (L10), links the village node 5 of their wikidata first, the quarter area, relation 100,
+    // passes it over for the hamlet node 6, and the quarter area of way 300, round node 5 alone,
+    // finds none left and stays a quarter. Whatever order the nodes come in.
+    for (const bool reversed : {false, true}) {
+        World w("NL");
+        const uint32_t quarter = w.place_area(100, PlaceValue::QUARTER, Box{0, 0, 1, 1}, {PlaceValue::NONE, "Lent", "Q9"});
+        const uint32_t wijk = w.relation(200, 10, Box{0, 0, 0.7, 0.7}, {PlaceValue::NONE, "Lent", "Q9"});
+        Tags way_tags{PlaceValue::QUARTER, "Lent", "Q9"};
+        const uint32_t way = w.add(way_boundary_id(300), 15, Box{0.4, 0.4, 0.6, 0.6}, way_tags);
+        if (reversed) w.node(6, PlaceValue::HAMLET, 0.9, 0.9, "Lent-Oost", "Q9");
+        w.node(5, PlaceValue::VILLAGE, 0.5, 0.5, "Lent", "Q9");
+        if (!reversed) w.node(6, PlaceValue::HAMLET, 0.9, 0.9, "Lent-Oost", "Q9");
+        w.link();
+        CHECK_EQ(w.link_of(wijk).node, int64_t(5));
+        CHECK(w.label(wijk) == AdminPlaceType::VILLAGE);
+        CHECK_EQ(w.link_of(quarter).node, int64_t(6));
+        CHECK(w.label(quarter) == AdminPlaceType::HAMLET);
+        CHECK_EQ(w.data.admin_polygons[quarter].own_place_value, value(PlaceValue::QUARTER));
+        CHECK(w.link_of(way).step == LinkStep::NONE);
+        CHECK(w.label(way) == AdminPlaceType::QUARTER);
+        CHECK_EQ(w.claimant(5), w.boundary(wijk));
+        CHECK_EQ(w.claimant(6), w.boundary(quarter));
+    }
+}
+
+TEST(a_boundary_of_rank_0_reserves_no_node_of_its_wikidata) {
+    // find_linked_place returns at once for a boundary of rank_address 0 (placex_triggers.sql:284),
+    // so it links nothing and leaves the node to the polygons after it: an Australian local
+    // government area (admin_level 6, rank 0 there), relation 100, and a place=suburb area,
+    // relation 200, both cover the town node 5 of their wikidata. The area links it.
+    World w("AU");
+    const uint32_t lga = w.relation(100, 6, Box{0, 0, 1, 1}, {PlaceValue::NONE, "Gold Coast City", "Q5"});
+    const uint32_t area = w.place_area(200, PlaceValue::SUBURB, Box{0.2, 0.2, 0.8, 0.8}, {PlaceValue::NONE, "Southport", "Q5"});
+    w.node(5, PlaceValue::TOWN, 0.5, 0.5, "Southport", "Q5");
+    w.link();
+    CHECK(w.link_of(lga).step == LinkStep::NONE);
+    CHECK(w.label(lga) == AdminPlaceType::NONE);
+    CHECK_EQ(w.claimant(5), w.boundary(area));
+    CHECK(w.label(area) == AdminPlaceType::TOWN);
+    CHECK_EQ(w.data.admin_polygons[area].own_place_value, value(PlaceValue::SUBURB));
+}
+
+TEST(a_label_member_is_left_to_the_wikidata_step_only_by_a_boundary_of_rank_0) {
+    // The label step comes first, but find_linked_place returns at once for a boundary of
+    // rank_address 0: an Australian local government area (admin_level 6, rank 0 there), relation
+    // 100, names the town node 5 as its label, which the place=suburb area, relation 200, of its
+    // wikidata links. A boundary of rank 16, relation 300, links its label member, the town node
+    // 6, which the suburb area 400 of its wikidata passes over.
+    World w("AU");
+    const uint32_t lga = w.relation(100, 6, Box{0, 0, 1, 1}, {PlaceValue::NONE, "Gold Coast City", "", 5});
+    const uint32_t area = w.place_area(200, PlaceValue::SUBURB, Box{0.2, 0.2, 0.8, 0.8}, {PlaceValue::NONE, "Southport", "Q5"});
+    w.node(5, PlaceValue::TOWN, 0.5, 0.5, "Southport", "Q5");
+    const uint32_t city = w.relation(300, 8, Box{2, 2, 3, 3}, {PlaceValue::NONE, "Ipswich", "", 6});
+    const uint32_t other = w.place_area(400, PlaceValue::SUBURB, Box{2.2, 2.2, 2.8, 2.8}, {PlaceValue::NONE, "Ipswich Central", "Q6"});
+    w.node(6, PlaceValue::TOWN, 2.5, 2.5, "Ipswich", "Q6");
+    w.link();
+    CHECK(w.link_of(lga).step == LinkStep::NONE);
+    CHECK(w.link_of(area).step == LinkStep::WIKIDATA);
+    CHECK_EQ(w.claimant(5), w.boundary(area));
+    CHECK(w.label(area) == AdminPlaceType::TOWN);
+    CHECK(w.link_of(city).step == LinkStep::LABEL);
+    CHECK_EQ(w.claimant(6), w.boundary(city));
+    CHECK(w.link_of(other).step == LinkStep::NONE);
+    CHECK(w.label(other) == AdminPlaceType::SUBURB);
+}
+
+TEST(place_areas_link_in_the_order_of_their_address_ranks) {
+    // Nominatim indexes the place areas after every boundary, one rank_address after another
+    // (indexer.py index_by_rank, RankRunner): a place=suburb area (rank 20), relation 300, takes
+    // the village node 5 of its wikidata before a place=quarter area (rank 22) of a lower id,
+    // relation 100, which links nothing and stays a quarter.
+    World w("GB");
+    const uint32_t quarter = w.place_area(100, PlaceValue::QUARTER, Box{0, 0, 1, 1}, {PlaceValue::NONE, "Oost", "Q5"});
+    const uint32_t suburb = w.place_area(300, PlaceValue::SUBURB, Box{0.1, 0.1, 0.9, 0.9}, {PlaceValue::NONE, "Oost", "Q5"});
+    w.node(5, PlaceValue::VILLAGE, 0.5, 0.5, "Oostdorp", "Q5");
+    w.link();
+    CHECK_EQ(w.claimant(5), w.boundary(suburb));
+    CHECK(w.label(suburb) == AdminPlaceType::VILLAGE);
+    CHECK_EQ(w.data.admin_polygons[suburb].own_place_value, value(PlaceValue::SUBURB));
+    CHECK(w.link_of(quarter).step == LinkStep::NONE);
+    CHECK(w.label(quarter) == AdminPlaceType::QUARTER);
+}
+
+TEST(of_nodes_equal_in_the_steps_order_the_one_of_the_lowest_address_rank_links) {
+    // The step's ORDER BY leaves nodes of one name unordered: Espanola (relation 100) covers the
+    // town node 20 and the hamlet node 10 of its wikidata, both named Española. The town, of
+    // address rank 16, comes before the hamlet's 20 whatever their ids, and equals go to the
+    // lower.
+    World w("US");
+    const uint32_t espanola = w.relation(100, 8, Box{0, 0, 1, 1}, {PlaceValue::NONE, "Espanola", "Q5"});
+    w.node(10, PlaceValue::HAMLET, 0.5, 0.5, "Española", "Q5");
+    w.node(20, PlaceValue::TOWN, 0.6, 0.6, "Española", "Q5");
+    w.link();
+    CHECK_EQ(w.link_of(espanola).node, int64_t(20));
+    CHECK(w.label(espanola) == AdminPlaceType::TOWN);
+
+    World v("US");
+    const uint32_t other = v.relation(100, 8, Box{0, 0, 1, 1}, {PlaceValue::NONE, "Espanola", "Q5"});
+    v.node(40, PlaceValue::VILLAGE, 0.5, 0.5, "Española", "Q5");
+    v.node(30, PlaceValue::TOWN, 0.6, 0.6, "Española", "Q5");
+    v.link();
+    CHECK_EQ(v.link_of(other).node, int64_t(30));
+}

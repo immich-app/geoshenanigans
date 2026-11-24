@@ -312,13 +312,16 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
             if (const uint32_t i = label_of(o); i != NO_DATA) return done(LinkStep::LABEL, i);
             const std::string_view name = tags ? std::string_view(tags->name) : std::string_view();
             // 2. Its wikidata's nodes: unnamed ones first (a null sorts first in Nominatim's
-            //    descending order), then those of its name, then the others.
+            //    descending order), then those of its name, then the others. The order leaves
+            //    nodes of one place in it unordered: of those the one of the lowest address rank
+            //    in its country, one of rank 0 last (Espanola's town before its hamlet), then the
+            //    lower osm id.
             if (const std::string* wikidata = o.wikidata()) {
                 const auto [first, last] = equal_range_of(by_wikidata, wikidata_key, std::string_view(*wikidata));
                 std::vector<uint32_t> found_nodes(first, last);
                 auto order_key = [&](uint32_t i) {
-                    if (name.empty() || nodes[i].name == LinkText::kNone) return 0;
-                    return text.at(nodes[i].name) == name ? 1 : 2;
+                    const int named = name.empty() || nodes[i].name == LinkText::kNone ? 0 : text.at(nodes[i].name) == name ? 1 : 2;
+                    return std::make_pair(named, ranks[i].address == 0 ? UINT8_MAX : ranks[i].address);
                 };
                 std::stable_sort(found_nodes.begin(), found_nodes.end(),
                                  [&](uint32_t a, uint32_t b) { return order_key(a) < order_key(b); });

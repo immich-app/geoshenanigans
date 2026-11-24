@@ -31,8 +31,10 @@
 #include "pbf_reader.h"
 
 #include <absl/synchronization/mutex.h>
+#include <s2/s2cell.h>
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
+#include <s2/s2latlng_rect.h>
 
 #include "types.h"
 #include "string_files.h"
@@ -55,6 +57,7 @@
 #include "polygon_rings.h"
 #include "admin_rank_config.h"
 #include "admin_arcs.h"
+#include "admin_cover.h"
 #include "admin_links.h"
 #include "cell_walk.h"
 #include "parallel.h"
@@ -275,20 +278,16 @@ static ExternalPostcodes read_external_postcodes(const std::string& path) {
         if (postcode.empty() || cc_str.size() < 2) continue;
         if (lat == 0 && lng == 0) continue;
 
-        // Validate against country pattern
-        char cc_lower[3] = {
-            static_cast<char>(std::tolower(static_cast<unsigned char>(cc_str[0]))),
-            static_cast<char>(std::tolower(static_cast<unsigned char>(cc_str[1]))),
-            0
-        };
-        if (!validate_postcode_for_country(cc_lower, postcode.c_str())) {
+        // _update_from_external keeps the postcode the country's pattern
+        // makes of the row's (m.norm), of a row the pattern takes.
+        const uint16_t cc = pack_country_code(static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[0]))),
+                                              static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[1]))));
+        std::optional<std::string> norm = match_postcode(cc, postcode, PostcodeDefault::Any);
+        if (!norm) {
             out.skipped++;
             continue;
         }
-
-        uint16_t cc = pack_country_code(static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[0]))),
-                                        static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[1]))));
-        out.rows.push_back({std::move(postcode), lat, lng, cc});
+        out.rows.push_back({std::move(*norm), lat, lng, cc});
     }
     return out;
 }
@@ -725,33 +724,80 @@ static AdminTags way_link_tags(const WayTags& t, int64_t way_id) {
 
 // Gives each postal area (POSTAL_AREA_LEVEL) the country its centroid lies in,
 // as Nominatim gives a place_postcode row the country of its centroid
-// (postcodes.py update_postcodes, get_country_code), and marks the ones of a
-// postcode the country's pattern rejects POSTAL_AREA_INVALID: Nominatim makes
-// no postcode area of those (_update_postcode_areas), so they name nothing.
+// (postcodes.py update_postcodes, get_country_code). A relation is one row,
+// its centroid its whole multipolygon's (init.lua postcode_area,
+// o.geometry:centroid()): its rings' centroids weighted by their areas, and
+// every ring of it takes that country. A US area of a ZIP+4 is its ZIP's.
+// The areas of a postcode the country's pattern rejects are marked
+// POSTAL_AREA_INVALID: Nominatim makes no postcode area of those
+// (_update_postcode_areas), so they name nothing.
 static void assign_postal_area_countries(ParsedData& data, const AdminRings& countries, unsigned int threads) {
-    const auto& pool = data.string_pool.data();
-    std::atomic<size_t> areas{0}, invalid{0};
-    parallel_for(data.admin_polygons.size(), [&](size_t begin, size_t end, unsigned) {
-        for (size_t i = begin; i < end; i++) {
-            AdminPolygon& poly = data.admin_polygons[i];
-            if (poly.admin_level != POSTAL_AREA_LEVEL || poly.name_id == NO_DATA) continue;
-            const auto& rings = data.admin_exact_rings;
-            if (rings.polygons[i].ring_count == 0) continue;
-            const LatLng c = exact_polygon_centroid(rings.vertices.data(), rings.rings_of(static_cast<uint32_t>(i)),
-                                                    rings.polygons[i].ring_count);
-            poly.country_code = country_code_at_point(data, countries, c.first, c.second);
-            areas.fetch_add(1);
-            if (poly.country_code == 0) continue;
-            const char cc[3] = {static_cast<char>(std::tolower(poly.country_code >> 8)),
-                                static_cast<char>(std::tolower(poly.country_code & 0xFF)), 0};
-            if (!validate_postcode_for_country(cc, pool.data() + poly.name_id)) {
-                poly.place_type_override = POSTAL_AREA_INVALID;
-                invalid.fetch_add(1);
+    const auto& rings = data.admin_exact_rings;
+    const bool ids = data.admin_osm_ids.size() == data.admin_polygons.size();
+    // (boundary, slot) of each postal ring, a relation's together in ring order.
+    std::vector<std::pair<uint64_t, uint32_t>> rings_of;
+    for (uint32_t i = 0; i < data.admin_polygons.size(); i++) {
+        const AdminPolygon& poly = data.admin_polygons[i];
+        if (poly.admin_level != POSTAL_AREA_LEVEL || poly.name_id == NO_DATA || rings.polygons[i].ring_count == 0) continue;
+        rings_of.push_back({ids ? admin_boundary_id(data.admin_osm_ids[i]) : i, i});
+    }
+    std::sort(rings_of.begin(), rings_of.end(), [&](const auto& a, const auto& b) {
+        if (a.first != b.first) return a.first < b.first;
+        return ids ? data.admin_osm_ids[a.second] < data.admin_osm_ids[b.second] : a.second < b.second;
+    });
+    std::vector<size_t> starts;
+    for (size_t k = 0; k < rings_of.size(); k++)
+        if (k == 0 || rings_of[k].first != rings_of[k - 1].first) starts.push_back(k);
+    starts.push_back(rings_of.size());
+    const size_t areas = starts.size() - 1;
+
+    std::vector<uint16_t> country(areas);
+    parallel_for(areas, [&](size_t begin, size_t end, unsigned) {
+        for (size_t a = begin; a < end; a++) {
+            double weight = 0, lat = 0, lng = 0;
+            LatLng first{};
+            for (size_t k = starts[a]; k < starts[a + 1]; k++) {
+                const uint32_t i = rings_of[k].second;
+                const LatLng c = exact_polygon_centroid(rings.vertices.data(), rings.rings_of(i), rings.polygons[i].ring_count);
+                if (k == starts[a]) first = c;
+                const double area = data.admin_polygons[i].area;
+                weight += area;
+                lat += area * c.first;
+                lng += area * c.second;
             }
+            const LatLng centre = weight > 0 ? LatLng{lat / weight, lng / weight} : first;
+            country[a] = country_code_at_point(data, countries, centre.first, centre.second);
         }
     }, threads);
-    std::cerr << "Postal areas: " << areas.load() << " given their centroid's country, " << invalid.load()
-              << " of a postcode their country's pattern rejects" << std::endl;
+
+    // One after another: interning a postcode grows the pool. Each takes
+    // the postcode its country's pattern makes of its tag (m.norm), a US
+    // ZIP+4 its ZIP; one of no country known keeps its tag.
+    size_t invalid = 0, renamed = 0;
+    for (size_t a = 0; a < areas; a++) {
+        const uint16_t cc = country[a];
+        uint32_t name_id = data.admin_polygons[rings_of[starts[a]].second].name_id;
+        bool valid = true;
+        if (cc != 0) {
+            const std::string postcode = data.string_pool.data().data() + name_id;
+            const std::optional<std::string> norm = match_postcode(cc, postcode, PostcodeDefault::Any);
+            valid = norm.has_value();
+            if (valid && *norm != postcode) {
+                name_id = data.string_pool.intern(*norm);
+                renamed++;
+            }
+        }
+        invalid += !valid;
+        for (size_t k = starts[a]; k < starts[a + 1]; k++) {
+            AdminPolygon& poly = data.admin_polygons[rings_of[k].second];
+            poly.country_code = cc;
+            poly.name_id = name_id;
+            if (!valid) poly.place_type_override = POSTAL_AREA_INVALID;
+        }
+    }
+    std::cerr << "Postal areas: " << areas << " given their centroid's country (" << rings_of.size() << " rings), "
+              << invalid << " of a postcode their country's pattern rejects, " << renamed
+              << " renamed to the postcode it makes" << std::endl;
 }
 
 // Nominatim's find_linked_place for every boundary and place area
@@ -3980,9 +4026,11 @@ static int run(int argc, char* argv[]) {
         std::vector<PackedLocation>().swap(data.place_points);
 
         // TIGER and GeoNames write only the string pool, interpolations and
-        // postcode centroids, none of which the parent chains read, so they
-        // load alongside them. The GeoNames file is read meanwhile; its rows
-        // go in after TIGER's, as they always have.
+        // postcode centroids, none of which the admin parent chain reads, so
+        // they load alongside it. The streets' pass reads the postal areas'
+        // postcodes from the pool, which interning grows and moves, so it
+        // waits for them. The GeoNames file is read meanwhile; its rows go in
+        // after TIGER's, as they always have.
         std::future<ExternalPostcodes> external_postcodes;
         if (!external_postcodes_path.empty())
             external_postcodes = std::async(std::launch::async, read_external_postcodes, external_postcodes_path);
@@ -3999,9 +4047,9 @@ static int run(int argc, char* argv[]) {
 
         compute_admin_parent_chain(data, num_threads);
 
-        compute_way_parent_polygons(data, num_threads);
-
         std::future<void> tiger_freed = external_data.get();
+        compute_way_parent_polygons(data, num_threads);
+        timed_phase("    Addr: house postcodes", [&] { normalise_addr_postcodes(data, num_threads); });
         arenas_trimmed.get();
 #ifdef __GLIBC__
         std::cerr << "Trimmed malloc arenas: " << rss_before_trim << " -> "

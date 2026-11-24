@@ -87,6 +87,38 @@ impl Found<'_> {
             "type": self.typ,
         })
     }
+
+    /// The result as `place-search query` prints it: `to_json`, and how it was found (its kind's
+    /// letter, its score and the text's part of it, whether its context matched, its class and
+    /// its entity).
+    pub fn debug_json(&self) -> serde_json::Value {
+        let mut r = self.to_json();
+        r["kind"] = serde_json::json!(self.kind.letter().to_string());
+        r["score"] = serde_json::json!(self.hit.score);
+        r["text"] = serde_json::json!(self.hit.text);
+        r["context"] = serde_json::json!(self.hit.context);
+        r["class"] = serde_json::json!(self.hit.class);
+        r["entity"] = serde_json::json!(self.hit.entity);
+        r
+    }
+}
+
+/// The results as the node binding's searchPlaces and the test portal's /search answer them: a
+/// JSON array of each one's `to_json`, best first.
+pub fn results_json(found: &[Found]) -> String {
+    let results: Vec<String> = found.iter().map(|f| f.to_json().to_string()).collect();
+    format!("[{}]", results.join(","))
+}
+
+/// The line `place-search query` prints for the query `q`, which took `us` microseconds and the
+/// work `stats` counts: each result's `debug_json`, best first. The test portal's
+/// /search?debug=1 answers it too.
+pub fn debug_line(q: &str, us: f64, found: &[Found], stats: &QueryStats) -> serde_json::Value {
+    serde_json::json!({
+        "q": q, "us": us, "reverse_lookups": stats.reverse_lookups, "context_checks": stats.context_checks,
+        "keys": stats.keys_matched, "postings": stats.postings_read,
+        "results": found.iter().map(Found::debug_json).collect::<Vec<_>>(),
+    })
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -1004,6 +1036,45 @@ mod tests {
 
             assert_eq!(found.iter().map(|f| f.hit.entity).collect::<Vec<_>>(), want, "{q}");
         }
+    }
+
+    // The answers as the node binding's searchPlaces (results_json) and `place-search query`
+    // (debug_line) give them, byte for byte: a serde_json of preserve_order, which one of the
+    // dependency graphs they are built in could bring, would give their keys in another order.
+    #[test]
+    fn answers_are_the_bindings_and_the_clis_bytes() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        let mut g = Geo::default();
+        g.boundary("Testland", 2, [10.0, 20.0, 11.0, 21.0]);
+        g.place("Testville", 1, 10.5, 20.5);
+        g.poi("Testville Mill", 10.25, 20.75, 10);
+        let dir = TempDir::new("answer-bytes");
+        let geo = g.load(&dir.0.join("geo"));
+        build_search(&geo, &dir.0.join("idx"), None);
+        let idx = SearchIndex::open(&geo, &dir.0.join("idx"), None, None).unwrap();
+
+        let (found, stats) = Searcher::new(&idx).search("testville", 5);
+
+        assert_eq!(
+            results_json(&found),
+            concat!(
+                r#"[{"admin1name":"","admin2name":"","country":"","country_code":"\u0000\u0000","latitude":10.5,"longitude":20.5,"#,
+                r#""name":"Testville","type":"town"},"#,
+                r#"{"admin1name":"","admin2name":"","country":"","country_code":"\u0000\u0000","latitude":10.25,"longitude":20.75,"#,
+                r#""name":"Testville Mill","type":"unknown"}]"#,
+            )
+        );
+        assert_eq!(
+            debug_line("testville", 12.5, &found, &stats).to_string(),
+            concat!(
+                r#"{"context_checks":0,"keys":2,"postings":2,"q":"testville","results":["#,
+                r#"{"admin1name":"","admin2name":"","class":0,"context":false,"country":"","country_code":"\u0000\u0000","entity":0,"#,
+                r#""kind":"P","latitude":10.5,"longitude":20.5,"name":"Testville","score":0.20999999344348907,"text":1.0,"type":"town"},"#,
+                r#"{"admin1name":"","admin2name":"","class":0,"context":false,"country":"","country_code":"\u0000\u0000","#,
+                r#""entity":2147483648,"kind":"O","latitude":10.25,"longitude":20.75,"name":"Testville Mill","score":0.15616248548030853,"#,
+                r#""text":0.7749999761581421,"type":"unknown"}],"reverse_lookups":2,"us":12.5}"#,
+            )
+        );
     }
 
     #[test]

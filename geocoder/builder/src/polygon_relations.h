@@ -286,27 +286,67 @@ inline bool rings_equal(const PackedLocation* a, uint32_t na, const PackedLocati
     return false;
 }
 
+// Whether b lies on the segment from a to c, past a and before c: a vertex
+// there adds no point to an outline (exact, in e7 integers).
+inline bool straight_between(const PackedLocation& a, const PackedLocation& b, const PackedLocation& c) {
+    const __int128 ux = int64_t(b.lon_e7) - a.lon_e7, uy = int64_t(b.lat_e7) - a.lat_e7;
+    const __int128 vx = int64_t(c.lon_e7) - b.lon_e7, vy = int64_t(c.lat_e7) - b.lat_e7;
+    return ux * vy == uy * vx && ux * vx + uy * vy > 0;
+}
+
+// The outline of the closed ring v (n vertices) as a closed ring, into `out`:
+// one of each run of equal vertices, none that lies straight between the
+// vertices either side of it, and the first again last.
+inline void ring_outline(const PackedLocation* v, uint32_t n, std::vector<PackedLocation>& out) {
+    out.clear();
+    const uint32_t m = n > 1 && v[0] == v[n - 1] ? n - 1 : n;
+    for (uint32_t k = 0; k < m; k++) {
+        if (!out.empty() && out.back() == v[k]) continue;
+        while (out.size() >= 2 && straight_between(out[out.size() - 2], out.back(), v[k])) out.pop_back();
+        out.push_back(v[k]);
+    }
+    // Round the end, where the cycle closes.
+    for (bool changed = true; changed;) {
+        changed = false;
+        if (out.size() >= 2 && out.back() == out.front()) {
+            out.pop_back();
+            changed = true;
+        } else if (out.size() >= 3 && straight_between(out[out.size() - 2], out.back(), out.front())) {
+            out.pop_back();
+            changed = true;
+        } else if (out.size() >= 3 && straight_between(out.back(), out.front(), out[1])) {
+            out.erase(out.begin());
+            changed = true;
+        }
+    }
+    if (!out.empty()) out.push_back(out.front());
+}
+
 // ST_Equals as far as the rings tell it: the two multipolygons have the same
-// rings. (An extra vertex on a straight side makes another ring here, where
-// PostGIS would find the same point set.)
+// rings, each taken as its outline (ring_outline): a vertex along a straight
+// side, or a run of equal ones, adds no point, as PostGIS finds the same
+// point set either way.
 inline bool polygons_equal(const std::vector<RingPolygon>& a, const std::vector<RingPolygon>& b) {
     struct Ring {
-        const PackedLocation* v;
-        uint32_t n;
+        std::vector<PackedLocation> v;
         PackedLocation least;
     };
     auto rings_of = [](const std::vector<RingPolygon>& polygons) {
         std::vector<Ring> out;
         for (const RingPolygon& p : polygons)
             for (uint32_t r = 0; r < p.ring_count; r++) {
-                const PackedLocation* v = p.v + p.rings[r].begin;
-                const uint32_t n = p.rings[r].count;
-                out.push_back({v, n, n ? *std::min_element(v, v + n) : PackedLocation{0, 0}});
+                Ring ring;
+                ring_outline(p.v + p.rings[r].begin, p.rings[r].count, ring.v);
+                ring.least = ring.v.empty() ? PackedLocation{0, 0} : *std::min_element(ring.v.begin(), ring.v.end());
+                out.push_back(std::move(ring));
             }
-        auto key_less = [](const Ring& x, const Ring& y) { return x.n != y.n ? x.n < y.n : x.least < y.least; };
+        auto key_less = [](const Ring& x, const Ring& y) {
+            return x.v.size() != y.v.size() ? x.v.size() < y.v.size() : x.least < y.least;
+        };
         std::sort(out.begin(), out.end(), key_less);
         return out;
     };
+    auto key_equal = [](const Ring& x, const Ring& y) { return x.v.size() == y.v.size() && x.least == y.least; };
     const std::vector<Ring> ra = rings_of(a), rb = rings_of(b);
     if (ra.size() != rb.size()) return false;
     std::vector<bool> used(rb.size());
@@ -314,9 +354,11 @@ inline bool polygons_equal(const std::vector<RingPolygon>& a, const std::vector<
         bool matched = false;
         // The rings of b with ring i's key are a run round place i.
         size_t j = i;
-        while (j > 0 && rb[j - 1].n == ra[i].n && rb[j - 1].least == ra[i].least) j--;
-        for (; j < rb.size() && rb[j].n == ra[i].n && rb[j].least == ra[i].least; j++) {
-            if (used[j] || !rings_equal(ra[i].v, ra[i].n, rb[j].v, rb[j].n)) continue;
+        while (j > 0 && key_equal(rb[j - 1], ra[i])) j--;
+        for (; j < rb.size() && key_equal(rb[j], ra[i]); j++) {
+            if (used[j] || !rings_equal(ra[i].v.data(), static_cast<uint32_t>(ra[i].v.size()), rb[j].v.data(),
+                                        static_cast<uint32_t>(rb[j].v.size())))
+                continue;
             used[j] = matched = true;
             break;
         }

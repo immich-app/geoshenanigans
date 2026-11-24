@@ -13,9 +13,13 @@
 #include <atomic>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
+#include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "admin_rank_config.h"
 #include "id_allocator.h"
 #include "parallel.h"
 #include "types.h"

@@ -334,9 +334,18 @@ fn bit_group(bytes: &[u8], at: &mut usize, end: usize, head: &ArcHead, prev: &mu
     Some(c)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The arc blocks `arc_vertices` has decoded on this thread, for tests that count a walk's
+    /// reads.
+    pub(crate) static ARC_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Calls `f` with each vertex of an arc block in e7 units, in the order it stores them; their
 /// count, or None for a malformed block.
 pub(crate) fn arc_vertices(block: &[u8], mut f: impl FnMut(PointE7)) -> Option<u32> {
+    #[cfg(test)]
+    ARC_DECODES.with(|n| n.set(n.get() + 1));
     let head = arc_head(block)?;
     let e7 = |lat: i64, lng: i64| PointE7 { lat: lat * head.step, lng: lng * head.step };
     let (mut lat, mut lng) = (head.lat, head.lng);
@@ -357,11 +366,11 @@ pub(crate) fn arc_vertices(block: &[u8], mut f: impl FnMut(PointE7)) -> Option<u
     Some(n)
 }
 
-/// The highest latitude, in e7 units, of an arc block's vertices from its box; None for a block
+/// The box of an arc block's vertices in e7 units, [min_lng, max_lng, max_lat]; None for a block
 /// without a box, and a malformed one.
-pub(crate) fn arc_box_max_lat(block: &[u8]) -> Option<i64> {
+pub(crate) fn arc_box(block: &[u8]) -> Option<[i64; 3]> {
     let head = arc_head(block)?;
-    head.bbox.map(|[_, _, max_lat]| max_lat * head.step)
+    head.bbox.map(|side| side.map(|c| c * head.step))
 }
 
 /// What the ray from a point towards +lat does at one arc.

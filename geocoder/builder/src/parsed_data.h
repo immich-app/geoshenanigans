@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -523,6 +524,29 @@ struct ParsedData {
     };
     std::unordered_map<uint64_t, PostcodeAccum> postcode_accum;
 
+    // The houses whose tag makes a centroid of another postcode than the
+    // one they keep (normalise_addr_postcodes), those of a country of no
+    // pattern of its own: update_postcodes reads the tag (placex.address)
+    // with PostcodeFormatter's default, .*, and the clean-postcodes
+    // sanitizer with its own. Each as its addr_osm_ids entry, the postcode
+    // it keeps (NO_DATA for none) and postcode_key of the centroid's
+    // (kNoCentroid for none), sorted, their strings in the postcode tier
+    // (partition_strings_into_tiers), for collect_postcode_centroids
+    // (build-time only).
+    struct HouseCentroid {
+        uint64_t osm_id;
+        uint32_t house;
+        uint64_t key;
+        bool operator<(const HouseCentroid& o) const {
+            return std::tie(osm_id, house, key) < std::tie(o.osm_id, o.house, o.key);
+        }
+        bool operator==(const HouseCentroid& o) const {
+            return osm_id == o.osm_id && house == o.house && key == o.key;
+        }
+    };
+    static constexpr uint64_t kNoCentroid = UINT64_MAX;
+    std::vector<HouseCentroid> house_centroids;
+
     // Each linked place node's claimant, the boundary of its last link (the
     // link pass's), by which the node is hidden like Nominatim's
     // linked_place_id and names its claimant once the polygons have their
@@ -685,6 +709,8 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
         mark_each(data.interp_postcode_ids.size(), [&](size_t i) { mark(data.interp_postcode_ids[i], STR_TIER_BIT_POSTCODE); });
         mark_each(data.addr_postcode_ids.size(), [&](size_t i) { mark(data.addr_postcode_ids[i], STR_TIER_BIT_POSTCODE); });
         for (const auto& [key, _acc] : data.postcode_accum) mark(postcode_key_pc(key), STR_TIER_BIT_POSTCODE);
+        for (const ParsedData::HouseCentroid& h : data.house_centroids)
+            if (h.key != ParsedData::kNoCentroid) mark(postcode_key_pc(h.key), STR_TIER_BIT_POSTCODE);
 
         mark_each(data.poi_records.size(), [&](size_t i) {
             const auto& pr = data.poi_records[i];
@@ -853,6 +879,23 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
             if (!placed.inserted) placed.position->second = placed.node.mapped();
         }
         accum = std::move(remapped);
+    }
+    {
+        // A house whose postcode no address keeps any more is no house's.
+        auto& houses = data.house_centroids;
+        std::vector<ParsedData::HouseCentroid> kept;
+        kept.reserve(houses.size());
+        for (ParsedData::HouseCentroid h : houses) {
+            const uint32_t house = new_offset(h.house);
+            if (h.house != NO_DATA && house == NO_DATA) continue;
+            h.house = house;
+            if (h.key != ParsedData::kNoCentroid)
+                h.key = postcode_key(postcode_key_cc(h.key), new_offset(postcode_key_pc(h.key)));
+            kept.push_back(h);
+        }
+        std::sort(kept.begin(), kept.end());
+        kept.erase(std::unique(kept.begin(), kept.end()), kept.end());
+        houses = std::move(kept);
     }
 }
 

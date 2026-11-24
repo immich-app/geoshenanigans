@@ -1,13 +1,19 @@
 //! A bucket of one build for the download tests, served on localhost:
 //! builds/latest.json, builds/<DATE>/configurations.json and every file as
-//! compress_index.py publishes it. The manifest's files table lists every
+//! compress_index.py publishes it. A test can add builds of other dates and
+//! versions, of the same files (TestBucket::add_build), publish one again
+//! with its manifest changed (TestBucket::edit_build), and move latest.json
+//! to one (TestBucket::set_latest). The manifest's files table lists every
 //! path its components name, in each region of the template, each of bytes
 //! of its own: a dir's place, POI and arc files are a small dataset of that
 //! dir (the library's fixture encoders), the others made up, a region's JSON
-//! files alike as a build's are. A dir holding all the files of one of the
-//! template's transport units publishes the unit, the only form of them;
+//! files alike as a build's are; dirs a test names alike (serve_alike) hold
+//! the first one's bytes under each name. A dir holding all the files of one
+//! of the template's transport units publishes the unit, the only form of them;
 //! every other file goes as its .zst. A test can have it hold an object's
-//! body back half way (TestBucket::hold).
+//! body back half way (TestBucket::hold), or fail the next fetches of one
+//! (TestBucket::fail). A case of a host without CA certificates runs in a
+//! process of its own (without_ca_store).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,11 +38,14 @@ const TEMPLATE: &str = include_str!("../../builder/configurations.template.json"
 pub struct TestBucket {
     /// The base_url a configuration names the bucket by.
     pub url: String,
-    /// What it serves as builds/<DATE>/configurations.json.
+    /// The manifest of DATE as it first serves it, at
+    /// builds/<DATE>/configurations.json: a publication of DATE again
+    /// (edit_build) changes what it serves, not this.
     pub manifest: Configurations,
     file_requests: Arc<AtomicUsize>,
     files: BTreeMap<String, Vec<u8>>,
     hold: Arc<Mutex<Option<Hold>>>,
+    served: Arc<Served>,
 }
 
 /// An object whose body the bucket holds back half way (TestBucket::hold).
@@ -49,19 +58,24 @@ struct Hold {
 /// Held by a test while the bucket holds an object's body back: the rest
 /// goes once it is dropped.
 pub struct Holding {
+    path: String,
     reached: Arc<tokio::sync::Notify>,
     _go: tokio::sync::oneshot::Sender<()>,
 }
 
 impl Holding {
-    /// Returns once the bucket sent the first half of the body.
+    /// Returns once the bucket sent the first half of the body; panics,
+    /// naming the object, once it has waited a minute for it.
     pub async fn reached(&self) {
-        self.reached.notified().await
+        if tokio::time::timeout(std::time::Duration::from_secs(60), self.reached.notified()).await.is_err() {
+            panic!("waited a minute for the bucket to send half of {}", self.path);
+        }
     }
 }
 
 impl TestBucket {
-    /// How many objects (a file's .zst or a unit) it has served.
+    /// How many fetches of an object (a file's .zst or a unit) it has had,
+    /// those it failed (fail) among them.
     pub fn files_served(&self) -> usize {
         self.file_requests.load(Ordering::SeqCst)
     }
@@ -72,12 +86,60 @@ impl TestBucket {
     pub fn hold(&self, path: &str) -> Holding {
         let (reached, (go_tx, go)) = (Arc::new(tokio::sync::Notify::new()), tokio::sync::oneshot::channel());
         *self.hold.lock().unwrap() = Some(Hold { path: path.to_string(), reached: reached.clone(), go });
-        Holding { reached, _go: go_tx }
+        Holding { path: path.to_string(), reached, _go: go_tx }
     }
 
     /// The bytes of the file at `path`, as its manifest entry gives them.
     pub fn file(&self, path: &str) -> &[u8] {
         &self.files[path]
+    }
+
+    /// Serves a build of `date` too, of build version `version` and the
+    /// same files as DATE's.
+    pub fn add_build(&self, date: &str, version: u32) {
+        let mut manifest: serde_json::Value = serde_json::from_str(&self.served.builds.lock().unwrap()[DATE]).unwrap();
+        manifest["build"] = serde_json::json!({ "date": date, "version": version });
+        self.served.builds.lock().unwrap().insert(date.to_string(), manifest.to_string());
+    }
+
+    /// Publishes the build of `date` again, its manifest as `edit` changes
+    /// it (a rerun of the nightly over a date's build).
+    pub fn edit_build(&self, date: &str, edit: impl FnOnce(&mut serde_json::Value)) {
+        let mut builds = self.served.builds.lock().unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_str(&builds[date]).unwrap();
+        edit(&mut manifest);
+        builds.insert(date.to_string(), manifest.to_string());
+    }
+
+    /// Has latest.json name the build of `date`, of build version
+    /// `version` (none: a latest.json without one).
+    pub fn set_latest(&self, date: &str, version: Option<u32>) {
+        *self.served.latest.lock().unwrap() = latest_json(date, version);
+    }
+
+    /// Each fetch of an object (a file's .zst or a unit) it has had so far,
+    /// in order, those it failed (fail) among them: `<date>/<path>`.
+    pub fn requests(&self) -> Vec<String> {
+        self.served.requests.lock().unwrap().clone()
+    }
+
+    /// Fails the next `times` fetches of the object at `path` (a unit, or a
+    /// file's .zst), of any build, with a 503.
+    pub fn fail(&self, path: &str, times: usize) {
+        self.served.failing.lock().unwrap().insert(path.to_string(), times);
+    }
+}
+
+/// The build version of the template, which a build of the bucket has
+/// unless added as another (TestBucket::add_build).
+pub fn template_version() -> u32 {
+    serde_json::from_str::<serde_json::Value>(TEMPLATE).unwrap()["build"]["version"].as_u64().unwrap() as u32
+}
+
+fn latest_json(date: &str, version: Option<u32>) -> String {
+    match version {
+        Some(v) => format!("{{\"build_version\":{v},\"latest\":\"{date}\"}}"),
+        None => format!("{{\"latest\":\"{date}\"}}"),
     }
 }
 
@@ -87,21 +149,37 @@ pub fn template_components() -> serde_json::Value {
 }
 
 struct Served {
-    manifest: String,
+    /// What it serves as latest.json.
+    latest: Mutex<String>,
+    /// Each build's configurations.json, by date.
+    builds: Mutex<BTreeMap<String, String>>,
     objects: HashMap<String, Vec<u8>>,
     file_requests: Arc<AtomicUsize>,
+    requests: Mutex<Vec<String>>,
+    failing: Mutex<HashMap<String, usize>>,
     hold: Arc<Mutex<Option<Hold>>>,
 }
 
 async fn get(State(s): State<Arc<Served>>, Path(path): Path<String>) -> Response {
     if path == "latest.json" {
-        return format!("{{\"latest\":\"{DATE}\"}}").into_response();
+        return s.latest.lock().unwrap().clone().into_response();
     }
-    if path == format!("{DATE}/configurations.json") {
-        return s.manifest.clone().into_response();
+    let Some((date, rest)) = path.split_once('/') else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(manifest) = s.builds.lock().unwrap().get(date).cloned() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if rest == "configurations.json" {
+        return manifest.into_response();
     }
-    if let Some((object, body)) = path.strip_prefix(&format!("{DATE}/")).and_then(|p| s.objects.get_key_value(p)) {
+    if let Some((object, body)) = s.objects.get_key_value(rest) {
         s.file_requests.fetch_add(1, Ordering::SeqCst);
+        s.requests.lock().unwrap().push(path.clone());
+        if let Some(left) = s.failing.lock().unwrap().get_mut(object).filter(|left| **left > 0) {
+            *left -= 1;
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         let held = s.hold.lock().unwrap().take_if(|h| h.path == *object);
         if let Some(Hold { reached, go, .. }) = held {
             use futures_util::StreamExt;
@@ -234,10 +312,22 @@ pub async fn serve(components: serde_json::Value) -> TestBucket {
     serve_tampered(components, |_, _| {}).await
 }
 
+/// Serves a build whose manifest has `components`, the dirs `alike` holding
+/// under each name the bytes the first of them holds, as the place files
+/// and core strings of the planet build's modes full, no-addresses and
+/// admin are.
+pub async fn serve_alike(components: serde_json::Value, alike: &[&str]) -> TestBucket {
+    serve_with(components, |_, _| {}, alike).await
+}
+
 /// Serves a build whose manifest has `components`, each object's bytes
 /// before zstd (a unit's stream, a file's bytes) given to `tamper` by its
 /// path, to change, the manifest still the true files'.
 pub async fn serve_tampered(components: serde_json::Value, tamper: impl Fn(&str, &mut Vec<u8>)) -> TestBucket {
+    serve_with(components, tamper, &[]).await
+}
+
+async fn serve_with(components: serde_json::Value, tamper: impl Fn(&str, &mut Vec<u8>), alike: &[&str]) -> TestBucket {
     let template: serde_json::Value = serde_json::from_str(TEMPLATE).unwrap();
     let regions: Vec<&String> = template["axes"]["region"]["values"].as_object().unwrap().keys().collect();
     let mut paths = BTreeSet::new();
@@ -257,9 +347,10 @@ pub async fn serve_tampered(components: serde_json::Value, tamper: impl Fn(&str,
     let (mut files, mut objects) = (BTreeMap::new(), HashMap::new());
     let (mut entries, mut units) = (serde_json::Map::new(), serde_json::Map::new());
     for (dir, names) in &by_dir {
-        let fixture = dataset(dir);
+        let of = if alike.contains(&dir.as_str()) { alike[0] } else { dir.as_str() };
+        let fixture = dataset(of);
         let bytes: BTreeMap<&str, Vec<u8>> =
-            names.iter().map(|n| (n.as_str(), fixture.get(n.as_str()).cloned().unwrap_or_else(|| made_up(&format!("{dir}/{n}"))))).collect();
+            names.iter().map(|n| (n.as_str(), fixture.get(n.as_str()).cloned().unwrap_or_else(|| made_up(&format!("{of}/{n}"))))).collect();
         let mut in_unit = BTreeSet::new();
         for u in template["transport"]["units"].as_array().unwrap() {
             let held: Vec<&str> = u["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).collect();
@@ -297,13 +388,77 @@ pub async fn serve_tampered(components: serde_json::Value, tamper: impl Fn(&str,
             files.insert(path, b.clone());
         }
     }
-    let manifest = serde_json::json!({ "build": { "date": DATE }, "components": components, "files": entries, "units": units });
+    // The template's own sections besides, as a build's manifest has them.
+    let mut manifest = template.clone();
+    manifest["build"] = serde_json::json!({ "date": DATE, "version": template["build"]["version"] });
+    manifest["components"] = components;
+    manifest["files"] = entries.into();
+    manifest["units"] = units.into();
 
     let (file_requests, hold) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)));
-    let served = Arc::new(Served { manifest: manifest.to_string(), objects, file_requests: file_requests.clone(), hold: hold.clone() });
-    let app = axum::Router::new().route("/builds/{*path}", axum::routing::get(get)).with_state(served);
+    let served = Arc::new(Served {
+        latest: Mutex::new(latest_json(DATE, Some(template_version()))),
+        builds: Mutex::new(BTreeMap::from([(DATE.to_string(), manifest.to_string())])),
+        objects,
+        file_requests: file_requests.clone(),
+        requests: Mutex::new(Vec::new()),
+        failing: Mutex::new(HashMap::new()),
+        hold: hold.clone(),
+    });
+    let app = axum::Router::new().route("/builds/{*path}", axum::routing::get(get)).with_state(served.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    TestBucket { url: format!("http://{addr}"), manifest: serde_json::from_value(manifest).unwrap(), file_requests, files, hold }
+    TestBucket { url: format!("http://{addr}"), manifest: serde_json::from_value(manifest).unwrap(), file_requests, files, hold, served }
+}
+
+/// Set for a process `without_ca_store` starts.
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+pub const NO_CA_STORE: &str = "GEOCODER_TEST_NO_CA_STORE";
+
+/// Runs the ignored test `name` of this binary alone, in a process of its
+/// own whose CA store is empty: SSL_CERT_FILE and SSL_CERT_DIR, which name
+/// the store in place of the system's where it is read from files (Unix but
+/// Apple's and Android's: elsewhere the verifier asks the system, which they
+/// don't change), name none, and NO_CA_STORE is set. The two are the
+/// process's, so it runs apart. Panics with its output unless it passed.
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+pub fn without_ca_store(name: &str) {
+    let empty = ScratchDir::new();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--ignored", "--test-threads=1"])
+        .env("SSL_CERT_FILE", empty.path().join("none.pem"))
+        .env("SSL_CERT_DIR", empty.path())
+        .env(NO_CA_STORE, "1")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && stdout.contains(" 1 passed;"), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A CA certificate of no one's, self-signed, its key thrown away: a store
+/// the client builds with, and the bucket, of plain HTTP, never asks for it.
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+const TEST_CA: &str = "-----BEGIN CERTIFICATE-----
+MIIBfDCCASKgAwIBAgIUALXgKemIbz/MhEkVWAJ5pfbUXyIwCgYIKoZIzj0EAwIw
+GzEZMBcGA1UEAwwQZ2VvY29kZXIgdGVzdCBDQTAgFw0yNjExMjMyMDE3MDdaGA8y
+MTI2MTAzMDIwMTcwN1owGzEZMBcGA1UEAwwQZ2VvY29kZXIgdGVzdCBDQTBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABBsXpEgb5tuTIbszY0eKXGlLFQBAcJxwthjM
+37dCc0ANoKmnGL97NqFrNeuw1crik6vrHRZYbUavNONOB1t5+jmjQjBAMB0GA1Ud
+DgQWBBTaVqM64tlUtORGKJxgEMAF9tAjVzAPBgNVHRMBAf8EBTADAQH/MA4GA1Ud
+DwEB/wQEAwICBDAKBggqhkjOPQQDAgNIADBFAiEA0fpbsRDb6LEPJeV6GybFv76L
+pis9+k8eFkw/rp4JIuACIFgTRdGzU46T24xNttrCePT+/UVqgJKMkPn9UJa8fdOl
+-----END CERTIFICATE-----
+";
+
+/// Gives a process of `without_ca_store` its certificates: SSL_CERT_FILE
+/// names TEST_CA, written into `dir`, not the host's store, which may be
+/// none; SSL_CERT_DIR still names an empty dir. The process runs its case
+/// alone, on a runtime of one thread, so the change is safe there.
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+pub fn with_test_ca(dir: &std::path::Path) {
+    let file = dir.join("test-ca.pem");
+    std::fs::write(&file, TEST_CA).unwrap();
+    std::env::set_var("SSL_CERT_FILE", file);
 }

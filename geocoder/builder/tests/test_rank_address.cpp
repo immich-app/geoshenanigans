@@ -3,6 +3,8 @@
 // one of its rules, laid out as the rings of the objects it was found on.
 #include "rank_address.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <string>
@@ -647,4 +649,167 @@ TEST(an_admin_level_is_the_number_nominatims_import_reads_from_its_tag) {
     CHECK_EQ(nominatim_admin_level("nan"), uint8_t(15));
     CHECK_EQ(nominatim_admin_level(""), uint8_t(15));
     CHECK_EQ(nominatim_admin_level(nullptr), uint8_t(15));
+}
+
+// The cases of #533's is_same pass (take_out_repeated_boundaries there) and of its query-time
+// rank steps, on the rank pass.
+
+namespace {
+
+// The closed ring through ring's distinct vertices from its k-th, closed again.
+Ring rotated(const Ring& ring, size_t k) {
+    Ring out(ring.begin() + static_cast<std::ptrdiff_t>(k), ring.end() - 1);
+    out.insert(out.end(), ring.begin(), ring.begin() + static_cast<std::ptrdiff_t>(k));
+    out.push_back(out.front());
+    return out;
+}
+
+Ring reversed(Ring ring) {
+    std::reverse(ring.begin(), ring.end());
+    return ring;
+}
+
+}  // namespace
+
+TEST(the_nested_step_stops_at_25_under_a_parent_of_24) {
+    // Upper Ward (admin_level 9, 18) takes its linked neighbourhood's 24, and Lower Ward (10, 20,
+    // linked to a neighbourhood too) inside it 25, the most the admin-nested step gives under a
+    // parent of 24 or more (placex_triggers.sql:903-904): its node's 24 is no higher than the
+    // parent's, so the link leaves it there.
+    World w("GB");
+    w.relation(1, 4, Box{50, -2, 53, 2});
+    const uint32_t upper = w.relation(2, 9, Box{51.0, -0.5, 51.5, 0.5}, {AdminPlaceType::NONE, AdminPlaceType::NEIGHBOURHOOD});
+    const uint32_t lower = w.relation(3, 10, Box{51.1, -0.4, 51.4, 0.4}, {AdminPlaceType::NONE, AdminPlaceType::NEIGHBOURHOOD});
+    w.rank();
+    CHECK_EQ(w.of(upper), uint8_t(24));
+    CHECK_EQ(w.of(lower), uint8_t(25));
+}
+
+TEST(a_duplicate_boundary_takes_its_nodes_rank_under_a_parent_of_24_and_none_of_a_node_of_rank_0) {
+    // is_same takes a boundary that repeats its parent out of addresses and leaves
+    // parent_address_level at 3, so the city node it links gives it 16 back (:1161) under a parent
+    // of 24, where it would rank 25, and a boundary inside it ranks under 16. One linking a
+    // place=state node, of no address rank as a node, stays out.
+    World w("GB");
+    w.relation(1, 4, Box{50, -2, 53, 2});
+    const Box ward{51.0, -0.5, 51.5, 0.5};
+    const uint32_t l8 = w.relation(2, 8, ward, {AdminPlaceType::NONE, AdminPlaceType::NEIGHBOURHOOD, "Q5"});
+    const uint32_t l10 = w.relation(3, 10, ward, {AdminPlaceType::NONE, AdminPlaceType::CITY, "Q5"});
+    const uint32_t l11 = w.relation(4, 11, Box{51.1, -0.4, 51.4, 0.4});
+    w.rank();
+    CHECK_EQ(w.of(l8), uint8_t(24));
+    CHECK_EQ(w.of(l10), uint8_t(16));
+    CHECK_EQ(w.of(l11), uint8_t(22));
+
+    World v("GB");
+    v.relation(1, 4, Box{50, -2, 53, 2});
+    v.relation(2, 8, ward, {AdminPlaceType::NONE, AdminPlaceType::NONE, "Q6"});
+    const uint32_t state = v.relation(3, 10, ward, {AdminPlaceType::NONE, AdminPlaceType::STATE, "Q6"});
+    v.rank();
+    CHECK_EQ(v.of(state), uint8_t(0));
+}
+
+TEST(a_boundary_relation_repeating_its_closest_parent_relation_ranks_0) {
+    // placex_update (placex_triggers.sql:909-931): a boundary=administrative relation of a rank
+    // above 0 whose closest boundary relation round it, of a lower admin level above 3 and a rank
+    // between 1 and 25, has its wikidata and geometry ranks 0. In the Netherlands, where
+    // admin_level 9 ranks 0: a woonplaats (10) along its gemeente's (8) outline, written from
+    // another vertex and the other way round, of its wikidata, ranks 0; one that links a place
+    // node repeats it too but takes the node's rank back (:1161); one of another wikidata does
+    // not, nor one round another outline; one under a level 9 boundary of the same outline and
+    // wikidata does, by the gemeente past it; one under a closed way of its outline does not, the
+    // province past the way having no wikidata of its; and a province along the country's
+    // outline, of its wikidata, does not, the country's level being under 4.
+    World w("NL");
+    using T = Tags;
+    const auto none = AdminPlaceType::NONE;
+    w.relation(2, 2, Box{0, 0, 1, 1}, T{none, none, "Q8"});
+    w.relation(4, 4, Box{0.1, 0.1, 0.9, 0.9});
+    const Ring sq = square(Box{0.2, 0.2, 0.3, 0.3});
+    w.relation(8, 8, sq, T{none, none, "Q1"});
+    const uint32_t repeats = w.relation(10, 10, reversed(rotated(sq, 2)), T{none, none, "Q1"});
+    w.relation(18, 8, Box{0.2, 0.4, 0.3, 0.5}, T{none, AdminPlaceType::CITY, "Q2"});
+    const uint32_t takes_back = w.relation(20, 10, Box{0.2, 0.4, 0.3, 0.5}, T{none, AdminPlaceType::TOWN, "Q2"});
+    w.relation(28, 8, Box{0.2, 0.6, 0.3, 0.7}, T{none, none, "Q3"});
+    const uint32_t other_wikidata = w.relation(30, 10, Box{0.2, 0.6, 0.3, 0.7}, T{none, none, "Q4"});
+    w.relation(38, 8, Box{0.4, 0.2, 0.5, 0.3}, T{none, none, "Q5"});
+    const uint32_t other_outline = w.relation(40, 10, Box{0.41, 0.21, 0.49, 0.29}, T{none, none, "Q5"});
+    w.relation(48, 8, Box{0.4, 0.4, 0.5, 0.5}, T{none, none, "Q6"});
+    w.relation(49, 9, Box{0.4, 0.4, 0.5, 0.5}, T{none, none, "Q6"});
+    const uint32_t past_level_9 = w.relation(50, 10, Box{0.4, 0.4, 0.5, 0.5}, T{none, none, "Q6"});
+    w.way(58, 8, Box{0.4, 0.6, 0.5, 0.7});
+    const uint32_t under_way = w.relation(60, 10, Box{0.4, 0.6, 0.5, 0.7}, T{none, none, "Q7"});
+    const uint32_t province = w.relation(64, 4, Box{0, 0, 1, 1}, T{none, none, "Q8"});
+    const RankStats stats = w.rank();
+    CHECK_EQ(w.of(repeats), uint8_t(0));
+    CHECK_EQ(w.of(takes_back), uint8_t(16));
+    CHECK_EQ(w.of(other_wikidata), uint8_t(16));
+    CHECK_EQ(w.of(other_outline), uint8_t(16));
+    CHECK_EQ(w.of(past_level_9), uint8_t(0));
+    CHECK_EQ(w.of(under_way), uint8_t(16));
+    CHECK_EQ(w.of(province), uint8_t(8));
+    CHECK_EQ(stats.duplicates, size_t(3));
+}
+
+TEST(a_boundary_repeats_the_closest_relation_round_its_own_point) {
+    // placex_update compares a boundary with the boundary relation of the highest admin level
+    // round its centroid, of a lower level above 3 and a rank of 1 to 25 (placex_triggers.sql:
+    // 916-931). A level 10 boundary along a level 8 one, of its wikidata, lies under a level 9
+    // closed way, and under a level 9 relation of rank 0 in the Netherlands, each holding its
+    // point but reaching far east, their own points outside the pair: both repeat their level 8
+    // parent, found round their own point.
+    World w("NL");
+    const auto none = AdminPlaceType::NONE;
+    w.relation(4, 4, Box{0.1, 0.1, 0.9, 0.9});
+    w.relation(8, 8, Box{0.2, 0.2, 0.3, 0.3}, Tags{none, none, "Q1"});
+    const uint32_t under_way = w.relation(10, 10, rotated(square(Box{0.2, 0.2, 0.3, 0.3}), 1), Tags{none, none, "Q1"});
+    w.way(1, 9, Box{0.24, 0.24, 0.26, 0.8});
+    w.relation(18, 8, Box{0.5, 0.2, 0.6, 0.3}, Tags{none, none, "Q2"});
+    const uint32_t under_rank0 = w.relation(20, 10, Box{0.5, 0.2, 0.6, 0.3}, Tags{none, none, "Q2"});
+    w.relation(19, 9, Box{0.54, 0.24, 0.56, 0.8});
+    w.rank();
+    CHECK_EQ(w.of(under_way), uint8_t(0));
+    CHECK_EQ(w.of(under_rank0), uint8_t(0));
+}
+
+TEST(a_boundary_repeats_a_parent_whose_outline_has_more_vertices_along_its_edges) {
+    // ST_Equals compares the outlines: a vertex along a straight edge, or two in a row, adds no
+    // point. A level 10 boundary with one on its south edge and two on its east edge, and a hole
+    // with one more, repeats its level 8 parent; one with a vertex an e7 step off the edge
+    // does not.
+    World w("PL");
+    const auto none = AdminPlaceType::NONE;
+    w.relation(4, 4, Box{0.1, 0.1, 0.9, 0.9});
+    const Ring hole = reversed(square(Box{0.24, 0.24, 0.26, 0.26}));
+    w.relation(8, 8, square(Box{0.2, 0.2, 0.3, 0.3}), Tags{none, none, "Q1"}, 0, {hole});
+    const Ring more = ring_of({{0.2, 0.2}, {0.2, 0.25}, {0.2, 0.3}, {0.24, 0.3}, {0.27, 0.3}, {0.3, 0.3}, {0.3, 0.2}});
+    const Ring hole_more = ring_of({{0.24, 0.24}, {0.26, 0.24}, {0.26, 0.26}, {0.25, 0.26}, {0.24, 0.26}});
+    const uint32_t repeats = w.relation(10, 10, more, Tags{none, none, "Q1"}, 0, {hole_more});
+    w.relation(28, 8, Box{0.5, 0.2, 0.6, 0.3}, Tags{none, none, "Q2"});
+    Ring off = ring_of({{0.5, 0.2}, {0.5, 0.25}, {0.5, 0.3}, {0.6, 0.3}, {0.6, 0.2}});
+    off[1].lat_e7 += 1;
+    const uint32_t differs = w.relation(30, 10, off, Tags{none, none, "Q2"});
+    w.rank();
+    CHECK_EQ(w.of(repeats), uint8_t(0));
+    CHECK_EQ(w.of(differs), uint8_t(20));
+}
+
+TEST(every_ring_of_a_boundary_that_repeats_its_parent_ranks_0_and_only_of_equal_rings) {
+    // ST_Equals: a relation of two outer rings, one with a hole, repeats one of the same rings in
+    // another order, and every ring of it ranks 0; one whose hole differs does not, nor one
+    // under it that lacks its other ring.
+    World w("PL");
+    const auto none = AdminPlaceType::NONE;
+    w.relation(1, 4, Box{0.1, 0.1, 0.9, 0.9});
+    const Ring west = square(Box{0.2, 0.2, 0.4, 0.4}), east = square(Box{0.2, 0.5, 0.4, 0.7});
+    const Ring hole = reversed(square(Box{0.25, 0.55, 0.3, 0.6})), other_hole = reversed(square(Box{0.25, 0.55, 0.31, 0.6}));
+    const Tags q{none, none, "Q270"};
+    const uint32_t parent_west = w.relation(6, 6, west, q, 0), parent_east = w.relation(6, 6, east, q, 1, {hole});
+    const uint32_t same_east = w.relation(7, 7, rotated(east, 1), q, 0, {hole}), same_west = w.relation(7, 7, west, q, 1);
+    const uint32_t holed_west = w.relation(8, 8, west, q, 0), holed_east = w.relation(8, 8, east, q, 1, {other_hole});
+    const uint32_t lacking = w.relation(9, 9, east, q, 0, {other_hole});
+    w.rank();
+    CHECK_EQ(w.of(same_east), uint8_t(0));
+    CHECK_EQ(w.of(same_west), uint8_t(0));
+    for (uint32_t pid : {parent_west, parent_east, holed_west, holed_east, lacking}) CHECK(w.of(pid) != 0);
 }
