@@ -3,10 +3,10 @@
 // validate_postcode_for_country(cc, pc) validates a postcode against a
 // per-country pattern (auto-generated from Nominatim country_settings.yaml).
 // These tests lock in the CURRENT behaviour: input normalization (lowercasing,
-// stripping spaces/hyphens), per-country length+char rules, the "always true"
-// and "always false" country buckets, the unknown-country default, and the
-// null/empty/length guard rails. They are a regression net for refactors, not
-// a spec.
+// stripping spaces/hyphens, the country's code before the postcode),
+// per-country length+char rules, the "always false" country bucket, the
+// unknown-country default, and the null/empty/length guard rails. They are a
+// regression net for refactors, not a spec.
 #include "postcode_validation.h"
 
 #include "test_framework.h"
@@ -195,18 +195,84 @@ TEST(postcode_always_false_countries) {
     CHECK(!validate_postcode_for_country("bs", "N1234"));
 }
 
-// ---- "Always true" bucket (pattern present but loosely accepted) -----------
+// ---- Patterns with letters, prefixes, choices of length ---------------------
 
-TEST(postcode_always_true_countries) {
-    // These return true for any non-empty bare string of len 1..10.
+TEST(postcode_saudi_arabia_takes_five_digits_and_four_more) {
+    // ddddd(?:-dddd)?: 12345 and 12345-6789, but no letters after the hyphen.
+    CHECK(validate_postcode_for_country("sa", "12345"));
+    CHECK(validate_postcode_for_country("sa", "12345-6789"));
+    CHECK(!validate_postcode_for_country("sa", "12345-ABCD"));
+    CHECK(!validate_postcode_for_country("sa", "1234"));
+    CHECK(!validate_postcode_for_country("sa", "12345-678"));
+}
+
+TEST(postcode_patterns_of_letters_and_fixed_codes) {
     CHECK(validate_postcode_for_country("ai", "2640"));
+    CHECK(!validate_postcode_for_country("ai", "ZZZ"));
     CHECK(validate_postcode_for_country("ar", "C1425"));
-    CHECK(validate_postcode_for_country("bb", "BB12345"));
+    CHECK(validate_postcode_for_country("ar", "C1425DKA"));
+    CHECK(validate_postcode_for_country("ar", "1425"));
+    CHECK(!validate_postcode_for_country("ar", "C1425DK"));
     CHECK(validate_postcode_for_country("ie", "D02 AF30"));
-    CHECK(validate_postcode_for_country("lv", "1234"));
+    CHECK(!validate_postcode_for_country("ie", "D02 AB30"));  // B is no Eircode letter
+    CHECK(validate_postcode_for_country("gg", "GY1 1AA"));
+    CHECK(validate_postcode_for_country("je", "JE2 3AB"));
+    CHECK(validate_postcode_for_country("im", "IM99 1AA"));
+    CHECK(!validate_postcode_for_country("im", "GY1 1AA"));
+    CHECK(validate_postcode_for_country("fk", "FIQQ 1ZZ"));
+    CHECK(!validate_postcode_for_country("fk", "FIQQ 1ZY"));
+    CHECK(validate_postcode_for_country("sh", "STHL 1ZZ"));
+    CHECK(validate_postcode_for_country("mt", "VLT 1010"));
+    CHECK(!validate_postcode_for_country("mt", "VL 1010"));
+    CHECK(validate_postcode_for_country("gh", "GA-123-4567"));
+    CHECK(validate_postcode_for_country("gh", "GA-1234-5678"));
+    CHECK(!validate_postcode_for_country("gh", "GA-12-3456"));
+    CHECK(validate_postcode_for_country("kz", "A10A3B5"));
+    CHECK(validate_postcode_for_country("kz", "010000"));
+    CHECK(!validate_postcode_for_country("kz", "A10A3BB"));
+}
+
+TEST(postcode_patterns_of_digits_and_choices_of_length) {
+    CHECK(validate_postcode_for_country("pl", "00-950"));
+    CHECK(!validate_postcode_for_country("pl", "00-95"));
+    CHECK(validate_postcode_for_country("pt", "1000"));
+    CHECK(validate_postcode_for_country("pt", "1000-001"));
+    CHECK(!validate_postcode_for_country("pt", "1000-01"));
+    CHECK(validate_postcode_for_country("tw", "100"));
+    CHECK(validate_postcode_for_country("tw", "10048"));
+    CHECK(validate_postcode_for_country("tw", "100048"));
+    CHECK(!validate_postcode_for_country("tw", "1004"));
+    CHECK(validate_postcode_for_country("lb", "1103 2010"));
+    CHECK(!validate_postcode_for_country("lb", "110320"));
+    CHECK(validate_postcode_for_country("mz", "1100-01"));
+    CHECK(validate_postcode_for_country("cy", "1010"));
+    CHECK(validate_postcode_for_country("cy", "99010"));
+    CHECK(!validate_postcode_for_country("cy", "98010"));
+    CHECK(validate_postcode_for_country("mc", "98000"));
+    CHECK(!validate_postcode_for_country("mc", "97000"));
+    CHECK(validate_postcode_for_country("sm", "47890"));
+    CHECK(validate_postcode_for_country("va", "00120"));
+    CHECK(!validate_postcode_for_country("va", "00121"));
+    CHECK(validate_postcode_for_country("pw", "96940"));
+    CHECK(!validate_postcode_for_country("pw", "96941"));
+    // Iran's (ddddd)[-_ ]?(ddddd), whose underscore stays: 11 characters.
+    CHECK(validate_postcode_for_country("ir", "1234567890"));
+    CHECK(validate_postcode_for_country("ir", "12345-67890"));
+    CHECK(validate_postcode_for_country("ir", "12345_67890"));
+    CHECK(!validate_postcode_for_country("ir", "12345_6789"));
+}
+
+TEST(postcode_the_country_s_code_may_lead) {
+    // CountryPostcodeMatcher matches \s*(?:CC[ -]?)?(pattern)\s*.
+    CHECK(validate_postcode_for_country("lv", "1050"));
+    CHECK(validate_postcode_for_country("lv", "LV-1050"));
     CHECK(validate_postcode_for_country("md", "MD2001"));
-    // arbitrary junk still passes for an "always true" country (within len).
-    CHECK(validate_postcode_for_country("ai", "ZZZ"));
+    CHECK(validate_postcode_for_country("bb", "BB12345"));
+    CHECK(validate_postcode_for_country("ky", "KY1-1000"));
+    CHECK(validate_postcode_for_country("lt", "LT-01100"));
+    CHECK(validate_postcode_for_country("de", "DE 10115"));
+    CHECK(!validate_postcode_for_country("lv", "LT-1050"));
+    CHECK(!validate_postcode_for_country("lv", "LV-105"));
 }
 
 // ---- Unknown country: default branch len 3..10 -----------------------------
@@ -229,7 +295,6 @@ TEST(postcode_unknown_country_too_short_after_strip) {
 TEST(postcode_over_10_chars_rejected_even_unknown) {
     // 11 bare chars exceeds the hard cap regardless of country.
     CHECK(!validate_postcode_for_country("zz", "ABCDEFGHIJK"));
-    // and for an "always true" country the >10 cap still applies.
     CHECK(!validate_postcode_for_country("ai", "ABCDEFGHIJK"));
 }
 

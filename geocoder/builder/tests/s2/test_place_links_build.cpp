@@ -9,9 +9,9 @@
 // is in no address, one that links one takes the node's rank, a
 // place=province area is an address area where its country ranks it, a
 // postal area names a point only of its own country, one for a relation, and
-// of a postcode its country takes, whatever its length, a US ZIP+4 its ZIP,
-// and a place area linked to a place node of another type ranks by its own
-// place tag.
+// of a postcode its country's pattern takes, whatever its length, a US ZIP+4
+// its ZIP, and a place area linked to a place node of another type ranks by
+// its own place tag.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -261,11 +261,17 @@ TEST(a_postal_area_of_an_extended_postcode_its_country_takes_names_a_point_and_a
     f.country(20, 40, 25, 45, "Saudi Arabia", "SA");
     f.area(22.4, 42.4, 22.6, 42.6, {{"type", "boundary"}, {"boundary", "postal_code"}, {"postal_code", "12345-6789"}});
     f.line({{22.5, 42.45}, {22.5, 42.55}}, {{"highway", "residential"}, {"name", "Shari Al Test"}});
-    const std::vector<std::string> answers = answers_of(f, "extended-postcode", {{22.45, 42.45}, {22.5002, 42.5}});
-    REQUIRE(answers.size() == 2);
+    // One of letters after the hyphen, which the pattern rejects, names nothing: the area of
+    // 54321 round it names the point, whose centroid lies farther from it.
+    f.area(23.49, 43.49, 23.51, 43.51, {{"type", "boundary"}, {"boundary", "postal_code"}, {"postal_code", "12345-ABCD"}});
+    f.area(23.4, 43.4, 23.8, 43.8, {{"type", "boundary"}, {"boundary", "postal_code"}, {"postal_code", "54321"}});
+    const std::vector<std::string> answers =
+        answers_of(f, "extended-postcode", {{22.45, 42.45}, {22.5002, 42.5}, {23.5, 43.5}});
+    REQUIRE(answers.size() == 3);
     CHECK(names(answers[0], "postcode", "12345-6789"));
     CHECK(names(answers[1], "road", "Shari Al Test"));
     CHECK(names(answers[1], "postcode", "12345-6789"));
+    CHECK(names(answers[2], "postcode", "54321"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 
