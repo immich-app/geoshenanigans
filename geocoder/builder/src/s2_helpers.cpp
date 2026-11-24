@@ -272,6 +272,7 @@ void add_admin_polygon(ParsedData& data,
     poly.name_id = data.string_pool.intern(name);
     poly.admin_level = admin_level;
     poly.place_type_override = place_type_override;
+    poly.of_way = 1;
     // Its one member way runs along the whole ring, however it is rotated.
     std::vector<std::vector<WayRun>> runs;
     if (osm_way_id != 0 && vertices.size() >= 2)

@@ -122,6 +122,8 @@ jobs:
     name: Plan Terragrunt
     runs-on: ubuntu-latest
     strategy:
+      # One environment's failed plan shouldn't cancel the other's.
+      fail-fast: false
       matrix:
         environment: [dev, prod]
     if: github.ref != 'refs/heads/main' && github.event_name != 'workflow_dispatch'

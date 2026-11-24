@@ -17,10 +17,5 @@ variable "o11y_vmauth_token" {
   sensitive = true
 }
 
-# Only for destroying the dashboards and alerts this module used to keep in the old monitoring.immich.cloud Grafana;
-# remove with the provider once that apply has run in both environments.
-variable "grafana_url" {}
-variable "grafana_token" {}
-
 variable "tigris_read_key_id" {}
 variable "tigris_read_access_key" {}

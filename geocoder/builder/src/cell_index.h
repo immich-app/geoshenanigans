@@ -59,12 +59,25 @@ AdminRings border_country_rings(const ParsedData& data, unsigned int threads = 0
 // (border_country_rings). 0 if unknown.
 uint16_t country_code_at_point(const ParsedData& data, const AdminRings& countries, double lat, double lng);
 
+// Each house's addr:postcode in data.addr_postcode_ids becomes the postcode
+// the clean-postcodes sanitizer makes of it in the house's country
+// (match_postcode, the sanitizer's default for a country without a pattern),
+// interned, or none where the pattern rejects it: the house then takes its
+// street's (placex_update). A house of no country known keeps its tag. One
+// whose tag makes a centroid of another postcode, update_postcodes matching
+// it by PostcodeFormatter's default, goes to data.house_centroids. Runs while
+// the pool interns, before the addr points are ordered.
+void normalise_addr_postcodes(ParsedData& data, unsigned threads = 0);
+
 // Fold the OSM addr:postcode points into data.postcode_accum per
-// (country, postcode), keeping external centroids only for the pairs OSM
-// lacks. Run once on the full data before the continent split, so every
-// region writes the same centroids (Nominatim's location_postcode is one
-// table) instead of recomputing them from its own subset of addr points.
-// With collect_postcode_grid, the last reader of data.admin_exact_rings.
+// (country, postcode), each house by the postcode update_postcodes makes of
+// its tag: the one it keeps (normalise_addr_postcodes), or its
+// data.house_centroids entry's, which this frees. External centroids fill
+// only the pairs OSM lacks, of a postcode their country's pattern takes. Run
+// once on the full data before the continent split, so every region writes
+// the same centroids (Nominatim's location_postcode is one table) instead of
+// recomputing them from its own subset of addr points. With
+// collect_postcode_grid, the last reader of data.admin_exact_rings.
 void collect_postcode_centroids(ParsedData& data);
 
 // The postcode grid's cells (postcode_grid_build.h) of the full data's

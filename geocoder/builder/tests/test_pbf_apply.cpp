@@ -5,12 +5,21 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <iterator>
+#include <linux/magic.h>
 #include <set>
+#include <sstream>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/statfs.h>
 #include <tuple>
+#include <utility>
 #include <vector>
 
+#include "captured_stderr.h"
 #include "pbf_test_objects.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
@@ -367,6 +376,7 @@ TEST(apply_writes_the_header_the_options_ask_for) {
     CHECK(out.required_features == std::vector<std::string>({"OsmSchema-V0.6", "DenseNodes"}));
     CHECK(out.optional_features == std::vector<std::string>({"Sort.Type_then_ID"}));
     CHECK_EQ(out.source, std::string("test source"));
+    CHECK_EQ(out.writingprogram, std::string("pbf-apply"));
     CHECK(out.replication_timestamp == std::optional<int64_t>(T0));
     CHECK(!out.replication_sequence.has_value());
     CHECK_EQ(out.replication_base_url, in.replication_base_url);
@@ -375,4 +385,243 @@ TEST(apply_writes_the_header_the_options_ask_for) {
     write_test_pbf(opt.input, {node(1, 1)}, 5, in);
     CHECK_EQ(refusal_of([&] { apply_changes(opt); }),
              std::string("input PBF requires unsupported feature HistoricalInformation (history files are not supported)"));
+}
+
+namespace {
+
+// The share of a file's pages in the page cache, or a negative number where
+// that can't be seen: a tmpfs keeps every page.
+double resident_share(const std::string& path) {
+    struct statfs fs;
+    if (statfs(path.c_str(), &fs) != 0 || fs.f_type == TMPFS_MAGIC) return -1;
+    int fd = open(path.c_str(), O_RDONLY);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size == 0) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    const size_t size = size_t(st.st_size), page = size_t(sysconf(_SC_PAGESIZE));
+    void* map = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return -1;
+    std::vector<unsigned char> pages((size + page - 1) / page);
+    double share = -1;
+    if (mincore(map, size, pages.data()) == 0)
+        share = double(std::count_if(pages.begin(), pages.end(), [](unsigned char p) { return p & 1; })) / double(pages.size());
+    munmap(map, size);
+    return share;
+}
+
+std::string file_bytes(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    std::stringstream s;
+    s << f.rdbuf();
+    return s.str();
+}
+
+// Whether the checks of what a run leaves in the page cache run: under
+// GEOCODER_TESTS_PAGE_CACHE=1. What stays resident hangs on reclaim too,
+// which a busy machine (the nightly runs its shards beside the planet's
+// download) does when it likes. Says which checks are skipped where they
+// don't.
+bool page_cache_checks_run(const char* skipped) {
+    const char* set = std::getenv("GEOCODER_TESTS_PAGE_CACHE");
+    if (set && std::string(set) == "1") return true;
+    std::printf("    SKIP %s: runs under GEOCODER_TESTS_PAGE_CACHE=1\n", skipped);
+    return false;
+}
+
+}  // namespace
+
+// The writer drops the input's pages once the output after them is written:
+// ranges from the start, in order, cut at 1 MiB and at least a step apart,
+// never past the input of the first item whose output is not yet written;
+// the rest of the file when the output is finished.
+TEST(apply_drops_the_input_behind_the_written_output) {
+    constexpr uint64_t MiB = 1 << 20;
+    std::vector<std::pair<uint64_t, uint64_t>> drops;
+    InputPageDropper sut([&](uint64_t offset, uint64_t length) { drops.emplace_back(offset, length); }, 4 * MiB);
+
+    sut.appended(3 * MiB, 3 * MiB);        // a copy: output and input to 3 MiB
+    sut.appended(6 * MiB, 7 * MiB + 100);  // a merge: its blob ends past 7 MiB
+    sut.written(0);
+    CHECK(drops.empty());
+    CHECK_EQ(sut.dropped(), uint64_t(0));
+    sut.written(4 * MiB);  // the copy's output is written: 3 MiB of input, under the step
+    CHECK(drops.empty());
+    sut.appended(8 * MiB, 0);  // a tail, which reads no input
+    sut.written(5 * MiB);      // the merge's output is not all written
+    CHECK(drops.empty());
+    sut.written(8 * MiB);
+    CHECK(drops == (std::vector<std::pair<uint64_t, uint64_t>>{{0, 7 * MiB}}));
+    CHECK_EQ(sut.dropped(), 7 * MiB);
+    sut.appended(9 * MiB, 9 * MiB);
+    sut.written(9 * MiB);  // 2 MiB more: under the step
+    CHECK_EQ(drops.size(), size_t(1));
+    sut.appended(20 * MiB, 20 * MiB);
+    sut.written(20 * MiB);
+    REQUIRE(drops.size() == 2);
+    CHECK(drops.back() == std::make_pair(7 * MiB, 13 * MiB));
+    sut.finish();  // length 0: to the end of the file
+    REQUIRE(drops.size() == 3);
+    CHECK(drops.back() == std::make_pair(20 * MiB, uint64_t(0)));
+
+    // A step of 0 drops whatever the input read gained, and nothing while it
+    // stays put: an empty range would be posix_fadvise's "to the end".
+    drops.clear();
+    InputPageDropper each([&](uint64_t offset, uint64_t length) { drops.emplace_back(offset, length); }, 0);
+    each.written(0);
+    CHECK(drops.empty());
+    each.appended(2 * MiB, MiB + 100);
+    each.written(2 * MiB);
+    each.written(2 * MiB);  // nothing more read
+    each.appended(3 * MiB, MiB + 200);
+    each.written(3 * MiB);  // still within the first MiB past the drop
+    each.appended(4 * MiB, 2 * MiB);
+    each.written(4 * MiB);
+    CHECK(drops == (std::vector<std::pair<uint64_t, uint64_t>>{{0, MiB}, {MiB, MiB}}));
+    CHECK_EQ(each.dropped(), 2 * MiB);
+}
+
+// The point of the drops: after a run the output, which build-index reads
+// next, is in the page cache and the input, which the nightly then deletes,
+// is not (under GEOCODER_TESTS_PAGE_CACHE=1). The output is the changes
+// applied either way.
+TEST(apply_leaves_the_output_in_the_page_cache_in_place_of_the_input) {
+    ScratchDir dir("pbf-apply-test");
+    ApplyOptions opt;
+    opt.input = dir.path() + "/in.osm.pbf";
+    opt.output = dir.path() + "/out.osm.pbf";
+    std::vector<TestObject> input;
+    for (int64_t id = 1; id <= 20000; id++) input.push_back(node(id, 1, T0, "value " + std::to_string(id * 7919 % 10007)));
+    write_test_pbf(opt.input, input, 100);
+    const char* checks = "apply_leaves_the_output_in_the_page_cache_in_place_of_the_input's page cache checks";
+    bool resident = page_cache_checks_run(checks);
+    if (resident) {
+        int fd = open(opt.input.c_str(), O_RDONLY);
+        REQUIRE(fd >= 0);
+        fsync(fd);
+        // A file system that keeps what is dropped (an overlay on a tmpfs,
+        // say, which resident_share can't tell from a disk) keeps the input
+        // cached whatever the run asks: the test asks first, and skips the
+        // checks there. The input is then read back into the cache, for the
+        // run to drop.
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        close(fd);
+        const double dropped = resident_share(opt.input);
+        file_bytes(opt.input);
+        double before = resident_share(opt.input);
+        if (before <= 0) {
+            std::printf("    SKIP %s: page cache not visible here\n", checks);
+            resident = false;
+        } else if (dropped != 0.0) {
+            std::printf("    SKIP %s: the page cache keeps what is dropped here\n", checks);
+            resident = false;
+        }
+    }
+    std::string change = dir.path() + "/c.osc";
+    std::string text = to_osc({{'m', node(5, 2, T0, "changed")}, {'c', node(30000, 1)}});
+    std::FILE* fp = std::fopen(change.c_str(), "wb");
+    std::fwrite(text.data(), 1, text.size(), fp);
+    std::fclose(fp);
+    opt.changes = {change};
+    opt.verbose = false;
+    opt.threads = 3;
+
+    apply_changes(opt);
+
+    if (resident) {
+        CHECK_EQ(resident_share(opt.input), 0.0);
+        CHECK(resident_share(opt.output) > 0.9);
+    }
+    CHECK(describe(read_test_pbf(opt.output)) == describe(osmium_apply(input, {{{'m', node(5, 2, T0, "changed")},
+                                                                                 {'c', node(30000, 1)}}})));
+}
+
+// In a run, not only at its end: the input leaves the page cache in ranges
+// from its start, in order, as the output after them is written, the rest
+// once the output is finished. And the drops change no byte of the output:
+// it is the bytes of a run that drops nothing.
+TEST(apply_drops_the_input_while_it_writes_and_changes_no_byte_of_the_output) {
+    constexpr uint64_t MiB = 1 << 20;
+    ScratchDir dir("pbf-apply-test");
+    ApplyOptions opt;
+    opt.input = dir.path() + "/in.osm.pbf";
+    // ~5 MiB of blobs, their tags too random to compress away.
+    std::vector<TestObject> input;
+    Lcg lcg{7};
+    for (int64_t id = 1; id <= 250000; id++) {
+        std::string tag;
+        for (int i = 0; i < 32; i++) tag += char('a' + lcg.next(26));
+        input.push_back(node(id, 1, T0, tag));
+    }
+    write_test_pbf(opt.input, input, 100);
+    const uint64_t input_bytes = file_bytes(opt.input).size();
+    REQUIRE(input_bytes > 4 * MiB);
+    std::string change = dir.path() + "/c.osc";
+    std::string text = to_osc({{'m', node(100000, 2, T0, "changed")}, {'c', node(300000, 1)}});
+    std::FILE* fp = std::fopen(change.c_str(), "wb");
+    std::fwrite(text.data(), 1, text.size(), fp);
+    std::fclose(fp);
+    opt.changes = {change};
+    opt.verbose = false;
+    opt.threads = 3;
+    opt.write_block_bytes = 64 << 10;
+    opt.input_drop_step_bytes = MiB;
+
+    opt.output = dir.path() + "/reference.osm.pbf";
+    opt.drop_input_pages = [](uint64_t, uint64_t) {};
+    apply_changes(opt);
+    std::vector<std::pair<uint64_t, uint64_t>> drops;
+    int fd = open(opt.input.c_str(), O_RDONLY);
+    REQUIRE(fd >= 0);
+    opt.output = dir.path() + "/out.osm.pbf";
+    opt.drop_input_pages = [&](uint64_t offset, uint64_t length) {
+        drops.emplace_back(offset, length);
+        posix_fadvise(fd, static_cast<off_t>(offset), static_cast<off_t>(length), POSIX_FADV_DONTNEED);
+    };
+    opt.verbose = true;
+    opt.input_drop_log_bytes = 2 * MiB;
+    std::string logged;
+    {
+        gctest::CapturedStderr captured;
+        apply_changes(opt);
+        logged = captured.str();
+    }
+    close(fd);
+
+    CHECK(file_bytes(opt.output) == file_bytes(dir.path() + "/reference.osm.pbf"));
+    REQUIRE(drops.size() >= 3);
+    uint64_t dropped = 0;
+    for (size_t i = 0; i + 1 < drops.size(); i++) {
+        CHECK_EQ(drops[i].first, dropped);
+        CHECK(drops[i].second >= MiB);
+        CHECK_EQ((drops[i].first + drops[i].second) % MiB, uint64_t(0));
+        dropped += drops[i].second;
+    }
+    // Most of the input went while the output was written: at most the
+    // writer's blocks in flight, and the step, are left for the end.
+    CHECK(dropped <= input_bytes);
+    CHECK(dropped + 3 * MiB >= input_bytes);
+    CHECK(drops.back() == std::make_pair(dropped, uint64_t(0)));
+    // A line each 2 MiB more of the input asked out of the page cache, at a
+    // drop's end, with the output written then, which is past it: this input
+    // and its output differ by a blob or two.
+    std::istringstream lines(logged);
+    std::set<uint64_t> ends;
+    for (size_t i = 0; i + 1 < drops.size(); i++) ends.insert((drops[i].first + drops[i].second) >> 20);
+    uint64_t previous = 0;
+    int seen = 0;
+    for (std::string line; std::getline(lines, line);) {
+        unsigned long long to = 0, written = 0;
+        if (std::sscanf(line.c_str(), "[pbf-apply] input asked out of the page cache up to %llu MiB, %llu MiB of the output written",
+                        &to, &written) != 2)
+            continue;
+        seen++;
+        CHECK(to >= previous + 2);
+        CHECK(ends.count(to) == 1);
+        CHECK(written + 1 >= to);
+        previous = to;
+    }
+    CHECK(seen >= 2);
 }

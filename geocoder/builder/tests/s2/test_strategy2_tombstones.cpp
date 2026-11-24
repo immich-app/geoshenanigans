@@ -3,10 +3,9 @@
 // gone holds a tombstone.
 #include <cstdint>
 #include <filesystem>
-#include <iostream>
-#include <sstream>
 #include <string>
 
+#include "captured_stderr.h"
 #include "cell_index.h"
 #include "id_allocator.h"
 #include "parsed_data.h"
@@ -82,10 +81,8 @@ TEST(admin_slots_come_from_the_exact_tiers_sidecar_and_a_cold_start_is_counted) 
     };
     auto remapped = [&](const std::string& prev, std::string& log) {
         ParsedData data = admins();
-        std::ostringstream err;
-        std::streambuf* was = std::cerr.rdbuf(err.rdbuf());
+        gctest::CapturedStderr err;
         apply_strategy2_remaps(data, prev, RunOrder::Serial);
-        std::cerr.rdbuf(was);
         log = err.str();
         return data;
     };

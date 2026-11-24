@@ -74,6 +74,33 @@ fn a_postal_area_of_no_valid_postcode_leaves_the_point_to_another_or_a_centroid(
         .centroid("10178", 0.0, 500.0)
         .load();
     assert_eq!(postcode_from(&index, berlin, 0.0, 0.0), "10179");
+    // The builder marks an area of a postcode its country's pattern rejects (POSTAL_AREA_INVALID):
+    // one tagged 1234, four digits in Germany, names nothing either.
+    let index = country_at(berlin, b"DE")
+        .boundary("1234", POSTCODE_AREA_LEVEL, POSTAL_AREA_INVALID, (-300.0, -300.0, 300.0, 300.0))
+        .centroid("10178", 0.0, 500.0)
+        .load();
+    assert_eq!(postcode_from(&index, berlin, 0.0, 0.0), "10178");
+    let index = country_at(berlin, b"DE")
+        .boundary("1234", POSTCODE_AREA_LEVEL, POSTAL_AREA_INVALID, (-300.0, -300.0, 300.0, 300.0))
+        .boundary("10179", POSTCODE_AREA_LEVEL, 0, (-2000.0, -2000.0, 2000.0, 2000.0))
+        .centroid("10178", 0.0, 500.0)
+        .load();
+    assert_eq!(postcode_from(&index, berlin, 0.0, 0.0), "10179");
+}
+
+#[test]
+fn a_postal_area_of_a_postcode_its_country_takes_names_the_point_whatever_its_length() {
+    // Nominatim makes a postcode area of every postcode its country's pattern takes, which the
+    // builder checks (POSTAL_AREA_INVALID): Saudi Arabia's ddddd(?:-dddd)? keeps 12345-6789 whole,
+    // and Iran's (ddddd)[-_ ]?(ddddd) writes 12345-67890, of 11 characters.
+    for (code, postcode, origin) in [(b"SA", "12345-6789", (24.7, 46.7)), (b"IR", "12345-67890", (35.7, 51.4))] {
+        let index = country_at(origin, code)
+            .boundary(postcode, POSTCODE_AREA_LEVEL, 0, (-300.0, -300.0, 300.0, 300.0))
+            .centroid("54321", 0.0, 500.0)
+            .load();
+        assert_eq!(postcode_from(&index, origin, 0.0, 0.0), postcode);
+    }
 }
 
 #[test]
@@ -88,14 +115,42 @@ fn a_postal_area_of_another_country_names_no_point() {
         .centroid("78266", 0.0, 400.0);
     dataset.polygons.last_mut().unwrap().0.country_code = u16::from_be_bytes(*b"CH");
     assert_eq!(postcode_from(&dataset.load(), busingen, 0.0, 0.0), "78266");
-    // One of the point's country, or of a country not known, names it.
-    for code in [*b"DE", [0, 0]] {
-        let mut dataset = country_at(busingen, b"DE");
-        dataset.boundary("78266", POSTCODE_AREA_LEVEL, 0, (-1000.0, -1000.0, 1000.0, 1000.0))
-            .centroid("79999", 0.0, 100.0);
-        dataset.polygons.last_mut().unwrap().0.country_code = u16::from_be_bytes(code);
-        assert_eq!(postcode_from(&dataset.load(), busingen, 0.0, 0.0), "78266");
-    }
+    // One of the point's country names it.
+    let index = country_at(busingen, b"DE")
+        .boundary("78266", POSTCODE_AREA_LEVEL, 0, (-1000.0, -1000.0, 1000.0, 1000.0))
+        .centroid("79999", 0.0, 100.0)
+        .load();
+    assert_eq!(postcode_from(&index, busingen, 0.0, 0.0), "78266");
+}
+
+#[test]
+fn a_postal_area_of_no_country_known_names_no_point_of_a_country() {
+    // Nominatim makes no postcode area of a postal boundary of no country (get_matcher(None) is
+    // None, postcodes.py _update_postcode_areas), and the builder gives a postal area the country
+    // its centroid lies in: an area of none round a German point leaves it to the centroid of
+    // 79999, and to the German area 78266 round both, whose centroid is the farther.
+    let busingen = (47.697, 8.69);
+    let countryless = |dataset: &mut TestIndex| {
+        dataset.boundary("78999", POSTCODE_AREA_LEVEL, 0, (-300.0, -300.0, 300.0, 300.0));
+        dataset.polygons.last_mut().unwrap().0.country_code = 0;
+    };
+    let mut dataset = country_at(busingen, b"DE");
+    countryless(&mut dataset);
+    dataset.centroid("79999", 0.0, 100.0);
+    assert_eq!(postcode_from(&dataset.load(), busingen, 0.0, 0.0), "79999");
+    let mut dataset = country_at(busingen, b"DE");
+    countryless(&mut dataset);
+    dataset.boundary("78266", POSTCODE_AREA_LEVEL, 0, (-1000.0, -500.0, 1000.0, 3500.0));
+    assert_eq!(postcode_from(&dataset.load(), busingen, 0.0, 100.0), "78266");
+
+    // A street of no postcode stored takes get_nearest_postcode's at its middle, of the country
+    // there: the area of none round the middle names nothing, and the centroid by it does.
+    let mut dataset = country_at(busingen, b"DE");
+    countryless(&mut dataset);
+    dataset.street("Junkerstraße", &[(0.0, -1000.0), (0.0, 1000.0)]).centroid("79999", 0.0, 100.0);
+    let address = address_from(&dataset.load(), busingen, 5.0, -800.0);
+    assert_eq!(address["road"], "Junkerstraße");
+    assert_eq!(address["postcode"], "79999");
 }
 
 #[test]
@@ -115,6 +170,17 @@ fn a_centroid_names_a_point_only_inside_its_countrys_extent() {
         assert_eq!(postcode_from(&index, origin, 0.0, inside_m), postcode, "{name} east");
         assert_eq!(postcode_from(&index, origin, outside_m, 0.0), serde_json::Value::Null, "{name} north");
         assert_eq!(postcode_from(&index, origin, 0.0, -outside_m), serde_json::Value::Null, "{name} west");
+    }
+}
+
+#[test]
+fn a_centroid_of_a_postcode_its_country_makes_names_a_point_whatever_its_length() {
+    // Iran's pattern makes every postcode ddddd-ddddd, eleven characters ((ddddd)[-_ ]?(ddddd),
+    // output \1-\2), and Saudi Arabia's, ddddd(?:-dddd)?, keeps the four digits after the hyphen
+    // (country_settings.yaml): each centroid names a point inside its country's extent.
+    for (code, postcode, origin) in [(b"IR", "13145-11111", (35.7, 51.4)), (b"SA", "12271-2422", (24.7, 46.7))] {
+        let index = country_at(origin, code).centroid(postcode, 0.0, 0.0).load();
+        assert_eq!(postcode_from(&index, origin, 300.0, 0.0), postcode, "{}", String::from_utf8_lossy(code));
     }
 }
 
@@ -173,6 +239,26 @@ fn a_house_the_street_that_won_has_near_names_its_own_postcode() {
 }
 
 #[test]
+fn a_house_tagged_a_placeholder_postcode_takes_its_street_s() {
+    // Nominatim's clean-postcodes sanitizer drops a postcode its country's pattern rejects, so a
+    // house tagged 00000 has none of its own (token_get_postcode) and takes its parent street's
+    // (placex_update), whether the house answers or the street that won takes its number from
+    // it.
+    let berlin = (52.52, 13.405);
+    let index = country_at(berlin, b"DE")
+        .street("Rungestraße", &[(0.0, -100.0), (0.0, 100.0)])
+        .way_postcode("10179")
+        .address("3", 30.0, 0.0)
+        .addr_postcode("00000")
+        .load();
+    for north in [2.0, 30.0] {
+        let address = address_from(&index, berlin, north, 0.0);
+        assert_eq!(address["house_number"], "3", "{north} m north");
+        assert_eq!(address["postcode"], "10179", "{north} m north");
+    }
+}
+
+#[test]
 fn a_house_without_a_postcode_of_its_own_takes_its_street_s() {
     // Grange View Road, Gedling: a rank-30 object takes its own addr:postcode, else that of its
     // parent street, else get_nearest_postcode at its own centroid (placex_update). House 30 on
@@ -207,6 +293,81 @@ fn a_house_whose_street_has_no_postcode_takes_the_one_nearest_the_house() {
     let address = address_from(&index, gedling, 0.0, 0.0);
     assert_eq!(address["house_number"], "7");
     assert_eq!(address["postcode"], "NG4 4AE");
+}
+
+#[test]
+fn a_house_takes_the_postcode_its_street_has_at_its_middle() {
+    // Neither the house nor its street has a postcode stored. The street's is get_nearest_postcode's
+    // at its middle, 1,450 m east, where NG4 4AF's centroid lies, and the house takes it, its
+    // parent street's (placex_update), not NG4 4AE's at the house.
+    let gedling = (52.98, -1.07);
+    let index = country_at(gedling, b"GB")
+        .street("Long Lane", &[(0.0, -100.0), (0.0, 3000.0)])
+        .address("7", 20.0, 0.0)
+        .centroid("NG4 4AE", 20.0, 0.0)
+        .centroid("NG4 4AF", 0.0, 1450.0)
+        .load();
+    let address = address_from(&index, gedling, 0.0, 0.0);
+    assert_eq!(address["house_number"], "7");
+    assert_eq!(address["postcode"], "NG4 4AF");
+}
+
+/// The country `west` west of `origin` and `east` east of it, each 50 km across.
+fn border_at(origin: (f64, f64), west: &[u8; 2], east: &[u8; 2]) -> TestIndex {
+    let mut index = TestIndex { origin, ..TestIndex::default() };
+    for (code, span) in [(west, (-50_000.0, -50_000.0, 50_000.0, 0.0)), (east, (-50_000.0, 0.0, 50_000.0, 50_000.0))] {
+        index.boundary(&String::from_utf8_lossy(code), 2, 0, span);
+        index.polygons.last_mut().unwrap().0.country_code = u16::from_be_bytes(*code);
+    }
+    index
+}
+
+#[test]
+fn a_street_across_a_border_takes_a_postcode_of_its_middle_s_country() {
+    // placex_update gives a street the country at its centroid (get_country_code) and
+    // get_nearest_postcode of that country there. Rheinweg runs from Germany, where the point
+    // is, 4 km east into Switzerland, its middle 1,500 m past the border: the Swiss postal area
+    // 8238 round the middle names it, though the box of the German centroid 78266 by the point
+    // reaches the middle too.
+    let origin = (47.69, 8.6);
+    let ch = u16::from_be_bytes(*b"CH");
+    let mut dataset = border_at(origin, b"DE", b"CH");
+    dataset.boundary("8238", POSTCODE_AREA_LEVEL, 0, (-500.0, 1000.0, 500.0, 2000.0));
+    dataset.polygons.last_mut().unwrap().0.country_code = ch;
+    dataset.street("Rheinweg", &[(0.0, -500.0), (0.0, 3500.0)]).centroid("78266", 0.0, -300.0);
+    let address = address_from(&dataset.load(), origin, 5.0, -400.0);
+    assert_eq!(address["road"], "Rheinweg");
+    assert_eq!(address["postcode"], "8238");
+
+    // A house takes its parent street's country, and where no postcode reaches the street's
+    // middle, get_nearest_postcode of that country at the house. Here Rheinweg runs 16 km east,
+    // and the box of the Swiss centroid 8200, 1.4 km from the house, reaches the house but not
+    // the middle: it names the German house, not the German centroid beside it.
+    let mut dataset = border_at(origin, b"DE", b"CH");
+    dataset.street("Rheinweg", &[(0.0, -500.0), (0.0, 15_500.0)])
+        .address("7", 20.0, -400.0)
+        .centroid("78266", 20.0, -450.0)
+        .centroid("8200", 0.0, 1000.0);
+    dataset.centroids.last_mut().unwrap().country_code = ch;
+    let address = address_from(&dataset.load(), origin, 5.0, -400.0);
+    assert_eq!(address["house_number"], "7");
+    assert_eq!(address["postcode"], "8200");
+
+    // The postcode is of the middle's country: from a point in the United Arab Emirates, which
+    // have no postcodes, a street whose middle is in Oman has Oman's 112.
+    let al_ain = (24.2, 55.8);
+    let mut dataset = border_at(al_ain, b"AE", b"OM");
+    dataset.boundary("112", POSTCODE_AREA_LEVEL, 0, (-500.0, 1000.0, 500.0, 2000.0));
+    dataset.polygons.last_mut().unwrap().0.country_code = u16::from_be_bytes(*b"OM");
+    dataset.street("Border Road", &[(0.0, -500.0), (0.0, 3500.0)]);
+    let address = address_from(&dataset.load(), al_ain, 5.0, -400.0);
+    assert_eq!(address["road"], "Border Road");
+    assert_eq!(address["postcode"], "112");
+    // As is the one the builder stores for it, which it takes at the middle too.
+    let mut dataset = border_at(al_ain, b"AE", b"OM");
+    dataset.street("Border Road", &[(0.0, -500.0), (0.0, 3500.0)]).way_postcode("112");
+    let address = address_from(&dataset.load(), al_ain, 5.0, -400.0);
+    assert_eq!(address["postcode"], "112");
 }
 
 #[test]
