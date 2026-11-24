@@ -19,6 +19,7 @@
 
 #include "arc_blocks.h"
 #include "captured_stderr.h"
+#include "cell_pairs.h"
 #include "scratch_dir.h"
 #include "string_files.h"
 #include "test_framework.h"
@@ -134,6 +135,13 @@ std::map<std::string, std::vector<char>> tree(const std::string& dir) {
         if (e.is_regular_file()) files[fs::relative(e.path(), dir).string()] = bytes_of(e.path());
     return files;
 }
+
+// A file's bytes as cell_pairs::Reader reads them.
+struct Bytes {
+    std::vector<char> data;
+    uint64_t size() const { return data.size(); }
+    const char* at(uint64_t off, size_t) const { return data.data() + off; }
+};
 
 // The name of each slot of the dir `dir` of `files`, from its
 // strings_core.bin: "" for a tombstone.
@@ -526,13 +534,28 @@ TEST(the_major_tier_takes_areas_of_100_km2_and_wikidata_rivers_of_5) {
     // The major dir holds them and no other.
     const ScratchDir dir("water-major");
     write(layer, dir.path());
-    std::vector<std::string> slots = slot_names(tree(dir.path()), "water/major/simplified");
+    const std::map<std::string, std::vector<char>> files = tree(dir.path());
+    const std::vector<std::string> by_slot = slot_names(files, "water/major/simplified");
+    std::vector<std::string> slots = by_slot;
     std::sort(slots.begin(), slots.end());
     CHECK(slots == std::vector<std::string>({"Big Lake", "Wide River"}));
-    // The big lake holds whole cells: interior entries.
-    size_t interior = 0;
-    for (const CellItemPair& cell : layer.cells)
-        interior += (cell.item_id & INTERIOR_FLAG) && name_of(layer, cell.item_id & ID_MASK) == "Big Lake";
+    // Its cell index lists those slots alone, and the big lake holds whole
+    // cells: interior entries.
+    Bytes cells{files.at("water/major/simplified/admin_cells.bin")},
+        entries{files.at("water/major/simplified/admin_entries.bin")};
+    cell_pairs::Reader reader(cells, entries, cell_pairs::ADMIN);
+    size_t listed = 0, interior = 0;
+    uint64_t cell;
+    std::vector<uint32_t> ids;
+    while (reader.next(cell, ids))
+        for (uint32_t id : ids) {
+            REQUIRE((id & ID_MASK) < by_slot.size());
+            const std::string& name = by_slot[id & ID_MASK];
+            CHECK(name == "Big Lake" || name == "Wide River");
+            listed++;
+            interior += (id & INTERIOR_FLAG) && name == "Big Lake";
+        }
+    CHECK(listed > 0);
     CHECK(interior > 0);
 }
 
@@ -1316,9 +1339,11 @@ TEST(a_member_of_a_waterway_relation_without_a_wikidata_item_keeps_its_own) {
 }
 
 TEST(a_waterway_relation_of_a_local_name_alone_shows_the_name_en_its_river_ways_carry_over_most_of_its_length) {
-    // The Koshibu River: its relation is 小渋川 alone and most of its river
-    // ways carry the name:en Koshibu River, but for one of Koshibu-gawa,
-    // longer than any other way and shorter than them all, and one of none.
+    // The Koshibu River: its relation is 小渋川 alone, and its ways of a
+    // name:en hold 9,000 of its 10,000 units of length, more than half. Of
+    // them the two of Koshibu River hold the most, 5,000 to the 4,000 of
+    // Koshibu-gawa's one, though that is the longest way; the last way, of
+    // 1,000, has none.
     CHECK(shown(river("小渋川", nullptr,
                       {{51, "小渋川", "Koshibu River", 2000},
                        {52, "小渋川", "Koshibu River", 3000},
@@ -1458,13 +1483,78 @@ TEST(the_local_names_of_a_rivers_reaches_dont_rename_it) {
                        {24, "Aller", nullptr, 4000}})) == Names({"Aller"}));
 }
 
+namespace {
+
+// Swaps each day's staged dir, `<dir>/<day>.staged`, in for `<dir>/<day>`,
+// keeping the old dirs until every day is in: a swap that fails puts back
+// each day it swapped (or removes it, for a day that had no dir) and
+// rethrows, so the dir holds the old days or the new ones, never some of
+// each.
+void swap_in_staged(const std::string& dir, const std::vector<std::string>& days) {
+    std::vector<std::string> swapped;
+    try {
+        for (const std::string& day : days) {
+            const std::string day_dir = dir + "/" + day, old = day_dir + ".old";
+            fs::remove_all(old);
+            if (fs::exists(day_dir)) fs::rename(day_dir, old);
+            swapped.push_back(day);
+            fs::rename(day_dir + ".staged", day_dir);
+        }
+    } catch (const fs::filesystem_error&) {
+        for (const std::string& day : swapped) {
+            const std::string day_dir = dir + "/" + day, old = day_dir + ".old";
+            fs::remove_all(day_dir);
+            if (fs::exists(old)) fs::rename(old, day_dir);
+        }
+        for (const std::string& day : days) fs::remove_all(dir + "/" + day + ".staged");
+        throw;
+    }
+    for (const std::string& day : days) fs::remove_all(dir + "/" + day + ".old");
+}
+
+void write_file(const std::string& path, const std::string& text) {
+    fs::create_directories(fs::path(path).parent_path());
+    std::ofstream(path, std::ios::binary) << text;
+}
+
+}  // namespace
+
+TEST(a_fixture_swap_that_fails_part_way_puts_back_the_days_it_swapped) {
+    // Day 1 has a dir and a staged one, day 2 a staged one alone, day 3 a
+    // dir and no staged one, so its swap fails.
+    const ScratchDir root("water-fixture-swap");
+    const std::string dir = root.path();
+    write_file(dir + "/day1/a", "old 1");
+    write_file(dir + "/day1.staged/a", "new 1");
+    write_file(dir + "/day2.staged/a", "new 2");
+    write_file(dir + "/day3/a", "old 3");
+    bool threw = false;
+    try {
+        swap_in_staged(dir, {"day1", "day2", "day3"});
+    } catch (const fs::filesystem_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(tree(dir) == (std::map<std::string, std::vector<char>>{{"day1/a", {'o', 'l', 'd', ' ', '1'}},
+                                                                 {"day3/a", {'o', 'l', 'd', ' ', '3'}}}));
+    // With every staged dir there, every day is the new one and no old dir
+    // stays.
+    write_file(dir + "/day1.staged/a", "new 1");
+    write_file(dir + "/day2.staged/a", "new 2");
+    write_file(dir + "/day3.staged/a", "new 3");
+    swap_in_staged(dir, {"day1", "day2", "day3"});
+    CHECK(tree(dir) == (std::map<std::string, std::vector<char>>{{"day1/a", {'n', 'e', 'w', ' ', '1'}},
+                                                                 {"day2/a", {'n', 'e', 'w', ' ', '2'}},
+                                                                 {"day3/a", {'n', 'e', 'w', ' ', '3'}}}));
+}
+
 // geocoder/testdata/water_dir: the client files of a water dir on three
 // days, which tools/test_generate_patches.py diffs, patches and verifies
 // with the real tools. Day 2 is day 1 with the pond's second vertex moved,
 // on day 1's slots. Day 3 is day 2 with a pond of a water=* value of its own
 // and a sea, on day 2's slots: its water_meta.json lists one more kind and
-// its attribution.json credits Marine Regions. With GEOCODER_WRITE_TESTDATA
-// set this writes them instead.
+// its attribution.json credits Marine Regions. Under
+// GEOCODER_WRITE_TESTDATA=1 this writes them instead.
 TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     const ScratchDir root("water-fixture");
     const std::string one = root.path() + "/one", two = root.path() + "/two", three = root.path() + "/three";
@@ -1480,7 +1570,8 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     more.marine.push_back(marine_area(2350, marine::kSea, "North Sea", {{square(kLat - 20000000, kLng, 20000, 4)}}));
     write(build(more, two), three, two);
     const std::string fixture_dir = std::string(GEOCODER_TESTDATA_DIR) + "/water_dir";
-    const bool rewrite = std::getenv("GEOCODER_WRITE_TESTDATA") != nullptr;
+    const char* write_testdata = std::getenv("GEOCODER_WRITE_TESTDATA");
+    const bool rewrite = write_testdata && std::string(write_testdata) == "1";
     // Every day's client files, each day all ten, before any fixture dir is
     // compared or written.
     const std::set<std::string> client = {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin",
@@ -1506,7 +1597,8 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     REQUIRE(text_of(days["day3"]["attribution.json"]).find("marine-regions") != std::string::npos);
     if (rewrite) {
         // Every day written whole beside its dir first, then each swapped in:
-        // a write that fails leaves the fixture as it was.
+        // a write or a swap that fails leaves the fixture as it was.
+        std::vector<std::string> day_names;
         for (const auto& [day, files] : days) {
             const std::string staged = fixture_dir + "/" + day + ".staged";
             fs::remove_all(staged);
@@ -1518,14 +1610,9 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
                 out.close();
                 REQUIRE(out.good());
             }
+            day_names.push_back(day);
         }
-        for (const auto& [day, files] : days) {
-            const std::string day_dir = fixture_dir + "/" + day, old = day_dir + ".old";
-            fs::remove_all(old);
-            if (fs::exists(day_dir)) fs::rename(day_dir, old);
-            fs::rename(day_dir + ".staged", day_dir);
-            fs::remove_all(old);
-        }
+        swap_in_staged(fixture_dir, day_names);
     }
     for (const auto& [day, files] : days) {
         // The day's fixture dir is those files and no other: the patch tests

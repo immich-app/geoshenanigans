@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -22,6 +23,7 @@
 #include "test_framework.h"
 #include "tool_runs.h"
 #include "types.h"
+#include "water_types.h"
 
 namespace fs = std::filesystem;
 
@@ -139,6 +141,26 @@ std::vector<std::string> slot_names(const std::string& dir) {
     return out;
 }
 
+// Each named slot's kind of a water dir, by its name: the class/type its
+// record's type code (country_code) has in the dir's water_meta.json.
+std::map<std::string, std::string> kinds_by_name(const std::string& dir) {
+    const std::vector<char> meta = bytes_of(dir + "/water_meta.json"), records = bytes_of(dir + "/admin_polygons.bin");
+    const std::optional<std::vector<water::MetaType>> kinds = water::parse_meta_json(std::string(meta.begin(), meta.end()));
+    if (!kinds) return {{"", "(water_meta.json unread)"}};
+    std::map<uint16_t, std::string> by_code;
+    for (const water::MetaType& k : *kinds) by_code[k.code] = k.cls + "/" + k.type;
+    const std::vector<std::string> names = slot_names(dir);
+    std::map<std::string, std::string> out;
+    for (size_t s = 0; s < names.size(); s++) {
+        if (names[s].empty()) continue;
+        AdminPolygonRecord r;
+        std::memcpy(&r, records.data() + s * sizeof r, sizeof r);
+        const auto it = by_code.find(r.country_code);
+        out[names[s]] = it == by_code.end() ? "(no kind)" : it->second;
+    }
+    return out;
+}
+
 const std::vector<std::string> kRegions = {"planet", "africa", "asia", "europe", "north-america", "south-america",
                                            "oceania", "central-america", "antarctica"};
 
@@ -190,12 +212,11 @@ TEST(build_index_writes_every_regions_water_dirs_and_a_chained_build_writes_them
         CHECK_EQ(files.at(dir + "admin_polygons.bin").size(), 4 * sizeof(AdminPolygonRecord));
         const std::vector<std::string> names = names_in(files.at(dir + "strings_core.bin"));
         CHECK(names == std::vector<std::string>({"Limmat", "Speicher", "Test Lake", "Weiher"}));
-        const std::vector<char>& meta = files.at(dir + "water_meta.json");
-        const std::string text(meta.begin(), meta.end());
-        for (const char* kind : {"\"class\": \"water\", \"type\": \"lake\"", "\"class\": \"water\", \"type\": \"pond\"",
-                                 "\"class\": \"landuse\", \"type\": \"reservoir\"",
-                                 "\"class\": \"waterway\", \"type\": \"river\""})
-            CHECK(text.find(kind) != std::string::npos);
+        // Each of its own kind.
+        CHECK(kinds_by_name(first + "/" + dir) == (std::map<std::string, std::string>{{"Limmat", "waterway/river"},
+                                                                                     {"Speicher", "landuse/reservoir"},
+                                                                                     {"Test Lake", "water/lake"},
+                                                                                     {"Weiher", "water/pond"}}));
     }
     CHECK(files.at("asia/water/all/exact/admin_polygons.bin").empty());
     CHECK(files.at("planet/water/all/simplified/arc_vertices.bin").size() <=
