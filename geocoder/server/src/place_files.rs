@@ -5,11 +5,11 @@
 //! place_hidden.bin, a row per node a boundary hides. A node's id is its row: a visible node's,
 //! or a hidden one's after the visible rows. A visible row's type field holds the place type in
 //! its low bits and, in PROMOTED_BIT, whether the node is promoted: its rank_address is its
-//! type's, PLACE_NODE_PROMOTION more where it is.
+//! type's, PLACE_NODE_PROMOTION more where it is, which only a type of a rank a relation promotes
+//! (PROMOTABLE_RANKS) is: a row promoting another is none the builder writes, which the reader
+//! leaves out and the transport codec refuses.
 
-use crate::{FileBytes, PlaceNode, NO_DATA, PLACE_FLAG_HIDDEN, PLACE_FLAG_LABEL_OF, PLACE_NODE_PROMOTION, PLACE_NODE_RANK};
-#[cfg(any(test, feature = "fixtures"))]
-use crate::PROMOTABLE_RANKS;
+use crate::{FileBytes, PlaceNode, NO_DATA, PLACE_FLAG_HIDDEN, PLACE_FLAG_LABEL_OF, PLACE_NODE_PROMOTION, PLACE_NODE_RANK, PROMOTABLE_RANKS};
 pub const CELLS_FILE: &str = "place_cells.bin";
 pub const NODES_FILE: &str = "place_nodes.bin";
 pub const HIDDEN_FILE: &str = "place_hidden.bin";
@@ -31,11 +31,22 @@ fn base_rank(place_type: u8) -> u8 {
     PLACE_NODE_RANK.get(place_type as usize).copied().unwrap_or(0)
 }
 
-/// A visible row's place type and rank_address from its type field.
-fn type_and_rank(field: u32) -> (u8, u8) {
+/// The rank of a node whose type field promotes it, though a relation promotes no node of that
+/// rank; None for any other field.
+pub(crate) fn refused_promotion(field: u32) -> Option<u8> {
+    let rank = base_rank((field & (PROMOTED_BIT - 1)) as u8);
+    (field & PROMOTED_BIT != 0 && !PROMOTABLE_RANKS.contains(&rank)).then_some(rank)
+}
+
+/// A visible row's place type and rank_address from its type field; None for one that promotes a
+/// node of a rank no relation promotes.
+fn type_and_rank(field: u32) -> Option<(u8, u8)> {
+    if refused_promotion(field).is_some() {
+        return None;
+    }
     let place_type = (field & (PROMOTED_BIT - 1)) as u8;
     let promotion = if field & PROMOTED_BIT != 0 { PLACE_NODE_PROMOTION } else { 0 };
-    (place_type, base_rank(place_type) + promotion)
+    Some((place_type, base_rank(place_type) + promotion))
 }
 
 #[inline(always)]
@@ -159,7 +170,8 @@ impl PlaceFiles {
     }
 
     /// Calls `f` with each visible row in [first, end) and its node, each block's entry read
-    /// once; a row of a block the table can't place is left out.
+    /// once; a row of a block the table can't place is left out, and so is one promoting a node
+    /// of a rank no relation promotes.
     pub fn for_rows(&self, first: u32, end: u32, mut f: impl FnMut(u32, PlaceNode)) {
         let n = self.nodes.as_slice();
         let end = end.min(self.visible);
@@ -182,16 +194,17 @@ impl PlaceFiles {
                 let (Some(dl), Some(dg), Some(t), Some(name)) = (take(e.wl), take(e.wg), take(TYPE_BITS), take(e.wn)) else {
                     break;
                 };
-                let (place_type, rank_address) = type_and_rank(t);
-                f(row, PlaceNode {
-                    lat: f32::from_bits(from_order_key(e.lat_base.wrapping_add(dl))),
-                    lng: f32::from_bits(from_order_key(e.lng_base.wrapping_add(dg))),
-                    name_id: name,
-                    place_type,
-                    _pad1: 0,
-                    rank_address,
-                    parent_poly_id: NO_DATA,
-                });
+                if let Some((place_type, rank_address)) = type_and_rank(t) {
+                    f(row, PlaceNode {
+                        lat: f32::from_bits(from_order_key(e.lat_base.wrapping_add(dl))),
+                        lng: f32::from_bits(from_order_key(e.lng_base.wrapping_add(dg))),
+                        name_id: name,
+                        place_type,
+                        _pad1: 0,
+                        rank_address,
+                        parent_poly_id: NO_DATA,
+                    });
+                }
                 row += 1;
             }
             row = block_end;

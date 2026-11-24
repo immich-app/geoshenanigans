@@ -1738,3 +1738,17 @@ fn a_chunk_reader_reads_a_channels_chunks_as_one_stream() {
     feeder.join().unwrap();
     assert!(got == bytes, "{} bytes read of {}", got.len(), bytes.len());
 }
+
+#[test]
+fn a_place_row_promoting_a_node_no_relation_promotes_is_refused() {
+    // A neighbourhood (24) and a node of no place type (7, 0) with the promoted bit, which the
+    // builder's decoder refuses (place_files.h): decode refuses the unit, encode the files.
+    assert_eq!(refusal(&place_block([5, 6, 0, 0, 3], &[[0, 0, 13, 7]], 25)), "transport: a place block promotes a node of rank 24");
+    assert_eq!(refusal(&place_block([5, 6, 0, 0, 3], &[[0, 0, 15, 7]], 25)), "transport: a place block promotes a node of rank 0");
+    let (p, _) = crate::place_files::encode(&[PlaceNode { lat: 1.0, lng: 2.0, name_id: 7, place_type: 5, _pad1: 0, rank_address: 24, parent_poly_id: NO_DATA }], 10);
+    let mut nodes = p.nodes.clone();
+    nodes[0] |= 0x08;
+    let dir = dir_of(&members_of(Kind::Places, vec![p.cells.clone(), nodes, p.hidden.clone()]));
+    let e = encode(Kind::Places, dir.path(), None, io::sink()).err().expect("encoded a promoted neighbourhood");
+    assert_eq!(e.to_string(), "transport: place_nodes.bin: block 0 promotes a node of rank 24");
+}

@@ -5,7 +5,7 @@
 
 use super::cols::{decode_rows, encode_rows, Layout};
 use super::container::{bits_at, col, invalid, read_tail, Chunk, ColSpec, Input, Out, Pack, Packed, Section, Source, B, D, R, S};
-use crate::place_files::{BLOCK_ROWS, CELLS_FILE, CELL_ROW_BYTES, FOOTER_BYTES, HIDDEN_FILE, HIDDEN_ROW_BYTES, MAGIC, NODES_FILE, TABLE_ENTRY_BYTES, TYPE_BITS};
+use crate::place_files::{refused_promotion, BLOCK_ROWS, CELLS_FILE, CELL_ROW_BYTES, FOOTER_BYTES, HIDDEN_FILE, HIDDEN_ROW_BYTES, MAGIC, NODES_FILE, TABLE_ENTRY_BYTES, TYPE_BITS};
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -91,6 +91,9 @@ fn encode_nodes(w: &mut impl Write, nodes: &Source) -> io::Result<()> {
                 *v = bits_at(block, bit, width);
                 bit += width as usize;
             }
+            if let Some(rank) = refused_promotion(f[2] as u32) {
+                return Err(nodes.refuse(format!("block {b} promotes a node of rank {rank}")));
+            }
             fields.push(f);
         }
         packed.clear();
@@ -160,7 +163,15 @@ fn decode_nodes<R: Read, W: Write>(r: &mut Input<R>, chunk: &mut Chunk, out: &mu
             entry[12..15].copy_from_slice(&[wl as u8, wg as u8, wn as u8]);
             table.put(&entry)?;
             let [dl, dg, t, name] = c.get_disjoint_mut([DL, DG, TYPE, NAME]).map_err(|_| invalid("place row columns"))?;
-            pack_block(out, rows_b as usize, (wl as u32, wg as u32, wn as u32), || [dl.next(buf), dg.next(buf), t.next(buf), name.next(buf)])?;
+            let mut refused = None;
+            pack_block(out, rows_b as usize, (wl as u32, wg as u32, wn as u32), || {
+                let field = t.next(buf);
+                refused = refused.or_else(|| refused_promotion(u32::try_from(field).unwrap_or(0)));
+                [dl.next(buf), dg.next(buf), field, name.next(buf)]
+            })?;
+            if let Some(rank) = refused {
+                return Err(invalid(format!("a place block promotes a node of rank {rank}")));
+            }
         }
     }
     table.copy_into(out, &mut chunk.buf)?;

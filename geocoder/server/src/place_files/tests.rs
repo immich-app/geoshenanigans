@@ -225,3 +225,19 @@ fn a_visible_rows_top_type_bit_promotes_the_node_by_2() {
         assert_eq!(files(&a).node(0).unwrap().rank_address, rank - PLACE_NODE_PROMOTION);
     }
 }
+
+#[test]
+fn a_row_promoting_a_node_no_relation_promotes_is_left_out() {
+    // A neighbourhood (24) and a node of no place type (7, rank 0) with the promoted bit: no
+    // builder writes either (place_files.h refuses them), and the reader reads neither.
+    for place_type in [5u8, 7] {
+        let (mut f, _) = encode(&[node(1.0, 1.0, 3, place_type)], DEFAULT_ADMIN_CELL_LEVEL);
+        assert_eq!(f.nodes[0] & 0x0F, place_type);
+        f.nodes[0] |= 0x08;
+        let p = files(&f);
+        assert!(p.node(0).is_none(), "type {place_type}");
+        let mut rows = 0;
+        p.for_rows(0, 1, |_, _| rows += 1);
+        assert_eq!(rows, 0, "type {place_type}");
+    }
+}
