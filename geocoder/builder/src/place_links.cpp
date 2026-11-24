@@ -134,7 +134,8 @@ public:
         if (p.lat_e7 < b.lat_lo || p.lat_e7 > b.lat_hi || p.lon_e7 < b.lng_lo || p.lon_e7 > b.lng_hi) return false;
         tests++;
         if (parts_.empty())
-            for (const RingPolygon& part : object_parts(data_, all_, o_)) parts_.push_back(std::make_unique<PolygonIndex>(part));
+            for (const RingPolygon& part : object_parts(data_, all_, o_))
+                parts_.push_back(std::make_unique<PolygonIndex>(part, false));
         const HalfPoint h = half_point(p);
         for (const auto& part : parts_)
             if (part->locate(h) != Where::OUTSIDE) return true;

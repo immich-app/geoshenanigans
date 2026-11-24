@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -83,15 +84,18 @@ inline bool inside_edge(PackedLocation x, PackedLocation a, PackedLocation b) {
 
 enum class Where : uint8_t { OUTSIDE, BOUNDARY, INSIDE };
 
-// A polygon's rings indexed for locating points and for finding its edges
-// near a box. Holds pointers into the rings, which must outlive it.
+// A polygon's rings indexed for locating points and, unless built for points
+// alone, for finding its edges near a box. Holds pointers into the rings,
+// which must outlive it.
 class PolygonIndex {
 public:
     struct Edge {
         PackedLocation a, b;
     };
 
-    explicit PolygonIndex(RingPolygon polygon) : polygon_(polygon) {
+    // `edges_near`: whether for_each_edge_near is asked of it, which the edge
+    // grid is built for.
+    explicit PolygonIndex(RingPolygon polygon, bool edges_near = true) : polygon_(polygon), edges_near_(edges_near) {
         for (uint32_t r = 0; r < polygon.ring_count; r++) {
             const PackedLocation* v = polygon.v + polygon.rings[r].begin;
             const uint32_t n = polygon.rings[r].count;
@@ -104,7 +108,8 @@ public:
                 if (v[k - 1] != v[k]) edges_.push_back({v[k - 1], v[k]});
         }
         box_ = ring_boxes_.empty() ? ExactRingBox{1, 0, 1, 0} : ring_boxes_[0];
-        grid_ = EdgeGrid(box_, static_cast<uint32_t>(edges_.size()), [&](uint32_t k) { return edge_box(edges_[k]); });
+        if (edges_near)
+            grid_ = EdgeGrid(box_, static_cast<uint32_t>(edges_.size()), [&](uint32_t k) { return edge_box(edges_[k]); });
     }
 
     RingPolygon polygon() const { return polygon_; }
@@ -146,9 +151,11 @@ public:
         return inside ? Where::INSIDE : Where::OUTSIDE;
     }
 
-    // Calls visit(k) once for each edge k whose box may meet `box`.
+    // Calls visit(k) once for each edge k whose box may meet `box`; an index
+    // built for points alone refuses.
     template <class Visit>
     void for_each_edge_near(const ExactRingBox& box, std::vector<uint32_t>& scratch, Visit visit) const {
+        if (!edges_near_) throw std::logic_error("edges near a box of a polygon indexed for points alone");
         grid_.for_each_meeting(box, scratch, visit);
     }
 
@@ -161,6 +168,7 @@ private:
     std::vector<ExactRingBox> ring_boxes_;
     std::vector<std::unique_ptr<RingEdgeBuckets>> buckets_;  // by ring, null for a short one
     std::vector<Edge> edges_;                                // every ring's, none of no length
+    bool edges_near_;
     EdgeGrid grid_;
 };
 

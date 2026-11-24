@@ -264,3 +264,36 @@ TEST(the_edge_grid_hands_every_segment_whose_box_meets_the_query_box) {
         }
     }
 }
+
+TEST(the_edge_grid_files_a_long_edge_in_few_cells_and_still_hands_it) {
+    // 2048 boxes nested across nearly the whole bounds, as the long edges of a star of a ring
+    // are, and 2048 short ones: filed in every cell they meet, the long ones alone would make
+    // some 2048 * 1024 postings. The grid keeps to a few cells an edge, and still hands every
+    // box that meets a query.
+    std::mt19937_64 rng(11);
+    const uint32_t count = 4096;
+    std::vector<ExactRingBox> boxes(count);
+    for (uint32_t k = 0; k < count; k++) {
+        if (k % 2 == 0) {
+            const int32_t in = static_cast<int32_t>(k);
+            boxes[k] = {in, 100000 - in, in, 100000 - in};
+        } else {
+            const int32_t lat = static_cast<int32_t>(rng() % 99000), lng = static_cast<int32_t>(rng() % 99000);
+            boxes[k] = {lat, lat + static_cast<int32_t>(rng() % 1000), lng, lng + static_cast<int32_t>(rng() % 1000)};
+        }
+    }
+    const EdgeGrid grid(ExactRingBox{0, 100000, 0, 100000}, count, [&](uint32_t k) { return boxes[k]; });
+    CHECK(grid.postings() <= size_t(16) * count);
+    std::vector<uint32_t> scratch;
+    for (int q = 0; q < 200; q++) {
+        const int32_t lat = static_cast<int32_t>(rng() % 102000) - 1000, lng = static_cast<int32_t>(rng() % 102000) - 1000;
+        const int32_t size = q % 2 ? 0 : static_cast<int32_t>(rng() % 3000);
+        const ExactRingBox query{lat, lat + size, lng, lng + size};
+        std::vector<uint32_t> got;
+        grid.for_each_meeting(query, scratch, [&](uint32_t k) { got.push_back(k); });
+        std::sort(got.begin(), got.end());
+        CHECK(std::adjacent_find(got.begin(), got.end()) == got.end());
+        for (uint32_t k = 0; k < count; k++)
+            if (EdgeGrid::meets(boxes[k], query)) CHECK(std::binary_search(got.begin(), got.end(), k));
+    }
+}
