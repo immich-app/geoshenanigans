@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -143,6 +144,10 @@ pub struct RegionState {
     /// Whether the configuration is one read from `config_path` as the
     /// server started, not the defaults.
     kept: bool,
+    /// Bumped as each configuration is swapped in, under the
+    /// configuration's lock: a manifest fetched under an earlier one is not
+    /// cached (ensure_configurations).
+    generation: AtomicU64,
 }
 
 impl RegionState {
@@ -167,6 +172,7 @@ impl RegionState {
             configurations_ttl: CONFIGURATIONS_TTL,
             region_locks: Mutex::new(region_locks),
             http: tokio::sync::OnceCell::new(),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -213,12 +219,22 @@ impl RegionState {
             }
         }
 
-        // Persist + swap in atomically. Disk write is best-effort —
-        // we still apply the new config in memory if disk is full.
-        let json = serde_json::to_string_pretty(&new_cfg).unwrap_or_default();
-        let _ = tokio::fs::write(&self.config_path, json).await;
-
-        *self.config.lock().await = new_cfg.clone();
+        // Persist + swap in under the configuration's lock, so that PUTs
+        // land on disk in the order they apply and a server restarted after
+        // them resumes the last (resume); the file is replaced by a rename,
+        // never left half written. Disk write is best-effort — we still
+        // apply the new config in memory if disk is full.
+        {
+            let mut cfg = self.config.lock().await;
+            let json = serde_json::to_string_pretty(&new_cfg).unwrap_or_default();
+            let mut tmp = self.config_path.clone().into_os_string();
+            tmp.push(".tmp");
+            if tokio::fs::write(&tmp, json).await.is_ok() {
+                let _ = tokio::fs::rename(&tmp, &self.config_path).await;
+            }
+            *cfg = new_cfg.clone();
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
         // Force re-fetch of configurations.json on next download (the
         // referenced build may have changed).
         *self.configurations.lock().await = None;
@@ -280,15 +296,18 @@ impl RegionState {
     }
 
     /// Fetch (or return cached) configurations.json for the latest build
-    /// of the bucket at `base_url`. The one fetched is kept only while the
-    /// configuration still names that bucket: a PUT naming another while
-    /// it was fetched leaves it to this download alone.
+    /// of the bucket at `base_url`. The one fetched is cached only where no
+    /// configuration was swapped in while it was fetched and the
+    /// configuration names that bucket: one fetched before a PUT, whose
+    /// bucket's latest build may since be another, is this download's
+    /// alone.
     async fn ensure_configurations(&self, base_url: &str) -> Result<Configurations, DownloadError> {
         if let Some((fetched_at, of, c)) = self.configurations.lock().await.as_ref() {
             if of == base_url && fetched_at.elapsed() < self.configurations_ttl {
                 return Ok(c.clone());
             }
         }
+        let generation = self.generation.load(Ordering::SeqCst);
 
         let http = self.http().await?;
         // Resolve latest build date via latest.json.
@@ -308,10 +327,10 @@ impl RegionState {
             .json().await
             .map_err(|e| DownloadError::Http(format!("{}: parse: {}", cfg_url, e)))?;
 
-        // Checked under the configuration's lock, which a PUT takes to swap
-        // its configuration in before it drops the cache.
+        // Checked under the configuration's lock, which a PUT holds as it
+        // swaps its configuration in, before it drops the cache.
         let cfg = self.config.lock().await;
-        if cfg.base_url == base_url {
+        if cfg.base_url == base_url && self.generation.load(Ordering::SeqCst) == generation {
             *self.configurations.lock().await = Some((Instant::now(), base_url.to_string(), configurations.clone()));
         }
         drop(cfg);
@@ -1095,6 +1114,41 @@ mod tests {
         assert_eq!(seen.borrow().len(), 2);
         let fetched = b.requests();
         assert!(!fetched.is_empty() && fetched.iter().all(|r| r.starts_with("2026-01-02/europe/")), "{fetched:?}");
+    }
+
+    // A manifest is cached only for the configuration it was fetched under:
+    // one a PUT replaced while it was fetched, of the same bucket, serves the
+    // download that fetched it alone, and a newer build's, fetched since,
+    // stays at hand. Here europe's download waits on the manifest of the
+    // build of DATE while a PUT of water all comes in and the bucket's latest
+    // moves on; asia's download then caches the newer build's, and europe's
+    // download for the PUT takes that one.
+    #[tokio::test]
+    async fn a_manifest_fetched_before_a_configuration_is_not_cached_after_it() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (root, state) = state_for(bucket.url.clone(), Duration::from_secs(3600)).await;
+        let state = Arc::new(state);
+        on_each_download(Rc::new(RefCell::new(Vec::new())));
+        let holding = bucket.hold("configurations.json");
+        let first = {
+            let state = state.clone();
+            tokio::spawn(async move { state.ensure_loaded("europe").await.map_err(|e| e.to_string()) })
+        };
+        holding.reached().await;
+
+        bucket.add_build("2026-01-02", test_bucket::template_version());
+        bucket.set_latest("2026-01-02", Some(test_bucket::template_version()));
+        let all = Configuration { water: "all".into(), ..state.get_configuration().await };
+        let tasks = state.configure(all.clone()).await.unwrap();
+        state.ensure_loaded("asia").await.unwrap();
+        drop(holding);
+        assert_eq!(first.await.unwrap(), Ok(()));
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let stamp = std::fs::read_to_string(root.path().join("europe").join(BUILD_STAMP)).unwrap();
+        assert_eq!(stamp, crate::downloader::stamp_text("2026-01-02", &bucket.url, &all.selection("europe")));
     }
 
     // A download fetches the files its manifest names from the bucket the
