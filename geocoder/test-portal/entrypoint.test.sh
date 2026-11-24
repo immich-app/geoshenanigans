@@ -214,6 +214,22 @@ start "$d"
 check "a finished download is not fetched again" eval '! fetched'
 check "a finished download is served" served "$d"
 
+# A finished download of an older build whose selection has this one's very
+# files, under the marker its server left (the selection alone, or naming
+# that build's version): this server can't read those files, so the
+# selection is downloaded afresh.
+for marker in legacy versioned; do
+  d="$work/older-build-same-files-$marker"
+  finished "$d"
+  list | while read -r dir f; do
+    { echo "build $((version - 1)) $dir/$f"; head -c 2048 /dev/zero; } > "$d/index/$f"
+  done
+  if [ "$marker" = legacy ]; then list; else echo "build_version $((version - 1))"; list; fi > "$d/index/.selection"
+  start "$d"
+  check "an older build's dataset of the same files ($marker marker) is downloaded afresh" holds "$d"
+  check "an older build's dataset of the same files ($marker marker): the server starts" served "$d"
+done
+
 # A dataset from before the arc geometry (admin_vertices.bin, no rings or arcs)
 # is replaced by the whole selection, not completed: its cells and strings are
 # another build's. The accounts stay.

@@ -140,7 +140,8 @@ optional_file() {
     return 1
 }
 
-# A finished download leaves the "<dir> <file>" lines of its selection here.
+# A finished download leaves the build version of its files and the
+# "<dir> <file>" lines of its selection here (marker_lines).
 MARKER="$INDEX_DIR/.selection"
 # A download goes here, beside the index, whose files it replaces once it is
 # whole.
@@ -155,11 +156,20 @@ missing_files() {
     done
 }
 
+# The marker of a finished download of this selection: the build version
+# its files are of, which this server reads, then the selection's lines. A
+# build of another version can have the very same files.
+marker_lines() {
+    echo "build_version $BUILD_VERSION"
+    selection_files
+}
+
 # Whether $INDEX_DIR holds a finished download of this selection: its marker
-# names this selection's files and none it needs is missing. An interrupted
-# download, or a dataset of another selection or build, fails it.
+# names this server's build version and this selection's files, and none it
+# needs is missing. An interrupted download, or a dataset of another
+# selection or build (a marker without a build version among them), fails it.
 dataset_complete() {
-    [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$(selection_files)" ] && [ -z "$(missing_files)" ]
+    [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$(marker_lines)" ] && [ -z "$(missing_files)" ]
 }
 
 # Sentinel file differs by mode — minimal doesn't download geo_cells.
@@ -248,7 +258,7 @@ else
     find "$INDEX_DIR" -mindepth 1 -maxdepth 1 ! -name geocoder.json -exec rm -rf {} +
     find "$STAGING" -mindepth 1 -maxdepth 1 -exec mv {} "$INDEX_DIR"/ \;
     rmdir "$STAGING"
-    selection_files > "$MARKER"
+    marker_lines > "$MARKER"
     echo "Total index size: $(du -sh "$INDEX_DIR" | cut -f1)"
 fi
 
