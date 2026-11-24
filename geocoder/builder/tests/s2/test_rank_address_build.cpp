@@ -297,3 +297,21 @@ TEST(the_ranks_are_the_same_in_every_dir_and_in_a_chained_build) {
         }
     CHECK_EQ(dirs, size_t(28));
 }
+
+TEST(place_nodes_rank_by_their_type_in_an_extract_without_boundaries) {
+    // An extract of a town and a hamlet and no boundary to rank or promote them: each ranks its
+    // type's, 16 and 20, and the answer names the hamlet.
+    Fixture f;
+    f.node(47.80, 12.10, {{"place", "town"}, {"name", "Rosenheim"}});
+    f.node(47.82, 12.14, {{"place", "hamlet"}, {"name", "Aising"}});
+    const ScratchDir root("rank-no-boundaries");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log", out = root.path() + "/out";
+    write_test_pbf(pbf, f.objects(), 1000);
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
+    const uint8_t town = uint8_t(PlaceType::TOWN), hamlet = uint8_t(PlaceType::HAMLET);
+    CHECK((ranks_in(out + "/planet").by_place_type == std::multimap<uint8_t, uint8_t>{{town, 16}, {hamlet, 20}}));
+    const std::vector<std::string> answers = server_answers(out + "/planet", {{47.8201, 12.1401}}, root.path() + "/answers", log);
+    REQUIRE(answers.size() == 1);
+    std::printf("    %s\n", answers[0].c_str());
+    CHECK(names(answers[0], "hamlet", "Aising"));
+}

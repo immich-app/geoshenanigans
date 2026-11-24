@@ -2521,6 +2521,10 @@ static int run(int argc, char* argv[]) {
                                 pn.lat = static_cast<float>(lat);
                                 pn.lng = static_cast<float>(lng);
                                 pn.place_type = static_cast<uint8_t>(settlement_pt);
+                                // Its type's rank, which the rank pass promotes where a
+                                // relation of that rank holds it; an extract without
+                                // boundaries takes no pass.
+                                pn.rank_address = place_node_rank(pn.place_type);
                                 tl_node_data->place_nodes.push_back(pn);
                                 tl_node_data->place_osm_node_ids.push_back(id);
                                 tl_node_data->place_names.push_back(tl_node_data->strings.add(place_name));
