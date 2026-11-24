@@ -4,8 +4,9 @@
 // postcode at its middle and a POI none of another country, and the
 // candidates don't depend on how a ring is written down. A street's postal
 // area covers its middle, its edges included, and has a postcode the server
-// takes. A boundary that repeats its parent, the same outline whatever
-// vertices lie along its edges, and links no place node is in no address.
+// takes. A boundary that repeats the closest boundary relation round its
+// point, the same outline whatever vertices lie along its edges, and links
+// no place node is in no address.
 #include "admin_links.h"
 
 #include <algorithm>
@@ -377,6 +378,38 @@ TEST(a_boundary_relation_repeating_its_closest_parent_relation_is_taken_out) {
         CHECK_EQ(a.data.admin_polygons[k + 1].place_type_override, want);
         if (a.data.admin_polygons[k + 1].place_type_override != want) std::printf("    boundary %zu\n", k);
     }
+}
+
+TEST(a_boundary_repeats_the_closest_relation_round_its_own_point) {
+    // placex_update compares a boundary with the boundary relation of the highest admin level
+    // round its centroid, of a lower level above 3 and a rank of 1 to 25 (placex_triggers.sql:
+    // 916-931). A level 10 boundary along a level 8 one, of its wikidata, lies under a level 9
+    // closed way, and under a level 9 relation of rank 0 in the Netherlands, each holding its
+    // point but reaching far east, their own points outside the pair: both repeat their level 8
+    // parent, found round their own point.
+    const uint16_t nl = pack_country_code('N', 'L');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Nederland", nl);
+    a.data.admin_osm_ids.back() = admin_ring_id(2, 0);
+    auto relation = [&](uint8_t level, const Ring& ring, int64_t id, uint64_t qid) {
+        const uint32_t pid = a.add(level, ring);
+        a.data.admin_osm_ids[pid] = admin_ring_id(id, 0);
+        if (qid) a.data.boundary_wikidata.push_back({relation_boundary_id(id), qid});
+        return pid;
+    };
+    relation(4, box(0.1, 0.1, 0.9, 0.9), 4, 0);
+    relation(8, box(0.2, 0.2, 0.3, 0.3), 8, 1);
+    const uint32_t under_way = relation(10, rotated(box(0.2, 0.2, 0.3, 0.3), 1), 10, 1);
+    const uint32_t way = a.add(9, box(0.24, 0.24, 0.26, 0.8));
+    a.data.admin_osm_ids[way] = way_boundary_id(1);
+    relation(8, box(0.5, 0.2, 0.6, 0.3), 18, 2);
+    const uint32_t under_rank0 = relation(10, box(0.5, 0.2, 0.6, 0.3), 20, 2);
+    relation(9, box(0.54, 0.24, 0.56, 0.8), 19, 0);
+    a.map();
+    compute_admin_parent_chain(a.data, 1);
+    CHECK_EQ(take_out_repeated_boundaries(a.data, 1), 2u);
+    CHECK_EQ(a.data.admin_polygons[under_way].place_type_override, BOUNDARY_REPEATS_PARENT);
+    CHECK_EQ(a.data.admin_polygons[under_rank0].place_type_override, BOUNDARY_REPEATS_PARENT);
 }
 
 TEST(a_boundary_repeats_a_parent_whose_outline_has_more_vertices_along_its_edges) {

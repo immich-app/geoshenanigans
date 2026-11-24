@@ -374,7 +374,7 @@ uint16_t polygon_country(const ParsedData& data, const AdminRings& countries, ui
 
 size_t take_out_repeated_boundaries(ParsedData& data, unsigned int num_threads) {
     const size_t n = data.admin_polygons.size();
-    if (n == 0 || data.admin_osm_ids.size() != n || data.admin_parent_ids.size() != n) return 0;
+    if (n == 0 || data.admin_osm_ids.size() != n) return 0;
     auto& qids = data.boundary_wikidata;
     std::sort(qids.begin(), qids.end());
     qids.erase(std::unique(qids.begin(), qids.end()), qids.end());
@@ -429,6 +429,14 @@ size_t take_out_repeated_boundaries(ParsedData& data, unsigned int num_threads) 
         rank_memo[p].store(kKnown | rank, std::memory_order_relaxed);
         return rank;
     };
+    // The rings a boundary can repeat, of the boundary relations of levels
+    // 4 to 9, edge-indexed for the tests at the boundaries' points.
+    auto may_repeat = [&](uint32_t p) {
+        const uint8_t level = data.admin_polygons[p].admin_level;
+        return level >= 4 && level <= 9 && admin_relation_ring(data.admin_osm_ids[p]);
+    };
+    const AdminRings parents(rings, num_threads, may_repeat);
+    const auto closer = closest_parent_first(data);
     // Taken out, by slot: a level's are marked after it, so the levels
     // below a boundary are settled when it looks for its parent.
     std::vector<uint8_t> out(n);
@@ -440,16 +448,33 @@ size_t take_out_repeated_boundaries(ParsedData& data, unsigned int num_threads) 
                 if (data.admin_polygons[p].admin_level != level || !admin_relation_ring(data.admin_osm_ids[p])) return;
                 if (std::binary_search(linking.begin(), linking.end(), boundary)) return;
                 const uint64_t qid = qid_of(boundary);
-                if (qid == 0) return;
-                uint32_t parent = data.admin_parent_ids[p];
-                while (parent != NO_DATA) {
-                    if (data.admin_polygons[parent].admin_level <= 3) return;
-                    if (admin_relation_ring(data.admin_osm_ids[parent]) && !out[parent] && rank_of(parent) != 0) break;
-                    parent = data.admin_parent_ids[parent];
+                if (qid == 0 || rank_of(p) == 0) return;
+                const uint32_t ring_count = rings.polygons[p].ring_count;
+                if (ring_count == 0) return;
+                // The closest relation round the boundary's point, of a lower
+                // level above 3 and a rank of 1 to 25, Nominatim's ORDER BY
+                // admin_level desc of those covering its centroid.
+                const LatLng at = interior_point(rings.vertices.data(), rings.rings_of(p), ring_count);
+                const PackedLocation inside = point_e7(at.first, at.second);
+                thread_local std::vector<uint32_t> ids;
+                thread_local std::vector<std::pair<uint32_t, uint32_t>> ranked;
+                ids.clear();
+                for_each_admin_candidate(data, admin_link_cell(inside), [&](uint32_t id, const AdminPolygon& poly) {
+                    if (poly.admin_level < level && may_repeat(id & ID_MASK)) ids.push_back(id);
+                });
+                rank_candidates(ids, closer, ranked);
+                uint32_t parent = NO_DATA;
+                for (uint32_t id : ids) {
+                    const uint32_t q = id & ID_MASK;
+                    if (out[q] || rank_of(q) == 0) continue;
+                    if ((id & INTERIOR_FLAG) || parents.covers(q, inside)) {
+                        parent = q;
+                        break;
+                    }
                 }
                 if (parent == NO_DATA) return;
                 const uint64_t parent_boundary = admin_boundary_id(data.admin_osm_ids[parent]);
-                if (qid_of(parent_boundary) != qid || rank_of(p) == 0) return;
+                if (qid_of(parent_boundary) != qid) return;
                 if (same_boundary(boundary, parent_boundary)) found.push_back(boundary);
             }, num_threads);
         for (uint64_t boundary : repeated) {
