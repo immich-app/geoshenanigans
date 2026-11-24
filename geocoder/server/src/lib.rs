@@ -1351,7 +1351,8 @@ fn street_tokens_overlap(a: &str, b: &str) -> bool {
 /// range — the old open-coded version computed the offset in unsigned space,
 /// so descending ranges (start > end) saturated the negative offset to 0.
 /// Squared distance (radians²) from the point to an interpolation line and
-/// the fraction along it, by length, of the closest point. None for a line
+/// the fraction along it, by length, of the closest point: the point nearest
+/// in metres, as a street's (point_to_segment_distance). None for a line
 /// without length.
 fn interp_position(nodes: &[NodeCoord], lat: f64, lng: f64, cos_lat: f64) -> Option<(f64, f64)> {
     if nodes.len() < 2 { return None; }
@@ -1371,10 +1372,10 @@ fn interp_position(nodes: &[NodeCoord], lat: f64, lng: f64, cos_lat: f64) -> Opt
     for i in 0..nodes.len() - 1 {
         let len = seg_len(i);
         let (dist, seg_t) = point_to_segment_with_t(
-            lat, lng,
-            nodes[i].lat as f64, nodes[i].lng as f64,
-            nodes[i + 1].lat as f64, nodes[i + 1].lng as f64,
-            cos_lat,
+            lat, lng * cos_lat,
+            nodes[i].lat as f64, nodes[i].lng as f64 * cos_lat,
+            nodes[i + 1].lat as f64, nodes[i + 1].lng as f64 * cos_lat,
+            PLANAR,
         );
         if dist < best_dist {
             best_dist = dist;

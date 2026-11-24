@@ -334,6 +334,26 @@ fn a_long_edge_is_found_where_the_builder_lists_its_great_circle() {
 }
 
 #[test]
+fn an_interpolation_line_is_as_far_as_its_point_nearest_in_metres() {
+    // At 60° N, a line running north-east whose nearest point lies 95 m south-east of the point,
+    // numbered 1 to 301 along its 300 m: a street of its name takes number 151 from it, within
+    // 100 m. In degrees its nearest point would lie 57 m along it, 111 m off. At 120 m it is the
+    // nearest line within the search distance, where in degrees it would be 140 m off.
+    let origin = (60.0, 10.0);
+    for (metres, within) in [(95.0, 100.0), (120.0, DEFAULT_SEARCH_DISTANCE)] {
+        let foot = along(metres, 135.0);
+        let (dn, de) = along(150.0, 45.0);
+        let index = TestIndex::around(origin)
+            .interpolation("Main Street", (1, 301, 0), &[(foot.0 - dn, foot.1 - de), (foot.0 + dn, foot.1 + de)])
+            .load();
+        let number = index.find_interp_on_way(origin.0, origin.1, "Main Street", radians_sq(within));
+        assert_eq!(number, Some(151), "{metres} m");
+        let interp = &index.debug_primary(origin.0, origin.1)["interp"];
+        assert!(interp["number"] == 151 && about(&interp["dist_m"], metres * 6_371_000.0_f64.to_radians() / METRES_PER_DEGREE), "{metres} m: {interp}");
+    }
+}
+
+#[test]
 fn a_building_round_the_point_is_found_at_any_search_distance() {
     // With a 30 m search distance, a building the point lies in whose own point lies 80 m east, in
     // a cell past 30 m of the point: the address at no distance, as the cells round the point's
