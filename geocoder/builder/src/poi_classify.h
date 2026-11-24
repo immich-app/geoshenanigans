@@ -246,7 +246,7 @@ inline std::optional<PoiClassification> classify_poi(
     // beside a natural tag of rank 30 alone yields too: natural=* is no
     // fallback tag, so it is the class, and 30 its rank, the lowest positive
     // one. A reservoir of the class building or place, which the lane leaves
-    // out, stays one.
+    // out, stays one, whether a POI main tag is beside it or not.
     // A water object a highway kind of rank 26 or 27 ranks is a street there
     // (the street lane takes address ranks 26 to 29, reverse.py:187-189): on
     // an area it takes the highway flag below (poi_water_street), unless a
@@ -275,7 +275,7 @@ inline std::optional<PoiClassification> classify_poi(
     // gave its tags theirs.
     PoiCategory kept = PoiCategory::UNKNOWN;
     if (kind != PoiCategory::UNKNOWN &&
-        (!ranks_30 || (kind == PoiCategory::RESERVOIR && poi_main_tag &&
+        (!ranks_30 || (kind == PoiCategory::RESERVOIR &&
                        reservoir_leaves_poi_lane(t_aeroway, t_amenity, t_boundary, t_building, t_craft, t_emergency,
                                                  t_highway, t_leisure, t_man_made, t_natural, t_office, t_place,
                                                  t_railway, t_shop, t_tourism, t_waterway, area)))) {

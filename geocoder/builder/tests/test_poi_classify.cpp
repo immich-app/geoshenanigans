@@ -678,8 +678,9 @@ TEST(poi_classify_a_reservoir_point_kept_out_of_the_poi_lane_never_takes_the_pri
     // reservoir or basin point is a rank-30 POI, in the lane, and the server
     // lets a RESERVOIR point take the slot. One a main tag of a lower rank
     // ranks (place=locality, 25) or whose class the POI lane takes none of
-    // (building, the first of its fallback tags) stays a RESERVOIR, but is in
-    // neither lane in Nominatim: it never takes the primary slot
+    // (building, the first of its fallback tags, with or without a POI main
+    // tag beside it; place, a main tag of no fallback) stays a RESERVOIR,
+    // but is in neither lane in Nominatim: it never takes the primary slot
     // (POI_FLAG_PLACES_ONLY). On an area, which the server keeps out of the
     // lanes as a RESERVOIR, it carries no such flag.
     for (const char* landuse : {"reservoir", "basin"}) {
@@ -688,13 +689,17 @@ TEST(poi_classify_a_reservoir_point_kept_out_of_the_poi_lane_never_takes_the_pri
         const Tags fountain = with(plain, "amenity", "fountain");
         const Tags locality = with(fountain, "place", "locality");
         const Tags building = with(with(plain, "building", "yes"), "tourism", "attraction");
+        const Tags building_alone = with(plain, "building", "yes");
+        const Tags island = with(plain, "place", "island");
         struct Case {
             Tags tags;
             PoiCategory category;
             bool places_only;
         };
         for (const Case& c : {Case{plain, PoiCategory::RESERVOIR, false}, Case{fountain, PoiCategory::FOUNTAIN, false},
-                              Case{locality, PoiCategory::RESERVOIR, true}, Case{building, PoiCategory::RESERVOIR, true}})
+                              Case{locality, PoiCategory::RESERVOIR, true}, Case{building, PoiCategory::RESERVOIR, true},
+                              Case{building_alone, PoiCategory::RESERVOIR, true},
+                              Case{island, PoiCategory::RESERVOIR, true}})
             for (const bool area : {false, true}) {
                 Tags t = c.tags;
                 t.area = area;

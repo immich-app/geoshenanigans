@@ -1609,28 +1609,31 @@ TEST(a_water_street_is_no_address_point_and_answers_its_own_name_as_a_street_doe
 // Beckenweg, 17 m north of it, and at a point 11 m south of it, nearer
 // Teststrasse (22 m) than Beckenweg (28 m), it answers, on Beckenweg. One
 // that is a locality (25) and a fountain too, or a reservoir that is a
-// building and an attraction, whose class (building, its first fallback tag)
-// the POI lane takes none of, is in neither lane there: the build writes each
-// a RESERVOIR of no parent street, and Teststrasse answers by it.
+// building and an attraction, or a building alone, whose class (building,
+// its first fallback tag) the POI lane takes none of, is in neither lane
+// there: the build writes each a RESERVOIR of no parent street, and
+// Teststrasse answers by it.
 TEST(a_reservoir_point_a_lower_rank_or_its_class_keeps_out_of_the_poi_lane_never_takes_the_primary_slot) {
     const ScratchDir root("reservoir-point-build");
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
     const int32_t lat0 = 470000000, lng0 = 80000000;
     std::vector<TestObject> objects;
     objects.push_back(node(1200, lat0 + 1404500, lng0 + 1420000));
-    objects.push_back(node(1201, lat0 + 1404500, lng0 + 1470000));
+    objects.push_back(node(1201, lat0 + 1404500, lng0 + 1490000));
     objects.push_back(way(4070, {1200, 1201}, {{"highway", "residential"}, {"name", "Beckenweg"}}));
     objects.push_back(node(1202, lat0 + 1403000, lng0 + 1430000, {{"landuse", "basin"}, {"name", "Becken Testdorf"}}));
     objects.push_back(node(1203, lat0 + 1403000, lng0 + 1445000, {{"amenity", "fountain"}, {"landuse", "basin"},
                                                                   {"name", "Brunnenbecken Testdorf"}, {"place", "locality"}}));
     objects.push_back(node(1204, lat0 + 1403000, lng0 + 1460000, {{"building", "yes"}, {"landuse", "reservoir"},
                                                                   {"name", "Stauweiher Testdorf"}, {"tourism", "attraction"}}));
+    objects.push_back(node(1205, lat0 + 1403000, lng0 + 1475000, {{"building", "yes"}, {"landuse", "basin"},
+                                                                  {"name", "Beckenhaus Testdorf"}}));
     write_fixture_with(pbf, objects);
     const std::string out = root.path() + "/single";
     REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
 
     const std::vector<PoiRecord> pois = poi_records_in(tree(out), "planet/poi/all");
-    REQUIRE(pois.size() == 3);
+    REQUIRE(pois.size() == 4);
     for (const PoiRecord& pr : pois) {
         const bool plain = std::abs(pr.lng - 8.1430) < 0.0001;
         if ((pr.parent_street_id != NO_DATA) != plain) std::printf("    at %.4f: parent %u\n", pr.lng, pr.parent_street_id);
@@ -1640,10 +1643,10 @@ TEST(a_reservoir_point_a_lower_rank_or_its_class_keeps_out_of_the_poi_lane_never
     }
 
     const std::string dataset = poi_dataset(out, "all", root.path() + "/dataset");
-    const std::vector<std::string> answers =
-        server_answers(dataset, {{47.1402, 8.1430}, {47.1402, 8.1445}, {47.1402, 8.1460}}, root.path() + "/q", log);
-    REQUIRE(answers.size() == 3);
-    const char* roads[] = {"Beckenweg", "Teststrasse", "Teststrasse"};
+    const std::vector<std::string> answers = server_answers(
+        dataset, {{47.1402, 8.1430}, {47.1402, 8.1445}, {47.1402, 8.1460}, {47.1402, 8.1475}}, root.path() + "/q", log);
+    REQUIRE(answers.size() == 4);
+    const char* roads[] = {"Beckenweg", "Teststrasse", "Teststrasse", "Teststrasse"};
     for (size_t k = 0; k < answers.size(); k++) {
         if (answer_string(answers[k], {"address", "road"}) != std::optional<std::string>(roads[k]))
             std::printf("    %s\n", answers[k].c_str());
