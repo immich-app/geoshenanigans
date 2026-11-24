@@ -149,7 +149,7 @@ def flat(paths):
 
 
 class TemplateTest(unittest.TestCase):
-    MINIMAL_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin",
+    MINIMAL_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_own_names.bin", "admin_polygons.bin", "admin_rings.bin",
                      "arc_index.bin", "arc_vertices.bin", "place_cells.bin", "place_hidden.bin", "place_nodes.bin",
                      "strings_core.bin", "strings_layout.json"]
 

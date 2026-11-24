@@ -922,7 +922,8 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 postcode centroids under id 23, and ids 24 and 25 name no file: the patcher
 writes the cells file beside the centroids, and the entries file is gone.
 v22 gives id 38 to the address points' `addr:city`, and ids 36 and 37 name
-no file.
+no file. v24 gives id 39 to the polygons' own names beside the admin
+polygons.
 
 | Id | File | How it travels |
 |----|------|----------------|
@@ -955,6 +956,7 @@ no file.
 | 35 | `geo_entries.bin` | the geo index's blocks, rebuilt with `geo_cells.bin` (8) |
 | 36, 37 | none (v22) | never: a section naming either is refused ("Unknown file 36") |
 | 38 | `addr_cities.bin` | parallel delta along addr_points, remap kind 2 (v22), after `interp_postcodes.bin`'s |
+| 39 | `admin_own_names.bin` | merge at stride 8 (v24), string field `name_id` at byte 4 (the slot at 0 a polygon keeps), after the admin geometry |
 
 The four admin geometry files (`ADMIN_SLOT_FAMILIES`) follow the place nodes
 as arc_index, arc_vertices, admin_polygons, admin_rings, ahead of the admin
@@ -968,6 +970,14 @@ death's a DELETE. The patcher replays them as any merge section. A file the
 new dir lacks gets no section, so a dir without admin geometry carries none;
 an empty one (Antarctica's dirs) goes as a full replacement of nothing, as
 COPY_OLD never stands for an empty file.
+
+`admin_own_names.bin` follows them the same way (v24): a record of 8 bytes
+(`types.h` AdminOwnName) for each polygon that goes by the English name of
+the place node it links, its slot and its own name (a core string), ascending
+by slot. It merges by content as any record file of a string field: a polygon
+whose own name only moved in the strings MATCHes, a polygon newly named so is
+an INSERT, and one no longer named so a DELETE. The planet's boundary tiers hold
+about 26,000 of them.
 
 ## Performance
 

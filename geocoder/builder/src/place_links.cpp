@@ -402,9 +402,17 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
             const std::string_view name = linked_english_name(!o.tags || o.tags->name_en, o.country, text.at(c.name_en),
                                                               text.at(c.name_tag), node_country[link.candidate]);
             if (!name.empty()) {
+                // Its own name stays one of its names, aside (own_name_id).
                 const uint32_t name_id = data.string_pool.intern(std::string(name));
-                for (uint32_t m = o.first; m < o.first + o.count; m++) data.admin_polygons[all.members[m]].name_id = name_id;
-                stats.named++;
+                bool named = false;
+                for (uint32_t m = o.first; m < o.first + o.count; m++) {
+                    AdminPolygon& p = data.admin_polygons[all.members[m]];
+                    if (p.name_id == name_id) continue;
+                    p.own_name_id = p.name_id;
+                    p.name_id = name_id;
+                    named = true;
+                }
+                stats.named += named;
             }
             const uint64_t node_id = pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, c.node);
             const auto p = std::lower_bound(place_at.begin(), place_at.end(), std::make_pair(node_id, uint32_t(0)));

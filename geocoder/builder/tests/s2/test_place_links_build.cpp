@@ -17,6 +17,8 @@
 
 #include "pbf_fixture.h"
 #include "place_files.h"
+#include "side_blocks.h"
+#include "string_files.h"
 #include "test_framework.h"
 #include "types.h"
 
@@ -333,4 +335,51 @@ TEST(a_linked_boundary_goes_by_its_nodes_english_name_where_it_has_none) {
     CHECK(names(answers[1], "town", "Kirsanov"));
     CHECK(names(answers[2], "town", "City of Ipswich"));
     CHECK(answers[2].find("Ipswich Town") == std::string::npos);
+}
+
+TEST(a_linked_boundary_keeps_its_own_name_beside_the_english_one_it_goes_by) {
+    // Sosnovka's boundary goes by its town node's name:en, and keeps its own name, Сосновка, in
+    // admin_own_names.bin at its slot, for the addr:city crosscheck and place search: a core
+    // string, which a house's addr:city of that name keeps in addr_cities.bin. Кирсанов, of a
+    // name:en of its own, keeps none. The planet's dirs and Europe's, of its own strings, alike.
+    Fixture f;
+    f.country(41, 19, 82, 180, "Россия", "RU");
+    f.boundary(51.5, 39.5, 54.0, 43.5, 4, "Тамбовская область", {{"name:en", "Tambov Oblast"}});
+    const int64_t town = f.node(53.24, 41.37, {{"place", "town"}, {"name", "Сосновка"}, {"name:en", "Sosnovka"}});
+    f.boundary(53.20, 41.30, 53.30, 41.45, 8, "Сосновка", {}, {{OsmType::Node, town, "label"}});
+    const int64_t kirsanov = f.node(52.65, 42.73, {{"place", "town"}, {"name", "Кирсанов"}, {"name:en", "Kirsanov Town"}});
+    f.boundary(52.60, 42.70, 52.70, 42.80, 8, "Кирсанов", {{"name:en", "Kirsanov"}}, {{OsmType::Node, kirsanov, "label"}});
+    f.line({{53.25, 41.36}, {53.25, 41.39}}, {{"highway", "residential"}, {"name", "улица Ленина"}});
+    f.node(53.2502, 41.37, {{"addr:housenumber", "1"}, {"addr:street", "улица Ленина"}, {"addr:city", "Сосновка"}});
+    const ScratchDir root("own-names");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log", out = root.path() + "/out";
+    write_test_pbf(pbf, f.objects(), 1000);
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output", "--multi-quality"}, log));
+    for (const char* region : {"planet", "europe"}) {
+        const std::string dir = out + "/" + region + "/";
+        std::string core;
+        const std::vector<char> core_file = file_bytes(dir + "full/strings_core.bin");
+        string_files::decode(reinterpret_cast<const uint8_t*>(core_file.data()), core_file.size(),
+                             [&](const char* p, size_t n) { core.append(p, n); });
+        auto core_string = [&](uint32_t id) { return id < core.size() ? std::string(core.c_str() + id) : std::string(); };
+        const std::vector<char> polygons = file_bytes(dir + "quality/exact/admin_polygons.bin"),
+                                own = file_bytes(dir + "quality/exact/" + kAdminOwnNamesFile);
+        REQUIRE(own.size() == sizeof(AdminOwnName));
+        CHECK(file_bytes(dir + "quality/simplified/" + kAdminOwnNamesFile) == own);
+        AdminOwnName name;
+        std::memcpy(&name, own.data(), sizeof name);
+        REQUIRE(size_t(name.slot + 1) * sizeof(AdminPolygonRecord) <= polygons.size());
+        AdminPolygonRecord polygon;
+        std::memcpy(&polygon, polygons.data() + size_t(name.slot) * sizeof polygon, sizeof polygon);
+        CHECK_EQ(core_string(polygon.name_id), std::string("Sosnovka"));
+        CHECK_EQ(core_string(name.name_id), std::string("Сосновка"));
+
+        const std::vector<char> cities_file = file_bytes(dir + "full/addr_cities.bin");
+        std::vector<uint32_t> cities;
+        side_blocks::decode("addr_cities.bin", reinterpret_cast<const uint8_t*>(cities_file.data()), cities_file.size(),
+                            [&](const uint32_t* v, size_t n) { cities.insert(cities.end(), v, v + n); });
+        REQUIRE(cities.size() == 1);
+        CHECK_EQ(cities[0], name.name_id);
+        if (gctest::failures()) std::printf("    in %s\n", region);
+    }
 }

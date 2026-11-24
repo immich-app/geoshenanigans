@@ -60,7 +60,7 @@ struct LinkStats {
     size_t claimed = 0;                  // nodes linked
     size_t taken = 0;                    // links of a node a later runner's label link took
     size_t covers = 0;                   // covers tests
-    size_t named = 0;                    // linking polygons the node names (linked_english_name)
+    size_t named = 0;                    // linking polygons the node renames (linked_english_name)
 };
 
 // Whether the country `cc` (packed upper case) has English for its one
@@ -89,6 +89,7 @@ std::string_view linked_english_name(bool own_name_en, uint16_t polygon_country,
 // linked node's claimant, the polygon of the last link of it) and
 // data.place_node_links (every boundary linking each place node), and names
 // a linking polygon by its node where Nominatim's English answer does
-// (linked_english_name), interning the name in data.string_pool. Reads
+// (linked_english_name), interning the name in data.string_pool, its own
+// name kept as its own_name_id where that is another string. Reads
 // admin_tags; `lookups.country_at` gives the nodes their countries.
 LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsigned threads);

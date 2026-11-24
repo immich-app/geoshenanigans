@@ -1150,8 +1150,8 @@ struct AdminMinimalStrings {
     uint32_t name(uint32_t shared) const { return subset ? subset->offset_of(shared) : shared; }
 };
 
-// The core strings admin-minimal's records name: its polygons' and its place
-// nodes', in the order of the shared core.
+// The core strings admin-minimal's records name: its polygons' (their own
+// names among them) and its place nodes', in the order of the shared core.
 static StringSubset admin_minimal_names(const ParsedData& data, const std::vector<uint32_t>& kept) {
     const std::vector<char>& core = data.strings_tiers[0];
     std::vector<std::atomic<uint64_t>> used(core.size() / 64 + 1);
@@ -1163,7 +1163,10 @@ static StringSubset admin_minimal_names(const ParsedData& data, const std::vecto
         mark_bit(used, name);
     };
     parallel_for(kept.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t k = b; k < e; k++) use(data.admin_polygons[kept[k]].name_id);
+        for (size_t k = b; k < e; k++) {
+            use(data.admin_polygons[kept[k]].name_id);
+            use(data.admin_polygons[kept[k]].own_name_id);
+        }
     });
     parallel_for(data.place_nodes.size(), [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++)
@@ -1207,7 +1210,8 @@ void write_place_files(const std::string& dir, const std::vector<PlaceNode>& nod
 namespace {
 
 // A dir's records over `slots`: polygon i at slot slots.slot_of[i] (none at
-// NO_DATA), named name(its shared name), and a tombstone at every other slot.
+// NO_DATA), named name(its shared name) and of the own name name(its shared
+// own name), and a tombstone at every other slot.
 template <class Name>
 SlotRecords records_at(const ParsedData& data, const AdminMinimalSlots& slots, Name name) {
     SlotRecords out{std::vector<AdminPolygon>(slots.count, admin_polygon_tombstone()),
@@ -1217,6 +1221,8 @@ SlotRecords records_at(const ParsedData& data, const AdminMinimalSlots& slots, N
         if (slot == NO_DATA) continue;
         out.at_slot[slot] = data.admin_polygons[i];
         out.at_slot[slot].name_id = name(data.admin_polygons[i].name_id);
+        if (data.admin_polygons[i].own_name_id != NO_DATA)
+            out.at_slot[slot].own_name_id = name(data.admin_polygons[i].own_name_id);
         out.polygon_of[slot] = static_cast<uint32_t>(i);
     }
     return out;

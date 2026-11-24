@@ -53,6 +53,17 @@ struct Fixture {
         return o.id;
     }
 
+    // An open way through new nodes at the points.
+    int64_t line(const std::vector<std::pair<double, double>>& points, Tags tags = {}) {
+        TestObject o;
+        o.type = OsmType::Way;
+        o.id = next_way++;
+        for (const auto& [lat, lng] : points) o.refs.push_back(node(lat, lng));
+        o.tags = std::move(tags);
+        ways.push_back(o);
+        return o.id;
+    }
+
     // A relation of the box's way as its outer ring, and its other members.
     int64_t area(double s, double w, double n, double e, Tags tags,
                  std::vector<std::tuple<OsmType, int64_t, std::string>> members = {}) {

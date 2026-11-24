@@ -30,10 +30,10 @@ selection_files() {
     if [ "$MINIMAL" = "1" ]; then
         # Everything comes from the admin-minimal/ subdir (filtered: admin
         # polygons of levels 2-8, place types in {city,town,village,hamlet}):
-        # its own polygons on the minimal arc set, cell index, place nodes,
-        # core strings and layout.
+        # its own polygons on the minimal arc set and their own names, cell
+        # index, place nodes, core strings and layout.
         for f in admin_cells.bin admin_entries.bin \
-                 admin_polygons.bin admin_rings.bin arc_index.bin arc_vertices.bin \
+                 admin_own_names.bin admin_polygons.bin admin_rings.bin arc_index.bin arc_vertices.bin \
                  place_cells.bin place_hidden.bin place_nodes.bin strings_core.bin strings_layout.json; do
             echo "admin-minimal $f"
         done
@@ -51,8 +51,8 @@ selection_files() {
         echo "full $f"
     done
     # The boundaries of the chosen tier: the admin polygons (postcode areas
-    # among them) and the arcs their rings share.
-    for f in admin_polygons.bin admin_rings.bin arc_index.bin arc_vertices.bin; do
+    # among them), their own names and the arcs their rings share.
+    for f in admin_own_names.bin admin_polygons.bin admin_rings.bin arc_index.bin arc_vertices.bin; do
         echo "quality/$QUALITY $f"
     done
     # The POI tier's records and strings; its string layout is the one every

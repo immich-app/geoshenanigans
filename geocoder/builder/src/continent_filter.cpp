@@ -494,7 +494,10 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     parallel_each(out.ways, [&](WayHeader& w) { add_used(w.name_id); });
     parallel_each(out.addr_points, [&](AddrPoint& a) { add_used(a.housenumber_id); add_used(a.street_id); });
     parallel_each(out.interp_ways, [&](InterpWay& iw) { add_used(iw.street_id); });
-    parallel_each(out.admin_polygons, [&](AdminPolygon& ap) { add_used(ap.name_id); });
+    parallel_each(out.admin_polygons, [&](AdminPolygon& ap) {
+        add_used(ap.name_id);
+        add_used(ap.own_name_id);
+    });
     parallel_each(out.place_nodes, [&](PlaceNode& pn) { add_used(pn.name_id); });
     parallel_each(out.poi_records, [&](PoiRecord& pr) {
         add_used(pr.name_id);
@@ -519,7 +522,10 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         a.street_id = remap_or_sentinel(a.street_id);
     });
     parallel_each(out.interp_ways, [&](InterpWay& iw) { iw.street_id = remap_or_sentinel(iw.street_id); });
-    parallel_each(out.admin_polygons, [&](AdminPolygon& ap) { ap.name_id = remap_or_sentinel(ap.name_id); });
+    parallel_each(out.admin_polygons, [&](AdminPolygon& ap) {
+        ap.name_id = remap_or_sentinel(ap.name_id);
+        ap.own_name_id = remap_or_sentinel(ap.own_name_id);
+    });
     parallel_each(out.place_nodes, [&](PlaceNode& pn) { pn.name_id = remap_or_sentinel(pn.name_id); });
     parallel_each(out.poi_records, [&](PoiRecord& pr) {
         pr.name_id = remap_or_sentinel(pr.name_id);

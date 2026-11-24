@@ -153,6 +153,7 @@
       "files": [
         "{region}/admin-minimal/admin_cells.bin",
         "{region}/admin-minimal/admin_entries.bin",
+        "{region}/admin-minimal/admin_own_names.bin",
         "{region}/admin-minimal/admin_polygons.bin",
         "{region}/admin-minimal/admin_rings.bin",
         "{region}/admin-minimal/arc_index.bin",
@@ -164,6 +165,7 @@
         "{region}/admin-minimal/strings_layout.json"
       ],
       "replaces": [
+        "{region}/quality/{quality}/admin_own_names.bin",
         "{region}/quality/{quality}/admin_polygons.bin",
         "{region}/quality/{quality}/admin_rings.bin",
         "{region}/quality/{quality}/arc_index.bin",
@@ -175,6 +177,7 @@
       "files": [
         "{region}/admin-minimal-poi/admin_cells.bin",
         "{region}/admin-minimal-poi/admin_entries.bin",
+        "{region}/admin-minimal-poi/admin_own_names.bin",
         "{region}/admin-minimal-poi/admin_polygons.bin",
         "{region}/admin-minimal-poi/admin_rings.bin",
         "{region}/admin-minimal-poi/arc_index.bin",
@@ -186,6 +189,7 @@
         "{region}/admin-minimal-poi/strings_layout.json"
       ],
       "replaces": [
+        "{region}/quality/{quality}/admin_own_names.bin",
         "{region}/quality/{quality}/admin_polygons.bin",
         "{region}/quality/{quality}/admin_rings.bin",
         "{region}/quality/{quality}/arc_index.bin",
@@ -267,6 +271,7 @@
     },
     "quality.simplified": {
       "files": [
+        "{region}/quality/simplified/admin_own_names.bin",
         "{region}/quality/simplified/admin_polygons.bin",
         "{region}/quality/simplified/admin_rings.bin",
         "{region}/quality/simplified/arc_index.bin",
@@ -275,6 +280,7 @@
     },
     "quality.exact": {
       "files": [
+        "{region}/quality/exact/admin_own_names.bin",
         "{region}/quality/exact/admin_polygons.bin",
         "{region}/quality/exact/admin_rings.bin",
         "{region}/quality/exact/arc_index.bin",

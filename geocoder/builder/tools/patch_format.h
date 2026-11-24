@@ -145,6 +145,11 @@ static constexpr size_t POI_RECORD_PARENT_POLY_ID_OFF = 32;
 // 16, is an admin slot).
 static constexpr size_t PLACE_NODE_NAME_ID_OFF = 8;
 
+// An admin_own_names.bin record (types.h AdminOwnName): a polygon's slot,
+// which it keeps, and its own name, a string-pool offset.
+static constexpr size_t ADMIN_OWN_NAME_STRIDE = 8;
+static constexpr size_t ADMIN_OWN_NAME_NAME_ID_OFF = 4;
+
 // --- File I/O helpers ---
 
 inline std::vector<char> read_file(const std::string& path) {
@@ -277,7 +282,10 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // v24: admin_polygons.bin's last byte is the polygon's rank_address, and the
 // place files are PNL4: a visible row's type field is 4 bits, its top bit a
 // promoted node, so a logical place row's byte 14 is its rank_address (0 for
-// a hidden node). Versions 20, 21 and 23 are other formats'.
+// a hidden node). File id 39 names admin_own_names.bin, the own name of each
+// polygon that goes by its place node's English name, which merges as a
+// record file of a string field after the admin geometry. Versions 20, 21
+// and 23 are other formats'.
 static constexpr uint32_t GCPATCH_VERSION = 24;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
@@ -341,7 +349,10 @@ enum class PatchFileId : uint32_t {
     // Per address point: its addr:city, a core string offset (NO_DATA for
     // none), along addr_points (v22).
     ADDR_CITIES = 38,
-    COUNT = 39
+    // Beside admin_polygons.bin: (slot, own name) of each polygon that goes
+    // by its place node's English name (v24).
+    ADMIN_OWN_NAMES = 39,
+    COUNT = 40
 };
 
 static const char* patch_file_names[] = {
@@ -360,7 +371,8 @@ static const char* patch_file_names[] = {
     "interp_postcodes.bin",
     "geo_entries.bin",
     "unused (36)", "unused (37)",
-    "addr_cities.bin"
+    "addr_cities.bin",
+    "admin_own_names.bin"
 };
 
 // The string offset fields of a record file the patch merges, as byte
@@ -376,6 +388,7 @@ inline std::vector<size_t> string_field_offsets(PatchFileId fid) {
         return {POI_RECORD_NAME_ID_OFF, POI_RECORD_PARENT_STREET_ID_OFF, POI_RECORD_PARENT_POSTCODE_ID_OFF};
     case PatchFileId::PLACE_NODES: return {PLACE_NODE_NAME_ID_OFF};
     case PatchFileId::POSTCODE_CENTROIDS: return {POSTCODE_CENTROID_POSTCODE_ID_OFF};
+    case PatchFileId::ADMIN_OWN_NAMES: return {ADMIN_OWN_NAME_NAME_ID_OFF};
     default: return {};
     }
 }
@@ -424,6 +437,7 @@ static constexpr StringRecordFile STRING_RECORD_FILES[] = {
     {PatchFileId::POI_RECORDS, POI_RECORD_STRIDE},
     {PatchFileId::PLACE_NODES, PLACE_NODE_STRIDE},
     {PatchFileId::POSTCODE_CENTROIDS, POSTCODE_CENTROID_STRIDE},
+    {PatchFileId::ADMIN_OWN_NAMES, ADMIN_OWN_NAME_STRIDE},
 };
 
 // The admin geometry files by family, in the order a patch sends them: a file

@@ -628,11 +628,17 @@ size_t write_ring_files(const std::vector<std::string>& dirs, const AdminArcBloc
         at += span.size;
         if (at > UINT32_MAX) throw std::length_error("admin_rings.bin past 4 GiB: admin_polygons.bin holds 32-bit offsets");
     }
+    // The own names beside them (types.h AdminOwnName), a tombstone of none.
+    std::vector<AdminOwnName> own;
+    for (size_t slot = 0; slot < records.size(); slot++)
+        if (records[slot].own_name_id != NO_DATA) own.push_back({static_cast<uint32_t>(slot), records[slot].own_name_id});
     for (size_t d = 0; d < dirs.size(); d++) {
         files[d].flush();
         if (!files[d]) throw std::runtime_error("failed to write " + dirs[d] + "/admin_rings.bin");
         write_binary_file(dirs[d] + "/admin_polygons.bin", reinterpret_cast<const char*>(out.data()),
                           out.size() * sizeof(AdminPolygonRecord));
+        write_binary_file(dirs[d] + "/" + kAdminOwnNamesFile, reinterpret_cast<const char*>(own.data()),
+                          own.size() * sizeof(AdminOwnName));
     }
     return at;
 }

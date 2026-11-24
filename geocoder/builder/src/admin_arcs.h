@@ -799,7 +799,8 @@ void write_arc_files(const std::string& dir, const ArcSetBlocks& set, const ArcB
 // The admin_polygons.bin and admin_rings.bin of `dirs`, the same bytes in
 // each, in set `set`: records[slot] as an AdminPolygonRecord with its ring
 // block (that of polygon polygon_of[slot]) laid out in slot order, a
-// tombstone (polygon_of NO_DATA) holding an empty one. Returns
+// tombstone (polygon_of NO_DATA) holding an empty one; and beside them
+// admin_own_names.bin, the own name of each record of one. Returns
 // admin_rings.bin's size.
 size_t write_ring_files(const std::vector<std::string>& dirs, const AdminArcBlocks& blocks, ArcSet set,
                         const std::vector<AdminPolygon>& records, const std::vector<uint32_t>& polygon_of);

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <iterator>
 #include <map>
 #include <random>
@@ -1275,6 +1276,37 @@ TEST(patch_round_trip_merges_postcode_centroids_as_logical_rows) {
     CHECK(logged(same, "postcode_centroids.bin: unchanged"));
     CHECK(logged(same, "postcode_centroid_cells.bin: unchanged (copied"));
     CHECK(!logged(same, "encode postcodes:"));
+}
+
+// The own names of the polygons named by their place nodes (admin_own_names.bin, types.h
+// AdminOwnName), a slot and a core string each, ascending by slot, merge as records of a string
+// field. The old pool is A Bonn Hafen Mitte, the new one Bonn Hafen Kai Mitte, so every name
+// moves: slots 1 and 7 keep Bonn and Mitte, MATCHes once the strings move, slot 4's own name
+// changes, slot 9's goes and slot 12's comes. They round-trip, under a cap of no moved-string
+// pairs too; an unchanged file is copied, a first one sent whole and an empty one written.
+TEST(patch_round_trip_merges_the_admin_own_names_as_records_of_a_string_field) {
+    const std::string old_pool("A\0Bonn\0Hafen\0Mitte\0", 19), new_pool("Bonn\0Hafen\0Kai\0Mitte\0", 21);
+    auto own = [](std::initializer_list<AdminOwnName> names) { return bytes_of(std::vector<AdminOwnName>(names)); };
+    BuildDir old_d = with_pool(old_pool), new_d = with_pool(new_pool);
+    old_d[kAdminOwnNamesFile] = own({{1, 2}, {4, 7}, {7, 13}, {9, 0}});
+    new_d[kAdminOwnNamesFile] = own({{1, 0}, {4, 11}, {7, 15}, {12, 5}});
+
+    const RoundTrip moved = round_trip(old_d, new_d);
+    CHECK(moved.mismatches.empty());
+    CHECK(merge_records(moved, kAdminOwnNamesFile).rfind("m/i/d/r=2/", 0) == 0);
+    CHECK(round_trip(old_d, new_d, {}, {"--string-pairs-max", "0"}).mismatches.empty());
+
+    const RoundTrip same = round_trip(new_d, new_d);
+    CHECK(same.mismatches.empty());
+    CHECK(logged(same, std::string(kAdminOwnNamesFile) + ": unchanged (copy old"));
+    const RoundTrip born = round_trip(with_pool(new_pool), new_d);
+    CHECK(born.mismatches.empty());
+    CHECK_EQ(merge_records(born, kAdminOwnNamesFile), std::string("m/i/d/r=0/4/0/0"));
+    BuildDir emptied = with_pool(new_pool);
+    emptied[kAdminOwnNamesFile] = {};
+    const RoundTrip gone = round_trip(old_d, emptied);
+    CHECK(gone.mismatches.empty());
+    CHECK(logged(gone, std::string(kAdminOwnNamesFile) + ": full replace 0 bytes"));
 }
 
 // The moved postcode's string fixups take 2 bytes each. Under a limit of 2

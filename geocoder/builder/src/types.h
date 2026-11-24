@@ -142,8 +142,12 @@ struct AdminPolygon {
     uint16_t country_code;
     uint8_t flags = 0;            // ADMIN_FLAG_* bits, which no dir holds
     uint8_t _pad4 = 0;
+    // Its own name where it goes by the English name of the place node it
+    // links (place_links.h linked_english_name), NO_DATA else: a core
+    // string, which its dirs hold in admin_own_names.bin.
+    uint32_t own_name_id = 0xFFFFFFFFu;
 };
-static_assert(sizeof(AdminPolygon) == 20, "AdminPolygon must be 20 bytes");
+static_assert(sizeof(AdminPolygon) == 24, "AdminPolygon must be 24 bytes");
 
 // AdminPolygon.flags bits.
 // A place area whose boundary tag Nominatim keeps as a category of its own
@@ -165,6 +169,19 @@ struct AdminPolygonRecord {
     uint8_t rank_address = 0;
 };
 static_assert(sizeof(AdminPolygonRecord) == 16, "AdminPolygonRecord must be 16 bytes");
+
+// An admin_polygons.bin's own names, the file beside it: an AdminOwnName for
+// each polygon of an own name (AdminPolygon::own_name_id), ascending by slot.
+// Nominatim's addr:city crosscheck compares every name of a polygon, its own
+// and its linked node's (results.py:606), and its search finds it by them, so
+// the server's crosscheck and the place search read it beside the name the
+// polygon goes by.
+inline constexpr const char* kAdminOwnNamesFile = "admin_own_names.bin";
+struct AdminOwnName {
+    uint32_t slot;
+    uint32_t name_id;
+};
+static_assert(sizeof(AdminOwnName) == 8, "AdminOwnName must be 8 bytes");
 
 inline AdminPolygonRecord admin_polygon_record(const AdminPolygon& p, uint32_t ring_offset) {
     if (p.admin_level > 15 || p.place_type_override > 15)

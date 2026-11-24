@@ -267,6 +267,7 @@ void add_admin_polygon(ParsedData& data,
     AdminPolygon poly;
     memset(&poly, 0, sizeof(poly)); // zero ALL bytes including padding
     poly.name_id = data.string_pool.intern(name);
+    poly.own_name_id = NO_DATA;
     poly.admin_level = admin_level;
     poly.place_type_override = place_type_override;
     // Its one member way runs along the whole ring, however it is rotated.

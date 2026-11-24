@@ -186,9 +186,11 @@ const std::vector<std::string> kRegions = {"planet",        "africa",        "as
 const std::set<std::string> kRegionsHeld = {"planet", "europe"};
 
 // The admin geometry files of every region's boundary tiers and, where it
-// has place nodes, its admin-minimal dirs.
+// has place nodes, its admin-minimal dirs, the own names of the polygons
+// beside them.
 std::set<std::string> admin_dir_layout() {
-    const std::vector<std::string> client = {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin"};
+    const std::vector<std::string> client = {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin",
+                                             kAdminOwnNamesFile};
     std::set<std::string> out;
     for (const std::string& region : kRegions)
         for (const char* dir : {"quality/simplified", "quality/exact", "admin-minimal", "admin-minimal-poi"})
@@ -200,7 +202,7 @@ std::set<std::string> admin_dir_layout() {
 bool admin_geometry(const std::string& name) {
     const std::string file = fs::path(name).filename().string();
     return file == "admin_polygons.bin" || file == "admin_rings.bin" || file == "arc_index.bin" ||
-           file == "arc_vertices.bin";
+           file == "arc_vertices.bin" || file == kAdminOwnNamesFile;
 }
 
 // An arc sidecar's slots: each live one's arc key, UINT64_MAX for a
@@ -712,7 +714,7 @@ TEST(a_build_without_the_multi_flags_writes_whole_dirs_the_server_answers_from) 
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
     write_test_pbf(pbf, fixture(), 1000);
     const std::vector<std::string> geometry = {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin",
-                                               "arc_vertices.bin"};
+                                               "arc_vertices.bin", kAdminOwnNamesFile};
     // The default invocation: the planet's dir, its mode's files and the
     // exact tier's admin geometry beside them; no boundary tier, no
     // admin-minimal.

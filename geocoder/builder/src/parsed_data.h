@@ -667,7 +667,10 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
                 for (size_t i = b; i < e; i++) mark_one(i);
             }, threads);
         };
-        mark_each(data.admin_polygons.size(), [&](size_t i) { mark(data.admin_polygons[i].name_id, STR_TIER_BIT_CORE); });
+        mark_each(data.admin_polygons.size(), [&](size_t i) {
+            mark(data.admin_polygons[i].name_id, STR_TIER_BIT_CORE);
+            mark(data.admin_polygons[i].own_name_id, STR_TIER_BIT_CORE);
+        });
         mark_each(data.place_nodes.size(), [&](size_t i) { mark(data.place_nodes[i].name_id, STR_TIER_BIT_CORE); });
 
         mark_each(data.ways.size(), [&](size_t i) { mark(data.ways[i].name_id, STR_TIER_BIT_STREET); });
@@ -814,6 +817,7 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
     });
     remap_each(data.admin_polygons.size(), [&](size_t i) {
         data.admin_polygons[i].name_id = new_offset(data.admin_polygons[i].name_id);
+        data.admin_polygons[i].own_name_id = new_offset(data.admin_polygons[i].own_name_id);
     });
     remap_each(data.poi_records.size(), [&](size_t i) {
         auto& pr = data.poi_records[i];

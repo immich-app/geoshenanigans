@@ -444,3 +444,28 @@ TEST(the_english_name_of_a_linking_polygon_follows_nominatims_name_order) {
     CHECK_EQ(linked_english_name(false, ug, "", "Busia", pack_country_code('K', 'E')), std::string_view());
     CHECK_EQ(linked_english_name(false, ru, "", "Ipswich", gb), std::string_view("Ipswich"));
 }
+
+TEST(a_polygon_named_by_its_node_keeps_its_own_name_aside) {
+    // Nominatim's addr:city crosscheck reads every name of the polygon, its own among the _place_
+    // ones (results.py:606), and its search finds it by them: Sosnovka's boundary keeps the name
+    // it had as own_name_id. One whose node's English name is its own name already, or that the
+    // pass names nothing, keeps none.
+    World w("RU");
+    w.node(1, PlaceValue::TOWN, 53.24, 41.37, "Сосновка", "", "Sosnovka");
+    const uint32_t sosnovka = w.relation(1, 8, Box{53.2, 41.3, 53.3, 41.4}, {PlaceValue::NONE, "Сосновка", "", 1});
+    w.node(2, PlaceValue::TOWN, 52.9, 40.5, "Уварово", "", "Uvarovo");
+    const uint32_t uvarovo = w.relation(2, 8, Box{52.85, 40.45, 52.95, 40.55}, {PlaceValue::NONE, "Уварово", "", 2});
+    const uint32_t uvarovo_en = w.data.string_pool.intern("Uvarovo");
+    w.data.admin_polygons[uvarovo].name_id = uvarovo_en;
+    w.node(3, PlaceValue::TOWN, 52.65, 42.73, "Кирсанов");
+    const uint32_t kirsanov = w.relation(3, 8, Box{52.6, 42.7, 52.7, 42.8}, {PlaceValue::NONE, "Кирсанов", "", 3});
+    for (const AdminPolygon& p : w.data.admin_polygons) CHECK_EQ(p.own_name_id, NO_DATA);
+    const LinkStats stats = w.link();
+    CHECK_EQ(w.name(sosnovka), std::string("Sosnovka"));
+    CHECK_EQ(w.data.admin_polygons[sosnovka].own_name_id, sosnovka);
+    CHECK_EQ(w.data.admin_polygons[uvarovo].name_id, uvarovo_en);
+    CHECK_EQ(w.data.admin_polygons[uvarovo].own_name_id, NO_DATA);
+    CHECK_EQ(w.name(kirsanov), std::string(""));
+    CHECK_EQ(w.data.admin_polygons[kirsanov].own_name_id, NO_DATA);
+    CHECK_EQ(stats.named, size_t(1));
+}
