@@ -538,8 +538,10 @@ class MarineWorkflowTest(unittest.TestCase):
         run = self.run_tests_step("OK (skipped=3)")
         self.assertNotEqual(run.returncode, 0)
         self.assertIn("::error::", run.stdout)
-        run = self.run_tests_step("FAILED (failures=1)", status=1)
-        self.assertNotEqual(run.returncode, 0)
+        # Tests that fail end the step with their status, whatever they wrote.
+        for said in ("FAILED (failures=1)", ""):
+            run = self.run_tests_step(said, status=3)
+            self.assertEqual(run.returncode, 3, run.stdout + run.stderr)
 
     def run_fetch(self, layer):
         """The Fetch step with the WFS serving `layer`, a GeoJSON document: the run."""
