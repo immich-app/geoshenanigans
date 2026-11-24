@@ -4,11 +4,12 @@
 // the boundaries after it, a boundary or a place area links a place node of
 // its wikidata only where it covers it, its edges included, and only one, one
 // of its name first, that no boundary before it links, and a node of its
-// name only of no other wikidata, a place=province area is an address area
-// where its country ranks it, a postal area names a point only of its own
-// country, one for a relation, and of a postcode its country takes, whatever
-// its length, a US ZIP+4 its ZIP, and a place area linked to a place node of
-// another type ranks by its own place tag.
+// name only of no other wikidata, a boundary that repeats its parent and
+// links no place node is in no address, a place=province area is an address
+// area where its country ranks it, a postal area names a point only of its
+// own country, one for a relation, and of a postcode its country takes,
+// whatever its length, a US ZIP+4 its ZIP, and a place area linked to a
+// place node of another type ranks by its own place tag.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -393,6 +394,78 @@ TEST(a_boundary_of_rank_0_in_its_country_leaves_the_place_node_of_its_wikidata_t
     REQUIRE(answers.size() == 1);
     CHECK(names(answers[0], "town", "Logan Central"));
     CHECK(answers[0].find("\"Logan\"") == std::string::npos);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_boundary_that_repeats_its_parent_and_links_no_place_node_is_in_no_address) {
+    // placex_update takes a boundary=administrative relation out of addresses (rank_address 0) when
+    // the closest boundary round its centroid of a lower admin level, above 3 and of a rank
+    // between 1 and 25, has its wikidata and geometry (is_same, placex_triggers.sql:909-931); one
+    // that links a place node takes the node's rank back (:1161). Arnhem's gemeente (admin_level 8,
+    // rank 14 in the Netherlands) and woonplaats (10, rank 16) run along the same ways and share
+    // Q1310: the gemeente, indexed first, links the city node by its wikidata and ranks 16, and the
+    // woonplaats, which links nothing, leaves the address, where it was a city_district.
+    Fixture f;
+    f.country(51, 3.5, 53.5, 7.2, "Netherlands", "NL");
+    f.boundary(51.7, 5.0, 52.6, 7.0, 4, "Gelderland");
+    const int64_t arnhem = f.square(51.95, 5.85, 52.05, 5.95);
+    for (int level : {8, 10}) {
+        Tags tags = Fixture::boundary_tags(level, "Arnhem");
+        tags.emplace_back("wikidata", "Q1310");
+        f.relation(tags, {arnhem});
+    }
+    f.node(51.98, 5.9, {{"place", "city"}, {"name", "Arnhem"}, {"wikidata", "Q1310"}});
+    // Borne's woonplaats shares its gemeente's wikidata, not its outline, so it stays: a
+    // city_district under the city the gemeente's link makes it.
+    f.boundary(52.25, 6.70, 52.35, 6.85, 8, "Borne", {{"wikidata", "Q2"}});
+    f.boundary(52.28, 6.74, 52.32, 6.80, 10, "Borne", {{"wikidata", "Q2"}});
+    f.node(52.30, 6.77, {{"place", "city"}, {"name", "Borne"}, {"wikidata", "Q2"}});
+    // Almere's woonplaats repeats its gemeente but links the city node, its label member, and so
+    // keeps the city's rank; the gemeente, whose wikidata step passes over a label member, stays
+    // a municipality.
+    const int64_t almere = f.square(52.32, 5.10, 52.42, 5.30);
+    const int64_t almere_city = f.node(52.37, 5.22, {{"place", "city"}, {"name", "Almere"}, {"wikidata", "Q3"}});
+    Tags gemeente = Fixture::boundary_tags(8, "Almere"), woonplaats = Fixture::boundary_tags(10, "Almere");
+    gemeente.emplace_back("wikidata", "Q3");
+    woonplaats.emplace_back("wikidata", "Q3");
+    f.relation(gemeente, {almere});
+    f.relation(woonplaats, {almere}, {{OsmType::Node, almere_city, "label"}});
+    const std::vector<std::string> answers =
+        answers_of(f, "repeated-boundary", {{51.99, 5.91}, {52.301, 6.771}, {52.371, 5.221}});
+    REQUIRE(answers.size() == 3);
+    CHECK(names(answers[0], "city", "Arnhem"));
+    CHECK(answers[0].find("city_district") == std::string::npos);
+    CHECK(answers[0].find("municipality") == std::string::npos);
+    CHECK(names(answers[1], "city", "Borne"));
+    CHECK(names(answers[1], "city_district", "Borne"));
+    CHECK(names(answers[2], "city", "Almere"));
+    CHECK(names(answers[2], "municipality", "Almere"));
+    CHECK(answers[2].find("city_district") == std::string::npos);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(boundaries_repeating_their_parent_on_two_levels_are_both_in_no_address) {
+    // Warsaw's city (admin_level 6), its county (7) and its gmina (8) run along the same ways and
+    // share Q270, the usual tagging in Poland. The city links the city node; the county repeats it
+    // and leaves the address, and the gmina, whose closest boundary of a rank above 0 is then the
+    // city, leaves it too. The district Śródmieście (9) ranks 18 under the city, a city_district.
+    Fixture f;
+    f.country(49, 14, 55, 24, "Polska", "PL");
+    f.boundary(51, 19, 53.5, 23.5, 4, "województwo mazowieckie");
+    const int64_t warsaw = f.square(52.10, 20.85, 52.37, 21.27);
+    for (int level : {6, 7, 8}) {
+        Tags tags = Fixture::boundary_tags(level, "Warszawa");
+        tags.emplace_back("wikidata", "Q270");
+        f.relation(tags, {warsaw});
+    }
+    f.node(52.23, 21.01, {{"place", "city"}, {"name", "Warszawa"}, {"wikidata", "Q270"}});
+    f.boundary(52.20, 20.98, 52.26, 21.05, 9, "Śródmieście");
+    const std::vector<std::string> answers = answers_of(f, "repeated-twice", {{52.2297, 21.0118}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "city", "Warszawa"));
+    CHECK(answers[0].find("\"suburb\":\"Warszawa\"") == std::string::npos);
+    CHECK(answers[0].find("\"city_district\":\"Warszawa\"") == std::string::npos);
+    CHECK(names(answers[0], "city_district", "Śródmieście"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 

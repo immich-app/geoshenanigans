@@ -46,6 +46,11 @@ inline uint64_t admin_boundary_id(uint64_t admin_osm_id) {
 
 inline uint64_t relation_boundary_id(int64_t relation) { return admin_ring_id(relation, 0); }
 
+// Whether an admin_osm_ids entry is a ring of a relation, not a closed way.
+inline bool admin_relation_ring(uint64_t admin_osm_id) {
+    return admin_osm_id >> 56 == static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_RELATION);
+}
+
 inline uint64_t way_boundary_id(int64_t way) { return pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, way); }
 
 // Whether reverse geocoding skips the node.

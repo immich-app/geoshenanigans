@@ -1,6 +1,7 @@
 #include "admin_links.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -14,6 +15,7 @@
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
 
+#include "admin_rank_config.h"
 #include "cell_index.h"
 #include "cell_index_io.h"
 #include "cell_walk.h"
@@ -155,6 +157,48 @@ double centroid_distance(PackedLocation p, const LatLng& centroid) {
     return dlat * dlat + dlng * dlng;
 }
 
+// Whether the closed rings a (an vertices) and b (bn) are one ring: the same
+// vertices from the first of their smallest on, either way round.
+bool same_ring(const PackedLocation* a, uint32_t an, const PackedLocation* b, uint32_t bn) {
+    if (an != bn || an == 0) return false;
+    const uint32_t m = an > 1 && a[0] == a[an - 1] ? an - 1 : an;
+    if (m != (bn > 1 && b[0] == b[bn - 1] ? bn - 1 : bn)) return false;
+    auto smallest = [m](const PackedLocation* v) {
+        uint32_t s = 0;
+        for (uint32_t k = 1; k < m; k++)
+            if (v[k] < v[s]) s = k;
+        return s;
+    };
+    const uint32_t sa = smallest(a), sb = smallest(b);
+    bool forward = true, backward = true;
+    for (uint32_t k = 0; k < m && (forward || backward); k++) {
+        const PackedLocation& v = a[(sa + k) % m];
+        forward = forward && v == b[(sb + k) % m];
+        backward = backward && v == b[(sb + m - k) % m];
+    }
+    return forward || backward;
+}
+
+// Whether polygons p and q of the exact rings are one: their outer rings
+// one ring and their holes one each, in any order.
+bool same_polygon(const AdminExactRings& rings, uint32_t p, uint32_t q) {
+    const uint32_t count = rings.polygons[p].ring_count;
+    if (count == 0 || count != rings.polygons[q].ring_count) return false;
+    const RingSpan* a = rings.rings_of(p);
+    const RingSpan* b = rings.rings_of(q);
+    const PackedLocation* v = rings.vertices.data();
+    auto same = [&](const RingSpan& x, const RingSpan& y) { return same_ring(v + x.begin, x.count, v + y.begin, y.count); };
+    if (!same(a[0], b[0])) return false;
+    std::vector<bool> used(count);
+    for (uint32_t i = 1; i < count; i++) {
+        bool found = false;
+        for (uint32_t j = 1; j < count && !found; j++)
+            if (!used[j] && same(a[i], b[j])) used[j] = found = true;
+        if (!found) return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 S2CellId admin_link_cell(PackedLocation p) {
@@ -270,6 +314,108 @@ void compute_admin_parent_chain(ParsedData& data, unsigned int num_threads) {
                   << " polygons linked in " << el << "s" << std::endl;
         log_phase("    Admin: parent chain", _ap_t, _ap_cpu);
     }
+}
+
+uint16_t polygon_country(const ParsedData& data, const AdminRings& countries, uint32_t i) {
+    const AdminPolygon& poly = data.admin_polygons[i];
+    if (poly.country_code != 0) return poly.country_code;
+    const auto& rings = data.admin_exact_rings;
+    const uint32_t ring_count = rings.polygons[i].ring_count;
+    if (ring_count == 0) return 0;
+    const LatLng inside = interior_point(rings.vertices.data(), rings.rings_of(i), ring_count);
+    return country_code_at_point(data, countries, inside.first, inside.second);
+}
+
+size_t take_out_repeated_boundaries(ParsedData& data, unsigned int num_threads) {
+    const size_t n = data.admin_polygons.size();
+    if (n == 0 || data.admin_osm_ids.size() != n || data.admin_parent_ids.size() != n) return 0;
+    auto& qids = data.boundary_wikidata;
+    std::sort(qids.begin(), qids.end());
+    qids.erase(std::unique(qids.begin(), qids.end()), qids.end());
+    auto& linking = data.linking_boundaries;
+    std::sort(linking.begin(), linking.end());
+    linking.erase(std::unique(linking.begin(), linking.end()), linking.end());
+    if (qids.empty()) return 0;
+    auto qid_of = [&](uint64_t boundary) {
+        const auto it = std::lower_bound(qids.begin(), qids.end(), std::make_pair(boundary, uint64_t(0)));
+        return it != qids.end() && it->first == boundary ? it->second : uint64_t(0);
+    };
+    // The rings of each boundary relation of levels 4 to 10, a boundary's
+    // together, and the polygon standing for it.
+    std::vector<std::pair<uint64_t, uint32_t>> slots;
+    for (uint32_t p = 0; p < n; p++) {
+        const uint8_t level = data.admin_polygons[p].admin_level;
+        if (level >= 4 && level <= 10 && admin_relation_ring(data.admin_osm_ids[p]))
+            slots.push_back({admin_boundary_id(data.admin_osm_ids[p]), p});
+    }
+    std::sort(slots.begin(), slots.end());
+    auto slots_of = [&](uint64_t boundary) {
+        return std::equal_range(slots.begin(), slots.end(), std::make_pair(boundary, uint32_t(0)),
+                                [](const auto& a, const auto& b) { return a.first < b.first; });
+    };
+    const auto boundaries = boundary_polygons(data.admin_polygons, data.admin_osm_ids);
+    const auto& rings = data.admin_exact_rings;
+    auto same_boundary = [&](uint64_t a, uint64_t b) {
+        const auto [a_first, a_last] = slots_of(a);
+        const auto [b_first, b_last] = slots_of(b);
+        if (a_last - a_first != b_last - b_first) return false;
+        std::vector<bool> used(static_cast<size_t>(b_last - b_first));
+        for (auto x = a_first; x != a_last; ++x) {
+            bool found = false;
+            for (auto y = b_first; y != b_last && !found; ++y) {
+                const size_t k = static_cast<size_t>(y - b_first);
+                if (!used[k] && same_polygon(rings, x->second, y->second)) used[k] = found = true;
+            }
+            if (!found) return false;
+        }
+        return true;
+    };
+
+    const AdminRings countries = border_country_rings(data, num_threads);
+    // Each polygon's rank_address in its country, found the first time it
+    // is asked for, on any thread: 0 not yet, else kKnown and the rank.
+    constexpr uint32_t kKnown = 1u << 8;
+    std::vector<std::atomic<uint32_t>> rank_memo(n);
+    auto rank_of = [&](uint32_t p) {
+        const uint32_t memo = rank_memo[p].load(std::memory_order_relaxed);
+        if (memo != 0) return static_cast<uint8_t>(memo);
+        const uint8_t rank = admin_rank_address(polygon_country(data, countries, p), data.admin_polygons[p].admin_level);
+        rank_memo[p].store(kKnown | rank, std::memory_order_relaxed);
+        return rank;
+    };
+    // Taken out, by slot: a level's are marked after it, so the levels
+    // below a boundary are settled when it looks for its parent.
+    std::vector<uint8_t> out(n);
+    size_t taken = 0;
+    for (uint8_t level = 5; level <= 10; level++) {
+        std::vector<uint64_t> repeated = parallel_collect<uint64_t>(boundaries.size(),
+            [&](size_t k, std::vector<uint64_t>& found) {
+                const auto [boundary, p] = boundaries[k];
+                if (data.admin_polygons[p].admin_level != level || !admin_relation_ring(data.admin_osm_ids[p])) return;
+                if (std::binary_search(linking.begin(), linking.end(), boundary)) return;
+                const uint64_t qid = qid_of(boundary);
+                if (qid == 0) return;
+                uint32_t parent = data.admin_parent_ids[p];
+                while (parent != NO_DATA) {
+                    if (data.admin_polygons[parent].admin_level <= 3) return;
+                    if (admin_relation_ring(data.admin_osm_ids[parent]) && !out[parent] && rank_of(parent) != 0) break;
+                    parent = data.admin_parent_ids[parent];
+                }
+                if (parent == NO_DATA) return;
+                const uint64_t parent_boundary = admin_boundary_id(data.admin_osm_ids[parent]);
+                if (qid_of(parent_boundary) != qid || rank_of(p) == 0) return;
+                if (same_boundary(boundary, parent_boundary)) found.push_back(boundary);
+            }, num_threads);
+        for (uint64_t boundary : repeated) {
+            const auto [first, last] = slots_of(boundary);
+            for (auto it = first; it != last; ++it) {
+                out[it->second] = 1;
+                data.admin_polygons[it->second].place_type_override = BOUNDARY_REPEATS_PARENT;
+            }
+        }
+        taken += repeated.size();
+    }
+    return taken;
 }
 
 // Way parent polygon: for each street way, find the smallest admin polygon containing

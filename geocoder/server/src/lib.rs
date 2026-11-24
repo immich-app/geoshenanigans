@@ -189,6 +189,11 @@ pub const POSTCODE_AREA_LEVEL: u8 = 11;
 /// Nominatim makes no postcode area of it (postcodes.py _update_postcode_areas).
 pub const POSTAL_AREA_INVALID: u8 = 15;
 
+/// The place type the builder gives a boundary (admin_level 4 to 10) that repeats its parent, the
+/// same wikidata and geometry, and links no place node: Nominatim takes it out of addresses
+/// (placex_update's is_same, placex_triggers.sql:909-931).
+pub const BOUNDARY_REPEATS_PARENT: u8 = 15;
+
 /// The admin level `/polygons` gives a postcode area, the one the test portal colours as postal.
 pub const POLYGONS_POSTAL_LEVEL: u8 = 99;
 
@@ -2115,6 +2120,8 @@ impl Index {
                 // :1158).
                 let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
                 if initial_rank == 0 { continue; }
+                // Nor is one that repeats its parent.
+                if poly.place_type_override == BOUNDARY_REPEATS_PARENT { continue; }
 
                 ranked.push(RankedPoly { poly, rank_address: initial_rank });
             }
@@ -2724,6 +2731,7 @@ impl Index {
             if poly.admin_level == 2 && poly.country_code == 0 { continue; }
             let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
             if initial_rank == 0 { continue; }
+            if poly.place_type_override == BOUNDARY_REPEATS_PARENT { continue; }
             ranked.push(RankedPoly { poly, rank_address: initial_rank });
         }
         // Add place-area polygons

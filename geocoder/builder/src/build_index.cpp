@@ -748,7 +748,8 @@ struct BoundaryWikidata {
 };
 
 // The number of a wikidata tag of the form Q<digits>, under 2^32, which is
-// how the name step compares two; 0 for any other, or none.
+// how the name step and take_out_repeated_boundaries compare two; 0 for any
+// other, or none.
 static uint32_t wikidata_q_number(const char* id) {
     if (!id || id[0] != 'Q' || !id[1]) return 0;
     uint64_t n = 0;
@@ -792,21 +793,6 @@ static LatLng outer_vertex_average(const ParsedData& data, uint32_t i) {
         sum_lng += ring[v].lon_e7;
     }
     return {static_cast<double>(sum_lat) / ring_count / 1e7, static_cast<double>(sum_lng) / ring_count / 1e7};
-}
-
-// The country polygon i lies in, as Nominatim takes a place's at its centroid
-// (get_country_code), ST_PointOnSurface for an area (get_center_point): its
-// own code where it has one (a country, a postal area), else the country at a
-// point inside its exact rings (interior_point), which a concave polygon's
-// vertex average needn't be; 0 where none is known.
-static uint16_t polygon_country(const ParsedData& data, const AdminRings& countries, uint32_t i) {
-    const AdminPolygon& poly = data.admin_polygons[i];
-    if (poly.country_code != 0) return poly.country_code;
-    const auto& rings = data.admin_exact_rings;
-    const uint32_t ring_count = rings.polygons[i].ring_count;
-    if (ring_count == 0) return 0;
-    const LatLng inside = interior_point(rings.vertices.data(), rings.rings_of(i), ring_count);
-    return country_code_at_point(data, countries, inside.first, inside.second);
 }
 
 // The country of each of `polygons` as polygon_country finds it, before the
@@ -1184,6 +1170,9 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         // Nominatim's linked_place_id. Deterministic regardless of worker
         // scheduling: the set of links is order-independent, and a node
         // several boundaries link names the one claim_wins picks.
+        if (data.admin_osm_ids.size() == data.admin_polygons.size())
+            for (const auto& [node, polygon] : linked_nodes)
+                data.linking_boundaries.push_back(admin_boundary_id(data.admin_osm_ids[polygon]));
         const size_t name_hidden = hide_name_linked_place_nodes(data.place_nodes, std::move(linked_nodes),
                                                                 data.admin_polygons, data.admin_osm_ids);
         const size_t labelled = parallel_count(data.place_nodes.size(),
@@ -3919,13 +3908,15 @@ static int run(int argc, char* argv[]) {
                                     auto it = label_node_to_place_type.find(rel.label_node_id);
                                     if (it != label_node_to_place_type.end()) {
                                         label_checked = true;
+                                        // The label step links any place node.
+                                        std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
+                                        data.linking_boundaries.push_back(relation_boundary_id(rel.id));
                                         if (it->second != static_cast<uint8_t>(PlaceType::UNKNOWN)) {
                                             pto = place_type_to_admin_override(it->second);
                                             if (pto != 0) label_linked_count.fetch_add(1);
                                             // The boundary claims this node
                                             // (Nominatim linked_place_id) —
                                             // hide it from results.
-                                            std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
                                             data.place_claims.push_back(
                                                 {pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, rel.label_node_id),
                                                  relation_boundary_id(rel.id), true});
@@ -4326,9 +4317,12 @@ static int run(int argc, char* argv[]) {
                 const uint16_t cc = it != countries.end() && it->first == p ? it->second : 0;
                 return polygon_rank_address(cc, poly.admin_level, own_place_tag(poly));
             };
+            const size_t claims_before = data.place_claims.size();
             const size_t linked = link_wikidata_places(std::move(data.wikidata_candidates), data.admin_polygons,
                                                        data.admin_osm_ids, data.place_claims, rank);
             std::vector<WikidataCandidate>().swap(data.wikidata_candidates);
+            for (size_t k = claims_before; k < data.place_claims.size(); k++)
+                data.linking_boundaries.push_back(data.place_claims[k].boundary);
             std::cerr << "find_linked_place wikidata: " << linked << " boundaries linked a place node of their wikidata ("
                       << candidates << " candidates)" << std::endl;
         }
@@ -4468,6 +4462,10 @@ static int run(int argc, char* argv[]) {
         });
 
         compute_admin_parent_chain(data, num_threads);
+        {
+            const size_t repeated = take_out_repeated_boundaries(data, num_threads);
+            std::cerr << "Boundaries repeating their parent, in no address: " << repeated << std::endl;
+        }
 
         std::future<void> tiger_freed = external_data.get();
         compute_way_parent_polygons(data, num_threads);

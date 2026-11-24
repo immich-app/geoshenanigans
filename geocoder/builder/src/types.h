@@ -73,6 +73,11 @@ enum class AdminPlaceType : uint8_t {
 // names no street, POI or point.
 constexpr uint8_t POSTAL_AREA_INVALID = 15;
 
+// The place type of a boundary (admin_level 4 to 10) that repeats its
+// parent, the same wikidata and geometry, and links no place node: Nominatim
+// takes it out of addresses (placex_update's is_same), so it names no field.
+constexpr uint8_t BOUNDARY_REPEATS_PARENT = 15;
+
 // Vertex encoding tag: picks the bytes-per-vertex / precision tradeoff
 // for this polygon.  Stored as a 1-byte tag in the per-polygon header
 // at the start of the polygon's vertex slice.

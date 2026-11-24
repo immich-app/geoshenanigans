@@ -4,7 +4,8 @@
 // postcode at its middle and a POI none of another country, and the
 // candidates don't depend on how a ring is written down. A street's postal
 // area covers its middle, its edges included, and has a postcode the server
-// takes.
+// takes. A boundary that repeats its parent and links no place node is in no
+// address.
 #include "admin_links.h"
 
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include "cell_index.h"
 #include "cell_walk.h"
 #include "country_code.h"
+#include "place_claims.h"
 #include "s2_helpers.h"
 #include "test_framework.h"
 
@@ -318,6 +320,93 @@ TEST(a_house_keeps_no_postcode_of_its_own_that_its_countrys_pattern_rejects) {
             std::printf("    \"%s\" at (%g, %g)\n", houses[i].tag, houses[i].lat, houses[i].lng);
     }
     CHECK(a.data.postcode_accum.count(postcode_key(pack_country_code('D', 'E'), tags[4])));
+}
+
+TEST(a_boundary_relation_repeating_its_closest_parent_relation_is_taken_out) {
+    // placex_update (placex_triggers.sql:909-931): a boundary=administrative relation of a rank
+    // above 0 whose closest boundary relation round it, of a lower admin level above 3 and a rank
+    // between 1 and 25, has its wikidata and geometry is in no address. In the Netherlands, where
+    // admin_level 9 ranks 0: a woonplaats (10) along its gemeente's (8) outline, written from
+    // another vertex and the other way round, of its wikidata, is taken out; one that links a
+    // place node is not, nor one of another wikidata, nor one round another outline; one under
+    // a level 9 boundary of the same outline and wikidata is, by the gemeente past it; a level 9
+    // boundary itself, of rank 0, is not; one under a closed way of its outline is not, the
+    // province past the way having no wikidata of its; and a province along the country's
+    // outline, of its wikidata, is not, the country's level being under 4.
+    const uint16_t nl = pack_country_code('N', 'L');
+    Admins a;
+    struct Boundary {
+        uint8_t level;
+        Ring ring;
+        int64_t relation;  // 0 for a closed way
+        uint64_t qid;
+        bool links, repeats;
+    };
+    const Ring square = box(0.2, 0.2, 0.3, 0.3);
+    const std::vector<Boundary> boundaries = {
+        {4, box(0.1, 0.1, 0.9, 0.9), 4, 0, false, false},
+        {8, square, 8, 1, false, false},
+        {10, reversed(rotated(square, 2)), 10, 1, false, true},
+        {8, box(0.2, 0.4, 0.3, 0.5), 18, 2, true, false},
+        {10, box(0.2, 0.4, 0.3, 0.5), 20, 2, true, false},
+        {8, box(0.2, 0.6, 0.3, 0.7), 28, 3, false, false},
+        {10, box(0.2, 0.6, 0.3, 0.7), 30, 4, false, false},
+        {8, box(0.4, 0.2, 0.5, 0.3), 38, 5, false, false},
+        {10, box(0.41, 0.21, 0.49, 0.29), 40, 5, false, false},
+        {8, box(0.4, 0.4, 0.5, 0.5), 48, 6, false, false},
+        {9, box(0.4, 0.4, 0.5, 0.5), 49, 6, false, false},
+        {10, box(0.4, 0.4, 0.5, 0.5), 50, 6, false, true},
+        {8, box(0.4, 0.6, 0.5, 0.7), 0, 0, false, false},
+        {10, box(0.4, 0.6, 0.5, 0.7), 60, 7, false, false},
+        {4, box(0, 0, 1, 1), 64, 8, false, false},
+    };
+    a.add(2, box(0, 0, 1, 1), {}, "Nederland", nl);
+    a.data.admin_osm_ids.back() = admin_ring_id(2, 0);
+    for (const Boundary& b : boundaries) {
+        const uint32_t pid = a.add(b.level, b.ring);
+        a.data.admin_osm_ids[pid] = b.relation ? admin_ring_id(b.relation, 0) : way_boundary_id(1000 + pid);
+        if (b.qid) a.data.boundary_wikidata.push_back({relation_boundary_id(b.relation), b.qid});
+        if (b.links) a.data.linking_boundaries.push_back(relation_boundary_id(b.relation));
+    }
+    a.data.boundary_wikidata.push_back({relation_boundary_id(2), 8});
+    a.map();
+    compute_admin_parent_chain(a.data, 1);
+    CHECK_EQ(take_out_repeated_boundaries(a.data, 1), 2u);
+    for (size_t k = 0; k < boundaries.size(); k++) {
+        const uint8_t want = boundaries[k].repeats ? BOUNDARY_REPEATS_PARENT : 0;
+        CHECK_EQ(a.data.admin_polygons[k + 1].place_type_override, want);
+        if (a.data.admin_polygons[k + 1].place_type_override != want) std::printf("    boundary %zu\n", k);
+    }
+}
+
+TEST(every_ring_of_a_boundary_that_repeats_its_parent_is_taken_out_and_only_of_equal_rings) {
+    // ST_Equals: a relation of two outer rings, one with a hole, repeats one of the same rings in
+    // another order, and every ring of it is taken out; one whose hole differs does not, nor one
+    // under it that lacks its other ring.
+    const uint16_t pl = pack_country_code('P', 'L');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Polska", pl);
+    a.data.admin_osm_ids.back() = admin_ring_id(2, 0);
+    const Ring west = box(0.2, 0.2, 0.4, 0.4), east = box(0.2, 0.5, 0.4, 0.7);
+    const Ring hole = reversed(box(0.25, 0.55, 0.3, 0.6)), other_hole = reversed(box(0.25, 0.55, 0.31, 0.6));
+    auto add = [&](uint8_t level, int64_t relation, uint16_t ring, const Ring& outer, const std::vector<Ring>& holes) {
+        const uint32_t pid = a.add(level, outer, holes);
+        a.data.admin_osm_ids[pid] = admin_ring_id(relation, ring);
+        return pid;
+    };
+    const uint32_t parent_west = add(6, 6, 0, west, {}), parent_east = add(6, 6, 1, east, {hole});
+    const uint32_t same_east = add(7, 7, 0, rotated(east, 1), {hole}), same_west = add(7, 7, 1, west, {});
+    const uint32_t holed_west = add(8, 8, 0, west, {}), holed_east = add(8, 8, 1, east, {other_hole});
+    const uint32_t lacking = add(9, 9, 0, east, {other_hole});
+    for (int64_t relation : {6, 7, 8, 9}) a.data.boundary_wikidata.push_back({relation_boundary_id(relation), 270});
+    a.data.linking_boundaries.push_back(relation_boundary_id(6));
+    a.map();
+    compute_admin_parent_chain(a.data, 1);
+    CHECK_EQ(take_out_repeated_boundaries(a.data, 1), 1u);
+    CHECK_EQ(a.data.admin_polygons[same_east].place_type_override, BOUNDARY_REPEATS_PARENT);
+    CHECK_EQ(a.data.admin_polygons[same_west].place_type_override, BOUNDARY_REPEATS_PARENT);
+    for (uint32_t pid : {parent_west, parent_east, holed_west, holed_east, lacking})
+        CHECK_EQ(a.data.admin_polygons[pid].place_type_override, 0);
 }
 
 TEST(a_point_finds_no_country_where_only_its_simplified_rings_reach_its_cell) {
