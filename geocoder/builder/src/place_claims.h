@@ -197,9 +197,11 @@ inline uint8_t candidate_rank_order(uint8_t place_type) {
 // ranks (index_by_rank), equals by boundary id. `rank(p, polygons[p])` is the
 // rank_address of a boundary's polygon p in its country (its own place
 // tag's for a place area); one of rank 0 links nothing (find_linked_place
-// returns at once) and takes no turn. Each links the first of its nodes in
-// wikidata_order, then candidate_rank_order, then node id, that no boundary
-// before it linked (placex.linked_place_id is null). Every polygon of a
+// returns at once) and takes no turn, and its label claim in `claims` goes.
+// The label step comes first: the node of every other label claim there is
+// linked already. Each links the first of its nodes in wikidata_order, then
+// candidate_rank_order, then node id, that no boundary before it linked
+// (placex.linked_place_id is null). Every polygon of a
 // boundary that links a node takes the node's place type, a place area
 // keeping its own place tag beside it (own_place_type); one that links none
 // keeps its own type for the steps after. The links go to `claims` for
@@ -209,6 +211,15 @@ inline size_t link_wikidata_places(std::vector<WikidataCandidate> candidates, st
                                    const std::vector<uint64_t>& polygon_ids, std::vector<PlaceClaim>& claims,
                                    Rank rank = {}) {
     const auto boundaries = boundary_polygons(polygons, polygon_ids);
+    std::unordered_set<uint64_t> linked;
+    claims.erase(std::remove_if(claims.begin(), claims.end(), [&](const PlaceClaim& c) {
+                     if (!c.label) return false;
+                     const uint32_t p = boundary_polygon(boundaries, c.boundary);
+                     if (p != NO_DATA && rank(p, polygons[p]) == 0) return true;
+                     linked.insert(c.node);
+                     return false;
+                 }),
+                 claims.end());
     if (candidates.empty() || boundaries.empty()) return 0;
     std::sort(candidates.begin(), candidates.end(), [](const WikidataCandidate& a, const WikidataCandidate& b) {
         return std::make_tuple(a.boundary, a.order, candidate_rank_order(a.place_type), a.node) <
@@ -235,7 +246,6 @@ inline size_t link_wikidata_places(std::vector<WikidataCandidate> candidates, st
     std::sort(turns.begin(), turns.end(), [](const Turn& a, const Turn& b) {
         return std::tie(a.admin_level, a.place_rank, a.boundary) < std::tie(b.admin_level, b.place_rank, b.boundary);
     });
-    std::unordered_set<uint64_t> linked;
     std::vector<std::pair<uint64_t, uint8_t>> links;  // (boundary, place type), a boundary's one link
     for (const Turn& turn : turns) {
         for (size_t k = turn.begin; k < turn.end; k++) {

@@ -988,15 +988,12 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         // names its claimant's polygon (place_claims.h).
         // A boundary or place area of rank 0 in its country links nothing
         // (find_linked_place returns at once, placex_triggers.sql:285): the
-        // node stays a place of its own.
+        // wikidata step took its label claim out, and the node stays a place
+        // of its own.
         if (!data.place_claims.empty()) {
             const size_t claims = data.place_claims.size();
-            const auto links = [&](uint32_t p) {
-                const AdminPolygon& poly = data.admin_polygons[p];
-                return polygon_rank_address(country_of(p), poly.admin_level, own_place_tag(poly)) != 0;
-            };
             const size_t hidden = hide_claimed_place_nodes(data.place_nodes, data.place_osm_ids,
-                std::move(data.place_claims), data.admin_polygons, data.admin_osm_ids, num_threads, links);
+                std::move(data.place_claims), data.admin_polygons, data.admin_osm_ids, num_threads);
             std::vector<PlaceClaim>().swap(data.place_claims);
             std::cerr << "find_linked_place label/wikidata: hid " << hidden
                       << " linked place nodes (" << claims << " claims)" << std::endl;
@@ -2918,11 +2915,12 @@ static int run(int argc, char* argv[]) {
                             // admin_level=6 → county mapping instead
                             // of picking up rank_address=18 (borough).
                             //
-                            // Skip label-role members: nominatim's
-                            // find_linked_place claims a place node
-                            // via label role first, so wikidata
-                            // linking only considers non-label nodes.
-                            if (n_wikidata && !is_label_member && label_pt != PlaceType::UNKNOWN) {
+                            // Label-role members too: find_linked_place
+                            // claims a place node via label role first,
+                            // and link_wikidata_places passes over the
+                            // nodes of those label claims, but a boundary
+                            // of rank 0 links nothing by its label.
+                            if (n_wikidata && label_pt != PlaceType::UNKNOWN) {
                                 tl_node_data->place_wikidata.push_back(
                                     {n_wikidata, WikidataPlace{id, point_e7(lat, lng), static_cast<uint8_t>(label_pt),
                                                                lower_name(n_name)}});
@@ -4300,7 +4298,8 @@ static int run(int argc, char* argv[]) {
         // Nominatim indexes them, once every input's are in; before anything
         // reads the place types it gives them. A boundary's rank_address is
         // its level's or own place tag's in its country, where one of rank 0
-        // links nothing.
+        // links nothing, by its label member either: its label claim goes
+        // here, the one decision of which boundaries link.
         {
             const size_t candidates = data.wikidata_candidates.size();
             std::vector<uint32_t> turn_polygons;
@@ -4310,6 +4309,10 @@ static int run(int argc, char* argv[]) {
                     const uint32_t p = boundary_polygon(boundaries, c.boundary);
                     if (p != NO_DATA) turn_polygons.push_back(p);
                 }
+                for (const PlaceClaim& c : data.place_claims) {
+                    const uint32_t p = c.label ? boundary_polygon(boundaries, c.boundary) : NO_DATA;
+                    if (p != NO_DATA) turn_polygons.push_back(p);
+                }
             }
             const auto countries = countries_before_cells(data, std::move(turn_polygons), num_threads);
             const auto rank = [&](uint32_t p, const AdminPolygon& poly) {
@@ -4317,12 +4320,10 @@ static int run(int argc, char* argv[]) {
                 const uint16_t cc = it != countries.end() && it->first == p ? it->second : 0;
                 return polygon_rank_address(cc, poly.admin_level, own_place_tag(poly));
             };
-            const size_t claims_before = data.place_claims.size();
             const size_t linked = link_wikidata_places(std::move(data.wikidata_candidates), data.admin_polygons,
                                                        data.admin_osm_ids, data.place_claims, rank);
             std::vector<WikidataCandidate>().swap(data.wikidata_candidates);
-            for (size_t k = claims_before; k < data.place_claims.size(); k++)
-                data.linking_boundaries.push_back(data.place_claims[k].boundary);
+            for (const PlaceClaim& c : data.place_claims) data.linking_boundaries.push_back(c.boundary);
             std::cerr << "find_linked_place wikidata: " << linked << " boundaries linked a place node of their wikidata ("
                       << candidates << " candidates)" << std::endl;
         }

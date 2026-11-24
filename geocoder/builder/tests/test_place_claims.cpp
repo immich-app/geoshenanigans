@@ -343,6 +343,35 @@ TEST(place_claims_a_boundary_of_rank_0_reserves_no_node_of_its_wikidata) {
     CHECK_EQ(polygons[1].own_place_type, suburb);
 }
 
+TEST(place_claims_a_label_member_is_left_to_the_wikidata_step_only_by_a_boundary_of_rank_0) {
+    // The label step comes first, but find_linked_place returns at once for a boundary of
+    // rank_address 0: an Australian local government area (admin_level 6, rank 0 there), relation
+    // 100, names the town node 5 as its label, which the place=suburb area, relation 200, of its
+    // wikidata links; the label claim of the LGA goes. A boundary of rank 16, relation 300, links
+    // its label member, the town node 6, which the suburb area 400 of its wikidata passes over.
+    const auto town = static_cast<uint8_t>(AdminPlaceType::TOWN), suburb = static_cast<uint8_t>(AdminPlaceType::SUBURB);
+    std::vector<AdminPolygon> polygons{polygon(6, 2.0f), polygon(15, 1.0f), polygon(8, 2.0f), polygon(15, 1.0f)};
+    polygons[1].place_type_override = suburb;
+    polygons[3].place_type_override = suburb;
+    const std::vector<uint64_t> ids{admin_ring_id(100, 0), admin_ring_id(200, 0), admin_ring_id(300, 0),
+                                    admin_ring_id(400, 0)};
+    const std::vector<WikidataCandidate> candidates{{relation_boundary_id(200), node_id(5), 2, town},
+                                                    {relation_boundary_id(400), node_id(6), 2, town}};
+    std::vector<PlaceClaim> claims{{node_id(5), relation_boundary_id(100), true},
+                                   {node_id(6), relation_boundary_id(300), true}};
+    const auto rank = [](uint32_t p, const AdminPolygon&) { return p == 0 ? uint8_t(0) : uint8_t(16); };
+    CHECK_EQ(link_wikidata_places(candidates, polygons, ids, claims, rank), 1u);
+    REQUIRE(claims.size() == 2u);
+    std::sort(claims.begin(), claims.end(), [](const PlaceClaim& a, const PlaceClaim& b) { return a.node < b.node; });
+    CHECK_EQ(claims[0].node, node_id(5));
+    CHECK_EQ(claims[0].boundary, relation_boundary_id(200));
+    CHECK(!claims[0].label);
+    CHECK_EQ(claims[1].node, node_id(6));
+    CHECK_EQ(claims[1].boundary, relation_boundary_id(300));
+    CHECK_EQ(polygons[1].place_type_override, town);
+    CHECK_EQ(polygons[3].place_type_override, suburb);
+}
+
 TEST(place_claims_place_areas_link_in_the_order_of_their_address_ranks) {
     // Nominatim indexes the place areas after every boundary, one rank_address after another
     // (indexer.py index_by_rank, RankRunner): a place=suburb area (rank 20), relation 300, takes
