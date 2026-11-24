@@ -1165,6 +1165,18 @@ TEST(an_unnamed_river_area_of_a_wikidata_item_of_its_own_takes_a_lines_name_but_
     // It shows the line's name.
     for (size_t p = 0; p < layer.size(); p++)
         if (layer.identities[p] == way_identity(2402)) CHECK(name_of(layer, p) == "Beta");
+    // An unnamed area of about 1 km2 the Beta names along the north side of
+    // the unnamed Alpha area shares an arc with it, but no river: the Alpha
+    // is a river of 4 km2, the Beta of 4. Joined across the arc by the name
+    // the Alpha area shows, the four would be one of 8.
+    c.closed_ways.push_back({2404, tags(code::kRiver, "", true), square(kLat - 4000000 + small, kLng, small)});
+    add_line(2414, kLat - 4000000 + small, small);
+    const Layer beside = build(c);
+    const auto [held_beside, major_beside] = ways_held(beside, {2401, 2402, 2403, 2404});
+    CHECK(held_beside == std::set<int64_t>({2401, 2402, 2403, 2404}));
+    CHECK(major_beside.empty());
+    for (size_t p = 0; p < beside.size(); p++)
+        if (beside.identities[p] == way_identity(2402)) CHECK(name_of(beside, p) == "Beta");
 }
 
 TEST(a_lake_of_100_km2_far_from_its_boxs_middle_latitude_is_in_the_major_tier) {
