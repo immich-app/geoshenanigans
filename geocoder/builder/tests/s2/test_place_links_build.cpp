@@ -1,16 +1,17 @@
 // build-index's place links and postal areas, from a PBF to the server's
 // answers: a boundary of rank 0 in its country links no place node, its
-// country taken at a point inside it, and leaves a node of its wikidata or
-// its label to the boundaries after it, a boundary or a place area links a
-// place node of its wikidata only where it covers it, its edges included,
-// and only one, one of its name first, that no boundary before it links, and
-// a node of its name only of no other wikidata, a boundary that repeats its
-// parent and links no place node is in no address, one that links one takes
-// the node's rank, a place=province area is an address area where its
-// country ranks it, a postal area names a point only of its own country, one
-// for a relation, and of a postcode its country takes, whatever its length,
-// a US ZIP+4 its ZIP, and a place area linked to a place node of another
-// type ranks by its own place tag.
+// country taken at a point inside it, off every outline that of the cell
+// there, and leaves a node of its wikidata or its label to the boundaries
+// after it, a boundary or a place area links a place node of its wikidata
+// only where it covers it, its edges included, and only one, one of its name
+// first, that no boundary before it links, and a node of its name only of no
+// other wikidata, a boundary that repeats its parent and links no place node
+// is in no address, one that links one takes the node's rank, a
+// place=province area is an address area where its country ranks it, a
+// postal area names a point only of its own country, one for a relation, and
+// of a postcode its country takes, whatever its length, a US ZIP+4 its ZIP,
+// and a place area linked to a place node of another type ranks by its own
+// place tag.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -414,6 +415,25 @@ TEST(a_boundary_of_rank_0_in_its_country_leaves_its_label_member_to_a_place_area
     REQUIRE(answers.size() == 1);
     CHECK(names(answers[0], "town", "Logan Central"));
     CHECK(answers[0].find("\"Logan\"") == std::string::npos);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_boundary_whose_point_lies_off_its_countrys_outline_takes_the_country_of_its_cell) {
+    // get_country_code falls back to the country grid where no country polygon covers a place's
+    // point, so a boundary's rank, which decides whether it links a place node, is its
+    // country's there. Redland City (admin_level 6) reaches past Australia's outline, a point
+    // inside it 11 m off, in a cell Australia's boundary crosses: it ranks 0, links nothing, and
+    // the place=suburb area Redland Central, of the town node's wikidata, links the node.
+    Fixture f;
+    f.country(-30, 140, -20, 154, "Australia", "AU");
+    f.boundary(-27.66, 153.9992, -27.64, 154.001, 6, "Redland City", {{"wikidata", "Q800"}});
+    f.node(-27.65, 153.9995, {{"place", "town"}, {"name", "Redland"}, {"wikidata", "Q800"}});
+    f.area(-27.651, 153.9993, -27.649, 153.9998,
+           {{"type", "multipolygon"}, {"place", "suburb"}, {"name", "Redland Central"}, {"wikidata", "Q800"}});
+    const std::vector<std::string> answers = answers_of(f, "offshore-point", {{-27.6502, 153.9996}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "town", "Redland Central"));
+    CHECK(answers[0].find("\"Redland\"") == std::string::npos);
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 

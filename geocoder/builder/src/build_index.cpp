@@ -31,8 +31,10 @@
 #include "pbf_reader.h"
 
 #include <absl/synchronization/mutex.h>
+#include <s2/s2cell.h>
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
+#include <s2/s2latlng_rect.h>
 
 #include "types.h"
 #include "string_files.h"
@@ -55,6 +57,7 @@
 #include "polygon_rings.h"
 #include "admin_rank_config.h"
 #include "admin_arcs.h"
+#include "admin_cover.h"
 #include "admin_links.h"
 #include "cell_walk.h"
 #include "parallel.h"
@@ -800,8 +803,12 @@ static LatLng outer_vertex_average(const ParsedData& data, uint32_t i) {
 // the place types it gives): its own code where it has one, else that of the
 // smallest country polygon whose exact rings hold a point inside it, the
 // lower code among equals, as country_code_at_point picks between the
-// countries of a border cell; 0 where none holds it. As (polygon, country),
-// sorted by polygon, each once.
+// countries of a border cell. Where none holds it, the lowest code of the
+// countries whose boundary cells (admin_arc_cells, those of the country cell
+// index) hold the point's cell, as country_code_at_point takes a point off
+// every outline in a cell the countries list: the one country of a coast
+// there. 0 where none does. As (polygon, country), sorted by polygon, each
+// once.
 static std::vector<std::pair<uint32_t, uint16_t>> countries_before_cells(const ParsedData& data,
                                                                          std::vector<uint32_t> polygons,
                                                                          unsigned int threads) {
@@ -868,6 +875,63 @@ static std::vector<std::pair<uint32_t, uint16_t>> countries_before_cells(const P
             out[k].second = best;
         }
     }, threads);
+
+    // The points off every outline, each with its cell and the cell's box.
+    struct Off {
+        double lat_lo, lat_hi, lng_lo, lng_hi;
+        uint64_t cell;
+        uint32_t k;
+    };
+    std::vector<Off> off;
+    for (const auto& [lat, k] : by_lat) {
+        if (out[k].second != 0) continue;
+        const S2CellId cell = admin_link_cell(inside[k]);
+        const S2LatLngRect box = S2Cell(cell).GetRectBound();
+        const bool wraps = box.lng().is_inverted();
+        off.push_back({box.lat_lo().degrees(), box.lat_hi().degrees(), wraps ? -180.0 : box.lng_lo().degrees(),
+                       wraps ? 180.0 : box.lng_hi().degrees(), cell.id(), k});
+    }
+    if (off.empty()) return out;
+    std::sort(off.begin(), off.end(), [](const Off& a, const Off& b) { return std::tie(a.lat_lo, a.k) < std::tie(b.lat_lo, b.k); });
+    double tallest = 0;
+    for (const Off& o : off) tallest = std::max(tallest, o.lat_hi - o.lat_lo);
+    // (point, country code) of each country whose boundary cells hold a
+    // point's cell: an edge's where its box meets the cell's, the edge's box
+    // widened by over a kilometre, far past the reach of its cells.
+    constexpr double kMarginDegrees = 0.01;
+    using Reached = std::pair<uint32_t, uint16_t>;
+    std::vector<Reached> reached = parallel_collect<Reached>(countries.size(), [&](size_t c, std::vector<Reached>& found) {
+        const uint32_t country = countries[c];
+        const uint16_t code = data.admin_polygons[country].country_code;
+        std::vector<uint64_t> cells;
+        const RingSpan* spans = rings.rings_of(country);
+        for (uint32_t r = 0; r < rings.polygons[country].ring_count; r++) {
+            const PackedLocation* v = rings.vertices.data() + spans[r].begin;
+            for (uint32_t e = 1; e < spans[r].count; e++) {
+                const double lat_lo = std::min(v[e - 1].lat(), v[e].lat()) - kMarginDegrees;
+                const double lat_hi = std::max(v[e - 1].lat(), v[e].lat()) + kMarginDegrees;
+                const double nearest_pole = std::max(std::abs(lat_lo), std::abs(lat_hi)) * (M_PI / 180.0);
+                const double lng_margin = kMarginDegrees / std::max(std::cos(nearest_pole), 0.05);
+                const double lng_lo = std::min(v[e - 1].lon(), v[e].lon()) - lng_margin;
+                const double lng_hi = std::max(v[e - 1].lon(), v[e].lon()) + lng_margin;
+                auto it = std::lower_bound(off.begin(), off.end(), lat_lo - tallest,
+                                           [](const Off& o, double lat) { return o.lat_lo < lat; });
+                bool edge_cells = false;
+                for (; it != off.end() && it->lat_lo <= lat_hi; ++it) {
+                    if (it->lat_hi < lat_lo || it->lng_hi < lng_lo || it->lng_lo > lng_hi) continue;
+                    if (!edge_cells) {
+                        cells.clear();
+                        admin_arc_cells(v + e - 1, 2, kAdminCellLevel, ADMIN_COVER_REACH_RAD, cells);
+                        edge_cells = true;
+                    }
+                    if (std::binary_search(cells.begin(), cells.end(), it->cell)) found.push_back({it->k, code});
+                }
+            }
+        }
+    }, threads);
+    std::sort(reached.begin(), reached.end());
+    for (size_t j = 0; j < reached.size(); j++)
+        if (j == 0 || reached[j].first != reached[j - 1].first) out[reached[j].first].second = reached[j].second;
     return out;
 }
 
