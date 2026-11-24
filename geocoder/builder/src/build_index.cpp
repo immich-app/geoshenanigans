@@ -1442,10 +1442,12 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                 water::write_water_exact(d.water, base_dir);
         };
 
+        // A continent's arc slots load the all set's sidecar of a previous
+        // build that wrote the water dirs whether this one does or not.
         const StageCosts costs =
             stage_costs(record_bytes(d), d.water.cells.size(), multi_output ? water::previous_slots(region_prev) : 0,
-                        multi_output ? water_arc_slots_past(water::previous_arc_slots(region_prev), water::arc_counts(d.water))
-                                     : 0);
+                        water_arc_slots_past(water::previous_arc_slots(region_prev), water::arc_counts(d.water),
+                                             multi_output));
         struct Stage {
             const char* name;
             std::function<void()> write;
@@ -1530,13 +1532,15 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
     // continent subsets build alongside.
     // The water stage keeps every slot of the previous build's water dirs,
     // and its slot allocations load the arc slots, those past today's arcs
-    // among them.
+    // among them: the all set's whether this build writes the water dirs or
+    // not (a continent's arc slots load them), the major tier's only where
+    // it does.
     auto water_slots_before = [&](const std::string& region) -> uint64_t {
         return multi_output && !prev_output_dir.empty() ? water::previous_slots(prev_output_dir + "/" + region) : 0;
     };
     auto water_arc_slots_before = [&](const std::string& region, const water::ArcCounts& today) -> uint64_t {
-        return multi_output && !prev_output_dir.empty()
-                   ? water_arc_slots_past(water::previous_arc_slots(prev_output_dir + "/" + region), today)
+        return !prev_output_dir.empty()
+                   ? water_arc_slots_past(water::previous_arc_slots(prev_output_dir + "/" + region), today, multi_output)
                    : 0;
     };
     const uint64_t planet_water_slots = water_slots_before("planet");
@@ -1698,6 +1702,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             std::thread::hardware_concurrency() / 8));
         const KindValues planet_bytes = record_bytes(data);
         const KindValues planet_counts = record_counts(data);
+        // The water split marks every planet water polygon and arc.
+        const uint64_t planet_water_polygons = data.water.size(),
+                       planet_water_arcs = data.water.arcs.set(ArcSet::Full).arcs();
         struct ContinentRun {
             size_t continent;
             RegionCost cost;
@@ -1707,7 +1714,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             const KindValues bytes = continent_share(planet_bytes, planet_pairs, continent_pairs[c],
                                                      c < water_shares.size() ? water_shares[c] : 0);
             const KindValues counts = continent_share(planet_counts, planet_pairs, continent_pairs[c]);
-            const uint64_t filter_bytes = filter_cost(planet_counts, continent_pairs[c]);
+            const uint64_t filter_bytes =
+                filter_cost(planet_counts, continent_pairs[c], planet_water_polygons, planet_water_arcs);
             // Its write runs without a budget (run_continent), so its
             // reservation holds every stage, the boundary tiers and both
             // admin-minimal dirs included.
