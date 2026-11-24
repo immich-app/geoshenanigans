@@ -2,7 +2,8 @@
 // a ring S2 won't take as a loop still gets its candidates, a point one e7
 // step inside one of two neighbours links to that one, a street takes the
 // postcode at its middle and a POI none of another country, and the
-// candidates don't depend on how a ring is written down.
+// candidates don't depend on how a ring is written down. A street's postal
+// area has a postcode the server takes.
 #include "admin_links.h"
 
 #include <algorithm>
@@ -191,6 +192,28 @@ TEST(of_the_postal_areas_at_a_streets_middle_the_one_of_its_country_whose_centro
     a.map();
     compute_way_parent_polygons(a.data, 1);
     CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[nearest].name_id);
+}
+
+TEST(a_streets_postal_area_is_none_of_a_placeholder_or_a_list_of_postcodes) {
+    // The server's postal_area_postcode passes over an area whose postcode is longer than 10
+    // characters, lists several or, past its spaces and hyphens, repeats one character
+    // (centroid_postcode_ok, postcode_looks_valid). A US area of 00000, which the US pattern
+    // takes, centred on a street's middle leaves the street to the larger area of 10001 round it;
+    // outside every country, areas of 12345;12346 and of 123456789012 leave it to 12345.
+    const uint16_t us = pack_country_code('U', 'S');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "United States", us);
+    a.add(11, box(0.499, 0.499, 0.501, 0.502), {}, "00000", us);
+    const uint32_t zip = a.add(11, box(0.45, 0.46, 0.55, 0.56), {}, "10001", us);
+    a.add_way({at(0.5, 0.5), at(0.5, 0.501)});
+    a.add(11, box(-0.501, 0.499, -0.499, 0.502), {}, "12345;12346");
+    a.add(11, box(-0.502, 0.498, -0.498, 0.503), {}, "123456789012");
+    const uint32_t plain = a.add(11, box(-0.55, 0.46, -0.45, 0.56), {}, "12345");
+    a.add_way({at(-0.5, 0.5), at(-0.5, 0.501)});
+    a.map();
+    compute_way_parent_polygons(a.data, 1);
+    CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[zip].name_id);
+    CHECK_EQ(a.data.way_postcode_ids[1], a.data.admin_polygons[plain].name_id);
 }
 
 TEST(a_poi_takes_no_postcode_of_a_postal_area_of_another_country) {

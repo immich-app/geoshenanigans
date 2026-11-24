@@ -74,15 +74,47 @@ auto smallest_first(const ParsedData& data) {
     };
 }
 
+// Whether the server's postal_area_postcode takes a postal area's postcode
+// (centroid_postcode_ok, postcode_looks_valid): at most 10 bytes, one value
+// (no ';'), not of a ZIP+4's shape (10 bytes, '-' the sixth), and past its
+// white space and hyphens neither empty nor one character repeated, as a
+// placeholder such as 00000 is.
+bool postcode_taken(const char* postcode) {
+    const size_t len = std::strlen(postcode);
+    if (len > 10 || std::strchr(postcode, ';') || (len == 10 && postcode[5] == '-')) return false;
+    auto white = [](uint32_t c) {  // Rust's char::is_whitespace
+        return (c >= 0x09 && c <= 0x0D) || c == 0x20 || c == 0x85 || c == 0xA0 || c == 0x1680 ||
+               (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F ||
+               c == 0x3000;
+    };
+    uint32_t first = 0;
+    bool any = false, repeated = true;
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(postcode); *p;) {
+        // One UTF-8 character; a byte of none is a character of its own.
+        const int n = *p >= 0xF0 ? 4 : *p >= 0xE0 ? 3 : *p >= 0xC0 ? 2 : 1;
+        uint32_t c = n == 1 ? *p : *p & (0x7F >> n);
+        int k = 1;
+        for (; k < n && (p[k] & 0xC0) == 0x80; k++) c = c << 6 | (p[k] & 0x3F);
+        if (k < n) c = *p, k = 1;
+        p += k;
+        if (white(c) || c == '-') continue;
+        if (!any) first = c;
+        else if (c != first) repeated = false;
+        any = true;
+    }
+    return any && !repeated;
+}
+
 // Whether the postal area `area`, of the postcode `postcode`, names a point of
 // the country `cc` (0 where unknown), as the server's postal_area_postcode
 // takes it: get_nearest_postcode takes an area of the point's country only
 // (utils.sql: p.country_code = country), of a postcode that country's pattern
-// takes (not POSTAL_AREA_INVALID). One of no country known names a point of
-// no country, or of one whose pattern takes its postcode (none of a country
-// without postcodes); any names a point of no country known.
+// takes (not POSTAL_AREA_INVALID) and the server takes (postcode_taken). One
+// of no country known names a point of no country, or of one whose pattern
+// takes its postcode (none of a country without postcodes); any names a
+// point of no country known.
 bool postal_area_names(const AdminPolygon& area, uint16_t cc, const char* postcode) {
-    if (area.place_type_override == POSTAL_AREA_INVALID) return false;
+    if (area.place_type_override == POSTAL_AREA_INVALID || !postcode_taken(postcode)) return false;
     if (cc == 0 || area.country_code == cc) return true;
     if (area.country_code != 0) return false;
     const char lower[3] = {static_cast<char>(std::tolower(cc >> 8)), static_cast<char>(std::tolower(cc & 0xFF)), 0};
