@@ -416,3 +416,25 @@ fn a_place_area_the_walk_accepts_is_the_boundary_of_finer_place_nodes() {
     assert_eq!(display, "High Street, Metro, Shire, Testland");
     assert_eq!(address["suburb"], serde_json::Value::Null);
 }
+
+#[test]
+fn an_area_the_walk_does_not_accept_leaves_the_place_nodes_fuzzy_area_in_force() {
+    // Longreach (admin_level 10, rank 20) holds the point but is larger than the county Shire
+    // round it, and its centre lies outside Shire, so the walk does not accept it
+    // (placex_triggers.sql:629-632). It shows all the same, as an area holding the result's
+    // centroid, but only an accepted area clears the last accepted node's fuzzy area (:645-652):
+    // the quarters Nearfield and Farfield of rank 22, outside the fuzzy area of the town
+    // Thornbury, are both turned down, and the farther shows.
+    let mut index = country("Testland", b"XX");
+    index
+        .boundary("Wessex", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Shire", 6, 0, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Longreach", 10, 0, (-2000.0, -3000.0, 2000.0, 35_000.0))
+        .place("Thornbury", 1, 3500.0, 0.0)
+        .place("Nearfield", 6, -600.0, 0.0)
+        .place("Farfield", 6, -900.0, 50.0)
+        .street("High Street", &[(0.0, -200.0), (0.0, 200.0)]);
+    let (display, address) = answer_at(&index.load(), 10.0, 0.0);
+    assert_eq!(display, "High Street, Farfield, Longreach, Thornbury, Shire, Wessex, Testland");
+    assert_eq!((&address["quarter"], &address["suburb"]), (&serde_json::json!("Farfield"), &serde_json::json!("Longreach")));
+}
