@@ -516,6 +516,16 @@ async fn make_fetch_dir(path: &Path) -> Result<(), DownloadError> {
 /// download killed as it wrote the mark, before any fetch), or none. The
 /// mark is read to a byte past the text, not whole.
 async fn own_fetch_dir(path: &Path) -> Result<(), DownloadError> {
+    if fetch_dir_is_ours(path).await? {
+        return Ok(());
+    }
+    Err(DownloadError::Io(format!("{} is none of the downloader's, whose fetch dir holds a {} of the downloader's own text, or nothing: a download removes nothing there", path.display(), FETCH_MARK)))
+}
+
+/// Whether what is at `path`, a FETCH_DIR's place, is the downloader's to
+/// remove with all it holds (own_fetch_dir), or nothing; an error where that
+/// can't be told, as a stat or a read fails.
+async fn fetch_dir_is_ours(path: &Path) -> Result<bool, DownloadError> {
     use tokio::io::AsyncReadExt;
     let io = |what: &str, at: &Path, e: std::io::Error| DownloadError::Io(format!("{} {}: {}", what, at.display(), e));
     let mark = path.join(FETCH_MARK);
@@ -536,10 +546,7 @@ async fn own_fetch_dir(path: &Path) -> Result<(), DownloadError> {
             Err(e) => return Err(io("stat", &mark, e)),
         },
     };
-    if ours {
-        return Ok(());
-    }
-    Err(DownloadError::Io(format!("{} is none of the downloader's, whose fetch dir holds a {} of the downloader's own text, or nothing: a download removes nothing there", path.display(), FETCH_MARK)))
+    Ok(ours)
 }
 
 /// Whether the dir `path` holds more than `n` entries, reading no further.
@@ -1220,9 +1227,10 @@ pub async fn download_region(
     } else if !stamped {
         // Those a download killed once its last fetch was in left, holding
         // their marks: what else is at their places stays, as this one
-        // changes no file.
+        // changes no file. One that can't be told fails the download before
+        // it stamps the dir, for the next to try again.
         for fetch_dir in &fetch_dirs {
-            if own_fetch_dir(fetch_dir).await.is_ok() {
+            if fetch_dir_is_ours(fetch_dir).await? {
                 clear(fetch_dir).await?;
             }
         }
