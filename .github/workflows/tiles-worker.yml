@@ -50,11 +50,6 @@ jobs:
         run: deployment/scripts/tiles-cleanup.test.sh
         if: ${{ !cancelled() }}
 
-      - name: Test tiles-worker v4 state script
-        working-directory: .
-        run: deployment/scripts/tiles-worker-v4-state.test.sh
-        if: ${{ !cancelled() }}
-
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -154,32 +149,13 @@ jobs:
           name: tiles-build-output
           path: "${{ github.workspace }}/dist"
 
-      # Until the deploy has taken what Cloudflare provider v4 left in tiles-worker's state out of it (see
-      # deployment/scripts/tiles-worker-v4-state.sh), provider v5 can't plan the module against that state. This plans
-      # it with those entries left out, which is what the deploy applies, and Plan All then skips it.
-      - name: Plan tiles-worker without provider v4 state
-        id: tiles-worker-v4
-        working-directory: ${{ github.workspace }}/deployment
-        env:
-          ENVIRONMENT: ${{ matrix.environment }}
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ matrix.environment == 'prod' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
-          TF_VAR_tiles_build_dir: "${{ github.workspace }}/dist"
-        run: op run --env-file=".env" -- scripts/tiles-worker-v4-state.sh plan
-
       - name: Plan All
         working-directory: ${{ github.workspace }}/deployment
         env:
           ENVIRONMENT: ${{ matrix.environment }}
           OP_SERVICE_ACCOUNT_TOKEN: ${{ matrix.environment == 'prod' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
           TF_VAR_tiles_build_dir: "${{ github.workspace }}/dist"
-          TILES_WORKER_PLANNED: ${{ steps.tiles-worker-v4.outputs.planned }}
-        run: |
-          set -euo pipefail
-          exclude=()
-          if [ "$TILES_WORKER_PLANNED" = true ]; then
-            exclude=(--queue-exclude-dir ./modules/cloudflare/tiles-worker)
-          fi
-          op run --env-file=".env" -- terragrunt run --all "${exclude[@]}" plan
+        run: op run --env-file=".env" -- terragrunt run --all plan
 
   deploy-terragrunt:
     needs: [build, test]
@@ -231,15 +207,6 @@ jobs:
         with:
           name: tiles-build-output
           path: "${{ github.workspace }}/dist"
-
-      # Takes what Cloudflare provider v4 left in tiles-worker's state, which v5 can't read, out of it; the apply's
-      # import blocks then adopt the live objects. A no-op once that has run (see the script).
-      - name: Forget tiles-worker's provider v4 state
-        if: steps.key.outputs.current == 'true'
-        working-directory: ${{ github.workspace }}/deployment
-        env:
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ github.ref == 'refs/heads/main' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
-        run: op run --env-file=".env" -- scripts/tiles-worker-v4-state.sh forget
 
       - name: Deploy All
         if: steps.key.outputs.current == 'true'
@@ -304,14 +271,6 @@ jobs:
         with:
           name: tiles-build-output
           path: "${{ github.workspace }}/dist"
-
-      # As in the job above.
-      - name: Forget tiles-worker's provider v4 state
-        if: steps.key.outputs.current == 'true'
-        working-directory: ${{ github.workspace }}/deployment
-        env:
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_DEV_ENV }}
-        run: op run --env-file=".env" -- scripts/tiles-worker-v4-state.sh forget
 
       - name: Deploy dev worker
         if: steps.key.outputs.current == 'true'
