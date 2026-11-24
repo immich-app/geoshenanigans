@@ -545,6 +545,12 @@ struct ParsedData {
     // for take_out_repeated_boundaries (build-time only).
     std::vector<std::pair<uint64_t, uint64_t>> boundary_wikidata;
     std::vector<uint32_t> place_qids;
+    // The AdminPlaceType of the place tag of the boundaries of admin levels
+    // 8 to 10 that have one, as (boundary id, type) sorted at use: the type
+    // find_linked_place's place-type step asks for (extratags 'place'), which
+    // a linked_place tag, though it stands for a place type too, is not
+    // (build-time only).
+    std::vector<std::pair<uint64_t, uint8_t>> boundary_place_tags;
     std::vector<uint64_t> linking_boundaries;
     std::vector<uint64_t> unranked_label_boundaries;
 

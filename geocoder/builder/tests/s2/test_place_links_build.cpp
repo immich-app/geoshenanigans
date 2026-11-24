@@ -2,22 +2,24 @@
 // answers: a boundary of rank 0 in its country links no place node, its
 // country taken at a point inside it, off every outline that of the cell
 // there, and leaves a node of its wikidata or its label to the boundaries
-// after it, a boundary or a place area links a place node of its wikidata
-// only where it covers it, its edges included, and only one, one of its name
-// first, that no boundary before it links, and a node of its name only of no
-// other wikidata, a boundary that repeats its parent and links no place node
-// is in no address, nor one whose label is a node of no address rank, one
-// that links another takes the node's rank, a boundary whose label links a
-// node links none of its name, a place=province area is an address area
-// where its country ranks it, a postal area names a point only of its own
-// country, one for a relation, and of a postcode its country's pattern
+// after it, a boundary or a place area links a place node of its wikidata only
+// where it covers it, its edges included, and only one, one of its name first,
+// that no boundary before it links, and a node of its name only of no other
+// wikidata, a boundary of a place tag of its own, not a linked_place tag, a
+// node of that type whose name holds its name or is held in it, and one of
+// several parts one node for all of them, a boundary that repeats its parent
+// and links no place node is in no address, nor one whose label is a node of
+// no address rank, one that links another takes the node's rank, a boundary
+// whose label links a node links none of its name, a place=province area is an
+// address area where its country ranks it, a postal area names a point only of
+// its own country, one for a relation, and of a postcode its country's pattern
 // takes, whatever its length, a US ZIP+4 its ZIP, a house, a centroid, a
 // postal area and an external centroid take the postcode their country's
 // pattern makes of their tag, a house's tag makes its centroid whatever the
 // house keeps, a place area linked to a place node of another type ranks by
 // its own place tag, a boundary round the smallest of its level at the point
-// is in the address as well, and a place node ranked above the boundary of
-// its label names the field.
+// is in the address as well, and a place node ranked above the boundary of its
+// label names the field.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -715,6 +717,65 @@ TEST(a_boundary_links_no_place_node_of_its_name_outside_it) {
     const std::vector<std::string> answers = answers_of(f, "name-link-covers", {{48.615515, 13.511634}});
     REQUIRE(answers.size() == 1);
     CHECK(names(answers[0], "village", "Witzmannsberg"));
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_boundary_with_a_place_tag_of_its_own_links_a_node_of_that_type_whose_name_its_name_holds) {
+    // find_linked_place's place-type step, before its name step, takes a node of the boundary's
+    // own place type whose name contains the boundary's or is contained in it, of any rank, that
+    // the boundary covers (position(...) > 0, placex_triggers.sql:338-356). Greater Foo,
+    // admin_level 8 and place=town, holds the town node Foo and the city node Greater Foo: it
+    // links the town, whose type labels it, and the city node, a place of its own, finds rank 16
+    // held by the boundary.
+    Fixture f;
+    f.country(47.2, 5.8, 55.1, 15.1, "Germany", "DE");
+    f.boundary(47.3, 8.9, 50.6, 13.9, 4, "Bavaria");
+    f.square(48.50, 11.50, 48.60, 11.60, {{"type", "boundary"}, {"boundary", "administrative"}, {"admin_level", "8"},
+                                          {"name", "Greater Foo"}, {"place", "town"}});
+    f.node(48.56, 11.56, {{"place", "town"}, {"name", "Foo"}});
+    f.node(48.55, 11.55, {{"place", "city"}, {"name", "Greater Foo"}});
+    const std::vector<std::string> answers = answers_of(f, "place-type-step-names-held", {{48.551, 11.551}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "town", "Greater Foo"));
+    CHECK(answers[0].find("\"city\"") == std::string::npos);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_boundary_with_a_linked_place_tag_takes_no_place_type_step) {
+    // The place-type step asks for the boundary's place tag (extratags 'place',
+    // placex_triggers.sql:338-356), which a linked_place tag is not. Greater Foo, admin_level 8
+    // and linked_place=town, links no town node Foo inside it, of another name, and the node is
+    // the town of a point beside the boundary.
+    Fixture f;
+    f.country(47.2, 5.8, 55.1, 15.1, "Germany", "DE");
+    f.boundary(47.3, 8.9, 50.6, 13.9, 4, "Bavaria");
+    f.square(48.50, 11.50, 48.60, 11.60, {{"type", "boundary"}, {"boundary", "administrative"}, {"admin_level", "8"},
+                                          {"name", "Greater Foo"}, {"linked_place", "town"}});
+    f.node(48.595, 11.595, {{"place", "town"}, {"name", "Foo"}});
+    const std::vector<std::string> answers = answers_of(f, "linked-place-no-type-step", {{48.605, 11.605}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "town", "Foo"));
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_boundary_of_two_parts_links_one_place_node_for_both) {
+    // Nominatim links a place node to the whole boundary, one row of every part (find_linked_place
+    // returns one node, placex_triggers.sql:359-381, placex_update :1141-1180). Bar, admin_level 8,
+    // has a part round its village node Bar and another a degree east: the village labels both.
+    // Its other part holds a town node Bar too, which the boundary does not link: a place of its
+    // own, it finds rank 16 held by the boundary.
+    Fixture f;
+    f.country(47.2, 5.8, 55.1, 15.1, "Germany", "DE");
+    f.boundary(47.3, 7.9, 50.6, 13.9, 4, "Hesse");
+    f.relation(Fixture::boundary_tags(8, "Bar"),
+               {f.square(50.00, 8.00, 50.10, 8.10), f.square(50.00, 9.00, 50.10, 9.10)});
+    f.node(50.05, 8.05, {{"place", "village"}, {"name", "Bar"}});
+    f.node(50.02, 9.08, {{"place", "town"}, {"name", "Bar"}});
+    const std::vector<std::string> answers = answers_of(f, "two-part-boundary-link", {{50.051, 8.051}, {50.06, 9.04}});
+    REQUIRE(answers.size() == 2);
+    CHECK(names(answers[0], "village", "Bar"));
+    CHECK(names(answers[1], "village", "Bar"));
+    CHECK(answers[1].find("\"town\"") == std::string::npos);
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 

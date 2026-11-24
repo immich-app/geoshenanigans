@@ -384,6 +384,9 @@ struct CollectedRelation {
     // own place tag is only step 3, so we store it as a *fallback*
     // applied after label / wikidata have been checked.
     uint8_t fallback_place_type = 0;  // AdminPlaceType
+    // The AdminPlaceType of its place tag alone, which the place-type step
+    // of find_linked_place reads (ParsedData::boundary_place_tags).
+    uint8_t place_tag_type = 0;
     std::string name;
     std::string country_code;
     bool is_postal;

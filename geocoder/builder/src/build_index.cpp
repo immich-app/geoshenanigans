@@ -1159,34 +1159,78 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
             return false;
         };
 
+        // The place-type step's nodes (placex_triggers.sql:338-356): of each
+        // place type, (latitude, place in `named`) of its nodes, in order.
+        constexpr size_t kNodeTypes = static_cast<size_t>(PlaceType::BOROUGH) + 1;
+        std::vector<std::vector<std::pair<float, uint32_t>>> typed(kNodeTypes);
+        for (uint32_t k = 0; k < named.size(); k++) {
+            const auto& pn = data.place_nodes[named[k].second];
+            if (pn.place_type < kNodeTypes) typed[pn.place_type].push_back({pn.lat, k});
+        }
+        for (auto& nodes : typed) std::sort(nodes.begin(), nodes.end());
+        // The node type of a boundary's place tag (boundary_place_tags; the
+        // place type it stands for where there are no ids), kNodeTypes for
+        // none: a linked_place tag takes no place-type step.
+        std::sort(data.boundary_place_tags.begin(), data.boundary_place_tags.end());
+        const auto node_type_of = [&](uint32_t p, uint8_t own) {
+            uint8_t tag = own;
+            if (data.admin_osm_ids.size() == data.admin_polygons.size()) {
+                const uint64_t boundary = admin_boundary_id(data.admin_osm_ids[p]);
+                const auto it = std::lower_bound(data.boundary_place_tags.begin(), data.boundary_place_tags.end(),
+                                                 std::make_pair(boundary, uint8_t(0)));
+                tag = it != data.boundary_place_tags.end() && it->first == boundary ? it->second : 0;
+            }
+            for (uint8_t t = 0; tag != 0 && t < kNodeTypes; t++)
+                if (place_type_to_admin_override(t) == tag) return t;
+            return static_cast<uint8_t>(kNodeTypes);
+        };
+
         // Nominatim gates step 4 to boundaries with
         // rank_address 16-23 (admin_level 8-11 under the default
         // rank mapping al*2). Coarser boundaries never fall through
         // to step 4 because steps 1-3 almost always catch them
         // (country/state wikidata coverage is near-total).
         std::atomic<size_t> pol_idx{0};
-        std::atomic<uint64_t> linked{0};
         std::atomic<uint64_t> considered{0};
         std::vector<std::thread> nl_workers;
-        // (node, polygon) of each link. Nominatim sets linked_place_id on
-        // the node when a boundary links it, hiding it from all results
-        // (the boundary represents it). We mirror that by flagging the node
-        // after the join below.
-        std::mutex linked_nodes_mutex;
-        std::vector<std::pair<uint32_t, uint32_t>> linked_nodes;
         const double max_dist_deg = 0.5;
         const double max_dist_sq = max_dist_deg * max_dist_deg;
+        // Each part's node: the boundary's polygon of that part takes the
+        // steps alone, and the boundary then takes its parts' best
+        // (`better`), below.
+        struct Choice {
+            uint32_t node = NO_DATA;
+            bool of_type = false;  // by the place-type step
+            bool exact = false;    // of the boundary's name, not one holding or held in it
+            double d2 = 0;         // from the part's outer ring's vertex average
+        };
+        std::vector<Choice> choices(data.admin_polygons.size());
+        std::vector<uint8_t> takes_steps(data.admin_polygons.size());
+        const auto node_id = [&](uint32_t idx) {
+            return idx < data.place_osm_ids.size() ? data.place_osm_ids[idx] : static_cast<uint64_t>(idx);
+        };
+        // Whether a is the better node: one of the place-type step, of the
+        // boundary's own name there, then the nearer, then the lower osm id,
+        // a stable order where the steps take any (no ORDER BY).
+        const auto better = [&](const Choice& a, const Choice& b) {
+            if (a.node == NO_DATA || b.node == NO_DATA) return b.node == NO_DATA && a.node != NO_DATA;
+            if (a.of_type != b.of_type) return a.of_type;
+            if (a.exact != b.exact) return a.exact;
+            if (a.d2 != b.d2) return a.d2 < b.d2;
+            return node_id(a.node) < node_id(b.node);
+        };
 
         for (unsigned int t = 0; t < num_threads; t++) {
             nl_workers.emplace_back([&]() {
                 while (true) {
                     size_t i = pol_idx.fetch_add(1);
                     if (i >= data.admin_polygons.size()) break;
-                    auto& poly = data.admin_polygons[i];
-                    // A place type here is the boundary's own place tag, as
-                    // the label and wikidata steps linked nothing to it
-                    // (links_already, below): find_linked_place still takes
-                    // its place-type step and its name step (:338-381), the
+                    const auto& poly = data.admin_polygons[i];
+                    // A place type here is the boundary's own place or
+                    // linked_place tag, as the label and wikidata steps
+                    // linked nothing to it (links_already, below):
+                    // find_linked_place still takes its place-type step, of
+                    // the place tag alone, and its name step (:338-381), the
                     // tag is the last resort where both find nothing
                     // (placex_update, :1190-1205).
                     const uint8_t own_type = poly.place_type_override;
@@ -1204,8 +1248,9 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
 
                     std::string nb = normalise_for_matching(bnd_name);
                     if (nb.empty()) continue;
+                    const uint8_t node_type = node_type_of(static_cast<uint32_t>(i), own_type);
                     const auto [first, last] = places_named(nb);
-                    if (first == last) continue;
+                    if (first == last && node_type == kNodeTypes) continue;
 
                     // Per-country rank_address (NL AL8 = 14, not the
                     // default 16), in the boundary's country.
@@ -1213,47 +1258,77 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                     uint8_t bnd_rank = admin_rank_address(bnd_cc, poly.admin_level);
                     if (bnd_rank == 0) continue;  // not in this country's address chain
                     const uint64_t bnd_qid = boundary_qid(static_cast<uint32_t>(i));
+                    takes_steps[i] = 1;
+                    // Nor a node whose wikidata is another than the
+                    // boundary's: either has none, or both the same.
+                    const auto other_qid = [&](uint32_t pidx) {
+                        const uint32_t node_qid = pidx < data.place_qids.size() ? data.place_qids[pidx] : 0;
+                        return bnd_qid != 0 && node_qid != 0 && node_qid != bnd_qid;
+                    };
 
-                    // The nearest node to the outer ring's vertex average,
-                    // one of the boundary's own place type first: the
-                    // place-type step comes before the name step (:338-356;
-                    // its names containing one another are taken here as
-                    // the same name).
                     const LatLng centre = outer_vertex_average(data, static_cast<uint32_t>(i));
                     const double clat = centre.first, clng = centre.second;
+                    const auto dist_sq = [&](const PlaceNode& pn) {
+                        const double dlat = (double)pn.lat - clat, dlng = (double)pn.lng - clng;
+                        return dlat * dlat + dlng * dlng;
+                    };
+                    Choice best;
+
+                    // The place-type step: a node of the type of the
+                    // boundary's place tag whose name holds the boundary's or
+                    // is held in it, of any rank, that the boundary covers,
+                    // at any distance; of the nodes in this part's box, the
+                    // best.
+                    if (node_type != kNodeTypes) {
+                        const RingSpan& outer = data.admin_exact_rings.rings_of(static_cast<uint32_t>(i))[0];
+                        const PackedLocation* ring = data.admin_exact_rings.vertices.data() + outer.begin;
+                        int32_t s = INT32_MAX, w = INT32_MAX, n = INT32_MIN, e = INT32_MIN;
+                        for (uint32_t v = 0; v < outer.count; v++) {
+                            s = std::min(s, ring[v].lat_e7), n = std::max(n, ring[v].lat_e7);
+                            w = std::min(w, ring[v].lon_e7), e = std::max(e, ring[v].lon_e7);
+                        }
+                        // A node's float position is within a few e-6 degrees
+                        // of its own.
+                        constexpr double kSlack = 1e-5;
+                        const double south = s / 1e7 - kSlack, north = n / 1e7 + kSlack;
+                        const double west = w / 1e7 - kSlack, east = e / 1e7 + kSlack;
+                        const auto& nodes = typed[node_type];
+                        for (auto it = std::lower_bound(nodes.begin(), nodes.end(), std::make_pair(static_cast<float>(south), uint32_t(0)));
+                             it != nodes.end() && it->first <= north; ++it) {
+                            if (it->first < south) continue;
+                            const auto& [name, pidx] = named[it->second];
+                            const auto& pn = data.place_nodes[pidx];
+                            if (pn.lng < west || pn.lng > east) continue;
+                            const bool exact = name == nb;
+                            if (!exact && name.find(nb) == std::string::npos && nb.find(name) == std::string::npos) continue;
+                            if (other_qid(pidx)) continue;
+                            const Choice c{pidx, true, exact, dist_sq(pn)};
+                            if (!better(c, best)) continue;
+                            if (!boundary_covers(static_cast<uint32_t>(i), point_e7(pn.lat, pn.lng))) continue;
+                            best = c;
+                        }
+                    }
+
+                    // The name step, where that finds none: the nearest node
+                    // of the boundary's name to the outer ring's vertex
+                    // average, of its rank, that it covers.
                     uint32_t best_idx = NO_DATA;
                     double best_dist_sq = max_dist_sq;
-                    bool best_of_type = false;
-                    for (auto it = first; it != last; ++it) {
+                    for (auto it = first; it != last && best.node == NO_DATA; ++it) {
                         const uint32_t pidx = it->second;
                         const auto& pn = data.place_nodes[pidx];
                         uint8_t pr = place_addr_rank(pn.place_type);
                         if (pr == 255) continue;
-                        const bool of_type = own_type != 0 && place_type_to_admin_override(pn.place_type) == own_type;
-                        if (best_of_type && !of_type) continue;
                         // Nominatim's name-match branch requires the
                         // node's address rank to EQUAL the boundary's
                         // rank_address (find_linked_place in
                         // placex_triggers.sql). The previous ±2 window
                         // on rank_search linked NL gemeentes (rank 14)
                         // to their town nodes (16), relabelling
-                        // municipalities as towns. The place-type step
-                        // asks the type alone.
-                        if (!of_type && pr != bnd_rank) continue;
-                        // Nor a node whose wikidata is another than the
-                        // boundary's: either has none, or both the same.
-                        const uint32_t node_qid = pidx < data.place_qids.size() ? data.place_qids[pidx] : 0;
-                        if (bnd_qid != 0 && node_qid != 0 && node_qid != bnd_qid) continue;
-                        double dlat = (double)pn.lat - clat;
-                        double dlng = (double)pn.lng - clng;
-                        double d2 = dlat * dlat + dlng * dlng;
-                        if (of_type && !best_of_type) {
-                            if (d2 >= max_dist_sq || !boundary_covers(static_cast<uint32_t>(i), point_e7(pn.lat, pn.lng))) continue;
-                            best_of_type = true;
-                            best_dist_sq = d2;
-                            best_idx = pidx;
-                            continue;
-                        }
+                        // municipalities as towns.
+                        if (pr != bnd_rank) continue;
+                        if (other_qid(pidx)) continue;
+                        const double d2 = dist_sq(pn);
                         if (d2 > best_dist_sq) continue;
                         if (d2 == best_dist_sq) {
                             // Preserve the original `>=` reject at the
@@ -1278,21 +1353,46 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                         best_dist_sq = d2;
                         best_idx = pidx;
                     }
-
-                    if (best_idx != NO_DATA) {
-                        const auto& pn = data.place_nodes[best_idx];
-                        uint8_t pto = place_type_to_admin_override(pn.place_type);
-                        if (pto != 0) {
-                            poly.place_type_override = pto;
-                            linked.fetch_add(1);
-                            std::lock_guard<std::mutex> lk(linked_nodes_mutex);
-                            linked_nodes.push_back({best_idx, static_cast<uint32_t>(i)});
-                        }
-                    }
+                    if (best.node == NO_DATA && best_idx != NO_DATA) best = {best_idx, false, true, best_dist_sq};
+                    choices[i] = best;
                 }
             });
         }
         for (auto& w : nl_workers) w.join();
+
+        // find_linked_place links one node to the whole boundary, which
+        // labels each of its parts (placex_update, :1141-1180): of the parts
+        // that took the steps, the best choice, its node's type the place
+        // type of every one. (node, polygon) of each link, one a boundary.
+        // Nominatim sets linked_place_id on the node when a boundary links
+        // it, hiding it from all results (the boundary represents it). We
+        // mirror that by flagging the node below.
+        std::vector<std::pair<uint32_t, uint32_t>> linked_nodes;
+        std::vector<std::pair<uint64_t, uint32_t>> parts;  // (boundary, polygon)
+        for (uint32_t p = 0; p < data.admin_polygons.size(); p++)
+            if (takes_steps[p]) parts.push_back({have_ids ? admin_boundary_id(data.admin_osm_ids[p]) : p, p});
+        std::sort(parts.begin(), parts.end());
+        uint64_t linked = 0, linked_by_type = 0, by_a_name_held = 0, of_parts = 0, parts_chose_another = 0;
+        for (size_t g = 0, h; g < parts.size(); g = h) {
+            h = g;
+            Choice best;
+            while (h < parts.size() && parts[h].first == parts[g].first) {
+                if (better(choices[parts[h].second], best)) best = choices[parts[h].second];
+                h++;
+            }
+            if (best.node == NO_DATA) continue;
+            const uint8_t pto = place_type_to_admin_override(data.place_nodes[best.node].place_type);
+            if (pto == 0) continue;
+            for (size_t k = g; k < h; k++) {
+                data.admin_polygons[parts[k].second].place_type_override = pto;
+                parts_chose_another += choices[parts[k].second].node != best.node;
+            }
+            linked_nodes.push_back({best.node, parts[g].second});
+            linked++;
+            linked_by_type += best.of_type;
+            by_a_name_held += !best.exact;
+            of_parts += h - g > 1;
+        }
 
         // Hide linked nodes: PLACE_FLAG_HIDDEN makes the server's
         // place_node() accessor return None everywhere (find_places,
@@ -1313,8 +1413,10 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         double _nl_elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - _nl_t).count();
         std::cerr << "find_linked_place step 4 (name match): "
-                  << linked.load() << "/" << considered.load()
-                  << " unlinked AL8-10 boundaries linked in "
+                  << linked << "/" << considered.load()
+                  << " unlinked AL8-10 boundaries linked (" << linked_by_type << " by the place-type step, "
+                  << by_a_name_held << " by a name holding or held in theirs; " << of_parts
+                  << " of several parts, " << parts_chose_another << " parts of another choice) in "
                   << _nl_elapsed << "s" << std::endl;
         log_phase("find_linked_place step 4", _pt, _cpu);
     }
@@ -2551,6 +2653,7 @@ static int run(int argc, char* argv[]) {
                         cr.country_code = std::move(country_code);
                         cr.is_postal = is_postal;
                         cr.fallback_place_type = static_cast<uint8_t>(po);
+                        cr.place_tag_type = static_cast<uint8_t>(classify_place_override(nullptr, place_tag_on_admin));
 
                         for (size_t mi = 0; mi < rel.members.size(); mi++) {
                             if (rel.members[mi].type == 'w') {
@@ -3273,6 +3376,7 @@ static int run(int argc, char* argv[]) {
                         uint8_t fallback_place_type;  // from own place tag, used last
                         BoundaryWikidata wikidata; // for place linking
                         int64_t way_id;       // source closed-way id (strategy-2 stable identity)
+                        uint8_t place_tag_type = 0;  // of its place tag alone (boundary_place_tags)
                     };
                     std::vector<ClosedWayAdmin> closed_way_admins;
                     // POI way data
@@ -3521,7 +3625,8 @@ static int run(int argc, char* argv[]) {
                                         std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
                                         std::string cc; if (al == 2) { const char* iso = t.iso; if (iso) cc = iso; }
                                         uint8_t fallback = static_cast<uint8_t>(classify_place_override(t.linked_place, t.place));
-                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), fallback, way_wikidata(), way_id});
+                                        const uint8_t place_tag = static_cast<uint8_t>(classify_place_override(nullptr, t.place));
+                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), fallback, way_wikidata(), way_id, place_tag});
                                     }
                                 }
                             }
@@ -3854,6 +3959,8 @@ static int run(int argc, char* argv[]) {
                             }
                             const uint32_t qid = wikidata_q_number(cwa.wikidata.id.c_str());
                             if (cwa.admin_level <= 10 && qid != 0) data.boundary_wikidata.push_back({way_boundary_id(cwa.way_id), qid});
+                            if (cwa.admin_level >= 8 && cwa.admin_level <= 10 && cwa.place_tag_type != 0)
+                                data.boundary_place_tags.push_back({way_boundary_id(cwa.way_id), cwa.place_tag_type});
                             const char* cc = cwa.country_code.empty() ? nullptr : cwa.country_code.c_str();
                             add_admin_polygon(data, cwa.vertices, cwa.name.c_str(),
                                               cwa.admin_level, cc, cwa.fallback_place_type,
@@ -4147,6 +4254,8 @@ static int run(int argc, char* argv[]) {
                         const CollectedRelation& rel = data.collected_relations[i];
                         const uint32_t qid = wikidata_q_number(rel_wikidata[i].id.c_str());
                         if (rel.admin_level <= 10 && qid != 0) data.boundary_wikidata.push_back({relation_boundary_id(rel.id), qid});
+                        if (rel.admin_level >= 8 && rel.admin_level <= 10 && rel.place_tag_type != 0)
+                            data.boundary_place_tags.push_back({relation_boundary_id(rel.id), rel.place_tag_type});
                     }
                     rel_wikidata.clear();
                     rel_wikidata.shrink_to_fit();
