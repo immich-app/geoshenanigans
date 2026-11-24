@@ -1110,6 +1110,20 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
             return it != data.boundary_wikidata.end() && it->first == boundary ? it->second : 0;
         };
 
+        // A boundary the label or the wikidata step linked a node to
+        // (data.linking_boundaries, every one so far) takes no name step:
+        // find_linked_place returns the node they found, of any place type,
+        // a place=locality label too, before it (placex_triggers.sql
+        // :296-337), so a node of the boundary's name stays a place of its
+        // own.
+        auto& linking = data.linking_boundaries;
+        std::sort(linking.begin(), linking.end());
+        linking.erase(std::unique(linking.begin(), linking.end()), linking.end());
+        const auto links_already = [&](uint32_t p) {
+            return data.admin_osm_ids.size() == data.admin_polygons.size() &&
+                   std::binary_search(linking.begin(), linking.end(), admin_boundary_id(data.admin_osm_ids[p]));
+        };
+
         // Nominatim gates step 4 to boundaries with
         // rank_address 16-23 (admin_level 8-11 under the default
         // rank mapping al*2). Coarser boundaries never fall through
@@ -1142,6 +1156,7 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                     if (poly.admin_level < 8 || poly.admin_level > 10) continue;
                     if (data.admin_exact_rings.polygons[i].ring_count == 0) continue;
                     if (poly.name_id == NO_DATA) continue;
+                    if (links_already(static_cast<uint32_t>(i))) continue;
                     const char* bnd_name = pool_data.data() + poly.name_id;
                     if (!bnd_name[0]) continue;
                     considered.fetch_add(1);

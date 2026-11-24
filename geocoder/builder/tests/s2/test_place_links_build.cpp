@@ -7,15 +7,16 @@
 // first, that no boundary before it links, and a node of its name only of no
 // other wikidata, a boundary that repeats its parent and links no place node
 // is in no address, nor one whose label is a node of no address rank, one
-// that links another takes the node's rank, a place=province area is an
-// address area where its country ranks it, a postal area names a point only
-// of its own country, one for a relation, and of a postcode its country's
-// pattern takes, whatever its length, a US ZIP+4 its ZIP, a house, a
-// centroid, a postal area and an external centroid take the postcode their
-// country's pattern makes of their tag, a place area linked to a place node
-// of another type ranks by its own place tag, a boundary round the smallest
-// of its level at the point is in the address as well, and a place node
-// ranked above the boundary of its label names the field.
+// that links another takes the node's rank, a boundary whose label links a
+// node links none of its name, a place=province area is an address area
+// where its country ranks it, a postal area names a point only of its own
+// country, one for a relation, and of a postcode its country's pattern
+// takes, whatever its length, a US ZIP+4 its ZIP, a house, a centroid, a
+// postal area and an external centroid take the postcode their country's
+// pattern makes of their tag, a place area linked to a place node of another
+// type ranks by its own place tag, a boundary round the smallest of its
+// level at the point is in the address as well, and a place node ranked
+// above the boundary of its label names the field.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -573,6 +574,30 @@ TEST(a_boundary_that_repeats_its_parent_and_labels_a_locality_is_in_no_address) 
     REQUIRE(answers.size() == 1);
     CHECK(names(answers[0], "neighbourhood", "Nowe Miasto"));
     CHECK(answers[0].find("Stare Miasto") == std::string::npos);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_boundary_whose_label_links_a_locality_links_no_place_node_of_its_name) {
+    // find_linked_place returns the label member, a node of any place type (placex_triggers.sql
+    // :296-309), before its name step: a town boundary of no place tag along its gmina's ways, of
+    // its wikidata, labelled by a place=locality node, links the locality and takes its rank, 25,
+    // back (:1161), in no address. The place=suburb node of the town's name inside it stays a
+    // place of its own and names the suburb.
+    Fixture f;
+    f.country(49, 14, 55, 24, "Polska", "PL");
+    f.boundary(51, 19, 53.5, 23.5, 4, "województwo mazowieckie");
+    const int64_t ways = f.square(52.00, 20.00, 52.10, 20.20);
+    Tags gmina = Fixture::boundary_tags(8, "Nowe Miasto"), town = Fixture::boundary_tags(10, "Stare Miasto");
+    gmina.emplace_back("wikidata", "Q900");
+    town.emplace_back("wikidata", "Q900");
+    const int64_t locality = f.node(52.05, 20.10, {{"place", "locality"}, {"name", "Rynek"}});
+    f.node(52.06, 20.12, {{"place", "suburb"}, {"name", "Stare Miasto"}});
+    f.relation(gmina, {ways});
+    f.relation(town, {ways}, {{OsmType::Node, locality, "label"}});
+    const std::vector<std::string> answers = answers_of(f, "locality-label-name", {{52.061, 20.121}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "suburb", "Stare Miasto"));
+    CHECK(names(answers[0], "city", "Nowe Miasto"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 
