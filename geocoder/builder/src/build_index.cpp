@@ -2964,12 +2964,12 @@ static int run(int argc, char* argv[]) {
                             if (al >= kMinBoundaryWayLevel && al <= kMaxBoundaryLevel) level = al;
                             else if (al >= 2 && iso && iso[0]) level = 2;
                             else if (al >= 2 && al < kMinBoundaryWayLevel && is_address_place_type(pt)) level = 15;
-                            if (level == 2) local.country_ways++;
-                            else if (level == 15) local.place_ways++;
-                            else if (al >= 2 && al < kMinBoundaryWayLevel) local.dropped_ways++;
                             if (level != 0 && level != 15 && kMaxAdminLevel > 0 && level > kMaxAdminLevel) level = 0;
                             const char* aname = t_best_name;
-                            if (level != 0 && aname && aname[0] && all_valid && resolved_locs.size() >= 3) {
+                            const bool whole = aname && aname[0] && all_valid && resolved_locs.size() >= 3;
+                            if (whole && al >= 2 && al < kMinBoundaryWayLevel)
+                                (level == 2 ? local.country_ways : level == 15 ? local.place_ways : local.dropped_ways)++;
+                            if (level != 0 && whole) {
                                 std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
                                 local.closed_way_admins.push_back({std::move(verts), std::string(aname), level,
                                                                    level == 2 ? std::string(iso) : std::string(), way_id,
@@ -3279,9 +3279,9 @@ static int run(int argc, char* argv[]) {
                     place_ways += local.place_ways;
                     dropped_ways += local.dropped_ways;
                 }
-                std::cerr << "  Closed administrative ways below level " << int(kMinBoundaryWayLevel) << ": " << country_ways
-                          << " kept for a country code, " << place_ways << " place areas by their place tag, "
-                          << dropped_ways << " dropped." << std::endl;
+                std::cerr << "  Named closed administrative ways below level " << int(kMinBoundaryWayLevel) << ": "
+                          << country_ways << " kept for a country code, " << place_ways
+                          << " place areas by their place tag, " << dropped_ways << " left out." << std::endl;
                 parallel_for_each(tld.size(), [&](size_t k, unsigned) {
                     auto& local = tld[k];
                     auto closed_way_admins = std::move(local.closed_way_admins);
