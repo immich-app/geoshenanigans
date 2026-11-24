@@ -2036,7 +2036,8 @@ const OSM = {
 const NOTICES = {
   geonames: ['UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.',
     'The Data is provided "as is" without warranty or any representation of accuracy, timeliness or completeness.',
-    "Changes: this dataset holds the coordinates of the GB postcodes of GB_full.csv.zip that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the file's other fields."],
+    "Changes: this dataset holds the coordinates of the GB postcodes of GB_full.csv.zip that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the file's other fields.",
+    "Changes: this dataset names a US ZIP code with the place name GeoNames's postal code files give it where the ZIP's OpenStreetMap addresses name too few cities or choose that name, spelt as those addresses spell it where they do, in its own format; it holds none of the files' other fields."],
   'codepoint-open': ["GeoNames's GB_full.csv.zip is derived from Code-Point Open.",
     'Contains Ordnance Survey data © Crown copyright and database right 2022.',
     'Contains Royal Mail data © Royal Mail copyright and database right 2022.',
