@@ -1279,7 +1279,7 @@ TEST(a_house_whose_postcode_its_country_rejects_answers_its_streets) {
         for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 
-TEST(postcode_centroids_keep_no_slots_and_a_region_of_no_valid_postcode_has_files_of_none) {
+TEST(postcode_centroids_keep_no_slots_and_a_region_of_no_valid_postcode_has_no_files) {
     // The next day 8002's address is gone and 8007's is new. A build of that
     // day on the day before writes the files a fresh build of it does: a
     // centroid that is gone leaves nothing, and one that is new takes no
@@ -1326,13 +1326,11 @@ TEST(postcode_centroids_keep_no_slots_and_a_region_of_no_valid_postcode_has_file
     for (const auto& tree_files : {one, fresh, chained})
         for (const std::string& name : names_of(tree_files)) CHECK(fs::path(name).filename() != "postcode_centroids.osm_ids");
 
-    // Addresses whose only postcode no Swiss postcode is like: the files of no
-    // centroid, the footer alone and an empty cells file.
+    // Addresses whose only postcode no Swiss postcode is like keep none, so
+    // their region has no centroid files, as one without postcodes.
     const auto none = build("none", {{7005, 470000000 + 1700000, 80000000 + 300000, "80A1"}}, {});
     for (const char* mode : {"admin", "no-addresses", "full"}) {
         const std::string at = std::string("planet/") + mode + "/";
-        REQUIRE(none.count(at + postcode_files::CENTROIDS_FILE) && none.count(at + postcode_files::CELLS_FILE));
-        CHECK(none.at(at + postcode_files::CENTROIDS_FILE) == std::vector<char>({0, 0, 0, 0, 'P', 'C', 'C', '1'}));
-        CHECK(none.at(at + postcode_files::CELLS_FILE).empty());
+        CHECK(!none.count(at + postcode_files::CENTROIDS_FILE) && !none.count(at + postcode_files::CELLS_FILE));
     }
 }

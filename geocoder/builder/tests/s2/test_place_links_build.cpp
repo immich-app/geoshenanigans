@@ -10,8 +10,10 @@
 // that links another takes the node's rank, a place=province area is an
 // address area where its country ranks it, a postal area names a point only
 // of its own country, one for a relation, and of a postcode its country's
-// pattern takes, whatever its length, a US ZIP+4 its ZIP, and a place area
-// linked to a place node of another type ranks by its own place tag.
+// pattern takes, whatever its length, a US ZIP+4 its ZIP, a house, a
+// centroid, a postal area and an external centroid take the postcode their
+// country's pattern makes of their tag, and a place area linked to a place
+// node of another type ranks by its own place tag.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -157,14 +159,24 @@ bool names(const std::string& answer, const std::string& field, const std::strin
 }
 
 // The answers at the points from a build of the fixture, one each; none,
-// the log printed, when the build fails.
+// the log printed, when the build fails. `files` are written into the
+// scratch dir, by name, before the build, whose further arguments are
+// `extra`, each with every "{dir}" in it the scratch dir.
 std::vector<std::string> answers_of(const Fixture& fixture, const std::string& name,
-                                    const std::vector<std::pair<double, double>>& points) {
+                                    const std::vector<std::pair<double, double>>& points,
+                                    const std::vector<std::pair<std::string, std::string>>& files = {},
+                                    const std::vector<std::string>& extra = {}) {
     const ScratchDir root(name);
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
     write_test_pbf(pbf, fixture.objects(), 1000);
+    for (const auto& [file, text] : files) std::ofstream(root.path() + "/" + file) << text;
     const std::string out = root.path() + "/out";
-    if (!gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log)) {
+    std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf};
+    for (std::string word : extra) {
+        for (size_t at; (at = word.find("{dir}")) != std::string::npos;) word.replace(at, 5, root.path());
+        words.push_back(word);
+    }
+    if (!gctest::run(words, log)) {
         print_failure("build-index", log);
         return {};
     }
@@ -621,6 +633,46 @@ TEST(a_postal_relation_takes_one_country_at_its_whole_centroid) {
     REQUIRE(answers.size() == 1);
     CHECK(answers[0].find("12345") == std::string::npos);
     CHECK(names(answers[0], "postcode", "60311"));
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_house_and_a_centroid_take_the_postcode_their_countrys_pattern_makes_of_the_tag) {
+    // Nominatim stores the postcode the pattern's output makes of a tag (PostcodeFormatter.match,
+    // match.expand), the sanitizer's for a house and update_postcodes' for a centroid, which it sums
+    // by that postcode. A house tagged DE-10115 answers 10115; DE 10117 and 10117 are one centroid,
+    // halfway between their houses; a house of 10-115, whose separator Germany's ddddd has no room
+    // for, keeps no postcode of its own, nor makes a centroid.
+    Fixture f;
+    f.country(50, 8, 51, 9, "Germany", "DE");
+    f.node(50.5, 8.5, {{"addr:postcode", "DE-10115"}, {"addr:housenumber", "1"}, {"addr:street", "Zeil"}});
+    f.node(50.7, 8.3, {{"addr:postcode", "10117"}, {"addr:housenumber", "2"}, {"addr:street", "Zeil"}});
+    f.node(50.7, 8.32, {{"addr:postcode", "DE 10117"}, {"addr:housenumber", "3"}, {"addr:street", "Zeil"}});
+    f.node(50.2, 8.2, {{"addr:postcode", "10-115"}, {"addr:housenumber", "4"}, {"addr:street", "Zeil"}});
+    const std::vector<std::string> answers =
+        answers_of(f, "normalised-house-postcodes", {{50.5, 8.5}, {50.708, 8.318}, {50.2, 8.2}});
+    REQUIRE(answers.size() == 3);
+    CHECK(names(answers[0], "postcode", "10115"));
+    CHECK(names(answers[1], "postcode", "10117"));
+    CHECK(answers[2].find("10-115") == std::string::npos);
+    CHECK(answers[2].find("10115") == std::string::npos);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_postal_area_and_an_external_centroid_take_the_postcode_their_countrys_pattern_makes) {
+    // update_postcodes keeps a postal area's and an external centroid's postcode as the pattern's
+    // output makes it (m.norm): Latvia's (dddd) gives LV-\1, so the area of 1050 is LV-1050's, and
+    // Britain's \1 \2 makes a GeoNames row of sw1a1aa the centroid of SW1A 1AA.
+    Fixture f;
+    f.country(56, 24, 57, 25, "Latvija", "LV");
+    f.area(56.4, 24.4, 56.6, 24.6, {{"type", "boundary"}, {"boundary", "postal_code"}, {"postal_code", "1050"}});
+    f.country(51, -1, 52, 0, "United Kingdom", "GB");
+    const std::vector<std::string> answers =
+        answers_of(f, "normalised-area-postcodes", {{56.5, 24.5}, {51.5, -0.5}},
+                   {{"external.csv", "postcode,lat,lon,country_code\nsw1a1aa,51.501,-0.501,GB\n"}},
+                   {"--external-postcodes", "{dir}/external.csv"});
+    REQUIRE(answers.size() == 2);
+    CHECK(names(answers[0], "postcode", "LV-1050"));
+    CHECK(names(answers[1], "postcode", "SW1A 1AA"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 

@@ -22,5 +22,5 @@ TEST(country_code_callers_read_the_same_packing) {
     // admin_rank_config's per-country overrides and the postcode validator's
     // switch both key on this layout.
     CHECK_EQ(admin_rank_address(pack_country_code('A', 'U'), 6), uint8_t(0));
-    CHECK(!validate_postcode_for_country("ae", "12345"));
+    CHECK(!match_postcode(pack_country_code('A', 'E'), "12345", PostcodeDefault::Any));
 }

@@ -5,9 +5,11 @@
 // candidates don't depend on how a ring is written down. A street's postal
 // area covers its middle, its edges included, is of the street's country, or
 // of any where the street has none, and has a postcode the server takes. A
-// boundary that repeats the closest boundary relation round its point, the
-// same outline whatever vertices lie along its edges, and links no place
-// node is in no address; one that links one takes the node's rank.
+// house keeps the postcode its country's pattern makes of its tag, by which
+// the centroids are summed. A boundary that repeats the closest boundary
+// relation round its point, the same outline whatever vertices lie along
+// its edges, and links no place node is in no address; one that links one
+// takes the node's rank.
 #include "admin_links.h"
 
 #include <algorithm>
@@ -305,27 +307,30 @@ TEST(a_poi_takes_no_postcode_of_a_postal_area_of_another_country) {
     CHECK_EQ(a.data.poi_records[1].parent_postcode_id, a.data.admin_polygons[swiss].name_id);
 }
 
-TEST(a_house_keeps_no_postcode_of_its_own_that_its_countrys_pattern_rejects) {
+TEST(a_house_keeps_the_postcode_its_countrys_pattern_makes_of_its_tag) {
     // The clean-postcodes sanitizer matches a house's addr:postcode in the house's own country
-    // (CountryPostcodeMatcher: upper-cased, after an optional country code and a space or a
-    // hyphen) and makes one that fails an address term, so the house has no postcode of its own
-    // and takes its street's (placex_update). A house outside every country known keeps its tag.
-    // Each tag still counts towards the centroids, which keep only the pairs the pattern takes.
+    // (PostcodeFormatter.match: upper-cased, after an optional country code and a space or a
+    // hyphen, the pattern's output) and makes one that fails an address term, so the house has no
+    // postcode of its own and takes its street's (placex_update). A house outside every country
+    // known keeps its tag. The centroids are summed by the postcodes the houses keep: Germany's
+    // 78462 of four tags, the US 10001 of three.
+    const uint16_t de = pack_country_code('D', 'E'), us = pack_country_code('U', 'S');
     Admins a;
-    a.add(2, box(0, 0, 1, 1), {}, "Deutschland", pack_country_code('D', 'E'));
-    a.add(2, box(1, 0, 2, 1), {}, "United States", pack_country_code('U', 'S'));
+    a.add(2, box(0, 0, 1, 1), {}, "Deutschland", de);
+    a.add(2, box(1, 0, 2, 1), {}, "United States", us);
     a.map();
     struct House {
         double lat, lng;
         const char* tag;
-        bool kept;
+        const char* kept;
     };
     const std::vector<House> houses = {
-        {0.5, 0.5, "78462", true},      {0.5, 0.5, "DE-78462", true},    {0.5, 0.5, "de 78462", true},
-        {0.5, 0.5, " DE78462 ", true},  {0.5, 0.5, "12ABC", false},      {0.5, 0.5, "7846", false},
-        {0.5, 0.5, "DE-7846", false},   {0.5, 0.5, "US-78462", false},   {1.5, 0.5, "10001", true},
-        {1.5, 0.5, "10001-2062", true}, {1.5, 0.5, "US 10001-2062", true}, {1.5, 0.5, "100012062", false},
-        {1.5, 0.5, "1000", false},      {5.0, 5.0, "12ABC", true},
+        {0.5, 0.5, "78462", "78462"},       {0.5, 0.5, "DE-78462", "78462"},    {0.5, 0.5, "de 78462", "78462"},
+        {0.5, 0.5, " DE78462 ", "78462"},   {0.5, 0.5, "12ABC", nullptr},       {0.5, 0.5, "7846", nullptr},
+        {0.5, 0.5, "DE-7846", nullptr},     {0.5, 0.5, "US-78462", nullptr},    {0.5, 0.5, "78-462", nullptr},
+        {0.5, 0.5, "D-E-78462", nullptr},   {1.5, 0.5, "10001", "10001"},       {1.5, 0.5, "10001-2062", "10001"},
+        {1.5, 0.5, "US 10001-2062", "10001"}, {1.5, 0.5, "100012062", nullptr}, {1.5, 0.5, "1000", nullptr},
+        {1.5, 0.5, "00000", nullptr},       {5.0, 5.0, "12ABC", "12ABC"},
     };
     for (const House& h : houses) {
         AddrPoint ap{};
@@ -335,14 +340,20 @@ TEST(a_house_keeps_no_postcode_of_its_own_that_its_countrys_pattern_rejects) {
         a.data.addr_points.push_back(ap);
         a.data.addr_postcode_ids.push_back(a.data.string_pool.intern(h.tag));
     }
-    const std::vector<uint32_t> tags = a.data.addr_postcode_ids;
+    normalise_addr_postcodes(a.data, 1);
+    std::vector<uint32_t> kept;
+    for (const House& h : houses) kept.push_back(h.kept ? a.data.string_pool.intern(h.kept) : NO_DATA);
     collect_postcode_centroids(a.data);
     for (size_t i = 0; i < houses.size(); i++) {
-        CHECK_EQ(a.data.addr_postcode_ids[i], houses[i].kept ? tags[i] : NO_DATA);
-        if (a.data.addr_postcode_ids[i] != (houses[i].kept ? tags[i] : NO_DATA))
+        CHECK_EQ(a.data.addr_postcode_ids[i], kept[i]);
+        if (a.data.addr_postcode_ids[i] != kept[i])
             std::printf("    \"%s\" at (%g, %g)\n", houses[i].tag, houses[i].lat, houses[i].lng);
     }
-    CHECK(a.data.postcode_accum.count(postcode_key(pack_country_code('D', 'E'), tags[4])));
+    const auto& accum = a.data.postcode_accum;
+    REQUIRE(accum.count(postcode_key(de, kept[0])) && accum.count(postcode_key(us, kept[10])));
+    CHECK_EQ(accum.at(postcode_key(de, kept[0])).count, uint64_t(4));
+    CHECK_EQ(accum.at(postcode_key(us, kept[10])).count, uint64_t(3));
+    CHECK_EQ(accum.size(), size_t(2));
 }
 
 TEST(a_boundary_relation_repeating_its_closest_parent_relation_is_taken_out) {

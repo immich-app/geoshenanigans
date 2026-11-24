@@ -59,14 +59,24 @@ AdminRings border_country_rings(const ParsedData& data, unsigned int threads = 0
 // (border_country_rings). 0 if unknown.
 uint16_t country_code_at_point(const ParsedData& data, const AdminRings& countries, double lat, double lng);
 
+// Each house's addr:postcode in data.addr_postcode_ids becomes the postcode
+// the clean-postcodes sanitizer makes of it in the house's country
+// (match_postcode, the sanitizer's default for a country without a pattern),
+// interned, or none where the pattern rejects it: the house then takes its
+// street's (placex_update). A house of no country known keeps its tag. Runs
+// while the pool interns, before the addr points are ordered.
+void normalise_addr_postcodes(ParsedData& data, unsigned threads = 0);
+
 // Fold the OSM addr:postcode points into data.postcode_accum per
-// (country, postcode), keeping external centroids only for the pairs OSM
-// lacks. Run once on the full data before the continent split, so every
-// region writes the same centroids (Nominatim's location_postcode is one
-// table) instead of recomputing them from its own subset of addr points.
-// A house of a country whose pattern rejects its tag keeps no postcode of
-// its own in data.addr_postcode_ids (postcode_tag_valid_for_country).
-// The last reader of data.admin_exact_rings.
+// (country, postcode), the houses' postcodes (normalise_addr_postcodes),
+// keeping external centroids only for the pairs OSM lacks and of a postcode
+// their country's pattern takes. Run once on the full data before the
+// continent split, so every region writes the same centroids (Nominatim's
+// location_postcode is one table) instead of recomputing them from its own
+// subset of addr points. In a country of a pattern, the postcodes the
+// sanitizer keeps are the ones update_postcodes sums; in one without, it
+// sums a tag the sanitizer's default rejects too, which none here makes a
+// centroid. The last reader of data.admin_exact_rings.
 void collect_postcode_centroids(ParsedData& data);
 
 // Strategy-2 persistent dense IDs. Loads the previous build's

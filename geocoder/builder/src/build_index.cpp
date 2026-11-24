@@ -300,20 +300,16 @@ static ExternalPostcodes read_external_postcodes(const std::string& path) {
         if (postcode.empty() || cc_str.size() < 2) continue;
         if (lat == 0 && lng == 0) continue;
 
-        // Validate against country pattern
-        char cc_lower[3] = {
-            static_cast<char>(std::tolower(static_cast<unsigned char>(cc_str[0]))),
-            static_cast<char>(std::tolower(static_cast<unsigned char>(cc_str[1]))),
-            0
-        };
-        if (!validate_postcode_for_country(cc_lower, postcode.c_str())) {
+        // _update_from_external keeps the postcode the country's pattern
+        // makes of the row's (m.norm), of a row the pattern takes.
+        const uint16_t cc = pack_country_code(static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[0]))),
+                                              static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[1]))));
+        std::optional<std::string> norm = match_postcode(cc, postcode, PostcodeDefault::Any);
+        if (!norm) {
             out.skipped++;
             continue;
         }
-
-        uint16_t cc = pack_country_code(static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[0]))),
-                                        static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[1]))));
-        out.rows.push_back({std::move(postcode), lat, lng, cc});
+        out.rows.push_back({std::move(*norm), lat, lng, cc});
     }
     return out;
 }
@@ -983,21 +979,22 @@ static void assign_postal_area_countries(ParsedData& data, const AdminRings& cou
         }
     }, threads);
 
-    // One after another: interning a ZIP grows the pool.
-    size_t invalid = 0, zips = 0;
+    // One after another: interning a postcode grows the pool. Each takes
+    // the postcode its country's pattern makes of its tag (m.norm), a US
+    // ZIP+4 its ZIP; one of no country known keeps its tag.
+    size_t invalid = 0, renamed = 0;
     for (size_t a = 0; a < areas; a++) {
         const uint16_t cc = country[a];
         uint32_t name_id = data.admin_polygons[rings_of[starts[a]].second].name_id;
         bool valid = true;
         if (cc != 0) {
-            const char lower[3] = {static_cast<char>(std::tolower(cc >> 8)), static_cast<char>(std::tolower(cc & 0xFF)), 0};
-            const char* postcode = data.string_pool.data().data() + name_id;
-            if (cc == pack_country_code('U', 'S') && is_zip_plus_4(postcode)) {
-                name_id = data.string_pool.intern(std::string(postcode, 5));
-                postcode = data.string_pool.data().data() + name_id;
-                zips++;
+            const std::string postcode = data.string_pool.data().data() + name_id;
+            const std::optional<std::string> norm = match_postcode(cc, postcode, PostcodeDefault::Any);
+            valid = norm.has_value();
+            if (valid && *norm != postcode) {
+                name_id = data.string_pool.intern(*norm);
+                renamed++;
             }
-            valid = validate_postcode_for_country(lower, postcode);
         }
         invalid += !valid;
         for (size_t k = starts[a]; k < starts[a + 1]; k++) {
@@ -1008,8 +1005,8 @@ static void assign_postal_area_countries(ParsedData& data, const AdminRings& cou
         }
     }
     std::cerr << "Postal areas: " << areas << " given their centroid's country (" << rings_of.size() << " rings), "
-              << invalid << " of a postcode their country's pattern rejects, " << zips << " US ZIP+4 taken as their ZIP"
-              << std::endl;
+              << invalid << " of a postcode their country's pattern rejects, " << renamed
+              << " renamed to the postcode it makes" << std::endl;
 }
 
 // find_linked_place step 4: name-based linking of admin boundaries to place nodes
@@ -4547,6 +4544,7 @@ static int run(int argc, char* argv[]) {
 
         std::future<void> tiger_freed = external_data.get();
         compute_way_parent_polygons(data, num_threads);
+        timed_phase("    Addr: house postcodes", [&] { normalise_addr_postcodes(data, num_threads); });
         arenas_trimmed.get();
 #ifdef __GLIBC__
         std::cerr << "Trimmed malloc arenas: " << rss_before_trim << " -> "
