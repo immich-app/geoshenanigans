@@ -77,7 +77,7 @@ TEST(place_values_rank_as_address_levels_place_entries) {
     CHECK(place_value_of("subdistrict") == PlaceValue::OTHER);
     CHECK(place_value_of("") == PlaceValue::NONE);
     CHECK(place_value_of(nullptr) == PlaceValue::NONE);
-    // The 14 that label polygons, and back.
+    // The 15 that label polygons, and back: a locality's too, whose polygons rank 25.
     size_t labels = 0;
     for (int v = 0; v <= static_cast<int>(PlaceValue::CIVIL_PARISH); v++) {
         const AdminPlaceType t = place_label_of(static_cast<PlaceValue>(v));
@@ -86,7 +86,10 @@ TEST(place_values_rank_as_address_levels_place_entries) {
         CHECK(place_value_of(t) == static_cast<PlaceValue>(v));
         CHECK(place_ranks(fr, pt(t)) == place_value_ranks(fr, static_cast<PlaceValue>(v)));
     }
-    CHECK_EQ(labels, size_t(14));
+    CHECK_EQ(labels, size_t(15));
+    CHECK(place_label_of(PlaceValue::LOCALITY) == AdminPlaceType::LOCALITY);
+    CHECK(place_ranks(fr, pt(AdminPlaceType::LOCALITY)) == (PlaceRanks{25, 25}));
+    CHECK(!admin_minimal_keeps(15, pt(AdminPlaceType::LOCALITY)));
 }
 
 TEST(place_area_ranks_follow_address_levels) {

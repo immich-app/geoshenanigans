@@ -413,6 +413,7 @@ pub fn place_type_to_field(pt: u8) -> Option<&'static str> {
         12 => Some("borough"),
         13 => Some("hamlet"),
         14 => Some("municipality"),
+        15 => Some("locality"),
         _ => None,
     }
 }
@@ -5770,7 +5771,8 @@ mod pure_helper_tests {
         assert_eq!(place_type_to_field(13), Some("hamlet"));
         assert_eq!(place_type_to_field(14), Some("municipality"));
         assert_eq!(place_type_to_field(0), None);
-        assert_eq!(place_type_to_field(15), None);
+        assert_eq!(place_type_to_field(15), Some("locality"));
+        assert_eq!(place_type_to_field(16), None);
         assert_eq!(place_type_to_field(255), None);
     }
 

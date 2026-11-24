@@ -93,7 +93,7 @@ When linked: the boundary adopts the place node's names. The place node itself g
 - **The steps** (placex_triggers.sql:271-391), for a polygon of rank_search below 26 and a rank_address other than 0: a relation's first label member that is a place node of any value, linked or not, named or not; a place node of its wikidata that it covers, unlinked, of rank_search below 26, one named as it is first (an unnamed one before both, as Nominatim's `ORDER BY ... desc` puts a null first); with a name and a place value of its own, an unlinked covered node of that value whose name holds its name or lies in it; with a name, an unlinked covered node of its name whose rank in its own country is the polygon's. Names are the `name` tag, lower-cased; ties go to the lower osm id.
 - **Label members:** a node that a relation links as its label member is linked by no other polygon's steps 2 to 4, whatever runner it is in. On a fresh import a polygon of an earlier runner would take it first and the label relation take it over; the public server indexes each polygon again after its import and finds it linked then (Den Haag's level 8 boundary keeps its 14: its wikidata node is the label of its level 10 one).
 - **Candidates:** every place node of any value, named, of a wikidata or a relation's label member.
-- **Label:** the linked node's type where AdminPlaceType holds it, else the polygon's own place tag.
+- **Label:** the linked node's type where AdminPlaceType holds it, else the polygon's own place tag. AdminPlaceType holds 15 types, a locality's among them.
 
 ## Step 4: Rank adjustments for nested boundaries
 

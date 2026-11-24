@@ -134,9 +134,9 @@ TEST(lowercase_utf8_lowers_each_letter_as_postgres_lower_does) {
 }
 
 TEST(a_label_member_links_whatever_its_value_name_or_link_and_a_boundary_of_rank_0_links_none) {
-    // Town Parks' label member, a place=locality node, links it (the node ranks 25); an unnamed
-    // village node is a label member too. Gold Coast City (AU admin_level 6, rank 0) links its
-    // label member nothing (:285).
+    // Town Parks' label member, a place=locality node, links it (the node ranks 25) and labels it
+    // a locality; an unnamed village node is a label member too. Gold Coast City (AU admin_level
+    // 6, rank 0) links its label member nothing (:285).
     World w("IE");
     w.node(1, PlaceValue::LOCALITY, 53.5, -6.5, "Town Parks");
     const uint32_t parks = w.relation(10, 10, Box{53.4, -6.6, 53.6, -6.4}, {PlaceValue::NONE, "Town Parks", "", 1});
@@ -145,7 +145,7 @@ TEST(a_label_member_links_whatever_its_value_name_or_link_and_a_boundary_of_rank
     w.link();
     CHECK(w.link_of(parks).step == LinkStep::LABEL);
     CHECK_EQ(w.link_of(parks).rank, uint8_t(25));
-    CHECK(w.label(parks) == AdminPlaceType::NONE);
+    CHECK(w.label(parks) == AdminPlaceType::LOCALITY);
     CHECK(w.link_of(parish).step == LinkStep::LABEL);
     CHECK(w.label(parish) == AdminPlaceType::VILLAGE);
 

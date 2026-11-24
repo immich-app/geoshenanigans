@@ -65,6 +65,11 @@ enum class AdminPlaceType : uint8_t {
     BOROUGH = 12,   // place=borough (distinct field from suburb in Nominatim)
     HAMLET = 13,
     MUNICIPALITY = 14,  // place=municipality (e.g. Sydney Council L6)
+    // place=locality: what labels a boundary of a locality (an Australian one linking its
+    // locality node, an Irish townland tagged so) as get_label_tag does, one of rank 25
+    // (address-levels.json), in no street's or house's address. A place area of it is never
+    // imported.
+    LOCALITY = 15,
 };
 
 // Nominatim's administrative levels run 2 to 12 (address-levels.json's

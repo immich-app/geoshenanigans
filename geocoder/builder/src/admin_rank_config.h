@@ -70,7 +70,7 @@ inline uint8_t admin_rank_address(uint16_t cc, uint8_t admin_level) { return adm
 // A place=* value, each of address-levels.json's `place` keys its own (and
 // Spain's civil_parish); OTHER for any other value, which the file's "" entry
 // ranks. It is what the builder holds of a place tag; AdminPlaceType, which
-// labels a polygon, holds 14 of them.
+// labels a polygon, holds 15 of them.
 enum class PlaceValue : uint8_t {
     NONE = 0,  // no place tag
     OTHER,
@@ -169,6 +169,7 @@ inline AdminPlaceType place_label_of(PlaceValue v) {
         case PlaceValue::BOROUGH: return AdminPlaceType::BOROUGH;
         case PlaceValue::HAMLET: return AdminPlaceType::HAMLET;
         case PlaceValue::MUNICIPALITY: return AdminPlaceType::MUNICIPALITY;
+        case PlaceValue::LOCALITY: return AdminPlaceType::LOCALITY;
         default: return AdminPlaceType::NONE;
     }
 }
@@ -189,6 +190,7 @@ inline PlaceValue place_value_of(AdminPlaceType t) {
         case AdminPlaceType::BOROUGH: return PlaceValue::BOROUGH;
         case AdminPlaceType::HAMLET: return PlaceValue::HAMLET;
         case AdminPlaceType::MUNICIPALITY: return PlaceValue::MUNICIPALITY;
+        case AdminPlaceType::LOCALITY: return PlaceValue::LOCALITY;
         default: return PlaceValue::NONE;
     }
 }
