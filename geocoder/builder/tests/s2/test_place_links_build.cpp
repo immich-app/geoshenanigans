@@ -136,20 +136,42 @@ TEST(a_place_area_linked_to_a_place_node_of_another_type_ranks_by_its_own_place_
 }
 
 TEST(a_boundary_with_a_place_tag_of_its_own_links_its_namesake_city_node_by_name) {
-    // Ferraz de Vasconcelos (R298265, admin_level 8, place=municipality) has no label member and
-    // no wikidata: find_linked_place links its city node by name, the node ranking 16 as the
+    // A boundary of admin_level 8 tagged place=municipality, with no label member and no
+    // wikidata: find_linked_place links its city node by name, the node ranking 16 as the
     // boundary does (placex_triggers.sql:363-386). The boundary is the address's city, labelled
     // by the node, and no municipality.
     Fixture f;
     f.country(-34, -54, -5, -35, "Brazil", "BR");
     f.boundary(-25, -53, -20, -44, 4, "São Paulo");
-    f.boundary(-23.6, -46.4, -23.5, -46.3, 8, "Ferraz de Vasconcelos", {{"place", "municipality"}});
-    f.node(-23.54, -46.37, {{"place", "city"}, {"name", "Ferraz de Vasconcelos"}});
+    f.boundary(-23.6, -46.4, -23.5, -46.3, 8, "Vila Exemplo", {{"place", "municipality"}});
+    f.node(-23.54, -46.37, {{"place", "city"}, {"name", "Vila Exemplo"}});
     const std::vector<std::string> answers = answers_of(f, "link-by-name", {{-23.545, -46.365}});
     REQUIRE(answers.size() == 1);
-    CHECK(names(answers[0], "city", "Ferraz de Vasconcelos"));
+    CHECK(names(answers[0], "city", "Vila Exemplo"));
     CHECK(answers[0].find("\"municipality\"") == std::string::npos);
     std::printf("    %s\n", answers[0].c_str());
+}
+
+TEST(a_municipality_whose_city_node_another_relation_labels_ranks_by_its_own_tag) {
+    // Ferraz de Vasconcelos: the municipality (R298265, admin_level 8, place=municipality) holds
+    // the city node, the label member of the city's boundary (R5683099, admin_level 9). The node
+    // is the city's (place_links.h), as Nominatim's indexer finds it when it takes a polygon
+    // again: the municipality ranks 14 by its own tag, and the city 16 by its node, above the
+    // municipality's 14. Nominatim's public server still ranks them 16 and 18 from the link the
+    // municipality made on its first index, before the city's label took the node, as it keeps
+    // Queluz (R298199) and Estiva Gerbi (R297955) at 16; indexed again they rank as here.
+    Fixture f;
+    f.country(-34, -54, -5, -35, "Brazil", "BR");
+    f.boundary(-25, -53, -20, -44, 4, "São Paulo");
+    const int64_t node = f.node(-23.54, -46.37, {{"place", "city"}, {"name", "Ferraz de Vasconcelos"}});
+    f.boundary(-23.6, -46.4, -23.5, -46.3, 8, "Ferraz de Vasconcelos", {{"place", "municipality"}});
+    f.boundary(-23.58, -46.38, -23.52, -46.32, 9, "Ferraz de Vasconcelos", {}, {{OsmType::Node, node, "label"}});
+    const std::vector<std::string> answers = answers_of(f, "label-held", {{-23.545, -46.365}});
+    REQUIRE(answers.size() == 1);
+    std::printf("    %s\n", answers[0].c_str());
+    CHECK(names(answers[0], "city", "Ferraz de Vasconcelos"));
+    CHECK(names(answers[0], "municipality", "Ferraz de Vasconcelos"));
+    CHECK(answers[0].find("\"display_name\":\"Ferraz de Vasconcelos, São Paulo, Brazil\"") != std::string::npos);
 }
 
 TEST(a_townland_of_a_locality_ranks_25_and_leaves_the_address) {

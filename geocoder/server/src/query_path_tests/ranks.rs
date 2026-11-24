@@ -85,15 +85,20 @@ fn a_boundary_its_level_ranks_0_stays_out_of_the_address_whatever_its_place_type
 #[test]
 fn brazil_and_slovakia_rank_their_levels_as_nominatim_does() {
     // Brazil's administrative5 to 7 are [10, 0] to [14, 0] since Nominatim 5.3.0: Greater São
-    // Paulo (R2661855, admin_level 5) is in no address.
+    // Paulo (R2661855, admin_level 5) is in no address. Ferraz de Vasconcelos' municipality
+    // (R298265, admin_level 8, place=municipality) ranks 14 by its own tag, as its city node is the
+    // label of the city's boundary (R5683099, admin_level 9: 16), the builder's ranks after a
+    // re-index; Nominatim's public server still ranks them 16 and 18 from an older link.
     let index = TestIndex::in_country(b"BR")
         .boundary("São Paulo", 4, 7, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("Greater São Paulo", 5, 0, (-30_000.0, -30_000.0, 30_000.0, 30_000.0)).rank(0)
-        .boundary("Ferraz de Vasconcelos", 8, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Ferraz de Vasconcelos", 8, 14, (-5000.0, -5000.0, 5000.0, 5000.0)).rank(14)
+        .boundary("Ferraz de Vasconcelos", 9, 1, (-3000.0, -3000.0, 3000.0, 3000.0)).rank(16)
         .load();
     let address = address_at(&index, 0.0, 0.0);
     assert_eq!(address.get("state_district"), None);
     assert_eq!(address["city"], "Ferraz de Vasconcelos");
+    assert_eq!(address["municipality"], "Ferraz de Vasconcelos");
 
     // Slovakia has no levels of its own any more: an okres (admin_level 6) is a county at 12, and
     // an obec (8) a city at 16 inside it.

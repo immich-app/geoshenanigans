@@ -183,6 +183,29 @@ TEST(a_label_member_is_left_to_its_relation_by_every_other_step) {
     CHECK_EQ(stats.taken, size_t(0));
 }
 
+TEST(a_node_another_relation_holds_as_its_label_is_no_link_whatever_the_public_server_keeps) {
+    // Ferraz de Vasconcelos: the municipality (R298265, admin_level 8, place=municipality) holds
+    // the city node of its name, the label member of the city's boundary (R5683099, admin_level
+    // 9). The builder leaves the node to its label relation (place_links.h), as Nominatim's
+    // indexer finds it linked when it takes a polygon again: the municipality links nothing, and
+    // the city its label. Nominatim's public server still holds the municipality's link of its
+    // first index, before the city's label took the node (its extratags keep linked_place, and its
+    // /details its rank 16), as it does for Queluz (R298199) and Estiva Gerbi (R297955), whose
+    // nodes another relation labels; a polygon it indexes again links as here.
+    World w("BR");
+    w.node(1, PlaceValue::CITY, -23.54, -46.37, "Ferraz de Vasconcelos");
+    const uint32_t municipality = w.relation(298265, 8, Box{-23.6, -46.4, -23.5, -46.3},
+                                             {PlaceValue::MUNICIPALITY, "Ferraz de Vasconcelos"});
+    const uint32_t city = w.relation(5683099, 9, Box{-23.58, -46.38, -23.52, -46.32},
+                                     {PlaceValue::NONE, "Ferraz de Vasconcelos", "", 1});
+    w.link();
+    CHECK(w.link_of(municipality).step == LinkStep::NONE);
+    CHECK(w.label(municipality) == AdminPlaceType::MUNICIPALITY);
+    CHECK(w.link_of(city).step == LinkStep::LABEL);
+    CHECK(w.label(city) == AdminPlaceType::CITY);
+    CHECK_EQ(w.claimant(1), w.boundary(city));
+}
+
 TEST(a_wikidata_link_takes_one_covered_unlinked_node_its_namesake_first) {
     // Of the two nodes of Springfield's wikidata inside it, the one named as it is links; the
     // other stays a place of its own, and one outside links nothing. A node an earlier runner's
@@ -237,13 +260,14 @@ TEST(a_place_tagged_boundary_links_a_node_of_its_value_whose_name_overlaps_its_o
 }
 
 TEST(a_name_link_takes_a_covered_node_of_the_boundarys_name_and_rank) {
-    // Ferraz de Vasconcelos (BR admin_level 8, 16, own place=municipality) links its city node by
-    // name (16); a namesake village outside it links nothing, nor a town of its name in a level 9
-    // boundary (18), whose rank is not the node's 16, nor one of another wikidata.
+    // A BR boundary of admin_level 8 (16) tagged place=municipality, whose city node is no
+    // relation's label member, links the node by name (16); a namesake village outside it links
+    // nothing, nor a town of its name in a level 9 boundary (18), whose rank is not the node's 16,
+    // nor one of another wikidata.
     World w("BR");
-    w.node(1, PlaceValue::CITY, -23.54, -46.37, "Ferraz de Vasconcelos");
+    w.node(1, PlaceValue::CITY, -23.54, -46.37, "Vila Exemplo");
     const uint32_t ferraz = w.relation(1, 8, Box{-23.6, -46.4, -23.5, -46.3},
-                                       {PlaceValue::MUNICIPALITY, "Ferraz de Vasconcelos"});
+                                       {PlaceValue::MUNICIPALITY, "Vila Exemplo"});
     w.node(2, PlaceValue::VILLAGE, -23.0, -46.0, "Northfield");
     const uint32_t northfield = w.relation(2, 8, Box{-22.8, -46.1, -22.7, -45.9}, {PlaceValue::NONE, "Northfield"});
     w.node(3, PlaceValue::TOWN, -22.0, -45.0, "Ninth");
