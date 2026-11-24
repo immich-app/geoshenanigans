@@ -31,8 +31,10 @@
 #include "pbf_reader.h"
 
 #include <absl/synchronization/mutex.h>
+#include <s2/s2cell.h>
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
+#include <s2/s2latlng_rect.h>
 
 #include "types.h"
 #include "string_files.h"
@@ -55,6 +57,7 @@
 #include "polygon_rings.h"
 #include "admin_rank_config.h"
 #include "admin_arcs.h"
+#include "admin_cover.h"
 #include "admin_links.h"
 #include "cell_walk.h"
 #include "parallel.h"
@@ -297,20 +300,16 @@ static ExternalPostcodes read_external_postcodes(const std::string& path) {
         if (postcode.empty() || cc_str.size() < 2) continue;
         if (lat == 0 && lng == 0) continue;
 
-        // Validate against country pattern
-        char cc_lower[3] = {
-            static_cast<char>(std::tolower(static_cast<unsigned char>(cc_str[0]))),
-            static_cast<char>(std::tolower(static_cast<unsigned char>(cc_str[1]))),
-            0
-        };
-        if (!validate_postcode_for_country(cc_lower, postcode.c_str())) {
+        // _update_from_external keeps the postcode the country's pattern
+        // makes of the row's (m.norm), of a row the pattern takes.
+        const uint16_t cc = pack_country_code(static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[0]))),
+                                              static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[1]))));
+        std::optional<std::string> norm = match_postcode(cc, postcode, PostcodeDefault::Any);
+        if (!norm) {
             out.skipped++;
             continue;
         }
-
-        uint16_t cc = pack_country_code(static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[0]))),
-                                        static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[1]))));
-        out.rows.push_back({std::move(postcode), lat, lng, cc});
+        out.rows.push_back({std::move(*norm), lat, lng, cc});
     }
     return out;
 }
@@ -737,36 +736,44 @@ struct WikidataPlace {
     int64_t node;
     PackedLocation at;
     uint8_t place_type;  // PlaceType
+    std::string name;    // lower_name of its name tag
 };
 
-// find_linked_place's wikidata step (placex_triggers.sql): of the place nodes
-// of a boundary's wikidata, the ones it covers (_st_covers(bnd.geometry,
-// placex.geometry)), `covers(at)` telling, into `nodes`; returns the place
-// type the boundary takes from them, the smallest of theirs, whatever order
-// they came in, or PlaceType::UNKNOWN where it covers none.
-template <class Covers>
-static uint8_t covered_wikidata_places(const std::vector<WikidataPlace>& places, Covers covers, std::vector<int64_t>& nodes) {
-    uint8_t place_type = static_cast<uint8_t>(PlaceType::UNKNOWN);
-    nodes.clear();
-    for (const WikidataPlace& place : places) {
-        if (!covers(place.at)) continue;
-        nodes.push_back(place.node);
-        if (nodes.size() == 1 || place.place_type < place_type) place_type = place.place_type;
+// A boundary's wikidata tag and the lower_name of its name tag, which orders
+// the place nodes of its wikidata.
+struct BoundaryWikidata {
+    std::string id;
+    std::string name;
+};
+
+// The number of a wikidata tag of the form Q<digits>, under 2^32, which is
+// how the name step and take_out_repeated_boundaries compare two; 0 for any
+// other, or none.
+static uint32_t wikidata_q_number(const char* id) {
+    if (!id || id[0] != 'Q' || !id[1]) return 0;
+    uint64_t n = 0;
+    for (const char* c = id + 1; *c; c++) {
+        if (*c < '0' || *c > '9' || n > UINT32_MAX / 10) return 0;
+        n = n * 10 + static_cast<uint64_t>(*c - '0');
     }
-    return place_type;
+    return n <= UINT32_MAX ? static_cast<uint32_t>(n) : 0;
 }
 
-// Whether the polygons (each an outer ring and its holes) hold the point.
-static bool polygons_hold(const std::vector<NestedPolygon<PackedLocation>>& polygons, PackedLocation at) {
-    for (const auto& polygon : polygons) {
-        if (polygon.outer.size() < 3 || !exact_ring_contains(polygon.outer.data(), static_cast<uint32_t>(polygon.outer.size()), at))
-            continue;
-        bool in_hole = false;
-        for (const auto& hole : polygon.holes)
-            in_hole |= hole.size() >= 3 && exact_ring_contains(hole.data(), static_cast<uint32_t>(hole.size()), at);
-        if (!in_hole) return true;
+// The candidates of find_linked_place's wikidata step (placex_triggers.sql)
+// for `boundary`, of the name `name` (lower_name): the place nodes of its
+// wikidata that it covers (_st_covers(bnd.geometry, placex.geometry), its
+// edges included), `covers(at)` telling, into `out`. link_wikidata_places
+// links one of them, once every boundary's are in.
+template <class Covers>
+static void add_wikidata_candidates(const std::vector<WikidataPlace>& places, Covers covers, uint64_t boundary,
+                                    const std::string& name, std::vector<WikidataCandidate>& out) {
+    for (const WikidataPlace& place : places) {
+        if (!covers(place.at)) continue;
+        const uint8_t place_type = place_type_to_admin_override(place.place_type);
+        if (place_type == 0) continue;
+        out.push_back({boundary, pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, place.node),
+                       wikidata_order(place.name, name), place_type});
     }
-    return false;
 }
 
 // The vertex average of polygon i's exact outer ring, each vertex once (a
@@ -787,57 +794,242 @@ static LatLng outer_vertex_average(const ParsedData& data, uint32_t i) {
     return {static_cast<double>(sum_lat) / ring_count / 1e7, static_cast<double>(sum_lng) / ring_count / 1e7};
 }
 
-// The country polygon i lies in, as Nominatim takes a place's at its centroid
-// (get_country_code): its own code where it has one (a country, a postal
-// area), else the country at its outer ring's vertex average; 0 where none
-// is known.
-static uint16_t polygon_country(const ParsedData& data, const AdminRings& countries, uint32_t i) {
-    const AdminPolygon& poly = data.admin_polygons[i];
-    if (poly.country_code != 0) return poly.country_code;
-    if (data.admin_exact_rings.polygons[i].ring_count == 0) return 0;
-    const LatLng c = outer_vertex_average(data, i);
-    return country_code_at_point(data, countries, c.first, c.second);
+// The country of each of `polygons` as polygon_country finds it, before the
+// country cells exist (the wikidata step comes before the arcs, which read
+// the place types it gives): its own code where it has one, else that of the
+// smallest country polygon whose exact rings hold a point inside it, the
+// lower code among equals, as country_code_at_point picks between the
+// countries of a border cell. Where none holds it, the lowest code of the
+// countries whose boundary cells (admin_arc_cells, those of the country cell
+// index) hold the point's cell, as country_code_at_point takes a point off
+// every outline in a cell the countries list: the one country of a coast
+// there. 0 where none does. As (polygon, country), sorted by polygon, each
+// once.
+static std::vector<std::pair<uint32_t, uint16_t>> countries_before_cells(const ParsedData& data,
+                                                                         std::vector<uint32_t> polygons,
+                                                                         unsigned int threads) {
+    std::sort(polygons.begin(), polygons.end());
+    polygons.erase(std::unique(polygons.begin(), polygons.end()), polygons.end());
+    const auto& rings = data.admin_exact_rings;
+    std::vector<std::pair<uint32_t, uint16_t>> out(polygons.size());
+    std::vector<PackedLocation> inside(polygons.size());
+    parallel_for(polygons.size(), [&](size_t begin, size_t end, unsigned) {
+        for (size_t k = begin; k < end; k++) {
+            const uint32_t p = polygons[k];
+            out[k] = {p, data.admin_polygons[p].country_code};
+            const uint32_t ring_count = rings.polygons[p].ring_count;
+            if (out[k].second != 0 || ring_count == 0) continue;
+            const LatLng at = interior_point(rings.vertices.data(), rings.rings_of(p), ring_count);
+            inside[k] = point_e7(at.first, at.second);
+        }
+    }, threads);
+    // The points to place, by latitude.
+    std::vector<std::pair<int32_t, uint32_t>> by_lat;
+    for (uint32_t k = 0; k < polygons.size(); k++)
+        if (out[k].second == 0 && rings.polygons[polygons[k]].ring_count != 0) by_lat.push_back({inside[k].lat_e7, k});
+    if (by_lat.empty()) return out;
+    std::sort(by_lat.begin(), by_lat.end());
+    std::vector<uint32_t> countries;
+    std::vector<bool> is_country(data.admin_polygons.size());
+    for (uint32_t p = 0; p < data.admin_polygons.size(); p++) {
+        const AdminPolygon& poly = data.admin_polygons[p];
+        if (poly.admin_level != 2 || poly.country_code == 0 || rings.polygons[p].ring_count == 0) continue;
+        countries.push_back(p);
+        is_country[p] = true;
+    }
+    // (point, country polygon) of each point in the box of a country's outer
+    // ring, a point's together.
+    using Pair = std::pair<uint32_t, uint32_t>;
+    std::vector<Pair> pairs = parallel_collect<Pair>(countries.size(), [&](size_t c, std::vector<Pair>& found) {
+        const RingSpan& outer = rings.rings_of(countries[c])[0];
+        const ExactRingBox box = exact_ring_box(rings.vertices.data() + outer.begin, outer.count);
+        for (auto it = std::lower_bound(by_lat.begin(), by_lat.end(), std::make_pair(box.lat_lo, uint32_t(0)));
+             it != by_lat.end() && it->first <= box.lat_hi; ++it) {
+            const PackedLocation q = inside[it->second];
+            if (q.lon_e7 >= box.lng_lo && q.lon_e7 <= box.lng_hi) found.push_back({it->second, countries[c]});
+        }
+    }, threads);
+    std::sort(pairs.begin(), pairs.end());
+    const AdminRings country_rings(rings, threads, [&](uint32_t p) { return is_country[p]; });
+    std::vector<size_t> starts;
+    for (size_t k = 0; k < pairs.size(); k++)
+        if (k == 0 || pairs[k].first != pairs[k - 1].first) starts.push_back(k);
+    starts.push_back(pairs.size());
+    parallel_for(starts.size() - 1, [&](size_t begin, size_t end, unsigned) {
+        for (size_t r = begin; r < end; r++) {
+            const uint32_t k = pairs[starts[r]].first;
+            float best_area = std::numeric_limits<float>::max();
+            uint16_t best = 0;
+            for (size_t j = starts[r]; j < starts[r + 1]; j++) {
+                const AdminPolygon& country = data.admin_polygons[pairs[j].second];
+                if (!country_rings.contains(pairs[j].second, inside[k])) continue;
+                if (country.area < best_area || (country.area == best_area && country.country_code < best)) {
+                    best_area = country.area;
+                    best = country.country_code;
+                }
+            }
+            out[k].second = best;
+        }
+    }, threads);
+
+    // The points off every outline, each with its cell and the cell's box.
+    struct Off {
+        double lat_lo, lat_hi, lng_lo, lng_hi;
+        uint64_t cell;
+        uint32_t k;
+    };
+    std::vector<Off> off;
+    for (const auto& [lat, k] : by_lat) {
+        if (out[k].second != 0) continue;
+        const S2CellId cell = admin_link_cell(inside[k]);
+        const S2LatLngRect box = S2Cell(cell).GetRectBound();
+        const bool wraps = box.lng().is_inverted();
+        off.push_back({box.lat_lo().degrees(), box.lat_hi().degrees(), wraps ? -180.0 : box.lng_lo().degrees(),
+                       wraps ? 180.0 : box.lng_hi().degrees(), cell.id(), k});
+    }
+    if (off.empty()) return out;
+    std::sort(off.begin(), off.end(), [](const Off& a, const Off& b) { return std::tie(a.lat_lo, a.k) < std::tie(b.lat_lo, b.k); });
+    double tallest = 0;
+    for (const Off& o : off) tallest = std::max(tallest, o.lat_hi - o.lat_lo);
+    // (point, country code) of each country whose boundary cells hold a
+    // point's cell: an edge's where its box meets the cell's, the edge's box
+    // widened by over a kilometre, far past the reach of its cells.
+    constexpr double kMarginDegrees = 0.01;
+    using Reached = std::pair<uint32_t, uint16_t>;
+    std::vector<Reached> reached = parallel_collect<Reached>(countries.size(), [&](size_t c, std::vector<Reached>& found) {
+        const uint32_t country = countries[c];
+        const uint16_t code = data.admin_polygons[country].country_code;
+        std::vector<uint64_t> cells;
+        const RingSpan* spans = rings.rings_of(country);
+        for (uint32_t r = 0; r < rings.polygons[country].ring_count; r++) {
+            const PackedLocation* v = rings.vertices.data() + spans[r].begin;
+            for (uint32_t e = 1; e < spans[r].count; e++) {
+                const double lat_lo = std::min(v[e - 1].lat(), v[e].lat()) - kMarginDegrees;
+                const double lat_hi = std::max(v[e - 1].lat(), v[e].lat()) + kMarginDegrees;
+                const double nearest_pole = std::max(std::abs(lat_lo), std::abs(lat_hi)) * (M_PI / 180.0);
+                const double lng_margin = kMarginDegrees / std::max(std::cos(nearest_pole), 0.05);
+                const double lng_lo = std::min(v[e - 1].lon(), v[e].lon()) - lng_margin;
+                const double lng_hi = std::max(v[e - 1].lon(), v[e].lon()) + lng_margin;
+                auto it = std::lower_bound(off.begin(), off.end(), lat_lo - tallest,
+                                           [](const Off& o, double lat) { return o.lat_lo < lat; });
+                bool edge_cells = false;
+                for (; it != off.end() && it->lat_lo <= lat_hi; ++it) {
+                    if (it->lat_hi < lat_lo || it->lng_hi < lng_lo || it->lng_lo > lng_hi) continue;
+                    if (!edge_cells) {
+                        cells.clear();
+                        admin_arc_cells(v + e - 1, 2, kAdminCellLevel, ADMIN_COVER_REACH_RAD, cells);
+                        edge_cells = true;
+                    }
+                    if (std::binary_search(cells.begin(), cells.end(), it->cell)) found.push_back({it->k, code});
+                }
+            }
+        }
+    }, threads);
+    std::sort(reached.begin(), reached.end());
+    for (size_t j = 0; j < reached.size(); j++)
+        if (j == 0 || reached[j].first != reached[j - 1].first) out[reached[j].first].second = reached[j].second;
+    return out;
 }
 
 // Gives each postal area (admin_level 11) the country its centroid lies in,
 // as Nominatim gives a place_postcode row the country of its centroid
-// (postcodes.py update_postcodes, get_country_code), and marks the ones of a
-// postcode the country's pattern rejects POSTAL_AREA_INVALID: Nominatim makes
-// no postcode area of those (_update_postcode_areas), so they name nothing.
+// (postcodes.py update_postcodes, get_country_code). A relation is one row,
+// its centroid its whole multipolygon's (init.lua postcode_area,
+// o.geometry:centroid()): its rings' centroids weighted by their areas, and
+// every ring of it takes that country. A US area of a ZIP+4 is its ZIP's.
+// The areas of a postcode the country's pattern rejects are marked
+// POSTAL_AREA_INVALID: Nominatim makes no postcode area of those
+// (_update_postcode_areas), so they name nothing.
 static void assign_postal_area_countries(ParsedData& data, const AdminRings& countries, unsigned int threads) {
-    const auto& pool = data.string_pool.data();
-    std::atomic<size_t> areas{0}, invalid{0};
-    parallel_for(data.admin_polygons.size(), [&](size_t begin, size_t end, unsigned) {
-        for (size_t i = begin; i < end; i++) {
-            AdminPolygon& poly = data.admin_polygons[i];
-            if (poly.admin_level != 11 || poly.name_id == NO_DATA) continue;
-            const auto& rings = data.admin_exact_rings;
-            if (rings.polygons[i].ring_count == 0) continue;
-            const LatLng c = exact_polygon_centroid(rings.vertices.data(), rings.rings_of(static_cast<uint32_t>(i)),
-                                                    rings.polygons[i].ring_count);
-            poly.country_code = country_code_at_point(data, countries, c.first, c.second);
-            areas.fetch_add(1);
-            if (poly.country_code == 0) continue;
-            const char cc[3] = {static_cast<char>(std::tolower(poly.country_code >> 8)),
-                                static_cast<char>(std::tolower(poly.country_code & 0xFF)), 0};
-            if (!validate_postcode_for_country(cc, pool.data() + poly.name_id)) {
-                poly.place_type_override = POSTAL_AREA_INVALID;
-                invalid.fetch_add(1);
+    const auto& rings = data.admin_exact_rings;
+    const bool ids = data.admin_osm_ids.size() == data.admin_polygons.size();
+    // (boundary, slot) of each postal ring, a relation's together in ring order.
+    std::vector<std::pair<uint64_t, uint32_t>> rings_of;
+    for (uint32_t i = 0; i < data.admin_polygons.size(); i++) {
+        const AdminPolygon& poly = data.admin_polygons[i];
+        if (poly.admin_level != 11 || poly.name_id == NO_DATA || rings.polygons[i].ring_count == 0) continue;
+        rings_of.push_back({ids ? admin_boundary_id(data.admin_osm_ids[i]) : i, i});
+    }
+    std::sort(rings_of.begin(), rings_of.end(), [&](const auto& a, const auto& b) {
+        if (a.first != b.first) return a.first < b.first;
+        return ids ? data.admin_osm_ids[a.second] < data.admin_osm_ids[b.second] : a.second < b.second;
+    });
+    std::vector<size_t> starts;
+    for (size_t k = 0; k < rings_of.size(); k++)
+        if (k == 0 || rings_of[k].first != rings_of[k - 1].first) starts.push_back(k);
+    starts.push_back(rings_of.size());
+    const size_t areas = starts.size() - 1;
+
+    std::vector<uint16_t> country(areas);
+    parallel_for(areas, [&](size_t begin, size_t end, unsigned) {
+        for (size_t a = begin; a < end; a++) {
+            double weight = 0, lat = 0, lng = 0;
+            LatLng first{};
+            for (size_t k = starts[a]; k < starts[a + 1]; k++) {
+                const uint32_t i = rings_of[k].second;
+                const LatLng c = exact_polygon_centroid(rings.vertices.data(), rings.rings_of(i), rings.polygons[i].ring_count);
+                if (k == starts[a]) first = c;
+                const double area = data.admin_polygons[i].area;
+                weight += area;
+                lat += area * c.first;
+                lng += area * c.second;
             }
+            const LatLng centre = weight > 0 ? LatLng{lat / weight, lng / weight} : first;
+            country[a] = country_code_at_point(data, countries, centre.first, centre.second);
         }
     }, threads);
-    std::cerr << "Postal areas: " << areas.load() << " given their centroid's country, " << invalid.load()
-              << " of a postcode their country's pattern rejects" << std::endl;
+
+    // One after another: interning a postcode grows the pool. Each takes
+    // the postcode its country's pattern makes of its tag (m.norm), a US
+    // ZIP+4 its ZIP; one of no country known keeps its tag.
+    size_t invalid = 0, renamed = 0;
+    for (size_t a = 0; a < areas; a++) {
+        const uint16_t cc = country[a];
+        uint32_t name_id = data.admin_polygons[rings_of[starts[a]].second].name_id;
+        bool valid = true;
+        if (cc != 0) {
+            const std::string postcode = data.string_pool.data().data() + name_id;
+            const std::optional<std::string> norm = match_postcode(cc, postcode, PostcodeDefault::Any);
+            valid = norm.has_value();
+            if (valid && *norm != postcode) {
+                name_id = data.string_pool.intern(*norm);
+                renamed++;
+            }
+        }
+        invalid += !valid;
+        for (size_t k = starts[a]; k < starts[a + 1]; k++) {
+            AdminPolygon& poly = data.admin_polygons[rings_of[k].second];
+            poly.country_code = cc;
+            poly.name_id = name_id;
+            if (!valid) poly.place_type_override = POSTAL_AREA_INVALID;
+        }
+    }
+    std::cerr << "Postal areas: " << areas << " given their centroid's country (" << rings_of.size() << " rings), "
+              << invalid << " of a postcode their country's pattern rejects, " << renamed
+              << " renamed to the postcode it makes" << std::endl;
 }
 
-// find_linked_place step 4: name-based linking of admin boundaries to place nodes
-// (Nominatim find_linked_place name-match fallback).
+// find_linked_place steps 3 and 4: the place-type and name links of admin
+// boundaries to the place nodes they cover, for a boundary the label and
+// wikidata steps linked nothing to.
 static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                 std::chrono::steady_clock::time_point& _pt, CpuTicks& _cpu) {
     unsigned int num_threads = cfg.num_threads;
     if (data.admin_polygons.empty()) return;
     const AdminRings countries = border_country_rings(data, num_threads);
     assign_postal_area_countries(data, countries, num_threads);
+    // Each polygon's country (polygon_country), found the first time the
+    // claims or the name match ask for it, on any thread: 0 not yet, else
+    // kKnown and the code. Threads that race find the same code.
+    constexpr uint32_t kKnown = 1u << 16;
+    std::vector<std::atomic<uint32_t>> country_memo(data.admin_polygons.size());
+    const auto country_of = [&](uint32_t p) {
+        const uint32_t memo = country_memo[p].load(std::memory_order_relaxed);
+        if (memo != 0) return static_cast<uint16_t>(memo);
+        const uint16_t cc = polygon_country(data, countries, p);
+        country_memo[p].store(kKnown | cc, std::memory_order_relaxed);
+        return cc;
+    };
     if (!data.place_nodes.empty()) {
         auto _nl_t = std::chrono::steady_clock::now();
 
@@ -858,16 +1050,12 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         // names its claimant's polygon (place_claims.h).
         // A boundary or place area of rank 0 in its country links nothing
         // (find_linked_place returns at once, placex_triggers.sql:285): the
-        // node stays a place of its own.
+        // wikidata step took its label claim out, and the node stays a place
+        // of its own.
         if (!data.place_claims.empty()) {
             const size_t claims = data.place_claims.size();
-            const auto links = [&](uint32_t p) {
-                const AdminPolygon& poly = data.admin_polygons[p];
-                return polygon_rank_address(polygon_country(data, countries, p), poly.admin_level,
-                                            own_place_tag(poly)) != 0;
-            };
             const size_t hidden = hide_claimed_place_nodes(data.place_nodes, data.place_osm_ids,
-                std::move(data.place_claims), data.admin_polygons, data.admin_osm_ids, num_threads, links);
+                std::move(data.place_claims), data.admin_polygons, data.admin_osm_ids, num_threads);
             std::vector<PlaceClaim>().swap(data.place_claims);
             std::cerr << "find_linked_place label/wikidata: hid " << hidden
                       << " linked place nodes (" << claims << " claims)" << std::endl;
@@ -913,31 +1101,139 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
             }
         };
 
+        // A boundary's wikidata (wikidata_q_number), 0 for none.
+        std::sort(data.boundary_wikidata.begin(), data.boundary_wikidata.end());
+        const auto boundary_qid = [&](uint32_t p) -> uint64_t {
+            if (data.admin_osm_ids.size() != data.admin_polygons.size()) return 0;
+            const uint64_t boundary = admin_boundary_id(data.admin_osm_ids[p]);
+            const auto it = std::lower_bound(data.boundary_wikidata.begin(), data.boundary_wikidata.end(),
+                                             std::make_pair(boundary, uint64_t(0)));
+            return it != data.boundary_wikidata.end() && it->first == boundary ? it->second : 0;
+        };
+
+        // A boundary the label or the wikidata step linked a node to
+        // (data.linking_boundaries, every one so far) takes no name step:
+        // find_linked_place returns the node they found, of any place type,
+        // a place=locality label too, before it (placex_triggers.sql
+        // :296-337), so a node of the boundary's name stays a place of its
+        // own.
+        auto& linking = data.linking_boundaries;
+        std::sort(linking.begin(), linking.end());
+        linking.erase(std::unique(linking.begin(), linking.end()), linking.end());
+        const auto links_already = [&](uint32_t p) {
+            return data.admin_osm_ids.size() == data.admin_polygons.size() &&
+                   std::binary_search(linking.begin(), linking.end(), admin_boundary_id(data.admin_osm_ids[p]));
+        };
+
+        // The name step takes a node only where the boundary covers it
+        // (ST_Covers(bnd.geometry, placex.geometry), placex_triggers.sql
+        // :359-381): the polygons of the boundary, a relation's rings or a
+        // closed way's one, each even-odd over its rings, their edges
+        // included.
+        const bool have_ids = data.admin_osm_ids.size() == data.admin_polygons.size();
+        std::vector<std::pair<uint64_t, uint32_t>> boundary_rings;
+        if (have_ids) {
+            for (uint32_t p = 0; p < data.admin_polygons.size(); p++) {
+                const uint8_t level = data.admin_polygons[p].admin_level;
+                if (level >= 8 && level <= 10) boundary_rings.push_back({admin_boundary_id(data.admin_osm_ids[p]), p});
+            }
+            std::sort(boundary_rings.begin(), boundary_rings.end());
+        }
+        const auto polygon_covers = [&](uint32_t p, PackedLocation at) {
+            const auto& polygon = data.admin_exact_rings.polygons[p];
+            bool inside = false;
+            for (uint32_t r = polygon.first_ring; r < polygon.first_ring + polygon.ring_count; r++) {
+                const RingSpan& span = data.admin_exact_rings.rings[r];
+                const PackedLocation* v = data.admin_exact_rings.vertices.data() + span.begin;
+                if (exact_ring_touches(v, span.count, at)) return true;
+                inside ^= exact_ring_contains(v, span.count, at);
+            }
+            return inside;
+        };
+        const auto boundary_covers = [&](uint32_t p, PackedLocation at) {
+            if (!have_ids) return polygon_covers(p, at);
+            const uint64_t boundary = admin_boundary_id(data.admin_osm_ids[p]);
+            for (auto it = std::lower_bound(boundary_rings.begin(), boundary_rings.end(), std::make_pair(boundary, uint32_t(0)));
+                 it != boundary_rings.end() && it->first == boundary; ++it)
+                if (polygon_covers(it->second, at)) return true;
+            return false;
+        };
+
+        // The place-type step's nodes (placex_triggers.sql:338-356): of each
+        // place type, (latitude, place in `named`) of its nodes, in order.
+        constexpr size_t kNodeTypes = static_cast<size_t>(PlaceType::BOROUGH) + 1;
+        std::vector<std::vector<std::pair<float, uint32_t>>> typed(kNodeTypes);
+        for (uint32_t k = 0; k < named.size(); k++) {
+            const auto& pn = data.place_nodes[named[k].second];
+            if (pn.place_type < kNodeTypes) typed[pn.place_type].push_back({pn.lat, k});
+        }
+        for (auto& nodes : typed) std::sort(nodes.begin(), nodes.end());
+        // The node type of a boundary's place tag (boundary_place_tags; the
+        // place type it stands for where there are no ids), kNodeTypes for
+        // none: a linked_place tag takes no place-type step.
+        std::sort(data.boundary_place_tags.begin(), data.boundary_place_tags.end());
+        const auto node_type_of = [&](uint32_t p, uint8_t own) {
+            uint8_t tag = own;
+            if (data.admin_osm_ids.size() == data.admin_polygons.size()) {
+                const uint64_t boundary = admin_boundary_id(data.admin_osm_ids[p]);
+                const auto it = std::lower_bound(data.boundary_place_tags.begin(), data.boundary_place_tags.end(),
+                                                 std::make_pair(boundary, uint8_t(0)));
+                tag = it != data.boundary_place_tags.end() && it->first == boundary ? it->second : 0;
+            }
+            for (uint8_t t = 0; tag != 0 && t < kNodeTypes; t++)
+                if (place_type_to_admin_override(t) == tag) return t;
+            return static_cast<uint8_t>(kNodeTypes);
+        };
+
         // Nominatim gates step 4 to boundaries with
         // rank_address 16-23 (admin_level 8-11 under the default
         // rank mapping al*2). Coarser boundaries never fall through
         // to step 4 because steps 1-3 almost always catch them
         // (country/state wikidata coverage is near-total).
         std::atomic<size_t> pol_idx{0};
-        std::atomic<uint64_t> linked{0};
         std::atomic<uint64_t> considered{0};
         std::vector<std::thread> nl_workers;
-        // (node, polygon) of each link. Nominatim sets linked_place_id on
-        // the node when a boundary links it, hiding it from all results
-        // (the boundary represents it). We mirror that by flagging the node
-        // after the join below.
-        std::mutex linked_nodes_mutex;
-        std::vector<std::pair<uint32_t, uint32_t>> linked_nodes;
         const double max_dist_deg = 0.5;
         const double max_dist_sq = max_dist_deg * max_dist_deg;
+        // Each part's node: the boundary's polygon of that part takes the
+        // steps alone, and the boundary then takes its parts' best
+        // (`better`), below.
+        struct Choice {
+            uint32_t node = NO_DATA;
+            bool of_type = false;  // by the place-type step
+            bool exact = false;    // of the boundary's name, not one holding or held in it
+            double d2 = 0;         // from the part's outer ring's vertex average
+        };
+        std::vector<Choice> choices(data.admin_polygons.size());
+        std::vector<uint8_t> takes_steps(data.admin_polygons.size());
+        const auto node_id = [&](uint32_t idx) {
+            return idx < data.place_osm_ids.size() ? data.place_osm_ids[idx] : static_cast<uint64_t>(idx);
+        };
+        // Whether a is the better node: one of the place-type step, of the
+        // boundary's own name there, then the nearer, then the lower osm id,
+        // a stable order where the steps take any (no ORDER BY).
+        const auto better = [&](const Choice& a, const Choice& b) {
+            if (a.node == NO_DATA || b.node == NO_DATA) return b.node == NO_DATA && a.node != NO_DATA;
+            if (a.of_type != b.of_type) return a.of_type;
+            if (a.exact != b.exact) return a.exact;
+            if (a.d2 != b.d2) return a.d2 < b.d2;
+            return node_id(a.node) < node_id(b.node);
+        };
 
         for (unsigned int t = 0; t < num_threads; t++) {
             nl_workers.emplace_back([&]() {
                 while (true) {
                     size_t i = pol_idx.fetch_add(1);
                     if (i >= data.admin_polygons.size()) break;
-                    auto& poly = data.admin_polygons[i];
-                    if (poly.place_type_override != 0) continue;
+                    const auto& poly = data.admin_polygons[i];
+                    // A place type here is the boundary's own place or
+                    // linked_place tag, as the label and wikidata steps
+                    // linked nothing to it (links_already, below):
+                    // find_linked_place still takes its place-type step, of
+                    // the place tag alone, and its name step (:338-381), the
+                    // tag is the last resort where both find nothing
+                    // (placex_update, :1190-1205).
+                    const uint8_t own_type = poly.place_type_override;
                     // AL11 slots hold boundary=postal_code polygons (their
                     // "name" is the postcode string) — Nominatim's
                     // find_linked_place only runs for boundary=administrative,
@@ -945,28 +1241,80 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                     if (poly.admin_level < 8 || poly.admin_level > 10) continue;
                     if (data.admin_exact_rings.polygons[i].ring_count == 0) continue;
                     if (poly.name_id == NO_DATA) continue;
+                    if (links_already(static_cast<uint32_t>(i))) continue;
                     const char* bnd_name = pool_data.data() + poly.name_id;
                     if (!bnd_name[0]) continue;
                     considered.fetch_add(1);
 
-                    // Per-country rank_address (NL AL8 = 14, not the
-                    // default 16) — resolved from the boundary's country.
-                    // AL8+ boundaries don't carry country tags, so resolve
-                    // the country from the polygon centroid's admin cell.
-                    const LatLng centre = outer_vertex_average(data, static_cast<uint32_t>(i));
-                    const double clat = centre.first, clng = centre.second;
-                    const uint16_t bnd_cc = polygon_country(data, countries, static_cast<uint32_t>(i));
-                    uint8_t bnd_rank = admin_rank_address(bnd_cc, poly.admin_level);
-                    if (bnd_rank == 0) continue;  // not in this country's address chain
-
                     std::string nb = normalise_for_matching(bnd_name);
                     if (nb.empty()) continue;
+                    const uint8_t node_type = node_type_of(static_cast<uint32_t>(i), own_type);
+                    const auto [first, last] = places_named(nb);
+                    if (first == last && node_type == kNodeTypes) continue;
 
+                    // Per-country rank_address (NL AL8 = 14, not the
+                    // default 16), in the boundary's country.
+                    const uint16_t bnd_cc = country_of(static_cast<uint32_t>(i));
+                    uint8_t bnd_rank = admin_rank_address(bnd_cc, poly.admin_level);
+                    if (bnd_rank == 0) continue;  // not in this country's address chain
+                    const uint64_t bnd_qid = boundary_qid(static_cast<uint32_t>(i));
+                    takes_steps[i] = 1;
+                    // Nor a node whose wikidata is another than the
+                    // boundary's: either has none, or both the same.
+                    const auto other_qid = [&](uint32_t pidx) {
+                        const uint32_t node_qid = pidx < data.place_qids.size() ? data.place_qids[pidx] : 0;
+                        return bnd_qid != 0 && node_qid != 0 && node_qid != bnd_qid;
+                    };
+
+                    const LatLng centre = outer_vertex_average(data, static_cast<uint32_t>(i));
+                    const double clat = centre.first, clng = centre.second;
+                    const auto dist_sq = [&](const PlaceNode& pn) {
+                        const double dlat = (double)pn.lat - clat, dlng = (double)pn.lng - clng;
+                        return dlat * dlat + dlng * dlng;
+                    };
+                    Choice best;
+
+                    // The place-type step: a node of the type of the
+                    // boundary's place tag whose name holds the boundary's or
+                    // is held in it, of any rank, that the boundary covers,
+                    // at any distance; of the nodes in this part's box, the
+                    // best.
+                    if (node_type != kNodeTypes) {
+                        const RingSpan& outer = data.admin_exact_rings.rings_of(static_cast<uint32_t>(i))[0];
+                        const PackedLocation* ring = data.admin_exact_rings.vertices.data() + outer.begin;
+                        int32_t s = INT32_MAX, w = INT32_MAX, n = INT32_MIN, e = INT32_MIN;
+                        for (uint32_t v = 0; v < outer.count; v++) {
+                            s = std::min(s, ring[v].lat_e7), n = std::max(n, ring[v].lat_e7);
+                            w = std::min(w, ring[v].lon_e7), e = std::max(e, ring[v].lon_e7);
+                        }
+                        // A node's float position is within a few e-6 degrees
+                        // of its own.
+                        constexpr double kSlack = 1e-5;
+                        const double south = s / 1e7 - kSlack, north = n / 1e7 + kSlack;
+                        const double west = w / 1e7 - kSlack, east = e / 1e7 + kSlack;
+                        const auto& nodes = typed[node_type];
+                        for (auto it = std::lower_bound(nodes.begin(), nodes.end(), std::make_pair(static_cast<float>(south), uint32_t(0)));
+                             it != nodes.end() && it->first <= north; ++it) {
+                            if (it->first < south) continue;
+                            const auto& [name, pidx] = named[it->second];
+                            const auto& pn = data.place_nodes[pidx];
+                            if (pn.lng < west || pn.lng > east) continue;
+                            const bool exact = name == nb;
+                            if (!exact && name.find(nb) == std::string::npos && nb.find(name) == std::string::npos) continue;
+                            if (other_qid(pidx)) continue;
+                            const Choice c{pidx, true, exact, dist_sq(pn)};
+                            if (!better(c, best)) continue;
+                            if (!boundary_covers(static_cast<uint32_t>(i), point_e7(pn.lat, pn.lng))) continue;
+                            best = c;
+                        }
+                    }
+
+                    // The name step, where that finds none: the nearest node
+                    // of the boundary's name to the outer ring's vertex
+                    // average, of its rank, that it covers.
                     uint32_t best_idx = NO_DATA;
                     double best_dist_sq = max_dist_sq;
-
-                    const auto [first, last] = places_named(nb);
-                    for (auto it = first; it != last; ++it) {
+                    for (auto it = first; it != last && best.node == NO_DATA; ++it) {
                         const uint32_t pidx = it->second;
                         const auto& pn = data.place_nodes[pidx];
                         uint8_t pr = place_addr_rank(pn.place_type);
@@ -979,9 +1327,8 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                         // to their town nodes (16), relabelling
                         // municipalities as towns.
                         if (pr != bnd_rank) continue;
-                        double dlat = (double)pn.lat - clat;
-                        double dlng = (double)pn.lng - clng;
-                        double d2 = dlat * dlat + dlng * dlng;
+                        if (other_qid(pidx)) continue;
+                        const double d2 = dist_sq(pn);
                         if (d2 > best_dist_sq) continue;
                         if (d2 == best_dist_sq) {
                             // Preserve the original `>=` reject at the
@@ -1002,24 +1349,50 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                                 data.place_osm_ids[pidx] >= data.place_osm_ids[best_idx])
                                 continue;
                         }
+                        if (!boundary_covers(static_cast<uint32_t>(i), point_e7(pn.lat, pn.lng))) continue;
                         best_dist_sq = d2;
                         best_idx = pidx;
                     }
-
-                    if (best_idx != NO_DATA) {
-                        const auto& pn = data.place_nodes[best_idx];
-                        uint8_t pto = place_type_to_admin_override(pn.place_type);
-                        if (pto != 0) {
-                            poly.place_type_override = pto;
-                            linked.fetch_add(1);
-                            std::lock_guard<std::mutex> lk(linked_nodes_mutex);
-                            linked_nodes.push_back({best_idx, static_cast<uint32_t>(i)});
-                        }
-                    }
+                    if (best.node == NO_DATA && best_idx != NO_DATA) best = {best_idx, false, true, best_dist_sq};
+                    choices[i] = best;
                 }
             });
         }
         for (auto& w : nl_workers) w.join();
+
+        // find_linked_place links one node to the whole boundary, which
+        // labels each of its parts (placex_update, :1141-1180): of the parts
+        // that took the steps, the best choice, its node's type the place
+        // type of every one. (node, polygon) of each link, one a boundary.
+        // Nominatim sets linked_place_id on the node when a boundary links
+        // it, hiding it from all results (the boundary represents it). We
+        // mirror that by flagging the node below.
+        std::vector<std::pair<uint32_t, uint32_t>> linked_nodes;
+        std::vector<std::pair<uint64_t, uint32_t>> parts;  // (boundary, polygon)
+        for (uint32_t p = 0; p < data.admin_polygons.size(); p++)
+            if (takes_steps[p]) parts.push_back({have_ids ? admin_boundary_id(data.admin_osm_ids[p]) : p, p});
+        std::sort(parts.begin(), parts.end());
+        uint64_t linked = 0, linked_by_type = 0, by_a_name_held = 0, of_parts = 0, parts_chose_another = 0;
+        for (size_t g = 0, h; g < parts.size(); g = h) {
+            h = g;
+            Choice best;
+            while (h < parts.size() && parts[h].first == parts[g].first) {
+                if (better(choices[parts[h].second], best)) best = choices[parts[h].second];
+                h++;
+            }
+            if (best.node == NO_DATA) continue;
+            const uint8_t pto = place_type_to_admin_override(data.place_nodes[best.node].place_type);
+            if (pto == 0) continue;
+            for (size_t k = g; k < h; k++) {
+                data.admin_polygons[parts[k].second].place_type_override = pto;
+                parts_chose_another += choices[parts[k].second].node != best.node;
+            }
+            linked_nodes.push_back({best.node, parts[g].second});
+            linked++;
+            linked_by_type += best.of_type;
+            by_a_name_held += !best.exact;
+            of_parts += h - g > 1;
+        }
 
         // Hide linked nodes: PLACE_FLAG_HIDDEN makes the server's
         // place_node() accessor return None everywhere (find_places,
@@ -1027,6 +1400,9 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         // Nominatim's linked_place_id. Deterministic regardless of worker
         // scheduling: the set of links is order-independent, and a node
         // several boundaries link names the one claim_wins picks.
+        if (data.admin_osm_ids.size() == data.admin_polygons.size())
+            for (const auto& [node, polygon] : linked_nodes)
+                data.linking_boundaries.push_back(admin_boundary_id(data.admin_osm_ids[polygon]));
         const size_t name_hidden = hide_name_linked_place_nodes(data.place_nodes, std::move(linked_nodes),
                                                                 data.admin_polygons, data.admin_osm_ids);
         const size_t labelled = parallel_count(data.place_nodes.size(),
@@ -1037,8 +1413,10 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         double _nl_elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - _nl_t).count();
         std::cerr << "find_linked_place step 4 (name match): "
-                  << linked.load() << "/" << considered.load()
-                  << " unlinked AL8-10 boundaries linked in "
+                  << linked << "/" << considered.load()
+                  << " unlinked AL8-10 boundaries linked (" << linked_by_type << " by the place-type step, "
+                  << by_a_name_held << " by a name holding or held in theirs; " << of_parts
+                  << " of several parts, " << parts_chose_another << " parts of another choice) in "
                   << _nl_elapsed << "s" << std::endl;
         log_phase("find_linked_place step 4", _pt, _cpu);
     }
@@ -2134,14 +2512,14 @@ static int run(int argc, char* argv[]) {
             PbfFile pbf(input_file, num_threads);
             log_phase("  Pass 1: blob scan", _bt, _bc);
 
-            std::vector<std::string> rel_wikidata; // parallel to data.collected_relations
+            std::vector<BoundaryWikidata> rel_wikidata; // parallel to data.collected_relations
             std::unordered_set<int64_t> wanted_label_nodes; // node IDs referenced as role=label
             {
                 // What each reader thread collects, joined after: one shared
                 // lock held across the vectors' growth queued every thread.
                 struct Collected {
                     std::vector<CollectedRelation> relations;
-                    std::vector<std::string> wikidata;  // parallel to relations
+                    std::vector<BoundaryWikidata> wikidata;  // parallel to relations
                     std::vector<int64_t> label_nodes;
                     std::vector<CollectedPoiRelation> poi_relations;
                     // Relations whose tags make an area kind (RelationKind)
@@ -2212,7 +2590,10 @@ static int run(int argc, char* argv[]) {
                                         }
                                         if (!cr.members.empty()) {
                                             mine.relations.push_back(std::move(cr));
-                                            mine.wikidata.emplace_back(); // already has override, no wikidata needed
+                                            // find_linked_place's wikidata step runs for a place area too.
+                                            const char* wikidata = rel.tag("wikidata");
+                                            mine.wikidata.push_back(wikidata ? BoundaryWikidata{wikidata, lower_name(rel.tag("name"))}
+                                                                             : BoundaryWikidata{});
                                             if (label_node_id >= 0) mine.label_nodes.push_back(label_node_id);
                                         }
                                     }
@@ -2272,6 +2653,7 @@ static int run(int argc, char* argv[]) {
                         cr.country_code = std::move(country_code);
                         cr.is_postal = is_postal;
                         cr.fallback_place_type = static_cast<uint8_t>(po);
+                        cr.place_tag_type = static_cast<uint8_t>(classify_place_override(nullptr, place_tag_on_admin));
 
                         for (size_t mi = 0; mi < rel.members.size(); mi++) {
                             if (rel.members[mi].type == 'w') {
@@ -2288,9 +2670,9 @@ static int run(int argc, char* argv[]) {
                             // lets Tokyo (place=province + wikidata=Q1490) link
                             // to its place=city admin_centre node and drop out
                             // of the address hierarchy after Suginami wins.
-                            std::string wd_str = wikidata_tag ? wikidata_tag : "";
                             mine.relations.push_back(std::move(cr));
-                            mine.wikidata.push_back(std::move(wd_str));
+                            mine.wikidata.push_back(wikidata_tag ? BoundaryWikidata{wikidata_tag, lower_name(name)}
+                                                                 : BoundaryWikidata{});
                             if (label_node_id >= 0) mine.label_nodes.push_back(label_node_id);
                         }
                     }
@@ -2518,6 +2900,12 @@ static int run(int argc, char* argv[]) {
 
             std::cerr << "  Pass 2: processing nodes with " << num_threads << " threads..." << std::endl;
             std::unordered_map<int64_t, uint8_t> label_node_to_place_type; // node_id → PlaceType
+            // label_node_to_place_type's value for a node of a place type the
+            // builder keeps none of whose rank_address lies outside 4 to 25 in
+            // every country (address-levels.json): locality, farm, square,
+            // island and the others but municipality, croft, subdivision,
+            // allotments and civil_parish.
+            constexpr uint8_t kLabelOfNoAddressRank = 254;
             // The place nodes of each QID, so a boundary of the QID links
             // the ones it covers and hides them like Nominatim's
             // linked_place_id does.
@@ -2547,6 +2935,7 @@ static int run(int argc, char* argv[]) {
                     // Place node data
                     std::vector<PlaceNode> place_nodes;
                     std::vector<int64_t> place_osm_node_ids; // parallel to place_nodes; strategy-2 stable identity
+                    std::vector<uint32_t> place_qids;        // parallel to place_nodes; wikidata_q_number
                     std::vector<uint32_t> place_names;
                     std::vector<std::pair<std::string, WikidataPlace>> place_wikidata; // (wikidata_id, node)
                 };
@@ -2742,6 +3131,7 @@ static int run(int argc, char* argv[]) {
                                 pn.place_type = static_cast<uint8_t>(settlement_pt);
                                 tl_node_data->place_nodes.push_back(pn);
                                 tl_node_data->place_osm_node_ids.push_back(id);
+                                tl_node_data->place_qids.push_back(wikidata_q_number(n_wikidata));
                                 tl_node_data->place_names.push_back(tl_node_data->strings.add(place_name));
                             }
 
@@ -2773,16 +3163,23 @@ static int run(int argc, char* argv[]) {
                             // admin_level=6 → county mapping instead
                             // of picking up rank_address=18 (borough).
                             //
-                            // Skip label-role members: nominatim's
-                            // find_linked_place claims a place node
-                            // via label role first, so wikidata
-                            // linking only considers non-label nodes.
-                            if (n_wikidata && !is_label_member && label_pt != PlaceType::UNKNOWN) {
+                            // Label-role members too: find_linked_place
+                            // claims a place node via label role first,
+                            // and link_wikidata_places passes over the
+                            // nodes of those label claims, but a boundary
+                            // of rank 0 links nothing by its label.
+                            if (n_wikidata && label_pt != PlaceType::UNKNOWN) {
                                 tl_node_data->place_wikidata.push_back(
-                                    {n_wikidata, WikidataPlace{id, point_e7(lat, lng), static_cast<uint8_t>(label_pt)}});
+                                    {n_wikidata, WikidataPlace{id, point_e7(lat, lng), static_cast<uint8_t>(label_pt),
+                                                               lower_name(n_name)}});
                             }
                             if (is_label_member) {
-                                tl_node_data->label_hits.push_back({id, static_cast<uint8_t>(label_pt)});
+                                uint8_t hit = static_cast<uint8_t>(label_pt);
+                                if (label_pt == PlaceType::UNKNOWN && std::strcmp(n_place, "municipality") != 0 &&
+                                    std::strcmp(n_place, "croft") != 0 && std::strcmp(n_place, "subdivision") != 0 &&
+                                    std::strcmp(n_place, "allotments") != 0 && std::strcmp(n_place, "civil_parish") != 0)
+                                    hit = kLabelOfNoAddressRank;
+                                tl_node_data->label_hits.push_back({id, hit});
                             }
                         }
                     }
@@ -2877,6 +3274,7 @@ static int run(int argc, char* argv[]) {
                 const auto place_at = local_offsets(ntld, [](const auto& l) { return l.place_nodes.size(); });
                 const size_t place_base = grow_by(data.place_nodes, place_at.back());
                 const size_t place_osm_base = grow_by(data.place_osm_ids, place_at.back());
+                grow_by(data.place_qids, place_at.back());
                 parallel_for_parts(place_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
                     const auto& local = ntld[k];
                     for (size_t j = begin; j < end; j++, at++) {
@@ -2888,20 +3286,15 @@ static int run(int argc, char* argv[]) {
                         int64_t place_node_id = j < local.place_osm_node_ids.size() ? local.place_osm_node_ids[j] : 0;
                         data.place_osm_ids[place_osm_base + at] =
                             pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, place_node_id);
+                        data.place_qids[place_osm_base + at] = local.place_qids[j];
                     }
                 });
-                // Build wikidata → place type map for admin boundary linking.
-                // Deterministic conflict resolution: when two place nodes share
-                // a wikidata id but carry different place types, plain
-                // last-write-wins picks the value from whichever thread-local
-                // batch happened to be processed last — and work-stealing makes
-                // that order non-deterministic, so the admin's
-                // place_type_override (and thus admin_polygons.bin) varied
-                // between same-PBF builds, cascading a spurious admin id_remap
-                // into way_parents / admin_entries. Keep the smallest PlaceType,
-                // which is order-independent.
+                // Build wikidata → place nodes map for admin boundary linking.
+                // A QID's nodes come in thread order, which work stealing
+                // varies between same-PBF builds: link_wikidata_places orders
+                // a boundary's by name and node id, never by this order.
                 for (auto& local : ntld) {
-                    for (auto& [wd, place] : local.place_wikidata) wikidata_places[wd].push_back(place);
+                    for (auto& [wd, place] : local.place_wikidata) wikidata_places[wd].push_back(std::move(place));
                     local.place_wikidata.clear();
                 }
                 // Build label-node → place type map (Nominatim's primary link
@@ -2989,8 +3382,9 @@ static int run(int argc, char* argv[]) {
                         uint8_t admin_level;
                         std::string country_code;
                         uint8_t fallback_place_type;  // from own place tag, used last
-                        std::string wikidata; // for place linking
+                        BoundaryWikidata wikidata; // for place linking
                         int64_t way_id;       // source closed-way id (strategy-2 stable identity)
+                        uint8_t place_tag_type = 0;  // of its place tag alone (boundary_place_tags)
                     };
                     std::vector<ClosedWayAdmin> closed_way_admins;
                     // POI way data
@@ -3220,6 +3614,9 @@ static int run(int argc, char* argv[]) {
 
                     // Closed way admin boundaries
                     const char* boundary = t.boundary;
+                    auto way_wikidata = [&] {
+                        return t.wikidata ? BoundaryWikidata{t.wikidata, lower_name(t.name)} : BoundaryWikidata{};
+                    };
                     if (boundary) {
                         bool is_admin = (std::strcmp(boundary, "administrative") == 0);
                         bool is_place_boundary = (std::strcmp(boundary, "place") == 0);
@@ -3237,8 +3634,8 @@ static int run(int argc, char* argv[]) {
                                         std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
                                         std::string cc; if (al == 2) { const char* iso = t.iso; if (iso) cc = iso; }
                                         uint8_t fallback = static_cast<uint8_t>(classify_place_override(t.linked_place, t.place));
-                                        std::string wd_str = t.wikidata ? t.wikidata : "";
-                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), fallback, std::move(wd_str), way_id});
+                                        const uint8_t place_tag = static_cast<uint8_t>(classify_place_override(nullptr, t.place));
+                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), fallback, way_wikidata(), way_id, place_tag});
                                     }
                                 }
                             }
@@ -3250,8 +3647,7 @@ static int run(int argc, char* argv[]) {
                                 AdminPlaceType pt = classify_place_override(nullptr, t.place);
                                 if (is_address_place_type(pt) && all_valid && resolved_locs.size() >= 3) {
                                     std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
-                                    std::string wd_str = t.wikidata ? t.wikidata : "";
-                                    local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), std::move(wd_str), way_id});
+                                    local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), way_wikidata(), way_id});
                                 }
                             }
                         }
@@ -3282,14 +3678,13 @@ static int run(int argc, char* argv[]) {
                                   || pt == AdminPlaceType::BOROUGH);
                         if (want && all_valid && resolved_locs.size() >= 3) {
                             std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
-                            std::string wd_str = t.wikidata ? t.wikidata : "";
                             local.closed_way_admins.push_back({
                                 std::move(verts),
                                 std::string(t_best_name),
                                 uint8_t(15),
                                 std::string(),
                                 static_cast<uint8_t>(pt),
-                                std::move(wd_str),
+                                way_wikidata(),
                                 way_id});
                         }
                     }
@@ -3562,48 +3957,32 @@ static int run(int argc, char* argv[]) {
                 // --- Merge closed-way admin polygons ---
                 {
                     uint64_t closed_way_admin_count = 0;
-                    size_t cwa_wikidata_linked = 0;
                     for (auto& local : tld) {
                         for (auto& cwa : local.closed_way_admins) {
-                            // wikidata step first (Nominatim priority), then
-                            // fall back to the way's own place tag.
-                            uint8_t pto = 0;
-                            if (!cwa.wikidata.empty()) {
-                                auto it = wikidata_places.find(cwa.wikidata);
-                                if (it != wikidata_places.end()) {
-                                    std::vector<int64_t> covered;
-                                    const uint8_t pt = covered_wikidata_places(it->second, [&](PackedLocation at) {
-                                        return exact_ring_contains(cwa.vertices.data(), static_cast<uint32_t>(cwa.vertices.size()), at);
-                                    }, covered);
-                                    pto = covered.empty() ? 0 : place_type_to_admin_override(pt);
-                                    if (pto != 0) {
-                                        cwa_wikidata_linked++;
-                                        for (int64_t nid : covered)
-                                            data.place_claims.push_back(
-                                                {pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, nid),
-                                                 way_boundary_id(cwa.way_id), false});
-                                    }
-                                }
+                            // The wikidata step's candidates, which
+                            // link_wikidata_places links first (Nominatim
+                            // priority); meanwhile the way's own place tag.
+                            if (!cwa.wikidata.id.empty()) {
+                                auto it = wikidata_places.find(cwa.wikidata.id);
+                                if (it != wikidata_places.end())
+                                    add_wikidata_candidates(it->second, [&](PackedLocation at) {
+                                        return exact_ring_covers(cwa.vertices.data(), static_cast<uint32_t>(cwa.vertices.size()), at);
+                                    }, way_boundary_id(cwa.way_id), cwa.wikidata.name, data.wikidata_candidates);
                             }
-                            if (pto == 0) pto = cwa.fallback_place_type;
+                            const uint32_t qid = wikidata_q_number(cwa.wikidata.id.c_str());
+                            if (cwa.admin_level <= 10 && qid != 0) data.boundary_wikidata.push_back({way_boundary_id(cwa.way_id), qid});
+                            if (cwa.admin_level >= 8 && cwa.admin_level <= 10 && cwa.place_tag_type != 0)
+                                data.boundary_place_tags.push_back({way_boundary_id(cwa.way_id), cwa.place_tag_type});
                             const char* cc = cwa.country_code.empty() ? nullptr : cwa.country_code.c_str();
                             add_admin_polygon(data, cwa.vertices, cwa.name.c_str(),
-                                              cwa.admin_level, cc, pto,
+                                              cwa.admin_level, cc, cwa.fallback_place_type,
                                               cwa.way_id);
-                            // A place area keeps its own place tag beside the linked node's type.
-                            if (cwa.admin_level == 15 && pto != cwa.fallback_place_type)
-                                data.admin_polygons.back().own_place_type = cwa.fallback_place_type;
                             closed_way_admin_count++;
                         }
                         local.closed_way_admins.clear();
                     }
-                    if (closed_way_admin_count > 0) {
-                        std::cerr << "  Added " << closed_way_admin_count
-                                  << " admin polygons from closed ways";
-                        if (cwa_wikidata_linked > 0)
-                            std::cerr << " (" << cwa_wikidata_linked << " wikidata-linked)";
-                        std::cerr << "." << std::endl;
-                    }
+                    if (closed_way_admin_count > 0)
+                        std::cerr << "  Added " << closed_way_admin_count << " admin polygons from closed ways." << std::endl;
                 }
 
                 log_phase("    Pass 2b: way merge", _st, _sc);
@@ -3651,7 +4030,7 @@ static int run(int argc, char* argv[]) {
                         [&](size_t i) { return member_coords(data.collected_relations[i]); }, num_threads);
                     std::atomic<size_t> rel_idx{0};
                     std::atomic<uint64_t> assembled_count{0};
-                    std::atomic<uint64_t> wikidata_linked_count{0};
+                    std::atomic<uint64_t> label_linked_count{0};
                     // How the rings nested (logged), and where that disagrees
                     // with the member roles.
                     struct RingNesting {
@@ -3774,11 +4153,13 @@ static int run(int argc, char* argv[]) {
                                 // priority order (placex_triggers.sql):
                                 //   1. label role (member with role=label, class=place)
                                 //   2. wikidata (place node with matching wikidata, inside
-                                //      the boundary, not already linked elsewhere)
+                                //      the boundary, not already linked elsewhere), its
+                                //      candidates linked by link_wikidata_places
                                 //   3. place type (boundary's own place=X tag with a
-                                //      matching-name place node — approximated here by
-                                //      the boundary's own place tag as a last resort)
-                                //   4. name match (not implemented)
+                                //      matching-name place node of that type) and
+                                //   4. name match, both in link_places_by_name; the
+                                //      boundary's own place tag stands meanwhile, the
+                                //      last resort where neither links a node
                                 // An authoritative label-role match stops us falling
                                 // through — even if the label is a non-settlement
                                 // (state/province/country) Nominatim inherits its
@@ -3789,34 +4170,37 @@ static int run(int argc, char* argv[]) {
                                     auto it = label_node_to_place_type.find(rel.label_node_id);
                                     if (it != label_node_to_place_type.end()) {
                                         label_checked = true;
-                                        if (it->second != static_cast<uint8_t>(PlaceType::UNKNOWN)) {
+                                        // The label step links any place node.
+                                        std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
+                                        data.linking_boundaries.push_back(relation_boundary_id(rel.id));
+                                        if (it->second == kLabelOfNoAddressRank) {
+                                            data.unranked_label_boundaries.push_back(relation_boundary_id(rel.id));
+                                        } else if (it->second != static_cast<uint8_t>(PlaceType::UNKNOWN)) {
                                             pto = place_type_to_admin_override(it->second);
-                                            if (pto != 0) wikidata_linked_count.fetch_add(1);
+                                            if (pto != 0) label_linked_count.fetch_add(1);
                                             // The boundary claims this node
                                             // (Nominatim linked_place_id) —
                                             // hide it from results.
-                                            std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
                                             data.place_claims.push_back(
                                                 {pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, rel.label_node_id),
                                                  relation_boundary_id(rel.id), true});
                                         }
                                     }
                                 }
-                                if (pto == 0 && !label_checked && !rel_wikidata[i].empty()) {
-                                    auto it = wikidata_places.find(rel_wikidata[i]);
+                                // The wikidata step's candidates, which
+                                // link_wikidata_places links once every
+                                // boundary's are in.
+                                if (pto == 0 && !label_checked && !rel_wikidata[i].id.empty()) {
+                                    auto it = wikidata_places.find(rel_wikidata[i].id);
                                     if (it != wikidata_places.end()) {
-                                        std::vector<int64_t> covered;
-                                        const uint8_t pt = covered_wikidata_places(it->second, [&](PackedLocation at) {
-                                            return polygons_hold(polygons, at);
-                                        }, covered);
-                                        pto = covered.empty() ? 0 : place_type_to_admin_override(pt);
-                                        if (pto != 0) {
-                                            wikidata_linked_count.fetch_add(1);
+                                        std::vector<WikidataCandidate> found;
+                                        add_wikidata_candidates(it->second, [&](PackedLocation at) {
+                                            return exact_polygons_cover(polygons, at);
+                                        }, relation_boundary_id(rel.id), rel_wikidata[i].name, found);
+                                        if (!found.empty()) {
                                             std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
-                                            for (int64_t nid : covered)
-                                                data.place_claims.push_back(
-                                                    {pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, nid),
-                                                     relation_boundary_id(rel.id), false});
+                                            data.wikidata_candidates.insert(data.wikidata_candidates.end(), found.begin(),
+                                                                            found.end());
                                         }
                                     }
                                 }
@@ -3874,9 +4258,16 @@ static int run(int argc, char* argv[]) {
                               << " touching over " << MAX_TOUCHING_LOCATIONS << " times, " << nesting.crossing
                               << " crossing; " << nesting.re_paired
                               << " with rings crossing at shared nodes re-paired by turn order" << std::endl;
-                    if (wikidata_linked_count > 0) {
-                        std::cerr << "  Wikidata place linking: " << wikidata_linked_count
+                    if (label_linked_count > 0) {
+                        std::cerr << "  Label place linking: " << label_linked_count
                                   << " admin relations linked to place types." << std::endl;
+                    }
+                    for (size_t i = 0; i < rel_wikidata.size(); i++) {
+                        const CollectedRelation& rel = data.collected_relations[i];
+                        const uint32_t qid = wikidata_q_number(rel_wikidata[i].id.c_str());
+                        if (rel.admin_level <= 10 && qid != 0) data.boundary_wikidata.push_back({relation_boundary_id(rel.id), qid});
+                        if (rel.admin_level >= 8 && rel.admin_level <= 10 && rel.place_tag_type != 0)
+                            data.boundary_place_tags.push_back({relation_boundary_id(rel.id), rel.place_tag_type});
                     }
                     rel_wikidata.clear();
                     rel_wikidata.shrink_to_fit();
@@ -4174,6 +4565,40 @@ static int run(int argc, char* argv[]) {
             }
         }
 
+        // find_linked_place's wikidata step, the boundaries in the order
+        // Nominatim indexes them, once every input's are in; before anything
+        // reads the place types it gives them. A boundary's rank_address is
+        // its level's or own place tag's in its country, where one of rank 0
+        // links nothing, by its label member either: its label claim goes
+        // here, the one decision of which boundaries link.
+        {
+            const size_t candidates = data.wikidata_candidates.size();
+            std::vector<uint32_t> turn_polygons;
+            {
+                const auto boundaries = boundary_polygons(data.admin_polygons, data.admin_osm_ids);
+                for (const WikidataCandidate& c : data.wikidata_candidates) {
+                    const uint32_t p = boundary_polygon(boundaries, c.boundary);
+                    if (p != NO_DATA) turn_polygons.push_back(p);
+                }
+                for (const PlaceClaim& c : data.place_claims) {
+                    const uint32_t p = c.label ? boundary_polygon(boundaries, c.boundary) : NO_DATA;
+                    if (p != NO_DATA) turn_polygons.push_back(p);
+                }
+            }
+            const auto countries = countries_before_cells(data, std::move(turn_polygons), num_threads);
+            const auto rank = [&](uint32_t p, const AdminPolygon& poly) {
+                const auto it = std::lower_bound(countries.begin(), countries.end(), std::make_pair(p, uint16_t(0)));
+                const uint16_t cc = it != countries.end() && it->first == p ? it->second : 0;
+                return polygon_rank_address(cc, poly.admin_level, own_place_tag(poly));
+            };
+            const size_t linked = link_wikidata_places(std::move(data.wikidata_candidates), data.admin_polygons,
+                                                       data.admin_osm_ids, data.place_claims, rank);
+            std::vector<WikidataCandidate>().swap(data.wikidata_candidates);
+            for (const PlaceClaim& c : data.place_claims) data.linking_boundaries.push_back(c.boundary);
+            std::cerr << "find_linked_place wikidata: " << linked << " boundaries linked a place node of their wikidata ("
+                      << candidates << " candidates)" << std::endl;
+        }
+
         // The way geometries ring assembly read, a hash node per way, take
         // one core a second to free. Then the parse threads' freed buffers
         // sit in free chunks of their malloc arenas, between live chunks,
@@ -4287,11 +4712,14 @@ static int run(int argc, char* argv[]) {
         log_phase("Admin polygon order", _pt, _cpu);
 
         link_places_by_name(data, cfg, _pt, _cpu);
+        std::vector<uint32_t>().swap(data.place_qids);
 
         // TIGER and GeoNames write only the string pool, interpolations and
-        // postcode centroids, none of which the parent chains read, so they
-        // load alongside them. The GeoNames file is read meanwhile; its rows
-        // go in after TIGER's, as they always have.
+        // postcode centroids, none of which the admin parent chain reads, so
+        // they load alongside it. The streets' pass reads the postal areas'
+        // postcodes from the pool, which interning grows and moves, so it
+        // waits for them. The GeoNames file is read meanwhile; its rows go in
+        // after TIGER's, as they always have.
         std::future<ExternalPostcodes> external_postcodes;
         if (!external_postcodes_path.empty())
             external_postcodes = std::async(std::launch::async, read_external_postcodes, external_postcodes_path);
@@ -4307,10 +4735,14 @@ static int run(int argc, char* argv[]) {
         });
 
         compute_admin_parent_chain(data, num_threads);
-
-        compute_way_parent_polygons(data, num_threads);
+        {
+            const size_t repeated = take_out_repeated_boundaries(data, num_threads);
+            std::cerr << "Boundaries repeating their parent: " << repeated << std::endl;
+        }
 
         std::future<void> tiger_freed = external_data.get();
+        compute_way_parent_polygons(data, num_threads);
+        timed_phase("    Addr: house postcodes", [&] { normalise_addr_postcodes(data, num_threads); });
         arenas_trimmed.get();
 #ifdef __GLIBC__
         std::cerr << "Trimmed malloc arenas: " << rss_before_trim << " -> "

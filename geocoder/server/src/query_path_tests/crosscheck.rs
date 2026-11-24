@@ -261,6 +261,24 @@ fn a_larger_boundary_of_the_level_that_holds_the_house_is_a_row_of_its_rank() {
 }
 
 #[test]
+fn a_boundary_that_repeats_its_parent_is_no_row_of_any_rank() {
+    // The level 9 Town of Greenburgh repeats the level 8 Greenburgh (the same wikidata and
+    // geometry, BOUNDARY_REPEATS_PARENT): is_same ranks it 0, so it is no area of getNearFeatures'
+    // (placex_triggers.sql:915-932, :1273) and the street has no row of it. A house whose
+    // addr:city names it keeps Greenburgh.
+    let places = |index: &mut TestIndex| {
+        index
+            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Town of Greenburgh", 9, BOUNDARY_REPEATS_PARENT, (-3000.0, -3000.0, 3000.0, 3000.0));
+    };
+    for city in [None, Some("Town of Greenburgh")] {
+        let (display, address) = answer_at(&main_street(city, places), 10.0, 0.0);
+        assert_eq!(display, "4 Main Street, Greenburgh, United States", "{city:?}");
+        assert_eq!(address["city"], "Greenburgh", "{city:?}");
+    }
+}
+
+#[test]
 fn a_boundary_the_street_runs_into_is_a_row_of_its_rank() {
     // Saw Mill River Road runs east from Greenburgh into Elmsford, a boundary of the same level;
     // house 9 is in Greenburgh, 100 m from the line. Nominatim's street has a row of rank 16 for

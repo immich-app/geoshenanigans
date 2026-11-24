@@ -25,6 +25,15 @@ from concurrent.futures import ThreadPoolExecutor
 
 AXES = ("mode", "quality", "poi_tier")
 
+# Prints the CPUs the nightly's tools size their threads by.
+CPU_BUDGET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpu_budget.sh")
+
+
+def cpu_budget():
+    """The CPUs the builds share (cpu_budget.sh): those this process may run on, or fewer under its cgroup's CPU
+    quota."""
+    return int(subprocess.run([CPU_BUDGET], check=True, capture_output=True, text=True).stdout)
+
 
 def substitute(path, sel):
     for key, value in sel.items():
@@ -120,12 +129,12 @@ def main():
     args.add_argument("out")
     args.add_argument("binary")
     args.add_argument("--threads", type=int, default=4)
-    args.add_argument("--jobs", type=int, default=0, help="builds at once (default: cores / threads)")
+    args.add_argument("--jobs", type=int, default=0, help="builds at once (default: the CPU budget / threads)")
     opts = args.parse_args()
     with open(os.path.join(opts.out, "configurations.json")) as f:
         cfg = json.load(f)
     selections = selections_of(opts.out, cfg)
-    workers = opts.jobs or max(1, (os.cpu_count() or 1) // opts.threads)
+    workers = opts.jobs or max(1, cpu_budget() // opts.threads)
     scratch = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"search-indexes-{os.getpid()}")
     print(f"Building {len(selections)} place search indexes, {workers} at once...", flush=True)
     try:
