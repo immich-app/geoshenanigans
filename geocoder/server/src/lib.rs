@@ -3885,8 +3885,13 @@ impl Index {
     /// The rank_address of `poly`, a row of an address that is none of the address's ranked
     /// polygons `areas`: that of the polygon of `areas` of its level (and of its place types, for
     /// a place area), else its own before any lift, its level's in `country` or a place area's
-    /// (place_area_ranks).
+    /// (place_area_ranks). A boundary that repeats its parent and links a place node ranks as
+    /// promote_nested_ranks ranks it: its node's rank, above 3 and below 26, else 0.
     fn area_row_rank(&self, poly: &AdminPolygon, areas: &[RankedPoly], country: &str) -> u8 {
+        if poly.admin_level != 15 && poly.own_place_type == BOUNDARY_REPEATS_PARENT {
+            let linked = place_type_to_rank(poly.place_type_override, country);
+            return if (4..26).contains(&linked) { linked } else { 0 };
+        }
         let kin = |r: &&RankedPoly| r.poly.admin_level == poly.admin_level
             && (poly.admin_level != 15 || (r.poly.place_type_override, r.poly.own_place_type) == (poly.place_type_override, poly.own_place_type));
         match areas.iter().find(kin) {
@@ -3968,10 +3973,12 @@ pub fn boundary_key(poly: &AdminPolygon) -> u64 {
 }
 
 /// Whether `poly` is a polygon find_admin_in ranks: a boundary of a level below 12 but a postal
-/// area's, of a country at level 2, or a place area with a place type; of an area.
+/// area's, of a country at level 2, or a place area with a place type; of an area. A boundary
+/// that repeats its parent and links no place node is none (BOUNDARY_REPEATS_PARENT).
 pub fn is_address_area(poly: &AdminPolygon) -> bool {
     poly.area > 0.0 && match poly.admin_level {
         15 => poly.place_type_override != 0,
+        _ if poly.place_type_override == BOUNDARY_REPEATS_PARENT => false,
         2 => poly.country_code != 0,
         level => level < 12 && level != POSTCODE_AREA_LEVEL,
     }
