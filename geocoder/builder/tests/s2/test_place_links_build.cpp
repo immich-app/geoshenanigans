@@ -867,14 +867,21 @@ TEST(a_house_whose_own_postcode_the_sanitizer_rejects_still_makes_a_centroid_of_
     // update_postcodes sums the houses' tags by the postcode PostcodeFormatter makes of them, of the
     // default .* in a country without a pattern (_PostcodeCollector.add), whatever the
     // clean-postcodes sanitizer, of the default [A-Z0-9- ]{3,12}, keeps for the house. Montserrat
-    // has no pattern: a house tagged 12.A keeps no postcode of its own, takes get_nearest_postcode's
-    // at itself (placex_update), and the centroid of 12.A its tag makes names it.
+    // has no pattern: a house tagged 12.A keeps no postcode of its own and takes
+    // get_nearest_postcode's at itself (placex_update), that of the centroid of MSR 1110 500 m west
+    // rather than the one of 12.A, 1 km east, that its tag and its neighbour's make, which names a
+    // point by it.
     Fixture f;
     f.country(16.6, -62.3, 16.9, -62.1, "Montserrat", "MS");
     f.node(16.75, -62.2, {{"addr:postcode", "12.A"}, {"addr:housenumber", "1"}, {"addr:street", "Old Road"}});
-    const std::vector<std::string> answers = answers_of(f, "centroid-of-a-rejected-tag", {{16.75, -62.2}});
-    REQUIRE(answers.size() == 1);
-    CHECK(names(answers[0], "postcode", "12.A"));
+    f.node(16.75, -62.18, {{"addr:postcode", "12.A"}, {"addr:housenumber", "2"}, {"addr:street", "Old Road"}});
+    f.node(16.75, -62.205, {{"addr:postcode", "MSR 1110"}, {"addr:housenumber", "3"}, {"addr:street", "Old Road"}});
+    const std::vector<std::string> answers =
+        answers_of(f, "centroid-of-a-rejected-tag", {{16.75, -62.2}, {16.758, -62.19}});
+    REQUIRE(answers.size() == 2);
+    CHECK(names(answers[0], "postcode", "MSR 1110"));
+    CHECK(answers[0].find("12.A") == std::string::npos);
+    CHECK(names(answers[1], "postcode", "12.A"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 
