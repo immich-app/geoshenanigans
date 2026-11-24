@@ -77,11 +77,12 @@ void compute_admin_parent_chain(ParsedData& data, unsigned int num_threads);
 // relation of a rank above 0 in its country whose closest boundary relation
 // round it, of a lower admin level above 3 and a rank above 0, not itself
 // taken out, has its wikidata (data.boundary_wikidata) and its rings (the
-// same vertices, from any one on, either way round: ST_Equals) is in no
-// address, its rank 0. One that links a place node (data.linking_boundaries)
-// takes the node's rank back (:1161) and stays. Every ring of one taken out
-// is marked BOUNDARY_REPEATS_PARENT. The closest is the first of the parent
-// chain (admin_parent_ids, from the boundary's largest ring) that is such a
+// same outline, from any vertex on, either way round, whatever vertices
+// either adds along its straight edges: ST_Equals) is in no address, its
+// rank 0. One that links a place node (data.linking_boundaries) takes the
+// node's rank back (:1161) and stays. Every ring of one taken out is marked
+// BOUNDARY_REPEATS_PARENT. The closest is the first of the parent chain
+// (admin_parent_ids, from the boundary's largest ring) that is such a
 // relation. Returns how many boundaries it takes out.
 size_t take_out_repeated_boundaries(ParsedData& data, unsigned int num_threads);
 

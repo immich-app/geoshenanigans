@@ -157,12 +157,10 @@ double centroid_distance(PackedLocation p, const LatLng& centroid) {
     return dlat * dlat + dlng * dlng;
 }
 
-// Whether the closed rings a (an vertices) and b (bn) are one ring: the same
-// vertices from the first of their smallest on, either way round.
-bool same_ring(const PackedLocation* a, uint32_t an, const PackedLocation* b, uint32_t bn) {
-    if (an != bn || an == 0) return false;
-    const uint32_t m = an > 1 && a[0] == a[an - 1] ? an - 1 : an;
-    if (m != (bn > 1 && b[0] == b[bn - 1] ? bn - 1 : bn)) return false;
+// Whether the cycles a and b of m vertices each are one: the same vertices
+// from the first of their smallest on, either way round.
+bool same_cycle(const PackedLocation* a, const PackedLocation* b, uint32_t m) {
+    if (m == 0) return false;
     auto smallest = [m](const PackedLocation* v) {
         uint32_t s = 0;
         for (uint32_t k = 1; k < m; k++)
@@ -177,6 +175,54 @@ bool same_ring(const PackedLocation* a, uint32_t an, const PackedLocation* b, ui
         backward = backward && v == b[(sb + m - k) % m];
     }
     return forward || backward;
+}
+
+// Whether b lies on the segment from a to c, past a and before c: a vertex
+// there adds no point to an outline (exact, in e7 integers).
+bool straight_between(const PackedLocation& a, const PackedLocation& b, const PackedLocation& c) {
+    const __int128 ux = int64_t(b.lon_e7) - a.lon_e7, uy = int64_t(b.lat_e7) - a.lat_e7;
+    const __int128 vx = int64_t(c.lon_e7) - b.lon_e7, vy = int64_t(c.lat_e7) - b.lat_e7;
+    return ux * vy == uy * vx && ux * vx + uy * vy > 0;
+}
+
+// The outline of the closed ring v (n vertices) as a cycle, into `out`: its
+// vertices without the closing one, one of each run of equal ones, and none
+// that lies straight between the vertices either side of it.
+void ring_outline(const PackedLocation* v, uint32_t n, std::vector<PackedLocation>& out) {
+    out.clear();
+    const uint32_t m = n > 1 && v[0] == v[n - 1] ? n - 1 : n;
+    for (uint32_t k = 0; k < m; k++) {
+        if (!out.empty() && out.back() == v[k]) continue;
+        while (out.size() >= 2 && straight_between(out[out.size() - 2], out.back(), v[k])) out.pop_back();
+        out.push_back(v[k]);
+    }
+    // Round the end, where the cycle closes.
+    for (bool changed = true; changed;) {
+        changed = false;
+        if (out.size() >= 2 && out.back() == out.front()) {
+            out.pop_back();
+            changed = true;
+        } else if (out.size() >= 3 && straight_between(out[out.size() - 2], out.back(), out.front())) {
+            out.pop_back();
+            changed = true;
+        } else if (out.size() >= 3 && straight_between(out.back(), out.front(), out[1])) {
+            out.erase(out.begin());
+            changed = true;
+        }
+    }
+}
+
+// Whether the closed rings a (an vertices) and b (bn) are one ring, as
+// ST_Equals takes them: the same outline, from any vertex on, either way
+// round, whatever vertices either adds along its straight edges.
+bool same_ring(const PackedLocation* a, uint32_t an, const PackedLocation* b, uint32_t bn) {
+    if (an == 0 || bn == 0) return false;
+    if (an == bn && same_cycle(a, b, an > 1 && a[0] == a[an - 1] ? an - 1 : an)) return true;
+    thread_local std::vector<PackedLocation> outline_a, outline_b;
+    ring_outline(a, an, outline_a);
+    ring_outline(b, bn, outline_b);
+    return outline_a.size() == outline_b.size() &&
+           same_cycle(outline_a.data(), outline_b.data(), static_cast<uint32_t>(outline_a.size()));
 }
 
 // Whether polygons p and q of the exact rings are one: their outer rings

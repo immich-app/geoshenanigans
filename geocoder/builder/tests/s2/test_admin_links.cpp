@@ -4,8 +4,8 @@
 // postcode at its middle and a POI none of another country, and the
 // candidates don't depend on how a ring is written down. A street's postal
 // area covers its middle, its edges included, and has a postcode the server
-// takes. A boundary that repeats its parent and links no place node is in no
-// address.
+// takes. A boundary that repeats its parent, the same outline whatever
+// vertices lie along its edges, and links no place node is in no address.
 #include "admin_links.h"
 
 #include <algorithm>
@@ -377,6 +377,39 @@ TEST(a_boundary_relation_repeating_its_closest_parent_relation_is_taken_out) {
         CHECK_EQ(a.data.admin_polygons[k + 1].place_type_override, want);
         if (a.data.admin_polygons[k + 1].place_type_override != want) std::printf("    boundary %zu\n", k);
     }
+}
+
+TEST(a_boundary_repeats_a_parent_whose_outline_has_more_vertices_along_its_edges) {
+    // ST_Equals compares the outlines: a vertex along a straight edge, or two in a row, adds no
+    // point. A level 10 boundary with one on its south edge and two on its east edge, and a hole
+    // with one more, repeats its level 8 parent; one with a vertex an e7 step off the edge
+    // does not.
+    const uint16_t pl = pack_country_code('P', 'L');
+    Admins a;
+    a.add(2, box(0, 0, 1, 1), {}, "Polska", pl);
+    a.data.admin_osm_ids.back() = admin_ring_id(2, 0);
+    auto relation = [&](uint8_t level, const Ring& ring, const std::vector<Ring>& holes, int64_t id) {
+        const uint32_t pid = a.add(level, ring, holes);
+        a.data.admin_osm_ids[pid] = admin_ring_id(id, 0);
+        a.data.boundary_wikidata.push_back({relation_boundary_id(id), id < 20 ? 1u : 2u});
+        return pid;
+    };
+    relation(4, box(0.1, 0.1, 0.9, 0.9), {}, 4);
+    const Ring hole = reversed(box(0.24, 0.24, 0.26, 0.26));
+    relation(8, box(0.2, 0.2, 0.3, 0.3), {hole}, 8);
+    const Ring more = closed({at(0.2, 0.2), at(0.2, 0.25), at(0.2, 0.3), at(0.24, 0.3), at(0.27, 0.3), at(0.3, 0.3),
+                              at(0.3, 0.2)});
+    const Ring hole_more = closed({at(0.24, 0.24), at(0.26, 0.24), at(0.26, 0.26), at(0.25, 0.26), at(0.24, 0.26)});
+    const uint32_t repeats = relation(10, more, {hole_more}, 10);
+    relation(8, box(0.5, 0.2, 0.6, 0.3), {}, 28);
+    const Ring off = closed({at(0.5, 0.2), PackedLocation{at(0.5, 0.25).lat_e7 + 1, at(0.5, 0.25).lon_e7}, at(0.5, 0.3),
+                             at(0.6, 0.3), at(0.6, 0.2)});
+    const uint32_t differs = relation(10, off, {}, 30);
+    a.map();
+    compute_admin_parent_chain(a.data, 1);
+    CHECK_EQ(take_out_repeated_boundaries(a.data, 1), 1u);
+    CHECK_EQ(a.data.admin_polygons[repeats].place_type_override, BOUNDARY_REPEATS_PARENT);
+    CHECK_EQ(a.data.admin_polygons[differs].place_type_override, 0);
 }
 
 TEST(every_ring_of_a_boundary_that_repeats_its_parent_is_taken_out_and_only_of_equal_rings) {
