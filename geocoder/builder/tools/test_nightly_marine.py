@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -26,7 +27,7 @@ out=""; url=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out=$2; shift 2 ;;
-    --connect-timeout|--max-time|--retry|--retry-delay) shift 2 ;;
+    --connect-timeout|--max-time|--retry|--retry-delay|--retry-max-time) shift 2 ;;
     -*) shift ;;
     *) url=$1; shift ;;
   esac
@@ -268,6 +269,26 @@ class NightlyTest(unittest.TestCase):
         self.assertNotEqual(run.returncode, 0)
         self.assertIn("::error::[marine]", run.stdout)
         self.assertEqual(output, "")
+
+    # A bucket that stalls costs curl its --max-time an attempt, and curl retries a timeout: the fetch with its
+    # retries must end while the step has time left, as a step past its timeout is cancelled, and the watchdog
+    # retries no cancelled step. curl starts no retry once --retry-max-time (0: none) has passed, so its last
+    # attempt starts by then and a delay, and runs at most its --max-time; without it every retry may.
+    def test_the_fetch_with_its_retries_ends_before_the_step_times_out(self):
+        block = marine_block()
+        self.assertIsNotNone(block)
+        call = re.search(r"^if ! curl ((?:.*\\\n)*.*)", block, re.M)
+        args = shlex.split(call.group(1).replace("\\\n", " "))
+        limits = {a: int(v) for a, v in zip(args, args[1:])
+                  if a in ("--max-time", "--retry", "--retry-delay", "--retry-max-time")}
+        attempt, retries, delay = limits["--max-time"], limits.get("--retry", 0), limits.get("--retry-delay", 0)
+        longest = (retries + 1) * attempt + retries * delay
+        if retries and limits.get("--retry-max-time"):
+            longest = min(longest, limits["--retry-max-time"] + delay + attempt)
+        download = script(read(NIGHTLY), "Download PBF and previous indexes")
+        step_seconds = int(re.search(r"^STEP_SECONDS=(\d+)$", download, re.M).group(1))
+        # The 2 minutes the step leaves after the day's diff, for the waits and the decompression after it.
+        self.assertLessEqual(longest, step_seconds - 120, limits)
 
     def test_no_pin_builds_without_marine_areas(self):
         self.pin(None)
