@@ -18,7 +18,7 @@ RUN cargo build --release --locked --manifest-path search/Cargo.toml --features 
 # when this image is built (its /build/geodata: GeoNames' cities500.txt,
 # admin1CodesASCII.txt, admin2Codes.txt and countryInfo.txt, Natural Earth's
 # countries and geodata-date.txt), and which release that is
-FROM ghcr.io/immich-app/immich-server:release AS immich
+FROM ghcr.io/immich-app/immich-server:release@sha256:fc880c1bf665b4aab1e74c15e56ab871225989cd546536e6b77e771869af06bd AS immich
 RUN printf 'version=%s\ncommit=%s\n' "$IMMICH_SOURCE_REF" "$IMMICH_SOURCE_COMMIT" > /immich-release.txt
 
 # Runtime
