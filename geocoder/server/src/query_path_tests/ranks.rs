@@ -168,3 +168,39 @@ fn a_boundary_that_repeats_its_parent_gates_and_promotes_no_place_node() {
     assert_eq!(address["town"], "Newtown");
     assert_eq!(address["county"], "Some County");
 }
+
+#[test]
+fn every_boundary_of_a_level_round_the_smallest_holding_the_point_ranks() {
+    // Brussels centre (50.85045, 4.34878): Nominatim takes every boundary of a rank above 0
+    // covering the point (getNearFeatures, placex_triggers.sql:1273), one row a rank. The level 9
+    // boundary repeating the city ranks 0, so Bruxelles - Brussel (admin_level 10, 18 in Belgium)
+    // round Quays Quarter (10, place=neighbourhood, 24) has the city (8, linked to the city node,
+    // 16) for its parent, keeps 18 and is the city_district.
+    let index = TestIndex::in_country(b"BE")
+        .boundary("Brussels-Capital", 4, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Brussels", 8, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Brussels", 9, BOUNDARY_REPEATS_PARENT, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Bruxelles - Brussel", 10, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+        .boundary("Quays Quarter", 10, 5, (-500.0, -500.0, 500.0, 500.0))
+        .load();
+    let address = address_at(&index, 0.0, 0.0);
+    assert_eq!(address["city"], "Brussels");
+    assert_eq!(address["city_district"], "Bruxelles - Brussel");
+    assert_eq!(address["neighbourhood"], "Quays Quarter");
+}
+
+#[test]
+fn a_larger_boundary_of_the_level_beside_the_smallest_holding_the_point_takes_no_rank() {
+    // Simplified neighbours overlap along their shared border: at a point in the overlap the
+    // larger level 10 boundary, a suburb, holds the point but not the smaller one, a
+    // neighbourhood, round which it would be a row of its own.
+    let index = TestIndex::new()
+        .boundary("Town", 8, 0, (-10_000.0, -10_000.0, 10_000.0, 10_000.0))
+        .boundary("West End", 10, 5, (-1000.0, -2000.0, 1000.0, 20.0))
+        .boundary("Eastfield", 10, 4, (-1500.0, -20.0, 1500.0, 3000.0))
+        .load();
+    let address = address_at(&index, 0.0, 0.0);
+    assert_eq!(address["neighbourhood"], "West End");
+    assert_eq!(address.get("suburb"), None);
+    assert_eq!(address["city"], "Town");
+}

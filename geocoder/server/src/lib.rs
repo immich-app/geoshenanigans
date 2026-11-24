@@ -2039,12 +2039,14 @@ impl Index {
         // For each admin level, the smallest-area polygon holding the point, the first in
         // visiting order among equals (`ScanPip::holds`: an entry flagged interior holds it
         // without a test). Owned AdminPolygon values so the backing admin_polygons file can be a
-        // chunked source. Nominatim ranks every boundary holding the point; a larger one of a
-        // level is left out here, as it would rank wrong where the boundary below it is one
-        // Nominatim takes out for repeating its parent (the same wikidata and geometry,
-        // placex_triggers.sql:895-899, which the polygons don't carry): Brussels' level 10
-        // boundary would rank 20 under Bruxelles - Brussel and name the suburb the Pentagon names.
+        // chunked source. Nominatim ranks every boundary of a rank above 0 covering the point
+        // (getNearFeatures, placex_triggers.sql:1273): of levels 3 to 10 every larger one holding
+        // the point that the smallest lies within ranks too (`round_smallest`), Bruxelles -
+        // Brussel round Quays Quarter. One beside the smallest is left out, as the simplified
+        // presets' neighbours overlap along their shared borders, and of level 2 the smallest
+        // alone names the country.
         let mut best_by_level: [Option<AdminPolygon>; 12] = [None; 12];
+        let mut round_smallest: Vec<AdminPolygon> = Vec::new();
         // Class='place' polygons (admin_level=15 marker) that cover the query point. These
         // drive the second-nested-check rule (placex_triggers.sql lines 944-963) — Nominatim
         // uses only these, not admin boundaries with linked_place tags. Kept apart from
@@ -2078,17 +2080,26 @@ impl Index {
             boundaries.push((level as u64) << 56 | (poly.area.to_bits() as u64) << 24 | (place - 1));
         });
         // Each level's polygons from the smallest up: the first to hold the point is the level's
-        // best, and the larger ones, which take the longest to test, are never read. Every postal
-        // area holding the point is a candidate for its postcode.
+        // best. The larger ones of levels 3 to 10 are tested too, as find_current_boundaries
+        // tests them on the same scan; those of level 2 are never read. Every postal area
+        // holding the point is a candidate for its postcode.
         boundaries.sort_unstable();
+        let within = |poly: &AdminPolygon, other: &AdminPolygon| self.admin_geometry.polygon_within(poly, other);
         let mut postal_areas: Vec<AdminPolygon> = Vec::new();
         for key in boundaries {
             let level = (key >> 56) as usize;
-            if best_by_level[level].is_none() || level == POSTCODE_AREA_LEVEL as usize {
-                let (id, poly) = scan.rings[(key & 0xff_ffff) as usize];
-                if scan.pip.holds(self, id, &poly) {
+            let postal = level == POSTCODE_AREA_LEVEL as usize;
+            let round = (3..=10).contains(&level);
+            if best_by_level[level].is_some() && !postal && !round { continue; }
+            let (id, poly) = scan.rings[(key & 0xff_ffff) as usize];
+            if !scan.pip.holds(self, id, &poly) { continue; }
+            match best_by_level[level] {
+                Some(smallest) if round => {
+                    if within(&smallest, &poly) { round_smallest.push(poly); }
+                }
+                _ => {
                     best_by_level[level].get_or_insert(poly);
-                    if level == POSTCODE_AREA_LEVEL as usize { postal_areas.push(poly); }
+                    if postal { postal_areas.push(poly); }
                 }
             }
         }
@@ -2126,18 +2137,15 @@ impl Index {
         // Collect polygons at this point with their initial rank_address;
         // promote_nested_ranks then gives them their effective one.
         let mut ranked: Vec<RankedPoly> = Vec::new();
-        for level in 0..12 {
-            if let Some(poly) = best_by_level[level] {
-                if poly.admin_level == POSTCODE_AREA_LEVEL { continue; } // handled separately
+        for &poly in best_by_level.iter().flatten().chain(&round_smallest) {
+            if poly.admin_level == POSTCODE_AREA_LEVEL { continue; } // handled separately
 
-                // A boundary its level ranks 0 is in no address, whatever its place type: it
-                // takes neither the admin-nested step nor a place rank (placex_triggers.sql:877,
-                // :1158).
-                let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
-                if initial_rank == 0 { continue; }
+            // A boundary its level ranks 0 is in no address, whatever its place type: it takes
+            // neither the admin-nested step nor a place rank (placex_triggers.sql:877, :1158).
+            let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
+            if initial_rank == 0 { continue; }
 
-                ranked.push(RankedPoly { poly, rank_address: initial_rank });
-            }
+            ranked.push(RankedPoly { poly, rank_address: initial_rank });
         }
 
         // Add class='place' polygons (our admin_level=15 marker) to
@@ -2161,7 +2169,6 @@ impl Index {
             ranked.push(RankedPoly { poly: *poly, rank_address: r });
         }
 
-        let within = |poly: &AdminPolygon, other: &AdminPolygon| self.admin_geometry.polygon_within(poly, other);
         promote_nested_ranks(&mut ranked, place_area_polygons.iter().map(|(_, pa)| pa), &country_code_str, within);
         ranked.retain(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address));
         result.boundary_ranks = rank_bits(&ranked);
@@ -10111,30 +10118,39 @@ mod admin_scan_tests {
     }
 
     #[test]
-    fn a_levels_larger_boundaries_are_not_read_once_a_smaller_one_holds_the_point() {
+    fn a_countrys_larger_polygons_are_not_read_once_a_smaller_one_holds_the_point() {
         let around_q = (21.99, 27.5, 22.05, 27.6);
         let wider = (21.9, 27.4, 22.1, 27.7);
+        // The country and the state found, and the arcs read.
         let arcs_read = |rings: &[Ring]| {
             let idx = admin_index(rings);
             let mut scan = AdminScan::new(&idx, Q.0, Q.1);
-            let state = idx.find_admin_in(&mut scan).state.map(Cow::into_owned);
-            (state, scan.pip.memo.arcs_read())
+            let found = idx.find_admin_in(&mut scan);
+            ((found.country.map(Cow::into_owned), found.state.map(Cow::into_owned)), scan.pip.memo.arcs_read())
         };
         // Listed first, so visited first in a walk down the list.
-        let (state, read) = arcs_read(&[
+        let (found, read) = arcs_read(&[
+            ring("Large", 2, 5.0, wider, &[(0, false)]),
+            ring("Small", 2, 1.0, around_q, &[(0, false)]),
+        ]);
+        assert_eq!(found.0.as_deref(), Some("Small"));
+        assert_eq!((found, read), arcs_read(&[ring("Small", 2, 1.0, around_q, &[(0, false)])]));
+        // A smaller one that misses the point leaves the larger one to be read.
+        let elsewhere = (30.0, 27.5, 30.05, 27.6);
+        let (found, read) = arcs_read(&[
+            ring("Large", 2, 5.0, wider, &[(0, false)]),
+            ring("Small", 2, 1.0, elsewhere, &[(0, false)]),
+        ]);
+        assert_eq!(found.0.as_deref(), Some("Large"));
+        assert!(read > 0);
+        // A larger state is read, as one round the smaller one is in the address too; the
+        // smaller one names the state.
+        let (found, read) = arcs_read(&[
             ring("Large", 4, 5.0, wider, &[(0, false)]),
             ring("Small", 4, 1.0, around_q, &[(0, false)]),
         ]);
-        assert_eq!(state.as_deref(), Some("Small"));
-        assert_eq!((state, read), arcs_read(&[ring("Small", 4, 1.0, around_q, &[(0, false)])]));
-        // A smaller one that misses the point leaves the larger one to be read.
-        let elsewhere = (30.0, 27.5, 30.05, 27.6);
-        let (state, read) = arcs_read(&[
-            ring("Large", 4, 5.0, wider, &[(0, false)]),
-            ring("Small", 4, 1.0, elsewhere, &[(0, false)]),
-        ]);
-        assert_eq!(state.as_deref(), Some("Large"));
-        assert!(read > 0);
+        assert_eq!(found.1.as_deref(), Some("Small"));
+        assert!(read > arcs_read(&[ring("Small", 4, 1.0, around_q, &[(0, false)])]).1);
     }
 
     #[test]

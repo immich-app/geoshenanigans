@@ -12,8 +12,9 @@
 // of its own country, one for a relation, and of a postcode its country's
 // pattern takes, whatever its length, a US ZIP+4 its ZIP, a house, a
 // centroid, a postal area and an external centroid take the postcode their
-// country's pattern makes of their tag, and a place area linked to a place
-// node of another type ranks by its own place tag.
+// country's pattern makes of their tag, a place area linked to a place node
+// of another type ranks by its own place tag, and a boundary round the
+// smallest of its level at the point is in the address as well.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -571,6 +572,32 @@ TEST(a_boundary_that_repeats_its_parent_and_labels_a_locality_is_in_no_address) 
     REQUIRE(answers.size() == 1);
     CHECK(names(answers[0], "neighbourhood", "Nowe Miasto"));
     CHECK(answers[0].find("Stare Miasto") == std::string::npos);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_boundary_round_the_smallest_of_its_level_at_the_point_is_in_the_address) {
+    // Nominatim takes every boundary of a rank above 0 covering the point (getNearFeatures,
+    // placex_triggers.sql:1273), one row a rank. Brussels' city (admin_level 8, Q239) links the
+    // city node and ranks 16; the level 9 boundary along its ways, of its wikidata, repeats it
+    // and ranks 0; Bruxelles - Brussel (10, 18 in Belgium) round Quays Quarter (10,
+    // place=neighbourhood, 24) has the city for its parent, keeps 18 and is the city_district.
+    Fixture f;
+    f.country(49.5, 2.5, 51.5, 6.4, "Belgium", "BE");
+    f.boundary(50.75, 4.2, 50.95, 4.5, 4, "Brussels-Capital");
+    const int64_t city = f.square(50.80, 4.30, 50.90, 4.42);
+    for (int level : {8, 9}) {
+        Tags tags = Fixture::boundary_tags(level, "Brussels");
+        tags.emplace_back("wikidata", "Q239");
+        f.relation(tags, {city});
+    }
+    f.node(50.846, 4.352, {{"place", "city"}, {"name", "Brussels"}, {"wikidata", "Q239"}});
+    f.boundary(50.83, 4.33, 50.87, 4.37, 10, "Bruxelles - Brussel");
+    f.boundary(50.848, 4.345, 50.853, 4.352, 10, "Quays Quarter", {{"place", "neighbourhood"}});
+    const std::vector<std::string> answers = answers_of(f, "round-the-smallest", {{50.8504, 4.3487}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "city", "Brussels"));
+    CHECK(names(answers[0], "city_district", "Bruxelles - Brussel"));
+    CHECK(names(answers[0], "neighbourhood", "Quays Quarter"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 
