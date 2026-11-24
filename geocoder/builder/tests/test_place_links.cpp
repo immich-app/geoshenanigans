@@ -135,27 +135,19 @@ TEST(lowercase_utf8_lowers_each_letter_as_postgres_lower_does) {
 
 TEST(a_label_member_links_whatever_its_value_name_or_link_and_a_boundary_of_rank_0_links_none) {
     // Town Parks' label member, a place=locality node, links it (the node ranks 25); an unnamed
-    // village node is a label member too. A label member another boundary of an earlier runner
-    // links is taken over. Gold Coast City (AU admin_level 6, rank 0) links its label member
-    // nothing (:285).
+    // village node is a label member too. Gold Coast City (AU admin_level 6, rank 0) links its
+    // label member nothing (:285).
     World w("IE");
     w.node(1, PlaceValue::LOCALITY, 53.5, -6.5, "Town Parks");
     const uint32_t parks = w.relation(10, 10, Box{53.4, -6.6, 53.6, -6.4}, {PlaceValue::NONE, "Town Parks", "", 1});
     w.node(2, PlaceValue::VILLAGE, 54.0, -7.0, "");
     const uint32_t parish = w.relation(11, 10, Box{53.9, -7.1, 54.1, -6.9}, {PlaceValue::NONE, "Kilmore", "", 2});
-    w.node(3, PlaceValue::TOWN, 52.0, -8.0, "Mallow", "Q3");
-    const uint32_t county = w.relation(12, 6, Box{51.5, -8.5, 52.5, -7.5}, {PlaceValue::NONE, "Cork", "Q3"});
-    const uint32_t district = w.relation(13, 8, Box{51.9, -8.1, 52.1, -7.9}, {PlaceValue::NONE, "Mallow District", "", 3});
-    const LinkStats stats = w.link();
+    w.link();
     CHECK(w.link_of(parks).step == LinkStep::LABEL);
     CHECK_EQ(w.link_of(parks).rank, uint8_t(25));
     CHECK(w.label(parks) == AdminPlaceType::NONE);
     CHECK(w.link_of(parish).step == LinkStep::LABEL);
     CHECK(w.label(parish) == AdminPlaceType::VILLAGE);
-    CHECK(w.link_of(county).step == LinkStep::WIKIDATA);
-    CHECK(w.link_of(district).step == LinkStep::LABEL);
-    CHECK_EQ(w.claimant(3), w.boundary(district));
-    CHECK_EQ(stats.taken, size_t(1));
 
     World au("AU");
     au.node(1, PlaceValue::CITY, -28.0, 153.43, "Gold Coast");
@@ -163,6 +155,32 @@ TEST(a_label_member_links_whatever_its_value_name_or_link_and_a_boundary_of_rank
     au.link();
     CHECK(au.link_of(gold_coast).step == LinkStep::NONE);
     CHECK_EQ(au.claimant(1), uint64_t(0));
+}
+
+TEST(a_label_member_is_left_to_its_relation_by_every_other_step) {
+    // Den Haag (R192736, NL admin_level 8, 14) shares its wikidata (Q36600) with the city node, the
+    // label member of the level 10 relation of its outline (R192737), a later runner. On a fresh
+    // import the level 8 one would link the node first and the level 10 one take it over by its
+    // label (:291-312, which reads no link); the public server, which indexes each polygon again
+    // after its import, finds the node linked then. So the level 8 one links nothing, by its
+    // wikidata or by name, and keeps its 14; so does Grad Sarajevo (R2567380, BA level 6),
+    // whose wikidata node is Sarajevo's label member (level 9). A label member of a relation of
+    // rank 0, which links nothing, is any step's.
+    World w("NL");
+    w.node(1, PlaceValue::CITY, 52.08, 4.31, "Den Haag", "Q36600");
+    const Box city{52.0, 4.2, 52.15, 4.4};
+    const uint32_t gemeente = w.relation(192736, 8, city, {PlaceValue::NONE, "Den Haag", "Q36600"});
+    const uint32_t woonplaats = w.relation(192737, 10, city, {PlaceValue::NONE, "Den Haag", "Q36600", 1});
+    w.node(2, PlaceValue::TOWN, 52.5, 4.6, "Velsen", "Q9");
+    const uint32_t velsen = w.relation(3, 8, Box{52.4, 4.5, 52.6, 4.7}, {PlaceValue::NONE, "Velsen", "Q9"});
+    w.relation(4, 9, Box{52.45, 4.55, 52.55, 4.65}, {PlaceValue::NONE, "Velsen-Zuid", "", 2});
+    const LinkStats stats = w.link();
+    CHECK(w.link_of(gemeente).step == LinkStep::NONE);
+    CHECK(w.link_of(woonplaats).step == LinkStep::LABEL);
+    CHECK_EQ(w.claimant(1), w.boundary(woonplaats));
+    // NL admin_level 9 ranks 0: Velsen-Zuid links nothing, and Velsen links the town node.
+    CHECK(w.link_of(velsen).step == LinkStep::WIKIDATA);
+    CHECK_EQ(stats.taken, size_t(0));
 }
 
 TEST(a_wikidata_link_takes_one_covered_unlinked_node_its_namesake_first) {

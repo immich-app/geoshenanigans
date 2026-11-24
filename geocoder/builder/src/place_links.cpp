@@ -249,10 +249,26 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
         return oa.id < ob.id;
     });
 
+    auto label_of = [&](const AdminObject& o) -> uint32_t {
+        if (!o.relation || !o.tags || o.tags->label < 0) return NO_DATA;
+        const auto it = std::lower_bound(nodes.begin(), nodes.end(), o.tags->label,
+                                         [](const LinkCandidate& c, int64_t id) { return c.node < id; });
+        return it != nodes.end() && it->node == o.tags->label ? static_cast<uint32_t>(it - nodes.begin()) : NO_DATA;
+    };
+    // The nodes a relation links as its label member: the public server's index, which takes
+    // every polygon again after its import, holds each with its label relation (a label link
+    // reads no other link, :291-312), so no other polygon finds one of them unlinked, whichever
+    // runner it is in.
+    std::vector<char> label_held(nodes.size(), 0);
+    for (uint32_t k : order)
+        if (const uint32_t i = label_of(objects[k]); i != NO_DATA) label_held[i] = 1;
+
     std::vector<uint32_t> claimant(nodes.size(), NO_DATA);  // by node, the object of the last link
     std::vector<PlaceLink> links(objects.size());
     std::atomic<size_t> covers_tests{0};
-    auto unlinked = [&](uint32_t i) { return claimant[i] == NO_DATA && ranks[i].search < kStreetSearchRank; };
+    auto unlinked = [&](uint32_t i) {
+        return claimant[i] == NO_DATA && !label_held[i] && ranks[i].search < kStreetSearchRank;
+    };
     auto same_or_no_wikidata = [&](uint32_t i, const AdminObject& o) {
         return nodes[i].wikidata == LinkText::kNone || !o.wikidata() || text.at(nodes[i].wikidata) == *o.wikidata();
     };
@@ -268,12 +284,7 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
         auto search = [&]() {
             const AdminTags* tags = o.tags;
             // 1. A relation's label member.
-            if (o.relation && tags && tags->label >= 0) {
-                const auto it = std::lower_bound(nodes.begin(), nodes.end(), tags->label,
-                                                 [](const LinkCandidate& c, int64_t id) { return c.node < id; });
-                if (it != nodes.end() && it->node == tags->label)
-                    return done(LinkStep::LABEL, static_cast<uint32_t>(it - nodes.begin()));
-            }
+            if (const uint32_t i = label_of(o); i != NO_DATA) return done(LinkStep::LABEL, i);
             const std::string_view name = tags ? std::string_view(tags->name) : std::string_view();
             // 2. Its wikidata's nodes: unnamed ones first (a null sorts first in Nominatim's
             //    descending order), then those of its name, then the others.

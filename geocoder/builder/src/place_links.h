@@ -28,6 +28,14 @@
 // Ties between nodes go to the lower osm id. A polygon's name is its name
 // tag, lower-cased; a value outside address-levels.json's (PlaceValue's
 // OTHER) links no node by step 3.
+//
+// A node that a relation links as its label member is linked to no other
+// polygon by steps 2 to 4, whichever runner it is in. On a fresh import a
+// polygon of an earlier runner would link it, and the label relation take it
+// over; the public server indexes each polygon again after its import, and
+// finds the node linked then: Den Haag's level 8 boundary, whose wikidata
+// node is the label member of its level 10 one, links nothing and keeps its
+// 14.
 #pragma once
 
 #include <cstddef>
