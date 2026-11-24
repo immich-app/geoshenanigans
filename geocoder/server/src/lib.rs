@@ -2158,13 +2158,22 @@ impl Index {
     /// needs no distance, and has 0. A polygon of the field and the outline of one before it in
     /// `ranked` is none of the walk's: a boundary repeating its parent's wikidata and geometry,
     /// which Nominatim takes out of addresses (placex_triggers.sql:895-899), Bruxelles - Brussel
-    /// under Brussels.
+    /// under Brussels. Nor is, at a rank of two or more areas, one a street `feature` does not run
+    /// through (runs_through), as getNearFeatures takes none such for a street, where another of
+    /// the rank is one it runs through.
     fn area_walk(&self, ranked: &[RankedPoly], feature: PlaceFeature<'_>, country: &str) -> Vec<(usize, bool, f64)> {
         let repeats = |k: usize| {
             let (field, area) = (polygon_field(&ranked[k]), ranked[k].poly.area);
             field.is_some() && ranked[..k].iter().any(|r| polygon_field(r) == field && r.poly.area == area)
         };
-        let kept: Vec<usize> = (0..ranked.len()).filter(|&k| !repeats(k)).collect();
+        let mut kept: Vec<usize> = (0..ranked.len()).filter(|&k| !repeats(k)).collect();
+        if let PlaceFeature::Line(line) = feature {
+            let rank = |k: usize| ranked[k].rank_address;
+            let shared: Vec<usize> = kept.iter().copied().filter(|&k| kept.iter().filter(|&&j| rank(j) == rank(k)).count() > 1).collect();
+            let rows: Vec<bool> = shared.iter().map(|&k| self.runs_through(&ranked[k].poly, line)).collect();
+            let rank_has_row = |r: u8| shared.iter().zip(&rows).any(|(&k, &row)| row && rank(k) == r);
+            kept.retain(|&k| shared.iter().position(|&j| j == k).is_none_or(|i| rows[i] || !rank_has_row(rank(k))));
+        }
         let candidates: Vec<(u8, AdminPolygon)> = kept.iter().map(|&k| (ranked[k].rank_address, ranked[k].poly)).collect();
         let mut distances = vec![0.0; candidates.len()];
         let key = |c: usize| {
@@ -2175,6 +2184,14 @@ impl Index {
         let geometry = &self.admin_geometry;
         let walked = CurrentBoundaries::accepted(&candidates, key, |poly, current| geometry.point_on_surface_in(poly, current));
         walked.into_iter().map(|(c, accepted)| (kept[c], accepted, distances[c])).collect()
+    }
+
+    /// Whether the street `line` runs through the area `poly` along a stretch, as getNearFeatures
+    /// takes an area for a street (line_runs_through); never for an area without rings.
+    fn runs_through(&self, poly: &AdminPolygon, line: &[NodeCoord]) -> bool {
+        let geometry = &self.admin_geometry;
+        geometry.has_rings(poly)
+            && line_runs_through(line, &geometry.rings(poly), |lat, lng| geometry.contains_once(poly, AdminPoint::new(lat, lng)))
     }
 
     /// The rank_search of the area `poly` in `country` (compute_place_rank): a boundary's is its
@@ -3569,11 +3586,7 @@ impl Index {
             if !ADDRESS_AREA_RANKS.contains(&rank) { continue; }
             let row = match feature {
                 PlaceFeature::Point(..) => scan.pip.holds(self, id, &poly),
-                PlaceFeature::Line(line) => {
-                    let geometry = &self.admin_geometry;
-                    geometry.has_rings(&poly)
-                        && line_runs_through(line, &geometry.rings(&poly), |lat, lng| geometry.contains_once(&poly, AdminPoint::new(lat, lng)))
-                }
+                PlaceFeature::Line(line) => self.runs_through(&poly, line),
             };
             if row {
                 polygons.push(RankedPoly { poly, rank_address: rank });

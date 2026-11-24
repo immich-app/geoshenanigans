@@ -383,3 +383,20 @@ fn the_walk_weighs_the_distance_of_a_rank_16_area_by_its_search_rank() {
     assert_eq!(display, "Malone Road, Belfast City District, County Antrim, Northern Ireland, United Kingdom");
     assert_eq!(address["city"], "Belfast City District");
 }
+
+#[test]
+fn an_area_the_street_does_not_run_through_is_no_row_of_a_rank_it_shares() {
+    // Two areas of rank 20 hold the point, 30 m off the street: the boundary Westend, which the
+    // street runs through, and the suburb area Eastend, which ends 10 m short of it.
+    // getNearFeatures takes an area for a street only where the two share a stretch
+    // (partition-functions.sql:39-44), so Eastend is no row of the street, and Westend is the
+    // rank's.
+    let mut index = country("Testland", b"XX");
+    index
+        .boundary("Westend", 10, 0, (-1000.0, -1000.0, 1000.0, 1000.0))
+        .boundary("Eastend", 15, 4, (10.0, -500.0, 1500.0, 1500.0))
+        .street("Border Street", &[(0.0, -200.0), (0.0, 200.0)]);
+    let (display, address) = answer_at(&index.load(), 30.0, 0.0);
+    assert_eq!(display, "Border Street, Westend, Testland");
+    assert_eq!(address["suburb"], "Westend");
+}
