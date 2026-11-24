@@ -212,23 +212,28 @@ struct Timing {
 }
 
 /// Each path called once untimed, warm, then `rounds` rounds of `water` and then `answer`, each
-/// timed.
-fn time_point(rounds: usize, mut water: impl FnMut(), mut answer: impl FnMut()) -> Timing {
+/// timed by `clock` (microseconds since some fixed instant; `since` in a run).
+fn time_point(rounds: usize, clock: impl Fn() -> f64, mut water: impl FnMut(), mut answer: impl FnMut()) -> Timing {
     water();
     answer();
     let (mut w, mut a, mut both) = (Vec::with_capacity(rounds), Vec::with_capacity(rounds), Vec::with_capacity(rounds));
     for _ in 0..rounds {
-        let t = Instant::now();
+        let t = clock();
         water();
-        let tw = t.elapsed().as_secs_f64() * 1e6;
-        let t = Instant::now();
+        let tw = clock() - t;
+        let t = clock();
         answer();
-        let ta = t.elapsed().as_secs_f64() * 1e6;
+        let ta = clock() - t;
         w.push(tw);
         a.push(ta);
         both.push(tw + ta);
     }
     Timing { water: median(w), answer: median(a), together: median(both) }
+}
+
+/// A clock of microseconds since `start`, for time_point.
+fn since(start: Instant) -> impl Fn() -> f64 {
+    move || start.elapsed().as_secs_f64() * 1e6
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -274,6 +279,7 @@ fn main() {
     let args = Args::parse(&std::env::args().collect::<Vec<_>>()).unwrap_or_else(|why| fail(&why));
     let water = Water::load(&args.water);
     let index = baseline(&args.dataset).unwrap_or_else(|why| fail(&why));
+    let start = Instant::now();
 
     // The polygons with the largest ring blocks, by their rings.
     let mut by_bytes: Vec<u32> = (0..water.records.len() as u32).collect();
@@ -336,6 +342,7 @@ fn main() {
             held += usize::from(water.at(lat, lng).is_some());
             timed.push(time_point(
                 args.rounds,
+                since(start),
                 || {
                     std::hint::black_box(water.at(lat, lng));
                 },
@@ -363,7 +370,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     const WATER_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../testdata/water_dir/day3");
 
@@ -439,32 +445,37 @@ mod tests {
         assert_eq!(held, at.iter().map(|&p| (p, 25)).collect::<Vec<_>>());
     }
 
-    // A path whose calls `slow_at` lists (0 the first) take `slow`, the others no time.
-    fn timed_call(slow_at: &'static [usize], slow: Duration) -> impl FnMut() {
+    // A path on the clock `now` (microseconds) whose calls `slow_at` lists (0 the first) move it
+    // on by `slow`, the others by `fast`.
+    fn timed_call<'a>(now: &'a std::cell::Cell<f64>, slow_at: &'static [usize], slow: f64, fast: f64) -> impl FnMut() + 'a {
         let mut n = 0;
         move || {
-            if slow_at.contains(&n) {
-                std::thread::sleep(slow);
-            }
+            now.set(now.get() + if slow_at.contains(&n) { slow } else { fast });
             n += 1;
         }
     }
 
     #[test]
     fn a_points_first_answer_of_each_path_is_untimed() {
-        let slow = Duration::from_millis(50);
-        let t = time_point(1, timed_call(&[0], slow), timed_call(&[0], slow));
-        assert!(t.water < 25_000.0 && t.answer < 25_000.0 && t.together < 25_000.0, "{t:?}");
+        let now = std::cell::Cell::new(0.0);
+        let t = time_point(1, || now.get(), timed_call(&now, &[0], 50_000.0, 0.0), timed_call(&now, &[0], 50_000.0, 0.0));
+        assert_eq!((t.water, t.answer, t.together), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn each_path_is_timed_on_its_own() {
+        let now = std::cell::Cell::new(0.0);
+        let t = time_point(3, || now.get(), timed_call(&now, &[], 0.0, 10.0), timed_call(&now, &[], 0.0, 20.0));
+        assert_eq!((t.water, t.answer, t.together), (10.0, 20.0, 30.0));
     }
 
     #[test]
     fn the_two_together_are_the_median_of_each_rounds_sum() {
-        // Round 1's water lookup and round 2's answer are slow: each path's median is fast, two
-        // rounds of three are slow together.
-        let slow = Duration::from_millis(50);
-        let t = time_point(3, timed_call(&[1], slow), timed_call(&[2], slow));
-        assert!(t.water < 25_000.0 && t.answer < 25_000.0, "{t:?}");
-        assert!(t.together >= 50_000.0, "{t:?}");
+        // The first round's water lookup (30 ms) and the second's answer (50 ms) are slow: each
+        // path's median is 0, and of the rounds' sums (30 ms, 50 ms and 0) the median is 30 ms.
+        let now = std::cell::Cell::new(0.0);
+        let t = time_point(3, || now.get(), timed_call(&now, &[1], 30_000.0, 0.0), timed_call(&now, &[2], 50_000.0, 0.0));
+        assert_eq!((t.water, t.answer, t.together), (0.0, 0.0, 30_000.0));
     }
 
     #[test]
