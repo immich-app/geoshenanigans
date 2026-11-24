@@ -303,16 +303,25 @@ TEST(place_areas_link_after_the_boundaries_by_their_rank) {
 }
 
 TEST(the_links_dont_hang_on_the_thread_count) {
+    // 200 boundaries, 140 of them at admin_level 8, one runner of more rows than a worker takes
+    // at once. 40 of those share a wikidata round one town node, their ids spread over the
+    // runner's last chunks: each finds the node free as the runner starts and links it, and the
+    // last keeps it, however many workers looked.
     World one("DE"), many("DE");
     for (World* w : {&one, &many}) {
-        for (int k = 0; k < 40; k++) {
-            const double s = 50.1 + (k % 8) * 0.2, west = 8.1 + (k / 8) * 0.3;
+        for (int k = 0; k < 160; k++) {
+            const double s = 50.1 + (k % 16) * 0.2, west = 8.1 + (k / 16) * 0.3;
             const std::string name = "Ort " + std::to_string(k % 5);
             w->node(100 + k, k % 2 ? PlaceValue::VILLAGE : PlaceValue::SUBURB, s + 0.02, west + 0.02, name,
                     k % 3 ? "" : "Q" + std::to_string(k % 4));
-            w->relation(10 + k, static_cast<uint8_t>(6 + k % 4), Box{s, west, s + 0.15, west + 0.25},
+            const uint8_t level = k < 100 ? 8 : static_cast<uint8_t>(6 + k % 4);
+            w->relation(10 + k, level, Box{s, west, s + 0.15, west + 0.25},
                         {k % 3 ? PlaceValue::NONE : PlaceValue::SUBURB, name, k % 2 ? "" : "Q" + std::to_string(k % 4)});
         }
+        w->node(1, PlaceValue::TOWN, 49.5, 7.5, "Mitte", "Q77");
+        for (int k = 0; k < 40; k++)
+            w->relation(1000 + 7 * k, 8, Box{49.4 - 0.001 * k, 7.4, 49.6, 7.6 + 0.001 * k},
+                        {PlaceValue::NONE, "Kreis " + std::to_string(k), "Q77"});
     }
     one.link(1);
     many.link(8);
@@ -320,8 +329,18 @@ TEST(the_links_dont_hang_on_the_thread_count) {
     for (size_t k = 0; k < one.data.admin_links.size(); k++) {
         CHECK_EQ(one.data.admin_links[k].boundary, many.data.admin_links[k].boundary);
         CHECK_EQ(one.data.admin_links[k].node, many.data.admin_links[k].node);
+        CHECK(one.data.admin_links[k].step == many.data.admin_links[k].step);
     }
     CHECK(one.data.place_node_links == many.data.place_node_links);
+    REQUIRE(one.data.place_claims.size() == many.data.place_claims.size());
+    for (size_t k = 0; k < one.data.place_claims.size(); k++) {
+        CHECK_EQ(one.data.place_claims[k].node, many.data.place_claims[k].node);
+        CHECK_EQ(one.data.place_claims[k].boundary, many.data.place_claims[k].boundary);
+    }
     for (uint32_t p = 0; p < one.data.admin_polygons.size(); p++) CHECK_EQ(one.label(p), many.label(p));
+    size_t mitte = 0;
+    for (const AdminLink& l : many.data.admin_links) mitte += l.node == 1;
+    CHECK_EQ(mitte, size_t(40));
+    CHECK_EQ(many.claimant(1), admin_boundary_id(admin_ring_id(1000 + 7 * 39, 0)));
     CHECK(!one.data.admin_links.empty());
 }
