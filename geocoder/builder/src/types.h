@@ -73,10 +73,11 @@ enum class AdminPlaceType : uint8_t {
 };
 
 // Nominatim's administrative levels run 2 to 12 (address-levels.json's
-// administrative2 to 12); a closed way is a boundary from level 8
-// (presets.lua admin_boundary).
+// administrative2 to 12); a closed way is a boundary from level 5, its
+// import dropping one of level 4 or less (placex_insert,
+// placex_triggers.sql:687-690).
 constexpr uint8_t kMaxBoundaryLevel = 12;
-constexpr uint8_t kMinBoundaryWayLevel = 8;
+constexpr uint8_t kMinBoundaryWayLevel = 5;
 
 // The admin_level of a postal area's polygon (boundary=postal_code), above
 // the administrative levels and below the place areas' 15.

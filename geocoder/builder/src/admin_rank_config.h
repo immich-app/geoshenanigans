@@ -101,6 +101,15 @@ inline PlaceValue place_value_of(const char* value) {
     return PlaceValue::OTHER;
 }
 
+// The PlaceValue of the place tag of a boundary=administrative relation or
+// way: Nominatim's import keeps it in the boundary's extratags, which rank,
+// link and label it, but for a value beginning "isl" (island, islet), which
+// makes a place row of its own instead (init.lua process_tags:740-745).
+inline PlaceValue boundary_place_value(const char* value) {
+    if (value && std::strncmp(value, "isl", 3) == 0) return PlaceValue::NONE;
+    return place_value_of(value);
+}
+
 // The ranks of a place tag of value `v` in the country `cc` (packed upper
 // case, 0 where unknown): address-levels.json's `place` entries, the
 // country's first (ca, de, es, id, ru, sa), then the defaults, a value of

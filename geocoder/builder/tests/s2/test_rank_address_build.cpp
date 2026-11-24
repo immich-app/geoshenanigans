@@ -245,11 +245,13 @@ TEST(boundaries_inside_a_city_area_nest_under_it) {
     CHECK(displays(answer, "One Tree Hill, River Valley, Central Region, Singapore"));
 }
 
-TEST(levels_11_and_12_are_boundaries_and_closed_ways_below_level_8_place_areas_or_none) {
+TEST(levels_11_and_12_are_boundaries_and_so_are_closed_ways_from_level_5) {
     // Germany: a level 11 and a level 12 relation inside a level 10 one are parts of the address
-    // of a house on a street in them, at 22 and 24. A closed administrative way of level 6 with
-    // place=town is a place area, a town of 16; one of level 6 without a place tag is no polygon
-    // of Nominatim's (an administrative way is a boundary at levels 8 to 12) and names nothing.
+    // of a house on a street in them, at 22 and 24. Nominatim 5.3.0 imports a named closed
+    // administrative way as a boundary, its place tag in its extratags, and drops one of level 4
+    // or less (placex_insert): a level 6 way with place=town is a boundary its tag ranks 16 and
+    // labels town, one of level 6 without a place tag a county of 12, as Iferouane (W1333677402)
+    // is in Niger, and one of level 4 with place=town names nothing.
     Fixture f;
     f.country(47, 6, 55, 15, "Germany", "DE");
     f.boundary(52, 12, 53, 14, 4, "Brandenburg");
@@ -267,14 +269,19 @@ TEST(levels_11_and_12_are_boundaries_and_closed_ways_below_level_8_place_areas_o
     f.square(52.70, 12.50, 52.80, 12.60,
              {{"boundary", "administrative"}, {"admin_level", "6"}, {"place", "town"}, {"name", "Wegstadt"}});
     f.square(52.10, 12.10, 52.30, 12.40, {{"boundary", "administrative"}, {"admin_level", "6"}, {"name", "Kreisweg"}});
+    f.square(52.05, 13.60, 52.30, 13.90,
+             {{"boundary", "administrative"}, {"admin_level", "4"}, {"place", "town"}, {"name", "Landweg"}});
     const std::vector<std::string> answers =
-        answers_of(f, "rank-levels-11-12", {{52.5002, 13.4001}, {52.75, 12.55}, {52.2, 12.2}});
-    REQUIRE(answers.size() == 3);
+        answers_of(f, "rank-levels-11-12", {{52.5002, 13.4001}, {52.75, 12.55}, {52.2, 12.2}, {52.2, 13.7}});
+    REQUIRE(answers.size() == 4);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
     CHECK(answers[0].find("Hauptstraße") != std::string::npos);
     CHECK(answers[0].find("Block Sieben, Ortslage Nord, Ortsteil Mitte, Brandenburg, Germany\"") != std::string::npos);
     CHECK(names(answers[1], "town", "Wegstadt"));
-    CHECK(answers[2].find("Kreisweg") == std::string::npos);
-    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+    CHECK(names(answers[2], "county", "Kreisweg"));
+    CHECK(displays(answers[2], "Kreisweg, Brandenburg, Germany"));
+    CHECK(answers[3].find("Landweg") == std::string::npos);
+    CHECK(displays(answers[3], "Brandenburg, Germany"));
 }
 
 TEST(the_ranks_are_the_same_in_every_dir_and_in_a_chained_build) {

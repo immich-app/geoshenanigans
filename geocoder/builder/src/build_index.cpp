@@ -2059,11 +2059,12 @@ static int run(int argc, char* argv[]) {
                         }
 
                         // place=* tag on boundary=administrative relations (e.g. Tokyo
-                        // has place=province, Suginami has place=city). Nominatim's
-                        // get_label_tag prefers extratags['place'] over the admin_level
-                        // → rank label, so it labels a boundary that links no place
-                        // node, and placex_update ranks one by it. A postal area has
-                        // neither.
+                        // has place=province, Suginami has place=city), which Nominatim's
+                        // import keeps in the boundary's extratags but for an island's
+                        // (boundary_place_value). Its get_label_tag prefers
+                        // extratags['place'] over the admin_level → rank label, so it
+                        // labels a boundary that links no place node, and placex_update
+                        // ranks one by it. A postal area has neither.
                         const char* place_tag_on_admin = is_postal ? nullptr : rel.tag("place");
 
                         CollectedRelation cr;
@@ -2073,7 +2074,7 @@ static int run(int argc, char* argv[]) {
                         cr.name = std::move(name_str);
                         cr.country_code = std::move(country_code);
                         cr.is_postal = is_postal;
-                        cr.own_place_value = static_cast<uint8_t>(place_value_of(place_tag_on_admin));
+                        cr.own_place_value = static_cast<uint8_t>(boundary_place_value(place_tag_on_admin));
                         if (!is_postal) {
                             if (name) cr.name_tag = name;
                             if (const char* wd = rel.tag("wikidata")) cr.wikidata = wd;
@@ -2731,9 +2732,9 @@ static int run(int argc, char* argv[]) {
                         AdminTags tags;           // its name and wikidata tags, for the links
                     };
                     std::vector<ClosedWayAdmin> closed_way_admins;
-                    // Closed administrative ways of levels 2 to 7: kept for their country
-                    // code, made place areas by their place tag, or dropped.
-                    size_t country_ways = 0, place_ways = 0, dropped_ways = 0;
+                    // Closed administrative ways of levels 2 to 4: kept for their country
+                    // code, or dropped.
+                    size_t country_ways = 0, dropped_ways = 0;
                     // POI way data
                     struct PoiWayEntry {
                         PoiRecord record;
@@ -2967,30 +2968,31 @@ static int run(int argc, char* argv[]) {
                         // A boundary=postal_code way is no postcode area:
                         // Nominatim's postcode_area makes one from relations
                         // only (init.lua process_tags).
-                        // Nominatim's import makes a boundary of a closed administrative
-                        // way at levels 8 to 12 only (presets.lua admin_boundary); at
-                        // 2 to 7 only its place tag makes a row, a place area. A level 2
-                        // way with a country code stays for the country alone, which the
-                        // rank pass keeps out of every address.
+                        // Nominatim's import makes a boundary of a named closed
+                        // administrative way of any level, its place tag in its
+                        // extratags (presets.lua MAIN_TAGS.all_boundaries, init.lua
+                        // process_tags), and placex_insert drops one of level 4 or
+                        // less (placex_triggers.sql:687-690): a boundary from level
+                        // kMinBoundaryWayLevel. A level 2 way with a country code stays
+                        // for the country alone, which the rank pass keeps out of every
+                        // address.
                         if (is_admin && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
                             uint8_t al = 0;
                             { const char* ls = t.admin_level; if (ls) al = static_cast<uint8_t>(std::atoi(ls)); }
                             const char* iso = al == 2 ? t.iso : nullptr;
-                            const AdminPlaceType pt = classify_place_override(t.place);
                             uint8_t level = 0;
                             if (al >= kMinBoundaryWayLevel && al <= kMaxBoundaryLevel) level = al;
-                            else if (al >= 2 && iso && iso[0]) level = 2;
-                            else if (al >= 2 && al < kMinBoundaryWayLevel && is_address_place_type(pt)) level = 15;
-                            if (level != 0 && level != 15 && kMaxAdminLevel > 0 && level > kMaxAdminLevel) level = 0;
+                            else if (al == 2 && iso && iso[0]) level = 2;
+                            if (level != 0 && kMaxAdminLevel > 0 && level > kMaxAdminLevel) level = 0;
                             const char* aname = t_best_name;
                             const bool whole = aname && aname[0] && all_valid && resolved_locs.size() >= 3;
-                            if (whole && al >= 2 && al < kMinBoundaryWayLevel)
-                                (level == 2 ? local.country_ways : level == 15 ? local.place_ways : local.dropped_ways)++;
+                            if (whole && al >= 2 && al < kMinBoundaryWayLevel) (level == 2 ? local.country_ways : local.dropped_ways)++;
                             if (level != 0 && whole) {
                                 std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
                                 local.closed_way_admins.push_back({std::move(verts), std::string(aname), level,
                                                                    level == 2 ? std::string(iso) : std::string(), way_id,
-                                                                   static_cast<uint8_t>(place_value_of(t.place)), way_link_tags(t, way_id)});
+                                                                   static_cast<uint8_t>(boundary_place_value(t.place)),
+                                                                   way_link_tags(t, way_id)});
                             }
                         }
                         // Closed way boundary=place (e.g., Washington DC)
@@ -3293,15 +3295,13 @@ static int run(int argc, char* argv[]) {
                 }
                 log_phase("      Way merge: way geometries", _mt, _mc);
 
-                size_t country_ways = 0, place_ways = 0, dropped_ways = 0;
+                size_t country_ways = 0, dropped_ways = 0;
                 for (const auto& local : tld) {
                     country_ways += local.country_ways;
-                    place_ways += local.place_ways;
                     dropped_ways += local.dropped_ways;
                 }
                 std::cerr << "  Named closed administrative ways below level " << int(kMinBoundaryWayLevel) << ": "
-                          << country_ways << " kept for a country code, " << place_ways
-                          << " place areas by their place tag, " << dropped_ways << " left out." << std::endl;
+                          << country_ways << " kept for a country code, " << dropped_ways << " left out." << std::endl;
                 parallel_for_each(tld.size(), [&](size_t k, unsigned) {
                     auto& local = tld[k];
                     auto closed_way_admins = std::move(local.closed_way_admins);
