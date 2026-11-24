@@ -1796,8 +1796,12 @@ impl Index {
         // however many of a level hold the point (Brussels' level 10 boundary round Quays
         // Quarter). One of a rank no street's or house's address takes is never tested. Of the
         // level 2 polygons the smallest with a country code holding the point is the country,
-        // and every postal area holding it is a candidate for its postcode. Owned AdminPolygon
-        // values so the backing admin_polygons file can be a chunked source.
+        // and every postal area holding it is a candidate for its postcode. The country names
+        // the answer's country whatever its rank, as Nominatim's answer names the country of its
+        // country code (_finalize_entry): a closed level 2 way, which the builder keeps for that
+        // alone at rank 0, where no relation of a rank holds the point, else the smallest that
+        // does. Owned AdminPolygon values so the backing admin_polygons file can be a chunked
+        // source.
         let mut place_area_polygons: Vec<(u32, AdminPolygon)> = Vec::new();
         // The boundaries to test, as (level, area, place in the list) in one integer: an area
         // here is positive, so its bits order as it does, and the place orders equals.
@@ -1825,15 +1829,17 @@ impl Index {
             boundaries.push((level as u64) << 56 | (poly.area.to_bits() as u64) << 24 | (place - 1));
         });
         // The level 2 polygons from the smallest up: the first to hold the point is the country,
-        // and the larger ones, which take the longest to test, are never read.
+        // and the larger ones, which take the longest to test, are read only until one of a rank
+        // holds it.
         boundaries.sort_unstable();
         let mut country: Option<AdminPolygon> = None;
+        let mut ranked_country = false;
         let mut postal_areas: Vec<AdminPolygon> = Vec::new();
         let mut ranked: Vec<RankedPoly> = Vec::new();
         let mut seen: Vec<u32> = Vec::new();
         for key in boundaries {
             let level = (key >> 56) as usize;
-            if level == 2 && country.is_some() { continue; }
+            if level == 2 && ranked_country { continue; }
             let (id, poly) = scan.rings[(key & 0xff_ffff) as usize];
             if seen.contains(&(id & ID_MASK)) || !scan.pip.holds(self, id, &poly) { continue; }
             seen.push(id & ID_MASK);
@@ -1841,8 +1847,12 @@ impl Index {
                 postal_areas.push(poly);
                 continue;
             }
-            if level == 2 { country = Some(poly); }
-            if ADDRESS_AREA_RANKS.contains(&poly.rank_address) { ranked.push(RankedPoly::of(poly)); }
+            let address = ADDRESS_AREA_RANKS.contains(&poly.rank_address);
+            if level == 2 {
+                country.get_or_insert(poly);
+                ranked_country = address;
+            }
+            if address { ranked.push(RankedPoly::of(poly)); }
         }
 
         let mut result = AdminResult::default();
@@ -1956,6 +1966,10 @@ impl Index {
                     (c.country_code & 0xFF) as u8,
                 ]);
             }
+        } else if let Some(poly) = country {
+            // A closed country way, in no address: the country row _finalize_entry adds.
+            result.country = Some(self.get_string(poly.name_id));
+            result.country_code = Some(poly.country_code.to_be_bytes());
         }
         result.state          = best_by_field[1].take().map(|c| c.name);
         result.province       = best_by_field[2].take().map(|c| c.name);

@@ -334,6 +334,30 @@ TEST(place_nodes_rank_by_their_type_in_an_extract_without_boundaries) {
     CHECK(names(answers[0], "hamlet", "Aising"));
 }
 
+TEST(a_closed_country_way_names_the_country_and_leaves_the_relation_round_it_its_rank) {
+    // Liechtenstein as a closed administrative way of level 2 with its country code, and no
+    // relation: Nominatim makes no boundary of such a way, but its answer names the country of
+    // the point (get_country_code, _finalize_entry), and so does the server's. Inside Austria's
+    // relation a closed level 2 way of its code is the smallest country polygon round the point,
+    // and the country the answer names is still the relation's.
+    Fixture f;
+    f.square(47.05, 9.47, 47.27, 9.64,
+             {{"boundary", "administrative"}, {"admin_level", "2"}, {"ISO3166-1", "LI"}, {"ISO3166-1:alpha2", "LI"},
+              {"name", "Liechtenstein"}});
+    f.country(46.4, 9.7, 49.0, 17.2, "Österreich", "AT");
+    f.square(47.20, 10.00, 47.30, 10.20,
+             {{"boundary", "administrative"}, {"admin_level", "2"}, {"ISO3166-1", "AT"}, {"ISO3166-1:alpha2", "AT"},
+              {"name", "Austria"}});
+    const std::vector<std::string> answers = answers_of(f, "rank-country-ways", {{47.16, 9.55}, {47.25, 10.10}, {48.2, 16.37}});
+    REQUIRE(answers.size() == 3);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+    CHECK(names(answers[0], "country", "Liechtenstein"));
+    CHECK(answers[0].find("\"country_code\":\"LI\"") != std::string::npos);
+    CHECK(names(answers[1], "country", "Österreich"));
+    CHECK(answers[1].find("\"country_code\":\"AT\"") != std::string::npos);
+    CHECK(names(answers[2], "country", "Österreich"));
+}
+
 TEST(a_place_node_on_a_relations_edge_or_an_e7_step_inside_it_is_promoted) {
     // Hayama (admin_level 7 in Japan: 16) holds the village node of Isshiki on its north edge,
     // and that of Horiuchi one e7 step inside its east edge at 138.9999997°, whose f32 is 139°,
