@@ -79,11 +79,12 @@ constexpr uint64_t HEAP_GROWTH_SLACK = 256 << 10;
 // 2,000,000 moved ways). The codec report lines show which state a run ended
 // in; runs in one state still differ, by up to 470 KB in the streets family,
 // past the slack, so one run at each size in a state can fail it alone. A
-// case at n streams a few rings' worth through each codec: one smaller than
-// a ring never fills it, so its runs never come up in the state a loaded run
-// at 10 n ends in, and the check of the runs as a whole is left comparing
-// the rings (the postcode centroids from 2,000, 40 KB: 0.37 to 0.44 MB at n,
-// 0.70 to 0.89 MB at 100 n with the rings full).
+// case at n streams a few rings' worth through each codec. One smaller than
+// a ring never fills it, so when every loaded run at the larger size ends
+// with its rings full, no state comes up at both sizes and the runs are
+// compared as a whole, rings and all. The postcode centroids once went from
+// 2,000 (40 KB) to 200,000 that way: 0.37 to 0.44 MB at n, 0.70 to 0.89 MB
+// at 100 n with the rings full.
 constexpr int THREADS_HEAP_RUNS = 7;
 constexpr int THREADS_HEAP_MAX_RUNS = 35;
 constexpr size_t THREADS_STATE_RUNS = 2;
@@ -8393,7 +8394,7 @@ TEST(patch_postcode_centroids_come_and_go_and_hold_none) {
 // moves in its cell (a delete and an insert in the merge): the family's
 // codecs hold a block of rows and the cells index's parent record, so the
 // patcher's heap peak at 10 n is its peak at n. From 20,000 centroids, 400 KB
-// of logical rows, which fill the codecs' 128 KiB rings as 10 n's do.
+// of logical rows, so the codecs' 128 KiB rings can fill at both sizes.
 TEST(patch_heap_stays_flat_as_postcode_centroids_grow) {
     CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
         std::vector<postcode_files::LogicalCentroid> rows, moved;
