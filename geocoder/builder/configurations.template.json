@@ -259,6 +259,7 @@
         "{region}/full/strings_postcode.bin"
       ],
       "optional_files": [
+        "{region}/full/addr_cities.bin",
         "{region}/full/interp_postcodes.bin",
         "{region}/full/postcode_centroids.bin",
         "{region}/full/postcode_centroid_cells.bin"

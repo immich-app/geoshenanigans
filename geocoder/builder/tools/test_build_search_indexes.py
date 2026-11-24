@@ -111,6 +111,16 @@ class BuildSearchIndexesTest(unittest.TestCase):
 
         self.assertEqual(self.run_main(), 1)
 
+    def test_a_full_selection_builds_without_the_addresses_cities(self):
+        # The builder writes addr_cities.bin beside a region's address points, so a region
+        # without them has none; the server reads the file where it is.
+        self.write_output(["planet"])
+        cities = os.path.join(self.out, "planet", "full", "addr_cities.bin")
+        if os.path.exists(cities):
+            os.remove(cities)
+
+        self.assertEqual(self.run_main(), 0)
+
 
 def load_template():
     with open(TEMPLATE) as f:

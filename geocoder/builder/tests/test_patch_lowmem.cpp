@@ -1229,6 +1229,7 @@ const std::vector<FamilyFiles> FAMILY_FILES = {
     {"postcodes", {"postcode_centroids.bin", "postcode_centroid_cells.bin"}},
     {"way_parents", {"way_parents.bin"}},
     {"addr_postcodes", {"addr_postcodes.bin"}},
+    {"addr_cities", {"addr_cities.bin"}},
 };
 
 // n place nodes, every fourth the hidden label of a polygon.
@@ -1258,14 +1259,15 @@ std::vector<postcode_files::LogicalCentroid> some_centroids(uint32_t n) {
 
 // A dir of every encoded family: 40 street ways of two nodes in a geo cell,
 // with a parent each; 30 interpolations of three nodes; 60 address points,
-// two in three with a footprint, with a postcode each; 50 POIs, two in three
+// two in three with a footprint, with a postcode each and three in four with
+// a city; 50 POIs, two in three
 // polygons; 20 place nodes; 30 postcode centroids.
 BuildDir every_family(std::mt19937& rng) {
     BuildDir d, meta;
     std::vector<uint32_t> names;
     for (uint32_t w = 0; w < 40; w++) names.push_back(w % 7);
     put_named_ways(d, meta, names);
-    std::vector<char> interps, interp_nodes, parents, postcodes;
+    std::vector<char> interps, interp_nodes, parents, postcodes, cities;
     for (uint32_t i = 0; i < 30; i++) {
         append(interps, InterpWay{3 * i, 3, 0, i % 5, 1 + 2 * i, 21 + 2 * i, 1});
         for (uint32_t k = 0; k < 3; k++) {
@@ -1279,11 +1281,13 @@ BuildDir every_family(std::mt19937& rng) {
     for (uint32_t i = 0; i < 60; i++) {
         addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, i % 3 == 0 ? std::vector<char>{} : block(rng, 1 + rng() % 8)});
         append(postcodes, i / 3 * 8);
+        append(cities, i % 4 == 1 ? NO_DATA : i / 7 * 8);
     }
     put_addrs(d, addrs);
     for (uint32_t w = 0; w < 40; w++) append(parents, w % 9);
     d["way_parents.bin"] = parents;
     d["addr_postcodes.bin"] = postcodes;
+    d["addr_cities.bin"] = cities;
     put_pois(d, pois_of(rng, 50, 0, true));
     put_places(d, some_places(20));
     put_centroids(d, some_centroids(30));
@@ -1382,6 +1386,7 @@ TEST(patch_copies_a_family_both_of_whose_sections_are_unchanged) {
          }},
         {"way-parent", {"way_parents"}, [](BuildDir& d) { put_at(d["way_parents.bin"], 11 * 4, 99u); }},
         {"postcode", {"addr_postcodes"}, [](BuildDir& d) { put_at(d["addr_postcodes.bin"], 11 * 4, 800u); }},
+        {"city", {"addr_cities"}, [](BuildDir& d) { put_at(d["addr_cities.bin"], 13 * 4, 800u); }},
     };
     for (const Day& day : days) {
         BuildDir new_d = base;
@@ -7999,6 +8004,7 @@ TEST(patch_refuses_a_section_sent_as_unchanged_whose_new_size_is_not_its_old_one
         {PatchFileId::POSTCODE_CENTROIDS, postcode_files::LOGICAL_STRIDE * 30, postcode_files::LOGICAL_STRIDE},
         {PatchFileId::WAY_PARENTS, logical("way_parents.bin"), 4},
         {PatchFileId::ADDR_POSTCODES, logical("addr_postcodes.bin"), 4},
+        {PatchFileId::ADDR_CITIES, logical("addr_cities.bin"), 4},
     };
     const std::vector<Section> of_arcs = {{PatchFileId::ARC_INDEX, arcs.at("arc_index.bin").size(), ARC_INDEX_STRIDE}};
     for (const auto& [name, d, sections] : {std::tuple<const char*, const BuildDir&, const std::vector<Section>&>{"families", families, of_families},

@@ -232,6 +232,16 @@ impl PlaceFiles {
         self.hidden_node(id)
     }
 
+    /// Calls `f` with the polygon of each hidden node a polygon claims (PLACE_FLAG_LABEL_OF: the
+    /// boundary that links it) and the node, in row order.
+    pub fn for_each_label(&self, mut f: impl FnMut(u32, PlaceNode)) {
+        for k in 0..self.hidden.as_slice().len() / HIDDEN_ROW_BYTES {
+            if let Some(pn) = self.hidden_node(self.visible + k as u32).filter(|pn| pn._pad1 & PLACE_FLAG_LABEL_OF != 0) {
+                f(pn.parent_poly_id, pn);
+            }
+        }
+    }
+
     /// The hidden node of id `id` (at or past the visible rows); None past the last.
     fn hidden_node(&self, id: u32) -> Option<PlaceNode> {
         let at = (id - self.visible) as usize * HIDDEN_ROW_BYTES;

@@ -195,8 +195,8 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   or one DELETE, and their footprints as the child stream of that merge.
   The string tiers are FCC2 files, front-coded buckets cut by content (`src/string_files.h`);
   the diff decodes each tier it reads into its pool and diffs the pools.
-  The four per-record side files (`way_parents.bin`, `way_postcodes.bin`, `interp_postcodes.bin`,
-  `addr_postcodes.bin`) are side blocks on disk (`src/side_blocks.h`); the diff decodes each into
+  The five per-record side files (`way_parents.bin`, `way_postcodes.bin`, `interp_postcodes.bin`,
+  `addr_postcodes.bin`, `addr_cities.bin`) are side blocks on disk (`src/side_blocks.h`); the diff decodes each into
   its u32 values, and a side file's section carries those: its sizes are 4 bytes a value, and a
   file the old day lacks goes as a full replacement of its values.
   The postcode centroids are the PCC1 files on disk (`src/postcode_files.h`): the centroids in
@@ -594,7 +594,7 @@ after them by marker):
 ```
 Header: "GCPATCH\0" (8) + version=24 (u32) + flags=0 (u32)
   (a v24 patcher accepts only v24 patches; the v8 to v24 changes are marked
-  below; versions 20 to 23 are other branches' formats)
+  below; versions 20, 21 and 23 are other branches' formats)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   + n × {name_len:u16, name, size:u64, inline:u8, [bytes] if inline}
@@ -729,7 +729,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     v14: no kind 1, an admin id the patch remapped; v19: no kind 3, a
     16-byte postcode centroid, whose file merges instead)
   stride=0xFA (v8): parallel delta for a per-record side file (way_parents,
-    way_postcodes, addr_postcodes, interp_postcodes), rebuilt along its
+    way_postcodes, addr_postcodes, interp_postcodes, and from v22
+    addr_cities, after the others), rebuilt along its
     parent's merge: parent_file_id u32, value_stride u32 = 4, remap_kind u32,
     n_inserted u32 + [value u32], n_changes u32 + [(pos u32, value u32)].
     MATCH / REPLACE copy the old value (remapped as the patcher remaps:
@@ -920,6 +921,8 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 9 to 11 its three lists, which the geo entry deltas name. v19 merges the
 postcode centroids under id 23, and ids 24 and 25 name no file: the patcher
 writes the cells file beside the centroids, and the entries file is gone.
+v22 gives id 38 to the address points' `addr:city`, and ids 36 and 37 name
+no file.
 
 | Id | File | How it travels |
 |----|------|----------------|
@@ -950,6 +953,8 @@ writes the cells file beside the centroids, and the entries file is gone.
 | 29-33 | `strings_core.bin` … `strings_poi.bin` | the strings section, of the decoded pools; a tier the old dir lacks, whole (its FCC2 file) |
 | 34 | `interp_postcodes.bin` | parallel delta along interp_ways, remap kind 2 |
 | 35 | `geo_entries.bin` | the geo index's blocks, rebuilt with `geo_cells.bin` (8) |
+| 36, 37 | none (v22) | never: a section naming either is refused ("Unknown file 36") |
+| 38 | `addr_cities.bin` | parallel delta along addr_points, remap kind 2 (v22), after `interp_postcodes.bin`'s |
 
 The four admin geometry files (`ADMIN_SLOT_FAMILIES`) follow the place nodes
 as arc_index, arc_vertices, admin_polygons, admin_rings, ahead of the admin

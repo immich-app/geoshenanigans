@@ -41,7 +41,7 @@ selection_files() {
     fi
     for f in geo_cells.bin geo_entries.bin \
              street_ways.bin street_nodes.bin \
-             addr_points.bin addr_vertices.bin addr_index.bin addr_postcodes.bin \
+             addr_points.bin addr_vertices.bin addr_index.bin addr_postcodes.bin addr_cities.bin \
              interp_ways.bin interp_nodes.bin interp_postcodes.bin \
              admin_cells.bin admin_entries.bin admin_parents.bin \
              place_cells.bin place_hidden.bin place_nodes.bin \
@@ -130,11 +130,12 @@ fetch_unit() {
     return 1
 }
 
-# Files a region may lack (interp_postcodes.bin outside TIGER regions, the
-# postcode centroids): the template's optional files of mode full.
+# Files a region may lack (addr_cities.bin without address points,
+# interp_postcodes.bin outside TIGER regions, the postcode centroids): the
+# template's optional files of mode full.
 optional_file() {
     case "$1" in
-        interp_postcodes.bin|postcode_centroids.bin|postcode_centroid_cells.bin)
+        addr_cities.bin|interp_postcodes.bin|postcode_centroids.bin|postcode_centroid_cells.bin)
             return 0 ;;
     esac
     return 1
@@ -206,10 +207,11 @@ else
     rm -rf "$STAGING"
     mkdir -p "$STAGING"
 
-    # An optional file a region lacks (interp_postcodes.bin outside TIGER
-    # regions, the postcode centroids) is a miss, not an error. A fetch that
-    # failed fails the start before the download replaces anything. The
-    # files a transport unit holds come through it, once.
+    # An optional file a region lacks (addr_cities.bin without address
+    # points, interp_postcodes.bin outside TIGER regions, the postcode
+    # centroids) is a miss, not an error. A fetch that failed fails the
+    # start before the download replaces anything. The files a transport
+    # unit holds come through it, once.
     if ! selection_files | {
         pids=; units=
         while read -r dir f; do

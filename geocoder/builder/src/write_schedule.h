@@ -40,8 +40,8 @@ inline KindValues record_bytes(const ParsedData& d) {
         + vector_bytes(d.way_parent_ids) + vector_bytes(d.way_postcode_ids) + vector_bytes(d.way_orig_name_ids)
         + vector_bytes(d.street_nodes) + vector_bytes(d.sorted_way_cells);
     at(b, RecordKind::Addrs) = vector_bytes(d.addr_points) + vector_bytes(d.addr_osm_ids)
-        + vector_bytes(d.addr_sidecar_blob) + vector_bytes(d.addr_postcode_ids) + vector_bytes(d.addr_vertices)
-        + vector_bytes(d.sorted_addr_cells);
+        + vector_bytes(d.addr_sidecar_blob) + vector_bytes(d.addr_postcode_ids) + vector_bytes(d.addr_city_ids)
+        + vector_bytes(d.addr_vertices) + vector_bytes(d.sorted_addr_cells);
     at(b, RecordKind::Interps) = vector_bytes(d.interp_ways) + vector_bytes(d.interp_osm_ids)
         + vector_bytes(d.interp_sidecar_blob) + vector_bytes(d.interp_postcode_ids) + vector_bytes(d.interp_nodes)
         + vector_bytes(d.sorted_interp_cells);
@@ -180,7 +180,7 @@ inline uint64_t ordering_cost(const ParsedData& d) {
     const uint64_t copies = vector_bytes(d.ways) + vector_bytes(d.street_nodes) + vector_bytes(d.way_osm_ids)
         + vector_bytes(d.way_parent_ids) + vector_bytes(d.way_postcode_ids)
         + vector_bytes(d.addr_points) + vector_bytes(d.addr_vertices) + vector_bytes(d.addr_osm_ids)
-        + vector_bytes(d.addr_postcode_ids)
+        + vector_bytes(d.addr_postcode_ids) + vector_bytes(d.addr_city_ids)
         + vector_bytes(d.poi_records) + vector_bytes(d.poi_vertices) + vector_bytes(d.poi_osm_ids)
         + vector_bytes(d.place_nodes) + vector_bytes(d.place_osm_ids)
         + vector_bytes(d.interp_ways) + vector_bytes(d.interp_nodes) + vector_bytes(d.interp_osm_ids)

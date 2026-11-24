@@ -212,7 +212,7 @@ std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<std::pair
 
 void add_addr_point(ParsedData& data, double lat, double lng,
                     const char* housenumber, const char* street,
-                    const char* postcode,
+                    const char* postcode, const char* city,
                     uint64_t& addr_count_total,
                     uint64_t osm_id_packed,
                     const NodeCoord* polygon_vertices,
@@ -223,7 +223,8 @@ void add_addr_point(ParsedData& data, double lat, double lng,
     uint32_t housenumber_id = data.string_pool.intern(housenumber);
     uint32_t pc_id = (postcode && postcode[0])
         ? data.string_pool.intern(postcode) : NO_DATA;
-    append_addr_point(data, lat, lng, housenumber_id, street_id, pc_id,
+    uint32_t city_id = (city && city[0]) ? data.string_pool.intern(city) : NO_DATA;
+    append_addr_point(data, lat, lng, housenumber_id, street_id, pc_id, city_id,
                       point_to_cell(lat, lng), osm_id_packed,
                       polygon_vertices, polygon_vertex_count);
 
@@ -235,7 +236,7 @@ void add_addr_point(ParsedData& data, double lat, double lng,
 
 void append_addr_point(ParsedData& data, double lat, double lng,
                        uint32_t housenumber_id, uint32_t street_id, uint32_t postcode_id,
-                       S2CellId cell, uint64_t osm_id_packed,
+                       uint32_t city_id, S2CellId cell, uint64_t osm_id_packed,
                        const NodeCoord* polygon_vertices,
                        uint32_t polygon_vertex_count) {
     uint32_t vertex_offset = NO_DATA;
@@ -247,7 +248,7 @@ void append_addr_point(ParsedData& data, double lat, double lng,
             polygon_vertices, polygon_vertices + polygon_vertex_count);
     }
     put_addr_point(data, grow_addr_points(data, 1), static_cast<float>(lat), static_cast<float>(lng),
-                   housenumber_id, street_id, postcode_id, cell.id(), osm_id_packed,
+                   housenumber_id, street_id, postcode_id, city_id, cell.id(), osm_id_packed,
                    vertex_offset, vertex_count);
 }
 

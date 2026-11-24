@@ -815,6 +815,7 @@ static const std::vector<LogicalFamily>& logical_families() {
         {"way_postcodes", {"way_postcodes.bin"}, {"way_postcodes.bin"}, decode_side_file, side_logical_size},
         {"interp_postcodes", {"interp_postcodes.bin"}, {"interp_postcodes.bin"}, decode_side_file, side_logical_size},
         {"addr_postcodes", {"addr_postcodes.bin"}, {"addr_postcodes.bin"}, decode_side_file, side_logical_size},
+        {"addr_cities", {"addr_cities.bin"}, {"addr_cities.bin"}, decode_side_file, side_logical_size},
     };
     return f;
 }

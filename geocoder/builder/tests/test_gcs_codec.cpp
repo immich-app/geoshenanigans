@@ -361,7 +361,7 @@ void write_one_address(const std::string& dir, const std::vector<uint8_t>& blob,
 }
 
 // The families of the four side files, each <family>.bin.
-const char* const SIDE_FAMILIES[] = {"way_parents", "way_postcodes", "interp_postcodes", "addr_postcodes"};
+const char* const SIDE_FAMILIES[] = {"way_parents", "way_postcodes", "interp_postcodes", "addr_postcodes", "addr_cities"};
 
 // n side values in stretches of 100, which cut the blocks of 64 anywhere: one
 // value, a few values in turn with NO_DATA among them (a dictionary), a

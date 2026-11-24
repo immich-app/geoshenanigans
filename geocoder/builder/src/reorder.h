@@ -362,6 +362,7 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t
     regroup_by_cell(order, starts, data.sorted_addr_cells, threads);
     const size_t kept = starts.size();
     const bool have_postcodes = data.addr_postcode_ids.size() == n;
+    const bool have_cities = data.addr_city_ids.size() == n;
     auto sorted_buffer = vector_beside<AddrPoint>(beside ? kept : 0);
 
     // Reorder the vertex buffer alongside addr_points. Duplicates keep
@@ -379,6 +380,7 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t
     parallel_resize(sorted, kept);
     auto osm_buffer = vector_beside<uint64_t>(have_osm && beside ? kept : 0);
     auto postcode_buffer = vector_beside<uint32_t>(have_postcodes && beside ? kept : 0);
+    auto city_buffer = vector_beside<uint32_t>(have_cities && beside ? kept : 0);
     parallel_for(kept, [&](size_t b, size_t e, unsigned) {
         for (size_t k = b; k < e; k++) {
             AddrPoint p = points[order[starts[k]]];
@@ -402,6 +404,8 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t
     if (have_postcodes)
         data.addr_postcode_ids =
             first_set_per_run(data.addr_postcode_ids, order, starts, NO_DATA, threads, postcode_buffer.get());
+    if (have_cities)
+        data.addr_city_ids = first_set_per_run(data.addr_city_ids, order, starts, NO_DATA, threads, city_buffer.get());
     if (kept < n)
         std::cerr << "  Deduped addr_points: " << n << " → " << kept
                   << " (-" << (n - kept) << ")" << std::endl;

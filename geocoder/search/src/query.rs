@@ -388,12 +388,13 @@ impl<'a, 'g> Searcher<'a, 'g> {
     /// Display context of a point: the geocoder's admin lookup (country, state, county).
     pub fn context_at(&self, lat: f32, lng: f32) -> Ctx<'g> {
         let admin = self.idx.geo.find_admin(lat as f64, lng as f64);
+        let field = |label: &str| admin.row(label).map(|row| row.name.clone());
         Ctx {
             cc: admin.country_code.map(|c| [c[0].to_ascii_uppercase(), c[1].to_ascii_uppercase()]).unwrap_or([0, 0]),
-            country: admin.country.unwrap_or_default(),
-            state: admin.state.or(admin.province).unwrap_or_default(),
-            county: admin.county.unwrap_or_default(),
-            district: admin.state_district.or(admin.district).unwrap_or_default(),
+            country: field("country").unwrap_or_default(),
+            state: field("state").or_else(|| field("province")).unwrap_or_default(),
+            county: field("county").unwrap_or_default(),
+            district: field("state_district").or_else(|| field("district")).unwrap_or_default(),
         }
     }
 

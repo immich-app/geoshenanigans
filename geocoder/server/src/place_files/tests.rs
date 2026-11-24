@@ -92,6 +92,24 @@ fn every_node_reads_back_at_its_id_and_every_visible_one_in_its_cell() {
 }
 
 #[test]
+fn each_label_gives_its_polygon_name_and_position_in_row_order() {
+    let mut rng = Rng::new(20261123);
+    for n in [0usize, 1, 200, 3000] {
+        let nodes = random_nodes(&mut rng, n);
+        let (bytes, ids) = encode(&nodes, DEFAULT_ADMIN_CELL_LEVEL);
+        let f = files(&bytes);
+        let mut want: Vec<(u32, u32, u32, u32, u32)> = nodes.iter().zip(&ids)
+            .filter(|(pn, _)| pn._pad1 & PLACE_FLAG_LABEL_OF != 0)
+            .map(|(pn, &id)| (id, pn.parent_poly_id, pn.name_id, pn.lat.to_bits(), pn.lng.to_bits()))
+            .collect();
+        want.sort_unstable();
+        let mut got = Vec::new();
+        f.for_each_label(|polygon, pn| got.push((polygon, pn.name_id, pn.lat.to_bits(), pn.lng.to_bits())));
+        assert_eq!(got, want.iter().map(|&(_, polygon, name, lat, lng)| (polygon, name, lat, lng)).collect::<Vec<_>>(), "{n} nodes");
+    }
+}
+
+#[test]
 fn a_cell_without_nodes_has_no_rows() {
     let nodes = [node(52.37, 4.89, 1, 0), node(52.38, 4.90, 2, 1)];
     let (bytes, _) = encode(&nodes, DEFAULT_ADMIN_CELL_LEVEL);

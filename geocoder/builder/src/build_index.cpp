@@ -2201,6 +2201,8 @@ static int run(int argc, char* argv[]) {
                                     if (r_st) cpr.addr_street = r_st;
                                     const char* r_pc = rel.tag("addr:postcode");
                                     if (r_pc) cpr.addr_postcode = r_pc;
+                                    const char* r_city = rel.tag("addr:city");
+                                    if (r_city) cpr.addr_city = r_city;
                                 }
 
                                 for (size_t mi = 0; mi < rel.members.size(); mi++) {
@@ -2320,6 +2322,7 @@ static int run(int argc, char* argv[]) {
                     std::vector<uint64_t> addr_cells;
                     std::vector<std::pair<uint32_t, uint32_t>> addr_strings; // {hn, street}
                     std::vector<uint32_t> addr_postcodes; // parallel to addr_strings
+                    std::vector<uint32_t> addr_cities; // parallel to addr_strings
                     std::vector<int64_t> addr_osm_node_ids; // parallel to addr_coords; strategy-2 stable identity
                     uint64_t count = 0;
                     uint64_t nodes = 0;
@@ -2365,6 +2368,7 @@ static int run(int argc, char* argv[]) {
                         const char* housenumber = nullptr;
                         const char* street = nullptr;
                         const char* postcode = nullptr;
+                        const char* city = nullptr;
                         const char* n_tourism = nullptr;
                         const char* n_historic = nullptr;
                         const char* n_amenity = nullptr;
@@ -2398,6 +2402,7 @@ static int run(int argc, char* argv[]) {
                                     if (k == "addr:housenumber") housenumber = v;
                                     else if (k == "addr:street") street = v;
                                     else if (k == "addr:postcode") postcode = v;
+                                    else if (k == "addr:city") city = v;
                                     else if (k == "amenity") n_amenity = v;
                                     else if (k == "aeroway") n_aeroway = v;
                                     break;
@@ -2457,6 +2462,7 @@ static int run(int argc, char* argv[]) {
                                 (street && street[0]) ? strs.add(street) : StringDict::kNone});
                             tl_node_data->addr_postcodes.push_back(
                                 (postcode && postcode[0]) ? strs.add(postcode) : StringDict::kNone);
+                            tl_node_data->addr_cities.push_back((city && city[0]) ? strs.add(city) : StringDict::kNone);
                             tl_node_data->addr_osm_node_ids.push_back(id);
                             tl_node_data->count++;
                         }
@@ -2582,6 +2588,7 @@ static int run(int argc, char* argv[]) {
                             emit(local.addr_strings[j].second);
                             emit(local.addr_strings[j].first);
                             emit(local.addr_postcodes[j]);
+                            emit(local.addr_cities[j]);
                         }
                     } else {
                         for (uint32_t code : r < 2 * n_tl ? local.poi_names : local.place_names) emit(code);
@@ -2598,7 +2605,7 @@ static int run(int argc, char* argv[]) {
                         int64_t node_id = j < local.addr_osm_node_ids.size() ? local.addr_osm_node_ids[j] : 0;
                         put_addr_point(data, addr_base + at, local.addr_coords[j].lat, local.addr_coords[j].lng,
                                        ids(local.addr_strings[j].first), ids(local.addr_strings[j].second),
-                                       ids(local.addr_postcodes[j]), local.addr_cells[j],
+                                       ids(local.addr_postcodes[j]), ids(local.addr_cities[j]), local.addr_cells[j],
                                        pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, node_id));
                     }
                 });
@@ -2699,6 +2706,7 @@ static int run(int argc, char* argv[]) {
                     std::vector<uint32_t> way_orig_names;   // way original name (always name tag)
                     std::vector<std::pair<uint32_t, uint32_t>> addr_strings; // building addr {hn, street}
                     std::vector<uint32_t> addr_postcodes; // parallel to addr_strings
+                    std::vector<uint32_t> addr_cities;    // parallel to addr_strings
                     std::vector<uint32_t> interp_strings;   // interp street name strings
                     uint64_t way_count = 0;
                     uint64_t building_addr_count = 0;
@@ -2825,6 +2833,7 @@ static int run(int argc, char* argv[]) {
                                 (street && street[0]) ? local.strings.add(street) : StringDict::kNone});
                             local.addr_postcodes.push_back(
                                 (t.postcode && t.postcode[0]) ? local.strings.add(t.postcode) : StringDict::kNone);
+                            local.addr_cities.push_back((t.city && t.city[0]) ? local.strings.add(t.city) : StringDict::kNone);
                             // Polygon vertices for closed ways (buildings).
                             // Lets the server compute exact distance-to-
                             // polygon for Nominatim parity instead of the
@@ -3077,6 +3086,7 @@ static int run(int argc, char* argv[]) {
                             emit(local.addr_strings[i].second);
                             emit(local.addr_strings[i].first);
                             emit(local.addr_postcodes[i]);
+                            emit(local.addr_cities[i]);
                         }
                         break;
                     case 2:
@@ -3164,7 +3174,8 @@ static int run(int argc, char* argv[]) {
                             ? local.building_addr_osm_way_ids[i] : 0;
                         put_addr_point(data, bldg_base + at, local.building_addrs[i].lat, local.building_addrs[i].lng,
                                        name_id(local.addr_strings[i].first), name_id(local.addr_strings[i].second),
-                                       name_id(local.addr_postcodes[i]), local.building_addr_cells[i],
+                                       name_id(local.addr_postcodes[i]), name_id(local.addr_cities[i]),
+                                       local.building_addr_cells[i],
                                        pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, bldg_way_id),
                                        has_poly ? static_cast<uint32_t>(bldg_vert_base + bldg_vert_at[k] + poly_off) : NO_DATA,
                                        has_poly ? poly_cnt : 0);
@@ -3179,6 +3190,7 @@ static int run(int argc, char* argv[]) {
                     free_storage(local.building_addr_osm_way_ids);
                     free_storage(local.addr_strings);
                     free_storage(local.addr_postcodes);
+                    free_storage(local.addr_cities);
                 });
                 addr_vertices_grown.second.get();
                 copy_locals(data.addr_vertices, bldg_vert_base, tld, building_vertex_buffer);
@@ -3652,6 +3664,7 @@ static int run(int argc, char* argv[]) {
                             std::string addr_housenumber;
                             std::string addr_street;
                             std::string addr_postcode;
+                            std::string addr_city;
                             // Strategy-2 stable identity: relation_id +
                             // ring_index. A multi-ring POI relation produces
                             // one PoiResult per ring; ring_index makes them
@@ -3722,6 +3735,7 @@ static int run(int argc, char* argv[]) {
                                                 pr.addr_housenumber = rel.addr_housenumber;
                                                 pr.addr_street = rel.addr_street;
                                                 pr.addr_postcode = rel.addr_postcode;
+                                                pr.addr_city = rel.addr_city;
                                                 pr.relation_id = rel.id;
                                                 pr.ring_index = poi_ring_idx;
                                                 local_results.push_back(std::move(pr));
@@ -3784,6 +3798,7 @@ static int run(int argc, char* argv[]) {
                                 if (!pr.addr_housenumber.empty()) {
                                     uint64_t dummy = 0;
                                     const char* bpc_ptr = pr.addr_postcode.empty() ? nullptr : pr.addr_postcode.c_str();
+                                    const char* city_ptr = pr.addr_city.empty() ? nullptr : pr.addr_city.c_str();
                                     std::vector<NodeCoord> poly_verts;
                                     poly_verts.reserve(pr.vertices.size());
                                     for (const auto& [vlat, vlng] : pr.vertices) {
@@ -3808,7 +3823,7 @@ static int run(int argc, char* argv[]) {
                                     add_addr_point(data, clat, clng,
                                                    pr.addr_housenumber.c_str(),
                                                    pr.addr_street.c_str(),
-                                                   bpc_ptr, dummy,
+                                                   bpc_ptr, city_ptr, dummy,
                                                    pack_osm_id(gc::id_alloc::ObjectType::OSM_RELATION,
                                                                static_cast<int64_t>(rel_payload)),
                                                    poly_verts.data(),
@@ -3865,6 +3880,7 @@ static int run(int argc, char* argv[]) {
         log_mem("data.addr_osm_ids",                 vec_bytes(data.addr_osm_ids));
         log_mem("data.addr_vertices",                vec_bytes(data.addr_vertices));
         log_mem("data.addr_postcode_ids",            vec_bytes(data.addr_postcode_ids));
+        log_mem("data.addr_city_ids",                vec_bytes(data.addr_city_ids));
         log_mem("data.addr_cells",                   vec_bytes(data.addr_cells));
         log_mem("data.admin_polygons",               vec_bytes(data.admin_polygons));
         log_mem("data.admin_osm_ids",                vec_bytes(data.admin_osm_ids));
