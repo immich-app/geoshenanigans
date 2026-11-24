@@ -363,3 +363,23 @@ fn a_boundary_repeating_the_outline_of_the_one_before_it_holds_no_rank() {
     assert_eq!(display, "Rue Melsens - Melsensstraat, Laeken, Brussels, Brussels-Capital, Belgium");
     assert_eq!((&address["town"], &address["city"]), (&serde_json::json!("Laeken"), &serde_json::json!("Brussels")));
 }
+
+#[test]
+fn the_walk_weighs_the_distance_of_a_rank_16_area_by_its_search_rank() {
+    // Malone Road, Belfast (W10288833): Belfast City District (admin_level 7, linked city: rank 16,
+    // rank_search 14) and the County Borough of Belfast (a place=city area, rank_search 16) both
+    // hold the street's middle, and the district's centre is the nearer the street. The walk
+    // weighs the distance of a rank-16 area of rank_search 16 by a quarter (placex_triggers.sql:
+    // 597-605), so it takes the borough first and accepts it, and the district, holding the
+    // house, is the rank's row.
+    let mut index = country("United Kingdom", b"GB");
+    index
+        .boundary("Northern Ireland", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("County Antrim", 15, 10, (-30_000.0, -30_000.0, 30_000.0, 30_000.0))
+        .boundary("Belfast City District", 7, 1, (-3000.0, -3000.0, 5000.0, 3000.0))
+        .boundary("County Borough of Belfast", 15, 1, (-3000.0, -2000.0, 6000.0, 3500.0))
+        .street("Malone Road", &[(0.0, -100.0), (0.0, 100.0)]);
+    let (display, address) = answer_at(&index.load(), 0.0, 0.0);
+    assert_eq!(display, "Malone Road, Belfast City District, County Antrim, Northern Ireland, United Kingdom");
+    assert_eq!(address["city"], "Belfast City District");
+}
