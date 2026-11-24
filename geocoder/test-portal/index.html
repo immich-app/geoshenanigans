@@ -2170,7 +2170,8 @@ function feedbackError(status, body) {
 // /datasets passes on; the builds before it have none): its sources as
 // configurations.template.json lists them, and builder/src/attribution.h
 // writes them into each dataset's attribution.json, but for the datasets
-// each applies to.
+// each applies to, and but those of the water alone (ofWaterAlone), which
+// the portal serves none of.
 const DATA_CREDITS = [
   {
     id: 'osm',
@@ -2220,14 +2221,6 @@ const DATA_CREDITS = [
     licence_url: 'https://creativecommons.org/publicdomain/zero/1.0/',
     notices: ["POI importance from the sitelink counts of the POIs' Wikidata items; Wikidata's structured data is available under CC0 1.0."],
   },
-  {
-    id: 'marine-regions',
-    text: 'Flanders Marine Institute (2024). The intersect of the Exclusive Economic Zones and IHO sea areas, version 5. Available online at https://www.marineregions.org/. https://doi.org/10.14284/699',
-    url: 'https://www.marineregions.org/',
-    licence: 'CC BY 4.0',
-    licence_url: 'https://creativecommons.org/licenses/by/4.0/',
-    notices: ["Changes: each IHO sea area's parts in every EEZ dissolved into one, cut to the water off OpenStreetMap's land polygons and along a 1-degree grid, the coastal water the sea areas leave out given to the nearest sea area, and simplified in the simplified tiers. Cut to OpenStreetMap's land, the areas are part of this dataset's ODbL derivative database."],
-  },
 ];
 
 // The credit of the Immich column's geodata: the files of Immich's release
@@ -2258,13 +2251,82 @@ const IMMICH_CREDITS = [
   },
 ];
 
-// The credit of the build served: /datasets' attribution where it is a list
-// of entries each of a text, else DATA_CREDITS.
+// Whether the shell pattern `pattern` matches `id` whole, as Python's
+// fnmatch.fnmatchcase reads it: * any run of characters, ? any one, [...]
+// one of a set and [!...] one of none of it (a-z a range; a ] first, a -
+// first or last, or a - after a range itself), a [ no ] closes itself, and
+// every other character itself.
+function namesId(pattern, id) {
+  const p = Array.from(pattern), s = Array.from(id);
+  // The pattern's parts: '*', or a test of one character.
+  const parts = [];
+  for (let i = 0; i < p.length;) {
+    const c = p[i++];
+    if (c === '*') { parts.push('*'); continue; }
+    if (c === '?') { parts.push(() => true); continue; }
+    let j = i;
+    if (c === '[') {
+      if (p[j] === '!') j++;
+      if (p[j] === ']') j++;
+      while (j < p.length && p[j] !== ']') j++;
+    }
+    if (c !== '[' || j >= p.length) { parts.push((x) => x === c); continue; }
+    const none = p[i] === '!';
+    const set = p.slice(none ? i + 1 : i, j);
+    i = j + 1;
+    parts.push((x) => {
+      let found = false;
+      for (let k = 0; k < set.length && !found; k++) {
+        if (set[k + 1] === '-' && k + 2 < set.length) {
+          found = set[k].codePointAt(0) <= x.codePointAt(0) && x.codePointAt(0) <= set[k + 2].codePointAt(0);
+          k += 2;
+        } else {
+          found = set[k] === x;
+        }
+      }
+      return found !== none;
+    });
+  }
+  // Each * takes as few characters as it can, one more each time what
+  // follows it fails.
+  let at = 0, of = 0, star = -1, from = 0;
+  while (of < s.length) {
+    if (at < parts.length && parts[at] !== '*' && parts[at](s[of])) { at++; of++; }
+    else if (parts[at] === '*') { star = at++; from = of; }
+    else if (star >= 0) { at = star + 1; of = ++from; }
+    else return false;
+  }
+  while (parts[at] === '*') at++;
+  return at === parts.length;
+}
+
+// Whether a credit of the build applies to its water alone: of the build's
+// components (their ids, as /datasets lists them), those its applies_to
+// names (shell patterns of their ids, namesId) are some, and each one of
+// water.*. The portal serves the selections without water
+// (server/src/portal/catalog.rs's WATER), so such a source is none of the
+// answers'.
+function ofWaterAlone(entry, components) {
+  const to = entry.applies_to;
+  if (!Array.isArray(to) || !to.every((p) => typeof p === 'string')) return false;
+  const named = components.filter((id) => to.some((p) => namesId(p, id)));
+  return named.length > 0 && named.every((id) => id.startsWith('water.'));
+}
+
+// The credit of the build served: where /datasets' attribution is a list of
+// entries each of a text, its entries but those of the water alone (of the
+// components /datasets lists, none where it lists none), then the page's
+// (DATA_CREDITS) of the sources it lists none of, by id, in the page's
+// order; else, or where none is left, DATA_CREDITS.
 function dataCredits(catalog) {
   const listed = catalog ? catalog.attribution : null;
   const reads = Array.isArray(listed) && listed.length > 0
     && listed.every((e) => e && typeof e === 'object' && typeof e.text === 'string' && e.text !== '');
-  return reads ? listed : DATA_CREDITS;
+  const components = (catalog && Array.isArray(catalog.components) ? catalog.components : []).filter((c) => typeof c === 'string');
+  const own = reads ? listed.filter((e) => !ofWaterAlone(e, components)) : [];
+  if (!own.length) return DATA_CREDITS;
+  const ids = new Set(own.map((e) => e.id));
+  return [...own, ...DATA_CREDITS.filter((e) => !ids.has(e.id))];
 }
 
 // `text` as a link to `url`, opened in a tab of its own; the text alone
@@ -2285,8 +2347,9 @@ function creditHtml(entry) {
 }
 
 // The sources in full, as the page's disclosure holds them: the build's
-// (dataCredits; data-from says whether the build's own or the page's), then
-// the Immich column's where /datasets lists it.
+// (dataCredits; data-from says whether the build's own, the page's of the
+// sources it lists none of after them, or the page's alone), then the
+// Immich column's where /datasets lists it.
 function creditsHtml(catalog) {
   const credits = dataCredits(catalog);
   let html = `<div class="credit-group" data-from="${credits === DATA_CREDITS ? 'page' : 'build'}">`

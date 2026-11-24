@@ -236,6 +236,9 @@ pub struct Plan {
     pub groups: Vec<Group>,
     /// The manifest's attribution, as it is.
     pub attribution: Option<serde_json::Value>,
+    /// The ids of the build's components, sorted: the shell patterns of an attribution
+    /// entry's applies_to name them.
+    pub components: Vec<String>,
 }
 
 /// The values of an axis of `manifest`, in their order (by key where two
@@ -472,6 +475,7 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
         default,
         groups,
         attribution: manifest.attribution.clone(),
+        components: cfg.components.keys().cloned().collect(),
     })
 }
 
@@ -544,7 +548,8 @@ impl Plan {
 
     /// What /datasets answers while the build of the publication ID `id`
     /// (sync::publication_id) is served from its dir `dir`: its attribution
-    /// as the manifest has it, null where it has none.
+    /// as the manifest has it, null where it has none, and the ids of its
+    /// components, which the attribution's applies_to names.
     pub fn json(&self, id: &str, dir: &str) -> serde_json::Value {
         let selection = |s: &RegionSelection| {
             serde_json::json!({ "region": s.region, "mode": s.mode, "quality": s.quality, "poi_tier": s.poi_tier })
@@ -584,6 +589,7 @@ impl Plan {
                 "requires": x.requires,
             })).collect::<Vec<_>>(),
             "attribution": self.attribution,
+            "components": self.components,
         })
     }
 }

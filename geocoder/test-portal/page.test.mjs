@@ -42,9 +42,10 @@ function core() {
 // the axes (of region, planet only) and their values in order, the presets,
 // each planet selection the constraints allow as a dataset (the preset's
 // label and description for a preset's, of size its place in GiB on disk and
-// half that to download) and those they rule out. As catalog.rs, a preset
-// names the dataset of its region, mode, quality and POI tier, and one with
-// water names none: the portal serves the selections without water.
+// half that to download) and those they rule out, and the ids of the
+// build's components. As catalog.rs, a preset names the dataset of its
+// region, mode, quality and POI tier, and one with water names none: the
+// portal serves the selections without water.
 function catalog(edit = () => {}) {
   const t = structuredClone(template);
   edit(t);
@@ -87,7 +88,8 @@ function catalog(edit = () => {}) {
   const presets = dry.map((p) => ({
     id: p.id, label: p.label, description: p.description, dataset: `${p.selections.mode}.${p.selections.quality}.${p.selections.poi_tier}`,
   }));
-  return { build: { date: '2026-11-20', version: 24, id: ID, dir: '2026-11-20-1' }, default: 'full.simplified.all', axes, presets, datasets, excluded };
+  const components = Object.keys(t.components).sort();
+  return { build: { date: '2026-11-20', version: 24, id: ID, dir: '2026-11-20-1' }, default: 'full.simplified.all', axes, presets, datasets, excluded, components };
 }
 
 // The publication IDs of two builds of 2026-11-20, the second published
@@ -2083,7 +2085,7 @@ test('the sources in full are in a native disclosure, its body scrolling within 
 
 test("without the build's own credit, the disclosure holds the page's: each source, its licence and its notices", () => {
   const { creditsHtml, DATA_CREDITS } = core();
-  assert.deepEqual(plain(DATA_CREDITS.map((e) => e.id)), ['osm', 'geonames', 'codepoint-open', 'tiger', 'wikidata', 'marine-regions']);
+  assert.deepEqual(plain(DATA_CREDITS.map((e) => e.id)), ['osm', 'geonames', 'codepoint-open', 'tiger', 'wikidata']);
   assert.deepEqual(plain(DATA_CREDITS[0]), OSM);
   for (const [id, notices] of Object.entries(NOTICES)) {
     assert.deepEqual(plain(DATA_CREDITS.find((e) => e.id === id).notices), notices, id);
@@ -2116,17 +2118,22 @@ test('the Immich column credits its geodata, GeoNames cities500 and Natural Eart
   assert.ok(creditsHtml({ ...withImmich(), attribution: [OSM] }).startsWith('<div class="credit-group" data-from="build">'));
 });
 
-test("a build's own credit, as /datasets passes it on, is the one shown, escaped, and only http links are links", () => {
-  const { creditsHtml } = core();
+test("a build's own credit of a source, as /datasets passes it on, is the one shown of it, escaped, and only http links are links", () => {
+  const { creditsHtml, dataCredits } = core();
   const own = [
-    { ...OSM, applies_to: ['mode.*'] },
+    { ...OSM, notices: ['The build says this of OpenStreetMap.'], applies_to: ['mode.*'] },
     { id: 'x', text: '<img src=x onerror=alert(1)>', url: 'javascript:alert(2)', licence: '<b>L</b>', licence_url: '" onmouseover="alert(3)', notices: ['<script>alert(4)</script>', 5, null] },
+    { id: 'tiger', text: 'TIGER/Line, as the build credits it', notices: ['The build says this of TIGER.'] },
     { id: 'y', text: 'No licence' },
   ];
   const out = creditsHtml({ ...catalog(), attribution: own });
   assert.ok(out.startsWith('<div class="credit-group" data-from="build">'), out);
-  assert.ok(text(out).includes(OSM.notices[0]), out);
-  for (const notice of Object.values(NOTICES).flat()) assert.ok(!text(out).includes(notice), notice);
+  // The build's entries come first, each in place of the page's of its id,
+  // then the page's of the sources it lists none of, in the page's order.
+  assert.deepEqual(plain(dataCredits({ ...catalog(), attribution: own }).map((e) => e.id)), ['osm', 'x', 'tiger', 'y', 'geonames', 'codepoint-open', 'wikidata']);
+  assert.ok(text(out).includes('The build says this of OpenStreetMap.') && text(out).includes('The build says this of TIGER.'), out);
+  for (const notice of [...OSM.notices, ...NOTICES.tiger]) assert.ok(!text(out).includes(notice), notice);
+  for (const notice of [...NOTICES.geonames, ...NOTICES['codepoint-open']]) assert.ok(text(out).includes(notice), notice);
   assertEscaped(out);
   assert.ok(!out.includes('javascript:') && !out.includes('href="&quot;'), out);
   assert.ok(out.includes('<div class="credit-source">&lt;img src=x onerror=alert(1)&gt;, &lt;b&gt;L&lt;/b&gt;</div><ul><li>&lt;script&gt;alert(4)&lt;/script&gt;</li></ul>'), out);
@@ -2138,11 +2145,87 @@ test("a build's own credit, as /datasets passes it on, is the one shown, escaped
   }
 });
 
-// The page's credit holds the template's sources, in its order, each as
-// the template has it but for the datasets it applies to; until the
-// template lists them all (PR 530), the page's others besides.
-test("the page's credit holds the template's attribution", { skip: !template.attribution && 'the template has no attribution yet' }, () => {
-  const { DATA_CREDITS } = core();
-  const listed = new Set(template.attribution.map((e) => e.id));
-  assert.deepEqual(plain(DATA_CREDITS.filter((e) => listed.has(e.id))), template.attribution.map(({ applies_to, ...entry }) => entry));
+// An applies_to's patterns name the component ids that Python's
+// fnmatch.fnmatchcase matches them with (tools/test_configurations_template.py
+// resolves the template's so): of these ids, those it gives each pattern.
+test("a pattern of applies_to names the components a shell pattern matches, as fnmatchcase reads it", () => {
+  const { namesId } = core();
+  const ids = ['water.major', 'water.all', 'water.all-exact', 'water.none', 'mode.full', 'poi_tier.major', 'dir.admin-minimal'];
+  const water = ['water.major', 'water.all', 'water.all-exact', 'water.none'];
+  const named = [
+    ['water.major', ['water.major']], ['wate[r].major', ['water.major']], ['water*', water], ['[w]ater.*', water],
+    ['w?ter.all', ['water.all']], ['water.all-*', ['water.all-exact']], ['*.major', ['water.major', 'poi_tier.major']],
+    ['[wm]*', [...water, 'mode.full']], ['[!w]*', ['mode.full', 'poi_tier.major', 'dir.admin-minimal']], ['[!]*', []],
+    ['[a-z]ater.none', ['water.none']], ['[z-a]ater.none', []], ['[!z-a]ater.none', ['water.none']],
+    ['water.[a-m]*', ['water.major', 'water.all', 'water.all-exact']], ['water.all[-]exact', ['water.all-exact']],
+    ['water.all[]-]exact', ['water.all-exact']], ['water.all[a-]exact', ['water.all-exact']], ['water[.]all', ['water.all']],
+    ['water.al?', ['water.all']], ['*', ids], ['', []], ['[', []], ['water.[', []],
+    ['dir.admin-mini[a-c-m]al', ['dir.admin-minimal']], ['\\water.major', []], ['*.all*', ['water.all', 'water.all-exact']],
+    ['?????.*', water], ['water.*-exact', ['water.all-exact']],
+  ];
+  for (const [pattern, want] of named) {
+    assert.deepEqual(ids.filter((id) => namesId(pattern, id)), want, pattern);
+  }
+});
+
+// The page's credit holds the template's sources but those of the water
+// alone, in its order, each as the template has it but for the datasets it
+// applies to; until the template lists them all (PR 530), the page's others
+// besides.
+test("the page's credit holds the template's attribution but the water's own", { skip: !template.attribution && 'the template has no attribution yet' }, () => {
+  const { DATA_CREDITS, ofWaterAlone: of } = core();
+  const ofWaterAlone = (entry) => of(entry, Object.keys(template.components));
+  const dry = template.attribution.filter((e) => !ofWaterAlone(e));
+  const listed = new Set(dry.map((e) => e.id));
+  assert.deepEqual(plain(DATA_CREDITS.filter((e) => listed.has(e.id))), dry.map(({ applies_to, ...entry }) => entry));
+  for (const e of template.attribution.filter(ofWaterAlone)) assert.ok(!DATA_CREDITS.some((d) => d.id === e.id), e.id);
+});
+
+// The portal serves the selections without water (catalog.rs's WATER), so
+// a source the build credits for its water alone is none of the answers',
+// the page's own credit or the build's.
+test('the disclosure credits no source of the water alone, which the portal serves none of', () => {
+  const { creditsHtml } = core();
+  const sea = { id: 'sea', text: 'Seas of somewhere', url: 'https://seas.example.org/', notices: ['The seas, cut to the land.'], applies_to: ['water.major', 'water.all'] };
+  for (const c of [null, catalog(), { ...catalog(), attribution: template.attribution }, { ...catalog(), attribution: [OSM, sea] }]) {
+    const out = creditsHtml(c);
+    assert.ok(!/marine/i.test(out), out);
+    assert.ok(!out.includes('Seas of somewhere') && !text(out).includes('The seas, cut to the land.'), out);
+  }
+  // A list of the water's sources alone credits none of the answers: the
+  // page's is shown.
+  assert.ok(creditsHtml({ ...catalog(), attribution: [sea] }).startsWith('<div class="credit-group" data-from="page">'));
+  // The patterns name the build's components as shell patterns do: those
+  // that name only water components are of the water alone, however they
+  // are written.
+  for (const applies_to of [['wate[r].major'], ['water*'], ['[w]ater.all', 'w?ter.all-*'], ['?????.*']]) {
+    const out = creditsHtml({ ...catalog(), attribution: [OSM, { ...sea, applies_to }] });
+    assert.ok(!text(out).includes('The seas, cut to the land.'), JSON.stringify(applies_to));
+  }
+  // A source of the water and of the rest is one of the answers, and so is
+  // one whose patterns name no component, or that doesn't read as a list of
+  // patterns.
+  for (const applies_to of [['water.*', 'mode.*'], ['*'], ['*.major'], ['[wm]*'], ['[!z]*'], [], ['seas.*'], ['water.major', 5], 'water.*']) {
+    assert.ok(text(creditsHtml({ ...catalog(), attribution: [OSM, { ...sea, applies_to }] })).includes('The seas, cut to the land.'), JSON.stringify(applies_to));
+  }
+  const { applies_to, ...unscoped } = sea;
+  assert.ok(text(creditsHtml({ ...catalog(), attribution: [OSM, unscoped] })).includes('The seas, cut to the land.'));
+  // A /datasets that lists no components names none: every source it lists
+  // is shown.
+  const { components, ...unlisted } = catalog();
+  assert.ok(text(creditsHtml({ ...unlisted, attribution: [OSM, sea] })).includes('The seas, cut to the land.'));
+});
+
+// configurations.json is a copy of the template (the nightly's
+// geocoder-build.yml), whose attribution lists some of the sources until
+// PR 530: the disclosure still credits every source of the answers.
+test("the build's credit of some of the sources keeps the page's of the others", () => {
+  const { creditsHtml, dataCredits, DATA_CREDITS } = core();
+  const c = { ...catalog(), attribution: template.attribution };
+  const out = creditsHtml(c);
+  for (const notice of [...OSM.notices, ...Object.values(NOTICES).flat(), ...DATA_CREDITS.flatMap((e) => e.notices)]) {
+    assert.ok(text(out).includes(notice), notice);
+  }
+  // Each source once.
+  assert.deepEqual(plain(dataCredits(c).map((e) => e.id)).sort(), plain(DATA_CREDITS.map((e) => e.id)).sort());
 });
