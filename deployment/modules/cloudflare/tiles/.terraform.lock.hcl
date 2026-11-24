@@ -72,7 +72,8 @@ provider "registry.opentofu.org/hashicorp/random" {
 }
 
 provider "registry.opentofu.org/tigrisdata/tigris" {
-  version = "1.1.4"
+  version     = "1.1.4"
+  constraints = "1.1.4"
   hashes = [
     "h1:/aGQ4cXaVNPtiOpansfkqRXkEf24BBhArxyag2G7VSw=",
     "h1:0D55DW6jiY+Al5FTOIoteQt8Go4hXBYdzu/jOVrw0vY=",

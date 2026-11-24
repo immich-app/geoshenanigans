@@ -26,18 +26,23 @@ quality, POI tier) and how a client downloads and patches them.
 ## Monitoring
 
 The nightly reports every run on `main` to FUTO o11y (project
-`geoshenanigans`), whatever its outcome; test dispatches from other branches
-don't report. Its last step, `builder/tools/o11y_report.py nightly`, pushes
-what only its runner has: each build phase's duration, peak memory, the patch
-verify counts, each patch's size, the index size, the data's age and the
-bytes of planet/full's address footprint stream beside the limit they may not
-pass, and logs build.log, the memwatch samples and each variant's verify
-result. Every 2 hours the watchdog's `report` job (`o11y_report.py watchdog`,
-on a GitHub-hosted runner) pushes the dates in the published `latest.json`
-with a heartbeat (none when it can't read `latest.json`), and the latest
-finished nightly's outcome, duration and step durations from the GitHub API,
-logging that run's steps once. A run whose runner died or that timed out never
-reaches its own last step, so its outcome comes from the watchdog.
+`geoshenanigans`), whatever its outcome; test dispatches, from other branches
+or under a scratch `s3_prefix` (whose run title ends `[scratch: <prefix>]`),
+don't report, and the watchdog passes them over. Its report,
+`builder/tools/o11y_report.py nightly`, starts after Finalize whatever the
+steps before it did (a failed or skipped Setup or upload included), runs
+beside the cleanups and artifact uploads, and is waited for by the job's last
+step. It pushes what only its runner has: each build phase's duration, peak
+memory, the patch verify counts, each patch's size, the index size, the
+data's age and the bytes of planet/full's address footprint stream beside the
+limit they may not pass, and logs build.log, the memwatch samples and each
+variant's verify result. Every 2 hours the watchdog's `report` job
+(`o11y_report.py watchdog`, on a GitHub-hosted runner) pushes the dates in
+the published `latest.json` with a heartbeat (none when it can't read
+`latest.json`), and the latest finished nightly's outcome, duration and step
+durations from the GitHub API, logging that run's steps once. A run whose
+runner died or that timed out never reaches its own report, so its outcome
+comes from the watchdog.
 
 Both push straight to o11y's public gateway (`O11Y_URL` in the workflows,
 `https://vmauth.futostatus.com`), metrics to VictoriaMetrics and logs to
@@ -76,7 +81,13 @@ lands in it: `admin` mode, `simplified` boundaries and no POIs unless an admin s
 another selection with `PUT /admin/configuration` (a JSON body of `base_url`,
 `mode`, `quality`, `poi_tier` and the regions to `preload`). A value the build
 doesn't offer fails each download, naming those it does, and the PUT is refused
-with them (400) when the server has the build's manifest at hand. A continent
+with them (400) when the server has the build's manifest at hand. Downloads
+check the bucket's certificate against the system's CA store: on Linux and the
+other Unix systems but macOS, its certificate bundle (`ca-certificates` on
+Debian), or another that `SSL_CERT_FILE` or `SSL_CERT_DIR` names; on macOS and
+Windows, the system's trust store, which those variables don't change. On a
+host without one the server starts and serves what its data dir holds, and each
+download fails, naming why. A continent
 dir keeps a ledger of what each of its files holds, `.file_sha256` (a line
 `<name> <sha256>` each, `-` while unknown), and a download skips a file only
 where the ledger names the build's sha256 for it. It removes the files its
@@ -129,13 +140,214 @@ read, which a local file system allows; on NFS an exclusive lock needs the
 file open to write, so there it fails, saying so.
 
 The test portal is a map page for checking answers, served by every query
-server at `/test`. Its compose file runs two servers on the latest published
-index, a full one and a minimal one, side by side:
+server at `/test`, where it asks that server. Its compose file runs
+`query-portal`, a binary of the search crate whose sources are the server
+crate's, which serves every dataset of
+the latest published planet build: each selection of a mode, a boundary
+precision and a POI tier the manifest's constraints allow (28). Its page
+compares up to 4 of them side by side, each a preset or a pick by axis, and
+its URL holds the columns, the point, the build (`b=`, its publication
+ID: `<date>-<the first 12 hex digits of its manifest's sha256>`, the same on
+every volume), which it flags when another build is served, one published
+again under its date among them, and the search box's text (`q=`); a `b=`
+of a date alone stands for any build of its date. To run it:
 
 ```bash
-cd test-portal && docker compose up --build
+cd test-portal && docker compose up --build --remove-orphans
 # open http://localhost:3002/test
+# or http://localhost:3002/test?d=with-addresses&d=smallest&at=48.8584,2.2945
+# or http://localhost:3002/test?d=with-addresses&d=smallest&q=eiffel
 ```
+
+Its volume, `geocoder-portal-data`, is not the old services' volumes: at its
+first start the portal makes the test account in `geocoder.json` on it. To
+keep the accounts of the old `geocoder-data-full` volume, copy that volume's
+`index/geocoder.json` to `geocoder.json` on the new one once, before the
+first start.
+
+Its `/reverse` and `/polygons` take `dataset=`: a preset's id (`smallest`)
+or `<mode>.<quality>.<poi_tier>` (`admin.simplified.major`), and
+`with-addresses` without one. They answer what a query-server serving that
+selection's files answers, and name the dataset and build that answered in
+`X-Geocoder-Dataset`, `X-Geocoder-Build` (its date), `X-Geocoder-Build-Id`
+(its publication ID, as `/health` and `/datasets` name it) and
+`X-Geocoder-Build-Dir` (the dir the volume holds it in, `<date>-<n>`, the
+volume's alone).
+`/datasets` lists the datasets with their labels and sizes, and the
+combinations the constraints exclude with their messages; `/health` gives
+the build served and how its sync goes. The page asks `/datasets` anew
+once `/health` names another publication ID, and cancels a polygon
+request once a newer one or a clear supersedes it.
+Its `/search` takes `dataset=` too, `q=` (what to search for, 1 to 256
+bytes but the spaces at its ends, given to the search as it is), `limit=`
+(1 to 50, 20 without one), `key=` and `debug=1`. It answers what the node
+binding's `searchPlaces` answers from that selection's files, byte for byte:
+a JSON array of `{name, latitude, longitude, admin1name, admin2name, country,
+country_code, type}`, best first; with `debug=1` the line `place-search
+query` prints instead (the query, `us` the time it took, what it read, and
+each result with how it was found). It names the dataset and build as the
+lookups do, and the index it searched in `X-Geocoder-Search-Index`.
+Datasets whose dirs hold the files an index is made of alike share one, a
+group named by its first dataset (12 for the 28: `admin`, `full` and
+`no-addresses` of a precision and a POI tier share one); `/datasets` names
+each dataset's (`search.index`, and `search.shipped` where the build
+publishes it), and `/health`'s `search` tells each group's datasets, its
+state (`queued`, `building`, `ready` or `failed` with its `reason`) and
+`since` when, and once ready whether it was `built` or found built from its
+files (`current`), and for an index the build publishes how it compares
+with the published files (`shipped`: `same`, the files that `differ` and
+those `unpublished`). Until a dataset's index is ready its `/search` answers
+503 with JSON `{status: "building", dataset, index, since}` and
+`Retry-After: 5`, or `{status: "failed", dataset, index, since, reason}`.
+Searches run 4 at once beside the 8 lookups, so a few `/polygons` of
+exact boundaries can't hold one up, and count against the key's rate as
+`/reverse` does.
+
+The page's search box searches each column's dataset as one types, once
+the text has stood 250 ms (Enter searches at once), 10 results a column. A
+newer search cancels the requests of the one before. The results go into
+one matrix: a row a result, its rank in each column (`–` where a column
+that answered lacks it, `·` where one has no answer yet), its name, kind,
+type and context (admin2 · admin1 · country). Results of two columns are
+one row where their names are equal, both or neither is a POI, and their
+points are at most 1 km apart, 20 km where one is a boundary without a
+label node, whose point moves with the boundary's precision. A row marks the columns that lack it, a rank
+below its best, how far its points are apart, another type, and each part
+of the context the columns disagree on. Each row is a dot on the map,
+coloured by the columns that have it, and a click on a row or a dot looks
+up its point in every column, as a click on the map does. A column whose
+index is queued or building says so, with how many of the build's indexes
+are ready, and is asked again after the `Retry-After`; one whose index
+failed says why. A server without `/datasets`, or whose `/datasets` names
+no indexes, shows no search.
+
+A column can also show what a photo at the point gets in Immich today:
+"Immich today (GeoNames cities500)", `dataset=immich-cities500`, which
+`/datasets` lists under `others` (`kind: "immich"`, with the release and
+the date of its geodata). The portal's image copies the geodata of
+`ghcr.io/immich-app/immich-server:release` as it is when the image is built
+(its `/build/geodata`: GeoNames' `cities500.txt`, `admin1CodesASCII.txt`,
+`admin2Codes.txt` and `countryInfo.txt`, Natural Earth's
+`ne_10m_admin_0_countries.geojson`, `geodata-date.txt`) and the release's
+tag and commit, and `/reverse` answers as that release's
+`MapRepository.reverseGeocode` does (`server/src/portal/immich.rs`): the
+cities500 place, but the PPLX outside Australia and the PPLH, nearest by
+`earth_distance` among those in `earth_box` of 25 km about the point (a
+cube on earthdistance's sphere of 6378168 m, so a place in its corner up to
+~43 km away counts), its name the city, its admin1 name the state and its
+country code's `countryInfo.txt` name the country; with none in the box,
+the first Natural Earth polygon whose outer ring holds the point (Postgres'
+`polygon @> point`, its edge too; holes are not read), its `ADM0_A3`'s
+name the country (24 codes, Kosovo's `KOS` among them, have none); else
+nothing, and at 0, 0 nothing, which Immich takes for no GPS. Of places at
+one distance the first in the file wins. The answer, JSON of no build
+(`X-Geocoder-Dataset` alone), gives what Immich stores as
+`immich.stored` (`city`, `state`, `country`) and as `address` and
+`display_name` for the page's field table, and how it found it:
+`immich.how` (`cities500`, `natural_earth`, `nothing` or `no_gps`), the
+place (`geonameid`, name, point, codes, `distance_m`,
+`beyond_max_distance`) and `in_box`, or the Natural Earth row. The column
+has no search and no polygons (`/search` and `/polygons` of it are a 400),
+and its search head says so; feedback of it carries its dataset id.
+
+Someone who disagrees with an answer can tell us what they expected. Each
+column's answer in the detail and each column's search has a "Disagree?"
+button, and the toolbar's Feedback sends a general report. Its form sends
+the column's dataset, the build that answered and the answer the page
+showed, what they expected (in words; by name, road, house number, city,
+postcode and country; or that the answer should be empty), a comment and
+the link's state to `POST /feedback?key=`, a JSON body of at most 16 KiB
+(413 past it; the page cuts an answer of over 8 KiB to the start of its
+JSON). A client IP sends 20 reports a minute (429 past them), a body that
+isn't a report is a 400, and one kept a 201. `GET /feedback/count`, of no
+key, gives `{"today": <n>, "total": <n>}`, which the page thanks with. The
+portal appends each report as one JSON line to
+`<data>/feedback/<YYYY-MM-DD>.jsonl` of the UTC day it came: on the box,
+`/ssd/test-portal/data-portal/feedback/`, the volume of the portal on
+`:3002`. A report keeps only its own fields: nothing of who sent it, no IP
+and no email, as the form says. A line (one line in the file):
+
+```json
+{"received": "2026-11-21T20:41:07Z", "kind": "reverse", "lat": 48.8584, "lon": 2.2945,
+ "q": null, "result_index": null, "dataset": "admin-minimal.simplified.none",
+ "build": "2026-11-21-9bc04e7d1a25", "answer": {"display_name": "Paris, France", "address": {}},
+ "answer_trimmed": false,
+ "expected": {"text": "the Eiffel Tower", "name": null, "road": "Avenue Gustave Eiffel",
+              "house_number": null, "city": null, "postcode": null, "country": null, "empty": false},
+ "comment": "the tower is right there",
+ "page": {"columns": ["with-addresses", "smallest"], "point": {"lat": 48.8584, "lon": 2.2945}, "q": null}}
+```
+
+`kind` is `reverse` (at `lat`, `lon`), `search` (of `q`, and of its
+result at `result_index`, from 0, at that result's point; `null` for the
+results as a whole) or `general` (at the selected point, if any, of no
+dataset). `answer` is the JSON the page showed, a reverse lookup's answer
+or a search's results, or the start of it as a string where
+`answer_trimmed` is true. `page` is the link's `d=` (the columns), `at=`
+and `q=`.
+
+The test key the page sends allows 200 requests a second and 5,000,000 a
+day (UTC), shared by every visitor. The page keeps 8 in flight and asks a
+429 of `/reverse` or `/search` again after a pause (a search's 429 pauses
+the searches alone), 8 tries in all, after which the 429 is its answer;
+once the day's 5,000,000 are spent, `/reverse` and `/search` answer 429 until
+the UTC day turns. Its `/polygons` (of no rate limit) don't wait out
+those pauses, and the portal runs 8 lookups at once, the others waiting
+their turn.
+
+`query-portal` checks the bucket for a new build itself, every hour
+(`PORTAL_SYNC_SECONDS`), and 10 minutes after a round that failed (or
+`PORTAL_SYNC_SECONDS`, where that is less). A round that finds latest.json
+and the build's manifest naming the build it serves fetches nothing else.
+It fetches a new build into a dir of its own in the volume, each file
+checked against the build's manifest (~11.2 GiB a build, ~9 GiB to
+download): each dataset's dir holds hard links of the build's files, files
+the build holds twice byte for byte are fetched once and hard-linked, and
+no file is shared between the dirs of two builds. Once the build loads, and
+before it switches to it, it builds the build's 12 place search indexes in
+the build's dir, as a device builds its own (`search/<group>/`, ~0.9 GiB
+once the files they hold alike are hard-linked, ~7 GiB at the peak while
+they build): 4 at once (`PORTAL_SEARCH_JOBS`, at most the CPUs it may run
+on), each on one thread at the lowest priority, the costliest first, ~156 s
+and ~10 CPU-minutes for the planet build. A group that fails doesn't hold
+the build back: it is switched to all the same, and the next round tries
+the group again. At start it serves the build at once and opens its
+indexes after, building those its dir lacks. An index is used again while
+its search_meta.json names the files beside it and the index format the
+image builds: an image of another index builder of the same format keeps
+the indexes the build holds until the next build. It fetches only with room
+free for the files still to fetch, 7 GiB for the indexes and 2 GiB besides,
+so a volume that holds the build served and the one before needs ~20 GiB
+more free to fetch a third, ~45 GiB in all. A sync killed part way resumes in its dir: it reads
+the files of the objects its ledger names against their sha256 and removes
+those that fail and the files the ledger doesn't name before it weighs the
+room. It switches to a build only once every file of it holds its
+manifest's bytes, each read against its sha256 again, each dataset's dir
+holds hard links of the build's files and nothing else, and every dataset
+loads. A build whose files fail that check is fetched again, into a new
+dir, not refused; one whose files check out but whose datasets don't load
+is refused, as is one whose manifest is of another build version than it
+reads, each saying so on `/health`. While latest.json gives another build
+version than the manifest, the sync fails and retries, refusing nothing. A
+build published again under its date (a rerun of the nightly) is another
+build: it fetches that one too, and a refusal of the build as first
+published doesn't hold against it. At start it serves the newest build the
+volume holds whose files all hold their manifest's bytes, each read against
+its sha256 before the build is served (~3 s for a planet build on an NVMe
+disk, cold or warm), and fetches one that doesn't again. Until it has a
+build to serve, `/health`, `/datasets`, `/reverse` and `/polygons` answer
+503 with the reason, `/reverse` and `/polygons` whatever key they are sent.
+Besides the build it serves, it keeps the newest complete build it holds of
+another date (the one it served before, but where that was of the same
+date: a build published again under its date takes the place of the one
+first published), and an incomplete one of the latest build, to resume.
+Once latest.json names a build it keeps again, as published then (its
+manifest the same byte for byte), it serves that one again once its files
+check out and its datasets load, fetching only its manifest. A date in
+`<data>/latest.override` stands in for the bucket's latest.json. One
+`query-portal` serves a volume: it holds `<data>/portal.lock` for as long
+as it runs, and a second one started on the same volume exits at once,
+saying so.
 
 ## API
 
@@ -188,7 +400,7 @@ The project consists of four components:
 - **Builder** (`builder/`, C++) - `build-index` parses OSM PBF files and creates a compact binary index using S2 geometry cells for spatial lookup. `geocoder-diff` and `geocoder-patch` make and apply the daily patches ([builder/PATCHING.md](builder/PATCHING.md)), and `pbf-apply` applies OSM replication diffs to a PBF.
 - **Server** (`server/`, Rust) - Memory-maps the index files and serves queries via HTTP/HTTPS with sub-millisecond latency. It is also the `query_server` library the binding wraps.
 - **Node binding** (`node/`) - The native module Immich uses to geocode in-process: `Geocoder.load(dir)`, then `reverseGeocode(lat, lng)` resolves to the response JSON as a string. `openPlaceSearch()` opens the place search index of the dataset (shipped with the bigger packs, else built on the device; see [builder/PATCHING.md](builder/PATCHING.md#place-search-index)), then `searchPlaces(query)` resolves to the results as a JSON string. `createTransportDecoder(dir, files)` decodes a downloading transport unit into the dataset dir ([PATCHING.md](PATCHING.md#transport-units)).
-- **Test portal** (`test-portal/`) - The map page served at `/test`, and a compose file that runs it on the published index.
+- **Test portal** (`test-portal/`) - The map page served at `/test`, and the image and compose file of `query-portal`, which serves every dataset of the published planet build for the page to compare side by side.
 
 ### Index Structure
 
@@ -204,12 +416,12 @@ to the same files ([builder/PATCHING.md](builder/PATCHING.md#transport-units)).
 | `street_ways.bin`, `street_nodes.bin` | Street ways: a row per way (its name, where its nodes start) in groups of 16 ways, and the ways' nodes as deltas in a block per way (`builder/src/way_files.h`). A fresh build writes the ways in cell order: by the least street cell that lists a way, then by name and nodes, so the ways of one place sit together (a continent's files keep the planet's order) |
 | `way_parents.bin`, `way_postcodes.bin` | Per street: smallest containing admin polygon, postcode from its postal boundary; a value per street in blocks of 64 (`builder/src/side_blocks.h`) |
 | `addr_points.bin`, `addr_vertices.bin`, `addr_index.bin` | Address points (coordinates, house number, street) in blocks of 16 records, building outlines as a blob per building, and where each block and its blobs start (`builder/src/addr_files.h`); in cell order as the ways are, then by street and house number |
-| `addr_postcodes.bin` | Per address point: its own `addr:postcode`, in blocks as the streets' side files |
+| `addr_postcodes.bin` | Per address point: its own `addr:postcode` where its country's pattern takes it, in blocks as the streets' side files |
 | `addr_cities.bin` | Per address point: its `addr:city` where a place or a boundary has that name (a core string, else none), in blocks as the other side files |
 | `interp_ways.bin`, `interp_nodes.bin` | Interpolation ways and their nodes, in the street ways' format; in cell order as the ways are, then by street and range |
 | `interp_postcodes.bin` | Per interpolation way: its TIGER ZIP (TIGER regions only), in blocks as the other side files |
 | `admin_cells.bin`, `admin_entries.bin` | S2 cell index for admin boundaries: lists in blocks of 8 cells, each against the one before (the cell pair layout, `builder/src/cell_pairs.h`) |
-| `admin_polygons.bin`, `admin_rings.bin` | Admin polygon records (postcode areas among them, at level 11; a place area linked to a place node of another type keeps its own place tag in the last byte) and their rings, as refs to arcs |
+| `admin_polygons.bin`, `admin_rings.bin` | Admin polygon records (postcode areas among them, at level 11; a place area linked to a place node of another type keeps its own place tag in the last byte, whose top bit marks a closed way's polygon) and their rings, as refs to arcs |
 | `arc_index.bin`, `arc_vertices.bin` | The boundary arcs those rings share, each border once (per boundary tier: `quality/simplified` or `quality/exact`) |
 | `admin_parents.bin` | Per admin polygon: the next larger polygon containing it |
 | `place_cells.bin`, `place_nodes.bin`, `place_hidden.bin` | Place nodes (city, town, village, suburb, ...): the visible ones in admin cell order, bit-packed in blocks of 64, with each cell's first row; the ones a boundary hides (its label for place search) beside them (`builder/src/place_files.h`) |
