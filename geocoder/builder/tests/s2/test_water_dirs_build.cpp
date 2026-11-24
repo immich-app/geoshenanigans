@@ -6,6 +6,7 @@
 // too, and a build without --multi-output writes the exact tier beside its
 // mode's files.
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -16,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "id_allocator.h"
 #include "marine_test_file.h"
 #include "pbf_test_objects.h"
 #include "scratch_dir.h"
@@ -137,6 +139,21 @@ std::vector<std::string> slot_names(const std::string& dir) {
         AdminPolygonRecord r;
         std::memcpy(&r, records.data() + at, sizeof r);
         out.push_back(r.name_id == NO_DATA ? "" : r.name_id < pool.size() ? pool.data() + r.name_id : "(out of the pool)");
+    }
+    return out;
+}
+
+// The name of each live slot of a water dir that a closed way holds, by
+// the way's id, from the dir's polygon sidecar (admin_polygons.osm_ids).
+std::map<int64_t, std::string> names_by_way(const std::string& dir) {
+    gc::id_alloc::IdAllocator alloc;
+    if (!alloc.load_previous(dir + "/admin_polygons.osm_ids")) return {{0, "(sidecar unread)"}};
+    const std::vector<std::string> names = slot_names(dir);
+    std::map<int64_t, std::string> out;
+    for (size_t s = 0; s < alloc.slots().size(); s++) {
+        const gc::id_alloc::SidecarSlot& slot = alloc.slots()[s];
+        if (gc::id_alloc::is_tombstone(slot) || slot.object_type != uint8_t(gc::id_alloc::ObjectType::OSM_WAY)) continue;
+        out[static_cast<int64_t>(slot.stable_id)] = s < names.size() ? names[s] : "(no record)";
     }
     return out;
 }
@@ -289,12 +306,20 @@ TEST(a_way_only_the_water_layer_reads_stays_out_of_the_other_layers) {
     const std::vector<std::string> names = names_in(a.at("planet/water/all/exact/strings_core.bin"));
     CHECK(std::find(names.begin(), names.end(), "English Pond") != names.end());
     CHECK(std::find(names.begin(), names.end(), "Ried") != names.end());
-    // ... and no other dir has more than it has without them: the same
-    // POIs and streets, slot by slot.
-    for (const char* f : {"planet/poi/all/poi_records.osm_ids", "planet/full/street_ways.osm_ids"}) {
-        REQUIRE(a.count(f) && b.count(f));
-        CHECK(a.at(f) == b.at(f));
-    }
+    // ... and every other file is as it is without them, byte for byte: the
+    // same POIs and streets, slot by slot, and their strings and geometry.
+    REQUIRE(a.count("planet/poi/all/poi_records.osm_ids") && a.count("planet/full/street_ways.osm_ids"));
+    std::set<std::string> outside_water;
+    for (const auto* files : {&a, &b})
+        for (const auto& [name, bytes] : *files)
+            if (name.rfind("planet/water/", 0) != 0) outside_water.insert(name);
+    size_t differing = 0;
+    for (const std::string& f : outside_water)
+        if (!a.count(f) || !b.count(f) || a.at(f) != b.at(f)) {
+            std::printf("    %s differs\n", f.c_str());
+            differing++;
+        }
+    CHECK_EQ(differing, size_t(0));
 }
 
 TEST(build_index_loads_the_marine_areas_it_is_given_into_the_water_dirs) {
@@ -349,10 +374,11 @@ TEST(a_build_without_multi_output_writes_the_exact_water_tier_beside_its_modes_f
 }
 
 TEST(a_river_area_shows_its_waterway_relations_name_as_the_datasets_names_go) {
-    // name:en, else name, as admin, place and POI names go. A relation of a
-    // local name alone shows the name:en its river ways carry over the most
-    // length where the ways of one hold more than half of the length, else
-    // its own name; one with a name:en of its own shows that.
+    // name:en, else name, as admin, place and POI names go. A relation with
+    // a name:en of its own shows that. One with only a local name shows the
+    // name:en its river ways carry over the most length if all its ways
+    // with a name:en together cover more than half its river ways' length,
+    // else its own name.
     const int32_t lat0 = 350000000, lng0 = 1380000000;
     std::vector<TestObject> objects;
     int64_t next = 1;
@@ -395,8 +421,12 @@ TEST(a_river_area_shows_its_waterway_relations_name_as_the_datasets_names_go) {
     objects.push_back(way(132, {at(lat0 + 350000, lng0), at(lat0 + 352000, lng0)}, {{"waterway", "river"}, {"name", "Havel"}}));
     objects.push_back(relation(953, {{"type", "waterway"}, {"waterway", "river"}, {"name", "Havel"}}, {{131, ""}, {132, ""}}));
     const ScratchDir root("water-river-names");
-    const std::vector<std::string> names = planet_water_names(objects, root.path() + "/out");
+    const std::string out = root.path() + "/out";
+    const std::vector<std::string> names = planet_water_names(objects, out);
     CHECK(names == std::vector<std::string>({"Danube", "Havel", "Koshibu River", "Spree"}));
+    // Each on its own area.
+    CHECK(names_by_way(out + "/planet/water/all/exact") ==
+          (std::map<int64_t, std::string>{{100, "Koshibu River"}, {110, "Danube"}, {120, "Spree"}, {130, "Havel"}}));
 }
 
 TEST(a_node_the_input_lacks_leaves_a_gap_that_no_water_ring_or_line_crosses) {
