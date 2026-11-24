@@ -138,22 +138,48 @@ TEST(postcode_de_5_digits) {
     CHECK(!validate_postcode_for_country("de", "1011"));
 }
 
-// ---- Bahrain: 4 OR 5 digits (dual-length branch) --------------------------
+// ---- Bahrain: 3 OR 4 digits (d?ddd) -----------------------------------------
 
-TEST(postcode_bh_4_or_5_digits) {
+TEST(postcode_bh_3_or_4_digits) {
+    CHECK(validate_postcode_for_country("bh", "317"));
     CHECK(validate_postcode_for_country("bh", "1234"));
-    CHECK(validate_postcode_for_country("bh", "12345"));
-    CHECK(!validate_postcode_for_country("bh", "123"));     // 3 too short
-    CHECK(!validate_postcode_for_country("bh", "123456"));  // 6 too long
-    CHECK(!validate_postcode_for_country("bh", "1234A"));   // non-digit
+    CHECK(!validate_postcode_for_country("bh", "12"));     // 2 too short
+    CHECK(!validate_postcode_for_country("bh", "31700"));  // 5 too long
+    CHECK(!validate_postcode_for_country("bh", "123A"));   // non-digit
 }
 
-// ---- Ukraine: 6 OR 7 digits ------------------------------------------------
+// ---- Ukraine: 5 OR 6 digits (d?ddddd) --------------------------------------
 
-TEST(postcode_ua_6_or_7_digits) {
+TEST(postcode_ua_5_or_6_digits) {
+    CHECK(validate_postcode_for_country("ua", "01001"));
     CHECK(validate_postcode_for_country("ua", "123456"));
-    CHECK(validate_postcode_for_country("ua", "1234567"));
-    CHECK(!validate_postcode_for_country("ua", "12345"));
+    CHECK(!validate_postcode_for_country("ua", "0100"));
+    CHECK(!validate_postcode_for_country("ua", "0100123"));
+}
+
+// ---- Nigeria: dddddd, or (ll)[ -]?(dd)[ -]?([A-Z0-9]{3})[ -]?(ll)[ -]?(dd) --
+
+TEST(postcode_ng_6_digits_or_the_lettered_pattern) {
+    CHECK(validate_postcode_for_country("ng", "100001"));
+    CHECK(!validate_postcode_for_country("ng", "10001"));
+    // The lettered pattern is 11 characters past its separators, over the 10 of every other.
+    CHECK(validate_postcode_for_country("ng", "AB 12 C3D EF 45"));
+    CHECK(validate_postcode_for_country("ng", "ab-12-123-ef-45"));
+    CHECK(validate_postcode_for_country("ng", "AB12XYZEF45"));
+    CHECK(!validate_postcode_for_country("ng", "A1 12 C3D EF 45"));
+    CHECK(!validate_postcode_for_country("ng", "AB 12 C3D E5 45"));
+    CHECK(!validate_postcode_for_country("ng", "AB 12 C3D EF 4X"));
+    CHECK(!validate_postcode_for_country("ng", "AB 12 C3D EF 456"));
+}
+
+// A house's own tag passes in these countries as it does in their patterns.
+TEST(postcode_tag_ua_bh_ng) {
+    CHECK(postcode_tag_valid_for_country("ua", "01001"));
+    CHECK(postcode_tag_valid_for_country("ua", "UA-01001"));
+    CHECK(!postcode_tag_valid_for_country("ua", "0100123"));
+    CHECK(postcode_tag_valid_for_country("bh", "317"));
+    CHECK(!postcode_tag_valid_for_country("bh", "31700"));
+    CHECK(postcode_tag_valid_for_country("ng", "AB 12 C3D EF 45"));
 }
 
 // ---- "Always false" bucket (postcode not used in that country) -------------

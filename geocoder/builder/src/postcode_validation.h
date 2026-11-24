@@ -19,10 +19,15 @@ inline bool validate_postcode_for_country(const char* cc, const char* pc) {
         if (c != ' ' && c != '-') bare += c;
     }
     size_t len = bare.size();
-    if (len == 0 || len > 10) return false;
     auto is_d = [](char c) { return c >= '0' && c <= '9'; };
     auto is_l = [](char c) { return c >= 'A' && c <= 'Z'; };
-    (void)is_d; (void)is_l;
+    // Nigeria's second pattern, (ll)[ -]?(dd)[ -]?([A-Z0-9]{3})[ -]?(ll)[ -]?(dd),
+    // is 11 characters past its separators, over the cap of every other.
+    if (key == pack_country_code('n', 'g') && len == 11)
+        return is_l(bare[0]) && is_l(bare[1]) && is_d(bare[2]) && is_d(bare[3]) &&
+               std::all_of(bare.begin() + 4, bare.begin() + 7, [&](char c) { return is_l(c) || is_d(c); }) &&
+               is_l(bare[7]) && is_l(bare[8]) && is_d(bare[9]) && is_d(bare[10]);
+    if (len == 0 || len > 10) return false;
     switch (key) {
         case ('a' << 8 | 'e'): return false;
         case ('a' << 8 | 'g'): return false;
@@ -92,7 +97,7 @@ inline bool validate_postcode_for_country(const char* cc, const char* pc) {
         case ('b' << 8 | 'd'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
         case ('b' << 8 | 'e'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
         case ('b' << 8 | 'g'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('b' << 8 | 'h'): return (len == 4 || len == 5) && std::all_of(bare.begin(), bare.end(), is_d);
+        case ('b' << 8 | 'h'): return (len == 3 || len == 4) && std::all_of(bare.begin(), bare.end(), is_d);
         case ('b' << 8 | 'm'): return true; // (ll)[ -]?(dd)
         case ('b' << 8 | 'n'): return true; // (ll) ?(dddd)
         case ('b' << 8 | 'r'): return len == 8 && std::all_of(bare.begin(), bare.end(), is_d);
@@ -185,7 +190,7 @@ inline bool validate_postcode_for_country(const char* cc, const char* pc) {
         case ('m' << 8 | 'z'): return true; // (dddd)(?:-dd)?
         case ('n' << 8 | 'a'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
         case ('n' << 8 | 'e'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('n' << 8 | 'g'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
+        case ('n' << 8 | 'g'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d); // or the lettered pattern above
         case ('n' << 8 | 'i'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
         case ('n' << 8 | 'l'): return len == 6 && is_d(bare[0]) && is_d(bare[1]) && is_d(bare[2]) && is_d(bare[3]) && is_l(bare[4]) && is_l(bare[5]);
         case ('n' << 8 | 'o'): return len == 4 && std::all_of(bare.begin(), bare.end(), is_d);
@@ -227,7 +232,7 @@ inline bool validate_postcode_for_country(const char* cc, const char* pc) {
         case ('t' << 8 | 't'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
         case ('t' << 8 | 'w'): return true; // ddd(?:ddd?)?
         case ('t' << 8 | 'z'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
-        case ('u' << 8 | 'a'): return (len == 6 || len == 7) && std::all_of(bare.begin(), bare.end(), is_d);
+        case ('u' << 8 | 'a'): return (len == 5 || len == 6) && std::all_of(bare.begin(), bare.end(), is_d);
         case ('u' << 8 | 's'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
         case ('u' << 8 | 'y'): return len == 5 && std::all_of(bare.begin(), bare.end(), is_d);
         case ('u' << 8 | 'z'): return len == 6 && std::all_of(bare.begin(), bare.end(), is_d);
