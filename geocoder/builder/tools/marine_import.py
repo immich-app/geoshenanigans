@@ -507,6 +507,8 @@ def build(opts):
             for key, mrgid, wkb in pieces:
                 tiles.setdefault(key, {}).setdefault(mrgid, []).append(wkb)
     _SEA_TILES = {k: {m: list(shapely.from_wkb(w)) for m, w in v.items()} for k, v in tiles.items()}
+    # The parts and pieces as WKB are done with: the land is read, and the tile workers fork, without them.
+    tiles = parts = order = pieces = wkb = None
     log(f"sea areas cut into {sum(len(v) for v in _SEA_TILES.values())} pieces in {len(_SEA_TILES)} tiles")
 
     _, _, geoms, _ = pyogrio.raw.read(_land_path(opts.land), columns=[],
