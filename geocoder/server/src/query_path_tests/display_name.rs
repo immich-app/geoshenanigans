@@ -218,6 +218,19 @@ fn a_boundary_that_loses_its_field_to_one_of_another_rank_is_still_listed() {
         .street("Rue Melsens - Melsensstraat", &[(0.0, -100.0), (0.0, 100.0)])
         .load();
     assert_eq!(display_at(&index, 0.0, 0.0), "Rue Melsens - Melsensstraat, Brussels, Brussels-Capital, Belgium");
+
+    // Of one area but another outline, the City of Fredericton is another place: it is listed,
+    // though the address names York County, the first of the two as large.
+    let mut dataset = TestIndex::country("Canada", b"CA");
+    dataset.boundary("New Brunswick", 4, 7, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("York County", 5, 10, (-8000.0, -8000.0, 8000.0, 8000.0))
+        .boundary("City of Fredericton", 6, 0, (-6000.0, -6000.0, 10_000.0, 10_000.0))
+        .street("Queen Street", &[(0.0, -100.0), (0.0, 100.0)]);
+    let area = dataset.polygons[2].0.area;
+    dataset.polygons[3].0.area = area;
+    let index = dataset.load();
+    assert_eq!(address_at(&index, 0.0, 0.0)["county"], "York County");
+    assert_eq!(display_at(&index, 0.0, 0.0), "Queen Street, City of Fredericton, York County, New Brunswick, Canada");
 }
 
 #[test]

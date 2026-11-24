@@ -15,7 +15,7 @@ const F: f64 = 1.0 / 298.257_223_563;
 const UTM_K0: f64 = 0.9996;
 
 /// The latitude beyond which _ST_BestSRID takes the polar projection.
-const POLAR_LAT: f64 = 70.0;
+pub const POLAR_LAT: f64 = 70.0;
 
 /// The longitude of origin of the north polar projection (PostGIS SRID_NORTH_LAMBERT,
 /// `+proj=laea +lat_0=90 +lon_0=-40`); the south polar one's is 0.
@@ -69,7 +69,9 @@ const FAST_OUTSIDE: f64 = 1.01;
 /// The most that expand_by_meters' box reaches from its point, as a share of the metres a degree
 /// of latitude (METRES_PER_DEGREE) and of longitude take there: a meridian degree is 110,574 m at
 /// the equator, UTM shrinks by up to its k0 and the polar projection by cos(10°) along a meridian
-/// at 70°. Searches for the boxes holding a point look this much farther.
+/// at 70°. Searches for the boxes holding a point look this much farther. It bounds a box that
+/// keeps off the antimeridian: one across it reaches this far in latitude, but spans every
+/// longitude between its corners the long way round.
 pub const BOX_REACH_FACTOR: f64 = 1.03;
 
 /// _ST_BestSRID's projection of a point.
