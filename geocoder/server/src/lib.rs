@@ -538,14 +538,17 @@ pub fn place_area_repeats<S: AsRef<str>>(found: impl IntoIterator<Item = (S, u8,
 /// address.
 #[derive(Clone, Copy)]
 pub struct RankedPoly {
+    /// Its slot in admin_polygons.bin, which names the one polygon its own name is of
+    /// (Index::admin_own_name).
+    pub slot: u32,
     pub poly: AdminPolygon,
     pub rank_address: u8,
 }
 
 impl RankedPoly {
-    /// The polygon at the rank the builder gave it.
-    pub fn of(poly: AdminPolygon) -> RankedPoly {
-        RankedPoly { poly, rank_address: poly.rank_address }
+    /// The polygon at slot `slot` at the rank the builder gave it.
+    pub fn of(slot: u32, poly: AdminPolygon) -> RankedPoly {
+        RankedPoly { slot, poly, rank_address: poly.rank_address }
     }
 }
 
@@ -942,8 +945,7 @@ pub struct Index {
     /// not the boundary's, ascending: Nominatim merges a linked node's names into its boundary's
     /// as `_place_*` (placex_indexing_prepare), which the crosscheck reads. A node labels one
     /// polygon of its boundary, the largest outer ring, and the key holds for every ring. From
-    /// place_hidden.bin's labels, on first use; with them the own name of each polygon that goes
-    /// by its node's English name (admin_own_names.bin), one of its names to Nominatim too.
+    /// place_hidden.bin's labels, on first use.
     pub linked_names: std::sync::OnceLock<Vec<(u64, u32)>>,
     /// (boundary_key, lat, lng) of the place node each boundary links, ascending: Nominatim
     /// takes the node for the boundary's centroid where it lies inside the boundary
@@ -1373,15 +1375,6 @@ impl Index {
 
     pub fn admin_polygon(&self, idx: u32) -> Option<AdminPolygon> {
         self.admin_polygon_record(idx).filter(|ap| ap.name_id != NO_DATA)
-    }
-
-    /// Each (slot, own name) of admin_own_names.bin, in slot order: the polygons that go by the
-    /// English name of the place node they link.
-    pub fn admin_own_names(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        let bytes = self.admin_own_names.as_ref().map_or(&[][..], FileBytes::as_slice);
-        bytes.chunks_exact(ADMIN_OWN_NAME_BYTES as usize).map(|r| {
-            (u32::from_le_bytes([r[0], r[1], r[2], r[3]]), u32::from_le_bytes([r[4], r[5], r[6], r[7]]))
-        })
     }
 
     /// The own name of polygon `idx` where it goes by the English name of the place node it links
@@ -1964,7 +1957,7 @@ impl Index {
                 country.get_or_insert(poly);
                 ranked_country = address;
             }
-            if address { ranked.push(RankedPoly::of(poly)); }
+            if address { ranked.push(RankedPoly::of(id & ID_MASK, poly)); }
         }
 
         let mut result = AdminResult::default();
@@ -1987,13 +1980,13 @@ impl Index {
         // Pick the smallest polygon per name and rank to avoid duplicates
         // when overlapping place areas share a name.
         let boundaries_ranked = ranked.len();
-        for (_pid, poly) in &place_area_polygons {
+        for &(pid, poly) in &place_area_polygons {
             let name = self.get_string(poly.name_id);
             let found = ranked[..boundaries_ranked].iter().map(|p| (self.get_string(p.poly.name_id), p.rank_address, p.poly.area));
             if place_area_repeats(found, &name, poly.rank_address, poly.area) {
                 continue;
             }
-            ranked.push(RankedPoly::of(*poly));
+            ranked.push(RankedPoly::of(pid, poly));
         }
         let shown = self.area_rows(&ranked, feature, &country_code_str, true);
         result.boundary_ranks = rank_bits(shown.iter().map(|&k| &ranked[k]));
@@ -2269,22 +2262,26 @@ impl Index {
                 _ => {}
             }
         });
-        let mut holding = |mut polys: Vec<(f32, u32, AdminPolygon)>| -> Vec<AdminPolygon> {
+        let mut holding = |mut polys: Vec<(f32, u32, AdminPolygon)>| -> Vec<RankedPoly> {
             polys.sort_by(|a, b| a.0.total_cmp(&b.0).then((a.1 & ID_MASK).cmp(&(b.1 & ID_MASK))));
             polys.dedup_by_key(|p| p.1 & ID_MASK);
-            polys.into_iter().filter(|(_, id, poly)| scan.pip.holds(self, *id, poly)).map(|(_, _, poly)| poly).collect()
+            polys.into_iter()
+                .filter(|(_, id, poly)| scan.pip.holds(self, *id, poly))
+                .map(|(_, id, poly)| RankedPoly::of(id & ID_MASK, poly))
+                .collect()
         };
-        let mut ranked: Vec<RankedPoly> = holding(boundaries).into_iter().map(RankedPoly::of).collect();
+        let mut ranked: Vec<RankedPoly> = holding(boundaries);
         // The place areas, but one repeating a boundary of its name and rank, as find_admin_in
         // takes them.
         let boundaries_ranked = ranked.len();
-        for poly in holding(place_areas) {
+        for area in holding(place_areas) {
+            let poly = area.poly;
             let name = self.get_string(poly.name_id);
             let found = ranked[..boundaries_ranked].iter().map(|p| (self.get_string(p.poly.name_id), p.rank_address, p.poly.area));
             if place_area_repeats(found, &name, poly.rank_address, poly.area) {
                 continue;
             }
-            ranked.push(RankedPoly::of(poly));
+            ranked.push(area);
         }
         let walk = |ranked: &[RankedPoly]| self.area_walk(ranked, feature, &cc).into_iter().map(|(k, accepted, _)| (k, accepted)).collect();
         CurrentBoundaries::from_ranked(ranked, walk)
@@ -2705,12 +2702,12 @@ impl Index {
 
         // Also collect class='place' polygons (admin_level=15) via
         // PIP from the query point: these aren't in the parent chain.
-        let mut place_area_polygons: Vec<AdminPolygon> = Vec::new();
+        let mut place_area_polygons: Vec<(u32, AdminPolygon)> = Vec::new();
         scan.for_each_entry(|pip, id, poly| {
             if poly.admin_level != 15 || poly.place_type_override == 0 { return; }
             if poly.area <= 0.0 || !ADDRESS_AREA_RANKS.contains(&poly.rank_address) { return; }
             if !pip.holds(self, id, &poly) { return; }
-            place_area_polygons.push(poly);
+            place_area_polygons.push((id & ID_MASK, poly));
         });
 
         // Now build the same ranked structure as find_admin, at the builder's ranks.
@@ -2722,10 +2719,10 @@ impl Index {
             // ISO-less level-2 polygons (maritime boundary closed ways)
             // can never name a country — see find_admin.
             if poly.admin_level == 2 && poly.country_code == 0 { continue; }
-            if ADDRESS_AREA_RANKS.contains(&poly.rank_address) { ranked.push(RankedPoly::of(poly)); }
+            if ADDRESS_AREA_RANKS.contains(&poly.rank_address) { ranked.push(RankedPoly::of(pid, poly)); }
         }
         // Add place-area polygons
-        ranked.extend(place_area_polygons.iter().map(|poly| RankedPoly::of(*poly)));
+        ranked.extend(place_area_polygons.iter().map(|&(slot, poly)| RankedPoly::of(slot, poly)));
         // The chain's country, whose levels the walk weighs the areas by.
         let country_code_str: String = ranked.iter()
             .find(|r| r.poly.admin_level == 2)
@@ -3576,7 +3573,9 @@ impl Index {
 
     /// The rows of an address that are named `name` (a string id), in Nominatim's order within a
     /// rank (results.py:617-621: fromarea, then distance, descending): the polygons named so, by
-    /// their own name or by a place node's they link, the farthest from `feature` first
+    /// the name they go by, by their own beside it (admin_own_names.bin, each polygon's by its
+    /// slot: Nominatim's CrosscheckNames compares each place's names, results.py:606) or by a
+    /// place node's they link, the farthest from `feature` first
     /// (area_row_distance), then the place nodes of `nodes` (PlaceResult::named_rows), the
     /// farthest first (a node a polygon links is hidden, and none of them). The polygons are
     /// those of `areas`, the address's ranked polygons (found by `scan`), and those of the scan's
@@ -3585,13 +3584,15 @@ impl Index {
     /// gave it.
     fn crosscheck_rows(&self, name: u32, areas: &[RankedPoly], scan: &mut AdminScan, nodes: &[NamedRow],
                        feature: PlaceFeature<'_>) -> Vec<AddressRow<'_>> {
-        let named = |poly: &AdminPolygon| poly.name_id == name || self.links_name(poly, name);
+        let named = |slot: u32, poly: &AdminPolygon| {
+            poly.name_id == name || self.links_name(poly, name) || self.admin_own_name(slot) == Some(name)
+        };
         let same = |a: &AdminPolygon, b: &AdminPolygon| a.ring_offset == b.ring_offset && a.ring_bytes == b.ring_bytes;
-        let mut polygons: Vec<RankedPoly> = areas.iter().filter(|r| named(&r.poly)).copied().collect();
+        let mut polygons: Vec<RankedPoly> = areas.iter().filter(|r| named(r.slot, &r.poly)).copied().collect();
         let mut seen: Vec<u32> = Vec::new();
         for k in 0..scan.rings.len() {
             let (id, poly) = scan.rings[k];
-            if !is_address_area(&poly) || !named(&poly) || seen.contains(&(id & ID_MASK)) { continue; }
+            if !is_address_area(&poly) || !named(id & ID_MASK, &poly) || seen.contains(&(id & ID_MASK)) { continue; }
             seen.push(id & ID_MASK);
             if areas.iter().any(|r| same(&r.poly, &poly)) { continue; }
             let row = match feature {
@@ -3599,7 +3600,7 @@ impl Index {
                 PlaceFeature::Line(line) => self.runs_through(&poly, line),
             };
             if row {
-                polygons.push(RankedPoly::of(poly));
+                polygons.push(RankedPoly::of(id & ID_MASK, poly));
             }
         }
         // Most ranks have one polygon of the name, which needs no distance.
@@ -3643,13 +3644,13 @@ impl Index {
     }
 
     /// Whether the boundary of polygon `poly` links a place node named `name` other than its own
-    /// name, or has the own name `name` beside the one it goes by (linked_names).
+    /// name (linked_names).
     fn links_name(&self, poly: &AdminPolygon, name: u32) -> bool {
         self.linked_names.get_or_init(|| self.read_linked_names()).binary_search(&(boundary_key(poly), name)).is_ok()
     }
 
     /// linked_names from place_hidden.bin: each label's boundary and name where the boundary has
-    /// another name; and from admin_own_names.bin each polygon's boundary and own name.
+    /// another name.
     fn read_linked_names(&self) -> Vec<(u64, u32)> {
         let mut linked = Vec::new();
         if let Some(places) = &self.places {
@@ -3658,11 +3659,6 @@ impl Index {
                     linked.push((boundary_key(&poly), node.name_id));
                 }
             });
-        }
-        for (slot, own) in self.admin_own_names() {
-            if let Some(poly) = self.admin_polygon(slot) {
-                linked.push((boundary_key(&poly), own));
-            }
         }
         linked.sort_unstable();
         linked.dedup();
@@ -6491,17 +6487,17 @@ mod pure_helper_tests {
         let child = AdminPolygon { area: 1.0, ..boundary(2, 7) };
         let country = AdminPolygon { area: 1000.0, ..boundary(3, 2) };
         let ranked = vec![
-            RankedPoly { poly: child, rank_address: 22 },
-            RankedPoly { poly: suburb, rank_address: 20 },
-            RankedPoly { poly: country, rank_address: 4 },
+            RankedPoly { slot: 0, poly: child, rank_address: 22 },
+            RankedPoly { slot: 0, poly: suburb, rank_address: 20 },
+            RankedPoly { slot: 0, poly: country, rank_address: 4 },
         ];
         let found = CurrentBoundaries::from_ranked(ranked, walk_with(|_, _| true));
         assert_eq!(names(&found), [Some(3), Some(3), Some(1), Some(2), Some(2)]);
         // A boundary of rank 0, and one of rank 5 or 11, gates nothing.
         let ranked = vec![
-            RankedPoly { poly: child, rank_address: 0 },
-            RankedPoly { poly: suburb, rank_address: 11 },
-            RankedPoly { poly: country, rank_address: 4 },
+            RankedPoly { slot: 0, poly: child, rank_address: 0 },
+            RankedPoly { slot: 0, poly: suburb, rank_address: 11 },
+            RankedPoly { slot: 0, poly: country, rank_address: 4 },
         ];
         assert_eq!(names(&CurrentBoundaries::from_ranked(ranked, walk_with(|_, _| true))), [Some(3); 5]);
     }
@@ -6513,7 +6509,7 @@ mod pure_helper_tests {
         // neighbourhoods, no longer city, town and village nodes.
         let starehe = AdminPolygon { area: 10.0, ..boundary(1, 6) };
         let country = AdminPolygon { area: 1000.0, ..boundary(2, 2) };
-        let ranked = vec![RankedPoly { poly: starehe, rank_address: 18 }, RankedPoly { poly: country, rank_address: 4 }];
+        let ranked = vec![RankedPoly { slot: 0, poly: starehe, rank_address: 18 }, RankedPoly { slot: 0, poly: country, rank_address: 4 }];
         let found = CurrentBoundaries::from_ranked(ranked, walk_with(|_, _| true));
         assert_eq!(names(&found), [Some(2), Some(1), Some(1), Some(1), Some(1)]);
     }
@@ -6525,6 +6521,7 @@ mod pure_helper_tests {
         // suburb nodes are gated by level 8, not by level 10 at its default
         // rank 20; quarters by level 9, neighbourhoods by level 10.
         let level = |admin_level: u8, rank_address: u8, area: f32, place_type_override: u8| RankedPoly {
+            slot: 0,
             poly: AdminPolygon { area, place_type_override, ..boundary(admin_level as u32, admin_level) },
             rank_address,
         };
@@ -6551,9 +6548,9 @@ mod pure_helper_tests {
         let city = AdminPolygon { area: 1.0, place_type_override: 1, ..boundary(2, 6) };
         let country = AdminPolygon { area: 1000.0, ..boundary(3, 2) };
         let ranked = || vec![
-            RankedPoly { poly: city, rank_address: 16 },
-            RankedPoly { poly: suburb, rank_address: 20 },
-            RankedPoly { poly: country, rank_address: 4 },
+            RankedPoly { slot: 0, poly: city, rank_address: 16 },
+            RankedPoly { slot: 0, poly: suburb, rank_address: 20 },
+            RankedPoly { slot: 0, poly: country, rank_address: 4 },
         ];
         let concentric = CurrentBoundaries::from_ranked(ranked(), walk_with(|_, _| true));
         assert_eq!(names(&concentric), [Some(2), Some(2), Some(1), Some(1), Some(1)]);
@@ -7690,7 +7687,6 @@ mod query_path_tests {
         for slot in [0, 2, 3, NO_DATA] {
             assert_eq!(idx.admin_own_name(slot), None, "{slot}");
         }
-        assert_eq!(idx.admin_own_names().collect::<Vec<_>>(), [(1, idx.admin_own_name(1).unwrap())]);
 
         // A file of a part record is no file the builder writes.
         let path = dir.path().join(ADMIN_OWN_NAMES_FILE);

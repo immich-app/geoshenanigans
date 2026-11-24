@@ -148,6 +148,38 @@ fn a_polygon_named_by_its_node_takes_its_rank_by_its_own_name_too() {
 }
 
 #[test]
+fn a_polygon_takes_its_rank_by_its_own_name_and_not_by_a_namesake_s() {
+    // Two city areas go by the English name Yonkers, one string of the builder's pool, and so
+    // share their boundary's record: the one the street runs through keeps the own name Yonkers
+    // City, or none, and one far off keeps City of Yonkers. Nominatim compares the names of each
+    // place (CrosscheckNames on its placex row), so a house named City of Yonkers takes no area:
+    // the one on its street has no such name.
+    let index = |near_own: Option<&str>, city: &str| {
+        let mut index = united_states();
+        index
+            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Yonkers", 15, 1, (-1000.0, 100.0, 8000.0, 8000.0));
+        if let Some(own) = near_own {
+            index.own_name(own);
+        }
+        let yonkers = index.interned("Yonkers");
+        index.boundary("Yonkers", 15, 1, (20_000.0, 20_000.0, 24_000.0, 24_000.0)).own_name("City of Yonkers");
+        index.polygons.last_mut().unwrap().0.name_id = yonkers;
+        index
+            .street("Riverdale Avenue", &[(0.0, -200.0), (0.0, 200.0)])
+            .address("5", 10.0, 0.0)
+            .addr_city(city);
+        index.load()
+    };
+    for (near_own, city, part) in [(Some("Yonkers City"), "City of Yonkers", "Greenburgh"), (None, "City of Yonkers", "Greenburgh"),
+                                   (Some("Yonkers City"), "Yonkers City", "Yonkers"), (None, "Yonkers", "Yonkers")] {
+        let (display, address) = answer_at(&index(near_own, city), 10.0, 0.0);
+        assert_eq!(display, format!("5 Riverdale Avenue, {part}, United States"), "{near_own:?} {city}");
+        assert_eq!(address["city"], part, "{near_own:?} {city}");
+    }
+}
+
+#[test]
 fn a_place_node_takes_a_rank_a_polygon_holds() {
     // Bywood, a place=neighbourhood area (rank 24), holds the rank, and the neighbourhood node
     // Kirklyn in it is a row of rank 24 that is no part; the house's addr:city makes it the part.
