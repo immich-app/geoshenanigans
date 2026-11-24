@@ -238,11 +238,11 @@ struct Build {
 // collected areas and geometries; moves the lines (keyed, key_lines) into
 // the build's NamingLines, keys and names sorted. The names follow the
 // dataset's (name:en, else name): a relation with a name:en of its own
-// shows that; the lines of a waterway relation of a local name alone show
-// the name:en its river ways carry (LineIn::way_en) over the most length
-// (the smaller of a tie) where the ways of one hold more than half of its
-// river ways' length, else the relation's name. Lengths are in whole
-// millimetres, none across a node the input lacks.
+// shows that; for a waterway relation with only a local name, the lines
+// show the name:en its river ways carry (LineIn::way_en) over the most
+// length (the smaller of a tie) if all its ways with a name:en together
+// cover more than half its river ways' length, else the relation's name.
+// Lengths are in whole millimetres, none across a node the input lacks.
 Build assemble(Collected& c, unsigned threads);
 
 // Leaves out each OSM natural=bay or strait that is a marine area's

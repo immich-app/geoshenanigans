@@ -430,9 +430,9 @@ Build assemble(Collected& c, unsigned threads) {
     // The candidate lines, by way (the first input's copy), their keys and
     // names as sorted indices.
     first_of_each_id(c.lines, [](const LineIn& l) { return l.way; });
-    // A waterway relation of a local name alone shows the name:en its river
-    // ways carry over the most length, the smaller of a tie, where the ways
-    // of one hold more than half of its river ways' length.
+    // A waterway relation with only a local name shows the name:en its river
+    // ways carry over the most length, the smaller of a tie, if all its ways
+    // with a name:en together cover more than half its river ways' length.
     {
         struct Lengths {
             std::map<std::string, uint64_t> en;  // name:en -> millimetres
