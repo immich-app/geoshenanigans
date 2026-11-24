@@ -175,7 +175,9 @@ So no water kind ever reaches the lane: `natural=water`, `wetland`, `bay` and
 server never lets those categories (`NATURAL_WATER`, `WETLAND`, `BAY`,
 `GLACIER`, and `RESERVOIR` as a polygon) take the primary slot, nor set `road`
 or `postcode` from it (`Index::is_below_poi_rank`); a `RESERVOIR` point, a
-`landuse=reservoir|basin` node, is a rank-30 POI there and stays.
+`landuse=reservoir|basin` node, is a rank-30 POI there and stays, but for one
+a main tag of a lower rank ranks, or whose class the lane takes none of
+(below), which the builder links no parent street.
 
 **Water streets.** A water area a `highway=*` kind of rank 26 or 27 ranks
 (`area=yes`, `highway=pedestrian`, `natural=water`, ...), where no place or

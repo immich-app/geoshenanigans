@@ -207,7 +207,9 @@ inline bool poi_water_street(const char* t_natural, const char* t_landuse, const
 // than its category, its flags carry the kind for the tiers in between
 // (POI_FLAG_WATER_MASK). An object a main tag of a lower positive rank ranks
 // is the water it is, whatever its other tags, and so is a reservoir whose
-// class the POI lane takes none of (reservoir_leaves_poi_lane).
+// class the POI lane takes none of (reservoir_leaves_poi_lane); such a
+// reservoir point, which the server would let take the primary slot as it
+// does any RESERVOIR point, never does (POI_FLAG_PLACES_ONLY).
 inline std::optional<PoiClassification> classify_poi(
     const char* t_tourism, const char* t_historic, const char* t_boundary,
     const char* t_amenity, const char* t_leisure, const char* t_natural,
@@ -616,6 +618,9 @@ inline std::optional<PoiClassification> classify_poi(
             std::strcmp(t_highway, "service") == 0))) {
         flags |= POI_FLAG_HIGHWAY;
     }
+    // A reservoir point a main tag of a lower rank ranks, or of a class the
+    // POI lane takes none of, is in neither lane in Nominatim.
+    if (kept == PoiCategory::RESERVOIR && !area) flags |= POI_FLAG_PLACES_ONLY;
     uint8_t tier = poi_tier_of(cat, flags);
     if (kept != PoiCategory::UNKNOWN && (flags & POI_FLAG_HIGHWAY)) tier = std::min(tier, poi_tier_of(tagged, flags));
     // A water object that yields ships as the water it is in the tiers whose

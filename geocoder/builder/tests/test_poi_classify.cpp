@@ -635,6 +635,43 @@ TEST(poi_classify_a_water_area_of_a_sidewalk_crossing_link_or_traffic_aisle_foot
     }
 }
 
+TEST(poi_classify_a_reservoir_point_kept_out_of_the_poi_lane_never_takes_the_primary_slot) {
+    // A landuse node ranks 30 (ranking.sql compute_place_rank), so a plain
+    // reservoir or basin point is a rank-30 POI, in the lane, and the server
+    // lets a RESERVOIR point take the slot. One a main tag of a lower rank
+    // ranks (place=locality, 25) or whose class the POI lane takes none of
+    // (building, the first of its fallback tags) stays a RESERVOIR, but is in
+    // neither lane in Nominatim: it never takes the primary slot
+    // (POI_FLAG_PLACES_ONLY). On an area, which the server keeps out of the
+    // lanes as a RESERVOIR, it carries no such flag.
+    for (const char* landuse : {"reservoir", "basin"}) {
+        Tags plain;
+        plain.landuse = landuse;
+        const Tags fountain = with(plain, "amenity", "fountain");
+        const Tags locality = with(fountain, "place", "locality");
+        const Tags building = with(with(plain, "building", "yes"), "tourism", "attraction");
+        struct Case {
+            Tags tags;
+            PoiCategory category;
+            bool places_only;
+        };
+        for (const Case& c : {Case{plain, PoiCategory::RESERVOIR, false}, Case{fountain, PoiCategory::FOUNTAIN, false},
+                              Case{locality, PoiCategory::RESERVOIR, true}, Case{building, PoiCategory::RESERVOIR, true}})
+            for (const bool area : {false, true}) {
+                Tags t = c.tags;
+                t.area = area;
+                const auto got = classify(t);
+                REQUIRE(got.has_value());
+                const bool places_only = c.places_only && !area;
+                if (got->category != c.category || ((got->flags & POI_FLAG_PLACES_ONLY) != 0) != places_only)
+                    std::printf("    landuse=%s, category %d, flags %d, %s\n", landuse, int(got->category),
+                                int(got->flags), area ? "an area" : "a node");
+                CHECK_EQ(uint8_t(got->category), uint8_t(c.category));
+                CHECK_EQ(int(got->flags), places_only ? int(POI_FLAG_PLACES_ONLY) : 0);
+            }
+    }
+}
+
 TEST(poi_classify_names_a_water_street_by_its_tags_alone) {
     // A water street: a water area a highway kind of rank 26 or 27 ranks,
     // where no place or landuse kind of a rank below 26 ranks it lower
