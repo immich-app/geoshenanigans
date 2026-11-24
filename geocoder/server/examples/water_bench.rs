@@ -78,6 +78,7 @@ fn world(dir: &str, water: Option<WaterLayer>) -> MultiIndex {
             name: "world",
             continent: None,
             index: arc_swap::ArcSwapOption::from(Some(Arc::new(index))),
+            loaded_stamp: None,
         }],
         root_dir: dir.to_string(),
         street_cell_level: DEFAULT_STREET_CELL_LEVEL,

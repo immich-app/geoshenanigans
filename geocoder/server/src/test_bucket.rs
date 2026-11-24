@@ -11,9 +11,9 @@
 //! the first one's bytes under each name. A dir holding all the files of one
 //! of the template's transport units publishes the unit, the only form of them;
 //! every other file goes as its .zst. A test can have it hold an object's
-//! body back half way (TestBucket::hold), or fail the next fetches of one
-//! (TestBucket::fail). A case of a host without CA certificates runs in a
-//! process of its own (without_ca_store).
+//! body back half way (TestBucket::hold), or a manifest's, or fail the next
+//! fetches of one (TestBucket::fail). A case of a host without CA
+//! certificates runs in a process of its own (without_ca_store).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -80,9 +80,10 @@ impl TestBucket {
         self.file_requests.load(Ordering::SeqCst)
     }
 
-    /// Holds back the body of the object at `path` (a unit, or a file's
-    /// .zst) the next time it is fetched: it sends the first half, and the
-    /// rest once the Holding returned is dropped.
+    /// Holds back the body of the object at `path` (a unit, a file's .zst,
+    /// or `configurations.json`, a build's manifest) the next time it is
+    /// fetched: it sends the first half, and the rest once the Holding
+    /// returned is dropped.
     pub fn hold(&self, path: &str) -> Holding {
         let (reached, (go_tx, go)) = (Arc::new(tokio::sync::Notify::new()), tokio::sync::oneshot::channel());
         *self.hold.lock().unwrap() = Some(Hold { path: path.to_string(), reached: reached.clone(), go });
@@ -180,7 +181,7 @@ async fn get(State(s): State<Arc<Served>>, Path(path): Path<String>) -> Response
         return StatusCode::NOT_FOUND.into_response();
     };
     if rest == "configurations.json" {
-        return manifest.into_response();
+        return send(&s, rest, manifest.as_bytes());
     }
     if let Some((object, body)) = s.objects.get_key_value(rest) {
         s.file_requests.fetch_add(1, Ordering::SeqCst);
@@ -190,21 +191,27 @@ async fn get(State(s): State<Arc<Served>>, Path(path): Path<String>) -> Response
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
         let body = if s.mended.load(Ordering::SeqCst) { s.true_objects.get(object).unwrap_or(body) } else { body };
-        let held = s.hold.lock().unwrap().take_if(|h| h.path == *object);
-        if let Some(Hold { reached, go, .. }) = held {
-            use futures_util::StreamExt;
-            let (first, rest) = body.split_at(body.len() / 2);
-            let (first, rest) = (bytes::Bytes::copy_from_slice(first), bytes::Bytes::copy_from_slice(rest));
-            let rest = futures_util::stream::once(async move {
-                reached.notify_one();
-                let _ = go.await;
-                Ok::<_, std::io::Error>(rest)
-            });
-            return axum::body::Body::from_stream(futures_util::stream::iter([Ok(first)]).chain(rest)).into_response();
-        }
-        return body.clone().into_response();
+        return send(&s, object, body);
     }
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// The response of `body`, the object at `object`: its first half, and the
+/// rest once the test lets go, where it holds the object back (hold).
+fn send(s: &Served, object: &str, body: &[u8]) -> Response {
+    let held = s.hold.lock().unwrap().take_if(|h| h.path == object);
+    if let Some(Hold { reached, go, .. }) = held {
+        use futures_util::StreamExt;
+        let (first, rest) = body.split_at(body.len() / 2);
+        let (first, rest) = (bytes::Bytes::copy_from_slice(first), bytes::Bytes::copy_from_slice(rest));
+        let rest = futures_util::stream::once(async move {
+            reached.notify_one();
+            let _ = go.await;
+            Ok::<_, std::io::Error>(rest)
+        });
+        return axum::body::Body::from_stream(futures_util::stream::iter([Ok(first)]).chain(rest)).into_response();
+    }
+    body.to_vec().into_response()
 }
 
 /// A splitmix64 stream, seeded by a name.
@@ -377,13 +384,15 @@ async fn serve_with(components: serde_json::Value, tamper: impl Fn(&str, &mut Ve
                 true_objects.insert(path.clone(), zstd::encode_all(&true_stream[..], 3).unwrap());
             }
             let body = zstd::encode_all(&stream[..], 3).unwrap();
+            // The manifest's size is the true unit's, served once mended.
+            let size = true_objects.get(&path).map_or(body.len(), Vec::len);
             for f in &held {
                 entries.insert(format!("{dir}/{f}"), serde_json::json!({ "size_raw": bytes[f].len(), "sha256": sha256(&bytes[f]), "unit": path }));
                 in_unit.insert(format!("{dir}/{f}"));
             }
             let held: Vec<String> = held.iter().map(|f| format!("{dir}/{f}")).collect();
             units.insert(path.clone(), serde_json::json!({ "kind": kind.name(), "transport_version": template["transport"]["version"],
-                                                           "size": body.len(), "files": held }));
+                                                           "size": size, "files": held }));
             objects.insert(path, body);
         }
         for (name, b) in &bytes {
@@ -395,7 +404,8 @@ async fn serve_with(components: serde_json::Value, tamper: impl Fn(&str, &mut Ve
                     true_objects.insert(format!("{path}.zst"), zstd::encode_all(&b[..], 3).unwrap());
                 }
                 let body = zstd::encode_all(&sent[..], 3).unwrap();
-                entries.insert(path.clone(), serde_json::json!({ "size_zst": body.len(), "size_raw": b.len(), "sha256": sha256(b) }));
+                let size = true_objects.get(&format!("{path}.zst")).map_or(body.len(), Vec::len);
+                entries.insert(path.clone(), serde_json::json!({ "size_zst": size, "size_raw": b.len(), "sha256": sha256(b) }));
                 objects.insert(format!("{path}.zst"), body);
             }
             files.insert(path, b.clone());

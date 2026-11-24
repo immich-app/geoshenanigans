@@ -215,21 +215,12 @@ async fn async_main() {
 
     let region_state = Arc::new(RegionState::new(index.clone(), std::path::PathBuf::from(data_dir)));
 
-    // On startup, kick off any preload downloads from the persisted
-    // configuration. Skipped silently if there's no persisted file —
-    // server starts empty and waits for a PUT /admin/configuration.
-    {
-        let s = region_state.clone();
-        let cfg = s.get_configuration().await;
-        for region in cfg.preload {
-            let s = s.clone();
-            tokio::spawn(async move {
-                if let Err(e) = s.ensure_loaded(&region).await {
-                    eprintln!("startup preload {}: {}", region, e);
-                }
-            });
-        }
-    }
+    // On startup, kick off the downloads the persisted configuration asks
+    // for: its preloads, and each loaded region whose files are of another
+    // bucket or selection (a PUT's whose downloads had not gone through).
+    // Skipped if there's no persisted file — the server waits for a PUT
+    // /admin/configuration.
+    drop(region_state.resume().await);
 
     let app = Router::new()
         .route("/health", get(health))

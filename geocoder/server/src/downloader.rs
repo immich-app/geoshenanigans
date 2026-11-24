@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
-use query_server::{file_mark, lower_hex, take_download_lock, FileMark, LockFor, BUILD_STAMP, DOWNLOAD_LOCK, FILE_LEDGER};
+use query_server::{lower_hex, take_download_lock, LockFor, BUILD_STAMP, DOWNLOAD_LOCK, FILE_LEDGER};
 use query_server::transport::{self, ChunkReader, Expected, TRANSPORT_VERSION};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -1007,19 +1007,22 @@ thread_local! {
 /// FETCH_DIR of the dir it goes in, the downloader's own, marked so as it is
 /// made (FETCH_MARK), and renames it into place: a file at the name of one of
 /// the build's with .tmp after it is none of a download's, and stays. The
-/// dir's stamp (BUILD_STAMP) says it holds a complete selection of the build
-/// it names and none of those files: a download that fetches or removes
-/// anything fails where a fetch dir's place holds what isn't the
-/// downloader's (a file, a link, or a dir holding files but not the mark),
+/// dir's stamp (BUILD_STAMP) says it holds a complete selection of the build,
+/// from the bucket and of the selection it names (stamp_text), and none of
+/// those files: a download that fetches or removes anything fails where a
+/// fetch dir's place holds what isn't the downloader's (a file, a link, or a
+/// dir holding files but not the mark),
 /// before it makes the ledger or removes the stamp; else it makes the ledger
 /// where the dir has none, then removes the stamp, before it writes anything
 /// else (a server leaves a dir holding the ledger but no stamp unloaded, and
 /// loads one holding neither), then removes the fetch dirs with what killed
 /// fetches left in them, and puts the stamp in once the last fetch is in and
 /// the fetch dirs are gone, the ledger rewritten with a line a file of the
-/// selection; one that has nothing to fetch or remove in a dir stamped with
-/// its build writes nothing. Downloads into the dir go one at a time, across
-/// processes too, and a server loads the dir only while none runs
+/// selection; one that has nothing to fetch or remove in a dir stamped so,
+/// with its build, bucket and selection, writes nothing, and one stamped
+/// otherwise or not at all removes the fetch dirs of the downloader's there
+/// (a killed download's) and stamps it. Downloads into the dir go one at a
+/// time, across processes too, and a server loads the dir only while none runs
 /// (DOWNLOAD_LOCK). Before it reads the dir a download finishes what a decode
 /// killed part way left there and in each sub-dir a component's `dir` names
 /// (finish_leftovers), or fails, writing nothing. A unit's files land
@@ -1030,11 +1033,6 @@ thread_local! {
 ///
 /// `progress` fires after each file or unit completes with the running
 /// total; the caller logs it.
-///
-/// Returns the mark of the stamp it leaves in the dir (FileMark), found
-/// while it holds the lock: a load that finds that stamp loads the files of
-/// `sel`, and one that finds another those of a download that ran after it
-/// (another server's, on the same data dir).
 pub async fn download_region(
     client: &reqwest::Client,
     base_url: &str,
@@ -1042,7 +1040,7 @@ pub async fn download_region(
     sel: &RegionSelection,
     root: &Path,
     progress: impl Fn(DownloadProgress) + Send + Sync,
-) -> Result<FileMark, DownloadError> {
+) -> Result<(), DownloadError> {
     let resolved = resolve_files(cfg, sel)?;
     if resolved.paths.is_empty() {
         return Err(DownloadError::UnknownRegion(sel.region.clone()));
@@ -1126,7 +1124,8 @@ pub async fn download_region(
         }
     }
     let changes = to_fetch || !others.is_empty();
-    let stamped = tokio::fs::read_to_string(&stamp).await.is_ok_and(|s| s.trim() == cfg.build.date);
+    let record = stamp_text(&cfg.build.date, base_url, sel);
+    let stamped = tokio::fs::read_to_string(&stamp).await.is_ok_and(|s| s == record);
     if changes {
         // What is at a fetch dir's place goes below with all it holds: the
         // downloader's own, or the download fails here, having changed
@@ -1234,11 +1233,40 @@ pub async fn download_region(
         // a server loading the dir without its lock tells it from the stamp
         // it found by its inode, should the download run all through while
         // it loaded.
-        write_whole(&stamp, cfg.build.date.as_bytes()).await?;
+        write_whole(&stamp, record.as_bytes()).await?;
     }
-    file_mark(&stamp)
-        .map_err(|e| DownloadError::Io(format!("stat {}: {}", stamp.display(), e)))?
-        .ok_or_else(|| DownloadError::Io(format!("{} isn't there once the download put it in", stamp.display())))
+    Ok(())
+}
+
+/// What a download writes in the stamp (BUILD_STAMP) of a region dir it
+/// leaves holding a complete selection: the build's date on its first line,
+/// then the bucket it came from (`base_url`) and the selection's value on
+/// each of COMPONENT_AXES, a line each. A server tells the bucket and the
+/// selection of the files it loaded by the stamp the dir held as it loaded
+/// it (stamped_source).
+pub fn stamp_text(date: &str, base_url: &str, sel: &RegionSelection) -> String {
+    let mut text = format!("{date}\nbase_url {base_url}\n");
+    for axis in COMPONENT_AXES {
+        text += &format!("{axis} {}\n", sel.axis(axis).unwrap_or_default());
+    }
+    text
+}
+
+/// The bucket and the selection of `region` the text of a stamp names
+/// (stamp_text); none for text of another form.
+pub fn stamped_source(text: &str, region: &str) -> Option<(String, RegionSelection)> {
+    let mut lines = text.lines();
+    let date = lines.next()?;
+    let mut value = |key: &str| Some(lines.next()?.strip_prefix(key)?.strip_prefix(' ')?.to_string());
+    let base_url = value("base_url")?;
+    let sel = RegionSelection {
+        region: region.to_string(),
+        mode: value("mode")?,
+        quality: value("quality")?,
+        poi_tier: value("poi_tier")?,
+        water: value("water")?,
+    };
+    (stamp_text(date, &base_url, &sel) == text).then_some((base_url, sel))
 }
 
 // --- Regression tests ---------------------------------------------------------
@@ -1837,7 +1865,7 @@ mod tests {
             .collect();
         let ledger: String = want.iter().map(|(name, bytes)| format!("{name} {}\n", sha256_of(bytes))).collect();
         want.insert(FILE_LEDGER.into(), ledger.into_bytes());
-        want.insert(BUILD_STAMP.into(), test_bucket::DATE.as_bytes().to_vec());
+        want.insert(BUILD_STAMP.into(), stamp_text(test_bucket::DATE, &bucket.url, s).into_bytes());
         if cfg!(unix) {
             want.insert(DOWNLOAD_LOCK.into(), Vec::new());
         }
@@ -2067,21 +2095,31 @@ mod tests {
     }
 
     // A download with nothing to fetch into a dir whose stamp doesn't name
-    // the build (one killed once its last fetch was in, before the stamp, or
-    // stamped with an older build) fetches nothing, rewrites the ledger with
-    // a line a file and stamps the dir.
+    // the build, the bucket and the selection (one killed once its last
+    // fetch was in, before the stamp; one stamped with an older build, or
+    // naming another bucket or selection, as a download from another bucket
+    // of the same files, or of another selection taking them, leaves it)
+    // fetches nothing, rewrites the ledger with a line a file and stamps the
+    // dir.
     #[tokio::test]
     async fn a_download_with_nothing_to_fetch_into_a_dir_not_stamped_with_its_build_stamps_it() {
         use std::io::Write;
         let s = sel("europe", "admin", "simplified", "major");
         let bucket = test_bucket::serve(test_bucket::template_components()).await;
-        for stamp in [None, Some("2025-12-01")] {
+        let other_tier = RegionSelection { poi_tier: "all".into(), ..s.clone() };
+        let others = [
+            "2025-12-01".to_string(),
+            stamp_text("2025-12-01", &bucket.url, &s),
+            stamp_text(test_bucket::DATE, "http://another.bucket", &s),
+            stamp_text(test_bucket::DATE, &bucket.url, &other_tier),
+        ];
+        for stamp in std::iter::once(None).chain(others.iter().map(Some)) {
             let root = ScratchDir::new();
             download(&bucket, &s, root.path()).await.unwrap();
             let dir = root.path().join("europe");
             match stamp {
                 None => std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap(),
-                Some(date) => std::fs::write(dir.join(BUILD_STAMP), date).unwrap(),
+                Some(text) => std::fs::write(dir.join(BUILD_STAMP), text).unwrap(),
             }
             let sha256 = &bucket.manifest.files["europe/admin/admin_cells.bin"].sha256;
             let mut ledger = std::fs::OpenOptions::new().append(true).open(dir.join(FILE_LEDGER)).unwrap();
@@ -2714,7 +2752,7 @@ mod tests {
         download(&bucket, &s, whole.path()).await.unwrap();
         let all = bucket.files_served();
         older_build(&bucket, &s, root.path());
-        std::fs::write(root.path().join("europe").join(BUILD_STAMP), test_bucket::DATE).unwrap();
+        std::fs::write(root.path().join("europe").join(BUILD_STAMP), stamp_text(test_bucket::DATE, &bucket.url, &s)).unwrap();
 
         download(&bucket, &s, root.path()).await.unwrap();
 
@@ -2762,7 +2800,7 @@ mod tests {
             assert_eq!((fetched, replaced == theirs), (1, true), "stopped: {stopped}");
             // The dir was stamped with the build before the switch: one that
             // stopped part way leaves it stamped with none.
-            assert_eq!(stamp.as_deref(), (!stopped).then_some(test_bucket::DATE), "stopped: {stopped}");
+            assert_eq!(stamp, (!stopped).then(|| stamp_text(test_bucket::DATE, &bucket.url, &all)), "stopped: {stopped}");
             assert_eq!(bucket.files_served() - before, 2, "stopped: {stopped}");
             assert!(held(&root.path().join("europe")) == files_of(&bucket, &major), "stopped: {stopped}");
         }
@@ -3123,6 +3161,43 @@ mod tests {
         }
     }
 
+    // A stamp names the bucket and the selection a download left: its text
+    // gives them back, for the region of its dir. Text of another form (a
+    // date alone, a line out of place or missing, a bucket with a newline in
+    // it) names none.
+    #[test]
+    fn a_stamp_names_the_bucket_and_the_selection_of_its_download() {
+        let s = wet("europe", "full", "exact", "major", "all-exact");
+        let text = stamp_text("2026-01-01", "http://bucket/geocoder", &s);
+
+        assert_eq!(text, "2026-01-01\nbase_url http://bucket/geocoder\nmode full\nquality exact\npoi_tier major\nwater all-exact\n");
+        assert_eq!(stamped_source(&text, "europe"), Some(("http://bucket/geocoder".to_string(), s.clone())));
+        let swapped = text.replace("mode full\nquality exact", "quality exact\nmode full");
+        let cut = text.trim_end_matches("water all-exact\n").to_string();
+        for other in ["2026-01-01".to_string(), swapped, cut, stamp_text("2026-01-01", "http://bucket\nmode admin", &s)] {
+            assert_eq!(stamped_source(&other, "europe"), None, "{other:?}");
+        }
+    }
+
+    // A bucket that serves objects of other bytes gives the true objects'
+    // sizes in its manifest, as a bucket serving those does: the sizes of
+    // what it serves once mended. Here a unit and a file's .zst, each
+    // served with bytes after its own.
+    #[tokio::test]
+    async fn a_tampered_buckets_manifest_gives_the_sizes_of_what_it_serves_once_mended() {
+        const UNIT: &str = "europe/water/all/simplified/arcs.tt.zst";
+        const FILE: &str = "europe/admin/admin_cells.bin";
+        let tampered = test_bucket::serve_tampered(test_bucket::template_components(), |path, bytes| {
+            if path == UNIT || path == format!("{FILE}.zst") {
+                bytes.extend_from_slice(b"and more");
+            }
+        }).await;
+        let true_one = test_bucket::serve(test_bucket::template_components()).await;
+
+        let sizes = |b: &TestBucket| (b.manifest.units[UNIT].size, b.manifest.files[FILE].size_zst);
+        assert_eq!(sizes(&tampered), sizes(&true_one));
+    }
+
     // A complete download leaves the ledger a line a file, each naming the
     // build's sha256, however many lines it held, and the stamp.
     #[tokio::test]
@@ -3140,7 +3215,7 @@ mod tests {
         let want = files_of(&bucket, &s);
         assert!(lines > want.len(), "{lines}");
         assert_eq!(std::fs::read_to_string(dir.join(FILE_LEDGER)).unwrap(), String::from_utf8(want[FILE_LEDGER].clone()).unwrap());
-        assert_eq!(std::fs::read_to_string(dir.join(BUILD_STAMP)).unwrap(), test_bucket::DATE);
+        assert_eq!(std::fs::read_to_string(dir.join(BUILD_STAMP)).unwrap(), stamp_text(test_bucket::DATE, &bucket.url, &s));
     }
 
     // A unit with one bad byte, in a file's bytes (decoded, of another

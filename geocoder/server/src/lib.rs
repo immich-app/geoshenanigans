@@ -3435,7 +3435,8 @@ impl Index {
 // continent subdirs.
 
 /// The stamp of a continent dir the server's downloader fills: the date of
-/// the build it holds a complete selection of, and no other file the
+/// the build it holds a complete selection of, with the bucket and the
+/// selection (the downloader's stamp_text), and no other file the
 /// downloader put there nor of a name a file of the build has. The
 /// downloader removes it before it writes or removes anything else in the
 /// dir but FILE_LEDGER, and puts it back once the last of the selection is
@@ -3652,15 +3653,16 @@ thread_local! {
 /// changed is dropped. That holds where the lock is taken too: a download
 /// on a file system whose locks don't reach other machines may not see it,
 /// and the check costs a few stats. The files stay mapped after. With the
-/// index, the mark of the stamp the dir held as it loaded, which tells the
-/// download whose files it loaded (None for a dir laid out by other means).
+/// index, the text of the stamp the dir held as it loaded, which names the
+/// bucket and the selection of the files it loaded (None for a dir laid out
+/// by other means).
 /// None for a dir that isn't there or holds no admin_cells.bin. An error,
 /// why the dir doesn't load, for a lock that can't be taken, a download that
 /// broke off (unfinished_download): it can leave files of a build or
 /// selection beside those of the one before, which Index::load can't tell
 /// apart; for a dir Index::load refuses; and for one a download changed
 /// while it loaded.
-fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Option<(Index, Option<FileMark>)>, String> {
+fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Option<(Index, Option<String>)>, String> {
     // A dir that isn't there holds nothing to load, and gets no lock file.
     if !std::path::Path::new(dir).is_dir() {
         return Ok(None);
@@ -3674,6 +3676,14 @@ fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, sear
     if let Some(why) = marks.unfinished_download() {
         return Err(why);
     }
+    // Read before the dir is, under its lock: a stamp a download put in
+    // meanwhile changes the marks, which the check below finds.
+    let stamp_path = format!("{}/{}", dir, BUILD_STAMP);
+    let stamp = match std::fs::read_to_string(&stamp_path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("can't read {}: {}", stamp_path, e)),
+    };
     #[cfg(test)]
     BEFORE_INDEX_LOAD.with_borrow_mut(|told| {
         if let Some(tell) = told {
@@ -3686,7 +3696,7 @@ fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, sear
     if DirMarks::of(dir)? != marks {
         return Err(format!("a download into it ran while it loaded ({} or {} changed): it may mix two selections' files", BUILD_STAMP, FILE_LEDGER));
     }
-    Ok(Some((index, marks.stamp)))
+    Ok(Some((index, stamp)))
 }
 
 pub struct ContinentSlot {
@@ -3698,6 +3708,11 @@ pub struct ContinentSlot {
     /// Hot-add via `MultiIndex::install_region` swaps a fresh Arc in
     /// without locking out concurrent queries.
     pub index: arc_swap::ArcSwapOption<Index>,
+    /// The text of the stamp (BUILD_STAMP) its dir held as MultiIndex::load
+    /// loaded it there, which names the bucket and the selection of its
+    /// files: None where it loaded none, and for a dir laid out by other
+    /// means. An install later does not change it.
+    pub loaded_stamp: Option<String>,
 }
 
 pub struct MultiIndex {
@@ -3725,6 +3740,7 @@ impl MultiIndex {
                     name: "world",
                     continent: None,
                     index: arc_swap::ArcSwapOption::from(Some(Arc::new(idx))),
+                    loaded_stamp: None,
                 }],
                 root_dir: root.to_string(),
                 street_cell_level, admin_cell_level, search_distance,
@@ -3740,17 +3756,19 @@ impl MultiIndex {
             // A dir a download broke off in, or that can't load, must not
             // take down the continents that did load; the slot stays empty
             // so the downloader can complete it later.
-            let arc_opt = match load_continent(&dir, street_cell_level, admin_cell_level, search_distance) {
-                Ok(idx) => idx.map(|(idx, _)| Arc::new(idx)),
+            let (arc_opt, loaded_stamp) = match load_continent(&dir, street_cell_level, admin_cell_level, search_distance) {
+                Ok(Some((idx, stamp))) => (Some(Arc::new(idx)), stamp),
+                Ok(None) => (None, None),
                 Err(why) => {
                     eprintln!("skipping continent {}: {}", continent.name, why);
-                    None
+                    (None, None)
                 }
             };
             slots.push(ContinentSlot {
                 name: continent.name,
                 continent: Some(continent),
                 index: arc_swap::ArcSwapOption::from(arc_opt),
+                loaded_stamp,
             });
         }
         Ok(MultiIndex {
@@ -3801,9 +3819,9 @@ impl MultiIndex {
     /// where the dir holds no admin_cells.bin, an error, the slot as it was.
     /// It blocks as long as that download runs: an async caller runs it on a
     /// thread of its own (spawn_blocking), not on one of the runtime's.
-    /// Returns the mark of the stamp the dir held as it loaded (FileMark),
-    /// which is that of the download whose files it loaded.
-    pub fn install_region(&self, name: &str) -> Result<Option<FileMark>, String> {
+    /// Returns the text of the stamp the dir held as it loaded, which names
+    /// the bucket and the selection of the files it loaded.
+    pub fn install_region(&self, name: &str) -> Result<Option<String>, String> {
         let slot = self.continents.iter().find(|c| c.name == name)
             .ok_or_else(|| format!("unknown continent: {}", name))?;
         let dir = format!("{}/{}", self.root_dir, name);
@@ -4155,6 +4173,7 @@ mod query_tests {
                 name,
                 continent: continents().iter().find(|c| c.name == name),
                 index: arc_swap::ArcSwapOption::from(Some(Arc::new(index))),
+                loaded_stamp: None,
             })
             .collect();
         MultiIndex {
@@ -7880,6 +7899,7 @@ mod query_path_tests {
                 name: "world",
                 continent: None,
                 index: arc_swap::ArcSwapOption::from(Some(Arc::new(TestIndex::new().load()))),
+                loaded_stamp: None,
             }],
             root_dir: String::new(),
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
