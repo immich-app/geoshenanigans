@@ -325,7 +325,10 @@ dataset dir by their names, as before.
 `text`, `url`, `licence`, `licence_url` and `notices`), with the components
 it `applies_to` (shell patterns of component ids). Each water dir's
 `attribution.json` holds the entries of the data in it: OpenStreetMap's, and
-Marine Regions' where it holds a sea or ocean.
+Marine Regions' where it holds a sea or ocean. `applies_to` names the
+components a source can apply to; a water dir's own `attribution.json` says
+what its data is owed and is the credit to show (OpenStreetMap's alone in a
+build without the marine areas).
 
 `component_sizes` gives, per region, each component's bytes: `raw` its files
 on disk, `wire` what downloading them costs (a unit's size once, or its share
@@ -380,6 +383,11 @@ variants', and only those the region has.
    - Download builds/{date}/europe/quality/simplified/patch.gcpatch → apply to quality files
    - Download builds/{date}/europe/poi/notable/patch.gcpatch → apply to POI files (if using POIs)
    - Download builds/{date}/europe/water/all/simplified/patch.gcpatch → apply to <dataset>/water/ (if using water)
+   The water patch applies only to a water dir the client holds. A client
+   with no water dir for its selection (it switched to water after its local
+   date, or no water patch exists for that date) downloads the value's files
+   fresh at the target date, as Switching Water does, and patches the other
+   dirs as usual.
 7. Update local date to latest
 ```
 

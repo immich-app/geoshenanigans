@@ -230,6 +230,24 @@ TEST(the_water_stage_builds_and_encodes_its_two_tiers_with_no_minimal_set) {
     CHECK(arc_sidecar_path(dir.path(), ArcSet::Full) == dir.path() + "/quality/exact/arc_index.osm_ids");
 }
 
+TEST(a_ring_of_a_stage_with_no_minimal_set_rebuilds_to_no_minimal_vertices) {
+    AdminExactRings store;
+    const TwoWays square;
+    store.append(square.ring, {}, square.runs);
+    store.append(closed({pt(0, 200), pt(0, 300), pt(100, 300), pt(100, 200)}),
+                 {closed({pt(20, 220), pt(20, 280), pt(80, 280), pt(80, 220)})}, {{{31, 4}}, {{32, 4}}});
+    AdminArcs arcs;
+    {
+        const gctest::CapturedStderr captured;
+        arcs = build_arc_stage(kWaterArcStage, store, {}, "", 2);
+    }
+    REQUIRE(arcs.minimal.ring_refs.empty());
+    for (uint32_t r = 0; r < store.rings.size(); r++) {
+        CHECK(rebuild_ring(arcs, store, ArcSet::Minimal, r).empty());
+        CHECK(!rebuild_ring(arcs, store, ArcSet::Full, r).empty());
+    }
+}
+
 TEST(a_pond_within_one_step_of_the_simplified_grid_keeps_its_shore_on_the_e7_grid) {
     // A pond 30 e7 units a side, every vertex of which snaps to one point of
     // the 100 grid; a strip 30 wide, which the grid flattens to a line; and

@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import stat
 import struct
 import sys
 import tempfile
@@ -49,8 +50,33 @@ class FileTest(unittest.TestCase):
         marine_import.write_marine(self.path, list(reversed(TWO_AREAS)))
         with open(self.path, "rb") as f, open(TWO_AREAS_FILE, "rb") as want:
             self.assertEqual(f.read(), want.read())
-        self.assertFalse(os.path.exists(self.path + ".part"))
+        self.assertEqual(os.listdir(self.dir.name), ["marine_areas.bin"])
+        umask = os.umask(0)
+        os.umask(umask)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o666 & ~umask)
         self.assertEqual(marine_import.read_marine(self.path), TWO_AREAS)
+
+    def test_a_file_or_link_named_as_the_outputs_part_keeps_its_bytes(self):
+        part, other = self.path + ".part", os.path.join(self.dir.name, "land.geojson")
+        for link in (False, True):
+            with self.subTest(link=link):
+                with open(other, "wb") as f:
+                    f.write(b"land")
+                if link:
+                    os.symlink(other, part)
+                else:
+                    with open(part, "wb") as f:
+                        f.write(b"part")
+                marine_import.write_marine(self.path, TWO_AREAS)
+                with open(other, "rb") as f:
+                    self.assertEqual(f.read(), b"land")
+                self.assertEqual(os.path.islink(part), link)
+                with open(part, "rb") as f:
+                    self.assertEqual(f.read(), b"land" if link else b"part")
+                self.assertEqual(marine_import.read_marine(self.path), TWO_AREAS)
+                self.assertEqual(sorted(os.listdir(self.dir.name)),
+                                 ["land.geojson", "marine_areas.bin", "marine_areas.bin.part"])
+                os.unlink(part)
 
     def test_refuses_what_the_builder_would(self):
         sea = TWO_AREAS[1]
@@ -65,7 +91,7 @@ class FileTest(unittest.TestCase):
         for why, objects in cases.items():
             with self.subTest(why), self.assertRaisesRegex(ValueError, why):
                 marine_import.write_marine(self.path, objects)
-            self.assertFalse(os.path.exists(self.path))
+            self.assertEqual(os.listdir(self.dir.name), [])
 
     def test_reads_refuse_a_file_cut_short_or_of_another_kind(self):
         marine_import.write_marine(self.path, TWO_AREAS)
@@ -373,8 +399,11 @@ class BuildTest(unittest.TestCase):
             with open(source, "rb") as f:
                 held[source] = f.read()
         for flag, source in (("--eez-iho", self.seas), ("--land", self.land)):
+            # The source by a link to its dir, and by a hard link of its own.
             alias = os.path.join(self.dir.name, "link", os.path.basename(source))
-            for written, stats in ((alias, out + ".json"), (out, alias)):
+            hard = os.path.join(self.dir.name, "hard-" + os.path.basename(source))
+            os.link(source, hard)
+            for written, stats in ((alias, out + ".json"), (out, alias), (hard, out + ".json"), (out, hard)):
                 for path, data in held.items():
                     with open(path, "wb") as f:
                         f.write(data)
@@ -393,6 +422,64 @@ class BuildTest(unittest.TestCase):
             with self.subTest(stats=stats), self.assertRaisesRegex(ValueError, "--stats"):
                 self.run_build(out, stats)
             self.assertFalse(os.path.exists(out))
+        # An output there already, and the stats path a hard link to it.
+        with open(out, "wb") as f:
+            f.write(b"old")
+        hard = os.path.join(self.dir.name, "hard.json")
+        os.link(out, hard)
+        with self.assertRaisesRegex(ValueError, "--stats"):
+            self.run_build(out, hard)
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), b"old")
+
+    def test_the_output_and_stats_replace_their_names_and_write_through_no_other(self):
+        out = os.path.join(self.dir.name, "marine_areas.bin")
+        part, stats, other = out + ".part", out + ".json", os.path.join(self.dir.name, "other.json")
+        with open(self.land, "rb") as f:
+            land = f.read()
+        with open(self.seas, "rb") as f:
+            seas = f.read()
+        whole, _ = self.build("whole.bin")
+        with open(whole, "rb") as f:
+            want = f.read()
+
+        def as_source():
+            # A source named as the output's ".part".
+            with open(part, "wb") as f:
+                f.write(land)
+            return {"land": part}, {part: land}
+
+        def linked_to_a_source():
+            # The output's ".part", a link to a source.
+            os.symlink(self.seas, part)
+            return {}, {self.seas: seas}
+
+        def stats_a_hard_link():
+            # The stats path a hard link to a file that is none of the run's.
+            with open(other, "w") as f:
+                f.write("{}\n")
+            os.link(other, stats)
+            return {}, {other: b"{}\n"}
+
+        for case in (as_source, linked_to_a_source, stats_a_hard_link):
+            with self.subTest(case.__name__):
+                for path in (out, part, stats, other):
+                    if os.path.lexists(path):
+                        os.unlink(path)
+                for path, data in ((self.land, land), (self.seas, seas)):
+                    with open(path, "wb") as f:
+                        f.write(data)
+                given, kept = case()
+                before = set(os.listdir(self.dir.name))
+                self.assertEqual(self.run_build(out, stats, **given), 0)
+                for path, data in kept.items():
+                    with open(path, "rb") as f:
+                        self.assertEqual(f.read(), data)
+                with open(out, "rb") as f:
+                    self.assertEqual(f.read(), want)
+                with open(stats) as f:
+                    self.assertEqual(json.load(f)["bytes"], len(want))
+                self.assertEqual(set(os.listdir(self.dir.name)), before | {"marine_areas.bin", "marine_areas.bin.json"})
 
 
 if __name__ == "__main__":

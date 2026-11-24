@@ -46,11 +46,17 @@ struct Layer {
     }
 };
 
+// A region's water arcs, or the slots of them a build's sidecars hold: the
+// all set's, and the major tier's.
+struct ArcCounts {
+    uint64_t all = 0, major = 0;
+};
+
 // The slot identity of a closed way's polygon, and of a relation's outer
 // ring (or a piece of one, water_split.h) by the ring's corner (ring_corner):
 // another outer ring added to the relation leaves it as it is. Its fallback
 // key, the relation and the ring's place among the relation's outer rings
-// (and the piece's cut), keeps the slot when that corner moves.
+// (and the piece's cut path), keeps the slot when that corner moves.
 inline uint64_t way_identity(int64_t way) {
     return gc::id_alloc::make_key(gc::id_alloc::ObjectType::OSM_WAY, static_cast<uint64_t>(way));
 }
@@ -89,9 +95,10 @@ inline uint64_t ring_corner(const PackedLocation* v, uint32_t count, uint64_t pi
     return piece == 0 ? corner : mix64(corner ^ mix64(piece));
 }
 // A piece of a ring cut along the grid (water_split.h): its fallback key,
-// the ring's with the cut's.
-inline uint64_t piece_fallback(uint64_t ring_fallback, uint64_t piece) {
-    return piece == 0 ? ring_fallback : mix64(ring_fallback ^ mix64(piece)) & 0x00FFFFFFFFFFFFFFull;
+// the ring's with its cut's path (SplitPolygon::path), which an edit of the
+// shore that leaves the cuts as they were doesn't move.
+inline uint64_t piece_fallback(uint64_t ring_fallback, uint64_t path) {
+    return path == 0 ? ring_fallback : mix64(ring_fallback ^ mix64(path)) & 0x00FFFFFFFFFFFFFFull;
 }
 
 }  // namespace water

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKFLOWS = os.path.join(HERE, "..", "..", "..", ".github", "workflows")
@@ -549,14 +550,64 @@ class GeneratePatchesTest(unittest.TestCase):
 WATER_DIR_FIXTURE = os.path.join(HERE, "..", "..", "testdata", "water_dir")
 
 
-def real_tool(name, env):
-    """The tool generate_patches.sh would run: $env, else the builder's build dir's, else None."""
-    path = os.environ.get(env) or os.path.join(HERE, "..", "build", name)
-    return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
+BUILD_DIR = os.path.join(HERE, "..", "build")
+
+
+def real_tool(name, env, build_dir=BUILD_DIR):
+    """The tool generate_patches.sh would run: $env (a path, or a name on PATH, as the script runs it), else the one
+    in the builder's build dir, else the one on PATH; None for none. The build dir's comes before PATH's, so a fresh
+    build is what the tests run rather than a tool installed before it."""
+    given = os.environ.get(env)
+    if given:
+        return shutil.which(given)
+    built = os.path.join(build_dir, name)
+    if os.path.isfile(built) and os.access(built, os.X_OK):
+        return built
+    return shutil.which(name)
 
 
 HAS_REAL_TOOLS = real_tool("geocoder-diff", "GEOCODER_DIFF") and real_tool("geocoder-patch", "GEOCODER_PATCH")
-NEEDS_REAL_TOOLS = "needs geocoder-diff and geocoder-patch (GEOCODER_DIFF / GEOCODER_PATCH, or builder/build)"
+NEEDS_REAL_TOOLS = ("needs geocoder-diff and geocoder-patch (GEOCODER_DIFF / GEOCODER_PATCH, builder/build, "
+                    "or on PATH)")
+
+
+class RealToolTest(unittest.TestCase):
+    """Where the water dir tests find the tools generate_patches.sh runs."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root)
+        self.bin, self.build = os.path.join(self.root, "bin"), os.path.join(self.root, "build")
+        os.makedirs(self.bin)
+        os.makedirs(self.build)
+
+    def tool(self, directory):
+        path = os.path.join(directory, "geocoder-diff")
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def found(self, given=None):
+        env = {"PATH": self.bin}
+        if given is not None:
+            env["GEOCODER_DIFF"] = given
+        with mock.patch.dict(os.environ, env):
+            if given is None:
+                os.environ.pop("GEOCODER_DIFF", None)
+            return real_tool("geocoder-diff", "GEOCODER_DIFF", self.build)
+
+    def test_a_tool_is_the_one_given_else_the_build_dirs_else_the_one_on_path(self):
+        self.assertIsNone(self.found())
+        on_path = self.tool(self.bin)
+        self.assertEqual(self.found(), on_path)
+        built = self.tool(self.build)
+        self.assertEqual(self.found(), built)
+        # Given by name, it is the one on PATH, as the script runs it; by path, that one; one not there, none.
+        self.assertEqual(self.found("geocoder-diff"), on_path)
+        self.assertEqual(self.found(built), built)
+        self.assertIsNone(self.found(os.path.join(self.root, "gone")))
+        self.assertIsNone(self.found("geocoder-gone"))
 
 
 def patch_water_days(test, old_day, new_day):

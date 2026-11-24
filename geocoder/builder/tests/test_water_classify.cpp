@@ -237,6 +237,39 @@ TEST(water_meta_json_of_every_kind_stays_within_what_a_patch_carries_inline) {
     CHECK(gctest::refusal_of<std::logic_error>([&] { table.verbatim_code("never_given"); }) != "");
 }
 
+TEST(water_meta_json_of_values_its_escapes_double_stays_within_what_a_patch_carries_inline) {
+    // 20,000 water=* values of 255 bytes, all but their first few quotes and
+    // backslashes, each of which water_meta.json writes as two: a kind of
+    // about 565 bytes written, of about 315 unescaped.
+    std::map<std::string, size_t> uses;
+    for (int k = 0; k < 20000; k++) {
+        std::string v = "v" + std::to_string(k);
+        while (v.size() < 255) v += v.size() % 2 ? '"' : '\\';
+        uses[v] = 2;
+    }
+    TypeTable table;
+    table.assign(uses, {});
+    std::set<uint16_t> codes;
+    for (uint16_t c = 1; c <= kFixedKindCount; c++) codes.insert(c);
+    size_t generic = 0;
+    for (const auto& [value, n] : uses) {
+        const uint16_t c = table.verbatim_code(value);
+        if (c == code::kNaturalWater) generic++;
+        else codes.insert(c);
+    }
+    const std::string text = meta_json(table, codes);
+    CHECK(text.size() <= MAX_INLINE_CLIENT_FILE_BYTES);
+    // Read back, each value as it was; the values past the budget are
+    // natural/water.
+    const std::optional<std::vector<MetaType>> read = parse_meta_json(text);
+    REQUIRE(read.has_value());
+    CHECK_EQ(read->size(), codes.size());
+    for (const MetaType& m : *read)
+        if (m.code >= kVerbatimBase) CHECK(uses.count(m.type) && table.verbatim_code(m.type) == m.code);
+    CHECK(generic > 0 && generic < uses.size());
+    CHECK_EQ(generic, table.generic_count());
+}
+
 TEST(water_meta_json_cut_short_or_with_more_after_it_is_no_table_and_one_of_no_kinds_is_one) {
     TypeTable table;
     table.assign({{"salt_pond", 1}}, {});

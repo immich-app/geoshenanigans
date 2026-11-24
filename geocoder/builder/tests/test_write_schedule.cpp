@@ -53,7 +53,7 @@ TEST(continent_share_gives_the_waters_what_their_share_holds_and_leaves_them_out
 }
 
 TEST(the_water_stage_holds_three_times_its_cells_beside_its_share_of_the_rest) {
-    // A layer of 1 GiB, a quarter of it its 32 Mi cell entries of 8 bytes.
+    // A layer of 1 GiB, a quarter of it its 16 Mi cell entries of 16 bytes.
     KindValues bytes = kinds(0, 0, 0, 0, 0, 0);
     at(bytes, RecordKind::Waters) = kGiB;
     const uint64_t pairs = kGiB / 4 / sizeof(CellItemPair);
@@ -93,8 +93,42 @@ TEST(the_water_stage_holds_its_slot_arrays_for_every_slot_the_previous_build_lef
     const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
     CHECK_EQ(region_peak(bytes, counts, 0, RunOrder::Serial, pairs, slots),
              region_peak(bytes, counts, 0, RunOrder::Serial, pairs) + slots * kWaterSlotBytes);
-    CHECK_EQ(continent_cost(bytes, counts, 0, UINT64_MAX, pairs, slots).bytes,
-             region_peak(bytes, counts, 0, RunOrder::Concurrent, pairs, slots));
+    const RegionCost at_once = continent_cost(bytes, counts, 0, UINT64_MAX, pairs, slots);
+    CHECK(at_once.order == RunOrder::Concurrent);
+    CHECK_EQ(at_once.bytes, region_peak(bytes, counts, 0, RunOrder::Concurrent, pairs) + slots * kWaterSlotBytes);
+}
+
+TEST(the_water_stage_holds_the_slot_allocation_of_each_previous_arc_slot_past_todays_arcs) {
+    // A previous build of 5 Mi all-set and 3 Mi major arc slots over a
+    // layer of 1 Mi arcs, 0.1 Mi of them the major tier's: the all set's
+    // 4 Mi past today's, the larger, as the two allocations run one after
+    // the other.
+    using water::ArcCounts;
+    const uint64_t Mi = uint64_t(1) << 20;
+    CHECK_EQ(water_arc_slots_past(ArcCounts{5 * Mi, 3 * Mi}, ArcCounts{Mi, Mi / 10}), 4 * Mi);
+    CHECK_EQ(water_arc_slots_past(ArcCounts{Mi, 3 * Mi}, ArcCounts{Mi, Mi / 10}), 3 * Mi - Mi / 10);
+    // As many slots as arcs, or fewer (water gained since): none past them.
+    CHECK_EQ(water_arc_slots_past(ArcCounts{Mi, Mi / 10}, ArcCounts{Mi, Mi / 10}), uint64_t(0));
+    CHECK_EQ(water_arc_slots_past(ArcCounts{Mi, Mi / 10}, ArcCounts{Mi + 5, Mi / 10 + 3}), uint64_t(0));
+    CHECK_EQ(water_arc_slots_past(ArcCounts{}, ArcCounts{Mi, Mi / 10}), uint64_t(0));
+    // Each slot past them: the slot as loaded and its key, the previous keys
+    // and their sort's copy, its fallback keys, a fallback pass's keys and
+    // their sort's copy, and its marks.
+    CHECK(kWaterArcSlotBytes >= sizeof(gc::id_alloc::SidecarSlot) + sizeof(uint64_t) + 4 * sizeof(gc::id_alloc::KeyIdx) +
+                                    sizeof(ArcFallbackKeys) + 2);
+    KindValues bytes = kinds(0, 0, 0, 0, 0, 0);
+    at(bytes, RecordKind::Waters) = kGiB;
+    const uint64_t pairs = kGiB / 4 / sizeof(CellItemPair), slots = uint64_t(3) << 20, past = 4 * Mi;
+    CHECK_EQ(stage_costs(bytes, pairs, slots, past).water, stage_costs(bytes, pairs, slots).water + past * kWaterArcSlotBytes);
+    CHECK_EQ(stage_costs(bytes, pairs, slots, 0).water, stage_costs(bytes, pairs, slots).water);
+    // The reservations carry it.
+    const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
+    CHECK_EQ(region_peak(bytes, counts, 0, RunOrder::Serial, pairs, slots, past),
+             region_peak(bytes, counts, 0, RunOrder::Serial, pairs, slots) + past * kWaterArcSlotBytes);
+    const RegionCost at_once = continent_cost(bytes, counts, 0, UINT64_MAX, pairs, slots, past);
+    CHECK(at_once.order == RunOrder::Concurrent);
+    CHECK_EQ(at_once.bytes,
+             region_peak(bytes, counts, 0, RunOrder::Concurrent, pairs, slots) + past * kWaterArcSlotBytes);
 }
 
 TEST(pair_counts_takes_the_water_cell_index_entries_for_the_waters_pairs) {
@@ -154,8 +188,13 @@ TEST(filter_cost_holds_the_planet_maps_and_half_the_subset_pairs) {
 TEST(filter_cost_holds_the_continents_water_pairs_among_the_pairs_the_workers_copy_and_no_marks_of_its_own) {
     // The water split reads the planet's water masks, which the build holds
     // with the other kinds' while the continents run: of the planet's water
-    // cells, nothing of its own.
-    const KindValues planet_counts = kinds(80, 160, 0, 0, 0, 0);
+    // records and cells, nothing of its own. The planet's counts as the build
+    // takes them, of a planet of 40 water records.
+    ParsedData d;
+    d.ways.resize(80);
+    d.addr_points.resize(160);
+    d.water.records.resize(40);
+    const KindValues planet_counts = record_counts(d);
     KindValues pairs = kinds(10, 0, 0, 0, 0, 0);
     at(pairs, RecordKind::Waters) = 40;
     CHECK_EQ(filter_cost(planet_counts, pairs), uint64_t(240 * 4 + 240 * 3 / 8 + 50 * 16 / 2));

@@ -1,7 +1,8 @@
 // How a river or canal area with no name of its own takes one: the waterway
 // with the most length inside it. Each candidate line is a waterway=river or
-// canal way, or a member way of a waterway=river or canal relation whatever
-// its own waterway tag (a run of one, where the input lacks a node of it),
+// canal way, or a member way of a waterway=river or canal relation in a role
+// of its streams (main_stream, side_stream or none) whatever its own
+// waterway tag (a run of one, where the input lacks a node of it),
 // keyed by the type=waterway relation it belongs to (the lowest relation id,
 // where it belongs to two) or else by its own local name (the name tag, not
 // name:en), so a river whose ways vary in name:en is one key.
@@ -73,6 +74,12 @@ inline bool segment_wraps(PackedLocation a, PackedLocation b) {
 
 inline constexpr int32_t kAntimeridianE7 = 1800000000;
 
+// Whether segment a-b runs along the antimeridian: both its ends on it, each
+// spelled at 180 east or west.
+inline bool segment_on_antimeridian(PackedLocation a, PackedLocation b) {
+    return std::abs(int64_t(a.lon_e7)) == kAntimeridianE7 && std::abs(int64_t(b.lon_e7)) == kAntimeridianE7;
+}
+
 // The latitude at which segment a-b, across the antimeridian
 // (segment_wraps), crosses it: its straight line in (lat, lng) the short
 // way round, rounded to the nearest e7 unit (a half to the north), the
@@ -91,10 +98,17 @@ inline int32_t antimeridian_latitude(PackedLocation a, PackedLocation b) {
 // the antimeridian cut there: between its ends, the point at which it
 // crosses (antimeridian_latitude) on its first end's side, then on its
 // second's. The stretch between those two runs along the antimeridian and
-// wraps; each piece either side of it lies on one side.
+// wraps; each piece either side of it lies on one side. A segment along the
+// antimeridian (segment_on_antimeridian) runs at 180 east, its ends there
+// between its own: SegmentClip credits the side to its left, the area west
+// of it, run north, and none lies west of 180 west. The stretch from an end
+// spelled at 180 west to the same point at 180 east wraps.
 inline void cut_at_antimeridian(const PackedLocation* v, uint32_t count, std::vector<PackedLocation>& out) {
     for (uint32_t i = 0; i < count; i++) {
-        if (i > 0 && segment_wraps(v[i - 1], v[i])) {
+        if (i > 0 && segment_on_antimeridian(v[i - 1], v[i])) {
+            if (v[i - 1].lon_e7 != kAntimeridianE7) out.push_back({v[i - 1].lat_e7, kAntimeridianE7});
+            if (v[i].lon_e7 != kAntimeridianE7) out.push_back({v[i].lat_e7, kAntimeridianE7});
+        } else if (i > 0 && segment_wraps(v[i - 1], v[i])) {
             const int32_t lat = antimeridian_latitude(v[i - 1], v[i]);
             const int32_t side = v[i - 1].lon_e7 > 0 ? kAntimeridianE7 : -kAntimeridianE7;
             out.push_back({lat, side});

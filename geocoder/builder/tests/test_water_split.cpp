@@ -400,3 +400,60 @@ TEST(pieces_that_hold_other_points_pass_the_check_only_where_those_lie_on_a_cut)
     // none of this split's cuts.
     CHECK(!split_detail::pieces_hold(whole, {south, north}, {split_detail::cut_way_of(5, false)}));
 }
+
+TEST(a_pieces_path_stays_when_its_corner_moves_and_the_cuts_stay_where_they_were) {
+    // A square lake of 1.6 degrees from (47, 8), a vertex each 0.2 along its
+    // sides, with 20 x 20 islands; the next day its south-west corner, the
+    // smallest vertex of the piece there, moves in, and the lake's box, so
+    // every cut, stays as it was.
+    auto lake_of = [](int32_t corner_in) {
+        SplitPolygon p;
+        const int32_t lat0 = 470000000, lng0 = 80000000, size = 16000000;
+        const PackedLocation corners[] = {pt(lat0, lng0), pt(lat0, lng0 + size), pt(lat0 + size, lng0 + size),
+                                          pt(lat0 + size, lng0)};
+        for (int e = 0; e < 4; e++)
+            for (int k = 0; k < 8; k++) {
+                const PackedLocation a = corners[e], b = corners[(e + 1) % 4];
+                p.outer.v.push_back(pt(a.lat_e7 + (b.lat_e7 - a.lat_e7) / 8 * k, a.lon_e7 + (b.lon_e7 - a.lon_e7) / 8 * k));
+                p.outer.way.push_back(1000 + e);
+            }
+        p.outer.v[0] = pt(lat0 + corner_in, lng0 + corner_in);
+        const int32_t pitch = (size - 400000) / 20;
+        for (int i = 0; i < 20; i++)
+            for (int j = 0; j < 20; j++) {
+                SplitRing h = box_ring(lat0 + 200000 + i * pitch, lng0 + 200000 + j * pitch, 100000, 100000,
+                                       10 * (i * 20 + j) + 10);
+                turn(h);
+                p.holes.push_back(h);
+            }
+        return p;
+    };
+    // Each piece's path, and its holes' smallest vertices.
+    auto by_path = [](const std::vector<SplitPolygon>& pieces) {
+        std::map<uint64_t, std::vector<std::pair<int32_t, int32_t>>> out;
+        for (const SplitPolygon& q : pieces) {
+            CHECK(q.path != 0);
+            std::vector<std::pair<int32_t, int32_t>> holes;
+            for (const SplitRing& h : q.holes) {
+                std::pair<int32_t, int32_t> least = {INT32_MAX, INT32_MAX};
+                for (const PackedLocation& v : h.v) least = std::min(least, std::make_pair(v.lat_e7, v.lon_e7));
+                holes.push_back(least);
+            }
+            std::sort(holes.begin(), holes.end());
+            CHECK(out.emplace(q.path, holes).second);
+        }
+        return out;
+    };
+    auto keys = [](const std::vector<SplitPolygon>& pieces) {
+        std::set<uint64_t> out;
+        for (const SplitPolygon& q : pieces) out.insert(q.key);
+        return out;
+    };
+    const std::vector<SplitPolygon> day1 = split_polygon(lake_of(0), 64), day2 = split_polygon(lake_of(5000), 64);
+    REQUIRE(day1.size() > 2);
+    REQUIRE(day2.size() == day1.size());
+    // The piece at the corner takes a key of its own corner the next day,
+    // and keeps its path, as every other piece does.
+    CHECK(keys(day1) != keys(day2));
+    CHECK(by_path(day1) == by_path(day2));
+}

@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -22,6 +23,7 @@
 #include "test_framework.h"
 #include "tool_runs.h"
 #include "types.h"
+#include "water_types.h"
 
 namespace fs = std::filesystem;
 
@@ -139,6 +141,26 @@ std::vector<std::string> slot_names(const std::string& dir) {
     return out;
 }
 
+// Each named slot's kind of a water dir, by its name: the class/type its
+// record's type code (country_code) has in the dir's water_meta.json.
+std::map<std::string, std::string> kinds_by_name(const std::string& dir) {
+    const std::vector<char> meta = bytes_of(dir + "/water_meta.json"), records = bytes_of(dir + "/admin_polygons.bin");
+    const std::optional<std::vector<water::MetaType>> kinds = water::parse_meta_json(std::string(meta.begin(), meta.end()));
+    if (!kinds) return {{"", "(water_meta.json unread)"}};
+    std::map<uint16_t, std::string> by_code;
+    for (const water::MetaType& k : *kinds) by_code[k.code] = k.cls + "/" + k.type;
+    const std::vector<std::string> names = slot_names(dir);
+    std::map<std::string, std::string> out;
+    for (size_t s = 0; s < names.size(); s++) {
+        if (names[s].empty()) continue;
+        AdminPolygonRecord r;
+        std::memcpy(&r, records.data() + s * sizeof r, sizeof r);
+        const auto it = by_code.find(r.country_code);
+        out[names[s]] = it == by_code.end() ? "(no kind)" : it->second;
+    }
+    return out;
+}
+
 const std::vector<std::string> kRegions = {"planet", "africa", "asia", "europe", "north-america", "south-america",
                                            "oceania", "central-america", "antarctica"};
 
@@ -190,12 +212,11 @@ TEST(build_index_writes_every_regions_water_dirs_and_a_chained_build_writes_them
         CHECK_EQ(files.at(dir + "admin_polygons.bin").size(), 4 * sizeof(AdminPolygonRecord));
         const std::vector<std::string> names = names_in(files.at(dir + "strings_core.bin"));
         CHECK(names == std::vector<std::string>({"Limmat", "Speicher", "Test Lake", "Weiher"}));
-        const std::vector<char>& meta = files.at(dir + "water_meta.json");
-        const std::string text(meta.begin(), meta.end());
-        for (const char* kind : {"\"class\": \"water\", \"type\": \"lake\"", "\"class\": \"water\", \"type\": \"pond\"",
-                                 "\"class\": \"landuse\", \"type\": \"reservoir\"",
-                                 "\"class\": \"waterway\", \"type\": \"river\""})
-            CHECK(text.find(kind) != std::string::npos);
+        // Each of its own kind.
+        CHECK(kinds_by_name(first + "/" + dir) == (std::map<std::string, std::string>{{"Limmat", "waterway/river"},
+                                                                                     {"Speicher", "landuse/reservoir"},
+                                                                                     {"Test Lake", "water/lake"},
+                                                                                     {"Weiher", "water/pond"}}));
     }
     CHECK(files.at("asia/water/all/exact/admin_polygons.bin").empty());
     CHECK(files.at("planet/water/all/simplified/arc_vertices.bin").size() <=
@@ -291,6 +312,23 @@ TEST(build_index_loads_the_marine_areas_it_is_given_into_the_water_dirs) {
     CHECK(std::string(credited.begin(), credited.end()).find("\"id\": \"marine-regions\"") != std::string::npos);
     CHECK(std::string(uncredited.begin(), uncredited.end()).find("\"id\": \"osm\"") != std::string::npos);
     CHECK(std::string(uncredited.begin(), uncredited.end()).find("marine-regions") == std::string::npos);
+}
+
+TEST(build_index_refuses_a_marine_areas_file_cut_short_before_it_reads_the_pbf) {
+    // Its header as it should be, its body cut short: refused at the start,
+    // before the passes over the PBF.
+    const ScratchDir root("water-marine-cut-short");
+    const std::string good = gctest::two_areas_bytes(), marine = root.path() + "/marine_areas.bin";
+    std::ofstream(marine, std::ios::binary) << good.substr(0, good.size() - 3);
+    const std::string pbf = root.path() + "/water.osm.pbf", log = root.path() + "/build.log";
+    write_test_pbf(pbf, fixture(), 1000);
+    CHECK(!gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/out", pbf, "--multi-output", "--multi-quality",
+                        "--marine", marine},
+                       log));
+    const std::vector<char> text = bytes_of(log);
+    const std::string said(text.begin(), text.end());
+    CHECK(said.find("cut short") != std::string::npos);
+    CHECK(said.find("Processing " + pbf) == std::string::npos);
 }
 
 TEST(a_build_without_multi_output_writes_the_exact_water_tier_beside_its_modes_files) {
@@ -534,4 +572,40 @@ TEST(a_member_way_of_a_river_relation_tagged_as_a_stream_names_the_area_it_runs_
                           {{"waterway", "stream"}, {"name", "Dorfbach"}}));
     const ScratchDir root("water-stream-member");
     CHECK(planet_water_names(objects, root.path() + "/out") == std::vector<std::string>({"Rhine"}));
+}
+
+TEST(a_river_relations_tributary_or_bank_doesnt_name_the_area_it_runs_through) {
+    // The Rhine's relation: its main stream, of no role, through one unnamed
+    // river area and a side stream through another, which both take its
+    // name; a tributary of no name of its own through a third, and the
+    // outline of a fourth as its riverbank, which name nothing.
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    std::vector<TestObject> objects;
+    int64_t next = 1;
+    auto at = [&](int32_t lat, int32_t lng) {
+        objects.push_back(node(next, lat, lng));
+        return next++;
+    };
+    auto square = [&](int32_t lat, int32_t lng, int32_t side) {
+        const int64_t a = at(lat, lng), b = at(lat, lng + side), c = at(lat + side, lng + side), d = at(lat + side, lng);
+        return std::vector<int64_t>{a, b, c, d, a};
+    };
+    const std::vector<std::pair<std::string, std::string>> river_area = {{"natural", "water"}, {"water", "river"}};
+    for (int k = 0; k < 3; k++) {
+        const int32_t lat = lat0 + k * 100000;
+        objects.push_back(way(100 + 10 * k, square(lat, lng0, 10000), river_area));
+        objects.push_back(way(101 + 10 * k, {at(lat + 2000, lng0 + 2000), at(lat + 6000, lng0 + 6000)},
+                              {{"waterway", k == 2 ? "stream" : "river"}}));
+    }
+    // The bank: a river area's own outline, run so that the area is to its
+    // left.
+    objects.push_back(way(130, square(lat0 + 300000, lng0, 10000), river_area));
+    objects.push_back(relation(900, {{"type", "waterway"}, {"waterway", "river"}, {"name", "Rhein"}, {"name:en", "Rhine"}},
+                               {{101, ""}, {111, "side_stream"}, {121, "tributary"}, {130, "riverbank"}}));
+    const ScratchDir root("water-river-roles");
+    const std::string out = root.path() + "/out";
+    REQUIRE(planet_water_names(objects, out) == std::vector<std::string>({"Rhine"}));
+    std::vector<std::string> slots = slot_names(out + "/planet/water/all/exact");
+    std::sort(slots.begin(), slots.end());
+    CHECK(slots == std::vector<std::string>({"Rhine", "Rhine"}));
 }

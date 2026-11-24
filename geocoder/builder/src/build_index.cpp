@@ -1443,7 +1443,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         };
 
         const StageCosts costs =
-            stage_costs(record_bytes(d), d.water.cells.size(), multi_output ? water::previous_slots(region_prev) : 0);
+            stage_costs(record_bytes(d), d.water.cells.size(), multi_output ? water::previous_slots(region_prev) : 0,
+                        multi_output ? water_arc_slots_past(water::previous_arc_slots(region_prev), water::arc_counts(d.water))
+                                     : 0);
         struct Stage {
             const char* name;
             std::function<void()> write;
@@ -1526,13 +1528,21 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
     // when the budget holds them beside the costliest continents that can
     // run together; else one after another, to hold memory down while
     // continent subsets build alongside.
-    // The water stage keeps every slot of the previous build's water dirs.
+    // The water stage keeps every slot of the previous build's water dirs,
+    // and its slot allocations load the arc slots, those past today's arcs
+    // among them.
     auto water_slots_before = [&](const std::string& region) -> uint64_t {
         return multi_output && !prev_output_dir.empty() ? water::previous_slots(prev_output_dir + "/" + region) : 0;
     };
+    auto water_arc_slots_before = [&](const std::string& region, const water::ArcCounts& today) -> uint64_t {
+        return multi_output && !prev_output_dir.empty()
+                   ? water_arc_slots_past(water::previous_arc_slots(prev_output_dir + "/" + region), today)
+                   : 0;
+    };
     const uint64_t planet_water_slots = water_slots_before("planet");
+    const uint64_t planet_water_arc_slots = water_arc_slots_before("planet", water::arc_counts(data.water));
     const uint64_t planet_stages =
-        stage_costs(record_bytes(data), data.water.cells.size(), planet_water_slots).total();
+        stage_costs(record_bytes(data), data.water.cells.size(), planet_water_slots, planet_water_arc_slots).total();
 
     // The planet's own write and each continent's split read the planet
     // records; the last of them to finish frees them beside the work left,
@@ -1548,7 +1558,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
     auto write_planet = [&](uint64_t beside) {
         const RunOrder order = planet_stages + beside <= budget.capacity() ? RunOrder::Concurrent : RunOrder::Serial;
         const KindValues bytes = record_bytes(data);
-        const StageCosts costs = stage_costs(bytes, data.water.cells.size(), planet_water_slots);
+        const StageCosts costs = stage_costs(bytes, data.water.cells.size(), planet_water_slots, planet_water_arc_slots);
         std::cerr << "Planet: stages " << (order == RunOrder::Serial ? "one at a time" : "at once") << " (admins "
                   << (at(bytes, RecordKind::Admins) >> 20) << " MiB, pois " << (at(bytes, RecordKind::Pois) >> 20)
                   << " MiB, waters " << (at(bytes, RecordKind::Waters) >> 20)
@@ -1670,8 +1680,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         }
         // What each continent's share of the water layer holds: a polygon of
         // its cells comes whole, with its arcs.
-        const std::vector<uint64_t> water_shares =
-            water::share_bytes(data.water, water_continent_masks, std::min<size_t>(kContinentCount, 8));
+        std::vector<water::ArcCounts> water_share_arcs;
+        const std::vector<uint64_t> water_shares = water::share_bytes(
+            data.water, water_continent_masks, std::min<size_t>(kContinentCount, 8), &water_share_arcs);
         std::vector<size_t> continent_order(kContinentCount);
         std::iota(continent_order.begin(), continent_order.end(), 0u);
         std::stable_sort(continent_order.begin(), continent_order.end(), [&](size_t a, size_t b) {
@@ -1702,7 +1713,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             // admin-minimal dirs included.
             pending.push_back({c, continent_cost(bytes, counts, filter_bytes, budget.capacity(),
                                                  at(continent_pairs[c], RecordKind::Waters),
-                                                 water_slots_before(kContinents[c].name))});
+                                                 water_slots_before(kContinents[c].name),
+                                                 water_arc_slots_before(kContinents[c].name,
+                                                                        c < water_share_arcs.size() ? water_share_arcs[c]
+                                                                                                    : water::ArcCounts{}))});
         }
         // A continent past the budget even with its steps one after another
         // goes last, once nothing else reads the planet records: its split
@@ -1930,10 +1944,11 @@ static water::ObjectTags water_way_tags(const WayTags& t) {
 }
 
 // Whether the water layer reads a way: a member of a water area relation
-// (`member`), a member of a waterway relation whatever its own waterway tag
-// (`in_waterway`), a waterway=river or canal way with a name, or a closed
-// way in scope (`closed()`, which decodes its refs, asked only then). The
-// node pre-scan and the way pass apply it alike.
+// (`member`), a stream of a waterway relation (collect_water_relations)
+// whatever its own waterway tag (`in_waterway`), a waterway=river or canal
+// way with a name, or a closed way in scope (`closed()`, which decodes its
+// refs, asked only then). The node pre-scan and the way pass apply it
+// alike.
 template <class Closed>
 static bool water_way_wanted(const WayTags& t, bool member, bool in_waterway, Closed closed) {
     if (member || in_waterway) return true;
@@ -1943,7 +1958,9 @@ static bool water_way_wanted(const WayTags& t, bool member, bool in_waterway, Cl
 
 // The water layer's relations of a block: the areas in scope, and the named
 // waterway=river or canal relations, which name river areas, with their
-// member ways.
+// member ways of the river's streams: the roles main_stream and side_stream,
+// and none (an older main stream). A tributary, a spring or a riverbank's
+// outline (riverbank, waterbody) names no area for it.
 static void collect_water_relations(const PbfBlock& block, std::vector<water::CollectedArea>& areas,
                                     std::vector<water::CollectedWaterway>& waterways) {
     for (const auto& rel : block.relations) {
@@ -1970,8 +1987,11 @@ static void collect_water_relations(const PbfBlock& block, std::vector<water::Co
             way.local_name = w_name ? w_name : w_name_en;
             way.english = w_name_en != nullptr;
             way.qid = water::qid_of(rel.tag("wikidata"));
-            for (const auto& m : rel.members)
-                if (m.type == 'w') way.ways.push_back(m.ref);
+            for (size_t mi = 0; mi < rel.members.size(); mi++) {
+                if (rel.members[mi].type != 'w') continue;
+                const std::string& role = rel.member_role(mi);
+                if (role.empty() || role == "main_stream" || role == "side_stream") way.ways.push_back(rel.members[mi].ref);
+            }
             if (!way.ways.empty()) waterways.push_back(std::move(way));
         }
     }
@@ -3154,8 +3174,8 @@ static int run(int argc, char* argv[]) {
                                                               std::vector<PackedLocation>(resolved_locs.begin(), resolved_locs.end())});
                         }
                         // A line's way tags; key_lines keys it once every
-                        // input's waterway relations are in. A waterway
-                        // relation's member is its river's line whatever
+                        // input's waterway relations are in. A stream of a
+                        // waterway relation is its river's line whatever
                         // its own waterway tag (a reach tagged as a stream).
                         if (waterway_member || water::is_naming_waterway(t.waterway)) {
                             water::LineIn line;

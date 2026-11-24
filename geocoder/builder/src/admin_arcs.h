@@ -652,7 +652,8 @@ AdminArcs build_arc_stage(const ArcStage& stage, const AdminExactRings& store, c
 
 // Ring `ring` of the store as set `set`'s refs chain its arcs: each arc
 // walked as its ref says, a junction two arcs share once, ending where it
-// starts. A ring of no minimal polygon has no minimal refs and no vertices.
+// starts. A ring of no minimal polygon has no minimal refs and no vertices,
+// as has every ring of a stage with no minimal set.
 std::vector<PackedLocation> rebuild_ring(const AdminArcs& arcs, const AdminExactRings& store, ArcSet set,
                                          uint32_t ring);
 

@@ -1234,7 +1234,9 @@ std::vector<PackedLocation> rebuild_ring(const AdminArcs& arcs, const AdminExact
         for (uint32_t k = arcs.ring_refs[ring]; k < arcs.ring_refs[ring + 1]; k++)
             chain(arc_vertices(store, arcs.arcs[arcs.refs[k].arc].view), arcs.refs[k].reversed);
     } else {
+        // A stage with no minimal set has no minimal refs at all.
         const MinimalArcs& m = arcs.minimal;
+        if (m.ring_refs.empty()) return out;
         for (uint32_t k = m.ring_refs[ring]; k < m.ring_refs[ring + 1]; k++)
             chain(MinimalArcVertices(store, arcs, m.refs[k].arc), m.refs[k].reversed);
     }

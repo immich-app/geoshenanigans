@@ -114,7 +114,8 @@ struct CollectedArea {
 };
 
 // A named type=waterway relation of waterway=river or canal: what its
-// member ways are keyed by when they name an area.
+// member ways are keyed by when they name an area, those of its streams
+// (the roles main_stream, side_stream and none) alone.
 struct CollectedWaterway {
     int64_t id = 0;
     std::string name;        // name:en, else name
@@ -165,11 +166,16 @@ struct Collected {
     WayGeometries member_geometries;
     // The marine areas (--marine), by id.
     std::vector<marine::Area> marine;
+    // How many relations and waterways index_collected left: no more since,
+    // nothing to index again.
+    size_t indexed_relations = SIZE_MAX, indexed_waterways = SIZE_MAX;
 };
 
 // Sorts the relations and waterways by id, each once (of copies, the first
 // input's), and indexes the waterways' member ways
-// (Collected::waterway_of_way).
+// (Collected::waterway_of_way); nothing where none were collected since it
+// last did (another input's pass over the relations every input's prepass
+// read, or key_lines after the relation pass).
 void index_collected(Collected& c);
 
 // The key and display name of a waterway=river or canal way or a waterway
@@ -197,7 +203,7 @@ struct Object {
     int64_t id = 0;
     ObjectTags tags;
     double area_deg2 = 0;  // its polygons' exact areas less their holes, square degrees
-    double km2 = 0;
+    double km2 = 0;        // the same on the sphere, km² (the major tier's thresholds)
     uint32_t name_key = UINT32_MAX;  // the naming key it took (NamingLines::keys), UINT32_MAX for none
     uint32_t key_qid = 0;            // the lowest wikidata item of that key's lines in it, 0 for none
 };
@@ -211,6 +217,7 @@ struct Build {
     std::vector<uint32_t> object_of;  // by polygon
     std::vector<uint32_t> outer_rank;  // by polygon: its place among its object's outer rings
     std::vector<uint64_t> piece_key;   // by polygon: its cut (water_split.h), 0 for an outer ring whole
+    std::vector<uint64_t> piece_path;  // by polygon: its cut's path alone (SplitPolygon::path), 0 for one whole
     NamingLines lines;
     size_t relations_missing_ways = 0, relations_without_rings = 0, marine_objects = 0;
     size_t outer_twins = 0;  // closed ways left to a relation of their names whose outer ring they are
@@ -243,24 +250,27 @@ Build assemble(Collected& c, unsigned threads);
 // marine area's, ASCII case, spaces and punctuation aside, and the polygons
 // of the marine areas of its name hold all its water (polygons_cover: its
 // polygons' rings even-odd, its holes left out, within the union of the
-// areas', each area's rings even-odd, a shared shore aside). Those marine
-// areas answer there; every other bay and strait stays, the water of one
-// that reaches past them, or round an island they leave out, among them.
+// areas', each area's rings even-odd, a shared shore aside; each area's
+// polygons alone first, so that another area's edge across its water
+// doesn't keep it). Those marine areas answer there; every other bay and
+// strait stays, the water of one that reaches past them, or round an island
+// they leave out, among them.
 // Logs each it leaves out and returns how many.
 size_t drop_marine_namesakes(Build& b);
 
 // Names each unnamed river or canal object by `choices` (pick_names, by
 // object) and drops the objects with no name and their polygons, in place;
 // sums each object's area. Each object takes its choice's key and wikidata
-// item, by which the major tier joins it to its river, but one of a name of
-// its own only where they are its own: the choice's item its own item where
-// it has one, else the key's local name its local name. Returns how many
-// objects it named.
+// item, by which the major tier joins it to its river, only where they are
+// its own: the choice's item its own item where it has one, else (one of a
+// name of its own) the key's local name its local name; an unnamed one of
+// an item of its own takes the choice's name alone otherwise. Returns how
+// many objects it named.
 size_t apply_names(Build& b, const std::vector<NameChoice>& choices);
 
 // Cuts each polygon of more than kSplitMaxHoles holes into pieces along the
 // grid (water_split.h), in place: each piece a polygon of the same object
-// and outer rank, with its cut's key. Logs what it cut.
+// and outer rank, with its cut's key and path. Logs what it cut.
 void split_polygons(Build& b, unsigned threads);
 
 // The layer's type table: the water=* values outside the fixed table among
@@ -273,8 +283,9 @@ std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_pl
 
 // Each polygon's slot identity and fallback key, by polygon: a way's by its
 // id; a relation's outer ring, or a marine area's, by the object and the
-// ring's smallest vertex (and its cut), with a fallback key by the object
-// and the ring's place. Two polygons that still share an identity (rings
+// ring's smallest vertex (and its cut's key), with a fallback key by the
+// object and the ring's place (and its cut's path, which no vertex of the
+// shore moves). Two polygons that still share an identity (rings
 // alike at their corners) are told apart by their fallback keys, which no
 // two share: the one of the smaller keeps it, the other takes one of its own
 // key mixed in, the same from day to day; `told_apart` counts those.
@@ -321,8 +332,10 @@ std::vector<uint8_t> routed_cell_masks(const std::vector<CellItemPair>& cells, s
 // whole, with its record, identities, name, rings and ring blocks, every
 // arc of its rings with that arc's keys, slots and blocks in every tier,
 // and the entries. A name a few polygons share counts for each: a little
-// over, never under.
-std::vector<uint64_t> share_bytes(const Layer& planet, const std::vector<uint8_t>& masks, size_t regions);
+// over, never under. With `arcs`, each region's arcs there too, those of its
+// polygons and of its major tier's (arc_counts of its share).
+std::vector<uint64_t> share_bytes(const Layer& planet, const std::vector<uint8_t>& masks, size_t regions,
+                                  std::vector<ArcCounts>* arcs = nullptr);
 
 // The rows of the fame rule the major tier could take instead: objects of
 // kMajorAreaKm2 or more, and those whose wikidata item has `min_sitelinks`
@@ -357,6 +370,15 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
 // them, each of which write_water_dirs keeps: 0 for none there, and for one
 // that is no sidecar, which that write refuses.
 uint32_t previous_slots(const std::string& region_prev);
+
+// The slots of the previous build's arc sidecars of a region's water dirs
+// under region_prev, tombstones among them: water/all/exact's (the all set's)
+// and water/major/simplified's, each 0 for none there and for one that is no
+// sidecar.
+ArcCounts previous_arc_slots(const std::string& region_prev);
+
+// The arcs of a layer's polygons, and of its major tier's polygons.
+ArcCounts arc_counts(const Layer& layer);
 
 // The single-output build's water: the all set's exact tier, in dir (the
 // region's dir), as water/ beside its mode's files.

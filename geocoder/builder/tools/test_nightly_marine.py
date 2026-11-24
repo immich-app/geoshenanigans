@@ -314,27 +314,45 @@ class NightlyTest(unittest.TestCase):
         sidecars = download[download.index("# ── Background: previous strategy-2 sidecars ──"):download.index("IDX_PID=$!")]
         self.assertIn("planet/water/all/exact/water_meta.json", sidecars)
 
-    def test_build_index_takes_the_marine_areas_when_the_download_gave_a_file(self):
+    def build_index_args(self, marine=""):
+        """build-index's arguments as the Build step runs it, its $MARINE_FILE `marine`."""
         block = build_run()
         self.assertIsNotNone(block)
         path = os.path.join(self.bin, "build-index")
         with open(path, "w") as f:
             f.write(FAKE_BUILD_INDEX)
         os.chmod(path, 0o755)
+        recorded = os.path.join(self.tmp.name, "build-index-args")
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "WORKDIR": self.work, "MARINE_FILE": marine,
+               "BUILD_INDEX_ARGS": recorded}
+        run = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", block], env=env, capture_output=True, text=True,
+                             timeout=60)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        args = read(recorded).splitlines()
+        self.assertEqual(args[:2], [f"{self.work}/output/", f"{self.work}/planet.osm.pbf"])
+        return args
+
+    def test_build_index_takes_the_marine_areas_when_the_download_gave_a_file(self):
         marine = os.path.join(self.work, "marine_areas.bin")
         with open(marine, "wb") as f:
             f.write(self.raw)
-        recorded = os.path.join(self.tmp.name, "build-index-args")
         for given, want in ((marine, [["--marine", marine]]), ("", []), (os.path.join(self.work, "gone.bin"), [])):
             with self.subTest(marine=given):
-                env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "WORKDIR": self.work, "MARINE_FILE": given,
-                       "BUILD_INDEX_ARGS": recorded}
-                run = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", block], env=env, capture_output=True,
-                                     text=True, timeout=60)
-                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-                args = read(recorded).splitlines()
-                self.assertEqual(args[:2], [f"{self.work}/output/", f"{self.work}/planet.osm.pbf"])
+                args = self.build_index_args(given)
                 self.assertEqual([args[i:i + 2] for i, a in enumerate(args) if a == "--marine"], want)
+
+    def test_build_index_takes_yesterdays_output_when_the_download_left_it(self):
+        # The water dirs' slots and type codes, as every other dir's ids, come from yesterday's output: a build
+        # without it starts them afresh.
+        old = os.path.join(self.work, "old-output")
+        for held, want in ((True, [["--prev-output", old]]), (False, [])):
+            with self.subTest(old_output=held):
+                if held:
+                    os.makedirs(old)
+                else:
+                    os.rmdir(old)
+                args = self.build_index_args()
+                self.assertEqual([args[i:i + 2] for i, a in enumerate(args) if a == "--prev-output"], want)
 
 
 class SidecarFetchTest(unittest.TestCase):
