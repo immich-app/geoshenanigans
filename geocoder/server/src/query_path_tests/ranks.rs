@@ -175,3 +175,25 @@ fn a_city_labelled_boundary_holds_its_own_rank_from_place_nodes() {
     assert_eq!(address["city"], "Sarajevo");
     assert_eq!(address["village"], "Vogošća");
 }
+
+#[test]
+fn boundaries_of_levels_11_and_12_are_parts_of_the_address_and_a_postal_area_none() {
+    // Nominatim's administrative levels run to 12 (22 and 24); a postal area is at its own level
+    // above them, and no part.
+    let index = TestIndex::in_country(b"DE")
+        .boundary("Brandenburg", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Ortsteil Mitte", 10, 0, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Ortslage Nord", 11, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+        .boundary("Block Sieben", 12, 0, (-1000.0, -1000.0, 1000.0, 1000.0))
+        .boundary("14467", POSTCODE_AREA_LEVEL, 0, (-2000.0, -2000.0, 2000.0, 2000.0))
+        .load();
+    let address = address_at(&index, 100.0, 100.0);
+    assert_eq!(address["suburb"], "Ortsteil Mitte");
+    assert_eq!(address["neighbourhood"], "Ortslage Nord");
+    assert_eq!(address["city_block"], "Block Sieben");
+    assert!(!address.as_object().unwrap().values().any(|v| v == "14467") || address["postcode"] == "14467");
+    let point = at(100.0, 100.0);
+    let seen = &index.debug_admin(point.lat as f64, point.lng as f64)["seen_per_level"];
+    assert_eq!(seen[12][0]["name"], "Block Sieben");
+    assert_eq!(seen[POSTCODE_AREA_LEVEL as usize][0]["name"], "14467");
+}

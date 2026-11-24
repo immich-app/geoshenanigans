@@ -722,7 +722,7 @@ static AdminTags way_link_tags(const WayTags& t, int64_t way_id) {
     return tags;
 }
 
-// Gives each postal area (admin_level 11) the country its centroid lies in,
+// Gives each postal area (POSTAL_AREA_LEVEL) the country its centroid lies in,
 // as Nominatim gives a place_postcode row the country of its centroid
 // (postcodes.py update_postcodes, get_country_code), and marks the ones of a
 // postcode the country's pattern rejects POSTAL_AREA_INVALID: Nominatim makes
@@ -733,7 +733,7 @@ static void assign_postal_area_countries(ParsedData& data, const AdminRings& cou
     parallel_for(data.admin_polygons.size(), [&](size_t begin, size_t end, unsigned) {
         for (size_t i = begin; i < end; i++) {
             AdminPolygon& poly = data.admin_polygons[i];
-            if (poly.admin_level != 11 || poly.name_id == NO_DATA) continue;
+            if (poly.admin_level != POSTAL_AREA_LEVEL || poly.name_id == NO_DATA) continue;
             const auto& rings = data.admin_exact_rings;
             if (rings.polygons[i].ring_count == 0) continue;
             const LatLng c = exact_polygon_centroid(rings.vertices.data(), rings.rings_of(static_cast<uint32_t>(i)),
@@ -2023,16 +2023,17 @@ static int run(int argc, char* argv[]) {
                             continue;
                         }
 
+                        // Nominatim's administrative levels run 2 to 12 (address-levels.json).
                         uint8_t admin_level = 0;
                         if (is_admin) {
                             const char* level_str = rel.tag("admin_level");
                             if (!level_str) continue;
                             admin_level = static_cast<uint8_t>(std::atoi(level_str));
-                            if (admin_level < 2 || admin_level > 10) continue;
+                            if (admin_level < 2 || admin_level > kMaxBoundaryLevel) continue;
+                            if (kMaxAdminLevel > 0 && admin_level > kMaxAdminLevel) continue;
                         } else {
-                            admin_level = 11;
+                            admin_level = POSTAL_AREA_LEVEL;
                         }
-                        if (kMaxAdminLevel > 0 && admin_level > kMaxAdminLevel) continue;
 
                         const char* name_en = rel.tag("name:en");
                         const char* name = rel.tag("name");
@@ -2714,6 +2715,9 @@ static int run(int argc, char* argv[]) {
                         AdminTags tags;           // its name and wikidata tags, for the links
                     };
                     std::vector<ClosedWayAdmin> closed_way_admins;
+                    // Closed administrative ways of levels 2 to 7: kept for their country
+                    // code, made place areas by their place tag, or dropped.
+                    size_t country_ways = 0, place_ways = 0, dropped_ways = 0;
                     // POI way data
                     struct PoiWayEntry {
                         PoiRecord record;
@@ -2946,20 +2950,30 @@ static int run(int argc, char* argv[]) {
                         // A boundary=postal_code way is no postcode area:
                         // Nominatim's postcode_area makes one from relations
                         // only (init.lua process_tags).
+                        // Nominatim's import makes a boundary of a closed administrative
+                        // way at levels 8 to 12 only (presets.lua admin_boundary); at
+                        // 2 to 7 only its place tag makes a row, a place area. A level 2
+                        // way with a country code stays for the country alone, which the
+                        // rank pass keeps out of every address.
                         if (is_admin && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
                             uint8_t al = 0;
                             { const char* ls = t.admin_level; if (ls) al = static_cast<uint8_t>(std::atoi(ls)); }
-                            if (al >= 2 && al <= 10 && (kMaxAdminLevel == 0 || al <= kMaxAdminLevel)) {
-                                const char* aname = t_best_name;
-                                if (aname) {
-                                    std::string name_str = aname;
-                                    if (!name_str.empty() && all_valid && resolved_locs.size() >= 3) {
-                                        std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
-                                        std::string cc; if (al == 2) { const char* iso = t.iso; if (iso) cc = iso; }
-                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), way_id,
-                                                                           static_cast<uint8_t>(place_value_of(t.place)), way_link_tags(t, way_id)});
-                                    }
-                                }
+                            const char* iso = al == 2 ? t.iso : nullptr;
+                            const AdminPlaceType pt = classify_place_override(t.place);
+                            uint8_t level = 0;
+                            if (al >= kMinBoundaryWayLevel && al <= kMaxBoundaryLevel) level = al;
+                            else if (al >= 2 && iso && iso[0]) level = 2;
+                            else if (al >= 2 && al < kMinBoundaryWayLevel && is_address_place_type(pt)) level = 15;
+                            if (level == 2) local.country_ways++;
+                            else if (level == 15) local.place_ways++;
+                            else if (al >= 2 && al < kMinBoundaryWayLevel) local.dropped_ways++;
+                            if (level != 0 && level != 15 && kMaxAdminLevel > 0 && level > kMaxAdminLevel) level = 0;
+                            const char* aname = t_best_name;
+                            if (level != 0 && aname && aname[0] && all_valid && resolved_locs.size() >= 3) {
+                                std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
+                                local.closed_way_admins.push_back({std::move(verts), std::string(aname), level,
+                                                                   level == 2 ? std::string(iso) : std::string(), way_id,
+                                                                   static_cast<uint8_t>(place_value_of(t.place)), way_link_tags(t, way_id)});
                             }
                         }
                         // Closed way boundary=place (e.g., Washington DC)
@@ -3259,6 +3273,15 @@ static int run(int argc, char* argv[]) {
                 }
                 log_phase("      Way merge: way geometries", _mt, _mc);
 
+                size_t country_ways = 0, place_ways = 0, dropped_ways = 0;
+                for (const auto& local : tld) {
+                    country_ways += local.country_ways;
+                    place_ways += local.place_ways;
+                    dropped_ways += local.dropped_ways;
+                }
+                std::cerr << "  Closed administrative ways below level " << int(kMinBoundaryWayLevel) << ": " << country_ways
+                          << " kept for a country code, " << place_ways << " place areas by their place tag, "
+                          << dropped_ways << " dropped." << std::endl;
                 parallel_for_each(tld.size(), [&](size_t k, unsigned) {
                     auto& local = tld[k];
                     auto closed_way_admins = std::move(local.closed_way_admins);

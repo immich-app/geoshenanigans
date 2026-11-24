@@ -227,6 +227,38 @@ TEST(boundaries_inside_a_city_area_nest_under_it) {
     CHECK(displays(answer, "One Tree Hill, River Valley, Central Region, Singapore"));
 }
 
+TEST(levels_11_and_12_are_boundaries_and_closed_ways_below_level_8_place_areas_or_none) {
+    // Germany: a level 11 and a level 12 relation inside a level 10 one are parts of the address
+    // of a house on a street in them, at 22 and 24. A closed administrative way of level 6 with
+    // place=town is a place area, a town of 16; one of level 6 without a place tag is no polygon
+    // of Nominatim's (an administrative way is a boundary at levels 8 to 12) and names nothing.
+    Fixture f;
+    f.country(47, 6, 55, 15, "Germany", "DE");
+    f.boundary(52, 12, 53, 14, 4, "Brandenburg");
+    f.boundary(52.4, 13.3, 52.6, 13.5, 10, "Ortsteil Mitte");
+    f.boundary(52.45, 13.35, 52.55, 13.45, 11, "Ortslage Nord");
+    f.boundary(52.48, 13.38, 52.52, 13.42, 12, "Block Sieben");
+    const int64_t a = f.node(52.500, 13.395), b = f.node(52.500, 13.405);
+    TestObject street;
+    street.type = OsmType::Way;
+    street.id = f.next_way++;
+    street.refs = {a, b};
+    street.tags = {{"highway", "residential"}, {"name", "Hauptstraße"}};
+    f.ways.push_back(street);
+    f.node(52.5002, 13.400, {{"addr:housenumber", "7"}, {"addr:street", "Hauptstraße"}});
+    f.square(52.70, 12.50, 52.80, 12.60,
+             {{"boundary", "administrative"}, {"admin_level", "6"}, {"place", "town"}, {"name", "Wegstadt"}});
+    f.square(52.10, 12.10, 52.30, 12.40, {{"boundary", "administrative"}, {"admin_level", "6"}, {"name", "Kreisweg"}});
+    const std::vector<std::string> answers =
+        answers_of(f, "rank-levels-11-12", {{52.5002, 13.4001}, {52.75, 12.55}, {52.2, 12.2}});
+    REQUIRE(answers.size() == 3);
+    CHECK(answers[0].find("Hauptstraße") != std::string::npos);
+    CHECK(answers[0].find("Block Sieben, Ortslage Nord, Ortsteil Mitte, Brandenburg, Germany\"") != std::string::npos);
+    CHECK(names(answers[1], "town", "Wegstadt"));
+    CHECK(answers[2].find("Kreisweg") == std::string::npos);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
 TEST(the_ranks_are_the_same_in_every_dir_and_in_a_chained_build) {
     // Winsford's build with every region and variant, then a chained build of the same data:
     // each dir holding a level's records holds its rank, and each holding the village node of

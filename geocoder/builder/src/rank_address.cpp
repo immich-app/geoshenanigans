@@ -72,7 +72,7 @@ AdminObjects admin_objects(ParsedData& data, const RankLookups& lookups, unsigne
     };
     std::vector<uint32_t>& members = out.members;
     for (uint32_t pid = 0; pid < polygons.size(); pid++)
-        if (polygons[pid].admin_level != 11 && exact.polygons[pid].ring_count > 0) members.push_back(pid);
+        if (polygons[pid].admin_level != POSTAL_AREA_LEVEL && exact.polygons[pid].ring_count > 0) members.push_back(pid);
     std::sort(members.begin(), members.end(), [&](uint32_t a, uint32_t b) {
         const uint64_t ba = boundary_of(a), bb = boundary_of(b);
         return ba != bb ? ba < bb : data.admin_osm_ids[a] < data.admin_osm_ids[b];
@@ -124,6 +124,10 @@ AdminObjects admin_objects(ParsedData& data, const RankLookups& lookups, unsigne
             o.point = point_e7(point.first, point.second);
             if (!o.country) o.country = lookups.country_at(o.point);
             o.initial = polygon_ranks(o.country, o.level, static_cast<PlaceValue>(o.own));
+            // A closed way of a level below kMinBoundaryWayLevel is no boundary of Nominatim's:
+            // the builder keeps a country's (level 2, a country code) for the country alone, in no
+            // address, linking nothing.
+            if (!o.relation && o.boundary() && o.level < kMinBoundaryWayLevel) o.initial = {};
             const auto t = std::lower_bound(data.admin_tags.begin(), data.admin_tags.end(), o.id,
                                             [](const AdminTags& a, uint64_t id) { return a.boundary < id; });
             if (t != data.admin_tags.end() && t->boundary == o.id) o.tags = &*t;

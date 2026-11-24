@@ -114,8 +114,8 @@ struct World {
         tags.own = type;
         return add(way_boundary_id(id), 15, square(box), {}, tags);
     }
-    // A postal area (admin_level 11).
-    uint32_t postal(int64_t id, Box box) { return add(admin_ring_id(id, 0), 11, square(box), {}, {}); }
+    // A postal area (POSTAL_AREA_LEVEL).
+    uint32_t postal(int64_t id, Box box) { return add(admin_ring_id(id, 0), POSTAL_AREA_LEVEL, square(box), {}, {}); }
 
     uint32_t node(PlaceType type, double lat, double lng, bool hidden = false) {
         PlaceNode pn{};
@@ -494,6 +494,31 @@ TEST(a_relations_rings_rank_as_one_boundary_and_postal_areas_rank_0) {
     CHECK_EQ(w.of(small), uint8_t(16));
     CHECK_EQ(w.of(wide), uint8_t(16));
     CHECK_EQ(w.of(postal), uint8_t(0));
+}
+
+TEST(levels_11_and_12_rank_as_boundaries_and_a_closed_level_2_way_in_no_address) {
+    // A German level 11 relation inside a level 10 one (20) ranks 22, a level 12 inside it 24, and
+    // a Japanese level 11 24. A closed administrative way of level 2 with a country code is no
+    // boundary of Nominatim's, which takes ways at levels 8 to 12 only: it gives the country and
+    // ranks 0. A postal area ranks 0.
+    World w("DE");
+    w.relation(1, 4, Box{50, 8, 52, 10});
+    w.relation(2, 10, Box{50.5, 8.5, 50.9, 8.9});
+    const uint32_t l11 = w.relation(3, 11, Box{50.6, 8.6, 50.8, 8.8});
+    const uint32_t l12 = w.relation(4, 12, Box{50.65, 8.65, 50.75, 8.75});
+    const uint32_t country_way = w.way(5, 2, Box{49, 7, 53, 11}, {AdminPlaceType::NONE, AdminPlaceType::NONE, "Q183"});
+    const uint32_t postal = w.postal(6, Box{50.70, 8.70, 50.72, 8.72});
+    w.rank();
+    CHECK_EQ(w.of(l11), uint8_t(22));
+    CHECK_EQ(w.of(l12), uint8_t(24));
+    CHECK_EQ(w.of(country_way), uint8_t(0));
+    CHECK_EQ(w.of(postal), uint8_t(0));
+
+    World jp("JP");
+    jp.relation(1, 4, Box{35, 139, 36, 140});
+    const uint32_t jp11 = jp.relation(2, 11, Box{35.6, 139.6, 35.7, 139.7});
+    jp.rank();
+    CHECK_EQ(jp.of(jp11), uint8_t(24));
 }
 
 TEST(the_ranks_dont_hang_on_the_thread_count) {

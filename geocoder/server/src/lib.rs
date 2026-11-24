@@ -181,8 +181,9 @@ pub fn vertex_scale(enc: u8) -> f64 {
     }
 }
 
-/// The admin level of a postcode area's record (boundary=postal_code).
-pub const POSTCODE_AREA_LEVEL: u8 = 11;
+/// The admin level of a postcode area's record (boundary=postal_code), above the administrative
+/// levels, 2 to 12.
+pub const POSTCODE_AREA_LEVEL: u8 = 13;
 
 /// The place type the builder gives a postal area whose postcode its country's pattern rejects:
 /// Nominatim makes no postcode area of it (postcodes.py _update_postcode_areas).
@@ -1675,8 +1676,10 @@ impl Index {
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
-        let mut best_by_level: [Option<(f32, AdminPolygon, bool)>; 12] = [None; 12];
-        let mut seen_in_level: [Vec<serde_json::Value>; 12] = Default::default();
+        // A slot per level up to the postal areas'.
+        const LEVELS: usize = POSTCODE_AREA_LEVEL as usize + 1;
+        let mut best_by_level: [Option<(f32, AdminPolygon, bool)>; LEVELS] = [None; LEVELS];
+        let mut seen_in_level: [Vec<serde_json::Value>; LEVELS] = Default::default();
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             self.admin_index.for_each(c, |id| {
@@ -1692,7 +1695,7 @@ impl Index {
                 let poly_id = id & ID_MASK;
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 let level = poly.admin_level as usize;
-                if level >= 12 { return; }
+                if level >= LEVELS { return; }
                 // Level-2 candidates without an ISO code can never name a
                 // country. Mirrors Nominatim, where the response's country
                 // comes from the country_code -> country-names table, so a
@@ -1729,7 +1732,7 @@ impl Index {
         }
 
         let mut picked: Vec<serde_json::Value> = Vec::new();
-        for level in 0..12 {
+        for level in 0..LEVELS {
             if let Some((_, poly, _)) = best_by_level[level] {
                 picked.push(serde_json::json!({
                     "admin_level": level,
@@ -1814,7 +1817,7 @@ impl Index {
                 return;
             }
             let level = poly.admin_level as usize;
-            if level >= 12 { return; }
+            if level > POSTCODE_AREA_LEVEL as usize { return; }
             // See debug_admin: ISO-less level-2 polygons (maritime
             // boundary closed ways) can never name a country.
             if level == 2 && poly.country_code == 0 { return; }
@@ -1999,7 +2002,7 @@ impl Index {
             match poly.admin_level {
                 // ISO-less level-2 polygons are maritime lines, not countries.
                 2 if poly.country_code == 0 => {}
-                2..=10 => boundaries.push((poly.area, id, poly)),
+                2..=12 => boundaries.push((poly.area, id, poly)),
                 _ => {}
             }
         });

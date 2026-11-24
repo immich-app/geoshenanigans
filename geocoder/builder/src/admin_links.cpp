@@ -222,18 +222,19 @@ void compute_way_parent_polygons(ParsedData& data, unsigned int num_threads) {
         };
         auto add_postals = [&](S2CellId cell, std::vector<uint32_t>& postals) {
             for_each_admin_candidate(data, cell, [&](uint32_t id, const AdminPolygon& p) {
-                if (p.admin_level == 11 && p.place_type_override != POSTAL_AREA_INVALID) postals.push_back(id & ID_MASK);
+                if (p.admin_level == POSTAL_AREA_LEVEL && p.place_type_override != POSTAL_AREA_INVALID)
+                    postals.push_back(id & ID_MASK);
             });
         };
         walk_items_by_cell<Candidates>(order, num_threads,
             [&](S2CellId cell, Candidates& c) {
-                // Admin levels <= 10 compete for the parent chain, postal
-                // boundaries (11) for the postcode.
+                // The administrative levels compete for the parent chain,
+                // postal boundaries (POSTAL_AREA_LEVEL) for the postcode.
                 c.cell = cell.id();
                 c.admins.clear();
                 c.postals.clear();
                 for_each_admin_candidate(data, cell, [&](uint32_t id, const AdminPolygon& p) {
-                    if (p.admin_level <= 10) c.admins.push_back(id);
+                    if (p.admin_level <= kMaxBoundaryLevel) c.admins.push_back(id);
                 });
                 add_postals(cell, c.postals);
                 rank_candidates(c.admins, more_specific, c.scratch);
@@ -326,9 +327,9 @@ void compute_way_parent_polygons(ParsedData& data, unsigned int num_threads) {
 
 // POI parent polygons, the smallest containing the POI (area as the
 // specificity proxy, lower = tighter; ties to the first one listed):
-// - parent_postcode_id: the postal boundary's (11) postcode, Nominatim's
-//   placex.postcode chain approximation.
-// - parent_poly_id: the admin polygon (levels 2..10; place-area markers 15
+// - parent_postcode_id: the postal boundary's (POSTAL_AREA_LEVEL) postcode,
+//   Nominatim's placex.postcode chain approximation.
+// - parent_poly_id: the admin polygon (levels 2..12; place-area markers 15
 //   skipped) the server's chain-containment check walks up from.
 // POIs are walked per admin cell, so each cell's candidates are gathered and
 // ranked once for both.
@@ -357,10 +358,10 @@ void compute_poi_parent_polygons(ParsedData& data, unsigned int num_threads, std
                 c.postal.clear();
                 c.admin.clear();
                 for_each_admin_candidate(data, cell, [&](uint32_t id, const AdminPolygon& p) {
-                    if (p.admin_level == 11) {
+                    if (p.admin_level == POSTAL_AREA_LEVEL) {
                         if (p.place_type_override != POSTAL_AREA_INVALID) c.postal.push_back(id);
                     }
-                    else if (p.admin_level >= 2 && p.admin_level <= 10) c.admin.push_back(id);
+                    else if (p.admin_level >= 2 && p.admin_level <= kMaxBoundaryLevel) c.admin.push_back(id);
                 });
                 rank_candidates(c.postal, smaller, c.scratch);
                 rank_candidates(c.admin, smaller, c.scratch);

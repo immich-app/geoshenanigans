@@ -70,7 +70,7 @@ as they are.
 | `quality/simplified/` | 4 files | Admin boundaries simplified to within 37.5 m (less for small areas), on a 1.1 m grid |
 | `quality/exact/` | 4 files | Every OSM point of every admin boundary, with nothing simplified, snapped or capped |
 
-Both hold the admin polygons (postcode areas among them, at level 11) as
+Both hold the admin polygons (postcode areas among them, at level 13) as
 `admin_polygons.bin` and their rings as `admin_rings.bin`: the same bytes in
 both. Each ring is a list of refs to the arcs of `arc_index.bin` and
 `arc_vertices.bin`, the borders the polygons on either side of them share, each

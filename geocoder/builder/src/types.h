@@ -67,7 +67,17 @@ enum class AdminPlaceType : uint8_t {
     MUNICIPALITY = 14,  // place=municipality (e.g. Sydney Council L6)
 };
 
-// The place type of a postal area (admin_level 11) whose postcode its
+// Nominatim's administrative levels run 2 to 12 (address-levels.json's
+// administrative2 to 12); a closed way is a boundary from level 8
+// (presets.lua admin_boundary).
+constexpr uint8_t kMaxBoundaryLevel = 12;
+constexpr uint8_t kMinBoundaryWayLevel = 8;
+
+// The admin_level of a postal area's polygon (boundary=postal_code), above
+// the administrative levels and below the place areas' 15.
+constexpr uint8_t POSTAL_AREA_LEVEL = 13;
+
+// The place type of a postal area (POSTAL_AREA_LEVEL) whose postcode its
 // country's pattern rejects: Nominatim makes no postcode area of it, and it
 // names no street, POI or point.
 constexpr uint8_t POSTAL_AREA_INVALID = 15;
@@ -1045,7 +1055,7 @@ struct PoiRecord {
     // NO_DATA if the POI isn't inside any postal
     // boundary.
     uint32_t parent_postcode_id = NO_DATA;
-    // Polygon id of the smallest admin boundary (admin_level <= 10)
+    // Polygon id of the smallest admin boundary (admin_level <= 12)
     // containing the POI. The server walks admin_parents from here
     // to get the POI's administrative chain — a cheap approximation
     // of Nominatim's parent_place_id walk. Used to demote POIs

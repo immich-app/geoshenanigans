@@ -825,7 +825,7 @@ const POLY_LABELS = 'debug-polygons-labels';
 //   "off"     no overlay
 //   "full"    fetch /polygons from the page's origin (full server, port 3002)
 //   "minimal" fetch from MINIMAL_BASE_URL (minimal server, port 3001)
-// Use to A/B the L9/L10/L11/L15 polygons that admin-minimal drops.
+// Use to A/B the L9-L12, postal and L15 polygons that admin-minimal drops.
 const POLY_STATES = ['off', 'full', 'minimal'];
 let polygonsSource = (() => {
   const saved = localStorage.getItem('polygons_source');
@@ -934,6 +934,7 @@ function ensurePolygonLayer() {
     9, '#44aadd',
     10, '#4488dd', // suburb
     11, '#4466dd',
+    12, '#5555cc',
     15, '#8844dd', // class=place marker
     99, '#dd44bb', // postal
     '#888888'

@@ -244,10 +244,10 @@ pub fn record(name_id: u32, admin_level: u8, area: f32) -> AdminPolygon {
 
 /// The rank_address the builder gives a polygon that nothing nests, contains or links, outside
 /// any country's own ranks (address-levels.json): a boundary its level's, a place area (level 15)
-/// its place type's, a postal area (level 11) 0.
+/// its place type's, a postal area (POSTCODE_AREA_LEVEL) 0.
 pub fn default_rank(admin_level: u8, place_type_override: u8) -> u8 {
     match (admin_level, place_type_override) {
-        (2..=10, _) => 2 * admin_level,
+        (2..=12, _) => 2 * admin_level,
         (15, 1..=3) => 16,
         (15, 4 | 13) => 20,
         (15, 5) => 24,
