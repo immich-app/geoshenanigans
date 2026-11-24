@@ -6,7 +6,7 @@
 // area covers its middle, its edges included, and has a postcode the server
 // takes. A boundary that repeats the closest boundary relation round its
 // point, the same outline whatever vertices lie along its edges, and links
-// no place node is in no address.
+// no place node is in no address; one that links one takes the node's rank.
 #include "admin_links.h"
 
 #include <algorithm>
@@ -329,11 +329,13 @@ TEST(a_boundary_relation_repeating_its_closest_parent_relation_is_taken_out) {
     // between 1 and 25, has its wikidata and geometry is in no address. In the Netherlands, where
     // admin_level 9 ranks 0: a woonplaats (10) along its gemeente's (8) outline, written from
     // another vertex and the other way round, of its wikidata, is taken out; one that links a
-    // place node is not, nor one of another wikidata, nor one round another outline; one under
-    // a level 9 boundary of the same outline and wikidata is, by the gemeente past it; a level 9
-    // boundary itself, of rank 0, is not; one under a closed way of its outline is not, the
-    // province past the way having no wikidata of its; and a province along the country's
-    // outline, of its wikidata, is not, the country's level being under 4.
+    // place node repeats it too but takes the node's rank back (:1161), its own_place_type
+    // marking it, and links a node of no rank here; one of another wikidata is not, nor one
+    // round another outline; one under a level 9 boundary of the same outline and wikidata is,
+    // by the gemeente past it; a level 9 boundary itself, of rank 0, is not; one under a closed
+    // way of its outline is not, the province past the way having no wikidata of its; and a
+    // province along the country's outline, of its wikidata, is not, the country's level being
+    // under 4.
     const uint16_t nl = pack_country_code('N', 'L');
     Admins a;
     struct Boundary {
@@ -349,7 +351,7 @@ TEST(a_boundary_relation_repeating_its_closest_parent_relation_is_taken_out) {
         {8, square, 8, 1, false, false},
         {10, reversed(rotated(square, 2)), 10, 1, false, true},
         {8, box(0.2, 0.4, 0.3, 0.5), 18, 2, true, false},
-        {10, box(0.2, 0.4, 0.3, 0.5), 20, 2, true, false},
+        {10, box(0.2, 0.4, 0.3, 0.5), 20, 2, true, true},
         {8, box(0.2, 0.6, 0.3, 0.7), 28, 3, false, false},
         {10, box(0.2, 0.6, 0.3, 0.7), 30, 4, false, false},
         {8, box(0.4, 0.2, 0.5, 0.3), 38, 5, false, false},
@@ -372,11 +374,16 @@ TEST(a_boundary_relation_repeating_its_closest_parent_relation_is_taken_out) {
     a.data.boundary_wikidata.push_back({relation_boundary_id(2), 8});
     a.map();
     compute_admin_parent_chain(a.data, 1);
-    CHECK_EQ(take_out_repeated_boundaries(a.data, 1), 2u);
+    CHECK_EQ(take_out_repeated_boundaries(a.data, 1), 3u);
     for (size_t k = 0; k < boundaries.size(); k++) {
-        const uint8_t want = boundaries[k].repeats ? BOUNDARY_REPEATS_PARENT : 0;
-        CHECK_EQ(a.data.admin_polygons[k + 1].place_type_override, want);
-        if (a.data.admin_polygons[k + 1].place_type_override != want) std::printf("    boundary %zu\n", k);
+        const bool out = boundaries[k].repeats && !boundaries[k].links;
+        const bool back = boundaries[k].repeats && boundaries[k].links;
+        const AdminPolygon& poly = a.data.admin_polygons[k + 1];
+        CHECK_EQ(poly.place_type_override, out ? BOUNDARY_REPEATS_PARENT : 0);
+        CHECK_EQ(poly.own_place_type, back ? BOUNDARY_REPEATS_PARENT : 0);
+        if (poly.place_type_override != (out ? BOUNDARY_REPEATS_PARENT : 0) ||
+            poly.own_place_type != (back ? BOUNDARY_REPEATS_PARENT : 0))
+            std::printf("    boundary %zu\n", k);
     }
 }
 

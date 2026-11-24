@@ -437,16 +437,18 @@ size_t take_out_repeated_boundaries(ParsedData& data, unsigned int num_threads) 
     };
     const AdminRings parents(rings, num_threads, may_repeat);
     const auto closer = closest_parent_first(data);
-    // Taken out, by slot: a level's are marked after it, so the levels
-    // below a boundary are settled when it looks for its parent.
+    // By slot, 1 for the rings of a boundary in no address (rank 0): a
+    // level's are marked after it, so the levels below a boundary are
+    // settled when it looks for its parent. One that repeats its parent and
+    // links a place node of a rank above 3 and below 26 takes that rank and
+    // stays a parent.
     std::vector<uint8_t> out(n);
-    size_t taken = 0;
+    size_t repeating = 0;
     for (uint8_t level = 5; level <= 10; level++) {
         std::vector<uint64_t> repeated = parallel_collect<uint64_t>(boundaries.size(),
             [&](size_t k, std::vector<uint64_t>& found) {
                 const auto [boundary, p] = boundaries[k];
                 if (data.admin_polygons[p].admin_level != level || !admin_relation_ring(data.admin_osm_ids[p])) return;
-                if (std::binary_search(linking.begin(), linking.end(), boundary)) return;
                 const uint64_t qid = qid_of(boundary);
                 if (qid == 0 || rank_of(p) == 0) return;
                 const uint32_t ring_count = rings.polygons[p].ring_count;
@@ -479,14 +481,24 @@ size_t take_out_repeated_boundaries(ParsedData& data, unsigned int num_threads) 
             }, num_threads);
         for (uint64_t boundary : repeated) {
             const auto [first, last] = slots_of(boundary);
+            const bool links = std::binary_search(linking.begin(), linking.end(), boundary);
             for (auto it = first; it != last; ++it) {
-                out[it->second] = 1;
-                data.admin_polygons[it->second].place_type_override = BOUNDARY_REPEATS_PARENT;
+                AdminPolygon& poly = data.admin_polygons[it->second];
+                if (!links) {
+                    poly.place_type_override = BOUNDARY_REPEATS_PARENT;
+                    out[it->second] = 1;
+                    continue;
+                }
+                // placex_update's parent_address_level stays 3 (:1161).
+                poly.own_place_type = BOUNDARY_REPEATS_PARENT;
+                const uint8_t linked = place_area_rank_address(polygon_country(data, countries, it->second),
+                                                               poly.place_type_override);
+                out[it->second] = linked < 4 || linked > 25;
             }
         }
-        taken += repeated.size();
+        repeating += repeated.size();
     }
-    return taken;
+    return repeating;
 }
 
 // Way parent polygon: for each street way, find the smallest admin polygon containing

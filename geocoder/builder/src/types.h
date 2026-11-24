@@ -76,6 +76,8 @@ constexpr uint8_t POSTAL_AREA_INVALID = 15;
 // The place type of a boundary (admin_level 4 to 10) that repeats its
 // parent, the same wikidata and geometry, and links no place node: Nominatim
 // takes it out of addresses (placex_update's is_same), so it names no field.
+// One that links a place node keeps the node's type and has this as its
+// own_place_type: it takes the node's rank back (placex_triggers.sql:1161).
 constexpr uint8_t BOUNDARY_REPEATS_PARENT = 15;
 
 // Vertex encoding tag: picks the bytes-per-vertex / precision tradeoff

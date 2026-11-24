@@ -191,7 +191,8 @@ pub const POSTAL_AREA_INVALID: u8 = 15;
 
 /// The place type the builder gives a boundary (admin_level 4 to 10) that repeats its parent, the
 /// same wikidata and geometry, and links no place node: Nominatim takes it out of addresses
-/// (placex_update's is_same, placex_triggers.sql:909-931).
+/// (placex_update's is_same, placex_triggers.sql:909-931). One that links a place node keeps the
+/// node's type and has this as its own_place_type: it takes the node's rank back (:1161).
 pub const BOUNDARY_REPEATS_PARENT: u8 = 15;
 
 /// The admin level `/polygons` gives a postcode area, the one the test portal colours as postal.
@@ -700,6 +701,10 @@ pub struct RankedPoly {
 ///      a boundary too, but only from a link, or from the own tag where no
 ///      node links: the place type here may be either, and only raises.
 ///
+/// A boundary that repeats its parent and links a place node (own_place_type
+/// BOUNDARY_REPEATS_PARENT) takes none of them: it ranks as its place node,
+/// above 3 and below 26, or 0 (is_same leaves parent_address_level 3).
+///
 /// A place area (admin_level 15, after every boundary) takes none of them:
 /// one of rank 16 to 23 is lifted to an area's rank + 2 where that area, a
 /// boundary or a place area whose initial rank is the place area's or more
@@ -749,6 +754,13 @@ pub fn promote_nested_ranks<'a>(
             continue;
         }
         if rank_address == 0 { continue; }
+        // One that repeats its parent and links a place node ranks 0 there, parent_address_level
+        // staying 3, and takes the node's rank back where that is above 3 and below 26 (:1161).
+        if poly.own_place_type == BOUNDARY_REPEATS_PARENT {
+            let linked = place_type_to_rank(poly.place_type_override, country);
+            ranked[i].rank_address = if (4..26).contains(&linked) { linked } else { 0 };
+            continue;
+        }
 
         // Step 1: admin nested.
         let parent_rank = ranked[..i].iter().rev()
@@ -6478,6 +6490,24 @@ mod pure_helper_tests {
         let mut polys = [ranked(10, 20, 1.0, 5), ranked(9, 18, 10.0, 5)];
         promote_nested_ranks(&mut polys, std::iter::empty::<&AdminPolygon>(), "", |_, _| true);
         assert_eq!(levels_and_ranks(&polys), [(9, 24), (10, 25)]);
+    }
+
+    #[test]
+    fn nested_ranks_give_a_boundary_repeating_its_parent_its_place_nodes_rank() {
+        // is_same takes a boundary that repeats its parent out of addresses and leaves
+        // parent_address_level at 3, so the city node it links gives it 16 back (:1161) under a
+        // parent of 24, where it would rank 25, and a boundary inside it ranks under 16. One
+        // linking a place=state node, of rank 0, stays out.
+        let repeating = |admin_level: u8, rank_address: u8, place_type_override: u8| RankedPoly {
+            poly: AdminPolygon { own_place_type: BOUNDARY_REPEATS_PARENT, ..ranked(admin_level, rank_address, 10.0, place_type_override).poly },
+            rank_address,
+        };
+        let mut polys = [ranked(11, 22, 1.0, 0), repeating(10, 20, 1), ranked(8, 16, 10.0, 5)];
+        promote_nested_ranks(&mut polys, std::iter::empty::<&AdminPolygon>(), "", |_, _| true);
+        assert_eq!(levels_and_ranks(&polys), [(8, 24), (10, 16), (11, 22)]);
+        let mut polys = [repeating(10, 20, 7), ranked(8, 16, 10.0, 0)];
+        promote_nested_ranks(&mut polys, std::iter::empty::<&AdminPolygon>(), "", |_, _| true);
+        assert_eq!(levels_and_ranks(&polys), [(8, 16), (10, 0)]);
     }
 
     #[test]

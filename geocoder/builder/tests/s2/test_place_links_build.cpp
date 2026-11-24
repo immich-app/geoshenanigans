@@ -2,14 +2,15 @@
 // answers: a boundary of rank 0 in its country links no place node, its
 // country taken at a point inside it, and leaves a node of its wikidata to
 // the boundaries after it, a boundary or a place area links a place node of
-// its wikidata only where it covers it, its edges included, and only one, one
-// of its name first, that no boundary before it links, and a node of its
+// its wikidata only where it covers it, its edges included, and only one,
+// one of its name first, that no boundary before it links, and a node of its
 // name only of no other wikidata, a boundary that repeats its parent and
-// links no place node is in no address, a place=province area is an address
-// area where its country ranks it, a postal area names a point only of its
-// own country, one for a relation, and of a postcode its country takes,
-// whatever its length, a US ZIP+4 its ZIP, and a place area linked to a
-// place node of another type ranks by its own place tag.
+// links no place node is in no address, one that links one takes the node's
+// rank, a place=province area is an address area where its country ranks it,
+// a postal area names a point only of its own country, one for a relation,
+// and of a postcode its country takes, whatever its length, a US ZIP+4 its
+// ZIP, and a place area linked to a place node of another type ranks by its
+// own place tag.
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -466,6 +467,30 @@ TEST(boundaries_repeating_their_parent_on_two_levels_are_both_in_no_address) {
     CHECK(answers[0].find("\"suburb\":\"Warszawa\"") == std::string::npos);
     CHECK(answers[0].find("\"city_district\":\"Warszawa\"") == std::string::npos);
     CHECK(names(answers[0], "city_district", "Śródmieście"));
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_boundary_that_repeats_its_parent_and_links_a_place_node_takes_the_nodes_rank) {
+    // is_same leaves parent_address_level at 3, so a boundary that repeats its parent and links a
+    // place node takes the node's rank back where that is above 3 and below 26 (placex_triggers.sql
+    // :1161), whatever its parent's. The gmina Nowe Miasto (admin_level 8) is tagged
+    // place=neighbourhood and ranks 24; the town boundary along its ways (10), of its wikidata,
+    // links the city node its label names and ranks 16, a city, where under a parent of 24 it
+    // would rank 25, in no address.
+    Fixture f;
+    f.country(49, 14, 55, 24, "Polska", "PL");
+    f.boundary(51, 19, 53.5, 23.5, 4, "województwo mazowieckie");
+    const int64_t ways = f.square(52.00, 20.00, 52.10, 20.20);
+    Tags gmina = Fixture::boundary_tags(8, "Nowe Miasto"), town = Fixture::boundary_tags(10, "Nowe Miasto");
+    gmina.insert(gmina.end(), {{"wikidata", "Q900"}, {"place", "neighbourhood"}});
+    town.emplace_back("wikidata", "Q900");
+    const int64_t centre = f.node(52.05, 20.10, {{"place", "city"}, {"name", "Śródmieście Nowego Miasta"}});
+    f.relation(gmina, {ways});
+    f.relation(town, {ways}, {{OsmType::Node, centre, "label"}});
+    const std::vector<std::string> answers = answers_of(f, "repeated-linked", {{52.051, 20.101}});
+    REQUIRE(answers.size() == 1);
+    CHECK(names(answers[0], "city", "Nowe Miasto"));
+    CHECK(names(answers[0], "neighbourhood", "Nowe Miasto"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 

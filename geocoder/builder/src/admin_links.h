@@ -78,13 +78,16 @@ void compute_admin_parent_chain(ParsedData& data, unsigned int num_threads);
 // round it, of a lower admin level above 3 and a rank of 1 to 25, has its
 // wikidata (data.boundary_wikidata) and its rings (the same outline, from
 // any vertex on, either way round, whatever vertices either adds along its
-// straight edges: ST_Equals) is in no address, its rank 0. The closest is
-// the one of the highest level, then the smallest, of those covering a
-// point inside the boundary's largest ring (its admin cell entries,
-// data.admin_index_cells), the levels below settled first. One that links a
-// place node (data.linking_boundaries) takes the node's rank back (:1161)
-// and stays. Every ring of one taken out is marked BOUNDARY_REPEATS_PARENT.
-// Returns how many boundaries it takes out.
+// straight edges: ST_Equals) ranks 0. The closest is the one of the highest
+// level, then the smallest, of those covering a point inside the
+// boundary's largest ring (its admin cell entries, data.admin_index_cells),
+// the levels below settled first. Every ring of one that links no place
+// node (data.linking_boundaries) is marked BOUNDARY_REPEATS_PARENT, in no
+// address; every ring of one that links a node keeps the node's type and
+// has own_place_type BOUNDARY_REPEATS_PARENT: parent_address_level staying
+// 3, it takes the node's rank where that is above 3 and below 26 (:1161),
+// whatever its parent's, and is a parent of that rank. Returns how many
+// boundaries repeat their parent.
 size_t take_out_repeated_boundaries(ParsedData& data, unsigned int num_threads);
 
 void compute_way_parent_polygons(ParsedData& data, unsigned int num_threads);

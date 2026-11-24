@@ -4464,7 +4464,7 @@ static int run(int argc, char* argv[]) {
         compute_admin_parent_chain(data, num_threads);
         {
             const size_t repeated = take_out_repeated_boundaries(data, num_threads);
-            std::cerr << "Boundaries repeating their parent, in no address: " << repeated << std::endl;
+            std::cerr << "Boundaries repeating their parent: " << repeated << std::endl;
         }
 
         std::future<void> tiger_freed = external_data.get();
