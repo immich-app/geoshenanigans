@@ -194,7 +194,9 @@ geometry is its polygon; a closed way's is its polygon where `area=yes`
 alone, and its outline as a line else (`init.lua` `process_way`). The builder
 names one by its tags (`poi_classify.h` `poi_water_street`): its POI polygon
 takes the highway flag, but for a closed way of no `area=yes`, which is the
-line the street index holds, and it writes no address point of it. The
+line the street index holds, and it writes no address point of it. A
+reservoir or basin way of `area=yes` that is a street is a POI polygon of its
+own, with no POI main tag beside it (`way_tags.h` `has_poi_tags`). The
 server lets a water area of that flag compete as streets do, linked to a
 parent street or not, its own name the `road` wherever it wins
 (`Index::is_water_street`). Two differences stay: Nominatim's lane takes an

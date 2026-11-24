@@ -1497,7 +1497,10 @@ TEST(a_water_street_that_is_an_attraction_answers_its_own_name_from_poi_notable_
 // Teststrasse is nearer than its outline, and answers. A lake of
 // highway=pedestrian 2 km north of every street links no parent street, and
 // its own name answers inside it, as just outside it, 3 m west, where its
-// outline is the nearest feature. Nor is any water multipolygon of a hole an
+// outline is the nearest feature. A basin of area=yes and highway=pedestrian
+// alone, of no POI main tag, is such a street too: the build writes its
+// polygon, which answers inside it though Teststrasse is nearer than its
+// outline. Nor is any water multipolygon of a hole an
 // address point, whose polygon of the outer ring would fill it: a point on
 // the island of a wetland nature reserve that is a rank-30 POI of no
 // category of its own finds no house number, though the reserve of no
@@ -1523,6 +1526,9 @@ TEST(a_water_street_is_no_address_point_and_answers_its_own_name_as_a_street_doe
                                 {"natural", "water"}}));
     add_rectangle(water, 4042, 998, south, lng0 + 1450000, north, lng0 + 1458000,
                   {{"highway", "pedestrian"}, {"name", "Seeufer Testdorf"}, {"natural", "water"}});
+    add_rectangle(water, 4049, 1026, south, lng0 + 1535000, north, lng0 + 1543000,
+                  with_address({{"area", "yes"}, {"highway", "pedestrian"}, {"landuse", "basin"},
+                                {"name", "Beckenplatz Testdorf"}}));
     add_rectangle(water, 4043, 1002, lat0 + 1600000, lng0 + 1420000, lat0 + 1608000, lng0 + 1428000);
     water.push_back(multipolygon(5043, 4043, {{"highway", "pedestrian"}, {"name", "Bergsee Testdorf"}, {"natural", "water"}}));
     // The reserves and the bay 22 m by 60 m, 33 m north of Teststrasse, each
@@ -1574,7 +1580,8 @@ TEST(a_water_street_is_no_address_point_and_answers_its_own_name_as_a_street_doe
                           Want{47.14, 8.1454, lake, 0, true}, Want{47.1604, 8.1424, lake, POI_FLAG_HIGHWAY, false},
                           Want{47.1404, 8.1469, int(PoiCategory::NATURE_RESERVE), 0, false},
                           Want{47.1404, 8.1524, int(PoiCategory::NATURE_RESERVE), 0, false},
-                          Want{47.1404, 8.1399, int(PoiCategory::BAY), 0, false}}) {
+                          Want{47.1404, 8.1399, int(PoiCategory::BAY), 0, false},
+                          Want{47.14, 8.1539, int(PoiCategory::RESERVOIR), POI_FLAG_HIGHWAY, true}}) {
         const PoiRecord* pr = at(w.lat, w.lng);
         REQUIRE(pr != nullptr);
         if (pr->category != w.category || pr->flags != w.flags || (pr->parent_street_id != NO_DATA) != w.parent)
@@ -1588,11 +1595,11 @@ TEST(a_water_street_is_no_address_point_and_answers_its_own_name_as_a_street_doe
     const std::string dataset = poi_dataset(out, "all", root.path() + "/dataset");
     const std::vector<std::pair<double, double>> asked = {
         {47.14005, 8.1424}, {47.14005, 8.1439}, {47.14005, 8.1454}, {47.1604, 8.1424},
-        {47.1604, 8.14196}, {47.1404, 8.1469},  {47.1404, 8.1399}};
+        {47.1604, 8.14196}, {47.1404, 8.1469},  {47.1404, 8.1399}, {47.14005, 8.1539}};
     const std::vector<std::string> answers = server_answers(dataset, asked, root.path() + "/q", log);
     REQUIRE(answers.size() == asked.size());
     const char* roads[] = {"Seeplatz Testdorf", "Seesteg Testdorf", "Teststrasse", "Bergsee Testdorf",
-                           "Bergsee Testdorf", "Teststrasse", "Teststrasse"};
+                           "Bergsee Testdorf", "Teststrasse", "Teststrasse", "Beckenplatz Testdorf"};
     for (size_t k = 0; k < answers.size(); k++) {
         const bool numbered = answer_string(answers[k], {"address", "house_number"}).has_value();
         if (answer_string(answers[k], {"address", "road"}) != std::optional<std::string>(roads[k]) || numbered ||

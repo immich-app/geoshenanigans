@@ -66,7 +66,11 @@ struct WayTags {
             // way alone.
             (landuse && (std::strcmp(landuse, "reservoir") == 0 || std::strcmp(landuse, "basin") == 0) &&
              has_poi_main_tag(amenity, leisure, emergency, tourism, historic, shop, craft, office, aeroway, railway,
-                              man_made));
+                              man_made)) ||
+            // So is one that is a street (poi_water_street) of area=yes, which
+            // alone makes a closed way of a highway tag a polygon (init.lua
+            // process_way): its own name answers inside it.
+            (area && std::strcmp(area, "yes") == 0 && poi_water_street(natural, landuse, highway, footway, place));
     }
 };
 
