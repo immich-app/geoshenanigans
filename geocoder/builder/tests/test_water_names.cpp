@@ -139,6 +139,57 @@ TEST(a_segment_across_the_antimeridian_is_cut_there_at_the_latitude_it_crosses_a
     CHECK(cut == std::vector<PackedLocation>(line.begin(), line.begin() + 2));
 }
 
+TEST(a_reach_along_the_antimeridian_is_cut_to_run_along_it_at_180_east_whichever_way_its_ends_are_spelled) {
+    // Both ends on the antimeridian: either spelling, either way along it.
+    CHECK(segment_on_antimeridian({100, 1800000000}, {200, -1800000000}));
+    CHECK(segment_on_antimeridian({100, -1800000000}, {200, -1800000000}));
+    CHECK(segment_on_antimeridian({100, 1800000000}, {200, 1800000000}));
+    CHECK(!segment_on_antimeridian({100, 1800000000}, {200, 1799999999}));
+    CHECK(!segment_on_antimeridian({100, -1799999999}, {200, 1800000000}));
+    using Line = std::vector<PackedLocation>;
+    auto cut_of = [](const Line& line) {
+        Line out;
+        cut_at_antimeridian(line.data(), static_cast<uint32_t>(line.size()), out);
+        return out;
+    };
+    // Its ends of opposite spellings, north or south: the reach at 180 east,
+    // then on to its end as it is spelled.
+    CHECK(cut_of({{100, 1800000000}, {200, -1800000000}}) ==
+          Line({{100, 1800000000}, {200, 1800000000}, {200, -1800000000}}));
+    CHECK(cut_of({{200, 1800000000}, {100, -1800000000}}) ==
+          Line({{200, 1800000000}, {100, 1800000000}, {100, -1800000000}}));
+    CHECK(cut_of({{100, -1800000000}, {200, 1800000000}}) ==
+          Line({{100, -1800000000}, {100, 1800000000}, {200, 1800000000}}));
+    CHECK(cut_of({{200, -1800000000}, {100, 1800000000}}) ==
+          Line({{200, -1800000000}, {200, 1800000000}, {100, 1800000000}}));
+    // Both at 180 west, either way: the same.
+    CHECK(cut_of({{100, -1800000000}, {200, -1800000000}}) ==
+          Line({{100, -1800000000}, {100, 1800000000}, {200, 1800000000}, {200, -1800000000}}));
+    CHECK(cut_of({{200, -1800000000}, {100, -1800000000}}) ==
+          Line({{200, -1800000000}, {200, 1800000000}, {100, 1800000000}, {100, -1800000000}}));
+    // Both at 180 east: as it was.
+    CHECK(cut_of({{100, 1800000000}, {200, 1800000000}}) == Line({{100, 1800000000}, {200, 1800000000}}));
+    // In each, a stretch along the antimeridian is at 180 east; the others
+    // across it wrap, of no length on the sphere.
+    for (const Line& line : {Line{{100, 1800000000}, {200, -1800000000}}, Line{{200, -1800000000}, {100, -1800000000}},
+                             Line{{100, 1799990000}, {100, -1800000000}, {300, -1800000000}, {300, -1799990000}}}) {
+        const Line cut = cut_of(line);
+        uint64_t along = 0;
+        for (size_t i = 1; i < cut.size(); i++) {
+            if (cut[i - 1] == cut[i]) continue;
+            if (segment_wraps(cut[i - 1], cut[i])) {
+                CHECK_EQ(segment_mm(cut[i - 1], cut[i]), uint64_t(0));
+                continue;
+            }
+            if (segment_on_antimeridian(cut[i - 1], cut[i])) {
+                CHECK(cut[i - 1].lon_e7 == kAntimeridianE7 && cut[i].lon_e7 == kAntimeridianE7);
+                along += segment_mm(cut[i - 1], cut[i]);
+            }
+        }
+        CHECK(along > 0);
+    }
+}
+
 TEST(an_area_takes_the_key_of_most_length_and_that_keys_display_of_most_length) {
     // Object 0: key 1 (500 + 400) beats key 0 (800); key 1's display 3 has
     // 500 against display 2's 400. Object 1: keys tie, the smaller wins;

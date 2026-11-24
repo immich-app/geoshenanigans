@@ -329,6 +329,50 @@ TEST(a_segment_across_the_antimeridian_credits_the_river_areas_it_runs_through_o
     CHECK(named == std::set<int64_t>({2201, 2202}));
 }
 
+TEST(a_reach_along_the_antimeridian_credits_the_river_area_west_of_it_whichever_way_its_ends_are_spelled) {
+    // The two unnamed river areas either side of the antimeridian, as above,
+    // and a line whose one segment runs along it between them, 0.002 to
+    // 0.008 up their sides: run north, the area to its left is the one west
+    // of it, at 180 east, which holds all of it, however its ends are spelled
+    // and whichever way it runs; the one east of it holds none.
+    const int32_t lat = 650000000, east = kAntimeridianE7 - 100000, west = -kAntimeridianE7;
+    const int32_t E = kAntimeridianE7, W = -kAntimeridianE7, s = lat + 20000, n = lat + 80000;
+    const std::vector<std::pair<PackedLocation, PackedLocation>> reaches = {
+        {pt(s, E), pt(n, E)}, {pt(s, W), pt(n, W)}, {pt(n, W), pt(s, W)}, {pt(s, E), pt(n, W)},
+        {pt(s, W), pt(n, E)}, {pt(n, E), pt(s, W)}, {pt(n, W), pt(s, E)}};
+    const uint64_t reach_mm = segment_mm(pt(s, E), pt(n, E));
+    REQUIRE(reach_mm > 0);
+    for (const auto& [a, b] : reaches) {
+        Collected c = fixture();
+        c.closed_ways.push_back({2201, tags(code::kRiver, "", true), square(lat, east, 100000)});
+        c.closed_ways.push_back({2202, tags(code::kRiver, "", true), square(lat, west, 100000)});
+        LineIn anadyr;
+        anadyr.way = 2210;
+        anadyr.key = "nAnadyr";
+        anadyr.local = anadyr.display = "Anadyr";
+        anadyr.vertices = {a, b};
+        c.lines.push_back(anadyr);
+        Collected joined = c;
+        Build built = assemble(joined, 1);
+        std::vector<uint32_t> rivers;
+        for (uint32_t p = 0; p < built.rings.polygons.size(); p++)
+            if (built.objects[built.object_of[p]].tags.river_area) rivers.push_back(p);
+        NamingCounts counts;
+        std::vector<Credit> credits = credit_naming_lines(built.rings, rivers, built.object_of, built.lines, counts, 2);
+        std::map<int64_t, uint64_t> mm;
+        for (const Credit& cr : credits) mm[built.objects[cr.object].id] += cr.mm;
+        CHECK_EQ(mm[2201], reach_mm);
+        CHECK_EQ(mm[2202], uint64_t(0));
+        // So the one west of it takes its name, and the other none.
+        const Layer layer = build(c);
+        std::set<int64_t> named;
+        for (size_t p = 0; p < layer.size(); p++)
+            for (int64_t id : {2201, 2202})
+                if (layer.identities[p] == way_identity(id) && name_of(layer, p) == "Anadyr") named.insert(id);
+        CHECK(named == std::set<int64_t>({2201}));
+    }
+}
+
 TEST(the_join_of_no_lines_credits_nothing_and_covers_no_river_area) {
     Collected c = fixture();
     Build b = assemble(c, 1);

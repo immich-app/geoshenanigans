@@ -122,15 +122,16 @@ std::vector<Credit> credit_naming_lines(const AdminExactRings& rings, const std:
     for (size_t i = 0; i < cover.size(); i++) covered[i] = cover[i].cell_id;
     covered.erase(std::unique(covered.begin(), covered.end()), covered.end());
 
-    // The lines with a segment across the antimeridian, each stood in for
-    // by a copy of it cut there (cut_at_antimeridian), past the others: a
-    // piece either side of it is a segment of its own.
+    // The lines with a segment across the antimeridian or along it, each
+    // stood in for by a copy of it cut there (cut_at_antimeridian), past the
+    // others: a piece either side of it is a segment of its own, and a reach
+    // along it runs at 180 east.
     const size_t own = lines.lines.size();
     const std::vector<uint32_t> wrapping = parallel_filter<uint32_t>(own, [&](size_t l) {
         const NamingLine& line = lines.lines[l];
         const PackedLocation* lv = lines.vertices.data() + line.first;
         for (uint32_t i = 0; i + 1 < line.count; i++)
-            if (segment_wraps(lv[i], lv[i + 1])) return true;
+            if (segment_wraps(lv[i], lv[i + 1]) || segment_on_antimeridian(lv[i], lv[i + 1])) return true;
         return false;
     }, threads);
     std::vector<NamingLine> cut;
