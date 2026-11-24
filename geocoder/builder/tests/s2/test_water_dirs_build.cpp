@@ -293,6 +293,23 @@ TEST(build_index_loads_the_marine_areas_it_is_given_into_the_water_dirs) {
     CHECK(std::string(uncredited.begin(), uncredited.end()).find("marine-regions") == std::string::npos);
 }
 
+TEST(build_index_refuses_a_marine_areas_file_cut_short_before_it_reads_the_pbf) {
+    // Its header as it should be, its body cut short: refused at the start,
+    // before the passes over the PBF.
+    const ScratchDir root("water-marine-cut-short");
+    const std::string good = gctest::two_areas_bytes(), marine = root.path() + "/marine_areas.bin";
+    std::ofstream(marine, std::ios::binary) << good.substr(0, good.size() - 3);
+    const std::string pbf = root.path() + "/water.osm.pbf", log = root.path() + "/build.log";
+    write_test_pbf(pbf, fixture(), 1000);
+    CHECK(!gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/out", pbf, "--multi-output", "--multi-quality",
+                        "--marine", marine},
+                       log));
+    const std::vector<char> text = bytes_of(log);
+    const std::string said(text.begin(), text.end());
+    CHECK(said.find("cut short") != std::string::npos);
+    CHECK(said.find("Processing " + pbf) == std::string::npos);
+}
+
 TEST(a_build_without_multi_output_writes_the_exact_water_tier_beside_its_modes_files) {
     const ScratchDir root("water-single-output");
     const std::string pbf = root.path() + "/water.osm.pbf", log = root.path() + "/build.log";

@@ -152,6 +152,25 @@ TEST(a_marine_areas_file_of_another_shape_is_refused) {
     CHECK(refused);
 }
 
+TEST(the_check_before_the_build_refuses_a_marine_areas_file_its_read_would) {
+    // A good header over a body cut short or with bytes past its last
+    // object: refused at the check, as the build's read of it would be.
+    ScratchDir dir("marine");
+    const std::string good = two_areas_bytes();
+    auto check_error = [](const std::string& path) -> std::string {
+        try {
+            marine::check_file(path);
+        } catch (const std::runtime_error& e) {
+            return e.what();
+        }
+        return "";
+    };
+    CHECK(check_error(write(dir, "good.bin", good)).empty());
+    CHECK(check_error(write(dir, "short.bin", good.substr(0, good.size() - 3))).find("cut short") != std::string::npos);
+    CHECK(check_error(write(dir, "body.bin", good.substr(0, 20))).find("cut short") != std::string::npos);
+    CHECK(check_error(write(dir, "long.bin", good + "x")).find("1 bytes past the last object") != std::string::npos);
+}
+
 TEST(a_marine_count_past_what_the_rest_of_the_file_can_hold_is_cut_short_where_it_stands) {
     ScratchDir dir("marine");
     const std::string good = two_areas_bytes();
