@@ -556,6 +556,11 @@ pub const ADDRESS_AREA_RANKS: std::ops::Range<u8> = 1..25;
 /// "South Kumminin, Western Australia, 6368, Australia".
 pub const AREA_RESULT_RANK: u8 = 25;
 
+/// How far from a point Nominatim looks for the street, house or POI that answers it
+/// (reverse.py lookup_street_poi: 0.006 degrees and 0.001 of fuzziness), in degrees, planar as
+/// ST_DWithin measures them on lon/lat.
+pub const STREET_POI_REACH_DEG: f64 = 0.007;
+
 /// The rank_search of boundary=administrative at `level` in `country` (upper case, "" where
 /// unknown): address-levels.json's administrativeN, the first of its pair, the country's entry
 /// first, else twice the level from 2 to 12 (compute_place_rank, as the builder's admin_ranks).
@@ -2128,6 +2133,40 @@ impl Index {
         rows
     }
 
+    /// Whether a street or an address point lies within STREET_POI_REACH_DEG of (lat, lng), or
+    /// `poi` (the nearest of the POIs, with its squared distance): Nominatim answers with the
+    /// nearest of those (_find_closest_street_or_pois), whose address leaves an area of rank 25
+    /// out, where the street cells next to the point's, which our own search reads, hold none.
+    fn feature_within_reach(&self, lat: f64, lng: f64, poi: Option<&(f64, PoiRecord)>) -> bool {
+        let near = |plat: f64, plng: f64| (plat - lat).hypot(plng - lng) <= STREET_POI_REACH_DEG;
+        if poi.is_some_and(|(d, p)| *d == 0.0 || near(f64::from(p.lat), f64::from(p.lng))) {
+            return true;
+        }
+        let Some(streets) = self.streets.as_ref() else { return false };
+        let cells = cells_near_point(lat, lng, STREET_POI_REACH_DEG * METRES_PER_DEGREE, self.street_cell_level);
+        let mut lists = GeoLists::default();
+        self.geo_index.lookup_many(&cells, 1 << geo_index::STREETS | 1 << geo_index::ADDRESSES, &mut lists);
+        let mut found = false;
+        if let Some(addrs) = self.addrs.as_ref() {
+            let ids = (0..cells.len()).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
+            addrs.for_ids(ids, |_, point| found |= near(f64::from(point.lat), f64::from(point.lng)));
+        }
+        if found { return true; }
+        with_way_nodes(|nodes| {
+            for i in 0..cells.len() {
+                for &id in lists.list(i, geo_index::STREETS) {
+                    if found { return; }
+                    if !streets.way(id, nodes) { continue; }
+                    found = nodes.windows(2).any(|w| {
+                        planar_segment_distance((lat, lng), (f64::from(w[0].lat), f64::from(w[0].lng)), (f64::from(w[1].lat), f64::from(w[1].lng)))
+                            <= STREET_POI_REACH_DEG
+                    });
+                }
+            }
+        });
+        found
+    }
+
     // --- Place node lookup (nearest city/town/village/suburb) ---
 
     // Nominatim's `current_boundary` (insert_addresslines in
@@ -3384,7 +3423,7 @@ impl Index {
         // out.
         let area_result = if self.streets.is_some() && closest_feature_dist >= max_dist && landmark_name.is_none() {
             let country = admin.country_code.map(|c| String::from_utf8_lossy(&c).to_uppercase()).unwrap_or_default();
-            self.area_result(&mut admin_scan, &country)
+            self.area_result(&mut admin_scan, &country).filter(|_| !self.feature_within_reach(lat, lng, poi_primary_raw.as_ref()))
         } else {
             None
         };

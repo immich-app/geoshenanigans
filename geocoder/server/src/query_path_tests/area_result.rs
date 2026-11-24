@@ -42,6 +42,22 @@ fn a_locality_of_rank_25_answers_a_point_no_street_is_near() {
 }
 
 #[test]
+fn a_street_or_a_house_within_nominatims_reach_answers_instead() {
+    // lookup_street_poi reaches 0.007 degrees (0.006 and 0.001 of fuzziness), planar as ST_DWithin
+    // on lon/lat, much farther than the street cells round the point that our own search reads: a
+    // street 500 m north (0.0045 degrees) answers, its address leaving Telfer out, and one 900 m
+    // north (0.0081 degrees) is out of reach, where Telfer answers.
+    for (north_m, locality) in [(500.0, None), (900.0, Some("Telfer"))] {
+        let index = telfer(Some(north_m)).load();
+        let address = address_at(&index, 0.0, 0.0);
+        assert_eq!(address.get("locality").and_then(|v| v.as_str()), locality, "{north_m}");
+    }
+    // So does a house 600 m east (0.0055 degrees at 10 degrees north).
+    let index = telfer(Some(5000.0)).address("12", 0.0, 600.0).load();
+    assert_eq!(address_at(&index, 0.0, 0.0).get("locality"), None);
+}
+
+#[test]
 fn a_dir_without_streets_answers_as_on_a_street_and_leaves_the_locality_out() {
     // An admin dir has no streets to tell a point no street is near: its answers stand for a
     // street's at the point, whose address takes no area of rank 25.
