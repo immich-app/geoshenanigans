@@ -126,7 +126,10 @@ struct AdminPolygon {
     // node of another type, whose type is its place_type_override and labels
     // it (find_linked_place); 0 where its place type is its own.
     uint8_t own_place_type = 0;
-    uint8_t _pad3 = 0;
+    // 1 for a closed way's polygon, 0 for a ring of a relation: a place node
+    // is raised two ranks inside a relation of its rank only (osm_type = 'R',
+    // placex_triggers.sql:984-1004), which the server reads from the record.
+    uint8_t of_way = 0;
     float area;                   // of the exact rings, holes subtracted
     uint16_t country_code;
     uint16_t _pad4 = 0;
@@ -138,7 +141,8 @@ static_assert(sizeof(AdminPolygon) == 20, "AdminPolygon must be 20 bytes");
 // record's offset is the running one, a tombstone's included, whose block is
 // empty, as is that of a polygon a tier left without rings. A tombstone's
 // name_id is NO_DATA. level_override is admin_level << 4 | the
-// place_type_override, both under 16, and own_place_type is the polygon's.
+// place_type_override, both under 16, and own_place_type is the polygon's,
+// under 128, with ADMIN_OF_WAY set for a closed way's.
 struct AdminPolygonRecord {
     uint32_t ring_offset;
     uint32_t name_id;
@@ -149,16 +153,21 @@ struct AdminPolygonRecord {
 };
 static_assert(sizeof(AdminPolygonRecord) == 16, "AdminPolygonRecord must be 16 bytes");
 
+// The bit of an AdminPolygonRecord's own_place_type that marks a closed way's
+// polygon (AdminPolygon::of_way).
+static constexpr uint8_t ADMIN_OF_WAY = 0x80;
+
 inline AdminPolygonRecord admin_polygon_record(const AdminPolygon& p, uint32_t ring_offset) {
     if (p.admin_level > 15 || p.place_type_override > 15)
         throw std::logic_error("an admin level or place type past 4 bits");
+    if (p.own_place_type & ADMIN_OF_WAY) throw std::logic_error("an own place type past 7 bits");
     AdminPolygonRecord r;
     r.ring_offset = ring_offset;
     r.name_id = p.name_id;
     r.area = p.area;
     r.country_code = p.country_code;
     r.level_override = static_cast<uint8_t>(p.admin_level << 4 | p.place_type_override);
-    r.own_place_type = p.own_place_type;
+    r.own_place_type = static_cast<uint8_t>(p.own_place_type | (p.of_way ? ADMIN_OF_WAY : 0));
     return r;
 }
 

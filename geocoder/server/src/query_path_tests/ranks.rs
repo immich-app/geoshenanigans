@@ -270,3 +270,25 @@ fn a_place_area_in_the_address_holds_the_place_nodes_of_finer_ranks_to_itself() 
         .load();
     assert_eq!(address_at(&index, 0.0, 0.0)["neighbourhood"], "Al Khalidiyah");
 }
+
+#[test]
+fn a_place_area_of_a_closed_way_promotes_no_place_node_of_its_rank() {
+    // Bat Yam (32.012156, 34.756722): the place=suburb way בת ים (W1219784953, rank 20) holds the
+    // place=suburb node Ramat HaNasi (rank 20). placex_update raises a place node to a subpart,
+    // two ranks up, only inside a relation of its rank (osm_type = 'R',
+    // placex_triggers.sql:984-1004), so the node stays at 20, where the area's row comes first
+    // (isguess asc, :576): the area is the suburb. Inside a place=suburb relation the node ranks
+    // 22 and, the finer row, is the suburb.
+    let bat_yam = |way: bool| {
+        let mut index = TestIndex::in_country(b"IL");
+        index.boundary("Tel-Aviv District", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+            .boundary("Bat Yam", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Bat Yam West", 15, 4, (-1000.0, -1000.0, 1000.0, 1000.0));
+        if way { index.of_way(); }
+        index.place("Ramat HaNasi", 3, 300.0, 200.0).load()
+    };
+    let address = address_at(&bat_yam(true), 0.0, 0.0);
+    assert_eq!(address["suburb"], "Bat Yam West");
+    let address = address_at(&bat_yam(false), 0.0, 0.0);
+    assert_eq!(address["suburb"], "Ramat HaNasi");
+}

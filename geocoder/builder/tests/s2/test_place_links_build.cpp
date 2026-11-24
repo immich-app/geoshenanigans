@@ -647,6 +647,39 @@ TEST(a_place_node_ranked_above_the_boundary_of_its_label_names_the_field) {
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 
+TEST(a_place_area_of_a_closed_way_raises_no_place_node_of_its_rank) {
+    // Bat Yam (32.012156, 34.756722): the place=suburb way בת ים (W1219784953, rank 20) holds the
+    // place=suburb node Ramat HaNasi (rank 20). placex_update raises a place node two ranks only
+    // inside a relation of its rank (osm_type = 'R', placex_triggers.sql:984-1004), so the node
+    // stays at 20, where the area's row comes first (isguess asc, :576), and the area is the
+    // suburb. As a place=suburb relation the area raises the node to 22, the finer row and the
+    // suburb.
+    const auto suburb_at = [](bool way) {
+        Fixture f;
+        f.country(29.5, 34.2, 33.3, 35.9, "Israel", "IL");
+        f.boundary(31.9, 34.7, 32.2, 34.9, 4, "Tel-Aviv District");
+        f.boundary(31.99, 34.73, 32.03, 34.78, 8, "Bat Yam");
+        const Tags area = {{"place", "suburb"}, {"name", "Bat Yam West"}};
+        if (way) {
+            f.square(32.005, 34.745, 32.02, 34.765, area);
+        } else {
+            Tags tags = area;
+            tags.push_back({"type", "multipolygon"});
+            f.area(32.005, 34.745, 32.02, 34.765, tags);
+        }
+        f.node(32.013, 34.7575, {{"place", "suburb"}, {"name", "Ramat HaNasi"}});
+        const std::vector<std::string> answers = answers_of(f, way ? "suburb-way" : "suburb-relation", {{32.012156, 34.756722}});
+        for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+        return answers;
+    };
+    const std::vector<std::string> of_way = suburb_at(true);
+    REQUIRE(of_way.size() == 1);
+    CHECK(names(of_way[0], "suburb", "Bat Yam West"));
+    const std::vector<std::string> of_relation = suburb_at(false);
+    REQUIRE(of_relation.size() == 1);
+    CHECK(names(of_relation[0], "suburb", "Ramat HaNasi"));
+}
+
 TEST(a_boundary_links_no_place_node_of_its_name_whose_wikidata_is_another) {
     // find_linked_place's name step takes a node of the boundary's name only where either has no
     // wikidata or both the same (placex_triggers.sql:376-377). Ottignies-Louvain-la-Neuve (admin

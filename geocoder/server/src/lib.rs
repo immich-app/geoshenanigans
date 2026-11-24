@@ -195,6 +195,10 @@ pub const POSTAL_AREA_INVALID: u8 = 15;
 /// node's type and has this as its own_place_type: it takes the node's rank back (:1161).
 pub const BOUNDARY_REPEATS_PARENT: u8 = 15;
 
+/// The top bit of an admin_polygons.bin record's last byte: the polygon is a closed way's
+/// (AdminPolygon::of_way); the bits below it are its own_place_type.
+pub const ADMIN_OF_WAY: u8 = 0x80;
+
 /// The admin level `/polygons` gives a postcode area, the one the test portal colours as postal.
 pub const POLYGONS_POSTAL_LEVEL: u8 = 99;
 
@@ -202,8 +206,8 @@ pub const POLYGONS_POSTAL_LEVEL: u8 = 99;
 /// ring block in admin_rings.bin, every record's the running one, a tombstone's included (whose
 /// block, like that of a polygon a tier left without rings, is empty); its u32 name_id, NO_DATA
 /// for a tombstone; its f32 area; its u16 country code; admin_level << 4 | place_type_override;
-/// own_place_type. A ring block runs to the next record's offset, the last to the end of
-/// admin_rings.bin.
+/// own_place_type, ADMIN_OF_WAY set for a closed way's. A ring block runs to the next record's
+/// offset, the last to the end of admin_rings.bin.
 pub const ADMIN_POLYGON_RECORD_BYTES: u64 = 16;
 
 /// An admin polygon: its admin_polygons.bin record, with its ring block's length.
@@ -225,6 +229,10 @@ pub struct AdminPolygon {
     /// every tier.
     pub area: f32,
     pub country_code: u16,
+    /// A closed way's polygon, not a ring of a relation (the record's last byte's top bit): it
+    /// raises no place node of its rank to a subpart, which placex_update does inside a relation
+    /// only (osm_type = 'R', placex_triggers.sql:984-1004).
+    pub of_way: bool,
 }
 
 impl AdminPolygon {
@@ -241,9 +249,10 @@ impl AdminPolygon {
             name_id: u32_at(4),
             admin_level: bytes[14] >> 4,
             place_type_override: bytes[14] & 15,
-            own_place_type: bytes[15],
+            own_place_type: bytes[15] & !ADMIN_OF_WAY,
             area: f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
             country_code: u16::from_le_bytes([bytes[12], bytes[13]]),
+            of_way: bytes[15] & ADMIN_OF_WAY != 0,
         }
     }
 
@@ -255,7 +264,7 @@ impl AdminPolygon {
         b[8..12].copy_from_slice(&self.area.to_le_bytes());
         b[12..14].copy_from_slice(&self.country_code.to_le_bytes());
         b[14] = self.admin_level << 4 | self.place_type_override;
-        b[15] = self.own_place_type;
+        b[15] = self.own_place_type | if self.of_way { ADMIN_OF_WAY } else { 0 };
         b
     }
 
@@ -5612,7 +5621,8 @@ pub fn place_node_rank(pn: &PlaceNode, promoting: &[(u8, AdminPolygon)], mut hol
 pub struct CurrentBoundaries {
     pub gates: [Option<AdminPolygon>; 5],
     /// (rank_address, polygon) of the boundaries, and (place rank, polygon)
-    /// of the place areas, holding the point at a PROMOTABLE_RANKS rank.
+    /// of the place areas, holding the point at a PROMOTABLE_RANKS rank, of
+    /// relations: a closed way's raises no place node.
     pub promoting: Vec<(u8, AdminPolygon)>,
 }
 
@@ -5654,9 +5664,11 @@ impl CurrentBoundaries {
         ranked.extend(place_areas.clone().map(|p| RankedPoly { poly: *p, rank_address: place_area_ranks(p, country).1 }));
         promote_nested_ranks(&mut ranked, place_areas.clone(), country, within);
         ranked.sort_by(|a, b| a.poly.area.total_cmp(&b.poly.area));
+        // A place node is raised inside a relation of its rank alone, a boundary of its
+        // rank_address or a place area of its own place rank (placex_triggers.sql:984-1004).
         let promoting = ranked.iter().filter(|r| r.poly.admin_level != 15).map(|r| (r.rank_address, r.poly))
             .chain(place_areas.map(|p| (place_area_ranks(p, country).0, *p)))
-            .filter(|(rank, _)| PROMOTABLE_RANKS.contains(rank))
+            .filter(|(rank, poly)| PROMOTABLE_RANKS.contains(rank) && !poly.of_way)
             .collect();
         let gating = ranked.into_iter()
             .filter(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address) && !matches!(r.rank_address, 5 | 11));
@@ -6488,7 +6500,7 @@ mod pure_helper_tests {
     fn boundary(name_id: u32, admin_level: u8) -> AdminPolygon {
         AdminPolygon {
             ring_offset: 0, ring_bytes: 0, name_id, admin_level, place_type_override: 0, own_place_type: 0, area: 1.0,
-            country_code: 0,
+            country_code: 0, of_way: false,
         }
     }
 
@@ -7355,6 +7367,12 @@ mod query_path_tests {
                 ..arc_fixture::record(self.string(name), admin_level, ((lat_hi - lat_lo) * (lng_hi - lng_lo)) as f32)
             };
             self.polygons.push((poly, ring));
+            self
+        }
+
+        /// Makes the polygon added last a closed way's, not a relation's.
+        fn of_way(&mut self) -> &mut Self {
+            self.polygons.last_mut().unwrap().0.of_way = true;
             self
         }
 
