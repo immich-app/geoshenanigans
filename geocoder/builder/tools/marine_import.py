@@ -46,6 +46,7 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 MAGIC = b"GCMARINE"
@@ -102,16 +103,36 @@ def _check_ring(ring, oid):
             raise ValueError(f"object {oid}: vertex ({lat}, {lon}) outside the world")
 
 
+def _replace(path, write, mode="wb"):
+    """Writes `path` through write(f): to a new file of a name of its own beside it, which replaces `path`
+    when whole and goes when write fails. No file is written through, at `path` or any other name: one `path`
+    was a hard link to keeps its bytes. The new file gets the mode open() would give it."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=os.path.basename(path) + ".", suffix=".part")
+    try:
+        umask = os.umask(0)
+        os.umask(umask)
+        os.fchmod(fd, 0o666 & ~umask)
+        with os.fdopen(fd, mode) as f:
+            fd = None
+            write(f)
+        os.replace(tmp, path)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        os.unlink(tmp)
+        raise
+
+
 def write_marine(path, objects):
     """Writes `objects`, (id, kind, name, polygons), each polygon a list of rings (outer first), each ring
-    (lat_e7, lon_e7) pairs (a list of tuples, or an int array of shape (n, 2)), to `path` by id: first to
-    path + ".part", renamed when whole."""
+    (lat_e7, lon_e7) pairs (a list of tuples, or an int array of shape (n, 2)), to `path` by id, through a
+    new file that replaces it when whole (_replace)."""
     ordered = sorted(objects, key=lambda o: o[0])
     for a, b in zip(ordered, ordered[1:]):
         if a[0] == b[0]:
             raise ValueError(f"object {a[0]} twice")
-    tmp = path + ".part"
-    with open(tmp, "wb") as f:
+
+    def write(f):
         f.write(HEADER.pack(MAGIC, VERSION, len(ordered)))
         for oid, kind, name, polygons in ordered:
             if kind not in KIND_NAMES:
@@ -128,7 +149,8 @@ def write_marine(path, objects):
                     _check_ring(ring, oid)
                     n, data = _ring_bytes(ring, oid)
                     f.write(COUNT.pack(n) + data)
-    os.replace(tmp, path)
+
+    _replace(path, write)
 
 
 def _read_objects(path, ring):
@@ -443,6 +465,16 @@ def _bbox(text):
     return box
 
 
+def _same_file(a, b):
+    """Whether paths a and b are one file: the same path, by links or not, or hard links of one file."""
+    if os.path.realpath(a) == os.path.realpath(b):
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def build(opts):
     import multiprocessing
     import numpy as np
@@ -454,12 +486,12 @@ def build(opts):
     def log(message):
         print(f"[{time.time() - started:7.1f}s] {message}", flush=True)
 
-    if opts.stats and os.path.realpath(opts.stats) == os.path.realpath(opts.output):
+    if opts.stats and _same_file(opts.stats, opts.output):
         raise ValueError(f"--stats {opts.stats} is the output, -o {opts.output}")
     # Both are written once the sources are read: either over a source would replace it.
     for flag, path in (("-o", opts.output), ("--stats", opts.stats)):
         for source_flag, source in (("--eez-iho", opts.eez_iho), ("--land", opts.land)):
-            if path and os.path.realpath(path) == os.path.realpath(source):
+            if path and _same_file(path, source):
                 raise ValueError(f"{flag} {path} is a source, {source_flag} {source}")
     bbox = opts.bbox
     ctx = multiprocessing.get_context("fork")
@@ -527,9 +559,7 @@ def build(opts):
     }
     log(json.dumps(summary))
     if opts.stats:
-        with open(opts.stats, "w") as f:
-            json.dump(summary, f, indent=2)
-            f.write("\n")
+        _replace(opts.stats, lambda f: f.write(json.dumps(summary, indent=2) + "\n"), "w")
     return 0
 
 
