@@ -2281,14 +2281,24 @@ impl Index {
         }
     }
 
+    // Whether `poi` is a water street: a water area of the highway flag, which
+    // a highway kind of rank 26 or 27 ranks (the builder flags it only there,
+    // poi_classify.h poi_water_street). Nominatim imports it as one placex row
+    // of class highway, its polygon the geometry and rank_address 26 or 27
+    // (init.lua process_tags, ranking.sql compute_place_rank), which its
+    // street lane, of address ranks 26 to 29, finds by the distance to that
+    // polygon, 0 inside (reverse.py _find_closest_street_or_pois), and which
+    // answers by its own name as a street does, of no parent street
+    // (placex_update parents rank_search > 27 alone): it competes as one,
+    // wherever it wins, linked to a parent street or not.
+    pub fn is_water_street(poi: &PoiRecord) -> bool {
+        poi.is_polygon() && poi.flags & POI_FLAG_HIGHWAY != 0 && Self::is_below_poi_rank(poi.category, true)
+    }
+
     // Whether `poi` stays out of the primary slot: a water kind below the
-    // POI rank, but a water area of the highway flag, which a highway kind of
-    // rank 26 or 27 ranks (the builder flags it only there): Nominatim's
-    // street lane takes it by its address rank (26 to 29, reverse.py
-    // _find_closest_street_or_pois), and its own name answers inside it as a
-    // street's does.
+    // POI rank, but a water street (is_water_street).
     pub fn is_out_of_the_primary_lanes(poi: &PoiRecord) -> bool {
-        Self::is_below_poi_rank(poi.category, poi.is_polygon()) && !(poi.is_polygon() && poi.flags & POI_FLAG_HIGHWAY != 0)
+        Self::is_below_poi_rank(poi.category, poi.is_polygon()) && !Self::is_water_street(poi)
     }
 
     // Chain-containment check for a POI primary candidate.
@@ -2312,8 +2322,9 @@ impl Index {
 
     // --- POI primary-feature lookup ---
     //
-    // Returns the nearest POI with a valid parent_street_id to the
-    // query point. Used by query() as an additional primary-feature
+    // Returns the nearest POI with a valid parent_street_id, or water
+    // street (is_water_street), to the query point. Used by query() as an
+    // additional primary-feature
     // candidate alongside the raw address / interpolation / street
     // lookups — mirrors Nominatim's _find_closest_street_or_pois
     // which returns the closest rank-26+ feature regardless of
@@ -2366,8 +2377,10 @@ impl Index {
                 let Some(poi) = self.poi_record(poi_id) else { return; };
                 // Need a linked parent street (for the `road` field)
                 // when this POI wins — without it we have nothing to
-                // surface as the road name.
-                if poi.parent_street_id == NO_DATA || (!water && Self::is_out_of_the_primary_lanes(&poi)) {
+                // surface as the road name; a water street's own name is
+                // its road.
+                if (poi.parent_street_id == NO_DATA && !Self::is_water_street(&poi))
+                    || (!water && Self::is_out_of_the_primary_lanes(&poi)) {
                     return;
                 }
 
@@ -3213,10 +3226,11 @@ impl Index {
                 // POI_FLAG_HIGHWAY is set by the builder for highway-
                 // class polygons; without the flag we default to
                 // parent_street even when the polygon contains the
-                // query, matching nominatim's rank-30 chain walk.
+                // query, matching nominatim's rank-30 chain walk. A
+                // water street is a street wherever it wins.
                 let (_, poi) = poi_primary.unwrap();
                 let is_highway_poi = (poi.flags & POI_FLAG_HIGHWAY) != 0;
-                let use_poi_name = is_highway_poi && poi.is_polygon() && poi_dist == 0.0;
+                let use_poi_name = Self::is_water_street(&poi) || (is_highway_poi && poi.is_polygon() && poi_dist == 0.0);
                 if use_poi_name {
                     road = Some(self.get_string(poi.name_id));
                 } else if poi.parent_street_id != NO_DATA {
@@ -9042,6 +9056,41 @@ mod query_path_tests {
             assert!(!Index::is_out_of_the_primary_lanes(&record), "category {category}");
             assert!(Index::is_out_of_the_primary_lanes(&PoiRecord { flags: 0, ..record }), "category {category}");
         }
+    }
+
+    #[test]
+    fn a_water_street_answers_its_own_name_wherever_it_wins_and_needs_no_parent_street() {
+        // A water street, a water area of the highway flag, is one placex row of class highway
+        // in Nominatim, its polygon the geometry and rank_address 26 or 27 (init.lua
+        // process_tags, ranking.sql compute_place_rank): the street lane finds it by its
+        // distance to the polygon, 0 inside, and answers its own name (reverse.py
+        // lookup_street_poi), and a street has no parent street (placex_update parents
+        // rank_search > 27 alone). Main Street runs 10 m south of a point 3 m west of the
+        // outline, 40 m by 60 m, and of one inside it 10 m from the outline: the water street
+        // wins at both, and answers its own name, not that of its parent street, Mill Lane, nor
+        // Main Street where it links none. A polygon of the flag that is no water keeps its
+        // parent street outside it, and takes no slot without one.
+        let answer = |category: u8, linked: bool, (north, east): (f64, f64)| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Main Street", &parallel(20.0, 200.0));
+            let (name, lane) = (dataset.string("Seeplatz"), dataset.string("Mill Lane"));
+            let parents = (if linked { lane } else { NO_DATA }, NO_DATA);
+            let index = with_poi(dataset.load(), (category, POI_FLAG_HIGHWAY), name, parents, (0.0, 0.0, 40.0, 60.0), true);
+            address_at(&index, north, east)["road"].as_str().map(str::to_owned)
+        };
+        let (outside, inside) = ((30.0, -3.0), (30.0, 10.0));
+        // NATURAL_WATER, WETLAND, BAY, GLACIER and RESERVOIR.
+        for category in [99, 97, 91, 86, 148] {
+            for linked in [true, false] {
+                for point in [outside, inside] {
+                    assert_eq!(answer(category, linked, point).as_deref(), Some("Seeplatz"), "category {category}, linked {linked}, {point:?}");
+                }
+            }
+        }
+        // An ATTRACTION.
+        assert_eq!(answer(1, true, inside).as_deref(), Some("Seeplatz"));
+        assert_eq!(answer(1, true, outside).as_deref(), Some("Mill Lane"));
+        assert_eq!(answer(1, false, inside).as_deref(), Some("Main Street"));
     }
 
     #[test]

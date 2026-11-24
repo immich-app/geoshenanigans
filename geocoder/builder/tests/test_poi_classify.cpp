@@ -634,3 +634,40 @@ TEST(poi_classify_a_water_area_of_a_sidewalk_crossing_link_or_traffic_aisle_foot
         CHECK_EQ(int(street->flags & POI_FLAG_HIGHWAY), int(POI_FLAG_HIGHWAY));
     }
 }
+
+TEST(poi_classify_names_a_water_street_by_its_tags_alone) {
+    // A water street: a water area a highway kind of rank 26 or 27 ranks,
+    // where no place or landuse kind of a rank below 26 ranks it lower
+    // (place=square ranks 26) and its footway is a main tag. classify_poi
+    // gives one the highway flag, and the build writes no address point of
+    // it, whatever its addr:* tags (poi_water_street).
+    for (const WaterKind& kind : kWaterKinds) {
+        const Tags street = with(water(kind), "highway", "pedestrian");
+        const Tags footway = with(water(kind), "highway", "footway");
+        for (const Tags& t : {street, with(street, "place", "square"), with(street, "tourism", "attraction"),
+                              footway, with(footway, "footway", "access_aisle")})
+            CHECK(poi_water_street(t.natural, t.landuse, t.highway, t.footway, t.place));
+        for (const Tags& t : {with(street, "place", "locality"), with(footway, "footway", "sidewalk"),
+                              with(street, "highway", "bus_stop"), with(street, "highway", "no")})
+            CHECK(!poi_water_street(t.natural, t.landuse, t.highway, t.footway, t.place));
+        if (kind.natural) {
+            const Tags t = with(street, "landuse", "residential");
+            CHECK(!poi_water_street(t.natural, t.landuse, t.highway, t.footway, t.place));
+        }
+        CHECK(!poi_water_street(kind.natural, kind.landuse, nullptr, nullptr, nullptr));
+        // Wherever the classifier flags a water area, the tags name a street.
+        for (const char* highway : {"pedestrian", "steps", "residential", "bus_stop"})
+            for (const char* place : {(const char*)nullptr, "square", "locality"}) {
+                Tags t = with(with(water(kind), "highway", highway), "tourism", "attraction");
+                t.place = place;
+                t.area = true;
+                const auto got = classify(t);
+                REQUIRE(got.has_value());
+                CHECK_EQ((got->flags & POI_FLAG_HIGHWAY) != 0,
+                         poi_water_street(t.natural, t.landuse, t.highway, t.footway, t.place));
+            }
+    }
+    Tags pedestrian;
+    pedestrian.highway = "pedestrian";
+    CHECK(!poi_water_street(pedestrian.natural, pedestrian.landuse, pedestrian.highway, nullptr, nullptr));
+}

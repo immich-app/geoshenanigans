@@ -2248,12 +2248,20 @@ static int run(int argc, char* argv[]) {
                         // outer rings alone would fill, takes the scan's own
                         // categories instead, and never the slot: one of none
                         // is no POI, whose name, or address, a point in a hole
-                        // would find.
+                        // would find. Nor is any water multipolygon an
+                        // address point that is a street (poi_water_street)
+                        // or has holes, which the address's polygon of the
+                        // outer rings would fill: its addr:* tags give none.
                         std::optional<PoiClassification> water_poi;
                         bool places_only = false;
                         const char* r_landuse = rel.tag("landuse");
                         const PoiCategory r_water = area_type ? poi_water_kind(r_natural, r_landuse) : PoiCategory::UNKNOWN;
+                        bool no_address = false;
                         if (r_water != PoiCategory::UNKNOWN) {
+                            for (size_t mi = 0; mi < rel.members.size(); mi++)
+                                if (rel.member_role(mi) == "inner") no_address = true;
+                            if (poi_water_street(r_natural, r_landuse, rel.tag("highway"), rel.tag("footway"), r_place))
+                                no_address = true;
                             auto cls = classify_poi(r_tourism, rel.tag("historic"), r_boundary, rel.tag("amenity"),
                                                     r_leisure, r_natural, rel.tag("railway"), r_aeroway,
                                                     rel.tag("man_made"), rel.tag("building"), rel.tag("craft"),
@@ -2362,7 +2370,10 @@ static int run(int argc, char* argv[]) {
                                     tier = water_poi->tier;
                                     flags = water_poi->flags;
                                 }
-                                if (places_only) flags |= POI_FLAG_PLACES_ONLY;
+                                // One that never takes the slot is no street
+                                // either, though its highway tag is one.
+                                if (places_only)
+                                    flags = static_cast<uint8_t>((flags & ~POI_FLAG_HIGHWAY) | POI_FLAG_PLACES_ONLY);
 
                                 CollectedPoiRelation cpr;
                                 cpr.id = rel.id;
@@ -2379,7 +2390,7 @@ static int run(int argc, char* argv[]) {
                                 // header for rationale — rank-30 rows with
                                 // addr:housenumber become AddrPoints too).
                                 const char* r_hn = rel.tag("addr:housenumber");
-                                if (r_hn) {
+                                if (r_hn && !no_address) {
                                     cpr.addr_housenumber = r_hn;
                                     const char* r_st = rel.tag("addr:street");
                                     if (r_st) cpr.addr_street = r_st;
@@ -3053,9 +3064,17 @@ static int run(int argc, char* argv[]) {
                     // addr:street is present. Missing streets are
                     // backfilled via the nearest-named-street sweep
                     // after way indexing, matching Nominatim's
-                    // parent_place_id resolution behaviour.
+                    // parent_place_id resolution behaviour. A named water
+                    // street is no address point, whatever its addr:* tags
+                    // (poi_water_street), and is a polygon in Nominatim of
+                    // area=yes alone (init.lua process_way): of none it is
+                    // the line the street index holds, which its POI's
+                    // polygon takes no highway flag beside.
                     const char* housenumber = t.housenumber;
-                    if (housenumber && refs_size > 0) {
+                    const bool water_street = t_best_name && refs_size >= 4 && refs_data[0] == refs_data[refs_size - 1] &&
+                                              poi_water_street(t.natural, t.landuse, t.highway, t.footway, t.place);
+                    const bool water_street_line = water_street && !(t.area && std::strcmp(t.area, "yes") == 0);
+                    if (housenumber && refs_size > 0 && !water_street) {
                         const char* street = t.street;
                         double sum_lat = 0, sum_lng = 0; int valid = 0;
                         for (const auto& loc : resolved_locs) {
@@ -3185,6 +3204,7 @@ static int run(int argc, char* argv[]) {
                             pr.category = static_cast<uint8_t>(cls->category);
                             pr.tier = cls->tier;
                             pr.flags = cls->flags;
+                            if (water_street_line) pr.flags &= static_cast<uint8_t>(~POI_FLAG_HIGHWAY);
 
                             float way_ele = 0;
                             if (t.ele) { char* end; way_ele = std::strtof(t.ele, &end); if (end == t.ele) way_ele = 0; }

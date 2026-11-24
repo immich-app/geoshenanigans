@@ -1483,6 +1483,127 @@ TEST(a_water_street_that_is_an_attraction_answers_its_own_name_from_poi_notable_
     }
 }
 
+// A named water area of a street's highway kind is a street in Nominatim:
+// one placex row of class highway and rank_address 26 or 27, which its
+// street lane finds by the distance to its geometry and answers by its own
+// name, of no parent street, and which is no address point, whatever addr:*
+// tags it carries (IsAddressPoint takes rank_address 30 alone). The build
+// writes no address of a multipolygon lake of highway=pedestrian, nor of a
+// closed way of area=yes, each 60 m by 89 m across Teststrasse, which runs
+// 6 m south of the point asked inside each: there the server answers each
+// one's own name, not its addr:street, Inselweg, nor its house number. A
+// closed way of a highway tag is a polygon of area=yes alone (init.lua
+// process_way), a line else: inside a lake of highway=pedestrian of none,
+// Teststrasse is nearer than its outline, and answers. A lake of
+// highway=pedestrian 2 km north of every street links no parent street, and
+// its own name answers inside it, as just outside it, 3 m west, where its
+// outline is the nearest feature. Nor is any water multipolygon of a hole an
+// address point, whose polygon of the outer ring would fill it: a point on
+// the island of a wetland nature reserve that is a rank-30 POI of no
+// category of its own finds no house number, though the reserve of no
+// island keeps its address. A bay of highway=pedestrian of a hole never
+// takes the slot, and is no street either: at a point on its island its own
+// name doesn't answer.
+TEST(a_water_street_is_no_address_point_and_answers_its_own_name_as_a_street_does) {
+    const ScratchDir root("water-street-address-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    const int32_t lat0 = 470000000, lng0 = 80000000, south = lat0 + 1396000, north = lat0 + 1404000;
+    const std::vector<std::pair<std::string, std::string>> address = {
+        {"addr:housenumber", "5"}, {"addr:postcode", "8899"}, {"addr:street", "Inselweg"}};
+    auto with_address = [&](std::vector<std::pair<std::string, std::string>> tags) {
+        tags.insert(tags.begin(), address.begin(), address.end());
+        return tags;
+    };
+    std::vector<TestObject> water;
+    add_rectangle(water, 4040, 990, south, lng0 + 1420000, north, lng0 + 1428000);
+    water.push_back(multipolygon(5040, 4040, with_address({{"highway", "pedestrian"}, {"name", "Seeplatz Testdorf"},
+                                                           {"natural", "water"}})));
+    add_rectangle(water, 4041, 994, south, lng0 + 1435000, north, lng0 + 1443000,
+                  with_address({{"area", "yes"}, {"highway", "pedestrian"}, {"name", "Seesteg Testdorf"},
+                                {"natural", "water"}}));
+    add_rectangle(water, 4042, 998, south, lng0 + 1450000, north, lng0 + 1458000,
+                  {{"highway", "pedestrian"}, {"name", "Seeufer Testdorf"}, {"natural", "water"}});
+    add_rectangle(water, 4043, 1002, lat0 + 1600000, lng0 + 1420000, lat0 + 1608000, lng0 + 1428000);
+    water.push_back(multipolygon(5043, 4043, {{"highway", "pedestrian"}, {"name", "Bergsee Testdorf"}, {"natural", "water"}}));
+    // The reserves and the bay 22 m by 60 m, 33 m north of Teststrasse, each
+    // island 7 m by 30 m in its middle.
+    const int32_t r_south = lat0 + 1403000, r_north = lat0 + 1405000;
+    add_rectangle(water, 4044, 1006, r_south, lng0 + 1465000, r_north, lng0 + 1473000);
+    add_rectangle(water, 4045, 1010, lat0 + 1403700, lng0 + 1467000, lat0 + 1404300, lng0 + 1471000);
+    add_rectangle(water, 4046, 1014, r_south, lng0 + 1520000, r_north, lng0 + 1528000);
+    add_rectangle(water, 4047, 1018, r_south, lng0 + 1395000, r_north, lng0 + 1403000);
+    add_rectangle(water, 4048, 1022, lat0 + 1403700, lng0 + 1397000, lat0 + 1404300, lng0 + 1401000);
+    TestObject island_reserve = multipolygon(5044, 4044, {{"addr:housenumber", "7"}, {"addr:street", "Riedweg"},
+                                                           {"emergency", "suction_point"}, {"leisure", "nature_reserve"},
+                                                           {"name", "Inselried Testdorf"}, {"natural", "wetland"}});
+    island_reserve.members.emplace_back(OsmType::Way, 4045, "inner");
+    water.push_back(island_reserve);
+    water.push_back(multipolygon(5046, 4046, {{"addr:housenumber", "8"}, {"addr:street", "Riedweg"},
+                                              {"emergency", "suction_point"}, {"leisure", "nature_reserve"},
+                                              {"name", "Ried Testdorf"}, {"natural", "wetland"}}));
+    TestObject island_bay = multipolygon(5047, 4047, {{"highway", "pedestrian"}, {"name", "Inselbucht Testdorf"},
+                                                       {"natural", "bay"}});
+    island_bay.members.emplace_back(OsmType::Way, 4048, "inner");
+    water.push_back(island_bay);
+    write_fixture_with(pbf, water);
+    const std::string out = root.path() + "/single";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
+    const auto files = tree(out);
+
+    // The addresses: the fixture's house 1, a node, and the reserve's of no
+    // island, its polygon.
+    const std::vector<AddrPoint> points = addresses_of(files, "planet/").points;
+    if (points.size() != 2) std::printf("    %zu addresses\n", points.size());
+    CHECK_EQ(points.size(), size_t(2));
+    CHECK_EQ(std::count_if(points.begin(), points.end(), [](const AddrPoint& a) { return a.vertex_count != 0; }), 1);
+
+    const std::vector<PoiRecord> pois = poi_records_in(files, "planet/poi/all");
+    auto at = [&](double lat, double lng) -> const PoiRecord* {
+        for (const PoiRecord& pr : pois)
+            if (std::abs(pr.lng - lng) < 0.0004 && std::abs(pr.lat - lat) < 0.002) return &pr;
+        return nullptr;
+    };
+    struct Want {
+        double lat, lng;
+        int category;
+        uint8_t flags;
+        bool parent;
+    };
+    const int lake = int(PoiCategory::NATURAL_WATER);
+    for (const Want& w : {Want{47.14, 8.1424, lake, POI_FLAG_HIGHWAY, true}, Want{47.14, 8.1439, lake, POI_FLAG_HIGHWAY, true},
+                          Want{47.14, 8.1454, lake, 0, true}, Want{47.1604, 8.1424, lake, POI_FLAG_HIGHWAY, false},
+                          Want{47.1404, 8.1469, int(PoiCategory::NATURE_RESERVE), 0, false},
+                          Want{47.1404, 8.1524, int(PoiCategory::NATURE_RESERVE), 0, false},
+                          Want{47.1404, 8.1399, int(PoiCategory::BAY), 0, false}}) {
+        const PoiRecord* pr = at(w.lat, w.lng);
+        REQUIRE(pr != nullptr);
+        if (pr->category != w.category || pr->flags != w.flags || (pr->parent_street_id != NO_DATA) != w.parent)
+            std::printf("    at %.4f, %.4f: category %d, flags %d, parent %u\n", w.lat, w.lng, int(pr->category),
+                        int(pr->flags), pr->parent_street_id);
+        CHECK_EQ(int(pr->category), w.category);
+        CHECK_EQ(int(pr->flags), int(w.flags));
+        CHECK_EQ(pr->parent_street_id != NO_DATA, w.parent);
+    }
+
+    const std::string dataset = poi_dataset(out, "all", root.path() + "/dataset");
+    const std::vector<std::pair<double, double>> asked = {
+        {47.14005, 8.1424}, {47.14005, 8.1439}, {47.14005, 8.1454}, {47.1604, 8.1424},
+        {47.1604, 8.14196}, {47.1404, 8.1469},  {47.1404, 8.1399}};
+    const std::vector<std::string> answers = server_answers(dataset, asked, root.path() + "/q", log);
+    REQUIRE(answers.size() == asked.size());
+    const char* roads[] = {"Seeplatz Testdorf", "Seesteg Testdorf", "Teststrasse", "Bergsee Testdorf",
+                           "Bergsee Testdorf", "Teststrasse", "Teststrasse"};
+    for (size_t k = 0; k < answers.size(); k++) {
+        const bool numbered = answer_string(answers[k], {"address", "house_number"}).has_value();
+        if (answer_string(answers[k], {"address", "road"}) != std::optional<std::string>(roads[k]) || numbered ||
+            says(answers[k], "Inselweg") || says(answers[k], "Riedweg"))
+            std::printf("    %s\n", answers[k].c_str());
+        CHECK(answer_string(answers[k], {"address", "road"}) == std::optional<std::string>(roads[k]));
+        CHECK(!numbered);
+        CHECK(!says(answers[k], "Inselweg") && !says(answers[k], "Riedweg"));
+    }
+}
+
 // A build logs, for each dir it writes with addresses and for each POI tier,
 // the bytes of the dir's logical vertex stream, the most a patch indexes of
 // them and their share of that: a STREAM_BYTES line, which the nightly's

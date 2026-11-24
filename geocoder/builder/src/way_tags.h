@@ -44,6 +44,9 @@ struct WayTags {
     const char* ele = nullptr;
     const char* shop = nullptr;
     const char* landuse = nullptr;
+    // area=*: a closed way of a highway tag is a polygon in Nominatim where
+    // it is yes alone (init.lua process_way), a line else.
+    const char* area = nullptr;
     // Classifies a POI way (poi_classify.h), and makes one on its own where
     // it is fire_water_pond, a category of its own, as a node of it is.
     const char* emergency = nullptr;
@@ -84,6 +87,7 @@ inline WayTags parse_way_tags(const uint32_t* tag_keys, const uint32_t* tag_vals
                 else if (k == "addr:street") t.street = v;
                 else if (k == "addr:postcode") t.postcode = v;
                 else if (k == "admin_level") t.admin_level = v;
+                else if (k == "area") t.area = v;
                 else if (k == "amenity") t.amenity = v;
                 else if (k == "aeroway") t.aeroway = v;
                 break;

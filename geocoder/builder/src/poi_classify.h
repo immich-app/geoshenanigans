@@ -166,6 +166,29 @@ inline PoiCategory poi_water_kind(const char* t_natural, const char* t_landuse) 
     return PoiCategory::UNKNOWN;
 }
 
+// Whether an area of these tags is a water street: water (poi_water_kind) a
+// highway kind of rank 26 or 27 ranks (poi_highway_ranks_street; a footway
+// of footway=sidewalk, crossing, link or traffic_aisle is no main tag,
+// is_excluded_footway), which no place or landuse kind of a rank below 26
+// ranks lower (has_lower_rank_main_tag; place=square ranks 26). Nominatim
+// imports a named one as one placex row of class highway, of rank_address
+// 26 or 27 (init.lua process_tags, ranking.sql compute_place_rank): a
+// street, which its street lane finds by the distance to its geometry and
+// answers by its own name (reverse.py lookup_street_poi), which has no
+// parent street (placex_update parents rank_search > 27 alone), and which is
+// no address point, whatever addr:* tags it carries (IsAddressPoint takes
+// rank_address 30 alone). classify_poi gives it the highway flag, by which
+// the server answers it as a street, and the build writes no address point
+// of it.
+inline bool poi_water_street(const char* t_natural, const char* t_landuse, const char* t_highway,
+                             const char* t_footway, const char* t_place) {
+    if (poi_water_kind(t_natural, t_landuse) == PoiCategory::UNKNOWN || !poi_highway_ranks_street(t_highway))
+        return false;
+    if (std::strcmp(t_highway, "footway") == 0 && is_excluded_footway(t_footway)) return false;
+    const char* place_below_streets = t_place && std::strcmp(t_place, "square") == 0 ? nullptr : t_place;
+    return !has_lower_rank_main_tag(place_below_streets, t_landuse, nullptr, /*area=*/true);
+}
+
 // POI classification: maps a node/way's raw OSM tag values to a
 // (category, tier, flags) triple (PoiClassification, defined in types.h),
 // or nullopt when nothing matches or no POI dir ships the tier (a generic
@@ -211,14 +234,16 @@ inline std::optional<PoiClassification> classify_poi(
     // would take for a shop. `yielded` is the kind that yielded. A reservoir
     // of the class building or place, which the lane leaves out, stays one.
     // A water object a highway kind of rank 26 or 27 ranks is a street there
-    // (the street lane takes address ranks 26 to 29, reverse.py:187-189): it
-    // takes the highway flag below, unless a place or landuse kind of a rank
-    // below 26 ranks it, every one but place=square (26), which makes it no
-    // street either. Such a street ships in its kind's tier, or in that of
-    // the category the classifier's branches give its tags where that is
-    // lower: a lake that is an attraction, as an attraction does, in
-    // poi/notable, where the server answers its own name inside it.
+    // (the street lane takes address ranks 26 to 29, reverse.py:187-189): on
+    // an area it takes the highway flag below (poi_water_street), unless a
+    // place or landuse kind of a rank below 26 ranks it, every one but
+    // place=square (26), which makes it no street either. Such a street
+    // ships in its kind's tier, or in that of the category the classifier's
+    // branches give its tags where that is lower: a lake that is an
+    // attraction, as an attraction does, in poi/notable, where the server
+    // answers its own name inside it.
     const PoiCategory kind = poi_water_kind(t_natural, t_landuse);
+    const bool water_street = area && poi_water_street(t_natural, t_landuse, t_highway, t_footway, t_place);
     // highway=footway of footway=sidewalk, crossing, link or traffic_aisle is
     // no main tag in Nominatim (is_excluded_footway): beside water it neither
     // ranks the object nor makes it a street.
@@ -579,17 +604,16 @@ inline std::optional<PoiClassification> classify_poi(
     // path/service areas as rank_search=26 (road rank) rather
     // than rank_search=30. Mark so the server can surface the
     // feature's own name as `road` rather than its parent street. A water
-    // area is a street of every highway kind that ranks it
-    // (poi_highway_ranks_street), and water a place or landuse kind of a
-    // lower rank ranks is no street (no_street).
-    if (t_highway && !no_street && (
+    // area is a street of every highway kind that ranks it (poi_water_street),
+    // and water a place or landuse kind of a lower rank ranks is no street
+    // (no_street).
+    if (water_street || (t_highway && !no_street && (
             std::strcmp(t_highway, "pedestrian") == 0 ||
             std::strcmp(t_highway, "footway") == 0 ||
             std::strcmp(t_highway, "living_street") == 0 ||
             std::strcmp(t_highway, "path") == 0 ||
             std::strcmp(t_highway, "cycleway") == 0 ||
-            std::strcmp(t_highway, "service") == 0 ||
-            (kind != PoiCategory::UNKNOWN && area && poi_highway_ranks_street(t_highway)))) {
+            std::strcmp(t_highway, "service") == 0))) {
         flags |= POI_FLAG_HIGHWAY;
     }
     uint8_t tier = poi_tier_of(cat, flags);

@@ -175,16 +175,31 @@ So no water kind ever reaches the lane: `natural=water`, `wetland`, `bay` and
 server never lets those categories (`NATURAL_WATER`, `WETLAND`, `BAY`,
 `GLACIER`, and `RESERVOIR` as a polygon) take the primary slot, nor set `road`
 or `postcode` from it (`Index::is_below_poi_rank`); a `RESERVOIR` point, a
-`landuse=reservoir|basin` node, is a rank-30 POI there and stays. A water
-area a `highway=*` kind of rank 26 or 27 ranks (`area=yes`,
-`highway=pedestrian`, `natural=water`, ...) is a street in Nominatim, whose
-street lane takes address ranks 26 to 29 (`reverse.py:187-189`): the builder
-gives it the highway flag where no place or landuse kind of a rank below 26
-ranks it (`poi_classify.h` `classify_poi`; `place=square` ranks 26), and the server lets a water area
-of that flag compete as streets do, its own name the `road` inside it
-(`Index::is_out_of_the_primary_lanes`). Such a street ships in the POI tier of
-its water kind or in that of the category its tags give, whichever is lower: a
-lake that is an attraction is in `poi/notable`, as an attraction is.
+`landuse=reservoir|basin` node, is a rank-30 POI there and stays.
+
+**Water streets.** A water area a `highway=*` kind of rank 26 or 27 ranks
+(`area=yes`, `highway=pedestrian`, `natural=water`, ...), where no place or
+landuse kind of a rank below 26 ranks it lower (`place=square` ranks 26), is
+one placex row of class `highway` and `rank_address` 26 or 27 in Nominatim: a
+street, whose street lane takes address ranks 26 to 29 (`reverse.py:187-189`)
+by the distance to its geometry, 0 inside a polygon, and answers its own name
+(`lookup_street_poi`). A street has no parent street (`placex_update` parents
+`rank_search > 27` alone) and is no address point, whatever `addr:*` tags it
+carries (`IsAddressPoint` takes `rank_address = 30` alone). A multipolygon's
+geometry is its polygon; a closed way's is its polygon where `area=yes`
+alone, and its outline as a line else (`init.lua` `process_way`). The builder
+names one by its tags (`poi_classify.h` `poi_water_street`): its POI polygon
+takes the highway flag, but for a closed way of no `area=yes`, which is the
+line the street index holds, and it writes no address point of it. The
+server lets a water area of that flag compete as streets do, linked to a
+parent street or not, its own name the `road` wherever it wins
+(`Index::is_water_street`). Two differences stay: Nominatim's lane takes an
+area only where its centroid is within 0.007 degrees of the point too, and
+its answer for a street of `addr:housenumber` carries that house number
+(`results.py` `_setup_address_details`), which a POI record holds none of.
+Such a street ships in the POI tier of its water kind or in that of the
+category its tags give, whichever is lower: a lake that is an attraction is in
+`poi/notable`, as an attraction is.
 
 **Water with a POI main tag.** A water object that also carries a main tag of
 the import's POI list (`presets.lua` `MAIN_TAGS_POIS`, lines 170-262) with a
@@ -252,8 +267,10 @@ with `amenity=fountain`).
   take the slot (a rank-30 POI, or a street) takes the scan's own categories
   instead, and never the slot: one the scan takes none of (a lake that is a
   swimming area) is no POI, so a point on its island finds neither its name
-  nor its road, nor the address its `addr:*` tags give. A plain bay or
-  glacier of holes keeps its parent street.
+  nor its road, nor the address its `addr:*` tags give; the one it takes is
+  no street either. No water multipolygon of holes is an address point,
+  whatever its `addr:*` tags. A plain bay or glacier of holes keeps its
+  parent street.
 - Where no boundary and no street anchors the address (a coast no boundary
   covers), Nominatim finds nothing; a water POI that would have won the slot
   but for the lane still gives the answer its `landmark` and `places`,
