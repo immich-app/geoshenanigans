@@ -1944,10 +1944,11 @@ static water::ObjectTags water_way_tags(const WayTags& t) {
 }
 
 // Whether the water layer reads a way: a member of a water area relation
-// (`member`), a member of a waterway relation whatever its own waterway tag
-// (`in_waterway`), a waterway=river or canal way with a name, or a closed
-// way in scope (`closed()`, which decodes its refs, asked only then). The
-// node pre-scan and the way pass apply it alike.
+// (`member`), a stream of a waterway relation (collect_water_relations)
+// whatever its own waterway tag (`in_waterway`), a waterway=river or canal
+// way with a name, or a closed way in scope (`closed()`, which decodes its
+// refs, asked only then). The node pre-scan and the way pass apply it
+// alike.
 template <class Closed>
 static bool water_way_wanted(const WayTags& t, bool member, bool in_waterway, Closed closed) {
     if (member || in_waterway) return true;
@@ -1957,7 +1958,9 @@ static bool water_way_wanted(const WayTags& t, bool member, bool in_waterway, Cl
 
 // The water layer's relations of a block: the areas in scope, and the named
 // waterway=river or canal relations, which name river areas, with their
-// member ways.
+// member ways of the river's streams: the roles main_stream and side_stream,
+// and none (an older main stream). A tributary, a spring or a riverbank's
+// outline (riverbank, waterbody) names no area for it.
 static void collect_water_relations(const PbfBlock& block, std::vector<water::CollectedArea>& areas,
                                     std::vector<water::CollectedWaterway>& waterways) {
     for (const auto& rel : block.relations) {
@@ -1984,8 +1987,11 @@ static void collect_water_relations(const PbfBlock& block, std::vector<water::Co
             way.local_name = w_name ? w_name : w_name_en;
             way.english = w_name_en != nullptr;
             way.qid = water::qid_of(rel.tag("wikidata"));
-            for (const auto& m : rel.members)
-                if (m.type == 'w') way.ways.push_back(m.ref);
+            for (size_t mi = 0; mi < rel.members.size(); mi++) {
+                if (rel.members[mi].type != 'w') continue;
+                const std::string& role = rel.member_role(mi);
+                if (role.empty() || role == "main_stream" || role == "side_stream") way.ways.push_back(rel.members[mi].ref);
+            }
             if (!way.ways.empty()) waterways.push_back(std::move(way));
         }
     }
@@ -3168,8 +3174,8 @@ static int run(int argc, char* argv[]) {
                                                               std::vector<PackedLocation>(resolved_locs.begin(), resolved_locs.end())});
                         }
                         // A line's way tags; key_lines keys it once every
-                        // input's waterway relations are in. A waterway
-                        // relation's member is its river's line whatever
+                        // input's waterway relations are in. A stream of a
+                        // waterway relation is its river's line whatever
                         // its own waterway tag (a reach tagged as a stream).
                         if (waterway_member || water::is_naming_waterway(t.waterway)) {
                             water::LineIn line;

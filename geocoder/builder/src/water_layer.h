@@ -114,7 +114,8 @@ struct CollectedArea {
 };
 
 // A named type=waterway relation of waterway=river or canal: what its
-// member ways are keyed by when they name an area.
+// member ways are keyed by when they name an area, those of its streams
+// (the roles main_stream, side_stream and none) alone.
 struct CollectedWaterway {
     int64_t id = 0;
     std::string name;        // name:en, else name

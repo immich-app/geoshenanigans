@@ -535,3 +535,39 @@ TEST(a_member_way_of_a_river_relation_tagged_as_a_stream_names_the_area_it_runs_
     const ScratchDir root("water-stream-member");
     CHECK(planet_water_names(objects, root.path() + "/out") == std::vector<std::string>({"Rhine"}));
 }
+
+TEST(a_river_relations_tributary_or_bank_doesnt_name_the_area_it_runs_through) {
+    // The Rhine's relation: its main stream, of no role, through one unnamed
+    // river area and a side stream through another, which both take its
+    // name; a tributary of no name of its own through a third, and the
+    // outline of a fourth as its riverbank, which name nothing.
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    std::vector<TestObject> objects;
+    int64_t next = 1;
+    auto at = [&](int32_t lat, int32_t lng) {
+        objects.push_back(node(next, lat, lng));
+        return next++;
+    };
+    auto square = [&](int32_t lat, int32_t lng, int32_t side) {
+        const int64_t a = at(lat, lng), b = at(lat, lng + side), c = at(lat + side, lng + side), d = at(lat + side, lng);
+        return std::vector<int64_t>{a, b, c, d, a};
+    };
+    const std::vector<std::pair<std::string, std::string>> river_area = {{"natural", "water"}, {"water", "river"}};
+    for (int k = 0; k < 3; k++) {
+        const int32_t lat = lat0 + k * 100000;
+        objects.push_back(way(100 + 10 * k, square(lat, lng0, 10000), river_area));
+        objects.push_back(way(101 + 10 * k, {at(lat + 2000, lng0 + 2000), at(lat + 6000, lng0 + 6000)},
+                              {{"waterway", k == 2 ? "stream" : "river"}}));
+    }
+    // The bank: a river area's own outline, run so that the area is to its
+    // left.
+    objects.push_back(way(130, square(lat0 + 300000, lng0, 10000), river_area));
+    objects.push_back(relation(900, {{"type", "waterway"}, {"waterway", "river"}, {"name", "Rhein"}, {"name:en", "Rhine"}},
+                               {{101, ""}, {111, "side_stream"}, {121, "tributary"}, {130, "riverbank"}}));
+    const ScratchDir root("water-river-roles");
+    const std::string out = root.path() + "/out";
+    REQUIRE(planet_water_names(objects, out) == std::vector<std::string>({"Rhine"}));
+    std::vector<std::string> slots = slot_names(out + "/planet/water/all/exact");
+    std::sort(slots.begin(), slots.end());
+    CHECK(slots == std::vector<std::string>({"Rhine", "Rhine"}));
+}

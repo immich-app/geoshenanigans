@@ -1,7 +1,8 @@
 // How a river or canal area with no name of its own takes one: the waterway
 // with the most length inside it. Each candidate line is a waterway=river or
-// canal way, or a member way of a waterway=river or canal relation whatever
-// its own waterway tag (a run of one, where the input lacks a node of it),
+// canal way, or a member way of a waterway=river or canal relation in a role
+// of its streams (main_stream, side_stream or none) whatever its own
+// waterway tag (a run of one, where the input lacks a node of it),
 // keyed by the type=waterway relation it belongs to (the lowest relation id,
 // where it belongs to two) or else by its own local name (the name tag, not
 // name:en), so a river whose ways vary in name:en is one key.
