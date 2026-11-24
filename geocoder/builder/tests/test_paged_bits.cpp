@@ -35,6 +35,9 @@ TEST(paged_bits_hold_the_ids_set_and_no_others_with_a_page_for_each_one_touched)
         pages.insert(page);
     }
     CHECK_EQ(bits.pages_used(), pages.size());
+    // The limit, the first id of the page past the last: never set, and no
+    // page is read for it.
+    CHECK(!bits.test(uint64_t(1) << 32));
     for (uint64_t id : ids) CHECK(bits.test(id));
     for (int k = 0; k < 100000; k++) {
         const uint64_t id = rng() % (uint64_t(1) << 32);

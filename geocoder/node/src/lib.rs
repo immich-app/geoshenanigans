@@ -9,9 +9,8 @@ use napi::bindgen_prelude::*;
 use napi::Env;
 use napi_derive::napi;
 use place_search::constants::{DATASET_SEARCH_DIR, DEFAULT_LIMIT};
-use place_search::dataset::{self, BuildOnDevice, Origin, Stamps};
-use place_search::query::Searcher;
-use place_search::reader::SearchIndex;
+use place_search::dataset::{self, BuildOnDevice, Origin, PlaceSearch, Stamps};
+use place_search::query::results_json;
 use query_server::transport::{self, ChunkReader, Expected};
 use query_server::Index;
 use std::path::{Path, PathBuf};
@@ -48,27 +47,6 @@ impl Task for QueryTask {
     }
 }
 
-/// An open place search index and the geocoder index its postings point into.
-pub struct PlaceSearch {
-    // Fields drop in order: the searcher borrows the index, which borrows the geocoder index.
-    searcher: Searcher<'static, 'static>,
-    _index: Arc<SearchIndex<'static>>,
-    _geo: Arc<Index>,
-}
-
-impl PlaceSearch {
-    /// `dataset::open` of the index in `index_dir` for `geo`, the dataset in `dir` stamped `loaded`.
-    fn open(geo: Arc<Index>, loaded: &Stamps, dir: &Path, index_dir: &Path, on_device: &BuildOnDevice) -> std::result::Result<(PlaceSearch, Origin), String> {
-        // SAFETY: the borrows point into the two Arcs' shared allocations, which never move and
-        // are held by this struct until after the searcher and the index that borrow them drop.
-        let geo_ref: &'static Index = unsafe { &*Arc::as_ptr(&geo) };
-        let (index, origin) = dataset::open(geo_ref, loaded, dir, index_dir, on_device)?;
-        let index = Arc::new(index);
-        let index_ref: &'static SearchIndex<'static> = unsafe { &*Arc::as_ptr(&index) };
-        Ok((PlaceSearch { searcher: Searcher::new(index_ref), _index: index, _geo: geo }, origin))
-    }
-}
-
 pub struct SearchTask {
     search: Arc<PlaceSearch>,
     query: String,
@@ -80,9 +58,8 @@ impl Task for SearchTask {
     type JsValue = String;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        let (found, _) = self.search.searcher.search(&self.query, self.limit);
-        let results: Vec<String> = found.iter().map(|f| f.to_json().to_string()).collect();
-        Ok(format!("[{}]", results.join(",")))
+        let (found, _) = self.search.search(&self.query, self.limit);
+        Ok(results_json(&found))
     }
 
     fn resolve(&mut self, _env: Env, output: Self::JsValue) -> Result<Self::JsValue> {
@@ -94,8 +71,8 @@ impl Task for SearchTask {
 pub struct PlaceSearchOptions {
     /// Where the index lives; default `<dataset dir>/search`, where packs that ship one put it.
     pub index_dir: Option<String>,
-    /// Sort memory of a build on this device in MiB (default 16: the build then fits a 32 MiB
-    /// memory limit).
+    /// Sort memory of a build on this device in MiB (default 16: the build's own memory then fits
+    /// a 32 MiB limit; the dataset's mapped files count apart, as `load` says).
     pub build_memory_mb: Option<u32>,
 }
 
@@ -103,7 +80,10 @@ pub struct PlaceSearchOptions {
 impl Geocoder {
     /// Load an index directory and its optional `water/` layer. Index data is memory-mapped;
     /// opening a water layer also reads its metadata, validates its cell index and checks that
-    /// its cut arcs cover its arc slots.
+    /// its cut arcs cover its arc slots. A memory limit counts the mapped pages lookups touch
+    /// and their page tables: under one of 32 MiB the planet's datasets answered (2026-11), but
+    /// `full` with the `all-exact` water tier, whose page tables outgrew it part way through
+    /// 12,265 lookups; `full` with `all` stayed within it.
     #[napi(factory)]
     pub fn load(dir: String) -> Result<Geocoder> {
         let (idx, loaded) = dataset::load(Path::new(&dir), || {
@@ -130,9 +110,10 @@ impl Geocoder {
 
     /// Opens place search for this dataset: the index in `indexDir` when it was built from these
     /// files (the one a pack ships, or one built here before), else builds it there on this
-    /// device first, on a thread of its own (seconds to minutes, within 32 MiB). After a patch,
-    /// load the patched dataset and open place search on that geocoder: this one rejects files
-    /// replaced since it loaded them. Resolves to "current" or "built".
+    /// device first, on a thread of its own (seconds to minutes, its sort within
+    /// `buildMemoryMb`). After a patch, load the patched dataset and open place search on that
+    /// geocoder: this one rejects files replaced since it loaded them. Resolves to "current" or
+    /// "built".
     #[napi(ts_return_type = "Promise<'current' | 'built'>")]
     pub fn open_place_search<'env>(&self, env: &'env Env, options: Option<PlaceSearchOptions>) -> Result<Object<'env>> {
         let PlaceSearchOptions { index_dir, build_memory_mb } = options.unwrap_or(PlaceSearchOptions { index_dir: None, build_memory_mb: None });

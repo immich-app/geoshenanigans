@@ -9,8 +9,11 @@ on:
       - "geocoder/server/**"
       - "geocoder/test-portal/**"
       - ".github/workflows/geocoder-tests.yml"
-      # The tool tests read the nightly's package list.
+      # The tool tests read the nightly's package list, and run the nightly's
+      # steps, its watchdog's scripts and the marine areas' workflow's steps.
       - ".github/workflows/geocoder-build.yml"
+      - ".github/workflows/geocoder-build-watchdog.yml"
+      - ".github/workflows/geocoder-marine.yml"
 
 permissions:
   contents: read
@@ -20,15 +23,16 @@ jobs:
     name: Builder unit tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # python3-yaml: the tool tests parse the workflows as GitHub does.
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake zlib1g-dev libprotozero-dev \
-            libbz2-dev libdeflate-dev libexpat1-dev libzstd-dev zstd
+            libdeflate-dev libexpat1-dev libzstd-dev python3-yaml zstd
       # The patcher's too-small-TMPDIR cases mount a tmpfs in a private user
       # namespace (unshare), which the image's AppArmor policy forbids; here
       # they must run (GEOCODER_TESTS_NEED_PRIVATE_TMPFS fails them if not).
@@ -37,11 +41,14 @@ jobs:
       # GEOCODER_TESTS_PAST_4GIB: the cases that put more than 4 GiB of
       # address footprints through the writer and the patcher run in this
       # step alone. The nightly's tools step leaves them out: its unit tests
-      # gate the night.
+      # gate the night. GEOCODER_TESTS_PAGE_CACHE likewise: the checks of
+      # what pbf-apply leaves in the page cache, which reclaim on a busy
+      # runner may change.
       - name: Build + run tests
         env:
           GEOCODER_TESTS_NEED_PRIVATE_TMPFS: "1"
           GEOCODER_TESTS_PAST_4GIB: "1"
+          GEOCODER_TESTS_PAGE_CACHE: "1"
         run: |
           cd geocoder/builder && mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
@@ -67,7 +74,7 @@ jobs:
     name: Builder unit tests (ASan + UBSan, libzstd)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install dependencies
@@ -75,7 +82,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake zlib1g-dev libprotozero-dev \
-            libbz2-dev libdeflate-dev libexpat1-dev libzstd-dev zstd
+            libdeflate-dev libexpat1-dev libzstd-dev zstd
       # As in the job above: the private tmpfs cases run, or fail.
       - name: Allow user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -95,7 +102,7 @@ jobs:
     name: Build index (release S2)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # The S2 tests load what build-index writes with the server's read path:
@@ -108,7 +115,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake zlib1g-dev libprotozero-dev \
-            libbz2-dev libdeflate-dev libexpat1-dev libssl-dev libzstd-dev patch xz-utils
+            libdeflate-dev libexpat1-dev libssl-dev libzstd-dev patch xz-utils
       - name: Restore S2
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -133,7 +140,7 @@ jobs:
     name: Server unit tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # The tag, not the stable branch: that branch is regenerated, and a
@@ -144,28 +151,40 @@ jobs:
       - name: Test
         run: |
           cd geocoder/server
-          cargo test --release
+          cargo test --release --locked
 
   search-tests:
     name: Place search unit tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
+      # query-portal, a bin of this crate, is built with this crate's
+      # lockfile, but its sources are tested in query-server's tests, with
+      # that crate's: every package this one holds is in that one alike.
+      - name: Lockfiles agree
+        run: python3 geocoder/builder/tools/check_cargo_locks.py geocoder/server/Cargo.lock geocoder/search/Cargo.lock
       - name: Test
         run: |
           cd geocoder/search
           cargo test --release --locked
+      # The test portal's server, a bin of this crate, as its image builds
+      # it: its tests run in query-server's, and it builds with the feature
+      # portal alone, so the step above doesn't build it.
+      - name: Build query-portal
+        run: |
+          cd geocoder/search
+          cargo build --release --locked --features portal --bin query-portal
 
   node-tests:
     name: Node binding tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
@@ -181,11 +200,16 @@ jobs:
           node --test test/*.test.mjs
 
   test-portal-tests:
-    name: Test portal entrypoint tests
+    name: Test portal tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Test
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: geocoder/node/.nvmrc
+      - name: Entrypoint
         run: geocoder/test-portal/entrypoint.test.sh
+      - name: Page
+        run: node --test geocoder/test-portal/page.test.mjs

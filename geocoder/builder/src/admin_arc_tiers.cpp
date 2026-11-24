@@ -511,7 +511,12 @@ public:
     // after round, every ring checked first and then those a round touched.
     // Returns the arcs it changed.
     std::vector<uint32_t> restore_degenerate_rings(ArcTierCounts& counts) {
-        std::vector<uint32_t> suspects = rings_, changed;
+        return restore_degenerate_rings(rings_, counts);
+    }
+
+    // The same from `suspects` (rings, ascending) instead of every ring.
+    std::vector<uint32_t> restore_degenerate_rings(std::vector<uint32_t> suspects, ArcTierCounts& counts) {
+        std::vector<uint32_t> changed;
         for (int round = 0;; round++) {
             std::vector<uint32_t> bad = collect_in_order<uint32_t, Scratch>(suspects.size(),
                 [&](size_t k, std::vector<uint32_t>& out, Scratch& s) {
@@ -665,17 +670,23 @@ public:
     // back. Once coarsened, each round keeps the rings of the arcs it
     // changed fine where they collapse; on a tier that takes collapsing
     // rings to the e7 grid, it puts those the junctions it moved collapse
-    // there (keep_collapsing_on_e7_grid).
+    // with every vertex kept there (keep_collapsing_on_e7_grid), then gives
+    // the rings of the arcs that changed that are degenerate as stored
+    // their dropped vertices back (restore_degenerate_rings).
     void keep_unnested_on_e7_grid(ArcTierCounts& counts) {
         std::vector<uint32_t> unnested = not_nesting(candidates_);
         while (!unnested.empty()) {
             std::vector<uint32_t> changed = keep_on_e7_grid(unnested);
             if (changed.empty()) break;
             counts.e7_grid_rounds++;
-            if (coarse_)
+            if (coarse_) {
                 with_collapsing_rings_kept_fine(changed, counts);
-            else if (tier_.collapsing_rings_on_e7)
+            } else if (tier_.collapsing_rings_on_e7) {
                 counts.e7_collapsing_rings += keep_collapsing_on_e7_grid(rings_of(changed), changed);
+                const std::vector<uint32_t> back = restore_degenerate_rings(rings_of(changed), counts);
+                changed.insert(changed.end(), back.begin(), back.end());
+                sort_unique(changed, threads_);
+            }
             add_conflicts(meetings_of(update(changed)));
             std::vector<uint32_t> suspects = unnested;
             for (uint32_t a : changed)
@@ -1482,6 +1493,8 @@ ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store,
     done("repair");
     builder.keep_unnested_on_e7_grid(state.counts);
     done("e7 grid");
+    // The e7 grid rounds give rings vertices back on such a tier.
+    if (tier.collapsing_rings_on_e7) builder.count_degenerate(state.counts);
     if (tier.coarsens()) {
         ArcTierCounts fine;
         builder.count_left(fine);

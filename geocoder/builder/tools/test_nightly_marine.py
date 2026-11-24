@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -26,7 +27,7 @@ out=""; url=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out=$2; shift 2 ;;
-    --connect-timeout|--max-time|--retry|--retry-delay) shift 2 ;;
+    --connect-timeout|--max-time|--retry|--retry-delay|--retry-max-time) shift 2 ;;
     -*) shift ;;
     *) url=$1; shift ;;
   esac
@@ -147,6 +148,9 @@ case "$cmd" in
 esac
 """
 
+# unzip as the Fetch step runs it, `-p ZIP PATTERN`: prints the land polygons README's date line.
+FAKE_UNZIP = "#!/bin/sh\necho 'Date of the data used is 2026-11-20T00:00:00Z'\n"
+
 REPO = os.path.join(HERE, "..", "..", "..")
 
 
@@ -155,6 +159,18 @@ def fake_s5cmd(bin_dir):
     with open(path, "w") as f:
         f.write(FAKE_S5CMD)
     os.chmod(path, 0o755)
+
+
+# build-index as the Build step runs it: writes each of its arguments on a line of $BUILD_INDEX_ARGS.
+FAKE_BUILD_INDEX = '#!/bin/sh\nprintf "%s\\n" "$@" > "$BUILD_INDEX_ARGS"\n'
+
+
+def build_run():
+    """The Build step's build-index arguments and its run of build-index with them, as bash."""
+    text = script(read(NIGHTLY), "Build geocoder index")
+    args = re.search(r'^# Build args\n.*?(?=^echo "Building geocoder index)', text, re.M | re.S)
+    run = re.search(r"^build-index .*\\\n(?: +.*\\\n)* +.*\n", text, re.M)
+    return args.group(0) + run.group(0) if args and run else None
 
 
 def sidecar_block():
@@ -254,6 +270,26 @@ class NightlyTest(unittest.TestCase):
         self.assertIn("::error::[marine]", run.stdout)
         self.assertEqual(output, "")
 
+    # A bucket that stalls costs curl its --max-time an attempt, and curl retries a timeout: the fetch with its
+    # retries must end while the step has time left, as a step past its timeout is cancelled, and the watchdog
+    # retries no cancelled step. curl starts no retry once --retry-max-time (0: none) has passed, so its last
+    # attempt starts by then and a delay, and runs at most its --max-time; without it every retry may.
+    def test_the_fetch_with_its_retries_ends_before_the_step_times_out(self):
+        block = marine_block()
+        self.assertIsNotNone(block)
+        call = re.search(r"^if ! curl ((?:.*\\\n)*.*)", block, re.M)
+        args = shlex.split(call.group(1).replace("\\\n", " "))
+        limits = {a: int(v) for a, v in zip(args, args[1:])
+                  if a in ("--max-time", "--retry", "--retry-delay", "--retry-max-time")}
+        attempt, retries, delay = limits["--max-time"], limits.get("--retry", 0), limits.get("--retry-delay", 0)
+        longest = (retries + 1) * attempt + retries * delay
+        if retries and limits.get("--retry-max-time"):
+            longest = min(longest, limits["--retry-max-time"] + delay + attempt)
+        download = script(read(NIGHTLY), "Download PBF and previous indexes")
+        step_seconds = int(re.search(r"^STEP_SECONDS=(\d+)$", download, re.M).group(1))
+        # The 2 minutes the step leaves after the day's diff, for the waits and the decompression after it.
+        self.assertLessEqual(longest, step_seconds - 120, limits)
+
     def test_no_pin_builds_without_marine_areas(self):
         self.pin(None)
         run, output = self.run_block()
@@ -298,6 +334,46 @@ class NightlyTest(unittest.TestCase):
         download = script(text, "Download PBF and previous indexes")
         sidecars = download[download.index("# ── Background: previous strategy-2 sidecars ──"):download.index("IDX_PID=$!")]
         self.assertIn("planet/water/all/exact/water_meta.json", sidecars)
+
+    def build_index_args(self, marine=""):
+        """build-index's arguments as the Build step runs it, its $MARINE_FILE `marine`."""
+        block = build_run()
+        self.assertIsNotNone(block)
+        path = os.path.join(self.bin, "build-index")
+        with open(path, "w") as f:
+            f.write(FAKE_BUILD_INDEX)
+        os.chmod(path, 0o755)
+        recorded = os.path.join(self.tmp.name, "build-index-args")
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "WORKDIR": self.work, "MARINE_FILE": marine,
+               "BUILD_INDEX_ARGS": recorded}
+        run = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", block], env=env, capture_output=True, text=True,
+                             timeout=60)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        args = read(recorded).splitlines()
+        self.assertEqual(args[:2], [f"{self.work}/output/", f"{self.work}/planet.osm.pbf"])
+        return args
+
+    def test_build_index_takes_the_marine_areas_when_the_download_gave_a_file(self):
+        marine = os.path.join(self.work, "marine_areas.bin")
+        with open(marine, "wb") as f:
+            f.write(self.raw)
+        for given, want in ((marine, [["--marine", marine]]), ("", []), (os.path.join(self.work, "gone.bin"), [])):
+            with self.subTest(marine=given):
+                args = self.build_index_args(given)
+                self.assertEqual([args[i:i + 2] for i, a in enumerate(args) if a == "--marine"], want)
+
+    def test_build_index_takes_yesterdays_output_when_the_download_left_it(self):
+        # The water dirs' slots and type codes, as every other dir's ids, come from yesterday's output: a build
+        # without it starts them afresh.
+        old = os.path.join(self.work, "old-output")
+        for held, want in ((True, [["--prev-output", old]]), (False, [])):
+            with self.subTest(old_output=held):
+                if held:
+                    os.makedirs(old)
+                else:
+                    os.rmdir(old)
+                args = self.build_index_args()
+                self.assertEqual([args[i:i + 2] for i, a in enumerate(args) if a == "--prev-output"], want)
 
 
 class SidecarFetchTest(unittest.TestCase):
@@ -381,6 +457,27 @@ class MarineWorkflowTest(unittest.TestCase):
         self.assertRegex(block.group(1), r"(?m)^  group: \S+$")
         self.assertRegex(block.group(1), r"(?m)^  cancel-in-progress: false$")
 
+    # Only the two steps that list and upload to the bucket hold its write key, in their own env: the fetch
+    # and the build, which parse the sources from outside, run without it, and no step puts it in $GITHUB_ENV,
+    # which every later step reads.
+    def test_only_the_steps_that_use_the_bucket_hold_its_write_key(self):
+        import yaml
+        workflow = yaml.safe_load(read(MARINE_WORKFLOW))
+        job = workflow["jobs"]["marine"]
+        # Nor does the workflow's env or the job's give it to every step.
+        self.assertNotIn("secrets.", json.dumps({k: v for k, v in workflow.items() if k != "jobs"}, default=str))
+        self.assertNotIn("secrets.", json.dumps({k: v for k, v in job.items() if k != "steps"}))
+        steps = job["steps"]
+        keys = {"AWS_ACCESS_KEY_ID": "${{ secrets.TIGRIS_WRITE_KEY_ID }}",
+                "AWS_SECRET_ACCESS_KEY": "${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}"}
+        for s in steps:
+            with self.subTest(step=s.get("name") or s.get("uses")):
+                self.assertNotRegex(s.get("run", ""), r"AWS_\w+=.*GITHUB_ENV")
+                if s.get("name") in ("Version", "Upload to Tigris"):
+                    self.assertEqual({k: v for k, v in s.get("env", {}).items() if k in keys}, keys)
+                else:
+                    self.assertNotIn("secrets.", json.dumps(s))
+
     def run_version(self, listed="", error=""):
         with tempfile.TemporaryDirectory() as t:
             bin_dir = os.path.join(t, "bin")
@@ -441,8 +538,46 @@ class MarineWorkflowTest(unittest.TestCase):
         run = self.run_tests_step("OK (skipped=3)")
         self.assertNotEqual(run.returncode, 0)
         self.assertIn("::error::", run.stdout)
-        run = self.run_tests_step("FAILED (failures=1)", status=1)
-        self.assertNotEqual(run.returncode, 0)
+        # Tests that fail end the step with their status, whatever they wrote.
+        for said in ("FAILED (failures=1)", ""):
+            run = self.run_tests_step(said, status=3)
+            self.assertEqual(run.returncode, 3, run.stdout + run.stderr)
+
+    def run_fetch(self, layer):
+        """The Fetch step with the WFS serving `layer`, a GeoJSON document: the run."""
+        with tempfile.TemporaryDirectory() as t:
+            served, bin_dir = os.path.join(t, "served"), os.path.join(t, "bin")
+            for d in (served, bin_dir):
+                os.makedirs(d)
+            for name, text in [("curl", FAKE_CURL), ("unzip", FAKE_UNZIP)]:
+                with open(os.path.join(bin_dir, name), "w") as f:
+                    f.write(text)
+                os.chmod(os.path.join(bin_dir, name), 0o755)
+            with open(os.path.join(served, "eez_iho.json"), "w") as f:
+                json.dump(layer, f)
+            with open(os.path.join(served, "land.zip"), "wb") as f:
+                f.write(b"PK")
+            env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNNER_TEMP": t, "GITHUB_ENV": os.path.join(t, "env"),
+                   "EEZ_IHO_URL": "https://wfs.example/geocoder/eez_iho.json",
+                   "LAND_URL": "https://land.example/geocoder/land.zip", "FAKE_CURL_DIR": served}
+            return subprocess.run(["bash", "-e", "-c", script(read(MARINE_WORKFLOW), "Fetch the sources")], env=env,
+                                  capture_output=True, text=True, timeout=60)
+
+    def test_a_wfs_download_short_of_the_whole_layer_stops_the_run(self):
+        features = [{"type": "Feature", "properties": {}, "geometry": None}] * 3
+        whole = {"type": "FeatureCollection", "features": features, "numberMatched": 3, "numberReturned": 3}
+        run = self.run_fetch(whole)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        # A server that caps a request's features says so only in these counts; without them nothing does.
+        for why, layer in [("capped", {**whole, "numberMatched": 5}), ("returned less", {**whole, "numberReturned": 2}),
+                           ("features short", {**whole, "features": features[:2]}),
+                           ("matched unknown", {**whole, "numberMatched": "unknown"}),
+                           ("no matched", {k: v for k, v in whole.items() if k != "numberMatched"}),
+                           ("no returned", {k: v for k, v in whole.items() if k != "numberReturned"})]:
+            with self.subTest(why):
+                run = self.run_fetch(layer)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn("::error::", run.stdout)
 
     def run_build(self, summary):
         """The Build step with the tool's summary `summary`: the run, and whether it compressed the file."""

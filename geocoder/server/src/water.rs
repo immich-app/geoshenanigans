@@ -31,6 +31,9 @@ use unicode_normalization::{char::canonical_combining_class, UnicodeNormalizatio
 /// The dir of a dataset that holds its water layer.
 pub const WATER_DIR: &str = "water";
 
+/// The antimeridian's longitude on the e7 grid, east (180) or west (-180).
+const SEAM_E7: i64 = 1_800_000_000;
+
 /// The files a water layer loads from, by name: a dir holds all of them or none.
 pub const WATER_FILES: [&str; 10] = [
     "admin_cells.bin",
@@ -459,7 +462,8 @@ impl WaterLayer {
             polygons: mmap_file(&format!("{dir}/admin_polygons.bin"))?,
             geometry,
             cuts,
-            strings: StringPool::load(dir)?,
+            // Every name of the layer is in its core tier.
+            strings: StringPool::load_tiers(dir, 1)?,
             meta,
             cell_level,
         }))
@@ -478,7 +482,28 @@ impl WaterLayer {
         // Rounded once, as every ring test takes the point; its cell is the rounded point's.
         let point = AdminPoint::new(lat, lng);
         let (lat, lng) = point.degrees();
-        let mut candidates: Vec<Candidate<'_>> = self.index.with_ids(cell_id_at_level(lat, lng, self.cell_level), |ids| {
+        if point.e7().lng.abs() != SEAM_E7 {
+            return self.at_point(point, cell_id_at_level(lat, lng, self.cell_level), memo);
+        }
+        // On the antimeridian, where an area that crosses it is cut: a ring test counts only
+        // the edges east of the point, so no piece holds a point at 180 and only the east one
+        // at -180. Each side is read in the cell of a step inside it. The east side's
+        // candidates are tested at -180, which the pieces reaching the meridian there hold; the
+        // west side's a step short of 180, which the pieces reaching it from the west hold and
+        // one ending there doesn't, as a ring holds the points of its west edges but none of
+        // its east edges'. Of the two waters the one first in answering order answers.
+        let step = 1e-7;
+        let east = self.at_point(AdminPoint::new(lat, -180.0), cell_id_at_level(lat, -180.0 + step, self.cell_level), memo);
+        let west_point = AdminPoint::new(lat, 180.0 - step);
+        let (_, west_lng) = west_point.degrees();
+        let west = self.at_point(west_point, cell_id_at_level(lat, west_lng, self.cell_level), &mut PipMemo::new());
+        east.into_iter().chain(west).min_by(WaterDetail::order)
+    }
+
+    /// The water holding `point`, rounded already, of the candidates of the cell `cell`: the
+    /// first of them, in answering order, that holds it.
+    fn at_point(&self, point: AdminPoint, cell: u64, memo: &mut PipMemo) -> Option<WaterDetail<'_>> {
+        let mut candidates: Vec<Candidate<'_>> = self.index.with_ids(cell, |ids| {
             ids.iter().for_each(|&id| self.polygons.prefetch(u64::from(id & ID_MASK) * ADMIN_POLYGON_RECORD_BYTES));
             ids.iter()
                 .filter_map(|&id| {
@@ -735,10 +760,11 @@ pub(crate) mod fixture {
         coverer.covering(&rect).0.iter().map(|c| c.0).collect()
     }
 
-    /// Whether the cell lies inside the span.
+    /// Whether the cell lies inside the span. A cell beside the antimeridian, whose bound S2
+    /// widens across it (an inverted interval), lies in none: no span crosses it.
     fn inside(cell: u64, (s, w, n, e): Span) -> bool {
         let b = s2::cell::Cell::from(CellID(cell)).rect_bound();
-        b.lat_lo().deg() > s && b.lat_hi().deg() < n && b.lng_lo().deg() > w && b.lng_hi().deg() < e
+        !b.lng.is_inverted() && b.lat_lo().deg() > s && b.lat_hi().deg() < n && b.lng_lo().deg() > w && b.lng_hi().deg() < e
     }
 
     /// Whether the cell meets the span.
@@ -1134,6 +1160,56 @@ mod tests {
         std::fs::write(water.join("water_meta.json"), "{\"types\": 1}").unwrap();
         std::fs::write(water.join("arc_index.bin"), []).unwrap();
         assert!(open().unwrap_err().starts_with(&format!("{}/water_meta.json: ", water.display())));
+    }
+
+    // A water dir's names are all in its core tier, the one string file it loads: another tier's
+    // file there (an operator's copy, a POI unit decoded into it) is none of its own, and the
+    // dir opens and answers as without it, though the file is no string tier.
+    #[test]
+    fn a_water_dir_loads_its_core_strings_only() {
+        let dir = crate::scratch_dir::ScratchDir::new();
+        let water = dir.path().join(WATER_DIR);
+        WaterFixture::new().area("Lake", LAKE, (0.0, 0.0, 1.0, 1.0), &[]).write(&water);
+        for name in &crate::STR_TIER_FILENAMES[1..] {
+            std::fs::write(water.join(name), "not a string tier").unwrap();
+        }
+
+        let layer = WaterLayer::open(water.to_str().unwrap(), crate::DEFAULT_ADMIN_CELL_LEVEL).unwrap().expect("the dir's files");
+
+        assert_eq!(serde_json::to_value(layer.at(0.5, 0.5)).unwrap(), named("Lake", "water", "lake"));
+    }
+
+    // Longitude 180 and -180 are one meridian, where an area that crosses it is cut (the seas
+    // of the Pacific), and S2 puts both in one cell: a point rounded onto it is in the water on
+    // either side of the cut, the piece east of it or the piece west of it. A ring test counts
+    // only the edges east of a point, so at 180 no piece would hold it.
+    #[test]
+    fn a_point_on_the_antimeridian_is_in_the_water_either_side_of_it() {
+        let (west, east) = ((10.0, 179.0, 11.0, 180.0), (10.0, -180.0, 11.0, -179.0));
+        let pieces = WaterFixture::new().piece("Bering Sea", SEA, 2.0, west).piece("Bering Sea", SEA, 2.0, east).layer();
+        let west_only = WaterFixture::new().area("Bering Sea", SEA, west, &[]).layer();
+        let east_only = WaterFixture::new().area("Bering Sea", SEA, east, &[]).layer();
+        let sea = named("Bering Sea", "place", "sea");
+
+        for (layer, what) in [(&pieces, "both pieces"), (&west_only, "the west piece"), (&east_only, "the east piece")] {
+            for lng in [180.0, -180.0, 179.99999996, -179.99999996] {
+                assert_eq!(water(layer, 10.5, lng), sea, "{what}: (10.5, {lng})");
+            }
+        }
+        assert_eq!(water(&west_only, 10.5, 179.5), sea);
+        assert_eq!(west_only.at(10.5, -179.5), None);
+        assert_eq!(east_only.at(10.5, 179.5), None);
+        // Only water that reaches the meridian holds a point on it: not an area a step short of it
+        // on either side, but a strip a step wide along it.
+        let short = WaterFixture::new()
+            .area("East Gap", SEA, (10.0, -179.9999999, 11.0, -179.0), &[])
+            .area("West Gap", SEA, (10.0, 179.0, 11.0, 179.9999999), &[])
+            .layer();
+        let strip = WaterFixture::new().area("Seam Strip", SEA, (10.0, -180.0, 11.0, -179.9999999), &[]).layer();
+        for lng in [180.0, -180.0] {
+            assert_eq!(short.at(10.5, lng), None, "(10.5, {lng})");
+            assert_eq!(water(&strip, 10.5, lng), named("Seam Strip", "place", "sea"), "(10.5, {lng})");
+        }
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::build::{
     Contended, HeldIndexDir,
 };
 use crate::constants::*;
+use crate::query::{Found, QueryStats, Searcher};
 use crate::reader::SearchIndex;
 use query_server::{lower_hex, FileStamp, Index, WATER_DIR, WATER_FILES};
 use serde_json::{json, Value};
@@ -18,6 +19,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::path::Path;
+use std::sync::Arc;
 
 /// The geocoder files an index is derived from: the records its postings point at, the string
 /// tiers of their names and the boundary geometry its label points come from, the boundary tier's
@@ -72,18 +74,28 @@ fn stamps_of(dir: &Path, names: &[&str]) -> std::io::Result<BTreeMap<String, Fil
 /// loaded with the stamps of the dataset files it read: those and the files of the dataset's
 /// water dir (WATER_FILES, which the geocoder index loads and an index of place search derives
 /// nothing from) the same before and after the load, else the files were being replaced and it
-/// fails.
+/// fails. A dir of continent dirs (one holding no admin_cells.bin, which MultiIndex::load
+/// loads continent by continent) has each continent dir's dataset and water files checked so
+/// too, a continent whose files can't be looked up taken as such (MultiIndex::load skips it,
+/// and loads the others); the stamps returned are still those of `dir`'s own.
 pub fn load<T>(dir: &Path, load: impl FnOnce() -> Result<T, String>) -> Result<(T, Stamps), String> {
+    let continents: Vec<std::path::PathBuf> = if dir.join("admin_cells.bin").exists() {
+        Vec::new()
+    } else {
+        query_server::continents().iter().map(|c| dir.join(c.name)).filter(|d| d.is_dir()).collect()
+    };
+    let of = |d: &Path| Ok::<_, std::io::Error>((Stamps::of(d)?, stamps_of(&d.join(WATER_DIR), &WATER_FILES)?));
     let stamps = || {
-        let io = |e: std::io::Error| e.to_string();
-        Ok::<_, String>((Stamps::of(dir).map_err(io)?, stamps_of(&dir.join(WATER_DIR), &WATER_FILES).map_err(io)?))
+        let own = of(dir).map_err(|e| e.to_string())?;
+        Ok::<_, String>((own, continents.iter().map(|d| of(d).ok()).collect::<Vec<_>>()))
     };
     let before = stamps()?;
     let loaded = load()?;
     if stamps()? != before {
         return Err(format!("The dataset in {} changed while it was loading", dir.display()));
     }
-    Ok((loaded, before.0))
+    let ((own, _), _) = before;
+    Ok((loaded, own))
 }
 
 /// Hashes of dataset files, each with the stat it was taken at; kept beside an index
@@ -288,12 +300,40 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
     Ok((opened, origin))
 }
 
+/// A place search `open` opened, held with the geocoder index its postings point into, so that it
+/// can be kept and shared across threads: the node binding's and the test portal's.
+pub struct PlaceSearch {
+    // Fields drop in order: the searcher borrows the index, which borrows the geocoder index.
+    searcher: Searcher<'static, 'static>,
+    _index: Arc<SearchIndex<'static>>,
+    _geo: Arc<Index>,
+}
+
+impl PlaceSearch {
+    /// `open` of the index in `index` for `geo`, the dataset in `dir` loaded from files stamped
+    /// `loaded`.
+    pub fn open(geo: Arc<Index>, loaded: &Stamps, dir: &Path, index: &Path, on_device: &BuildOnDevice) -> Result<(PlaceSearch, Origin), String> {
+        // SAFETY: the borrows point into the two Arcs' shared allocations, which never move and
+        // are held by this struct until after the searcher and the index that borrow them drop.
+        let geo_ref: &'static Index = unsafe { &*Arc::as_ptr(&geo) };
+        let (opened, origin) = open(geo_ref, loaded, dir, index, on_device)?;
+        let opened = Arc::new(opened);
+        let index_ref: &'static SearchIndex<'static> = unsafe { &*Arc::as_ptr(&opened) };
+        Ok((PlaceSearch { searcher: Searcher::new(index_ref), _index: opened, _geo: geo }, origin))
+    }
+
+    /// `Searcher::search`: the results for `q`, best first, and the work they took. They borrow
+    /// this search, which they can't outlive.
+    pub fn search(&self, q: &str, limit: usize) -> (Vec<Found<'_>>, QueryStats) {
+        self.searcher.search(q, limit)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::build::build_all;
     use crate::fixture::{Geo, TempDir};
-    use crate::query::Searcher;
     use query_server::{AdminPoint, ADMIN_GEOMETRY_FILES, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
     use std::path::PathBuf;
 
@@ -807,6 +847,25 @@ mod tests {
     }
 
     #[test]
+    fn a_place_search_answers_as_a_searcher_over_the_index_it_opened() {
+        let ds = TempDir::new("place-search");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let (geo, stamps) = load_dataset(&ds.0);
+        let index = ds.0.join("search");
+
+        let (search, origin) = PlaceSearch::open(Arc::new(geo), &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap();
+
+        // Kept by another thread than the one that opened it.
+        let search = std::thread::spawn(move || search).join().unwrap();
+        assert_eq!(origin, Origin::Built);
+        let geo = load_dataset(&ds.0).0;
+        let idx = SearchIndex::open(&geo, &index, None, None).unwrap();
+        let (found, _) = search.search("otherton", 5);
+        assert_eq!(crate::query::results_json(&found), crate::query::results_json(&Searcher::new(&idx).search("otherton", 5).0));
+        assert_eq!(found.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Otherton"]);
+    }
+
+    #[test]
     fn load_refuses_files_replaced_while_loading() {
         let ds = TempDir::new("loading");
         dataset(["Testville", "Otherton"]).write(&ds.0);
@@ -851,6 +910,56 @@ mod tests {
             assert!(got.unwrap_err().contains("changed while it was loading"), "{what}");
         }
         assert_eq!(kept.unwrap().1, Stamps::of(&ds.0).unwrap());
+    }
+
+    // A dir of continent dirs (no admin_cells.bin of its own) loads each continent's dataset
+    // and water dir, as MultiIndex::load does: a file of either replaced during the load fails
+    // it too. The stamps kept are still those of the dir's own dataset files, of which it holds
+    // none.
+    #[test]
+    fn load_refuses_a_continents_files_replaced_while_loading() {
+        let ds = TempDir::new("continents");
+        let europe = ds.0.join("europe");
+        std::fs::create_dir(&europe).unwrap();
+        dataset(["Testville", "Otherton"]).write(&europe);
+        std::fs::create_dir(europe.join(WATER_DIR)).unwrap();
+        std::fs::write(europe.join(WATER_DIR).join("admin_polygons.bin"), b"day 1").unwrap();
+        let replace = |path: PathBuf| {
+            let new = path.with_extension("new");
+            std::fs::write(&new, b"day 2").unwrap();
+            std::fs::rename(&new, path).unwrap();
+        };
+
+        let kept = load(&ds.0, || Ok(()));
+        let water = load(&ds.0, || {
+            replace(europe.join(WATER_DIR).join("admin_polygons.bin"));
+            Ok(())
+        });
+        let dataset_file = load(&ds.0, || {
+            replace(europe.join("place_nodes.bin"));
+            Ok(())
+        });
+
+        for (what, got) in [("water", water), ("dataset", dataset_file)] {
+            assert!(got.is_err_and(|e| e.contains("changed while it was loading")), "{what}");
+        }
+        assert_eq!(kept.unwrap().1, Stamps::default());
+    }
+
+    // A continent whose files can't be looked up (here under a water dir that is a file) is one
+    // MultiIndex::load skips, loading the others: it fails no load of the dir of continents.
+    #[test]
+    fn a_continent_whose_files_cant_be_looked_up_fails_no_regional_load() {
+        let ds = TempDir::new("unsearchable-continent");
+        for name in ["europe", "asia"] {
+            std::fs::create_dir(ds.0.join(name)).unwrap();
+            dataset(["Testville", "Otherton"]).write(&ds.0.join(name));
+        }
+        std::fs::write(ds.0.join("asia").join(WATER_DIR), b"not a dir").unwrap();
+
+        let got = load(&ds.0, || Ok(()));
+
+        assert_eq!(got.map(|(_, stamps)| stamps), Ok(Stamps::default()));
     }
 
     // A file that can't be looked up (here under a water dir that is a file, as under one that

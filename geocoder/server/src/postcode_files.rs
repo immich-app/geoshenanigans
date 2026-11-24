@@ -60,14 +60,16 @@ pub struct NearBlock {
     pub d: f64,
 }
 
-/// resolve_postcode's distance between the query (lat, lng; `cos_lat` the cosine of its lat) and a
-/// point, in squared radians: monotone in each of |lat - plat| and |lng - plng| (each step of it
-/// is), so a point's distance is at least that of any point of a box nearer the query on both.
+/// resolve_postcode's distance between the query (lat, lng) and a point, in squared radians: plain
+/// degrees, a degree of longitude as long as one of latitude, as Nominatim orders postcode
+/// centroids by ST_Distance on lon/lat geometry. Monotone in each of |lat - plat| and |lng - plng|
+/// (each step of it is), so a point's distance is at least that of any point of a box nearer the
+/// query on both.
 #[inline(always)]
-pub fn distance(lat: f64, lng: f64, cos_lat: f64, plat: f64, plng: f64) -> f64 {
+pub fn distance(lat: f64, lng: f64, plat: f64, plng: f64) -> f64 {
     let dlat = (lat - plat).to_radians();
     let dlng = (lng - plng).to_radians();
-    dlat * dlat + dlng * dlng * cos_lat * cos_lat
+    dlat * dlat + dlng * dlng
 }
 
 #[inline(always)]
@@ -197,7 +199,6 @@ impl PostcodeFiles {
             &mut many
         };
         ranges.sort_unstable();
-        let cos_lat = lat.to_radians().cos();
         // The block a range's rows were last added to, and whether it is in out; a cell given twice
         // is read once.
         let mut last: Option<(u32, bool)> = None;
@@ -224,7 +225,7 @@ impl PostcodeFiles {
                         let kept = match self.entry(b) {
                             Some(e) => {
                                 let [la, lah, ga, gah] = e.bounds();
-                                let d = distance(lat, lng, cos_lat, lat.max(la).min(lah), lng.max(ga).min(gah));
+                                let d = distance(lat, lng, lat.max(la).min(lah), lng.max(ga).min(gah));
                                 (d < max_d).then(|| out.push(NearBlock { block: b, rows: mask, d })).is_some()
                             }
                             None => false,

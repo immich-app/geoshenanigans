@@ -49,7 +49,7 @@ A file is published either as its own `<path>.zst` or inside a transport unit
 
 ## Files Overview
 
-A complete geocoder index for a given region and configuration consists of files from **up to three directories**:
+A complete geocoder index for a given region and configuration consists of files from **up to four directories**:
 
 ### Mode directory (pick one)
 
@@ -99,8 +99,8 @@ POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.
 
 | Water | Files | Description |
 |-------|-------|-------------|
-| `water/major/simplified/` | 11 files | The seas and oceans, in builds that pin the marine areas; lakes, wetlands and glaciers of 100 km² or more; bays, straits, fjords, sounds, lagoons and harbours of 10 km² or more; whole rivers and canals whose areas sum to 100 km² (5 km² with a Wikidata item). Those are the thresholds to enter: one in the previous build's tier stays down to 90 km² (9 km² for coastal water, 4.5 km² for a river). Shores within 37.5 m |
-| `water/all/simplified/` | 11 files | Every named water area, every river or canal area its waterway names, and the seas and oceans in builds that pin the marine areas. Shores within 37.5 m |
+| `water/major/simplified/` | 11 files | The seas and oceans, in builds that pin the marine areas; every named water area of 100 km² or more, whatever its kind (lakes, reservoirs, wetlands, glaciers and the rest), and bays, straits, fjords, sounds, lagoons and harbours of 10 km² or more; whole rivers and canals whose areas sum to 100 km² (5 km² with a Wikidata item). Those are the thresholds to enter: one in the previous build's tier stays down to 90 km² (9 km² for coastal water, 4.5 km² for a river). Shores simplified with a tolerance of 37.5 m |
+| `water/all/simplified/` | 11 files | Every named water area, every river or canal area its waterway names, and the seas and oceans in builds that pin the marine areas. Shores simplified with a tolerance of 37.5 m |
 | `water/all/exact/` | 11 files | The same with every OSM point of every shore |
 
 Water files: `admin_polygons.bin`, `admin_rings.bin`, `arc_index.bin`,
@@ -327,7 +327,10 @@ dataset dir by their names, as before.
 `text`, `url`, `licence`, `licence_url` and `notices`), with the components
 it `applies_to` (shell patterns of component ids). Each water dir's
 `attribution.json` holds the entries of the data in it: OpenStreetMap's, and
-Marine Regions' where it holds a sea or ocean.
+Marine Regions' where it holds a sea or ocean. `applies_to` names the
+components a source can apply to; a water dir's own `attribution.json` says
+what its data is owed and is the credit to show (OpenStreetMap's alone in a
+build without the marine areas).
 
 `component_sizes` gives, per region, each component's bytes: `raw` its files
 on disk, `wire` what downloading them costs (a unit's size once, or its share
@@ -382,6 +385,11 @@ variants', and only those the region has.
    - Download builds/{date}/europe/quality/simplified/patch.gcpatch → apply to quality files
    - Download builds/{date}/europe/poi/notable/patch.gcpatch → apply to POI files (if using POIs)
    - Download builds/{date}/europe/water/all/simplified/patch.gcpatch → apply to <dataset>/water/ (if using water)
+   The water patch applies only to a water dir the client holds. A client
+   with no water dir for its selection (it switched to water after its local
+   date, or no water patch exists for that date) downloads the value's files
+   fresh at the target date, as Switching Water does, and patches the other
+   dirs as usual.
 7. Update local date to latest
 ```
 
@@ -426,14 +434,17 @@ files into `<dataset>/water/` (or removes the water layer's files, for
 `none`), as a fresh install does, with no patch. On the server, a
 `PUT /admin/configuration` downloads each loaded region again whose dir the
 downloader filled (it holds `.file_sha256` or `.build_date`; one laid out by
-hand stays as it is) unless the server's last download of it that went through
-was of the PUT's selection, as it isn't where `water` (or another axis)
-changes: the download removes the files of `water/` the new value doesn't take
-and fetches the ones it does, its ledger naming each `water/<name>`, and the
-region loads again once that is in, answering from the files it had until then
-(and where the download fails, till a PUT, of the same selection too, downloads
-it again). Other names in `water/` stay, and a dir holding none of the water
-files has no water.
+hand stays as it is) unless the `.build_date` its dir held as its files loaded
+names the PUT's bucket and selection, as it doesn't where `water` (or another
+axis) changes: the download removes the files of `water/` the new value
+doesn't take and fetches the ones it does, its ledger naming each
+`water/<name>`, and the region loads again once that is in. Until then, or if
+the download or load fails, the running process keeps serving the old index
+and retries the switch on the next PUT, of whichever selection; if the failed
+download removed `.build_date`, a restart leaves that region unloaded until a
+download succeeds. A server restarted before a PUT's downloads went through
+runs them as it starts, from the configuration the PUT kept. Other names in
+`water/` stay, and a dir holding none of the water files has no water.
 
 ### Switching Region
 

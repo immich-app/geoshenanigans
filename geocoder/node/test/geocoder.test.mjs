@@ -155,13 +155,16 @@ function pool(names) {
 // The layout of a dataset whose strings are a core tier of `size` bytes.
 const coreLayout = (size) => JSON.stringify({ tiers: Array.from({ length: 5 }, (_, t) => ({ start: t === 0 ? 0 : size, end: size })) });
 
-// A dataset as the builder writes one: a country boundary, listed in the admin cell of
-// COUNTRY_CELL, and two places named `names`.
-function writeDataset(dir, names) {
+// The country's ring: (10, 20) to (11, 21).
+const COUNTRY = [[10, 20], [10, 21], [11, 21], [11, 20], [10, 20]];
+
+// A dataset as the builder writes one: a country boundary of the ring `ring`, listed in the admin
+// cell of COUNTRY_CELL, and two places named `names`.
+function writeDataset(dir, names, ring = COUNTRY) {
   const [strings, [country, ...places], size] = pool(['Testland', ...names]);
   // The country's ring as one arc. Its ring block is one chunk of one ref, to slot 0, that ends
   // the ring.
-  const arc = arcOf([[10, 20], [10, 21], [11, 21], [11, 20], [10, 20]]);
+  const arc = arcOf(ring);
   const rings = Buffer.from([(1 << 2) | 1, 0]);
   // Its record: its ring block at 0 (to the end of admin_rings.bin), its name, area, country
   // code and admin level 2 (level << 4 | place type).
@@ -242,10 +245,10 @@ function writeWater(dir) {
 }
 
 let datasets = 0;
-const dataset = (names) => {
+const dataset = (names, ring) => {
   const dir = join(root, `ds${datasets++}`);
   mkdirSync(dir);
-  return writeDataset(dir, names);
+  return writeDataset(dir, names, ring);
 };
 
 test('reverse geocoding finds a place in its cell', async () => {
@@ -277,6 +280,20 @@ test('reverse geocoding finds the water of the dataset\'s water dir, last in the
   assert.deepEqual(JSON.parse(await geocoder.reverseGeocode(10.4903, 20.5)).water, { name: 'Testsee', class: 'water', type: 'lake' });
   // Beside the lake in the cell that lists it: the answer without water, byte for byte.
   assert.equal(await geocoder.reverseGeocode(10.5, 20.45), dryBeside);
+});
+
+// A point no boundary holds (the open sea; here east of a country whose ring stops short of
+// the lake) has an empty address, and keeps the water of the dataset's water dir: far inside
+// its shore, with no line to hold its name already, the location line names it.
+test('reverse geocoding a point in water outside every boundary finds the water alone', async () => {
+  const dir = dataset(['Testville', 'Otherton'], [[10, 20], [10, 20.4], [11, 20.4], [11, 20], [10, 20]]);
+  const dry = await Geocoder.load(dir).reverseGeocode(10.5, 20.5);
+  writeWater(join(dir, 'water'));
+
+  const wet = await Geocoder.load(dir).reverseGeocode(10.5, 20.5);
+
+  assert.equal(dry, '{"address":{}}');
+  assert.equal(wet, '{"address":{},"water":{"name":"Testsee","class":"water","type":"lake","landmark":true}}');
 });
 
 test('reverse geocoding off the globe finds nothing', async () => {

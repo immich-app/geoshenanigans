@@ -258,9 +258,10 @@ inline std::string meta_json(const TypeTable& table, const std::set<uint16_t>& c
 }
 
 // The kinds of a water_meta.json meta_json wrote, with nothing but white
-// space after it: each code once, ascending, and each value outside the
-// fixed table once. None (nullopt) for any other text, one cut short, and
-// the empty text of a missing file, among them.
+// space after it: each code once, ascending, of the fixed table or from
+// kVerbatimBase up, and each value outside the fixed table once, class
+// water and rank kVerbatimRank. None (nullopt) for any other text, one cut
+// short, and the empty text of a missing file, among them.
 inline std::optional<std::vector<MetaType>> parse_meta_json(const std::string& text) {
     std::vector<MetaType> out;
     std::set<std::string> verbatim;
@@ -279,7 +280,7 @@ inline std::optional<std::vector<MetaType>> parse_meta_json(const std::string& t
         skip_space();
         size_t start = at;
         while (at < text.size() && text[at] >= '0' && text[at] <= '9') at++;
-        if (at == start || at - start > 6) return false;
+        if (at == start || at - start > 6 || (at - start > 1 && text[start] == '0')) return false;
         v = std::stol(text.substr(start, at - start));
         return true;
     };
@@ -335,8 +336,11 @@ inline std::optional<std::vector<MetaType>> parse_meta_json(const std::string& t
             !expect("}"))
             return std::nullopt;
         if (code <= 0 || code > 0xFFFF || rank > 255) return std::nullopt;
+        if (code > kFixedKindCount && code < kVerbatimBase) return std::nullopt;
         if (!out.empty() && code <= out.back().code) return std::nullopt;
-        if (code >= kVerbatimBase && !verbatim.insert(m.type).second) return std::nullopt;
+        if (code >= kVerbatimBase &&
+            (m.cls != "water" || rank != kVerbatimRank || !verbatim.insert(m.type).second))
+            return std::nullopt;
         m.code = static_cast<uint16_t>(code);
         m.rank = static_cast<uint8_t>(rank);
         out.push_back(m);

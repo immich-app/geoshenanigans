@@ -34,6 +34,8 @@ class WaterAxisTest(unittest.TestCase):
         for preset in cfg["presets"]:
             self.assertEqual(sorted(preset["selections"]), sorted(cfg["axes"]), preset["id"])
             self.assertEqual(preset["selections"]["water"], "none", preset["id"])
+            # Water adds files to any selection, so a preset without it is never the largest.
+            self.assertNotIn("largest", preset["description"].lower(), preset["id"])
         # Any boundary precision with any water: no constraint names it.
         for c in cfg["constraints"]:
             self.assertNotIn("water", c["when"], c["id"])
@@ -54,8 +56,9 @@ class WaterAxisTest(unittest.TestCase):
 
     def test_the_water_axis_offers_its_dirs_files_answered_in_a_water_field(self):
         description = load_template()["axes"]["water"]["description"]
-        self.assertIn("water/", description)
-        self.assertIn("answered in a `water` field beside the address", description)
+        self.assertIn("`<dataset>/water/`", description)
+        self.assertNotIn("beside the dataset", description)
+        self.assertIn("in a `water` field without changing the address", description)
         self.assertNotIn("yet", description)
 
     def test_the_seas_and_oceans_are_offered_as_in_builds_that_pin_the_marine_areas(self):

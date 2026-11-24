@@ -1,223 +1,197 @@
 // Unit tests for postcode_validation.h.
 //
-// validate_postcode_for_country(cc, pc) validates a postcode against a
-// per-country pattern (auto-generated from Nominatim country_settings.yaml).
-// These tests lock in the CURRENT behaviour: input normalization (lowercasing,
-// stripping spaces/hyphens), per-country length+char rules, the "always true"
-// and "always false" country buckets, the unknown-country default, and the
-// null/empty/length guard rails. They are a regression net for refactors, not
-// a spec.
+// match_postcode(cc, pc, default) is Nominatim's PostcodeFormatter.match on
+// the patterns of country_settings.yaml: in upper case, the tag matches
+// \s*(?:CC[ -]?)?(pattern)\s* whole, the pattern its group whole, a group of
+// zeros, hyphens and spaces is none, and the postcode is the pattern's output
+// (match.expand). A country without a pattern takes the default: .* where
+// update_postcodes matches postal areas and centroids, [A-Z0-9- ]{3,12} where
+// the clean-postcodes sanitizer matches a feature's own tag. A country without
+// postcodes, or no country, has none.
 #include "postcode_validation.h"
+
+#include <optional>
+#include <string>
 
 #include "test_framework.h"
 
-// ---- Guard rails: null / empty / too-short cc, empty pc -------------------
+namespace {
 
-TEST(postcode_null_cc_is_false) {
-    CHECK(!validate_postcode_for_country(nullptr, "12345"));
+uint16_t code(const char* cc) { return pack_country_code(cc[0], cc[1]); }
+
+// The postcode of the tag pc in the country cc (upper case), as postal
+// areas and centroids take it.
+std::optional<std::string> area(const char* cc, const char* pc) {
+    return match_postcode(code(cc), pc, PostcodeDefault::Any);
 }
 
-TEST(postcode_null_pc_is_false) {
-    CHECK(!validate_postcode_for_country("us", nullptr));
+// The postcode of the tag pc in the country cc, as a feature's own tag.
+std::optional<std::string> tag(const char* cc, const char* pc) {
+    return match_postcode(code(cc), pc, PostcodeDefault::Sanitizer);
 }
 
-TEST(postcode_empty_cc_is_false) {
-    CHECK(!validate_postcode_for_country("", "12345"));
+bool is(const std::optional<std::string>& got, const char* want) {
+    if (got == std::string(want)) return true;
+    std::printf("    got %s%s%s, want \"%s\"\n", got ? "\"" : "", got ? got->c_str() : "none", got ? "\"" : "", want);
+    return false;
 }
 
-TEST(postcode_single_char_cc_is_false) {
-    // cc must be at least 2 chars (cc[1] must be non-zero).
-    CHECK(!validate_postcode_for_country("u", "12345"));
+bool none(const std::optional<std::string>& got) {
+    if (!got) return true;
+    std::printf("    got \"%s\", want none\n", got->c_str());
+    return false;
 }
 
-TEST(postcode_empty_pc_is_false) {
-    CHECK(!validate_postcode_for_country("us", ""));
+}  // namespace
+
+TEST(postcode_of_no_country_or_a_country_without_postcodes_is_none) {
+    // get_matcher(None) is None, and so is a country of postcode: no.
+    CHECK(none(match_postcode(0, "12345", PostcodeDefault::Any)));
+    CHECK(none(match_postcode(0, "12345", PostcodeDefault::Sanitizer)));
+    CHECK(none(area("AE", "12345")));
+    CHECK(none(tag("AO", "1234")));
+    CHECK(none(area("ZW", "00263")));
+    CHECK(none(tag("QA", "12345")));
+    CHECK(none(area("BS", "N1234")));
+    CHECK(none(area("US", "")));
 }
 
-// ---- US: exactly 5 digits -------------------------------------------------
-
-TEST(postcode_us_valid_5_digits) {
-    CHECK(validate_postcode_for_country("us", "12345"));
-    CHECK(validate_postcode_for_country("us", "90210"));
-    CHECK(validate_postcode_for_country("us", "00000"));
+TEST(postcode_is_the_patterns_match_in_upper_case_past_the_white_space_round_it) {
+    CHECK(is(area("DE", "10115"), "10115"));
+    CHECK(is(tag("DE", " 10115 "), "10115"));
+    CHECK(is(tag("DE", "\t10115\n"), "10115"));
+    // Python's \s takes Unicode white space: a no-break space and a thin one.
+    CHECK(is(tag("DE", "\xc2\xa0" "10115\xe2\x80\x89"), "10115"));
+    CHECK(is(area("GB", "m1 1ae"), "M1 1AE"));
+    CHECK(none(area("DE", "1011")));
+    CHECK(none(area("DE", "101155")));
+    CHECK(none(area("US", "1234A")));
+    CHECK(none(area("US", "ABCDE")));
+    CHECK(none(area("CA", "12345")));
 }
 
-TEST(postcode_us_wrong_length_is_false) {
-    CHECK(!validate_postcode_for_country("us", "1234"));    // too short
-    CHECK(!validate_postcode_for_country("us", "123456"));  // too long
+TEST(postcode_drops_the_country_code_before_it) {
+    // \s*(?:CC[ -]?)?: the country's own code, then one space or hyphen at most.
+    CHECK(is(tag("DE", "DE 10115"), "10115"));
+    CHECK(is(tag("DE", "de-10115"), "10115"));
+    CHECK(is(tag("DE", "DE10115"), "10115"));
+    CHECK(is(tag("UA", "UA-01001"), "01001"));
+    CHECK(is(area("LT", "LT-01100"), "01100"));
+    CHECK(none(tag("DE", "D-E-10115")));
+    CHECK(none(tag("DE", "DE  10115")));
+    CHECK(none(tag("DE", "US-10115")));
+    CHECK(none(area("LV", "LT-1050")));
 }
 
-TEST(postcode_us_non_digit_is_false) {
-    CHECK(!validate_postcode_for_country("us", "1234A"));
-    CHECK(!validate_postcode_for_country("us", "ABCDE"));
+TEST(postcode_takes_a_separator_only_where_its_pattern_has_one) {
+    CHECK(none(tag("DE", "DE-10-115")));
+    CHECK(none(tag("DE", "10-115")));
+    CHECK(none(tag("DE", "1 0115")));
+    CHECK(is(area("PL", "12-345"), "12-345"));
+    CHECK(is(area("PL", "12 345"), "12-345"));
+    CHECK(none(area("PL", "123-45")));
+    CHECK(none(area("NL", "1234-AB")));
+    CHECK(none(area("NL", "12 34AB")));
+    CHECK(none(area("GB", "SW1A-1AA")));
+    CHECK(none(area("US", "12-345")));
+    CHECK(none(area("US", "1 2 3 4 5")));
+    CHECK(is(area("IR", "12345_67890"), "12345-67890"));
+    CHECK(is(area("IR", "12345 67890"), "12345-67890"));
+    CHECK(none(area("IR", "12345__67890")));
 }
 
-TEST(postcode_us_zip_plus_four_with_hyphen) {
-    // "12345-6789" -> hyphen stripped -> "123456789" (9 digits) -> not len 5.
-    CHECK(!validate_postcode_for_country("us", "12345-6789"));
+TEST(postcode_is_the_patterns_output) {
+    CHECK(is(area("NL", "1234AB"), "1234 AB"));
+    CHECK(is(area("NL", "nl 1234ab"), "1234 AB"));
+    CHECK(is(area("PL", "12345"), "12-345"));
+    CHECK(is(area("LV", "1050"), "LV-1050"));
+    CHECK(is(area("LV", "LV-1050"), "LV-1050"));
+    CHECK(is(area("MD", "MD2001"), "MD-2001"));
+    CHECK(is(area("US", "12345-6789"), "12345"));
+    CHECK(is(tag("US", "US 12345-6789"), "12345"));
+    CHECK(is(area("IR", "1234567890"), "12345-67890"));
+    CHECK(is(area("GB", "SW1A1AA"), "SW1A 1AA"));
+    CHECK(is(area("CA", "k1a0b1"), "K1A 0B1"));
+    CHECK(is(area("BR", "01310100"), "01310-100"));
+    CHECK(is(area("AD", "100"), "AD100"));
+    CHECK(is(area("AD", "AD100"), "AD100"));
+    CHECK(is(area("KY", "1-1000"), "KY1-1000"));
+    CHECK(is(area("KY", "KY1-1000"), "KY1-1000"));
+    CHECK(is(area("LC", "12345"), "LC12 345"));
+    CHECK(is(area("AI", "2640"), "AI-2640"));
+    CHECK(is(area("FK", "FIQQ1ZZ"), "FIQQ 1ZZ"));
+    CHECK(is(area("BN", "BS 8811"), "BS8811"));
+    CHECK(is(area("IN", "110 001"), "110001"));
+    // A pattern without an output keeps the match.
+    CHECK(is(area("SA", "12345-6789"), "12345-6789"));
+    CHECK(none(area("SA", "12345-ABCD")));
+    CHECK(is(area("PT", "1000-001"), "1000-001"));
+    CHECK(is(area("AR", "c1425dka"), "C1425DKA"));
+    CHECK(none(area("AR", "C1425DK")));
 }
 
-// ---- UK / GB: len 5..7, ends with digit + letter + letter -----------------
-
-TEST(postcode_gb_valid_examples) {
-    // GB pattern: bare len 5..7, last3 = d L L.
-    CHECK(validate_postcode_for_country("gb", "EC1A 1BB"));  // -> EC1A1BB (7)
-    CHECK(validate_postcode_for_country("gb", "W1A 0AX"));   // -> W1A0AX (6)
-    CHECK(validate_postcode_for_country("gb", "M1 1AE"));    // -> M11AE (5)
-    CHECK(validate_postcode_for_country("gb", "B33 8TH"));   // -> B338TH (6)
+TEST(postcode_of_several_patterns_is_the_first_that_matches) {
+    // ListPostcodeMatcher: Nigeria's dddddd, then its lettered pattern.
+    CHECK(is(area("NG", "100001"), "100001"));
+    CHECK(none(area("NG", "10001")));
+    CHECK(is(area("NG", "AB 12 C3D EF 45"), "AB-12-C3D-EF-45"));
+    CHECK(is(area("NG", "ab-12-123-ef-45"), "AB-12-123-EF-45"));
+    CHECK(is(area("NG", "AB12XYZEF45"), "AB-12-XYZ-EF-45"));
+    CHECK(none(area("NG", "A1 12 C3D EF 45")));
+    CHECK(none(area("NG", "AB 12 C3D EF 456")));
 }
 
-TEST(postcode_gb_lowercase_is_normalized) {
-    // lowercase letters are uppercased before validation.
-    CHECK(validate_postcode_for_country("gb", "m1 1ae"));
+TEST(postcode_of_zeros_is_none) {
+    // zero_pattern ^[0\- ]+$ over the pattern's match.
+    CHECK(none(area("US", "00000")));
+    CHECK(none(area("AT", "0000")));
+    CHECK(none(area("PL", "00-000")));
+    CHECK(none(area("PL", "00000")));
+    CHECK(is(area("PL", "00-950"), "00-950"));
+    CHECK(is(area("VA", "00120"), "00120"));
+    CHECK(none(tag("MS", "000")));
+    CHECK(none(area("MS", "0-0")));
 }
 
-TEST(postcode_gb_too_short_is_false) {
-    CHECK(!validate_postcode_for_country("gb", "1AA"));  // bare len 3
+TEST(postcode_of_a_country_without_a_pattern_takes_the_default) {
+    // Montserrat has postcodes and no pattern; nor has a code the yaml lacks.
+    CHECK(is(area("MS", "msr 1110"), "MSR 1110"));
+    CHECK(is(tag("MS", "msr 1110"), "MSR 1110"));
+    CHECK(is(area("MS", "AB"), "AB"));
+    CHECK(none(tag("MS", "AB")));
+    CHECK(is(area("MS", "ABCDEFGHIJKLM"), "ABCDEFGHIJKLM"));
+    CHECK(none(tag("MS", "ABCDEFGHIJKLM")));
+    CHECK(is(tag("MS", "ABCDEFGHIJKL"), "ABCDEFGHIJKL"));
+    CHECK(is(area("MS", "1234;5678"), "1234;5678"));
+    CHECK(none(tag("MS", "1234;5678")));
+    CHECK(is(tag("ZZ", "AB-CD"), "AB-CD"));
+    CHECK(is(tag("ZZ", "-ABC"), "ABC"));
+    CHECK(is(tag("ZZ", "-AB"), "-AB"));
 }
 
-TEST(postcode_gb_bad_tail_is_false) {
-    // last3 must be digit,letter,letter. "AE1" fails (last char is digit).
-    CHECK(!validate_postcode_for_country("gb", "M1 AE1"));
-}
-
-// ---- Canada: 6 chars, L D L D L D -----------------------------------------
-
-TEST(postcode_ca_valid) {
-    CHECK(validate_postcode_for_country("ca", "K1A 0B1"));  // -> K1A0B1
-    CHECK(validate_postcode_for_country("ca", "M5V 3L9"));
-}
-
-TEST(postcode_ca_wrong_pattern_is_false) {
-    CHECK(!validate_postcode_for_country("ca", "12345"));   // all digits
-    CHECK(!validate_postcode_for_country("ca", "K1A0B"));   // len 5
-}
-
-// ---- Netherlands: 6 chars, D D D D L L -------------------------------------
-
-TEST(postcode_nl_valid) {
-    CHECK(validate_postcode_for_country("nl", "1234 AB"));  // -> 1234AB
-}
-
-TEST(postcode_nl_separators_stripped_still_valid) {
-    // "12 34AB" -> strip space -> "1234AB" = D D D D L L -> valid.
-    CHECK(validate_postcode_for_country("nl", "12 34AB"));
-}
-
-TEST(postcode_nl_wrong_length_is_false) {
-    CHECK(!validate_postcode_for_country("nl", "123AB"));    // len 5
-    CHECK(!validate_postcode_for_country("nl", "12345A"));   // last2 not both letters
-}
-
-TEST(postcode_nl_letters_then_digits_is_false) {
-    // pattern is digits-then-letters; reversed should fail.
-    CHECK(!validate_postcode_for_country("nl", "AB1234"));
-}
-
-// ---- Brazil: exactly 8 digits ---------------------------------------------
-
-TEST(postcode_br_valid_8_digits) {
-    CHECK(validate_postcode_for_country("br", "01310-100"));  // -> 01310100 (8)
-    CHECK(validate_postcode_for_country("br", "12345678"));
-}
-
-TEST(postcode_br_wrong_length_is_false) {
-    CHECK(!validate_postcode_for_country("br", "1234567"));  // 7 digits
-}
-
-// ---- 4-digit countries (AT, AU, BE, CH, DK, ...) --------------------------
-
-TEST(postcode_at_4_digits) {
-    CHECK(validate_postcode_for_country("at", "1010"));
-    CHECK(!validate_postcode_for_country("at", "101"));
-    CHECK(!validate_postcode_for_country("at", "10101"));
-}
-
-TEST(postcode_de_5_digits) {
-    CHECK(validate_postcode_for_country("de", "10115"));
-    CHECK(!validate_postcode_for_country("de", "1011"));
-}
-
-// ---- Bahrain: 4 OR 5 digits (dual-length branch) --------------------------
-
-TEST(postcode_bh_4_or_5_digits) {
-    CHECK(validate_postcode_for_country("bh", "1234"));
-    CHECK(validate_postcode_for_country("bh", "12345"));
-    CHECK(!validate_postcode_for_country("bh", "123"));     // 3 too short
-    CHECK(!validate_postcode_for_country("bh", "123456"));  // 6 too long
-    CHECK(!validate_postcode_for_country("bh", "1234A"));   // non-digit
-}
-
-// ---- Ukraine: 6 OR 7 digits ------------------------------------------------
-
-TEST(postcode_ua_6_or_7_digits) {
-    CHECK(validate_postcode_for_country("ua", "123456"));
-    CHECK(validate_postcode_for_country("ua", "1234567"));
-    CHECK(!validate_postcode_for_country("ua", "12345"));
-}
-
-// ---- "Always false" bucket (postcode not used in that country) -------------
-
-TEST(postcode_always_false_countries) {
-    // A representative sample of the case-returns-false countries.
-    CHECK(!validate_postcode_for_country("ae", "12345"));
-    CHECK(!validate_postcode_for_country("ao", "1234"));
-    CHECK(!validate_postcode_for_country("zw", "00263"));
-    CHECK(!validate_postcode_for_country("qa", "12345"));
-    CHECK(!validate_postcode_for_country("ye", "12345"));
-    // even a plausible-looking value is rejected outright.
-    CHECK(!validate_postcode_for_country("bs", "N1234"));
-}
-
-// ---- "Always true" bucket (pattern present but loosely accepted) -----------
-
-TEST(postcode_always_true_countries) {
-    // These return true for any non-empty bare string of len 1..10.
-    CHECK(validate_postcode_for_country("ai", "2640"));
-    CHECK(validate_postcode_for_country("ar", "C1425"));
-    CHECK(validate_postcode_for_country("bb", "BB12345"));
-    CHECK(validate_postcode_for_country("ie", "D02 AF30"));
-    CHECK(validate_postcode_for_country("lv", "1234"));
-    CHECK(validate_postcode_for_country("md", "MD2001"));
-    // arbitrary junk still passes for an "always true" country (within len).
-    CHECK(validate_postcode_for_country("ai", "ZZZ"));
-}
-
-// ---- Unknown country: default branch len 3..10 -----------------------------
-
-TEST(postcode_unknown_country_default_len_range) {
-    // "zz" is not a switch case -> default: len 3..10.
-    CHECK(validate_postcode_for_country("zz", "123"));      // len 3 ok
-    CHECK(validate_postcode_for_country("zz", "ABCDEFGHIJ"));// len 10 ok
-    CHECK(!validate_postcode_for_country("zz", "12"));      // len 2 too short
-    CHECK(validate_postcode_for_country("zz", "AB-CD"));    // hyphen stripped -> ABCD (4)
-}
-
-TEST(postcode_unknown_country_too_short_after_strip) {
-    // "z z" -> strip space -> "ZZ" (len 2) -> below default min.
-    CHECK(!validate_postcode_for_country("zz", "z z"));
-}
-
-// ---- Global length guard: bare > 10 always rejected ------------------------
-
-TEST(postcode_over_10_chars_rejected_even_unknown) {
-    // 11 bare chars exceeds the hard cap regardless of country.
-    CHECK(!validate_postcode_for_country("zz", "ABCDEFGHIJK"));
-    // and for an "always true" country the >10 cap still applies.
-    CHECK(!validate_postcode_for_country("ai", "ABCDEFGHIJK"));
-}
-
-TEST(postcode_only_separators_strips_to_empty) {
-    // pc is non-empty (passes the pc[0] guard) but strips to "" -> len 0 false.
-    CHECK(!validate_postcode_for_country("us", "   "));
-    CHECK(!validate_postcode_for_country("us", "---"));
-    CHECK(!validate_postcode_for_country("zz", " - "));
-}
-
-// ---- Normalization: spaces and hyphens are equivalent / removed ------------
-
-TEST(postcode_separators_are_stripped) {
-    // US 5-digit with embedded separators that vanish.
-    CHECK(validate_postcode_for_country("us", "1 2 3 4 5"));  // -> 12345
-    CHECK(validate_postcode_for_country("us", "12-345"));     // -> 12345
+TEST(postcode_patterns_take_their_countries_postcodes) {
+    CHECK(is(area("BH", "317"), "317"));
+    CHECK(is(area("BH", "1234"), "1234"));
+    CHECK(none(area("BH", "31700")));
+    CHECK(is(area("UA", "123456"), "123456"));
+    CHECK(none(area("UA", "0100123")));
+    CHECK(is(area("IE", "D02 AF30"), "D02 AF30"));
+    CHECK(none(area("IE", "D02 AB30")));
+    CHECK(is(area("GG", "GY1 1AA"), "GY1 1AA"));
+    CHECK(is(area("IM", "IM99 1AA"), "IM99 1AA"));
+    CHECK(none(area("IM", "GY1 1AA")));
+    CHECK(is(area("MT", "VLT 1010"), "VLT 1010"));
+    CHECK(none(area("MT", "VL 1010")));
+    CHECK(is(area("GH", "GA-123-4567"), "GA-123-4567"));
+    CHECK(none(area("GH", "GA-12-3456")));
+    CHECK(is(area("KZ", "A10A3B5"), "A10A3B5"));
+    CHECK(is(area("KZ", "010000"), "010000"));
+    CHECK(is(area("TW", "100048"), "100048"));
+    CHECK(none(area("TW", "1004")));
+    CHECK(is(area("LB", "1103 2010"), "1103 2010"));
+    CHECK(is(area("CY", "99010"), "99010"));
+    CHECK(none(area("CY", "98010")));
+    CHECK(is(area("MC", "98000"), "98000"));
+    CHECK(none(area("PW", "96941")));
+    CHECK(is(area("SH", "STHL 1ZZ"), "STHL 1ZZ"));
 }

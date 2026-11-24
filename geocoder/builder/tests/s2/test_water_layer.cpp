@@ -12,6 +12,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,7 @@
 
 #include "arc_blocks.h"
 #include "captured_stderr.h"
+#include "cell_pairs.h"
 #include "scratch_dir.h"
 #include "string_files.h"
 #include "test_framework.h"
@@ -134,6 +136,13 @@ std::map<std::string, std::vector<char>> tree(const std::string& dir) {
         if (e.is_regular_file()) files[fs::relative(e.path(), dir).string()] = bytes_of(e.path());
     return files;
 }
+
+// A file's bytes as cell_pairs::Reader reads them.
+struct Bytes {
+    std::vector<char> data;
+    uint64_t size() const { return data.size(); }
+    const char* at(uint64_t off, size_t) const { return data.data() + off; }
+};
 
 // The name of each slot of the dir `dir` of `files`, from its
 // strings_core.bin: "" for a tombstone.
@@ -294,6 +303,99 @@ TEST(a_segment_of_no_length_lends_its_line_no_wikidata_item) {
     CHECK_EQ(named, size_t(1));
 }
 
+TEST(a_segment_across_the_antimeridian_credits_the_river_areas_it_runs_through_on_either_side) {
+    // Two unnamed river areas, 0.01 by 0.01 degrees, either side of the
+    // antimeridian along it, and one segment of a line from the middle of
+    // one to the middle of the other: each holds the half of it on its side.
+    Collected c = fixture();
+    const int32_t lat = 650000000, east = kAntimeridianE7 - 100000, west = -kAntimeridianE7;
+    c.closed_ways.push_back({2201, tags(code::kRiver, "", true), square(lat, east, 100000)});
+    c.closed_ways.push_back({2202, tags(code::kRiver, "", true), square(lat, west, 100000)});
+    LineIn anadyr;
+    anadyr.way = 2210;
+    anadyr.key = "nAnadyr";
+    anadyr.local = anadyr.display = "Anadyr";
+    anadyr.vertices = {pt(lat + 40000, east + 50000), pt(lat + 60000, west + 50000)};
+    c.lines.push_back(anadyr);
+    Collected joined = c;
+    Build b = assemble(joined, 1);
+    std::vector<uint32_t> rivers;
+    for (uint32_t p = 0; p < b.rings.polygons.size(); p++)
+        if (b.objects[b.object_of[p]].tags.river_area) rivers.push_back(p);
+    NamingCounts counts;
+    std::vector<Credit> credits = credit_naming_lines(b.rings, rivers, b.object_of, b.lines, counts, 2);
+    std::map<int64_t, uint64_t> mm;
+    for (const Credit& cr : credits) mm[b.objects[cr.object].id] += cr.mm;
+    const PackedLocation seam_east = pt(lat + 50000, kAntimeridianE7), seam_west = pt(lat + 50000, -kAntimeridianE7);
+    CHECK_EQ(mm[2201], segment_mm(anadyr.vertices[0], seam_east));
+    CHECK_EQ(mm[2202], segment_mm(seam_west, anadyr.vertices[1]));
+    // So both take its name.
+    const Layer layer = build(c);
+    std::set<int64_t> named;
+    for (size_t p = 0; p < layer.size(); p++)
+        for (int64_t id : {2201, 2202})
+            if (layer.identities[p] == way_identity(id) && name_of(layer, p) == "Anadyr") named.insert(id);
+    CHECK(named == std::set<int64_t>({2201, 2202}));
+}
+
+TEST(a_reach_along_the_antimeridian_credits_the_river_area_west_of_it_whichever_way_its_ends_are_spelled) {
+    // The two unnamed river areas either side of the antimeridian, as above,
+    // and a line whose one segment runs along it between them, 0.002 to
+    // 0.008 up their sides: run north, the area to its left is the one west
+    // of it, at 180 east, which holds all of it, however its ends are spelled
+    // and whichever way it runs; the one east of it holds none.
+    const int32_t lat = 650000000, east = kAntimeridianE7 - 100000, west = -kAntimeridianE7;
+    const int32_t E = kAntimeridianE7, W = -kAntimeridianE7, s = lat + 20000, n = lat + 80000;
+    const std::vector<std::pair<PackedLocation, PackedLocation>> reaches = {
+        {pt(s, E), pt(n, E)}, {pt(s, W), pt(n, W)}, {pt(n, W), pt(s, W)}, {pt(s, E), pt(n, W)},
+        {pt(s, W), pt(n, E)}, {pt(n, E), pt(s, W)}, {pt(n, W), pt(s, E)}};
+    const uint64_t reach_mm = segment_mm(pt(s, E), pt(n, E));
+    REQUIRE(reach_mm > 0);
+    for (const auto& [a, b] : reaches) {
+        Collected c = fixture();
+        c.closed_ways.push_back({2201, tags(code::kRiver, "", true), square(lat, east, 100000)});
+        c.closed_ways.push_back({2202, tags(code::kRiver, "", true), square(lat, west, 100000)});
+        LineIn anadyr;
+        anadyr.way = 2210;
+        anadyr.key = "nAnadyr";
+        anadyr.local = anadyr.display = "Anadyr";
+        anadyr.vertices = {a, b};
+        c.lines.push_back(anadyr);
+        Collected joined = c;
+        Build built = assemble(joined, 1);
+        std::vector<uint32_t> rivers;
+        for (uint32_t p = 0; p < built.rings.polygons.size(); p++)
+            if (built.objects[built.object_of[p]].tags.river_area) rivers.push_back(p);
+        NamingCounts counts;
+        std::vector<Credit> credits = credit_naming_lines(built.rings, rivers, built.object_of, built.lines, counts, 2);
+        std::map<int64_t, uint64_t> mm;
+        for (const Credit& cr : credits) mm[built.objects[cr.object].id] += cr.mm;
+        CHECK_EQ(mm[2201], reach_mm);
+        CHECK_EQ(mm[2202], uint64_t(0));
+        // So the one west of it takes its name, and the other none.
+        const Layer layer = build(c);
+        std::set<int64_t> named;
+        for (size_t p = 0; p < layer.size(); p++)
+            for (int64_t id : {2201, 2202})
+                if (layer.identities[p] == way_identity(id) && name_of(layer, p) == "Anadyr") named.insert(id);
+        CHECK(named == std::set<int64_t>({2201}));
+    }
+}
+
+TEST(the_join_of_no_lines_credits_nothing_and_covers_no_river_area) {
+    Collected c = fixture();
+    Build b = assemble(c, 1);
+    std::vector<uint32_t> rivers;
+    for (uint32_t p = 0; p < b.rings.polygons.size(); p++)
+        if (b.objects[b.object_of[p]].tags.river_area) rivers.push_back(p);
+    REQUIRE(rivers.size() == 2u);
+    NamingCounts counts;
+    CHECK(credit_naming_lines(b.rings, rivers, b.object_of, NamingLines(), counts, 2).empty());
+    CHECK_EQ(counts.cover_entries, size_t(0));
+    CHECK(credit_naming_lines(b.rings, {}, b.object_of, b.lines, counts, 2).empty());
+    CHECK_EQ(counts.segments_in_cover, size_t(0));
+}
+
 namespace {
 
 // Island Lake: a lake of 0.4 x 0.4 degrees with 12 x 12 islands, one way
@@ -341,6 +443,88 @@ TEST(a_lake_of_many_islands_is_cut_into_pieces_that_each_carry_the_lakes_name_ty
     CHECK(std::abs(layer.records[pieces[0]].area - float(0.16 - 144 * 0.000004)) < 1e-5f);
 }
 
+TEST(each_piece_of_a_lake_of_many_islands_keeps_its_slot_once_a_pieces_corner_moves) {
+    // The lake of 12 x 12 islands, as above; the next day its south-west
+    // corner, the smallest vertex of the piece there, moves in, and the
+    // lake's box, so every cut, stays as it was.
+    const int32_t lat = kLat - 10000000, side = 4000000;
+    auto with_lake = [&](int32_t corner_in) {
+        Collected c = fixture();
+        Ring shore = square(lat, kLng, side, 8);
+        shore.front() = shore.back() = pt(lat + corner_in, kLng + corner_in);
+        add_geometry(c, 70, shore);
+        CollectedArea isles;
+        isles.id = 600;
+        isles.tags = tags(code::kLake, "Island Lake");
+        isles.members = {{70, "outer"}};
+        for (int i = 0; i < 12; i++)
+            for (int j = 0; j < 12; j++) {
+                const int64_t way = 1000 + i * 12 + j;
+                add_geometry(c, way, square(lat + 100000 + i * 320000, kLng + 100000 + j * 320000, 20000));
+                isles.members.push_back({way, "inner"});
+            }
+        c.relations.push_back(isles);
+        return c;
+    };
+    const ScratchDir root("water-piece-corner");
+    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    const Layer day1 = build(with_lake(0));
+    write(day1, one);
+    const Layer day2 = build(with_lake(5000), one);
+    REQUIRE(day2.size() == day1.size());
+    REQUIRE(day1.size() > 6u);
+    // The piece at the corner, and those cut from a piece whose corner it
+    // was, are of other identities, and keep their slots by their fallback
+    // keys; every polygon keeps its own.
+    std::set<uint64_t> ids1(day1.identities.begin(), day1.identities.end());
+    size_t moved = 0;
+    for (uint64_t id : day2.identities) moved += !ids1.count(id);
+    CHECK(moved >= 1u);
+    const std::string n = std::to_string(day2.size());
+    const std::string summary = write(day2, two, one);
+    CHECK(summary.find("water/all: " + n + " polygons in " + n + " slots (" + n + " kept, " + std::to_string(moved) +
+                       " by fallback, 0 recycled)") != std::string::npos);
+    // Each slot holds the fallback key it held the day before, every piece's
+    // its own: each piece is in its own slot.
+    for (const char* dir : {"/water/all/exact", "/water/major/simplified"})
+        CHECK(bytes_of(one + dir + "/admin_polygons.fallback.osm_ids") ==
+              bytes_of(two + dir + "/admin_polygons.fallback.osm_ids"));
+}
+
+TEST(a_lake_of_many_islands_the_grid_cant_cut_keeps_its_store_as_it_was) {
+    // A lake of 0.0019 x 0.0019 degrees with 9 x 8 islands, between the
+    // lines of the finest grid a cut takes (2^16 e7 units: 7171 and 7172 of
+    // them in latitude, 1220 and 1221 in longitude).
+    Collected c;
+    add_geometry(c, 70, square(kLat, kLng, 19000));
+    CollectedArea isles;
+    isles.id = 600;
+    isles.tags = tags(code::kLake, "Tiny Isles Lake");
+    isles.members = {{70, "outer"}};
+    for (int i = 0; i < 9; i++)
+        for (int j = 0; j < 8; j++) {
+            const int64_t way = 1000 + i * 8 + j;
+            add_geometry(c, way, square(kLat + 1000 + i * 2000, kLng + 1000 + j * 2000, 500));
+            isles.members.push_back({way, "inner"});
+        }
+    c.relations.push_back(isles);
+    Build b = assemble(c, 1);
+    REQUIRE(b.rings.polygons.size() == 1u);
+    REQUIRE(b.rings.polygons[0].ring_count == 73u);
+    const PackedLocation* vertices = b.rings.vertices.data();
+    const std::vector<RingSpan> rings = b.rings.rings;
+    const gctest::CapturedStderr log;
+    split_polygons(b, 1);
+    CHECK(log.str().find("Tiny Isles Lake, 72 holes) kept whole: no cut leaves it in more than one piece") !=
+          std::string::npos);
+    CHECK(log.str().find("0 cut along 0 lines into 0 pieces, 1 kept whole; 1 polygons") != std::string::npos);
+    // Not copied: the store's vertices where they were.
+    CHECK(b.rings.vertices.data() == vertices);
+    CHECK_EQ(b.rings.rings.size(), rings.size());
+    CHECK(b.piece_key == std::vector<uint64_t>({0}));
+    CHECK(b.object_of == std::vector<uint32_t>({0}));
+}
+
 TEST(the_layer_is_the_same_on_one_thread_and_many) {
     const Layer one = build(fixture(), "", 1), many = build(fixture(), "", 8);
     const ScratchDir a("water-one"), b("water-many");
@@ -362,10 +546,31 @@ TEST(the_major_tier_takes_areas_of_100_km2_and_wikidata_rivers_of_5) {
     for (size_t p = 0; p < layer.size(); p++)
         if (layer.major[p]) major.insert(name_of(layer, p));
     CHECK(major == std::set<std::string>({"Big Lake", "Wide River"}));
-    // The big lake holds whole cells: interior entries.
+    // The major dir holds them and no other.
+    const ScratchDir dir("water-major");
+    write(layer, dir.path());
+    const std::map<std::string, std::vector<char>> files = tree(dir.path());
+    const std::vector<std::string> by_slot = slot_names(files, "water/major/simplified");
+    std::vector<std::string> slots = by_slot;
+    std::sort(slots.begin(), slots.end());
+    CHECK(slots == std::vector<std::string>({"Big Lake", "Wide River"}));
+    // Its cell index lists those slots alone, and the big lake holds whole
+    // cells: interior entries.
+    Bytes cells{files.at("water/major/simplified/admin_cells.bin")},
+        entries{files.at("water/major/simplified/admin_entries.bin")};
+    cell_pairs::Reader reader(cells, entries, cell_pairs::ADMIN);
     size_t interior = 0;
-    for (const CellItemPair& cell : layer.cells)
-        interior += (cell.item_id & INTERIOR_FLAG) && name_of(layer, cell.item_id & ID_MASK) == "Big Lake";
+    std::set<std::string> listed;
+    uint64_t cell;
+    std::vector<uint32_t> ids;
+    while (reader.next(cell, ids))
+        for (uint32_t id : ids) {
+            REQUIRE((id & ID_MASK) < by_slot.size());
+            const std::string& name = by_slot[id & ID_MASK];
+            listed.insert(name);
+            interior += (id & INTERIOR_FLAG) && name == "Big Lake";
+        }
+    CHECK(listed == std::set<std::string>({"Big Lake", "Wide River"}));
     CHECK(interior > 0);
 }
 
@@ -389,7 +594,7 @@ TEST(a_regions_share_holds_the_polygons_its_cells_list_whole_with_their_names) {
     // The cells of the lake alone.
     std::vector<uint8_t> kept(planet.cells.size(), 0);
     for (size_t i = 0; i < planet.cells.size(); i++) kept[i] = (planet.cells[i].item_id & ID_MASK) == 3;
-    const Layer region = subset_layer(planet, kept, 2);
+    const Layer region = subset_layer(planet, kept, 1, 2);
     REQUIRE(region.size() == 1u);
     CHECK(name_of(region, 0) == "Test Lake");
     CHECK(region.names == std::vector<char>({'T', 'e', 's', 't', ' ', 'L', 'a', 'k', 'e', '\0'}));
@@ -482,6 +687,63 @@ TEST(the_water_dirs_hold_every_file_and_keep_each_polygons_slot_the_next_day) {
     const std::string four = root.path() + "/four";
     CHECK(write(build(again, three), four, three).find("4 polygons in 4 slots (3 kept, 0 by fallback, 1 recycled)") !=
           std::string::npos);
+}
+
+TEST(the_previous_slots_of_a_regions_water_dirs_count_their_tombstones) {
+    const ScratchDir root("water-previous-slots");
+    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    CHECK_EQ(previous_slots(""), 0u);
+    CHECK_EQ(previous_slots(one), 0u);
+    write(build(fixture()), one);
+    CHECK_EQ(previous_slots(one), 4u);
+    // The pond gone, its slot a tombstone the next day's dirs keep.
+    Collected without_pond = fixture();
+    without_pond.closed_ways.erase(without_pond.closed_ways.begin());
+    const Layer day2 = build(without_pond, one);
+    REQUIRE(day2.size() == 3u);
+    write(day2, two, one);
+    CHECK_EQ(previous_slots(two), 4u);
+    // One that is no sidecar counts none, as the write refuses it.
+    fs::remove(two + "/water/major/simplified/admin_polygons.osm_ids");
+    CHECK_EQ(previous_slots(two), 4u);
+    std::ofstream(two + "/water/all/exact/admin_polygons.osm_ids", std::ios::binary | std::ios::trunc) << "no";
+    CHECK_EQ(previous_slots(two), 0u);
+}
+
+TEST(the_previous_arc_slots_of_a_regions_water_dirs_stay_past_the_arcs_a_day_of_less_water_has) {
+    const ScratchDir root("water-previous-arc-slots");
+    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    CHECK(previous_arc_slots("").all == 0u && previous_arc_slots("").major == 0u);
+    CHECK(previous_arc_slots(one).all == 0u && previous_arc_slots(one).major == 0u);
+    // The fixture and a lake of about 190 km2, the major tier's.
+    Collected c = fixture();
+    c.closed_ways.push_back({60, tags(code::kLake, "Big Lake"), square(kLat - 2000000, kLng, 1500000, 6)});
+    const Layer day1 = build(c);
+    const ArcCounts arcs1 = arc_counts(day1);
+    CHECK_EQ(arcs1.all, uint64_t(day1.arcs.set(ArcSet::Full).arcs()));
+    CHECK(arcs1.major > 0u && arcs1.major < arcs1.all);
+    write(day1, one);
+    const ArcCounts slots1 = previous_arc_slots(one);
+    CHECK_EQ(slots1.all, arcs1.all);
+    CHECK_EQ(slots1.major, arcs1.major);
+    // The next day holds the river areas alone: few arcs, none of the major
+    // tier's, and every slot of the day before kept.
+    Collected less = fixture();
+    less.closed_ways.erase(less.closed_ways.begin());
+    less.closed_ways.pop_back();
+    less.relations.clear();
+    const Layer day2 = build(less, one);
+    const ArcCounts arcs2 = arc_counts(day2);
+    CHECK(arcs2.all > 0u && arcs2.all < slots1.all);
+    CHECK_EQ(arcs2.major, uint64_t(0));
+    write(day2, two, one);
+    const ArcCounts slots2 = previous_arc_slots(two);
+    CHECK_EQ(slots2.all, slots1.all);
+    CHECK_EQ(slots2.major, slots1.major);
+    // One that is no sidecar counts none.
+    std::ofstream(two + "/water/major/simplified/arc_index.osm_ids", std::ios::binary | std::ios::trunc) << "no";
+    CHECK_EQ(previous_arc_slots(two).major, uint64_t(0));
+    CHECK_EQ(previous_arc_slots(two).all, slots1.all);
 }
 
 namespace {
@@ -722,7 +984,7 @@ TEST(a_water_dir_holding_a_marine_area_credits_marine_regions) {
     const Layer planet = build(with_marine());
     std::vector<uint8_t> kept(planet.cells.size(), 0);
     for (size_t i = 0; i < planet.cells.size(); i++) kept[i] = (planet.cells[i].item_id & ID_MASK) == 3;
-    Layer lake = subset_layer(planet, kept, 2);
+    Layer lake = subset_layer(planet, kept, 1, 2);
     REQUIRE(lake.size() == 1u);
     CHECK_EQ(int(lake.marine[0]), 0);
     {
@@ -764,10 +1026,29 @@ TEST(a_regions_share_counts_the_cells_around_its_own_and_each_polygon_they_list_
     // are made, the polygons its cells list whole, and none for a region of
     // no cells.
     const std::vector<uint64_t> shares = share_bytes(planet, masks, 3);
+    // And its arcs, those of its share's polygons and its major tier's.
+    std::vector<ArcCounts> arcs;
+    CHECK(share_bytes(planet, masks, 3, &arcs) == shares);
+    REQUIRE(arcs.size() == 3u);
+    CHECK(arcs[1].all == arc_counts(planet).all && arcs[1].major == arc_counts(planet).major);
+    CHECK(arcs[1].major > 0u && arcs[1].major < arcs[1].all);
+    CHECK(arcs[0].all > 0u && arcs[0].all < arcs[1].all);
+    CHECK(arcs[2].all == 0u && arcs[2].major == 0u);
     for (int r = 0; r < 2; r++) {
+        const Layer share = subset_layer(planet, masks, uint8_t(1u << r), 2);
+        CHECK_EQ(arcs[r].all, arc_counts(share).all);
+        CHECK_EQ(arcs[r].major, arc_counts(share).major);
+    }
+    for (int r = 0; r < 2; r++) {
+        // Its bit of the masks, as a continent's split reads them: the
+        // share of the entries that bit marks.
         std::vector<uint8_t> kept(planet.cells.size());
         for (size_t i = 0; i < kept.size(); i++) kept[i] = masks[i] >> r & 1;
-        Layer region = subset_layer(planet, kept, 2);
+        Layer region = subset_layer(planet, masks, uint8_t(1u << r), 2);
+        const Layer marked = subset_layer(planet, kept, 1, 2);
+        CHECK(region.identities == marked.identities);
+        CHECK(region.cells.size() == marked.cells.size());
+        CHECK(region.names == marked.names);
         {
             const gctest::CapturedStderr log;
             assign_region_arc_slots(region.arcs, "", "test", 0);
@@ -792,8 +1073,13 @@ TEST(marine_areas_keep_their_slots_from_one_day_to_the_next) {
     CHECK(day2.identities[4] != day1.identities[4]);
     const std::string summary = write(day2, two, one);
     CHECK(summary.find("7 polygons in 7 slots (7 kept, 1 by fallback, 0 recycled)") != std::string::npos);
+    // Each slot holds the fallback key it held the day before, the moved
+    // polygon's among them (its own: the area's and its place), and the name
+    // it held.
     const auto a = tree(one), b = tree(two);
-    CHECK(a.at("water/all/exact/admin_polygons.bin") == b.at("water/all/exact/admin_polygons.bin"));
+    CHECK(a.at("water/all/exact/admin_polygons.fallback.osm_ids") ==
+          b.at("water/all/exact/admin_polygons.fallback.osm_ids"));
+    CHECK(slot_names(a, "water/all/exact") == slot_names(b, "water/all/exact"));
 }
 
 TEST(polygons_of_one_object_meeting_at_their_smallest_vertex_keep_slots_of_their_own) {
@@ -984,6 +1270,115 @@ TEST(namesakes_apart_are_rivers_of_their_own_and_a_line_lends_its_wikidata_item_
     CHECK(major == std::set<int64_t>({2103}));
 }
 
+TEST(namesakes_that_share_a_shore_are_one_river) {
+    Collected c = fixture();
+    // Two unnamed river areas of about 61 km2, one north of the other along
+    // a shared side, each with a line of a local name alone, Mill Creek, in
+    // it and no wikidata item: one river of about 123 km2.
+    const int32_t lat = kLat - 3000000, side = 850000;
+    for (const auto& [way, south] : std::vector<std::pair<int64_t, int32_t>>{{2111, lat}, {2112, lat + side}}) {
+        c.closed_ways.push_back({way, tags(code::kRiver, "", true), square(south, kLng, side)});
+        LineIn line;
+        line.way = way + 1000;
+        line.key = "nMill Creek";
+        line.local = line.display = "Mill Creek";
+        line.vertices = {pt(south + side / 2, kLng + side / 10), pt(south + side / 2, kLng + side * 9 / 10)};
+        c.lines.push_back(line);
+    }
+    const auto [held, major] = ways_held(build(c), {2111, 2112});
+    CHECK(held == std::set<int64_t>({2111, 2112}));
+    CHECK(major == std::set<int64_t>({2111, 2112}));
+}
+
+TEST(a_named_river_area_takes_only_its_own_rivers_identity_from_the_line_of_most_length_in_it) {
+    // Two river areas of about 3 km2 far apart, each with a line of the
+    // Beta's relation (Q202) in it: one the Beta names, and the Alpha (Q101)
+    // of its own name. Joined, the two would be a wikidata river of 6 km2
+    // in the major tier; the Alpha is a river of its own, under 5 km2.
+    Collected c = fixture();
+    const int32_t side = 190000;
+    auto add_line = [&](int64_t way, int32_t lat) {
+        LineIn line;
+        line.way = way;
+        line.key = "r950";
+        line.local = line.display = "Beta";
+        line.qid = 202;
+        line.vertices = {pt(lat + side / 2, kLng + side / 10), pt(lat + side / 2, kLng + side * 9 / 10)};
+        c.lines.push_back(line);
+    };
+    c.closed_ways.push_back({2301, tags(code::kRiver, "Alpha", true, 101), square(kLat - 3000000, kLng, side)});
+    add_line(2311, kLat - 3000000);
+    c.closed_ways.push_back({2302, tags(code::kRiver, "", true), square(kLat - 4000000, kLng, side)});
+    add_line(2312, kLat - 4000000);
+    const auto [held, major] = ways_held(build(c), {2301, 2302});
+    CHECK(held == std::set<int64_t>({2301, 2302}));
+    CHECK(major.empty());
+    // An area of the Beta's own name, and no item, is the Beta's: the two
+    // Beta areas make 6 km2 together.
+    c.closed_ways.push_back({2303, tags(code::kRiver, "Beta", true), square(kLat - 5000000, kLng, side)});
+    add_line(2313, kLat - 5000000);
+    CHECK(ways_held(build(c), {2301, 2302, 2303}).second == std::set<int64_t>({2302, 2303}));
+}
+
+TEST(an_unnamed_river_area_of_a_wikidata_item_of_its_own_takes_a_lines_name_but_not_another_rivers_identity) {
+    // The Alpha (Q101), an area of its name of about 3 km2; an unnamed area
+    // of about 1 km2 tagged Q101, with a line of the Beta's relation (Q202)
+    // in it; and an unnamed area of about 3 km2 the Beta names. Joined
+    // through the unnamed Alpha area, the three would be a wikidata river of
+    // 7 km2 in the major tier; the Alpha is a river of 4, the Beta of 3.
+    Collected c = fixture();
+    const int32_t side = 190000, small = 110000;
+    auto add_line = [&](int64_t way, int32_t lat, int32_t width) {
+        LineIn line;
+        line.way = way;
+        line.key = "r950";
+        line.local = line.display = "Beta";
+        line.qid = 202;
+        line.vertices = {pt(lat + width / 2, kLng + width / 10), pt(lat + width / 2, kLng + width * 9 / 10)};
+        c.lines.push_back(line);
+    };
+    c.closed_ways.push_back({2401, tags(code::kRiver, "Alpha", true, 101), square(kLat - 3000000, kLng, side)});
+    c.closed_ways.push_back({2402, tags(code::kRiver, "", true, 101), square(kLat - 4000000, kLng, small)});
+    add_line(2412, kLat - 4000000, small);
+    c.closed_ways.push_back({2403, tags(code::kRiver, "", true), square(kLat - 5000000, kLng, side)});
+    add_line(2413, kLat - 5000000, side);
+    const Layer layer = build(c);
+    const auto [held, major] = ways_held(layer, {2401, 2402, 2403});
+    CHECK(held == std::set<int64_t>({2401, 2402, 2403}));
+    CHECK(major.empty());
+    // It shows the line's name.
+    for (size_t p = 0; p < layer.size(); p++)
+        if (layer.identities[p] == way_identity(2402)) CHECK(name_of(layer, p) == "Beta");
+    // An unnamed area of about 1 km2 the Beta names along the north side of
+    // the unnamed Alpha area shares an arc with it, but no river: the Alpha
+    // is a river of 4 km2, the Beta of 4. Joined across the arc by the name
+    // the Alpha area shows, the four would be one of 8.
+    c.closed_ways.push_back({2404, tags(code::kRiver, "", true), square(kLat - 4000000 + small, kLng, small)});
+    add_line(2414, kLat - 4000000 + small, small);
+    const Layer beside = build(c);
+    const auto [held_beside, major_beside] = ways_held(beside, {2401, 2402, 2403, 2404});
+    CHECK(held_beside == std::set<int64_t>({2401, 2402, 2403, 2404}));
+    CHECK(major_beside.empty());
+    for (size_t p = 0; p < beside.size(); p++)
+        if (beside.identities[p] == way_identity(2402)) CHECK(name_of(beside, p) == "Beta");
+}
+
+TEST(a_lake_of_100_km2_far_from_its_boxs_middle_latitude_is_in_the_major_tier) {
+    // A lobe of 0.13 x 0.13 degrees at 60 north (about 104.6 km2), and an arm
+    // 0.00001 wide from it to 70 north (about 0.5 km2): weighted by the
+    // cosine of its box's middle latitude, 65, the lake would be about 89.
+    Collected c = fixture();
+    const int32_t lat = 600000000, side = 1300000, arm = 100;
+    const Ring lake = {pt(lat, kLng), pt(lat, kLng + side), pt(lat + side, kLng + side), pt(700000000, kLng + side),
+                       pt(700000000, kLng + side - arm), pt(lat + side, kLng + side - arm), pt(lat + side, kLng),
+                       pt(lat, kLng)};
+    c.closed_ways.push_back({63, tags(code::kLake, "Long Arm Lake"), lake});
+    const Layer layer = build(c);
+    const auto [held, major] = ways_held(layer, {63});
+    CHECK(held == std::set<int64_t>({63}));
+    CHECK(major == std::set<int64_t>({63}));
+}
+
 TEST(a_lake_the_major_tier_held_stays_in_it_at_95_km2_once_its_smallest_vertex_moves) {
     // A lake relation of one way round a square of about 105 km2; the next
     // day its south-west corner, the smallest vertex, moves in, and it holds
@@ -1140,9 +1535,11 @@ TEST(a_member_of_a_waterway_relation_without_a_wikidata_item_keeps_its_own) {
 }
 
 TEST(a_waterway_relation_of_a_local_name_alone_shows_the_name_en_its_river_ways_carry_over_most_of_its_length) {
-    // The Koshibu River: its relation is 小渋川 alone and most of its river
-    // ways carry the name:en Koshibu River, but for one of Koshibu-gawa,
-    // longer than any other way and shorter than them all, and one of none.
+    // The Koshibu River: its relation is 小渋川 alone, and its ways of a
+    // name:en hold 9,000 of its 10,000 units of length, more than half. Of
+    // them the two of Koshibu River hold the most, 5,000 to the 4,000 of
+    // Koshibu-gawa's one, though that is the longest way; the last way, of
+    // 1,000, has none.
     CHECK(shown(river("小渋川", nullptr,
                       {{51, "小渋川", "Koshibu River", 2000},
                        {52, "小渋川", "Koshibu River", 3000},
@@ -1282,6 +1679,96 @@ TEST(the_local_names_of_a_rivers_reaches_dont_rename_it) {
                        {24, "Aller", nullptr, 4000}})) == Names({"Aller"}));
 }
 
+namespace {
+
+// Swaps each day's staged dir, `<dir>/<day>.staged`, in for `<dir>/<day>`,
+// keeping the old dirs until every day is in: a swap that fails puts back
+// each day it swapped (or removes it, for a day that had no dir) and
+// rethrows, so the dir holds the old days or the new ones, never some of
+// each. A day's old dir already there, which a swap that stopped part way
+// leaves as the only copy of that day, stops it before it swaps any.
+void swap_in_staged(const std::string& dir, const std::vector<std::string>& days) {
+    for (const std::string& day : days) {
+        const std::string old = dir + "/" + day + ".old";
+        if (fs::exists(old))
+            throw std::runtime_error(old + " is left from a swap that stopped part way: put it back or remove it");
+    }
+    std::vector<std::string> swapped;
+    try {
+        for (const std::string& day : days) {
+            const std::string day_dir = dir + "/" + day, old = day_dir + ".old";
+            if (fs::exists(day_dir)) fs::rename(day_dir, old);
+            swapped.push_back(day);
+            fs::rename(day_dir + ".staged", day_dir);
+        }
+    } catch (const fs::filesystem_error&) {
+        for (const std::string& day : swapped) {
+            const std::string day_dir = dir + "/" + day, old = day_dir + ".old";
+            fs::remove_all(day_dir);
+            if (fs::exists(old)) fs::rename(old, day_dir);
+        }
+        for (const std::string& day : days) fs::remove_all(dir + "/" + day + ".staged");
+        throw;
+    }
+    for (const std::string& day : days) fs::remove_all(dir + "/" + day + ".old");
+}
+
+void write_file(const std::string& path, const std::string& text) {
+    fs::create_directories(fs::path(path).parent_path());
+    std::ofstream(path, std::ios::binary) << text;
+}
+
+}  // namespace
+
+TEST(a_fixture_swap_that_fails_part_way_puts_back_the_days_it_swapped) {
+    // Day 1 has a dir and a staged one, day 2 a staged one alone, day 3 a
+    // dir and no staged one, so its swap fails.
+    const ScratchDir root("water-fixture-swap");
+    const std::string dir = root.path();
+    write_file(dir + "/day1/a", "old 1");
+    write_file(dir + "/day1.staged/a", "new 1");
+    write_file(dir + "/day2.staged/a", "new 2");
+    write_file(dir + "/day3/a", "old 3");
+    bool threw = false;
+    try {
+        swap_in_staged(dir, {"day1", "day2", "day3"});
+    } catch (const fs::filesystem_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(tree(dir) == (std::map<std::string, std::vector<char>>{{"day1/a", {'o', 'l', 'd', ' ', '1'}},
+                                                                 {"day3/a", {'o', 'l', 'd', ' ', '3'}}}));
+    // With every staged dir there, every day is the new one and no old dir
+    // stays.
+    write_file(dir + "/day1.staged/a", "new 1");
+    write_file(dir + "/day2.staged/a", "new 2");
+    write_file(dir + "/day3.staged/a", "new 3");
+    swap_in_staged(dir, {"day1", "day2", "day3"});
+    CHECK(tree(dir) == (std::map<std::string, std::vector<char>>{{"day1/a", {'n', 'e', 'w', ' ', '1'}},
+                                                                 {"day2/a", {'n', 'e', 'w', ' ', '2'}},
+                                                                 {"day3/a", {'n', 'e', 'w', ' ', '3'}}}));
+}
+
+TEST(a_fixture_swap_that_finds_an_old_dir_a_stopped_one_left_swaps_nothing_and_keeps_it) {
+    // A swap stopped after it moved day 1 aside: day1.old is the only copy
+    // of day 1, beside its staged dir; day 2 has a staged dir too.
+    const ScratchDir root("water-fixture-swap-left");
+    const std::string dir = root.path();
+    write_file(dir + "/day1.old/a", "old 1");
+    write_file(dir + "/day1.staged/a", "new 1");
+    write_file(dir + "/day2.staged/a", "new 2");
+    std::string said;
+    try {
+        swap_in_staged(dir, {"day1", "day2"});
+    } catch (const std::runtime_error& e) {
+        said = e.what();
+    }
+    CHECK(said.find(dir + "/day1.old") != std::string::npos);
+    CHECK(tree(dir) == (std::map<std::string, std::vector<char>>{{"day1.old/a", {'o', 'l', 'd', ' ', '1'}},
+                                                                 {"day1.staged/a", {'n', 'e', 'w', ' ', '1'}},
+                                                                 {"day2.staged/a", {'n', 'e', 'w', ' ', '2'}}}));
+}
+
 // geocoder/testdata/water_dir: the client files of a water dir on four
 // days, which tools/test_generate_patches.py diffs, patches and verifies
 // with the real tools. Day 2 is day 1 with the pond's second vertex moved,
@@ -1290,7 +1777,7 @@ TEST(the_local_names_of_a_rivers_reaches_dont_rename_it) {
 // lists one more kind, its attribution.json credits Marine Regions and its
 // water_cut_arcs.bin marks the side the tiles share. Day 4 is day 3 with
 // Island Lake, which the split cuts into pieces, on day 3's slots: its cut
-// arcs run on in words past day 3's. With GEOCODER_WRITE_TESTDATA set this
+// arcs run on in words past day 3's. Under GEOCODER_WRITE_TESTDATA=1 this
 // writes them instead.
 TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     const ScratchDir root("water-fixture");
@@ -1313,7 +1800,8 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     add_island_lake(isles);
     write(build(isles, three), four, three);
     const std::string fixture_dir = std::string(GEOCODER_TESTDATA_DIR) + "/water_dir";
-    const bool rewrite = std::getenv("GEOCODER_WRITE_TESTDATA") != nullptr;
+    const char* write_testdata = std::getenv("GEOCODER_WRITE_TESTDATA");
+    const bool rewrite = write_testdata && std::string(write_testdata) == "1";
     // Every day's client files, each day all eleven, before any fixture dir
     // is compared or written.
     const std::set<std::string> client = {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin",
@@ -1331,28 +1819,15 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
             }
         REQUIRE(names == client);
     }
-    for (const auto& [day, files] : days) {
-        // The day's fixture dir is those files and no other: the patch tests
-        // copy it whole.
-        const std::string day_dir = fixture_dir + "/" + day;
-        if (rewrite) {
-            fs::remove_all(day_dir);
-            for (const auto& [name, bytes] : files) {
-                const std::string path = day_dir + "/" + name;
-                fs::create_directories(fs::path(path).parent_path());
-                std::ofstream(path, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-            }
-        }
-        REQUIRE(fs::is_directory(day_dir));
-        CHECK(tree(day_dir) == files);
-    }
+    // The kinds, credits and cut arcs the patch tests rely on, before any
+    // fixture dir is written.
     for (const char* f : {"water_meta.json", "attribution.json"}) {
-        CHECK(days["day1"][f] == days["day2"][f]);
-        CHECK(days["day2"][f] != days["day3"][f]);
-        CHECK(days["day3"][f] == days["day4"][f]);
+        REQUIRE(days["day1"][f] == days["day2"][f]);
+        REQUIRE(days["day2"][f] != days["day3"][f]);
+        REQUIRE(days["day3"][f] == days["day4"][f]);
     }
-    CHECK(text_of(days["day3"]["water_meta.json"]).find("\"type\": \"salt_pond\"") != std::string::npos);
-    CHECK(text_of(days["day3"]["attribution.json"]).find("marine-regions") != std::string::npos);
+    REQUIRE(text_of(days["day3"]["water_meta.json"]).find("\"type\": \"salt_pond\"") != std::string::npos);
+    REQUIRE(text_of(days["day3"]["attribution.json"]).find("marine-regions") != std::string::npos);
     // No cut arc but on day 3: the side the sea's two tiles share.
     auto cuts = [&](const std::string& day) {
         std::map<std::string, std::vector<char>> files;
@@ -1361,17 +1836,43 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
         REQUIRE(cut_slots(files, "d", out));
         return out;
     };
-    CHECK(cuts("day1").empty());
-    CHECK(cuts("day2").empty());
-    CHECK(!cuts("day3").empty());
+    REQUIRE(cuts("day1").empty());
+    REQUIRE(cuts("day2").empty());
+    REQUIRE(!cuts("day3").empty());
     // Day 4's: day 3's, on the slots it kept, and Island Lake's, some of
     // them in words past day 3's.
     const std::set<uint32_t> day3_cuts = cuts("day3"), day4_cuts = cuts("day4");
     const uint32_t day3_slots = static_cast<uint32_t>(days["day3"]["arc_index.bin"].size() / 4);
     const uint32_t day3_words = static_cast<uint32_t>(days["day3"]["water_cut_arcs.bin"].size() / 4);
-    CHECK(std::set<uint32_t>(day4_cuts.begin(), day4_cuts.lower_bound(day3_slots)) == day3_cuts);
-    CHECK(days["day4"]["water_cut_arcs.bin"].size() > days["day3"]["water_cut_arcs.bin"].size());
-    CHECK(day4_cuts.lower_bound(day3_words * 32) != day4_cuts.end());
+    REQUIRE(std::set<uint32_t>(day4_cuts.begin(), day4_cuts.lower_bound(day3_slots)) == day3_cuts);
+    REQUIRE(days["day4"]["water_cut_arcs.bin"].size() > days["day3"]["water_cut_arcs.bin"].size());
+    REQUIRE(day4_cuts.lower_bound(day3_words * 32) != day4_cuts.end());
+    if (rewrite) {
+        // Every day written whole beside its dir first, then each swapped in:
+        // a write or a swap that fails leaves the fixture as it was.
+        std::vector<std::string> day_names;
+        for (const auto& [day, files] : days) {
+            const std::string staged = fixture_dir + "/" + day + ".staged";
+            fs::remove_all(staged);
+            for (const auto& [name, bytes] : files) {
+                const std::string path = staged + "/" + name;
+                fs::create_directories(fs::path(path).parent_path());
+                std::ofstream out(path, std::ios::binary);
+                out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                out.close();
+                REQUIRE(out.good());
+            }
+            day_names.push_back(day);
+        }
+        swap_in_staged(fixture_dir, day_names);
+    }
+    for (const auto& [day, files] : days) {
+        // The day's fixture dir is those files and no other: the patch tests
+        // copy it whole.
+        const std::string day_dir = fixture_dir + "/" + day;
+        REQUIRE(fs::is_directory(day_dir));
+        CHECK(tree(day_dir) == files);
+    }
 }
 
 TEST(a_river_area_a_short_waterway_runs_only_a_short_way_into_takes_its_name_weakly) {
@@ -1575,6 +2076,21 @@ TEST(a_previous_water_build_whose_fallback_sidecar_is_there_but_cant_be_opened_s
           std::string::npos);
 }
 
+TEST(a_previous_water_build_whose_polygon_sidecar_is_there_but_cant_be_opened_stops_the_layers_build) {
+    // Its type codes hang on that build's water_meta.json, which the sidecar
+    // being there says it wrote: the layer's build stops before it numbers
+    // the water=* values afresh.
+    const ScratchDir root("water-unopenable");
+    const std::string one = root.path() + "/one";
+    write(build(with_kinds({"ganga_river"})), one);
+    const std::string all = one + "/water/all/exact/admin_polygons.osm_ids";
+    fs::remove(all);
+    fs::create_symlink(fs::path(all).filename(), all);
+    CHECK(refusal(with_kinds({"ganga_river"}), one).find(all + " is there but can't be opened") != std::string::npos);
+    fs::remove(all);
+    CHECK(refusal(with_kinds({"ganga_river"}), one).empty());
+}
+
 TEST(a_way_tagged_as_the_multipolygon_whose_outer_ring_it_is_leaves_the_island_out) {
     Collected c = fixture();
     const int32_t lat = kLat - 1000000;
@@ -1749,6 +2265,40 @@ TEST(the_lines_are_keyed_by_the_waterway_relations_of_every_input_once_all_are_r
     CHECK_EQ(c.lines[2].qid, 9u);
 }
 
+TEST(the_collected_relations_are_indexed_again_only_once_more_are_collected) {
+    Collected c;
+    CollectedWaterway river;
+    river.id = 4100;
+    river.name = river.local_name = "Limmat";
+    river.ways = {4001};
+    c.waterways.push_back(river);
+    index_collected(c);
+    REQUIRE(c.waterway_of_way.count(4001) == 1u);
+    // An entry the index never makes shows whether it is made again: not by
+    // another input's pass over the same relations, nor by key_lines.
+    c.waterway_of_way[99] = 0;
+    index_collected(c);
+    CHECK(c.waterway_of_way.count(99) == 1u);
+    key_lines(c);
+    CHECK(c.waterway_of_way.count(99) == 1u);
+    // A relation more, a waterway or an area: indexed again.
+    river.id = 4101;
+    river.ways = {4002};
+    c.waterways.push_back(river);
+    index_collected(c);
+    CHECK(c.waterway_of_way.count(99) == 0u);
+    CHECK(c.waterway_of_way.count(4002) == 1u);
+    c.waterway_of_way[99] = 0;
+    CollectedArea lake;
+    lake.id = 500;
+    lake.tags = tags(code::kLake, "See");
+    lake.members = {{11, "outer"}};
+    c.relations.push_back(lake);
+    index_collected(c);
+    CHECK(c.waterway_of_way.count(99) == 0u);
+    CHECK_EQ(c.waterway_of_way.size(), size_t(2));
+}
+
 TEST(a_namesake_inside_a_marine_area_along_its_side_goes_and_one_touching_or_crossing_it_stays) {
     Collected c = with_marine();
     // The North Sea: lat .. lat + 0.2 by lng .. lng + 0.2, a vertex each
@@ -1838,4 +2388,51 @@ TEST(a_namesake_cutting_a_marine_areas_corner_or_meeting_it_along_a_side_or_at_a
                                   pt(lat + 1850000, east + 50000), pt(lat + 1800000, east)}});
     const Layer layer = build(c);
     CHECK(ways_held(layer, {3003, 3004, 3005, 3006}).first == std::set<int64_t>({3003, 3004, 3005, 3006}));
+}
+
+TEST(a_namesake_inside_marine_areas_of_its_name_that_overlap_goes) {
+    Collected c = with_marine();
+    // Marine areas of one name and MRGIDs of their own: the Celtic Sea
+    // twice over one square, and the Bristol Channel over two squares that
+    // overlap by half.
+    const int32_t lat = kLat - 26000000;
+    auto rect = [](int32_t south, int32_t west, int32_t height, int32_t width) {
+        return Ring{pt(south, west), pt(south, west + width), pt(south + height, west + width), pt(south + height, west),
+                    pt(south, west)};
+    };
+    c.marine.push_back(marine_area(2370, marine::kSea, "Celtic Sea", {{square(lat, kLng, 2000000, 5)}}));
+    c.marine.push_back(marine_area(2371, marine::kSea, "Celtic Sea", {{square(lat, kLng, 2000000, 5)}}));
+    c.marine.push_back(marine_area(2372, marine::kSea, "Bristol Channel", {{square(lat, kLng + 3000000, 2000000, 5)}}));
+    c.marine.push_back(marine_area(2373, marine::kSea, "Bristol Channel", {{square(lat, kLng + 4000000, 2000000, 5)}}));
+    // Bays of their names: in the Celtic Sea's square, in the half both
+    // squares of the Bristol Channel hold, and across that half from one
+    // square's own half to the other's, all of which they hold. One
+    // reaching east past them stays.
+    c.closed_ways.push_back({3030, tags(code::kNaturalBay, "Celtic Sea"), rect(lat + 500000, kLng + 500000, 500000, 500000)});
+    c.closed_ways.push_back(
+        {3031, tags(code::kNaturalBay, "Bristol Channel"), rect(lat + 500000, kLng + 4200000, 500000, 500000)});
+    c.closed_ways.push_back(
+        {3032, tags(code::kNaturalBay, "Bristol Channel"), rect(lat + 500000, kLng + 3500000, 500000, 2000000)});
+    c.closed_ways.push_back(
+        {3033, tags(code::kNaturalBay, "Bristol Channel"), rect(lat + 500000, kLng + 4500000, 500000, 2000000)});
+    const Layer layer = build(c);
+    CHECK(ways_held(layer, {3030, 3031, 3032, 3033}).first == std::set<int64_t>({3033}));
+}
+
+TEST(a_namesake_inside_one_marine_area_of_its_name_goes_though_another_of_its_name_crosses_it) {
+    Collected c = with_marine();
+    // The North Sea, as above, and a second area of its name over part of
+    // it, a triangle whose sloping side crosses the east side of a bay of
+    // its name that the North Sea's square holds whole, at lat + 0.1025:
+    // between two latitudes of a vertex of either.
+    const int32_t lat = kLat - 20000000;
+    c.marine.push_back(marine_area(2352, marine::kSea, "North Sea",
+                                   {{Ring{pt(lat + 500000, kLng + 2675000), pt(lat + 500000, kLng + 3675000),
+                                          pt(lat + 1500000, kLng + 3675000), pt(lat + 500000, kLng + 2675000)}}}));
+    c.closed_ways.push_back({3040, tags(code::kNaturalBay, "North Sea"),
+                             Ring{pt(lat + 800000, kLng + 2800000), pt(lat + 800000, kLng + 3200000),
+                                  pt(lat + 1200000, kLng + 3200000), pt(lat + 1200000, kLng + 2800000),
+                                  pt(lat + 800000, kLng + 2800000)}});
+    const Layer layer = build(c);
+    CHECK(ways_held(layer, {3040}).first.empty());
 }

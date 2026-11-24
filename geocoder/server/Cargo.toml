@@ -34,17 +34,23 @@ axum-server = "0.8"
 bcrypt = "0.19"
 getrandom = "0.4"
 arc-swap = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
 zstd = "0.14"
 sha2 = "0.11"
 futures-util = "0.3"
 bytes = "1"
 unicode-normalization = "0.1"
+# The body of a lookup's answer, which holds its place until it is sent
+# (portal.rs).
+http-body = "1"
 
 # The binary's tests (the download tests' bucket) build their datasets with the library's
-# fixture encoders.
+# fixture encoders. The test portal's server (src/portal.rs) is a bin of place-search, for the
+# place search it serves, and its tests run here, beside the routes it answers as: they take
+# place-search too, which only they compile.
 [dev-dependencies]
 query-server = { path = ".", features = ["fixtures"] }
+place-search = { path = "../search" }
 
 [profile.release]
 opt-level = 3

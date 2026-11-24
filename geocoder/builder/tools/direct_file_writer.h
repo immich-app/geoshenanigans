@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -122,6 +123,18 @@ public:
     // The writes go around the page cache (until finish() writes the tail).
     bool direct() const { return direct_; }
 
+    // The bytes appended so far.
+    uint64_t appended() const { return appended_; }
+
+    // The bytes from the file's start that are filled and written: the
+    // blocks done, oldest first, whose spans have all been read from their
+    // files. Retires the blocks that are done without waiting for any.
+    uint64_t written() {
+        while (!busy_.empty() && busy_.front().done.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            retire_oldest();
+        return written_;
+    }
+
 private:
     // n bytes of a block: bytes [offset, offset + n) of `bytes`, or of the
     // file fd when there are no bytes.
@@ -201,6 +214,7 @@ private:
         Block b = std::move(busy_.front());
         busy_.pop_front();
         b.done.get();
+        written_ += block_bytes_;
         free_.push_back(std::move(b));
     }
 
@@ -261,6 +275,7 @@ private:
     bool allocate_ = true;
     uint64_t allocated_ = 0;     // the file's size, allocated ahead
     uint64_t appended_ = 0;      // bytes laid out
+    uint64_t written_ = 0;       // bytes of the blocks retired
     std::vector<Piece> pieces_;  // of the block being laid out
     size_t filled_ = 0;          // its bytes so far
     std::vector<Block> free_;

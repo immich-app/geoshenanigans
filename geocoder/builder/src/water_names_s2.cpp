@@ -74,6 +74,7 @@ void credit(std::vector<Credit>& out, uint32_t object, const NamingLine& line, u
 std::vector<Credit> credit_naming_lines(const AdminExactRings& rings, const std::vector<uint32_t>& polygons,
                                         const std::vector<uint32_t>& object_of, const NamingLines& lines,
                                         NamingCounts& counts, unsigned threads) {
+    if (polygons.empty() || lines.lines.empty()) return {};
     if (threads == 0) threads = parallel_threads();
     const PackedLocation* v = rings.vertices.data();
 
@@ -122,13 +123,41 @@ std::vector<Credit> credit_naming_lines(const AdminExactRings& rings, const std:
     for (size_t i = 0; i < cover.size(); i++) covered[i] = cover[i].cell_id;
     covered.erase(std::unique(covered.begin(), covered.end()), covered.end());
 
+    // The lines with a segment across the antimeridian or along it, each
+    // stood in for by a copy of it cut there (cut_at_antimeridian), past the
+    // others: a piece either side of it is a segment of its own, and a reach
+    // along it runs at 180 east.
+    const size_t own = lines.lines.size();
+    const std::vector<uint32_t> wrapping = parallel_filter<uint32_t>(own, [&](size_t l) {
+        const NamingLine& line = lines.lines[l];
+        const PackedLocation* lv = lines.vertices.data() + line.first;
+        for (uint32_t i = 0; i + 1 < line.count; i++)
+            if (segment_wraps(lv[i], lv[i + 1]) || segment_on_antimeridian(lv[i], lv[i + 1])) return true;
+        return false;
+    }, threads);
+    std::vector<NamingLine> cut;
+    std::vector<PackedLocation> cut_vertices;
+    for (uint32_t l : wrapping) {
+        NamingLine line = lines.lines[l];
+        const size_t first = cut_vertices.size();
+        cut_at_antimeridian(lines.vertices.data() + line.first, line.count, cut_vertices);
+        line.first = first;
+        line.count = static_cast<uint32_t>(cut_vertices.size() - first);
+        cut.push_back(line);
+    }
+    auto line_of = [&](uint32_t l) -> const NamingLine& { return l < own ? lines.lines[l] : cut[l - own]; };
+    auto vertices_of = [&](uint32_t l) {
+        return (l < own ? lines.vertices.data() : cut_vertices.data()) + line_of(l).first;
+    };
+
     // Each segment's covered cells among those it passes near, as the
     // covering finds a ring's (admin_arc_cells), by cell. A polygon that
     // meets the segment is in one of them.
-    std::vector<Near> near = parallel_collect<Near>(lines.lines.size(), [&](size_t l, std::vector<Near>& out) {
+    std::vector<Near> near = parallel_collect<Near>(own + cut.size(), [&](size_t l, std::vector<Near>& out) {
         thread_local std::vector<uint64_t> cells;
-        const NamingLine& line = lines.lines[l];
-        const PackedLocation* lv = lines.vertices.data() + line.first;
+        if (l < own && std::binary_search(wrapping.begin(), wrapping.end(), static_cast<uint32_t>(l))) return;
+        const NamingLine& line = line_of(static_cast<uint32_t>(l));
+        const PackedLocation* lv = vertices_of(static_cast<uint32_t>(l));
         for (uint32_t i = 0; i + 1 < line.count; i++) {
             if (lv[i] == lv[i + 1] || segment_wraps(lv[i], lv[i + 1])) continue;
             cells.clear();
@@ -165,7 +194,7 @@ std::vector<Credit> credit_naming_lines(const AdminExactRings& rings, const std:
                 const uint32_t interior = (it->item_id & INTERIOR_FLAG) ? kInterior : 0;
                 const ExactRingBox& box = boxes[p];
                 for (size_t i = from; i < to; i++) {
-                    const PackedLocation* lv = lines.vertices.data() + lines.lines[near[i].line].first + near[i].index;
+                    const PackedLocation* lv = vertices_of(near[i].line) + near[i].index;
                     if (box_misses(box, lv[0], lv[1])) continue;
                     per_worker[worker].push_back({p, near[i].line, near[i].index, near[i].cells | interior});
                 }
@@ -197,8 +226,8 @@ std::vector<Credit> credit_naming_lines(const AdminExactRings& rings, const std:
         for (size_t g = begin; g < end; g++) {
             if (!whole(g)) continue;
             const Pair& pair = pairs[groups[g]];
-            const NamingLine& line = lines.lines[pair.line];
-            const PackedLocation* lv = lines.vertices.data() + line.first + pair.index;
+            const NamingLine& line = line_of(pair.line);
+            const PackedLocation* lv = vertices_of(pair.line) + pair.index;
             credit(credits[worker], object_of[pair.polygon], line, segment_mm(lv[0], lv[1]));
         }
     }, threads);
@@ -240,8 +269,8 @@ std::vector<Credit> credit_naming_lines(const AdminExactRings& rings, const std:
                         std::min<uint32_t>(spans[q].count / 16, 1u << 20), [rv](uint32_t i) { return rv[i].lon_e7; });
             }
             for (size_t i = from; i < to; i++) {
-                const NamingLine& line = lines.lines[clips[i].line];
-                const PackedLocation* lv = lines.vertices.data() + line.first + clips[i].index;
+                const NamingLine& line = line_of(clips[i].line);
+                const PackedLocation* lv = vertices_of(clips[i].line) + clips[i].index;
                 SegmentClip clip(lv[0], lv[1]);
                 const int32_t start = clip.start().lon_e7;
                 const int32_t lng_lo = std::min(lv[0].lon_e7, lv[1].lon_e7);

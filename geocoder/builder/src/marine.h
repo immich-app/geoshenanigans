@@ -88,18 +88,6 @@ struct Area {
     std::vector<std::vector<std::vector<PackedLocation>>> polygons;
 };
 
-// Throws unless `path` opens as a marine areas file of this version: a
-// check of its header before the build reads it whole (read_areas).
-inline void check_file(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    char head[12];
-    uint32_t version = 0;
-    if (!f || !f.read(head, sizeof head) || std::memcmp(head, kMagic, 8) != 0 ||
-        (std::memcpy(&version, head + 8, 4), version != kVersion))
-        throw std::runtime_error("--marine: " + path + " is no marine areas file of version " +
-                                 std::to_string(kVersion));
-}
-
 // The areas of a marine_areas.bin, in its order; throws, naming the place,
 // on a file of another kind or version, one cut short or with bytes past its
 // last object, ids not ascending, an unknown kind, an empty name, a polygon
@@ -175,6 +163,12 @@ inline std::vector<Area> read_areas(const std::string& path) {
     if (at != data.size()) fail(std::to_string(data.size() - at) + " bytes past the last object");
     return out;
 }
+
+// Throws as read_areas does unless `path` reads whole as a marine areas
+// file: a check before the build's passes, which read it again once they
+// are done. The areas it reads are let go at once, so the passes' peak
+// holds none of them.
+inline void check_file(const std::string& path) { read_areas(path); }
 
 // Whether a stretch starts at the vertex.
 inline bool starts_stretch(PackedLocation v) {

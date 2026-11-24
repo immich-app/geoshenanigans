@@ -439,10 +439,13 @@ dirs must all be patched to the same date and swapped in together.
 
 ### The water dirs
 
-The water layer (`src/water_layer.h`) writes three dirs under each region:
-`water/all/simplified/`, `water/all/exact/` and `water/major/simplified/`.
-Each is made of file names the patch format has a section for, the admin
-geometry's and one of its own (file id 39, GCPATCH v23):
+With `--multi-output`, the water layer (`src/water_layer.h`) writes three
+dirs under each region: `water/all/simplified/`, `water/all/exact/` and
+`water/major/simplified/`. A build without it writes one, `water/` beside
+the region's mode files: the `all` set's exact tier, its polygons in their
+own order as slots, with none of the sidecars (`*.osm_ids`) the patches'
+slots come from. Each is made of file names the patch format has a section
+for, the admin geometry's and one of its own (file id 39, GCPATCH v23):
 
 - `admin_polygons.bin` and `admin_rings.bin`: one 16-byte record per polygon
   (an outer ring of an OSM object, with the holes inside it), its name in the
@@ -490,8 +493,10 @@ What keeps a day's patch small:
   the strings.
 - **Arcs are cut at OSM way ends** as well as at junctions
   (`ArcCuts::JunctionsAndWayEnds`): an arc lies within one way, so an edit to
-  a way changes only the arcs along it, and every other arc keeps its slot
-  (`arc_index.osm_ids`, with the way-set and ends fallbacks of
+  a way changes the arcs along it, and those of any other ring through a
+  shared vertex where it adds or removes a way end or junction (every ring is
+  cut at every way end and junction it passes); every other arc keeps its
+  slot (`arc_index.osm_ids`, with the way-set and ends fallbacks of
   `arc_index.fallback.osm_ids`). One arc per ring would resend a whole lake
   shore for a one-node edit.
 - **Ring blocks** are still a polygon's whole: an edit that adds or splits a
@@ -546,13 +551,14 @@ bay, harbour or lake inside a sea answers there, the sea out in open water.
 OSM's own `place=sea` areas stay out of the layer: the marine areas hold the
 seas, and Nominatim answers no `place=sea`. So does an OSM `natural=bay` or
 `strait` of a marine area's name (its `name` or `name:en`, ASCII case,
-spaces and punctuation aside) that holds water together with that area (a
-shared shore or point alone doesn't count), such as the Gulf of Oman
-(`drop_marine_namesakes`); every other OSM bay and strait stays. An area
-shows the name its sea goes by where the IHO's reads awkwardly in a line
-(`marine::kShownNames`: "Mediterranean Sea" for either basin, "Barents Sea"
-for "Barentsz Sea"), a name in dispute as the source has it; its namesakes
-are those of either name.
+spaces and punctuation aside) all of whose water the marine areas of that
+name hold (a shared shore or point aside), such as the Gulf of Oman
+(`drop_marine_namesakes`); every other OSM bay and strait stays, one that
+reaches past them or only overlaps them among them.
+An area shows the name its sea goes by where the IHO's reads awkwardly in a
+line (`marine::kShownNames`: "Mediterranean Sea" for either basin, "Barents
+Sea" for "Barentsz Sea"), a name in dispute as the source has it; its
+namesakes are those of either name.
 
 - **They don't change from day to day.** The nightly never runs the tool: it
   downloads the version `data/marine.json` pins (a run of Update Marine
@@ -593,11 +599,12 @@ are those of either name.
 and `admin_polygons` transport units (every dir holding all of a unit's files
 publishes it), the other `.bin` files as `.zst`, and `water_meta.json` and
 `attribution.json` among the JSON files (compressed and kept raw). The
-template's `water` axis takes `none`, `major`, `all` or `all-exact`, each a
-component of one dir's eleven client files with `"dir": "water"`: a client puts
-them in `<dataset>/water/` and patches that dir with the water dir's own
-patch (`generate_patches.sh` diffs every dir holding `.bin` files, these
-among them). `component_sizes` in configurations.json gives each region's
+template's `water` axis takes `none`, `major`, `all` or `all-exact`: `none`
+selects no files, and each of the other three is a component of one dir's
+eleven client files with `"dir": "water"` and that dir's own patch. A client
+puts them in `<dataset>/water/` and patches that dir with it
+(`generate_patches.sh` diffs every dir holding `.bin` files, these among
+them). `component_sizes` in configurations.json gives each region's
 components' raw and wire bytes.
 
 ## Place search index

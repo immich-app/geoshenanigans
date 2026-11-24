@@ -9,10 +9,12 @@ import importlib.util
 import io
 import json
 import os
+import stat
 import struct
 import sys
 import tempfile
 import time
+import tracemalloc
 import unittest
 from unittest import mock
 
@@ -23,7 +25,8 @@ import marine_import  # noqa: E402
 HAS_GEOMETRY = all(importlib.util.find_spec(m) for m in ("shapely", "numpy", "pyogrio"))
 
 # Two areas, by id: the ocean 1902 of two polygons (a triangle; a square with a triangular hole) and the sea
-# 2350 of one triangle. The builder's tests read the same bytes (tests/marine_test_file.h).
+# 2350 of one triangle. The bytes write_marine gives them are a file the builder's tests read too
+# (tests/marine_test_file.h).
 TWO_AREAS = [
     (1902, marine_import.KIND_OCEAN, "North Atlantic Ocean", [
         [[(0, -300000000), (0, -200000000), (100000000, -250000000)]],
@@ -32,11 +35,7 @@ TWO_AREAS = [
     ]),
     (2350, marine_import.KIND_SEA, "North Sea", [[[(530000000, 30000000), (530000000, 40000000), (540000000, 35000000)]]]),
 ]
-TWO_AREAS_HEX = (
-    "47434d4152494e4501000000020000006e070000000000000214004e6f7274682041746c616e746963204f6365616e020000000100000003"
-    "00000000000000005d1eee0000000000e1f50500e1f505800f05fd0200000004000000806967ff806967ff00000000002d3101002d310100"
-    "0000000000000000d3cefe03000000c0b4b3ffc0b4b3ff8096980000000000c0b4b3ff809698002e090000000000000109004e6f72746820"
-    "5365610100000001000000030000008028971f80c3c901000000008096980080969800c0b4b3ff")
+TWO_AREAS_FILE = os.path.join(HERE, "..", "..", "testdata", "marine_two_areas.bin")
 
 
 class FileTest(unittest.TestCase):
@@ -49,10 +48,35 @@ class FileTest(unittest.TestCase):
 
     def test_writes_the_bytes_the_builder_reads_by_id(self):
         marine_import.write_marine(self.path, list(reversed(TWO_AREAS)))
-        with open(self.path, "rb") as f:
-            self.assertEqual(f.read().hex(), TWO_AREAS_HEX)
-        self.assertFalse(os.path.exists(self.path + ".part"))
+        with open(self.path, "rb") as f, open(TWO_AREAS_FILE, "rb") as want:
+            self.assertEqual(f.read(), want.read())
+        self.assertEqual(os.listdir(self.dir.name), ["marine_areas.bin"])
+        umask = os.umask(0)
+        os.umask(umask)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o666 & ~umask)
         self.assertEqual(marine_import.read_marine(self.path), TWO_AREAS)
+
+    def test_a_file_or_link_named_as_the_outputs_part_keeps_its_bytes(self):
+        part, other = self.path + ".part", os.path.join(self.dir.name, "land.geojson")
+        for link in (False, True):
+            with self.subTest(link=link):
+                with open(other, "wb") as f:
+                    f.write(b"land")
+                if link:
+                    os.symlink(other, part)
+                else:
+                    with open(part, "wb") as f:
+                        f.write(b"part")
+                marine_import.write_marine(self.path, TWO_AREAS)
+                with open(other, "rb") as f:
+                    self.assertEqual(f.read(), b"land")
+                self.assertEqual(os.path.islink(part), link)
+                with open(part, "rb") as f:
+                    self.assertEqual(f.read(), b"land" if link else b"part")
+                self.assertEqual(marine_import.read_marine(self.path), TWO_AREAS)
+                self.assertEqual(sorted(os.listdir(self.dir.name)),
+                                 ["land.geojson", "marine_areas.bin", "marine_areas.bin.part"])
+                os.unlink(part)
 
     def test_refuses_what_the_builder_would(self):
         sea = TWO_AREAS[1]
@@ -67,7 +91,7 @@ class FileTest(unittest.TestCase):
         for why, objects in cases.items():
             with self.subTest(why), self.assertRaisesRegex(ValueError, why):
                 marine_import.write_marine(self.path, objects)
-            self.assertFalse(os.path.exists(self.path))
+            self.assertEqual(os.listdir(self.dir.name), [])
 
     def test_reads_refuse_a_file_cut_short_or_of_another_kind(self):
         marine_import.write_marine(self.path, TWO_AREAS)
@@ -77,8 +101,34 @@ class FileTest(unittest.TestCase):
                           ("not a marine areas file", b"GCMARINX" + good[8:])]:
             with open(self.path, "wb") as f:
                 f.write(data)
-            with self.subTest(why), self.assertRaisesRegex(ValueError, why):
-                marine_import.read_marine(self.path)
+            for read in (marine_import.read_marine, marine_import.stats):
+                with self.subTest(why, read=read.__name__), contextlib.redirect_stdout(io.StringIO()), \
+                        self.assertRaisesRegex(ValueError, why):
+                    read(self.path)
+
+    def test_stats_counts_each_objects_polygons_rings_and_vertices_and_their_total(self):
+        marine_import.write_marine(self.path, TWO_AREAS)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            marine_import.stats(self.path)
+        self.assertEqual(out.getvalue().splitlines(), [
+            "1902\tocean\tNorth Atlantic Ocean\t2 polygons\t3 rings\t10 vertices",
+            "2350\tsea\tNorth Sea\t1 polygons\t1 rings\t3 vertices",
+            "total\t2 objects\t3 polygons\t4 rings\t13 vertices",
+        ])
+
+    def test_stats_holds_a_ring_at_a_time_not_the_file(self):
+        # 200 rings of 2,000 vertices, 3.2 MB of them: stats holds a ring's at most.
+        ring = [(k, k) for k in range(2000)]
+        marine_import.write_marine(self.path, [(1, marine_import.KIND_SEA, "North Sea", [[ring]] * 200)])
+        tracemalloc.start()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                marine_import.stats(self.path)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, os.path.getsize(self.path) // 10)
 
     def test_the_oceans_are_the_areas_named_ocean(self):
         self.assertEqual(marine_import.kind_of("North Atlantic Ocean"), marine_import.KIND_OCEAN)
@@ -104,6 +154,19 @@ class BoundsTest(unittest.TestCase):
                     self.assertIn("--bbox", err.getvalue())
                     self.assertIn(said, err.getvalue())
                     self.assertFalse(os.path.exists(out))
+
+
+class WorkersTest(unittest.TestCase):
+    # Without --workers, a build runs a tile worker a CPU of the budget the nightly's tools size theirs by
+    # (cpu_budget.sh): under a CPU quota, fewer than the CPUs the process may run on.
+    def test_without_workers_a_build_runs_one_a_cpu_of_the_budget(self):
+        from test_cpu_budget import fake_cpus
+        args = ["build", "--eez-iho", "eez_iho.geojson", "--land", "land.zip", "-o", "marine_areas.bin"]
+        with mock.patch.dict(os.environ, fake_cpus(self, 8, "/job", {"/job": "300000 100000"})), \
+                mock.patch.object(marine_import, "build", return_value=0) as build:
+            self.assertEqual(marine_import.main(args), 0)
+            self.assertEqual(marine_import.main(args + ["--workers", "5"]), 0)
+        self.assertEqual([call.args[0].workers for call in build.call_args_list], [3, 5])
 
 
 def feature(props, rings):
@@ -314,6 +377,43 @@ class BuildTest(unittest.TestCase):
                 bounded, _ = self.build("bounded.bin", seas=seas, land=land, more=[f"--bbox={bbox}"])
                 self.assertEqual(marine_import.read_marine(bounded), expected)
 
+    def test_a_run_of_the_world_without_land_is_refused_and_a_bounded_one_may_find_none(self):
+        out = os.path.join(self.dir.name, "marine_areas.bin")
+        line = {"type": "Feature", "properties": {},
+                "geometry": {"type": "LineString", "coordinates": [[10.0, 50.0], [11.0, 51.0]]}}
+        for why, features in [("no features", []), ("a line alone", [line])]:
+            land = self.write("no-land.geojson", features)
+            with self.subTest(why):
+                with self.assertRaisesRegex(ValueError, "no land polygons"):
+                    self.run_build(out, out + ".json", land=land)
+                self.assertFalse(os.path.exists(out))
+                # A bounded run's tiles can all lie offshore.
+                _, summary = self.build("offshore.bin", land=land, more=["--bbox=10.5,50.5,10.5,50.5"])
+                self.assertGreater(summary["polygons"], 0)
+
+    def test_an_output_or_stats_path_that_is_a_source_is_refused(self):
+        out = os.path.join(self.dir.name, "marine_areas.bin")
+        os.symlink(self.dir.name, os.path.join(self.dir.name, "link"))
+        held = {}
+        for source in (self.seas, self.land):
+            with open(source, "rb") as f:
+                held[source] = f.read()
+        for flag, source in (("--eez-iho", self.seas), ("--land", self.land)):
+            # The source by a link to its dir, and by a hard link of its own.
+            alias = os.path.join(self.dir.name, "link", os.path.basename(source))
+            hard = os.path.join(self.dir.name, "hard-" + os.path.basename(source))
+            os.link(source, hard)
+            for written, stats in ((alias, out + ".json"), (out, alias), (hard, out + ".json"), (out, hard)):
+                for path, data in held.items():
+                    with open(path, "wb") as f:
+                        f.write(data)
+                with self.subTest(source=flag, output=written, stats=stats):
+                    with self.assertRaisesRegex(ValueError, f"is a source, {flag} "):
+                        self.run_build(written, stats)
+                    with open(source, "rb") as f:
+                        self.assertEqual(f.read(), held[source])
+                    self.assertFalse(os.path.exists(out))
+
     def test_a_stats_path_that_is_the_output_is_refused(self):
         out = os.path.join(self.dir.name, "marine_areas.bin")
         os.symlink(self.dir.name, os.path.join(self.dir.name, "link"))
@@ -322,6 +422,64 @@ class BuildTest(unittest.TestCase):
             with self.subTest(stats=stats), self.assertRaisesRegex(ValueError, "--stats"):
                 self.run_build(out, stats)
             self.assertFalse(os.path.exists(out))
+        # An output there already, and the stats path a hard link to it.
+        with open(out, "wb") as f:
+            f.write(b"old")
+        hard = os.path.join(self.dir.name, "hard.json")
+        os.link(out, hard)
+        with self.assertRaisesRegex(ValueError, "--stats"):
+            self.run_build(out, hard)
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), b"old")
+
+    def test_the_output_and_stats_replace_their_names_and_write_through_no_other(self):
+        out = os.path.join(self.dir.name, "marine_areas.bin")
+        part, stats, other = out + ".part", out + ".json", os.path.join(self.dir.name, "other.json")
+        with open(self.land, "rb") as f:
+            land = f.read()
+        with open(self.seas, "rb") as f:
+            seas = f.read()
+        whole, _ = self.build("whole.bin")
+        with open(whole, "rb") as f:
+            want = f.read()
+
+        def as_source():
+            # A source named as the output's ".part".
+            with open(part, "wb") as f:
+                f.write(land)
+            return {"land": part}, {part: land}
+
+        def linked_to_a_source():
+            # The output's ".part", a link to a source.
+            os.symlink(self.seas, part)
+            return {}, {self.seas: seas}
+
+        def stats_a_hard_link():
+            # The stats path a hard link to a file that is none of the run's.
+            with open(other, "w") as f:
+                f.write("{}\n")
+            os.link(other, stats)
+            return {}, {other: b"{}\n"}
+
+        for case in (as_source, linked_to_a_source, stats_a_hard_link):
+            with self.subTest(case.__name__):
+                for path in (out, part, stats, other):
+                    if os.path.lexists(path):
+                        os.unlink(path)
+                for path, data in ((self.land, land), (self.seas, seas)):
+                    with open(path, "wb") as f:
+                        f.write(data)
+                given, kept = case()
+                before = set(os.listdir(self.dir.name))
+                self.assertEqual(self.run_build(out, stats, **given), 0)
+                for path, data in kept.items():
+                    with open(path, "rb") as f:
+                        self.assertEqual(f.read(), data)
+                with open(out, "rb") as f:
+                    self.assertEqual(f.read(), want)
+                with open(stats) as f:
+                    self.assertEqual(json.load(f)["bytes"], len(want))
+                self.assertEqual(set(os.listdir(self.dir.name)), before | {"marine_areas.bin", "marine_areas.bin.json"})
 
 
 if __name__ == "__main__":

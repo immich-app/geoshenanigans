@@ -429,20 +429,25 @@ fn major_faults() -> i64 {
     usage.ru_majflt as i64
 }
 
-/// The flags /proc/self/smaps gives the mapping that starts where `bytes` does.
+/// The flags /proc/self/smaps gives the mapping that starts where `bytes` does; none where the
+/// kernel has no smaps (one without CONFIG_PROC_PAGE_MONITOR) or this process can't read it.
 #[cfg(target_os = "linux")]
-fn vm_flags(bytes: &FileBytes) -> String {
+fn vm_flags(bytes: &FileBytes) -> Option<String> {
     let start = format!("{:x}-", bytes.as_slice().as_ptr() as usize);
-    let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
-    smaps.lines().skip_while(|l| !l.starts_with(&start)).find(|l| l.starts_with("VmFlags:")).unwrap().to_string()
+    let smaps = match std::fs::read_to_string("/proc/self/smaps") {
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied) => return None,
+        smaps => smaps.unwrap(),
+    };
+    Some(smaps.lines().skip_while(|l| !l.starts_with(&start)).find(|l| l.starts_with("VmFlags:")).unwrap().to_string())
 }
 
 // The open checks the whole cells file, in order: a mapped one is read ahead meanwhile, not
 // faulted in a page at a time (on a slow disk a read a page, ~800 for a planet water dir's), and
-// mapped for random reads again once open, as for the lookups. Where the file's pages can't be
-// dropped from the cache (a temp dir in memory) there is nothing to see. The file, of every level
-// 5 parent (about 1 MiB), is too few pages of 16 KiB or more for its faults to tell a read ahead
-// from a read a page: there the test sees the mapping's advice and a lookup only.
+// mapped for random reads again once open, as for the lookups. The faults are counted against
+// the pages the cache doesn't hold: where it keeps them all (a temp dir in memory), or holds
+// all but too few of 16 KiB or more for the faults to tell a read ahead from a read a page (the
+// file, of every level 5 parent, is about 1 MiB), the test sees the mapping's advice and a
+// lookup only, and without smaps a lookup only.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_mapped_cells_file_is_read_ahead_while_its_open_checks_it() {
@@ -458,21 +463,20 @@ fn a_mapped_cells_file_is_read_ahead_while_its_open_checks_it() {
     assert_eq!(unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) }, 0);
     let mapped = crate::mmap_file(path.to_str().unwrap()).unwrap();
     let (held, pages) = resident(&mapped);
-    if held == pages {
-        eprintln!("{}: its pages stay in the cache, nothing to see", path.display());
-        return;
-    }
+    let cold = pages - held;
 
     let before = major_faults();
     let index = CellPairs::open(mapped, FileBytes::Owned(entries), ADMIN, DEFAULT_ADMIN_CELL_LEVEL).unwrap();
     let faults = major_faults() - before;
 
-    if pages > 200 {
-        assert!(faults * 4 < pages as i64, "{faults} faults read pages of its {pages} ({held} in the cache before)");
+    if cold > 200 {
+        assert!(faults * 4 < cold as i64, "{faults} faults read pages of the {cold} of its {pages} not in the cache");
     } else {
-        eprintln!("{}: {pages} pages of {} bytes, too few to count its faults", path.display(), page_size());
+        eprintln!("{}: {cold} of its {pages} pages of {} bytes not in the cache, too few to count its faults", path.display(), page_size());
     }
-    let flags = vm_flags(&index.cells);
-    assert!(flags.contains(" rr") && !flags.contains(" sr"), "{flags}");
+    match vm_flags(&index.cells) {
+        Some(flags) => assert!(flags.contains(" rr") && !flags.contains(" sr"), "{flags}"),
+        None => eprintln!("no /proc/self/smaps to read: the mapping's advice can't be seen"),
+    }
     assert_eq!(index.with_ids(cell(6143 << 10 | 63 * 16), |ids| ids.to_vec()), [6143]);
 }

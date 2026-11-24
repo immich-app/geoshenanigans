@@ -26,6 +26,13 @@ Class of(const char* natural, const char* water_tag = nullptr, const char* water
     return classify(t);
 }
 
+// A water_meta.json of `kinds`, laid out as meta_json lays it out.
+std::string meta(const std::vector<MetaType>& kinds) {
+    std::string out = "{\"types\": [\n";
+    for (size_t k = 0; k < kinds.size(); k++) out += (k ? ",\n" : "") + meta_entry(kinds[k]);
+    return out + "\n]}\n";
+}
+
 std::string kind_of(const Class& c, const TypeTable& table) {
     const MetaType k = table.kind(c.code ? c.code : table.verbatim_code(c.verbatim));
     return k.cls + "/" + k.type + " " + std::to_string(k.rank);
@@ -135,14 +142,23 @@ TEST(water_meta_json_round_trips_quotes_and_controls_and_refuses_what_it_did_not
         CHECK(!parse_meta_json(with_type(other)).has_value());
 }
 
+TEST(water_meta_json_of_a_number_with_a_leading_zero_is_no_table) {
+    // Numbers as meta_json writes them, JSON's: no leading zero, but 0
+    // itself.
+    auto with = [](const std::string& code, const std::string& rank) {
+        return "{\"types\": [\n  {\"code\": " + code + ", \"class\": \"water\", \"type\": \"a\", \"rank\": " + rank +
+               "}\n]}\n";
+    };
+    CHECK(parse_meta_json(with("32769", "22")).has_value());
+    CHECK(parse_meta_json(with("1", "0")).has_value());
+    for (const auto& [code, rank] : std::vector<std::pair<std::string, std::string>>{
+             {"032769", "22"}, {"02", "20"}, {"32769", "022"}, {"1", "00"}, {"1", "020"}})
+        CHECK(!parse_meta_json(with(code, rank)).has_value());
+}
+
 TEST(water_meta_json_of_a_code_twice_or_out_of_order_or_a_value_twice_is_no_table) {
     // Kinds as meta_json writes them: each code once, ascending, each value
     // outside the fixed table once.
-    auto meta = [](const std::vector<MetaType>& kinds) {
-        std::string out = "{\"types\": [\n";
-        for (size_t k = 0; k < kinds.size(); k++) out += (k ? ",\n" : "") + meta_entry(kinds[k]);
-        return out + "\n]}\n";
-    };
     const MetaType lake{code::kLake, "water", "lake", 20};
     const MetaType a{32769, "water", "a", 22}, b{32770, "water", "b", 22};
     CHECK(parse_meta_json(meta({lake, a, b})).has_value());
@@ -151,6 +167,20 @@ TEST(water_meta_json_of_a_code_twice_or_out_of_order_or_a_value_twice_is_no_tabl
     CHECK(!parse_meta_json(meta({a, lake})).has_value());
     CHECK(!parse_meta_json(meta({lake, lake})).has_value());
     CHECK(!parse_meta_json(meta({lake, a, {32770, "water", "a", 22}})).has_value());
+}
+
+TEST(water_meta_json_of_a_verbatim_kind_not_class_water_of_its_rank_or_of_a_code_past_the_fixed_table_is_no_table) {
+    // A verbatim code is the water class's, rank kVerbatimRank; no code
+    // lies between the fixed table and kVerbatimBase.
+    const MetaType last{kFixedKindCount, kFixedKinds[kFixedKindCount - 1].cls, kFixedKinds[kFixedKindCount - 1].type,
+                        kFixedKinds[kFixedKindCount - 1].rank};
+    const MetaType a{32769, "water", "a", kVerbatimRank};
+    CHECK(parse_meta_json(meta({last, a})).has_value());
+    CHECK(parse_meta_json(meta({{kVerbatimBase, "water", "a", kVerbatimRank}})).has_value());
+    CHECK(!parse_meta_json(meta({last, {32769, "natural", "a", kVerbatimRank}})).has_value());
+    CHECK(!parse_meta_json(meta({last, {32769, "water", "a", 20}})).has_value());
+    CHECK(!parse_meta_json(meta({{uint16_t(kFixedKindCount + 1), "water", "a", kVerbatimRank}})).has_value());
+    CHECK(!parse_meta_json(meta({{uint16_t(kVerbatimBase - 1), "water", "a", kVerbatimRank}})).has_value());
 }
 
 TEST(the_major_tier_takes_100_km2_and_wikidata_rivers_of_5_and_keeps_its_own_at_90_percent) {
@@ -163,6 +193,7 @@ TEST(the_major_tier_takes_100_km2_and_wikidata_rivers_of_5_and_keeps_its_own_at_
     CHECK(water_major_keeps(90, false, false, true));
     CHECK(!water_major_keeps(89.9, false, false, true));
     CHECK(water_major_keeps(4.5, true, true, true));
+    CHECK(!water_major_keeps(4.49, true, true, true));
 }
 
 TEST(the_major_tier_takes_coastal_water_of_10_km2_and_keeps_its_own_at_9) {
@@ -234,6 +265,39 @@ TEST(water_meta_json_of_every_kind_stays_within_what_a_patch_carries_inline) {
     CHECK(table.kind(code::kNaturalWater).cls == "natural" && table.kind(code::kNaturalWater).type == "water");
     // A value it was not given has no code.
     CHECK(gctest::refusal_of<std::logic_error>([&] { table.verbatim_code("never_given"); }) != "");
+}
+
+TEST(water_meta_json_of_values_its_escapes_double_stays_within_what_a_patch_carries_inline) {
+    // 20,000 water=* values of 255 bytes, all but their first few quotes and
+    // backslashes, each of which water_meta.json writes as two: a kind of
+    // about 565 bytes written, of about 315 unescaped.
+    std::map<std::string, size_t> uses;
+    for (int k = 0; k < 20000; k++) {
+        std::string v = "v" + std::to_string(k);
+        while (v.size() < 255) v += v.size() % 2 ? '"' : '\\';
+        uses[v] = 2;
+    }
+    TypeTable table;
+    table.assign(uses, {});
+    std::set<uint16_t> codes;
+    for (uint16_t c = 1; c <= kFixedKindCount; c++) codes.insert(c);
+    size_t generic = 0;
+    for (const auto& [value, n] : uses) {
+        const uint16_t c = table.verbatim_code(value);
+        if (c == code::kNaturalWater) generic++;
+        else codes.insert(c);
+    }
+    const std::string text = meta_json(table, codes);
+    CHECK(text.size() <= MAX_INLINE_CLIENT_FILE_BYTES);
+    // Read back, each value as it was; the values past the budget are
+    // natural/water.
+    const std::optional<std::vector<MetaType>> read = parse_meta_json(text);
+    REQUIRE(read.has_value());
+    CHECK_EQ(read->size(), codes.size());
+    for (const MetaType& m : *read)
+        if (m.code >= kVerbatimBase) CHECK(uses.count(m.type) && table.verbatim_code(m.type) == m.code);
+    CHECK(generic > 0 && generic < uses.size());
+    CHECK_EQ(generic, table.generic_count());
 }
 
 TEST(water_meta_json_cut_short_or_with_more_after_it_is_no_table_and_one_of_no_kinds_is_one) {
