@@ -39,17 +39,25 @@ using gc::id_alloc::SidecarSlot;
 
 constexpr double kKm2PerDeg2AtEquator = 111.32 * 111.32;
 
-// An exact ring's area in km², by the cosine of its middle latitude.
+// An exact ring's area in km² on the sphere of 111.32 km a degree: R² times
+// the sum over its edges of each one's longitude step (radians) by the mean
+// of the sines of its ends' latitudes, each latitude where it lies. The
+// sines are taken less the first vertex's, which a closed ring's steps,
+// summing to nothing, leave out of the sum, so that a ring far from the
+// equator keeps its digits. `v` holds `n` vertices, the first repeated at
+// the end.
 double ring_km2(const PackedLocation* v, uint32_t n) {
-    const __int128 a2 = exact_ring_area2(v, n);
-    const double deg2 = static_cast<double>(a2 < 0 ? -a2 : a2) * 0.5e-14;
-    int32_t lo = INT32_MAX, hi = INT32_MIN;
-    for (uint32_t i = 0; i < n; i++) {
-        lo = std::min(lo, v[i].lat_e7);
-        hi = std::max(hi, v[i].lat_e7);
+    if (n < 2) return 0;
+    constexpr double kRad = 3.14159265358979323846 / 180.0 / 1e7;
+    const double base = std::sin(v[0].lat_e7 * kRad);
+    double sum = 0, before = 0;
+    for (uint32_t i = 1; i < n; i++) {
+        const double here = std::sin(v[i].lat_e7 * kRad) - base;
+        sum += static_cast<double>(int64_t(v[i].lon_e7) - v[i - 1].lon_e7) * (before + here);
+        before = here;
     }
-    const double mid = (double(lo) + double(hi)) / 2e7 * 3.14159265358979323846 / 180.0;
-    return deg2 * kKm2PerDeg2AtEquator * std::cos(mid);
+    // R = 111.32 km × 180 / π, and a step's unit 1e-7 × π / 180 radians.
+    return std::fabs(sum) / 2 * 1e-7 * kKm2PerDeg2AtEquator * (180.0 / 3.14159265358979323846);
 }
 
 // A polygon's area in km², its holes taken off.
@@ -787,12 +795,13 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
     for (size_t o = 0; o < b.objects.size(); o++) {
         Object& obj = b.objects[o];
         if (o < choices.size() && choices[o].named()) {
-            // An area of a name of its own takes its line's river only where
-            // that is its own: of its wikidata item where it has one, else of
-            // its local name.
+            // An area takes its line's river only where that is its own: of
+            // its wikidata item where it has one, else of its local name;
+            // any, of neither. One of no name takes the line's name all the
+            // same.
             const NameChoice& c = choices[o];
-            const bool own = obj.tags.name.empty() ||
-                             (obj.tags.qid ? c.qid == obj.tags.qid : b.lines.key_local[c.key] == obj.tags.local_name);
+            const bool own = obj.tags.qid ? c.qid == obj.tags.qid
+                                          : obj.tags.name.empty() || b.lines.key_local[c.key] == obj.tags.local_name;
             if (own) {
                 obj.name_key = c.key;
                 obj.key_qid = c.qid;

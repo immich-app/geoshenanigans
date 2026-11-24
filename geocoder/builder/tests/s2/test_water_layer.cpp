@@ -1070,6 +1070,53 @@ TEST(a_named_river_area_takes_only_its_own_rivers_identity_from_the_line_of_most
     CHECK(ways_held(build(c), {2301, 2302, 2303}).second == std::set<int64_t>({2302, 2303}));
 }
 
+TEST(an_unnamed_river_area_of_a_wikidata_item_of_its_own_takes_a_lines_name_but_not_another_rivers_identity) {
+    // The Alpha (Q101), an area of its name of about 3 km2; an unnamed area
+    // of about 1 km2 tagged Q101, with a line of the Beta's relation (Q202)
+    // in it; and an unnamed area of about 3 km2 the Beta names. Joined
+    // through the unnamed Alpha area, the three would be a wikidata river of
+    // 7 km2 in the major tier; the Alpha is a river of 4, the Beta of 3.
+    Collected c = fixture();
+    const int32_t side = 190000, small = 110000;
+    auto add_line = [&](int64_t way, int32_t lat, int32_t width) {
+        LineIn line;
+        line.way = way;
+        line.key = "r950";
+        line.local = line.display = "Beta";
+        line.qid = 202;
+        line.vertices = {pt(lat + width / 2, kLng + width / 10), pt(lat + width / 2, kLng + width * 9 / 10)};
+        c.lines.push_back(line);
+    };
+    c.closed_ways.push_back({2401, tags(code::kRiver, "Alpha", true, 101), square(kLat - 3000000, kLng, side)});
+    c.closed_ways.push_back({2402, tags(code::kRiver, "", true, 101), square(kLat - 4000000, kLng, small)});
+    add_line(2412, kLat - 4000000, small);
+    c.closed_ways.push_back({2403, tags(code::kRiver, "", true), square(kLat - 5000000, kLng, side)});
+    add_line(2413, kLat - 5000000, side);
+    const Layer layer = build(c);
+    const auto [held, major] = ways_held(layer, {2401, 2402, 2403});
+    CHECK(held == std::set<int64_t>({2401, 2402, 2403}));
+    CHECK(major.empty());
+    // It shows the line's name.
+    for (size_t p = 0; p < layer.size(); p++)
+        if (layer.identities[p] == way_identity(2402)) CHECK(name_of(layer, p) == "Beta");
+}
+
+TEST(a_lake_of_100_km2_far_from_its_boxs_middle_latitude_is_in_the_major_tier) {
+    // A lobe of 0.13 x 0.13 degrees at 60 north (about 104.6 km2), and an arm
+    // 0.00001 wide from it to 70 north (about 0.5 km2): weighted by the
+    // cosine of its box's middle latitude, 65, the lake would be about 89.
+    Collected c = fixture();
+    const int32_t lat = 600000000, side = 1300000, arm = 100;
+    const Ring lake = {pt(lat, kLng), pt(lat, kLng + side), pt(lat + side, kLng + side), pt(700000000, kLng + side),
+                       pt(700000000, kLng + side - arm), pt(lat + side, kLng + side - arm), pt(lat + side, kLng),
+                       pt(lat, kLng)};
+    c.closed_ways.push_back({63, tags(code::kLake, "Long Arm Lake"), lake});
+    const Layer layer = build(c);
+    const auto [held, major] = ways_held(layer, {63});
+    CHECK(held == std::set<int64_t>({63}));
+    CHECK(major == std::set<int64_t>({63}));
+}
+
 TEST(a_lake_the_major_tier_held_stays_in_it_at_95_km2_once_its_smallest_vertex_moves) {
     // A lake relation of one way round a square of about 105 km2; the next
     // day its south-west corner, the smallest vertex, moves in, and it holds

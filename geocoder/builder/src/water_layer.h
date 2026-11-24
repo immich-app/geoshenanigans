@@ -198,7 +198,7 @@ struct Object {
     int64_t id = 0;
     ObjectTags tags;
     double area_deg2 = 0;  // its polygons' exact areas less their holes, square degrees
-    double km2 = 0;
+    double km2 = 0;        // the same on the sphere, km² (the major tier's thresholds)
     uint32_t name_key = UINT32_MAX;  // the naming key it took (NamingLines::keys), UINT32_MAX for none
     uint32_t key_qid = 0;            // the lowest wikidata item of that key's lines in it, 0 for none
 };
@@ -253,10 +253,11 @@ size_t drop_marine_namesakes(Build& b);
 // Names each unnamed river or canal object by `choices` (pick_names, by
 // object) and drops the objects with no name and their polygons, in place;
 // sums each object's area. Each object takes its choice's key and wikidata
-// item, by which the major tier joins it to its river, but one of a name of
-// its own only where they are its own: the choice's item its own item where
-// it has one, else the key's local name its local name. Returns how many
-// objects it named.
+// item, by which the major tier joins it to its river, only where they are
+// its own: the choice's item its own item where it has one, else (one of a
+// name of its own) the key's local name its local name; an unnamed one of
+// an item of its own takes the choice's name alone otherwise. Returns how
+// many objects it named.
 size_t apply_names(Build& b, const std::vector<NameChoice>& choices);
 
 // Cuts each polygon of more than kSplitMaxHoles holes into pieces along the
