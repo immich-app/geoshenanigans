@@ -284,6 +284,28 @@ TEST(levels_11_and_12_are_boundaries_and_so_are_closed_ways_from_level_5) {
     CHECK(displays(answers[3], "Brandenburg, Germany"));
 }
 
+TEST(an_admin_level_that_is_no_whole_number_of_1_to_15_makes_no_boundary) {
+    // Nominatim's import reads admin_level as a number, and one that is none, not a whole one or
+    // past 15 is 15 (init.lua :306-311), which ranks 0: such a way or relation is in no address
+    // and links no place node. Germany: a level 6 way is a county of 12; ways of "6;7", "6.5"
+    // and "262" (6 past 256) and a relation of "6;7" name nothing.
+    Fixture f;
+    f.country(47, 6, 55, 15, "Germany", "DE");
+    f.boundary(52, 12, 53, 14, 4, "Brandenburg");
+    f.square(52.10, 12.10, 52.30, 12.40, {{"boundary", "administrative"}, {"admin_level", "6"}, {"name", "Kreisweg"}});
+    f.square(52.10, 12.60, 52.30, 12.90, {{"boundary", "administrative"}, {"admin_level", "6;7"}, {"name", "Kreisstrich"}});
+    f.square(52.10, 13.10, 52.30, 13.40, {{"boundary", "administrative"}, {"admin_level", "6.5"}, {"name", "Kreishalb"}});
+    f.square(52.50, 12.10, 52.70, 12.40, {{"boundary", "administrative"}, {"admin_level", "262"}, {"name", "Kreisrund"}});
+    f.area(52.50, 12.60, 52.70, 12.90,
+           {{"type", "boundary"}, {"boundary", "administrative"}, {"admin_level", "6;7"}, {"name", "Kreisbund"}});
+    const std::vector<std::string> answers = answers_of(
+        f, "rank-admin-level-tag", {{52.2, 12.2}, {52.2, 12.7}, {52.2, 13.2}, {52.6, 12.2}, {52.6, 12.7}});
+    REQUIRE(answers.size() == 5);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+    CHECK(names(answers[0], "county", "Kreisweg"));
+    for (size_t i = 1; i < answers.size(); i++) CHECK(displays(answers[i], "Brandenburg, Germany"));
+}
+
 TEST(the_ranks_are_the_same_in_every_dir_and_in_a_chained_build) {
     // Winsford's build with every region and variant, then a chained build of the same data:
     // each dir holding a level's records holds its rank, and each holding the village node of

@@ -2027,12 +2027,11 @@ static int run(int argc, char* argv[]) {
                             continue;
                         }
 
-                        // Nominatim's administrative levels run 2 to 12 (address-levels.json).
+                        // Nominatim's administrative levels run 2 to 12 (address-levels.json);
+                        // a tag it reads as no such number ranks 0 (nominatim_admin_level).
                         uint8_t admin_level = 0;
                         if (is_admin) {
-                            const char* level_str = rel.tag("admin_level");
-                            if (!level_str) continue;
-                            admin_level = static_cast<uint8_t>(std::atoi(level_str));
+                            admin_level = nominatim_admin_level(rel.tag("admin_level"));
                             if (admin_level < 2 || admin_level > kMaxBoundaryLevel) continue;
                             if (kMaxAdminLevel > 0 && admin_level > kMaxAdminLevel) continue;
                         } else {
@@ -2980,12 +2979,12 @@ static int run(int argc, char* argv[]) {
                         // extratags (presets.lua MAIN_TAGS.all_boundaries, init.lua
                         // process_tags), and placex_insert drops one of level 4 or
                         // less (placex_triggers.sql:687-690): a boundary from level
-                        // kMinBoundaryWayLevel. A level 2 way with a country code stays
-                        // for the country alone, which the rank pass keeps out of every
-                        // address.
+                        // kMinBoundaryWayLevel, its level read as the import reads it
+                        // (nominatim_admin_level). A level 2 way with a country code
+                        // stays for the country alone, which the rank pass keeps out of
+                        // every address.
                         if (is_admin && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
-                            uint8_t al = 0;
-                            { const char* ls = t.admin_level; if (ls) al = static_cast<uint8_t>(std::atoi(ls)); }
+                            const uint8_t al = nominatim_admin_level(t.admin_level);
                             const char* iso = al == 2 ? t.iso : nullptr;
                             uint8_t level = 0;
                             if (al >= kMinBoundaryWayLevel && al <= kMaxBoundaryLevel) level = al;

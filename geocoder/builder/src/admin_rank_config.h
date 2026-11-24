@@ -8,7 +8,9 @@
 // first indexed on 2026-11-22 ranking 25. rank_address.h gives every polygon
 // and place node its final rank_address from these, and the dirs carry it;
 // nothing else ranks.
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -108,6 +110,23 @@ inline PlaceValue place_value_of(const char* value) {
 inline PlaceValue boundary_place_value(const char* value) {
     if (value && std::strncmp(value, "isl", 3) == 0) return PlaceValue::NONE;
     return place_value_of(value);
+}
+
+// The admin_level Nominatim's import reads from the tag `value` (init.lua
+// :306-311): Lua's tonumber of it where that is a whole number of 1 to 15,
+// else 15, which address-levels.json gives no administrative rank (the
+// boundary default's [25, 0]), so that the object is in no address and
+// links no place node: "5;6", "6.5", "261" and a missing tag are all 15.
+// tonumber reads a number as strtod does in the C locale, with blanks round
+// it.
+inline uint8_t nominatim_admin_level(const char* value) {
+    if (!value) return 15;
+    char* end = nullptr;
+    const double level = std::strtod(value, &end);
+    if (end == value) return 15;
+    while (*end == ' ' || (*end >= '\t' && *end <= '\r')) end++;
+    if (*end != '\0' || !(level >= 1 && level <= 15) || level != std::floor(level)) return 15;
+    return static_cast<uint8_t>(level);
 }
 
 // The ranks of a place tag of value `v` in the country `cc` (packed upper

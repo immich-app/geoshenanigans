@@ -623,3 +623,28 @@ TEST(a_boundarys_place_tag_is_its_extratag_but_an_islands) {
     CHECK(boundary_place_value(nullptr) == PlaceValue::NONE);
     CHECK(boundary_place_value("") == PlaceValue::NONE);
 }
+
+TEST(an_admin_level_is_the_number_nominatims_import_reads_from_its_tag) {
+    // init.lua :306-311: tonumber of the tag, kept where it is a whole number of 1 to 15, else
+    // 15, which address-levels.json gives no administrative rank (boundary's [25, 0]).
+    CHECK_EQ(nominatim_admin_level("6"), uint8_t(6));
+    CHECK_EQ(nominatim_admin_level("4"), uint8_t(4));
+    CHECK_EQ(nominatim_admin_level("12"), uint8_t(12));
+    CHECK_EQ(nominatim_admin_level("15"), uint8_t(15));
+    // Lua's tonumber skips the blanks round a number and reads a whole float as its integer.
+    CHECK_EQ(nominatim_admin_level(" 7 "), uint8_t(7));
+    CHECK_EQ(nominatim_admin_level("7.0"), uint8_t(7));
+    CHECK_EQ(nominatim_admin_level("07"), uint8_t(7));
+    // No number, not a whole one, or one out of 1 to 15.
+    CHECK_EQ(nominatim_admin_level("5;6"), uint8_t(15));
+    CHECK_EQ(nominatim_admin_level("6.5"), uint8_t(15));
+    CHECK_EQ(nominatim_admin_level("6 7"), uint8_t(15));
+    CHECK_EQ(nominatim_admin_level("261"), uint8_t(15));
+    CHECK_EQ(nominatim_admin_level("16"), uint8_t(15));
+    CHECK_EQ(nominatim_admin_level("0"), uint8_t(15));
+    CHECK_EQ(nominatim_admin_level("-6"), uint8_t(15));
+    CHECK_EQ(nominatim_admin_level("six"), uint8_t(15));
+    CHECK_EQ(nominatim_admin_level("nan"), uint8_t(15));
+    CHECK_EQ(nominatim_admin_level(""), uint8_t(15));
+    CHECK_EQ(nominatim_admin_level(nullptr), uint8_t(15));
+}
