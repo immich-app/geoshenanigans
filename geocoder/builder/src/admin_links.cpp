@@ -203,6 +203,19 @@ bool AdminRings::contains(uint32_t pid, PackedLocation p) const {
     return inside;
 }
 
+bool AdminRings::covers(uint32_t pid, PackedLocation p) const {
+    if (contains(pid, p)) return true;
+    const auto& polygon = rings_.polygons[pid];
+    for (uint32_t r = polygon.first_ring; r < polygon.first_ring + polygon.ring_count; r++) {
+        const ExactRingBox& box = boxes_[r];
+        if (p.lat_e7 < box.lat_lo || p.lat_e7 > box.lat_hi || p.lon_e7 < box.lng_lo || p.lon_e7 > box.lng_hi) continue;
+        const RingSpan& span = rings_.rings[r];
+        if (edges_[r] ? edges_[r]->touches(p) : exact_ring_touches(rings_.vertices.data() + span.begin, span.count, p))
+            return true;
+    }
+    return false;
+}
+
 uint32_t AdminRings::first_containing(const std::vector<uint32_t>& ranked, PackedLocation p) const {
     for (uint32_t id : ranked)
         if ((id & INTERIOR_FLAG) || contains(id & ID_MASK, p)) return id & ID_MASK;
@@ -276,10 +289,11 @@ void compute_way_parent_polygons(ParsedData& data, unsigned int num_threads) {
         // A street's postcode is get_nearest_postcode's at its centroid, the
         // point halfway along it (placex_update, placex_triggers.sql), from
         // the postal areas only: the server takes the postcode centroids
-        // there at query time where none holds it. Of the areas holding the
-        // middle that name it (postal_area_names), the one whose centroid is
-        // nearest (ORDER BY ST_Distance(p.centroid, geom)), then the smaller,
-        // then the lower postcode, as the server's postal_area_postcode.
+        // there at query time where none holds it. Of the areas covering the
+        // middle, their edges included (ST_Covers(p.geometry, geom)), that
+        // name it (postal_area_names), the one whose centroid is nearest
+        // (ORDER BY ST_Distance(p.centroid, geom)), then the smaller, then
+        // the lower postcode, as the server's postal_area_postcode.
         const auto& exact = data.admin_exact_rings;
         std::vector<uint32_t> postal_slots;  // ascending, with postal_centroids
         for (uint32_t pid = 0; pid < data.admin_polygons.size(); pid++)
@@ -363,7 +377,7 @@ void compute_way_parent_polygons(ParsedData& data, unsigned int num_threads) {
                     const uint32_t pid = id & ID_MASK;
                     const AdminPolygon& area = data.admin_polygons[pid];
                     if (area.name_id == NO_DATA || !(area.area > 0)) continue;
-                    if (!(id & INTERIOR_FLAG) && !rings.contains(pid, middle)) continue;
+                    if (!(id & INTERIOR_FLAG) && !rings.covers(pid, middle)) continue;
                     if (!cc_found) {
                         cc = country_code_at_point(data, rings, middle.lat(), middle.lon());
                         cc_found = true;

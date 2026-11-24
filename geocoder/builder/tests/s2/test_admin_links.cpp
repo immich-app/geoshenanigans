@@ -3,7 +3,8 @@
 // step inside one of two neighbours links to that one, a street takes the
 // postcode at its middle and a POI none of another country, and the
 // candidates don't depend on how a ring is written down. A street's postal
-// area has a postcode the server takes.
+// area covers its middle, its edges included, and has a postcode the server
+// takes.
 #include "admin_links.h"
 
 #include <algorithm>
@@ -214,6 +215,30 @@ TEST(a_streets_postal_area_is_none_of_a_placeholder_or_a_list_of_postcodes) {
     compute_way_parent_polygons(a.data, 1);
     CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[zip].name_id);
     CHECK_EQ(a.data.way_postcode_ids[1], a.data.admin_polygons[plain].name_id);
+}
+
+TEST(a_streets_postal_area_holds_its_middle_on_its_edges_too) {
+    // get_nearest_postcode takes the postal areas covering the street's centroid (ST_Covers,
+    // utils.sql:172), their edges included: streets whose middles lie on a postal area's north
+    // edge, on a hole's south edge and on the north edge of a ring of 120 vertices, which an edge
+    // index tests, take their areas' postcodes.
+    Admins a;
+    const uint32_t north = a.add(11, box(0.49, 0.5, 0.5, 0.51), {}, "1000");
+    a.add_way({at(0.5, 0.502), at(0.5, 0.504)});
+    const uint32_t holed = a.add(11, box(0.6, 0.5, 0.7, 0.6), {reversed(box(0.64, 0.54, 0.66, 0.56))}, "2000");
+    a.add_way({at(0.64, 0.545), at(0.64, 0.555)});
+    Ring dense;
+    for (int k = 0; k < 30; k++) dense.push_back(at(0.3, 0.5 + 0.01 * k / 30));
+    for (int k = 0; k < 30; k++) dense.push_back(at(0.3 + 0.1 * k / 30, 0.51));
+    for (int k = 0; k < 30; k++) dense.push_back(at(0.4, 0.51 - 0.01 * k / 30));
+    for (int k = 0; k < 30; k++) dense.push_back(at(0.4 - 0.1 * k / 30, 0.5));
+    const uint32_t indexed = a.add(11, closed(dense), {}, "3000");
+    a.add_way({at(0.4, 0.502), at(0.4, 0.504)});
+    a.map();
+    compute_way_parent_polygons(a.data, 1);
+    CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[north].name_id);
+    CHECK_EQ(a.data.way_postcode_ids[1], a.data.admin_polygons[holed].name_id);
+    CHECK_EQ(a.data.way_postcode_ids[2], a.data.admin_polygons[indexed].name_id);
 }
 
 TEST(a_poi_takes_no_postcode_of_a_postal_area_of_another_country) {

@@ -40,6 +40,11 @@ public:
 
     bool contains(uint32_t pid, PackedLocation p) const;
 
+    // Whether polygon pid covers p, as ST_Covers: p is inside it or on an
+    // edge of one of its rings, a hole's too, which contains leaves to one
+    // side or the other.
+    bool covers(uint32_t pid, PackedLocation p) const;
+
     // The polygon of the first of `ranked` (admin cell index entries, see
     // rank_candidates) containing p, or NO_DATA: an entry flagged
     // INTERIOR_FLAG contains every point of its cell untested.

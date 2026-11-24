@@ -145,9 +145,9 @@ TEST(a_point_on_an_edge_two_rings_share_is_inside_exactly_one) {
             CHECK(inside_one(shift(west), shift(east), {o.lat_e7 + 3 * k + d, o.lon_e7 + k}));
 }
 
-TEST(exact_ring_edge_index_matches_the_scan_on_edges_and_vertices) {
+TEST(exact_ring_edge_index_matches_the_scans_on_edges_and_vertices) {
     std::mt19937_64 rng(20261102);
-    size_t inside = 0, tested = 0;
+    size_t inside = 0, on_edge = 0, tested = 0;
     for (int round = 0; round < 40; round++) {
         const uint32_t n = round % 4 == 0 ? 64 : 64 + static_cast<uint32_t>(rng() % 10000);
         const int64_t radius = round % 3 == 0 ? 100 : (round % 3 == 1 ? 1000000 : 300000000);
@@ -158,11 +158,15 @@ TEST(exact_ring_edge_index_matches_the_scan_on_edges_and_vertices) {
         for (const PackedLocation& p : probes(rng, ring, 2000)) {
             const bool want = exact_ring_contains(ring.data(), static_cast<uint32_t>(ring.size()), p);
             CHECK(index.contains(p) == want);
+            const bool touches = exact_ring_touches(ring.data(), static_cast<uint32_t>(ring.size()), p);
+            CHECK(index.touches(p) == touches);
             inside += want;
+            on_edge += touches;
             tested++;
         }
     }
     CHECK(inside > tested / 20);
+    CHECK(on_edge > tested / 20);
 }
 
 TEST(exact_ring_box_spans_the_vertices) {

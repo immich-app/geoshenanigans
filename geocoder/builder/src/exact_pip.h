@@ -130,6 +130,14 @@ public:
         });
     }
 
+    // exact_ring_touches: p's bucket holds every edge whose longitudes
+    // reach p's.
+    bool touches(PackedLocation p) const {
+        return buckets_.any_edge(p.lon_e7, [&](uint32_t a, uint32_t b) {
+            return exact_on_segment(verts_[b], verts_[a], p);
+        });
+    }
+
 private:
     const PackedLocation* verts_;
     RingEdgeBuckets buckets_;
