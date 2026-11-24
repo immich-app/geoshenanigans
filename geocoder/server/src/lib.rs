@@ -3795,13 +3795,22 @@ impl MultiIndex {
     }
 
     /// The credit of the data the loaded datasets hold (Index::credits, as each loaded), each
-    /// source once, in the order the datasets list them; none where none is loaded.
+    /// source once, in the order the datasets list them, of every notice any of them gives it
+    /// (a dataset of GB centroids owes GeoNames a notice others don't); none where none is
+    /// loaded.
     pub fn credits(&self) -> Vec<serde_json::Value> {
         let mut out: Vec<serde_json::Value> = Vec::new();
         for index in self.continents.iter().filter_map(|c| c.index.load_full()) {
             for entry in &index.credits {
-                if !out.iter().any(|e| e["id"] == entry["id"]) {
+                let Some(seen) = out.iter_mut().find(|e| e["id"] == entry["id"]) else {
                     out.push(entry.clone());
+                    continue;
+                };
+                let Some(have) = seen.get_mut("notices").and_then(serde_json::Value::as_array_mut) else { continue };
+                for notice in entry["notices"].as_array().into_iter().flatten() {
+                    if !have.contains(notice) {
+                        have.push(notice.clone());
+                    }
                 }
             }
         }
@@ -7428,6 +7437,34 @@ mod query_path_tests {
             assert_eq!(ids(&credits), want, "{written:?}");
             assert_eq!(credits[0], template_entry("osm"));
         }
+    }
+
+    // A source two datasets credit is credited once, of the notices of both: Asia's GeoNames
+    // centroids, of no GB postcode, owe no GB_full notice, which Europe's, of GB's, do.
+    #[test]
+    fn a_server_credits_a_source_of_two_datasets_once_of_both_their_notices() {
+        let root = two_continents();
+        let geonames = template_entry("geonames");
+        let notices = geonames["notices"].as_array().unwrap().clone();
+        assert!(notices[0].as_str().unwrap().starts_with("UK (GB_full.csv.zip)"));
+        let mut without_gb = geonames.clone();
+        without_gb["notices"] = serde_json::Value::Array(notices[1..].to_vec());
+        let asia = serde_json::json!([template_entry("osm"), without_gb]);
+        std::fs::write(root.path().join("asia").join("attribution.json"), asia.to_string()).unwrap();
+        write_credits(&root.path().join("europe"), "attribution.json", &["osm", "geonames", "codepoint-open"]);
+
+        let mi = MultiIndex::load(root.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+        let credits = mi.credits();
+        assert_eq!(ids(&credits), ["osm", "geonames", "codepoint-open"]);
+        let mut merged = credits[1].clone();
+        let mut given: Vec<String> = merged["notices"].as_array().unwrap().iter().map(|n| n.as_str().unwrap().to_owned()).collect();
+        let mut owed: Vec<String> = notices.iter().map(|n| n.as_str().unwrap().to_owned()).collect();
+        given.sort();
+        owed.sort();
+        assert_eq!(given, owed, "{merged}");
+        merged["notices"] = geonames["notices"].clone();
+        assert_eq!(merged, geonames);
+        assert_eq!(credits[2], template_entry("codepoint-open"));
     }
 
     // A server credits the datasets it loaded, not those their dirs hold now: a server sharing
