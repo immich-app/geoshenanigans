@@ -76,24 +76,26 @@ fn stamps_of(dir: &Path, names: &[&str]) -> std::io::Result<BTreeMap<String, Fil
 /// nothing from) the same before and after the load, else the files were being replaced and it
 /// fails. A dir of continent dirs (one holding no admin_cells.bin, which MultiIndex::load
 /// loads continent by continent) has each continent dir's dataset and water files checked so
-/// too; the stamps returned are still those of `dir`'s own.
+/// too, a continent whose files can't be looked up taken as such (MultiIndex::load skips it,
+/// and loads the others); the stamps returned are still those of `dir`'s own.
 pub fn load<T>(dir: &Path, load: impl FnOnce() -> Result<T, String>) -> Result<(T, Stamps), String> {
-    let mut dirs = vec![dir.to_path_buf()];
-    if !dir.join("admin_cells.bin").exists() {
-        dirs.extend(query_server::continents().iter().map(|c| dir.join(c.name)).filter(|d| d.is_dir()));
-    }
+    let continents: Vec<std::path::PathBuf> = if dir.join("admin_cells.bin").exists() {
+        Vec::new()
+    } else {
+        query_server::continents().iter().map(|c| dir.join(c.name)).filter(|d| d.is_dir()).collect()
+    };
+    let of = |d: &Path| Ok::<_, std::io::Error>((Stamps::of(d)?, stamps_of(&d.join(WATER_DIR), &WATER_FILES)?));
     let stamps = || {
-        let io = |e: std::io::Error| e.to_string();
-        dirs.iter()
-            .map(|d| Ok::<_, String>((Stamps::of(d).map_err(io)?, stamps_of(&d.join(WATER_DIR), &WATER_FILES).map_err(io)?)))
-            .collect::<Result<Vec<_>, String>>()
+        let own = of(dir).map_err(|e| e.to_string())?;
+        Ok::<_, String>((own, continents.iter().map(|d| of(d).ok()).collect::<Vec<_>>()))
     };
     let before = stamps()?;
     let loaded = load()?;
     if stamps()? != before {
         return Err(format!("The dataset in {} changed while it was loading", dir.display()));
     }
-    Ok((loaded, before.into_iter().next().map(|(own, _)| own).unwrap_or_default()))
+    let ((own, _), _) = before;
+    Ok((loaded, own))
 }
 
 /// Hashes of dataset files, each with the stat it was taken at; kept beside an index
@@ -942,6 +944,22 @@ mod tests {
             assert!(got.is_err_and(|e| e.contains("changed while it was loading")), "{what}");
         }
         assert_eq!(kept.unwrap().1, Stamps::default());
+    }
+
+    // A continent whose files can't be looked up (here under a water dir that is a file) is one
+    // MultiIndex::load skips, loading the others: it fails no load of the dir of continents.
+    #[test]
+    fn a_continent_whose_files_cant_be_looked_up_fails_no_regional_load() {
+        let ds = TempDir::new("unsearchable-continent");
+        for name in ["europe", "asia"] {
+            std::fs::create_dir(ds.0.join(name)).unwrap();
+            dataset(["Testville", "Otherton"]).write(&ds.0.join(name));
+        }
+        std::fs::write(ds.0.join("asia").join(WATER_DIR), b"not a dir").unwrap();
+
+        let got = load(&ds.0, || Ok(()));
+
+        assert_eq!(got.map(|(_, stamps)| stamps), Ok(Stamps::default()));
     }
 
     // A file that can't be looked up (here under a water dir that is a file, as under one that
