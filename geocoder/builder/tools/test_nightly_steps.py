@@ -262,6 +262,8 @@ elif url.endswith("/qid_sitelinks.bin") or url.endswith(".csv.tar.gz"):
     put(b"x" * 2000)
 elif url.endswith("/geocoder/tiger/latest.json"):
     print(json.dumps({{"year": "2025"}}))
+elif url.endswith("/geocoder/geonames/latest.json") and os.environ.get("FAKE_NO_POSTAL"):
+    sys.exit(22)
 elif url.endswith("/geocoder/geonames/latest.json"):
     places = b"US\t19026\tDrexel Hill\tPA\n"
     print(json.dumps({{"path": "geonames/20261116/1-2/postal_places.tsv.gz", "size": len(places),
@@ -372,9 +374,10 @@ class DownloadStepTest(unittest.TestCase):
             if alive(pid):
                 os.kill(pid, 9)
 
-    def download(self, cached, diff, pbf_cache="geocoder-cache", pbf_seconds=0):
-        """Runs the step with the cache holding `cached` (keys), the day's diff `diff` and a PBF that takes
-        `pbf_seconds` by the step's clock; returns its outputs, its output lines and how long it took."""
+    def download(self, cached, diff, pbf_cache="geocoder-cache", pbf_seconds=0, no_postal=False, fails=False):
+        """Runs the step with the cache holding `cached` (keys), the day's diff `diff`, a PBF that takes
+        `pbf_seconds` by the step's clock and, unless `no_postal`, the postal places' cache; returns its outputs,
+        its output lines and how long it took. `fails`: the step must fail, and gives no outputs."""
         output = os.path.join(self.root, "output")
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "WORKDIR": self.work, "CACHE_ENDPOINT": "http://cache.invalid",
                "CACHE_BUCKET": "cache", "CACHE_AWS_KEY": "k", "CACHE_AWS_SECRET": "s", "YESTERDAY": "2026-11-20",
@@ -383,7 +386,8 @@ class DownloadStepTest(unittest.TestCase):
                "S3_PUBLIC_URL": "https://public.invalid", "GITHUB_OUTPUT": output,
                "GITHUB_WORKSPACE": os.path.join(HERE, "..", "..", ".."), "FAKE_CALLS": self.calls,
                "FAKE_CACHED": ":".join(cached), "FAKE_DIFF": diff, "FAKE_DIFF_PID": self.diff_pid,
-               "FAKE_CLOCK": os.path.join(self.root, "clock"), "FAKE_PBF_SECONDS": str(pbf_seconds)}
+               "FAKE_CLOCK": os.path.join(self.root, "clock"), "FAKE_PBF_SECONDS": str(pbf_seconds),
+               "FAKE_NO_POSTAL": "1" if no_postal else ""}
         start = time.time()
         try:
             done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step_script("Download PBF and previous indexes")],
@@ -391,6 +395,9 @@ class DownloadStepTest(unittest.TestCase):
         except subprocess.TimeoutExpired:
             self.fail("the download step hung")
         took = time.time() - start
+        if fails:
+            self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+            return None, done.stdout, took
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         with open(output) as f:
             outputs = dict(line.split("=", 1) for line in f.read().splitlines())
@@ -414,6 +421,14 @@ class DownloadStepTest(unittest.TestCase):
         with open(self.calls) as f:
             return [int(line.split()[1]) for line in f.read().splitlines()
                     if line.startswith("timeout ") and "/replication/day/" in line]
+
+    # The postal places come down in the background, beside the PBF: a cache that names none fails the whole step,
+    # the PBF down or not.
+    def test_a_missing_postal_cache_fails_the_download_step(self):
+        _, stdout, _ = self.download(["geocoder-cache/planet-2026-11-21.osm.pbf"], "ok", no_postal=True, fails=True)
+        self.assertIn("::error::[postal] No postal places", stdout)
+        outputs, _, _ = self.download(["geocoder-cache/planet-2026-11-21.osm.pbf"], "ok")
+        self.assertIn("postal_places", outputs)
 
     # A run that has today's PBF from the cache needs no diff, and a stalled server can't hold its step (up to its
     # 60-minute timeout, a cancelled step the watchdog doesn't retry): it never asks for one.
