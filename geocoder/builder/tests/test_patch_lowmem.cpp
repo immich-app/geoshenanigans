@@ -1491,7 +1491,13 @@ TEST(patch_holds_the_old_postal_cities_it_replays_to_their_hash) {
     put_postal(day, rows);
     const LowMemCase c{dir.path(), "postal-day"};
     REQUIRE(prepare(c, base, day).empty());
-    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    // It replays the table: decodes the old rows and encodes the day's.
+    const LogCheck replayed = [](const std::string& log) {
+        for (const char* line : {"decode postal:", "encode postal:"})
+            if (log.find(line) == std::string::npos) return std::string("no ") + line + " line";
+        return std::string();
+    };
+    CHECK(apply_modes(c, ALL_MODES, replayed).bad.empty());
     const std::string postal = c.dir("old") + "/" + postal_cities::FILE_NAME;
     const std::vector<char> written = read_file(postal);
     BuildDir other;
