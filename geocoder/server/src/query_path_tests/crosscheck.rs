@@ -421,6 +421,35 @@ fn a_boundary_the_street_runs_into_ranks_by_its_own_place_type() {
 }
 
 #[test]
+fn a_boundary_the_street_runs_into_ranks_under_the_boundaries_round_it() {
+    // Saw Mill River Road runs east from Fairview, of level 8 and tagged place=suburb (rank 20),
+    // which holds house 9, into Elmsford, of level 9, which only Westchester County (rank 12)
+    // holds. placex_update ranks a boundary under the boundary of the highest level below its own
+    // round its centroid (placex_triggers.sql:881-906): Elmsford's is the county, so it keeps its
+    // level's rank, 18, and Fairview, which does not hold it, does not lift it to 22. The house's
+    // addr:city makes Elmsford the city_district, not the neighbourhood.
+    let index = |city: Option<&str>| {
+        let mut index = united_states();
+        index
+            .boundary("Westchester County", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+            .boundary("Fairview", 8, 4, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Elmsford", 9, 0, (-3000.0, 3000.0, 3000.0, 9000.0))
+            .street("Saw Mill River Road", &[(0.0, 1500.0), (0.0, 4000.0)])
+            .address("9", 10.0, 2900.0);
+        if let Some(city) = city {
+            index.addr_city(city);
+        }
+        index.load()
+    };
+    let (display, address) = answer_at(&index(None), 10.0, 2900.0);
+    assert_eq!(display, "9 Saw Mill River Road, Fairview, Westchester County, United States");
+    assert_eq!(address["suburb"], "Fairview");
+    let (display, address) = answer_at(&index(Some("Elmsford")), 10.0, 2900.0);
+    assert_eq!(display, "9 Saw Mill River Road, Fairview, Elmsford, Westchester County, United States");
+    assert_eq!((&address["city_district"], &address["neighbourhood"]), (&serde_json::json!("Elmsford"), &serde_json::Value::Null));
+}
+
+#[test]
 fn a_place_node_a_place_area_of_its_name_and_rank_links_is_no_row() {
     // High Wycombe, a place=town area of rank 16, holds the town node of its name, whose rank is
     // its own: find_linked_place's name match, which runs for ways as well as relations, links the

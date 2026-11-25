@@ -3836,7 +3836,8 @@ impl Index {
     /// street runs through. They are those of `areas`, the address's ranked polygons (found by
     /// `scan`), and the others: of the scan where the feature is a point, such as a larger
     /// boundary of a level `areas` holds it by, else of any admin cell under the street, each at
-    /// area_row_rank's rank; `country` is the point's, upper case.
+    /// area_row_rank's rank, a boundary the point is outside at own_area_rank's; `country` is the
+    /// point's, upper case.
     fn crosscheck_rows(&self, name: u32, areas: &[RankedPoly], scan: &mut AdminScan, nodes: &[NamedRow],
                        feature: PlaceFeature<'_>, country: &str) -> Vec<CrosscheckRow<'_>> {
         let named = |poly: &AdminPolygon| poly.name_id == name || self.links_name(poly, name);
@@ -3869,17 +3870,19 @@ impl Index {
             }
         }
         let mut seen: Vec<u32> = Vec::new();
-        for &(id, poly) in &candidates {
+        let scanned = scan.rings.len();
+        for (k, &(id, poly)) in candidates.iter().enumerate() {
             if !is_address_area(&poly) || !named(&poly) || seen.contains(&(id & ID_MASK)) { continue; }
             seen.push(id & ID_MASK);
             if areas.iter().any(|r| same(&r.poly, &poly)) { continue; }
-            let rank = self.area_row_rank(&poly, areas, country);
-            if !ADDRESS_AREA_RANKS.contains(&rank) { continue; }
-            let row = match feature {
-                PlaceFeature::Point(..) => scan.pip.holds(self, id, &poly),
-                PlaceFeature::Line(line) => runs_through(line, &poly),
+            let (row, at_point) = match feature {
+                PlaceFeature::Point(..) => (scan.pip.holds(self, id, &poly), true),
+                PlaceFeature::Line(line) => (runs_through(line, &poly), k < scanned && scan.pip.holds(self, id, &poly)),
             };
-            if row {
+            if !row { continue; }
+            // A boundary the point is outside ranks under the polygons round it, not the point's.
+            let rank = if at_point || poly.admin_level == 15 { self.area_row_rank(&poly, areas, country) } else { self.own_area_rank(&poly) };
+            if ADDRESS_AREA_RANKS.contains(&rank) {
                 polygons.push(RankedPoly { poly, rank_address: rank });
             }
         }
@@ -3942,6 +3945,22 @@ impl Index {
         promote_nested_ranks(&mut ranked, place_areas.iter(), country, |a, b| self.admin_geometry.polygon_within(a, b));
         let same = |r: &&RankedPoly| r.poly.ring_offset == poly.ring_offset && r.poly.ring_bytes == poly.ring_bytes;
         ranked.iter().find(same).map_or(initial, |r| r.rank_address)
+    }
+
+    /// The rank_address of the boundary `poly`, a row of an address whose point it does not hold:
+    /// the one find_admin gives it at its own point on surface, as placex_update ranks a boundary
+    /// under the boundary of the highest level below its own round its centroid
+    /// (placex_triggers.sql:881-906); where find_admin there ranks it in no row, area_row_rank's
+    /// under the polygons of the other levels round that point, in their country. 0 without rings.
+    fn own_area_rank(&self, poly: &AdminPolygon) -> u8 {
+        let Some((lat, lng)) = self.admin_geometry.point_on_surface(poly) else { return 0 };
+        let there = self.find_admin(f64::from(lat), f64::from(lng));
+        let same = |r: &&RankedPoly| r.poly.ring_offset == poly.ring_offset && r.poly.ring_bytes == poly.ring_bytes;
+        if let Some(r) = there.rows.iter().find(same) {
+            return r.rank_address;
+        }
+        let others: Vec<RankedPoly> = there.rows.iter().filter(|r| r.poly.admin_level != poly.admin_level).copied().collect();
+        self.area_row_rank(poly, &others, &upper_country(there.country_code))
     }
 
     /// getNearFeatures' distance of the area `poly` from `feature` (partition-functions.sql:32-36),
