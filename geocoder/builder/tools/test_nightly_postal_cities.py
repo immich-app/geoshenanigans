@@ -417,7 +417,7 @@ class NightlyPostalCitiesTest(unittest.TestCase):
 
     def test_the_cache_refreshes_weekly_from_geonames_and_never_overwrites_a_file(self):
         text = workflow("geocoder-geonames.yml")
-        self.assertRegex(text, r"(?m)^  schedule:\n    - cron: '[^']+'")
+        self.assertRegex(text, r"(?m)^  schedule:\n    - cron: '37 3 \* \* 1'(?: +#.*)?$")
         self.assertIn("workflow_dispatch:", text)
         script = step_script(text, "Build and upload postal_places.tsv.gz")
         self.assertIsNotNone(script)
