@@ -56,16 +56,21 @@ int main() {
          at(US, "19073", "Newtown Square"), at(US, "19083", "Havertown"), at(US, "19087", "Wayne"), at(US, "19089", "Wayne")});
     {
         // Three countries, a block each, and the US over three blocks: a
-        // block of BLOCK_ROWS, another, and the rest.
+        // block of BLOCK_ROWS, another, and the rest; the US's first code
+        // is Puerto Rico's first too, of another name.
         std::vector<LogicalRow> rows = {at(GU, "96910", "Hagåtña"), at(GU, "96913", "Barrigada")};
         const char* towns[] = {"San Juan", "Bayamón", "Carolina", "Ponce"};
         for (int i = 0; i < 5; i++) rows.push_back(at(PR, "009" + std::to_string(10 + 3 * i), towns[i % 4]));
+        rows.push_back(at(US, "00910", "Fixture Town"));
         for (int i = 0; i < 2 * int(postal_cities::BLOCK_ROWS) + 9; i++)
             rows.push_back(at(US, std::to_string(40200 + 2 * i), i % 5 ? "Louisville" : "Jeffersontown"));
         row("three countries, the last over three blocks", rows);
     }
-    row("codes of every length and names of every length",
-        {at(US, "1", "A"), at(US, "12", std::string(48, 'n')), at(US, "12 ", "O'Fallon"), at(US, "12-34", "Lee's Summit"),
+    // The longest name of 48 bytes ends in a character of three bytes of
+    // UTF-8 and one of four.
+    row("the shortest and longest codes and names",
+        {at(US, "1", "A"), at(US, "12", std::string(41, 'n') + "\xE5\xB1\xB1\xF0\xA0\x80\x80"), at(US, "12 ", "O'Fallon"),
+         at(US, "12-34", "Lee's Summit"),
          at(US, "12345678901234", "Cañon City"), at(US, "2", "Wilkes-Barre"), at(US, "~~~~~~~~~~~~~~", "Mayagüez")});
     {
         // A random table: codes of 9 digits, names of a few dozen.
