@@ -262,6 +262,11 @@ TEST(the_name_is_spelt_as_the_zips_votes_spell_its_key) {
     CHECK_EQ(name({{"Loíza", 3}}, "Loiza"), std::string("Loíza"));
     CHECK_EQ(name({{"Mayagüez", 20}, {"Mayaguez", 2}, {"Hormigueros", 21}}, "Mayaguez"), std::string("Mayagüez"));
     CHECK_EQ(name({{"Comerío", 15}, {"Comerio", 16}}, "Comerio"), std::string("Comerio"));
+    // An accented letter has its case: Álamo is in mixed case, ÁLAMO in
+    // capitals.
+    CHECK_EQ(name({{"alamo", 4}, {"Álamo", 2}}, "Alamo"), std::string("Álamo"));
+    CHECK_EQ(name({{"ÁLAMO", 5}, {"Álamo", 2}}), std::string("Álamo"));
+    CHECK_EQ(name({{"ÉLAN", 5}, {"élan", 9}}), std::string("ÉLAN"));
     // For GeoNames' key, none ending in a municipal word GeoNames' name lacks.
     CHECK_EQ(name({{"Roy City", 30}, {"Roy", 5}}, "Roy"), std::string("Roy"));
     CHECK_EQ(name({{"Salt Lake City", 300}, {"Salt Lake", 2}}, "Salt Lake City"), std::string("Salt Lake City"));

@@ -346,14 +346,22 @@ inline const char* step_name(Step s) {
 // max(2, 10% of them, rounded up).
 inline uint64_t margin(uint64_t votes) { return std::max<uint64_t>(2, (votes + 9) / 10); }
 
-// How a spelling is cased, the better first: in mixed case (or of no ASCII
-// letter), all in capitals, all in lower case.
+// How a spelling is cased, the better first: in mixed case (or of no letter
+// with a case), all in capitals, all in lower case. Its letters are ASCII's
+// and the Latin-1 ones upper() cases: U+00C0 to U+00DE but U+00D7 in
+// capitals, U+00DF to U+00FF but U+00F7 in lower case, as UTF-8.
 enum class Casing : uint8_t { MIXED, CAPITALS, LOWER };
 inline Casing casing(std::string_view s) {
     bool lower = false, capital = false;
-    for (char c : s) {
+    for (size_t i = 0; i < s.size(); i++) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
         lower |= c >= 'a' && c <= 'z';
         capital |= c >= 'A' && c <= 'Z';
+        if (c == 0xC3 && i + 1 < s.size()) {
+            const unsigned char d = static_cast<unsigned char>(s[++i]);
+            capital |= d >= 0x80 && d <= 0x9E && d != 0x97;
+            lower |= d >= 0x9F && d <= 0xBF && d != 0xB7;
+        }
     }
     return lower == capital ? Casing::MIXED : capital ? Casing::CAPITALS : Casing::LOWER;
 }
