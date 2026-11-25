@@ -322,15 +322,17 @@ fn a_boundary_the_street_runs_into_is_a_row_of_its_rank() {
 #[test]
 fn a_boundary_the_street_runs_along_is_a_row_of_its_rank() {
     // Saw Mill River Road runs along the border of Greenburgh and Elmsford, on nodes the boundary
-    // shares, which the street's f32 nodes hold 20 cm off: the intersection of the street and
-    // Elmsford is a stretch of the border, more than a point (ST_NPoints > 1), so Nominatim's
-    // street has a row of rank 16 for each, and the house's addr:city takes Elmsford. A street
-    // that ends on the border meets Elmsford at a point, and is no row of it.
+    // shares: the intersection of the street and Elmsford is a stretch of the border, more than a
+    // point (ST_NPoints > 1), so Nominatim's street has a row of rank 16 for each, and the house's
+    // addr:city takes Elmsford. So does a street that touches the border at two nodes, two
+    // points. A street 20 cm off the border, on nodes of its own, does not meet Elmsford, and one
+    // that ends on the border meets it at a point: neither is a row of it.
+    let border = [(-1000.0, 3000.0), (0.0, 3000.0), (1000.0, 3000.0)];
     let index = |city: Option<&str>, street: &[(f64, f64)]| {
         let mut index = united_states();
         index
-            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
-            .boundary("Elmsford", 8, 0, (-3000.0, 3000.0, 3000.0, 9000.0))
+            .boundary_through("Greenburgh", 8, 0, &[(-3000.0, -3000.0), (-3000.0, 3000.0), border[0], border[1], border[2], (3000.0, 3000.0), (3000.0, -3000.0)])
+            .boundary_through("Elmsford", 8, 0, &[(-3000.0, 3000.0), (-3000.0, 9000.0), (3000.0, 9000.0), (3000.0, 3000.0), border[2], border[1], border[0]])
             .street("Saw Mill River Road", street)
             .address("9", 0.0, 2990.0);
         if let Some(city) = city {
@@ -338,15 +340,46 @@ fn a_boundary_the_street_runs_along_is_a_row_of_its_rank() {
         }
         index.load()
     };
-    let along = [(-1000.0, 2999.8), (0.0, 2999.8), (1000.0, 2999.8)];
+    let along = border;
+    let touching = [(-1000.0, 1500.0), (-1000.0, 3000.0), (0.0, 2500.0), (1000.0, 3000.0), (1000.0, 1500.0)];
+    for street in [&along[..], &touching[..]] {
+        for (city, part) in [(None, "Greenburgh"), (Some("Elmsford"), "Elmsford")] {
+            let (display, address) = answer_at(&index(city, street), 0.0, 2990.0);
+            assert_eq!(display, format!("9 Saw Mill River Road, {part}, United States"), "{city:?} {street:?}");
+            assert_eq!(address["city"], part, "{city:?} {street:?}");
+        }
+    }
+    let beside = [(-1000.0, 2999.8), (0.0, 2999.8), (1000.0, 2999.8)];
+    for street in [&beside[..], &[(0.0, 1500.0), (0.0, 3000.0)][..]] {
+        let (display, address) = answer_at(&index(Some("Elmsford"), street), 0.0, 2990.0);
+        assert_eq!(display, "9 Saw Mill River Road, Greenburgh, United States", "{street:?}");
+        assert_eq!(address["city"], "Greenburgh", "{street:?}");
+    }
+}
+
+#[test]
+fn a_boundary_the_street_runs_along_an_edge_of_from_beyond_both_corners_is_a_row_of_its_rank() {
+    // Saw Mill River Road runs east from Greenburgh along the south edge of Elmsford, on no node
+    // of it, from beyond its south-west corner to beyond its south-east one: the street meets
+    // Elmsford in the whole edge, more than a point (ST_NPoints > 1), so Nominatim's street has a
+    // row of rank 16 for each, and the house's addr:city takes Elmsford.
+    let index = |city: Option<&str>| {
+        let mut index = united_states();
+        index
+            .boundary("Greenburgh", 8, 0, (-6000.0, -3000.0, 6000.0, 3000.0))
+            .boundary("Elmsford", 8, 0, (0.0, 3000.0, 6000.0, 9000.0))
+            .street("Saw Mill River Road", &[(0.0, 1500.0), (0.0, 10_000.0)])
+            .address("9", 10.0, 2900.0);
+        if let Some(city) = city {
+            index.addr_city(city);
+        }
+        index.load()
+    };
     for (city, part) in [(None, "Greenburgh"), (Some("Elmsford"), "Elmsford")] {
-        let (display, address) = answer_at(&index(city, &along), 0.0, 2990.0);
+        let (display, address) = answer_at(&index(city), 10.0, 2900.0);
         assert_eq!(display, format!("9 Saw Mill River Road, {part}, United States"), "{city:?}");
         assert_eq!(address["city"], part, "{city:?}");
     }
-    let (display, address) = answer_at(&index(Some("Elmsford"), &[(0.0, 1500.0), (0.0, 2999.8)]), 0.0, 2990.0);
-    assert_eq!(display, "9 Saw Mill River Road, Greenburgh, United States");
-    assert_eq!(address["city"], "Greenburgh");
 }
 
 #[test]
