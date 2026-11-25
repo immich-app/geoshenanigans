@@ -148,24 +148,31 @@ TEST(a_build_votes_with_its_grid_countries_addresses_and_tiger_lines) {
                                           {1.03f, 1.03f, 0, 0, 0, NO_DATA, 0}, {1.04f, 1.04f, 0, 0, 0, NO_DATA, 0},
                                           {1.05f, -1.05f, 0, 0, 0, NO_DATA, 0}, {2.05f, 2.05f, 0, 0, 0, NO_DATA, 0}};
     const std::vector<uint32_t> addr_postcodes = {1, 0, 1, 2, 0, NO_DATA};
-    // A TIGER line through three cells, its middle node in the third; an OSM
-    // interpolation (no ZIP); a line of a string no pattern takes.
-    const std::vector<NodeCoord> nodes = {{3.01f, 3.01f}, {3.11f, 3.01f}, {3.21f, 3.01f}, {3.31f, 3.01f},
-                                          {4.0f, 4.0f}, {4.1f, 4.0f}, {5.0f, 5.0f}};
-    std::vector<InterpWay> interps(3);
+    // A TIGER line through four cells, halfway along it in the second (its
+    // middle node, the third, in the third); an OSM interpolation (no ZIP); a
+    // line of a string no pattern takes; a line of two nodes across three
+    // cells and the same line the other way round, halfway along both in the
+    // middle cell.
+    const std::vector<NodeCoord> nodes = {{3.01f, 3.01f}, {3.11f, 3.01f}, {3.21f, 3.01f}, {3.31f, 3.01f}, {4.0f, 4.0f},
+                                          {4.1f, 4.0f},   {5.0f, 5.0f},   {6.01f, 6.01f}, {6.27f, 6.01f}, {6.27f, 6.01f},
+                                          {6.01f, 6.01f}};
+    std::vector<InterpWay> interps(5);
     interps[0].node_offset = 0, interps[0].node_count = 4;
     interps[1].node_offset = 4, interps[1].node_count = 2;
     interps[2].node_offset = 6, interps[2].node_count = 1;
-    const std::vector<uint32_t> interp_postcodes = {0, NO_DATA, 3};
+    interps[3].node_offset = 7, interps[3].node_count = 2;
+    interps[4].node_offset = 9, interps[4].node_count = 2;
+    const std::vector<uint32_t> interp_postcodes = {0, NO_DATA, 3, 0, 0};
     const postcode_grid::GridCells got =
         postcode_grid::grid_cells(addrs, addr_postcodes, interps, nodes, interp_postcodes, string_of, country_at, pos_at);
     REQUIRE(got.codes.size() == 2);
     CHECK(got.codes[0].country == US && got.codes[0].code == "19026");
     CHECK(got.codes[1].country == US && got.codes[1].code == "19073");
     CHECK_EQ(got.address_votes, size_t(3));
-    CHECK_EQ(got.tiger_votes, size_t(1));
-    // Cell (1.0, 1.0): 19073 twice, 19026 once; the line's middle node at 3.21.
-    CHECK(got.cells == std::vector<uint64_t>({postcode_grid::vote(10010, 1), postcode_grid::vote(32030, 0)}));
+    CHECK_EQ(got.tiger_votes, size_t(3));
+    // Cell (1.0, 1.0): 19073 twice, 19026 once; the first line's middle at
+    // 3.16, the two-node lines' at 6.14 either way round.
+    CHECK(got.cells == std::vector<uint64_t>({postcode_grid::vote(10010, 1), postcode_grid::vote(31030, 0), postcode_grid::vote(61060, 0)}));
 }
 
 TEST(a_builds_cells_and_rows_are_the_same_on_one_thread_and_many) {
@@ -235,6 +242,59 @@ TEST(a_gap_takes_the_nearer_cell_within_reach_and_none_past_it) {
     CHECK(same(rows({vote(20, 1), vote(end - 10, 0)}),
                {row(0, US, "19073"), none(20 + R + 1), row(end - 10 - R, US, "19026")}));
     CHECK(rows({}).empty());
+}
+
+// A region's grid is the planet's runs a query routed to it reads: the
+// region serves the level-10 cells 5 to 8. A house of 19026 10 cells before
+// cell 5 names the first cells of cell 5, where the region's own votes (one
+// house of 19073 in cell 7) would name none; the run of 19008 in cells 19 and
+// 20, which no query routed to the region reads, goes, and every cell the
+// region serves has the planet's postcode.
+TEST(a_regions_grid_is_the_planets_runs_a_query_routed_there_reads) {
+    using postcode_grid::vote;
+    const std::vector<GridCode> codes = {{US, "19008"}, {US, "19026"}, {US, "19073"}};
+    const uint64_t K = uint64_t(1) << 12;  // level-16 cells a level-10 cell
+    const uint64_t a = 5 * K - 10, d = 7 * K + 50, c = 20 * K + 100;
+    const std::vector<LogicalRow> planet = postcode_grid::grid_rows({vote(a, 1), vote(d, 2), vote(c, 0)}, codes, L);
+    auto served = [&](uint64_t id) {
+        int level = 0;
+        REQUIRE(postcode_grid::level_of(id, level) && level == 10);
+        const uint64_t at = id >> postcode_grid::cell_shift(10);
+        return at >= 5 && at < 9;
+    };
+    const std::vector<LogicalRow> region = postcode_grid::region_rows(planet, L, 10, served);
+    auto code_at = [](const std::vector<LogicalRow>& rows, uint64_t pos) {
+        std::string code = "-";
+        for (const LogicalRow& r : rows)
+            if (r.cell <= cell(pos)) code = r.country_code ? std::string(postcode_grid::code_of(r)) : "-";
+        return code;
+    };
+    CHECK_EQ(code_at(planet, 5 * K + 5), std::string("19026"));
+    CHECK_EQ(code_at(postcode_grid::grid_rows({vote(d, 2)}, codes, L), 5 * K + 5), std::string("-"));
+    CHECK_EQ(code_at(region, 5 * K + 5), std::string("19026"));
+    CHECK(same(region, {row(a - 150, US, "19026"), none(a + 151), row(d - 150, US, "19073"), none(d + 151)}));
+    size_t differ = 0;
+    for (uint64_t pos = 5 * K; pos < 9 * K; pos++) differ += code_at(planet, pos) != code_at(region, pos);
+    CHECK_EQ(differ, size_t(0));
+    CHECK_EQ(code_at(planet, c), std::string("19008"));
+    CHECK_EQ(code_at(region, c), std::string("-"));
+    // A region that serves none of the runs has no rows; one that serves
+    // every cell has the planet's.
+    CHECK(postcode_grid::region_rows(planet, L, 10, [](uint64_t) { return false; }).empty());
+    CHECK(same(postcode_grid::region_rows(planet, L, 10, [](uint64_t) { return true; }), planet));
+    CHECK_EQ(refusal(region), std::string());
+    // Served cells finer than the grid's: a level-17 cell in the first
+    // cell of 19026's run keeps it; one past the run's last keeps none.
+    auto served_17 = [&](uint64_t at) {
+        return [at](uint64_t id) {
+            int level = 0;
+            REQUIRE(postcode_grid::level_of(id, level) && level == 17);
+            return (id >> postcode_grid::cell_shift(17)) == at;
+        };
+    };
+    CHECK(same(postcode_grid::region_rows(planet, L, 17, served_17(4 * (a - 150))), {row(a - 150, US, "19026"), none(a + 151)}));
+    CHECK(postcode_grid::region_rows(planet, L, 17, served_17(4 * (a + 151))).empty());
+    CHECK(postcode_grid::region_rows({}, L, 17, served_17(0)).empty());
 }
 
 TEST(the_grid_file_is_run_coded_as_the_format_lays_it_out) {

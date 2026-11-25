@@ -62,7 +62,8 @@ int main() {
         row("two blocks and a row of three postcodes and gaps", rows);
     }
     {
-        // Steps of 1 to 2^34 cells, past the Rice codes' escape, across faces.
+        // Steps of 1 to 2^33 cells, across faces: the block's parameter, 30,
+        // takes each without the Rice code's escape.
         std::vector<LogicalRow> rows;
         uint64_t pos = 0;
         for (int i = 0; i < 35; i++) {
@@ -70,6 +71,14 @@ int main() {
             pos += uint64_t(1) << (i % 34);
         }
         row("steps of every size, across faces", rows);
+    }
+    {
+        // A block of 127 runs a cell apart and one 2^33 cells past them: the
+        // parameter is 0, and the long step takes the escape, its 64 bits.
+        std::vector<LogicalRow> rows;
+        for (uint64_t i = 0; i < postcode_grid::BLOCK_ROWS - 1; i++) rows.push_back(at(1000 + i, US, i % 2 ? "19073" : "19026"));
+        rows.push_back(at(1000 + postcode_grid::BLOCK_ROWS - 2 + (uint64_t(1) << 33) + 1, US, "19008"));
+        row("a step past the Rice code's escape", rows);
     }
     {
         // A block's rows each of a postcode of its own: ranks of seven bits.
@@ -88,6 +97,9 @@ int main() {
         }
         row("codes of every length of two countries", rows);
     }
+    // Runs of one code in two countries, a cell apart: two entries, and the
+    // country changes at the second.
+    row("one code in two countries", {at(91000, GB, "19026"), at(91001, US, "19026"), at(91002, 0, "")});
     {
         // A grid at level 10 of random runs.
         std::mt19937_64 rng(3);
@@ -121,7 +133,10 @@ int main() {
             if (code == last) continue;
             last = code;
             rows.push_back(code.empty() ? at(pos, 0, "") : at(pos, US, code));
-            pos += 1 + rng() % (rng() % 8 == 0 ? 5000 : 60);
+            // The step's draw, then its range's.
+            const uint64_t step = rng();
+            const uint64_t range = rng() % 8 == 0 ? 5000 : 60;
+            pos += 1 + step % range;
         }
         row("a random grid of 1000 rows", rows);
     }

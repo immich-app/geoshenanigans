@@ -761,12 +761,10 @@ void collect_postcode_grid(ParsedData& data) {
         data.addr_points, data.addr_postcode_ids, data.addr_city_ids, data.interp_ways, data.interp_nodes,
         data.interp_postcode_ids, [&](uint32_t id) { return std::string_view(data.get_string(id)); },
         [&](double lat, double lng) { return country_at(data, countries, lat, lng); }, pos_at);
-    data.postcode_grid_codes = std::move(grid.codes);
-    data.postcode_grid_cells = std::move(grid.cells);
-    if (!data.postcode_grid_cells.empty())
-        data.postcode_grid_file = encode_file(grid_rows(data.postcode_grid_cells, data.postcode_grid_codes, GRID_LEVEL));
+    data.postcode_grid_rows = grid_rows(grid.cells, grid.codes, GRID_LEVEL);
+    if (!data.postcode_grid_rows.empty()) data.postcode_grid_file = encode_file(data.postcode_grid_rows);
     std::cerr << "Postcode grid: " << grid.address_votes << " address votes, " << grid.tiger_votes << " TIGER line votes, "
-              << data.postcode_grid_codes.size() << " postcodes, " << data.postcode_grid_cells.size() << " cells, "
+              << grid.codes.size() << " postcodes, " << grid.cells.size() << " cells, " << data.postcode_grid_rows.size() << " runs, "
               << data.postcode_grid_file.size() << " bytes" << std::endl;
 
     // The postal cities, of the codes an answer in a grid country can give
@@ -788,10 +786,10 @@ void collect_postcode_grid(ParsedData& data) {
     }
     const size_t postal_areas = areas.size();
     postal_cities::TableCodes codes =
-        postal_cities::table_codes(data.postcode_grid_codes, data.postcode_grid_cells, grid.other_votes, std::move(areas));
+        postal_cities::table_codes(grid.codes, grid.cells, grid.other_votes, std::move(areas));
     std::vector<uint64_t>().swap(grid.other_votes);
     // The city votes of the table's codes: the merge keeps their order.
-    if (codes.codes.size() != data.postcode_grid_codes.size())
+    if (codes.codes.size() != grid.codes.size())
         parallel_for(grid.city_votes.size(), [&](size_t b, size_t e, unsigned) {
             for (size_t i = b; i < e; i++)
                 grid.city_votes[i] = city_vote(codes.of_grid[city_vote_code(grid.city_votes[i])], city_vote_city(grid.city_votes[i]));
@@ -808,12 +806,10 @@ void collect_postcode_grid(ParsedData& data) {
         dump.flush();
         if (!dump) throw std::runtime_error("failed to write " + data.postal_votes_dump);
     }
-    // Each grid code's row, and each other row a cell or a postal area gives,
-    // which a continent keeps the rows of its cells by.
+    // Each other row a cell or a postal area gives, which a continent keeps
+    // the rows of its cells by, beside the rows of its runs' codes.
     std::vector<uint32_t> row_of(codes.codes.size(), NO_DATA);
     for (size_t r = 0; r < table.row_codes.size(); r++) row_of[table.row_codes[r]] = static_cast<uint32_t>(r);
-    data.postal_city_row_of_grid_code.resize(codes.of_grid.size());
-    for (size_t g = 0; g < codes.of_grid.size(); g++) data.postal_city_row_of_grid_code[g] = row_of[codes.of_grid[g]];
     for (uint64_t v : codes.others)
         if (row_of[code_index(v)] != NO_DATA) data.postal_city_other_votes.push_back(vote(pos_of(v), row_of[code_index(v)]));
     data.postal_city_rows = std::move(table.rows);

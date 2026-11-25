@@ -511,13 +511,12 @@ struct ParsedData {
     };
     std::unordered_map<uint64_t, PostcodeAccum> postcode_accum;
 
-    // The postcode grid (postcode_grid_build.h): the postcodes its cells
-    // name and the cells holding votes, found once on the full data
-    // (collect_postcode_grid; a continent keeps the cells whose centre lies
-    // in it), and the region's postcode_grid.bin, which every mode dir holds
-    // alike: empty for a region of no such cell.
-    std::vector<postcode_grid::GridCode> postcode_grid_codes;
-    std::vector<uint64_t> postcode_grid_cells;
+    // The postcode grid (postcode_grid_build.h): the planet's runs, found
+    // once on the full data (collect_postcode_grid), which a continent's
+    // file is made of (region_rows) and which it doesn't keep, and the
+    // region's postcode_grid.bin, which every mode dir holds alike: empty for
+    // a region of no run.
+    std::vector<postcode_grid::LogicalRow> postcode_grid_rows;
     std::vector<uint8_t> postcode_grid_file;
 
     // The postal cities (postal_cities.h): the build's inputs to them
@@ -525,8 +524,7 @@ struct ParsedData {
     // names; --dump-postal-votes, where the votes go, "" for nowhere); the
     // planet's rows, found once on the full data with the grid
     // (collect_postcode_grid), of the ZIPs an answer can give; where the
-    // continents find theirs: each postcode_grid_codes entry's row
-    // (NO_DATA for none), which its cells give, and a
+    // continents find theirs beside the rows of their runs' codes: a
     // postcode_grid::vote(pos, row) for each other row a cell holds votes
     // for and each postal area's; and the region's postal_cities.bin, which
     // every mode dir holds alike: empty for a region of no row.
@@ -534,7 +532,6 @@ struct ParsedData {
     postal_cities::Names prev_postal_names;
     std::string postal_votes_dump;
     std::vector<postal_cities::LogicalRow> postal_city_rows;
-    std::vector<uint32_t> postal_city_row_of_grid_code;
     std::vector<uint64_t> postal_city_other_votes;
     std::vector<uint8_t> postal_cities_file;
 

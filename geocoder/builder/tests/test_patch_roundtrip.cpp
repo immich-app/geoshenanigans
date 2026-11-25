@@ -1275,12 +1275,6 @@ TEST(patch_round_trip_merges_postcode_centroids_as_logical_rows) {
     CHECK(!logged(same, "encode postcodes:"));
 }
 
-// The postcode grid (postcode_grid.h) of rows into d, as the builder writes it.
-static void put_grid(BuildDir& d, const std::vector<postcode_grid::LogicalRow>& rows) {
-    const std::vector<uint8_t> file = postcode_grid::encode_file(rows);
-    d[postcode_grid::FILE_NAME].assign(file.begin(), file.end());
-}
-
 // --decode-logical writes a dir's postcode grid as its 24-byte rows, and none
 // for a dir without one; a grid the encoder would not write is refused.
 TEST(decode_logical_writes_the_postcode_grids_rows) {
@@ -1348,7 +1342,7 @@ TEST(patch_round_trip_merges_the_postcode_grid_as_logical_rows) {
 
     const RoundTrip same = round_trip(old_d, old_d);
     CHECK(same.mismatches.empty());
-    CHECK(logged(same, "postcode_grid.bin: unchanged"));
+    CHECK(logged(same, "postcode_grid.bin: unchanged (copied "));
     CHECK(!logged(same, "encode grid:"));
 
     // A dir's first grid, and its last.

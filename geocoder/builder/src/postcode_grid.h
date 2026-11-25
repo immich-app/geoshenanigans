@@ -82,7 +82,8 @@ inline LogicalRow row_of(uint64_t cell, uint16_t country, std::string_view code)
     LogicalRow r;
     r.cell = cell;
     r.country_code = country;
-    std::memcpy(r.code, code.data(), code.size());
+    // An empty code's data() may be null, which memcpy may not take.
+    if (!code.empty()) std::memcpy(r.code, code.data(), code.size());
     return r;
 }
 

@@ -2284,6 +2284,10 @@ static int run(int argc, char* argv[]) {
     { std::vector<char>().swap(res_poi_v.seq.data); }
     serialize_merge(patch, res_place_n, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     serialize_merge(patch, res_postcodes, old_dir, new_dir, patcher_strings, offset_fixup_limits);
+    // The hash of the old postcode_grid.bin, before its section: a day that
+    // changes no run sends the grid unchanged, and the patcher copies the old
+    // file as it sits, held to the hash.
+    if (res_grid.old_size) append_old_file_hash(patch, old_dir, PatchFileId::POSTCODE_GRID);
     serialize_merge(patch, res_grid, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     serialize_merge(patch, res_postal, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     // The admin geometry, ahead of the admin cells: arc_index, arc_vertices,

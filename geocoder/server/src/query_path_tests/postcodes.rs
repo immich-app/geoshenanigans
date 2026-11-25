@@ -1,9 +1,8 @@
 //! The postcode of an answer without one of its own: Nominatim 5.3's get_nearest_postcode on a
-//! point (utils.sql:168-178), the street's middle, the house or the query point, which the
-//! postcode grid's cell of the point names first where the dir has a grid of the point's country;
-//! else the postcode area covering it, else the nearest postcode centroid whose box covers it,
-//! the box reaching the country's postcode extent from the centroid
-//! (settings/country_settings.yaml, postcodes.py).
+//! point (utils.sql:168-178), the street's middle, the house or the query point: the postcode
+//! area covering it, else the postcode grid's cell of the point where the dir has a grid of the
+//! point's country, else the nearest postcode centroid whose box covers it, the box reaching the
+//! country's postcode extent from the centroid (settings/country_settings.yaml, postcodes.py).
 
 use super::*;
 
@@ -479,6 +478,43 @@ fn the_postcode_grid_names_a_point_before_the_nearest_centroid() {
 }
 
 #[test]
+fn a_postal_area_names_a_point_before_the_grid_which_stands_in_for_the_nearest_centroid() {
+    // get_nearest_postcode takes a postal area covering the point before any centroid (ORDER BY
+    // osm_id is null), and the grid stands in for the nearest centroid: a US postal area of 19083
+    // round the point names it, though the grid's cell of it is 19026's; past the area the grid
+    // names it.
+    let point = (39.93538, -75.29800);
+    let mut dataset = country_at(point, b"US");
+    dataset.boundary("19083", POSTCODE_AREA_LEVEL, 0, (-300.0, -300.0, 300.0, 300.0)).centroid("19018", 1242.0, 0.0);
+    grid_of(&mut dataset, &[(grid_cell(point, 0.0, 0.0, 0), "19026"), (grid_cell(point, 0.0, 600.0, 0), "19026")]);
+    let index = dataset.load();
+    assert_eq!(postcode_from(&index, point, 0.0, 0.0), "19083");
+    assert_eq!(postcode_from(&index, point, 0.0, 600.0), "19026");
+
+    // At a street's middle, 1,450 m east, in the area: the street takes the area's, and so does
+    // its house, which has none of its own.
+    let (house, middle) = ((-30.0, 0.0), (0.0, 1450.0));
+    let mut dataset = country_at(point, b"US");
+    dataset.boundary("19083", POSTCODE_AREA_LEVEL, 0, (-300.0, 1150.0, 300.0, 1750.0))
+        .street("Gilmore Road", &[(0.0, -100.0), (0.0, 3000.0)])
+        .address("7", house.0, house.1);
+    grid_of(&mut dataset, &[(grid_cell(point, middle.0, middle.1, 0), "19018"), (grid_cell(point, house.0, house.1, 0), "19073")]);
+    let address = address_from(&dataset.load(), point, 0.0, 0.0);
+    assert_eq!(address["house_number"], "7");
+    assert_eq!(address["postcode"], "19083");
+
+    // At the house, where the street's middle names none: the area round the house names it.
+    let mut dataset = country_at(point, b"US");
+    dataset.boundary("19083", POSTCODE_AREA_LEVEL, 0, (-300.0, -300.0, 300.0, 300.0))
+        .street("Gilmore Road", &[(0.0, -100.0), (0.0, 3000.0)])
+        .address("7", house.0, house.1);
+    grid_of(&mut dataset, &[(grid_cell(point, middle.0, middle.1, 0), ""), (grid_cell(point, house.0, house.1, 0), "19073")]);
+    let address = address_from(&dataset.load(), point, 0.0, 0.0);
+    assert_eq!(address["house_number"], "7");
+    assert_eq!(address["postcode"], "19083");
+}
+
+#[test]
 fn a_cell_of_no_postcode_in_the_grid_leaves_the_point_to_the_nearest_centroid() {
     // Past the reach of every house the grid has no postcode, and get_nearest_postcode names the
     // point; before the grid's first run too.
@@ -489,6 +525,17 @@ fn a_cell_of_no_postcode_in_the_grid_leaves_the_point_to_the_nearest_centroid() 
     assert_eq!(postcode_from(&dataset.load(), point, 0.0, 0.0), "19018");
     let mut dataset = country_at(point, b"US");
     dataset.centroid("19018", 1242.0, 0.0).grid_run("19026", grid_cell(point, 0.0, 0.0, 1));
+    assert_eq!(postcode_from(&dataset.load(), point, 0.0, 0.0), "19018");
+}
+
+#[test]
+fn a_grid_postcode_the_answer_refuses_leaves_the_point_to_the_nearest_centroid() {
+    // A run of 44444, which Nominatim's pattern takes but the answer refuses as a placeholder (all
+    // one digit, postcode_looks_valid): the grid names the point no postcode, as a postal area of
+    // one names none, and the nearest centroid does.
+    let point = (39.93538, -75.29800);
+    let mut dataset = country_at(point, b"US");
+    dataset.centroid("19018", 1242.0, 0.0).grid_run("44444", grid_cell(point, 0.0, 0.0, -1));
     assert_eq!(postcode_from(&dataset.load(), point, 0.0, 0.0), "19018");
 }
 
