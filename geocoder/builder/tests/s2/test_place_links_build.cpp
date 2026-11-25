@@ -1053,3 +1053,17 @@ TEST(a_us_postal_area_of_a_zip_plus_4_names_its_zip) {
     CHECK(answers[0].find("2062") == std::string::npos);
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
+
+TEST(a_boundary_whose_name_en_is_empty_goes_by_its_nodes_english_name) {
+    // Sosnovka's boundary with an empty name:en: Nominatim's name:en of '' is no name, so the
+    // boundary goes by its town node's name:en as one without the tag does.
+    Fixture f;
+    f.country(41, 19, 82, 180, "Россия", "RU");
+    f.boundary(51.5, 39.5, 54.0, 43.5, 4, "Тамбовская область", {{"name:en", "Tambov Oblast"}});
+    const int64_t town = f.node(53.24, 41.37, {{"place", "town"}, {"name", "Сосновка"}, {"name:en", "Sosnovka"}});
+    f.boundary(53.20, 41.30, 53.30, 41.45, 8, "Сосновка", {{"name:en", ""}}, {{OsmType::Node, town, "label"}});
+    const std::vector<std::string> answers = answers_of(f, "empty-name-en", {{53.245, 41.375}});
+    REQUIRE(answers.size() == 1);
+    std::printf("    %s\n", answers[0].c_str());
+    CHECK(names(answers[0], "town", "Sosnovka"));
+}

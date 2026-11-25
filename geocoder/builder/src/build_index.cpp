@@ -2043,9 +2043,10 @@ static int run(int argc, char* argv[]) {
                             if (place_tag) {
                                 AdminPlaceType pt = classify_place_override(place_tag);
                                 if (pt != AdminPlaceType::NONE) {
+                                    // A name:en of '' is none, as Nominatim reads an empty name.
                                     const char* name = rel.tag("name:en");
-                                    const bool own_name_en = name != nullptr;
-                                    if (!name) name = rel.tag("name");
+                                    const bool own_name_en = name && name[0];
+                                    if (!own_name_en) name = rel.tag("name");
                                     if (name) {
                                         CollectedRelation cr;
                                         cr.id = rel.id;
@@ -2086,8 +2087,8 @@ static int run(int argc, char* argv[]) {
 
                         const char* name_en = rel.tag("name:en");
                         const char* name = rel.tag("name");
-                        const bool own_name_en = name_en != nullptr;
-                        if (!name_en) name_en = name;
+                        const bool own_name_en = name_en && name_en[0];
+                        if (!own_name_en) name_en = name;
                         if (!name_en && is_admin) continue;
 
                         std::string name_str;
