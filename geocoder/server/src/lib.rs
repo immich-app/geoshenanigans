@@ -7440,6 +7440,21 @@ mod pure_helper_tests {
     }
 
     #[test]
+    fn a_closed_street_that_starts_and_ends_on_a_ring_meets_it_in_one_point() {
+        // A 1 km square north-east of (0, 0), its corners vertices the street's nodes may share.
+        let corners = line_m(&[(0.0, 0.0), (0.0, 1000.0), (1000.0, 1000.0), (1000.0, 0.0), (0.0, 0.0)]);
+        let rings = vec![corners.iter().map(|c| [f64::from(c.lng), f64::from(c.lat)]).collect::<Vec<_>>()];
+        let (top, right) = (f64::from(corners[2].lat), f64::from(corners[2].lng));
+        let inside = |lat: f64, lng: f64| lat > 0.0 && lat < top && lng > 0.0 && lng < right;
+        // A loop outside the square from its south-west corner back to it, the closing node the
+        // first one again: the street meets the square in that one point, which getNearFeatures
+        // leaves out (ST_NPoints(ST_Intersection) > 1, partition-functions.sql:44).
+        assert!(!line_runs_through(&line_m(&[(0.0, 0.0), (-500.0, -200.0), (-200.0, -500.0), (0.0, 0.0)]), &rings, inside));
+        // A loop outside it through two of its corners meets it in two points.
+        assert!(line_runs_through(&line_m(&[(0.0, 0.0), (-500.0, 500.0), (0.0, 1000.0), (-1000.0, 500.0), (0.0, 0.0)]), &rings, inside));
+    }
+
+    #[test]
     fn place_nodes_cover_and_measure_from_the_street() {
         // The street runs north along longitude 0 from 1 km south to 5 km
         // north of the query. A hamlet 3 km north and 200 m east is no
