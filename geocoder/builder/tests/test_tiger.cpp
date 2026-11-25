@@ -4,6 +4,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <tuple>
 
 #include "test_framework.h"
 
@@ -41,6 +42,7 @@ void add_tiger_ranges_serially(ParsedData& data, const TigerCsv& csv) {
         acc.sum_lat_e7 += pc.sum.sum_lat_e7;
         acc.sum_lng_e7 += pc.sum.sum_lng_e7;
         acc.count += pc.sum.count;
+        acc.source = ATTRIBUTION_TIGER;
     }
 }
 
@@ -172,11 +174,13 @@ static void check_same_load(const ParsedData& got, const ParsedData& want) {
                         a.node_count == b.node_count;
     }
     CHECK(same_deferred);
-    // Same insertion sequence, so the same iteration order too.
-    std::vector<std::pair<uint64_t, uint64_t>> pa, pb;
-    for (const auto& [k, acc] : got.postcode_accum) pa.push_back({k, acc.count});
-    for (const auto& [k, acc] : want.postcode_accum) pb.push_back({k, acc.count});
+    // Same insertion sequence, so the same iteration order too; each
+    // centroid TIGER's, which its credit follows (attribution.h).
+    std::vector<std::tuple<uint64_t, uint64_t, uint8_t>> pa, pb;
+    for (const auto& [k, acc] : got.postcode_accum) pa.push_back({k, acc.count, acc.source});
+    for (const auto& [k, acc] : want.postcode_accum) pb.push_back({k, acc.count, acc.source});
     CHECK(pa == pb);
+    for (const auto& [k, acc] : got.postcode_accum) CHECK_EQ(int(acc.source), int(ATTRIBUTION_TIGER));
 }
 
 TEST(tiger_load_lays_files_out_as_adding_them_one_by_one_would) {

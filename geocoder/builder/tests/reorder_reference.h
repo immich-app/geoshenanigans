@@ -867,10 +867,17 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
 
         // Compute importance
         {
+            data.poi_water_importance.clear();
+            for (const auto& pr : data.poi_records)
+                if (poi_water_of(pr.flags) != PoiCategory::UNKNOWN) {
+                    data.poi_water_importance.assign(data.poi_records.size(), 0);
+                    break;
+                }
             for (size_t i = 0; i < data.poi_records.size(); i++) {
                 auto& pr = data.poi_records[i];
                 PoiCategory cat = static_cast<PoiCategory>(pr.category);
                 double base = category_base_importance(cat);
+                const PoiCategory water = poi_water_of(pr.flags);
 
                 // Wiki multiplier
                 bool has_wp = (pr.flags & POI_FLAG_WIKIPEDIA) != 0;
@@ -881,6 +888,7 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
                     if (sl > 0) {
                         // Smooth curve: 1 sitelink=1.2x, 10=1.8x, 50=2.9x, 200=3.6x
                         wiki_mult = 1.0 + std::log2(1.0 + sl) / 3.0;
+                        pr.flags |= POI_FLAG_SITELINKS;
                     } else if (has_wp && has_wd) {
                         wiki_mult = 3.0;  // fallback to binary flags
                     } else if (has_wp) {
@@ -896,6 +904,7 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
                 }
 
                 double raw = base * wiki_mult;
+                double water_raw = category_base_importance(water) * wiki_mult;
 
                 // Peak/volcano elevation scaling
                 if ((cat == PoiCategory::PEAK || cat == PoiCategory::VOLCANO) && i < poi_elevations.size()) {
@@ -918,10 +927,15 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
                     double lat_mid = std::abs((double)pr.lat);
                     double deg_to_km = 111.32 * std::cos(lat_mid * M_PI / 180.0);
                     double area_km2 = area_deg2 * 111.32 * deg_to_km;
-                    if (area_km2 > 0) raw *= std::min(1.0 + std::log2(1.0 + area_km2) / 4.0, 2.0);
+                    if (area_km2 > 0) {
+                        raw *= std::min(1.0 + std::log2(1.0 + area_km2) / 4.0, 2.0);
+                        water_raw *= std::min(1.0 + std::log2(1.0 + area_km2) / 4.0, 2.0);
+                    }
                 }
 
                 pr.importance = static_cast<uint8_t>(std::max(1.0, std::min(255.0, raw)));
+                if (water != PoiCategory::UNKNOWN)
+                    data.poi_water_importance[i] = static_cast<uint8_t>(std::max(1.0, std::min(255.0, water_raw)));
             }
             std::cerr << "  POI importance computed" << std::endl;
         }
