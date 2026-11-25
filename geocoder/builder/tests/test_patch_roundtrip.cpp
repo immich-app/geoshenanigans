@@ -1413,7 +1413,7 @@ TEST(patch_round_trip_merges_the_postal_cities_as_logical_rows) {
 
     const RoundTrip same = round_trip(old_d, old_d);
     CHECK(same.mismatches.empty());
-    CHECK(logged(same, "postal_cities.bin: unchanged"));
+    CHECK(logged(same, "postal_cities.bin: unchanged (copied "));
     CHECK(!logged(same, "encode postal:"));
 
     // A dir's first table, and its last.
