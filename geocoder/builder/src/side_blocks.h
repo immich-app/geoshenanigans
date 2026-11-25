@@ -1,12 +1,12 @@
 // A side file as it sits on disk: a u32 for each record of the record file it
 // sits beside, in that file's order (way_parents.bin and way_postcodes.bin
 // beside street_ways.bin, interp_postcodes.bin beside interp_ways.bin,
-// addr_postcodes.bin beside addr_points.bin). The builder writes one and the
-// patcher rebuilds it through Encoder; the server reads a value in place
-// (server/src/side_blocks.rs). The patch tools diff and replay the logical
-// form, the values as u32s back to back, which the file holds losslessly:
-// NO_DATA is a value like any other. The encoding has no choices, so the
-// values have one encoding, and the decoder refuses any other.
+// addr_postcodes.bin and addr_cities.bin beside addr_points.bin). The builder
+// writes one and the patcher rebuilds it through Encoder; the server reads a
+// value in place (server/src/side_blocks.rs). The patch tools diff and replay
+// the logical form, the values as u32s back to back, which the file holds
+// losslessly: NO_DATA is a value like any other. The encoding has no choices,
+// so the values have one encoding, and the decoder refuses any other.
 //
 // The file, front to back:
 //   the blocks, back to back, each from a byte: BLOCK_VALUES values a block

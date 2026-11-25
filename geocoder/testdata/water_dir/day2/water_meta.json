@@ -1,0 +1,6 @@
+{"types": [
+  {"code": 2, "class": "water", "type": "lake", "rank": 20},
+  {"code": 4, "class": "water", "type": "pond", "rank": 24},
+  {"code": 29, "class": "waterway", "type": "river", "rank": 19},
+  {"code": 50492, "class": "water", "type": "ganga_river", "rank": 22}
+]}

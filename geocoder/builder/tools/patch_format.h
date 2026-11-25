@@ -285,13 +285,16 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // centroids', in every patch (an empty merge where neither day has it), with
 // the old file's hash before it where the old grid has rows
 // (HASHED_OLD_FILES).
-// v21: the postal cities (postal_cities.h) merge as one logical stream of
+// v22: addr_cities.bin, an address point's addr:city as a core string
+// offset, follows addr_points.bin under file id 38 as a parallel delta of
+// string offsets after the other side files; id 37 names no file.
+// v23: the postal cities (postal_cities.h) merge as one logical stream of
 // 64-byte rows in (country, code) order under file id 37,
 // postal_cities.bin, which the patcher encodes again; a section of it right
 // after the postcode grid's, in every patch (an empty merge where neither
 // day has it), with the old file's hash before it where the old table has
 // rows (HASHED_OLD_FILES).
-static constexpr uint32_t GCPATCH_VERSION = 21;
+static constexpr uint32_t GCPATCH_VERSION = 23;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -350,9 +353,12 @@ enum class PatchFileId : uint32_t {
     GEO_ENTRIES = 35,
     // The postcode grid's logical rows (v20).
     POSTCODE_GRID = 36,
-    // The postal cities' logical rows (v21).
+    // The postal cities' logical rows (v23; no file in v22).
     POSTAL_CITIES = 37,
-    COUNT = 38
+    // Per address point: its addr:city, a core string offset (NO_DATA for
+    // none), along addr_points (v22).
+    ADDR_CITIES = 38,
+    COUNT = 39
 };
 
 static const char* patch_file_names[] = {
@@ -371,7 +377,8 @@ static const char* patch_file_names[] = {
     "interp_postcodes.bin",
     "geo_entries.bin",
     "postcode_grid.bin",
-    "postal_cities.bin"
+    "postal_cities.bin",
+    "addr_cities.bin"
 };
 
 // The string offset fields of a record file the patch merges, as byte
@@ -404,6 +411,7 @@ static constexpr SparseDeltaFile SPARSE_DELTA_FILES[] = {
     {PatchFileId::WAY_PARENTS, 4, 0},
     {PatchFileId::WAY_POSTCODES, 4, 2},
     {PatchFileId::INTERP_POSTCODES, 4, 2},
+    {PatchFileId::ADDR_CITIES, 4, 2},
 };
 
 inline const SparseDeltaFile* sparse_delta_file(PatchFileId fid) {
@@ -507,7 +515,8 @@ inline bool is_geo_list_id(uint32_t id) {
 // Whether an id of the file table names no file, so no file section's: the
 // legacy strings.bin (no patch sends it), the geo index's lists, and (v19)
 // ids 24 and 25, the postcode centroid cells, which the patcher writes beside
-// postcode_centroids.bin, and the entries file the centroids had.
+// postcode_centroids.bin, and the entries file the centroids had. Id 37,
+// which named no file in v22, is the postal cities' from v23.
 inline bool names_no_file(uint32_t id) {
     return id == uint32_t(PatchFileId::STRINGS) || is_geo_list_id(id) || id == uint32_t(PatchFileId::POSTCODE_CENTROID_CELLS) ||
            id == uint32_t(PatchFileId::POSTCODE_CENTROID_ENTRIES);
@@ -719,8 +728,9 @@ inline void require_copy_old_sizes(const std::string& name, uint64_t old_size, u
 }
 
 // Stride sentinel (v8): a per-record side file (one value per record of a
-// parent file: way_parents / way_postcodes per street way, addr_postcodes per
-// address, interp_postcodes per interpolation) rebuilt along the parent's
+// parent file: way_parents / way_postcodes per street way, addr_postcodes and
+// (v22) addr_cities per address, interp_postcodes per interpolation) rebuilt
+// along the parent's
 // merge sequence: MATCH and REPLACE copy the old record's value (remapped like
 // the sparse delta's remap_kind), INSERT takes the next inline value, DELETE
 // skips one; then (pos, value) pairs at new positions overwrite the values
@@ -770,6 +780,7 @@ static constexpr ParallelDeltaFile PARALLEL_DELTA_FILES[] = {
     {PatchFileId::WAY_PARENTS, PatchFileId::STREET_WAYS, 4, 0},
     {PatchFileId::WAY_POSTCODES, PatchFileId::STREET_WAYS, 4, 2},
     {PatchFileId::INTERP_POSTCODES, PatchFileId::INTERP_WAYS, 4, 2},
+    {PatchFileId::ADDR_CITIES, PatchFileId::ADDR_POINTS, 4, 2},
 };
 inline const ParallelDeltaFile* parallel_delta_file(PatchFileId fid) {
     for (const auto& f : PARALLEL_DELTA_FILES)

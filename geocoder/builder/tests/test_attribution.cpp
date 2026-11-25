@@ -294,10 +294,29 @@ TEST(attribution_entries_are_the_templates) {
     const size_t at = json.find(key);
     REQUIRE(at != std::string::npos && json.find(key, at + 1) == std::string::npos);
     const std::string all = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES | ATTRIBUTION_CODEPOINT |
-                                             ATTRIBUTION_TIGER | ATTRIBUTION_WIKIDATA | ATTRIBUTION_POSTAL_CITIES);
+                                             ATTRIBUTION_TIGER | ATTRIBUTION_WIKIDATA | ATTRIBUTION_MARINE |
+                                             ATTRIBUTION_POSTAL_CITIES);
     const std::string templates = canonical(json, at + key.size() - 1, "applies_to"), written = canonical_document(all);
     if (templates != written) std::printf("    template: %s\n    written:  %s\n", templates.c_str(), written.c_str());
     CHECK(templates == written);
+}
+
+TEST(attribution_of_marine_regions_follows_osm_and_says_how_the_dataset_changed_its_data) {
+    // A water dir holding a sea or ocean credits OpenStreetMap and Marine
+    // Regions, whose CC BY 4.0 asks for the changes (section 3(a)(1)(B)).
+    const std::string water = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_MARINE);
+    const size_t osm = water.find("\"id\": \"osm\""), marine = water.find("\"id\": \"marine-regions\"");
+    REQUIRE(osm != std::string::npos && marine != std::string::npos);
+    CHECK(osm < marine);
+    for (const char* line : {
+             R"("licence": "CC BY 4.0")", R"("licence_url": "https://creativecommons.org/licenses/by/4.0/")",
+             R"(The intersect of the Exclusive Economic Zones and IHO sea areas, version 5)",
+             R"(https://doi.org/10.14284/699)",
+             R"("Changes: each IHO sea area's parts in every EEZ dissolved into one, cut to the water off )"}) {
+        if (water.find(line, marine) == std::string::npos) std::printf("    %s\n", line);
+        CHECK(water.find(line, marine) != std::string::npos);
+    }
+    CHECK(attribution_json(ATTRIBUTION_OSM).find("marine-regions") == std::string::npos);
 }
 
 TEST(attribution_json_quote_escapes_what_json_needs) {

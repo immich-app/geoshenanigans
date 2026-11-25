@@ -1,9 +1,9 @@
 #pragma once
-// The credit a dataset's data is owed. Each mode dir the build writes holds
-// attribution.json: the entries of the sources its data came from, as
-// configurations.template.json's top-level `attribution` list gives them
-// (without their `applies_to`), in its order. Every dataset takes one mode
-// dir, so every dataset holds its credit. A POI tier dir holds
+// The credit a dataset's data is owed. Each mode dir and water dir the build
+// writes holds attribution.json: the entries of the sources its data came
+// from, as configurations.template.json's top-level `attribution` list gives
+// them (without their `applies_to`), in its order. Every dataset takes one
+// mode dir, so every dataset holds its credit. A POI tier dir holds
 // poi_attribution.json where Wikidata's sitelinks ranked a POI of it: Wikidata's
 // entry, beside the mode dir's credit of the OpenStreetMap data, by a name of
 // its own, as a dataset's files land in one dir by name.
@@ -31,11 +31,14 @@ enum AttributionSource : uint8_t {
     // GB_full, derived from Ordnance Survey's Code-Point Open, whose credit
     // travels with it.
     ATTRIBUTION_CODEPOINT = 1 << 4,
+    // The seas and oceans of a water dir (--marine, tools/marine_import.py),
+    // Marine Regions' sea areas cut to OSM's land (water_layer.h).
+    ATTRIBUTION_MARINE = 1 << 5,
     // The postal cities' names (postal_cities_build.h) of a build given
     // GeoNames's US postal places (--postal-places) or yesterday's table,
     // whose names they chose (--prev-postal-cities): GeoNames's entry, with
     // its notice of them, beside ATTRIBUTION_GEONAMES or without it.
-    ATTRIBUTION_POSTAL_CITIES = 1 << 5,
+    ATTRIBUTION_POSTAL_CITIES = 1 << 6,
 };
 
 struct AttributionNotice {
@@ -106,6 +109,16 @@ inline constexpr AttributionEntry kAttribution[] = {
      "https://creativecommons.org/publicdomain/zero/1.0/",
      {{"POI importance from the sitelink counts of the POIs' Wikidata items; Wikidata's structured data is available "
        "under CC0 1.0."}}},
+    // The changes CC BY 4.0 asks a distributor to indicate, as GeoNames's:
+    // what tools/marine_import.py and the water layer make of the sea areas.
+    {ATTRIBUTION_MARINE, "marine-regions",
+     "Flanders Marine Institute (2024). The intersect of the Exclusive Economic Zones and IHO sea areas, version 5. "
+     "Available online at https://www.marineregions.org/. https://doi.org/10.14284/699",
+     "https://www.marineregions.org/", "CC BY 4.0", "https://creativecommons.org/licenses/by/4.0/",
+     {{"Changes: each IHO sea area's parts in every EEZ dissolved into one, cut to the water off OpenStreetMap's land "
+       "polygons and along a 1-degree grid, the coastal water the sea areas leave out given to the nearest sea area, "
+       "and simplified in the simplified tiers. Cut to OpenStreetMap's land, the areas are part of this dataset's ODbL "
+       "derivative database."}}},
 };
 
 // `s` as a JSON string: quotes and backslashes escaped, control characters

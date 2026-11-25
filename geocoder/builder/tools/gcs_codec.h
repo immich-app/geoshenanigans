@@ -328,9 +328,9 @@ struct Enc : Encoder {
 }  // namespace ways
 
 // ------------------------------------------------------------------ side files (side_blocks.h)
-// way_parents.bin, way_postcodes.bin, interp_postcodes.bin and addr_postcodes.bin are side blocks in
-// every dir: these codecs turn one into its logical form, the u32 values back to back, for the
-// patcher's deltas and back. A family is its file's name without ".bin".
+// way_parents.bin, way_postcodes.bin, interp_postcodes.bin, addr_postcodes.bin and addr_cities.bin
+// are side blocks in every dir: these codecs turn one into its logical form, the u32 values back to
+// back, for the patcher's deltas and back. A family is its file's name without ".bin".
 namespace side {
 // The codec's buffers: a file streams front to back a block (262 bytes at most) at a time, its
 // table 4 bytes a block.

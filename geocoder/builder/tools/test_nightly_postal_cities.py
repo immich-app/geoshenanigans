@@ -384,7 +384,7 @@ class NightlyPostalCitiesTest(unittest.TestCase):
 
         def spliced(postal, sha):
             with open(os.path.join(out, "configurations.json"), "w") as f:
-                json.dump({"build": {"version": 24, "patch_version": 21}, "files": {}}, f)
+                json.dump({"build": {"version": 24, "patch_version": 23}, "files": {}}, f)
             env = {"PATH": os.environ["PATH"], "WORKDIR": self.work, "NEW_DATE": "2026-11-23", "OLD_DATE": "2026-11-22",
                    "HAS_PREVIOUS": "false", "WIKIDATA_DATE": "null", "POSTAL_CITIES_PREVIOUS": postal,
                    "POSTAL_CITIES_PREVIOUS_SHA256": sha}

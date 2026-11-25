@@ -314,6 +314,17 @@ struct ArcTier {
     double cap_factor;     // 0: none
     int32_t grid_e7;       // the snap grid's step; 1: OSM's own
     int32_t fine_grid_e7;  // the grid a collapsing ring keeps: grid_e7 for a tier that doesn't coarsen
+    // Whether the crossing repair counts only segments that one polygon's
+    // rings use (its outer ring and its holes, a ring with itself): areas
+    // that may overlap, whose borders cross one another where they lie.
+    bool crossings_within_polygons = false;
+    // Whether a ring valid as OSM has it that the tier's grid collapses with
+    // every vertex kept (under 3 vertices or of no area: a pond within a
+    // step or two of the grid) keeps its arcs, and their junctions, on the e7
+    // grid: areas small enough to fit between the grid's points. So does a
+    // ring that such a junction, on the e7 grid among its vertices on the
+    // tier's, collapses in turn.
+    bool collapsing_rings_on_e7 = false;
     bool simplifies() const { return tolerance_m > 0; }
     bool coarsens() const { return grid_e7 > fine_grid_e7; }
 };
@@ -324,6 +335,47 @@ inline constexpr ArcTier kArcTiers[] = {
     {ArcSet::Minimal, "admin-minimal", kArcSimplifyToleranceM, kArcCapFactor, kMinimalCoarseGridE7, kSimplifiedGridE7},
 };
 inline constexpr size_t kArcTierCount = sizeof(kArcTiers) / sizeof(kArcTiers[0]);
+
+// The water layer's tiers (water_layer.h), under a region's dir: the
+// boundary tiers' tolerance, cap and grid, and every raw vertex. Water areas
+// overlap (a lake in a wetland, a river in a bay), so the repair counts the
+// crossings of each polygon's own rings only; a pond the grid would collapse
+// keeps its shore on the e7 grid.
+inline constexpr ArcTier kWaterArcTiers[] = {
+    {ArcSet::Full, "water/all/simplified", kArcSimplifyToleranceM, kArcCapFactor, kSimplifiedGridE7, kSimplifiedGridE7,
+     true, true},
+    {ArcSet::Full, "water/all/exact", 0, 0, 1, 1, true},
+};
+inline constexpr size_t kWaterArcTierCount = sizeof(kWaterArcTiers) / sizeof(kWaterArcTiers[0]);
+
+// Where the arc stage cuts its rings into arcs: at their junctions, or at
+// those and at the ends of their member ways too (each vertex where a
+// ring's way changes), so that an edit to one way changes only the arcs
+// along it.
+enum class ArcCuts : uint8_t { Junctions, JunctionsAndWayEnds };
+
+// One run of the arc stage: the tiers it builds (the minimal set only when
+// one of them is of it), where it cuts rings, the dir under a region's that
+// holds its full set's sidecars, and what its log lines call it: `name` in
+// the phase lines, `set_word` as the full set's set= in its ARC_CHECK lines.
+struct ArcStage {
+    const char* name;
+    const char* set_word;
+    const ArcTier* tiers;
+    size_t tier_count;
+    ArcCuts cuts;
+    const char* sidecar_dir;
+    bool has_minimal() const {
+        for (size_t t = 0; t < tier_count; t++)
+            if (tiers[t].set == ArcSet::Minimal) return true;
+        return false;
+    }
+};
+
+inline constexpr ArcStage kAdminArcStage{"Admin", "full", kArcTiers, kArcTierCount, ArcCuts::Junctions, "quality/exact"};
+inline constexpr ArcStage kWaterArcStage{"Water", "water", kWaterArcTiers, kWaterArcTierCount,
+                                         ArcCuts::JunctionsAndWayEnds, "water/all/exact"};
+static_assert(kWaterArcTierCount <= kArcTierCount, "the encoded arcs hold kArcTierCount tiers at most");
 
 // The dir beside admin-minimal that holds the minimal set's arcs too, in the
 // shared polygon slots a POI's parent names (write_admin_minimal).
@@ -345,8 +397,11 @@ static constexpr uint64_t kRefChunkCutMask = 7;
 // its arcs (half the 1e-4 degree grid, the coarsest a tier may take).
 static constexpr int32_t kChunkBoxSlackE7 = 500;
 constexpr bool every_tier_snaps_within_the_chunk_slack() {
-    for (const ArcTier& tier : kArcTiers)
-        if (tier.grid_e7 / 2 > kChunkBoxSlackE7 || tier.fine_grid_e7 > tier.grid_e7) return false;
+    for (const ArcStage* stage : {&kAdminArcStage, &kWaterArcStage})
+        for (size_t t = 0; t < stage->tier_count; t++) {
+            const ArcTier& tier = stage->tiers[t];
+            if (tier.grid_e7 / 2 > kChunkBoxSlackE7 || tier.fine_grid_e7 > tier.grid_e7) return false;
+        }
     return true;
 }
 static_assert(every_tier_snaps_within_the_chunk_slack(),
@@ -1173,11 +1228,11 @@ struct CollectedPoiRelation {
     // relation's addr:street / addr:housenumber / addr:postcode win
     // as the primary feature's road/house_number/postcode fields.
     // Mirrors Nominatim's rank-30 row creation for relations with
-    // addr:housenumber (e.g. White House R19761182).
+    // addr:housenumber (e.g. White House R19761182). Its addr:city goes
+    // with the point too.
     std::string addr_housenumber;
     std::string addr_street;
     std::string addr_postcode;
-    // Its addr:city, for the postal cities' votes alone.
     std::string addr_city;
     std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
 };

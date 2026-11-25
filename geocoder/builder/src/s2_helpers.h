@@ -35,27 +35,26 @@ std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<std::pair
 
 // --- Helper functions that depend on S2 ---
 
-// Interns the address strings (street, housenumber, postcode, in that order)
-// and appends the point via append_addr_point.
+// Interns the address strings (street, housenumber, postcode, city, in that
+// order) and appends the point via append_addr_point.
 void add_addr_point(ParsedData& data, double lat, double lng,
                     const char* housenumber, const char* street,
-                    const char* postcode,
+                    const char* postcode, const char* city,
                     uint64_t& addr_count_total,
                     uint64_t osm_id_packed,
                     const NodeCoord* polygon_vertices = nullptr,
-                    uint32_t polygon_vertex_count = 0,
-                    const char* city = nullptr);
+                    uint32_t polygon_vertex_count = 0);
 
 // Appends one address point whose strings are already interned (NO_DATA
-// for a missing street or postcode, or city: an offset in
-// data.postal_vote_pool); `cell` is point_to_cell() of its location
-// (lat/lng are stored as float).
+// for a missing street, postcode or city; vote_city_id the city again, an
+// offset in data.postal_vote_pool); `cell` is point_to_cell() of its
+// location (lat/lng are stored as float).
 void append_addr_point(ParsedData& data, double lat, double lng,
                        uint32_t housenumber_id, uint32_t street_id, uint32_t postcode_id,
-                       S2CellId cell, uint64_t osm_id_packed,
+                       uint32_t city_id, S2CellId cell, uint64_t osm_id_packed,
                        const NodeCoord* polygon_vertices = nullptr,
                        uint32_t polygon_vertex_count = 0,
-                       uint32_t city_id = NO_DATA);
+                       uint32_t vote_city_id = NO_DATA);
 
 // Appends the admin polygon of a closed way's ring, with the ring itself to
 // the exact rings and their area as the polygon's.

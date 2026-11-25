@@ -16,8 +16,10 @@
 // addresses in cell order, whatever their names, and its postcode centroids
 // in cell order in each mode dir, which a chained build writes as a fresh one
 // does, and its postcode grid of a grid country's addresses in every mode dir
-// alike, which the server answers from before the nearest centroid. Every
-// mode dir credits the sources of the data it holds in attribution.json:
+// alike, which the server answers from before the nearest centroid. An
+// address keeps its addr:city beside the full dir's address points where a
+// place or a boundary has that name, which writes no string. Every mode dir
+// credits the sources of the data it holds in attribution.json:
 // OpenStreetMap, GeoNames and Code-Point Open, which its GB data is derived
 // from, where a postcode centroid there came from it, TIGER where an
 // interpolation, a centroid or the postcode grid's votes did.
@@ -206,10 +208,13 @@ std::set<std::string> admin_dir_layout() {
     return out;
 }
 
+// An admin dir's geometry file: not the water layer's, which has files of
+// the same names (water_layer.h).
 bool admin_geometry(const std::string& name) {
     const std::string file = fs::path(name).filename().string();
-    return file == "admin_polygons.bin" || file == "admin_rings.bin" || file == "arc_index.bin" ||
-           file == "arc_vertices.bin";
+    return name.find("/water/") == std::string::npos &&
+           (file == "admin_polygons.bin" || file == "admin_rings.bin" || file == "arc_index.bin" ||
+            file == "arc_vertices.bin");
 }
 
 // An arc sidecar's slots: each live one's arc key, UINT64_MAX for a
@@ -264,7 +269,8 @@ std::map<std::string, std::vector<char>> arc_files(const std::string& out) {
     std::map<std::string, std::vector<char>> files = tree(out);
     for (auto it = files.begin(); it != files.end();) {
         const std::string file = fs::path(it->first).filename().string();
-        it = admin_geometry(it->first) || file == "arc_index.osm_ids" ? std::next(it) : files.erase(it);
+        const bool admin_sidecar = file == "arc_index.osm_ids" && it->first.find("/water/") == std::string::npos;
+        it = admin_geometry(it->first) || admin_sidecar ? std::next(it) : files.erase(it);
     }
     return files;
 }
@@ -465,7 +471,7 @@ std::map<std::string, std::vector<uint32_t>> side_files(const std::map<std::stri
     };
     std::map<std::string, std::vector<uint32_t>> out;
     for (const SideFile& side : {SideFile{"way_parents.bin", "street_ways.bin"}, SideFile{"way_postcodes.bin", "street_ways.bin"},
-                                 SideFile{"addr_postcodes.bin", "addr_points.bin"},
+                                 SideFile{"addr_postcodes.bin", "addr_points.bin"}, SideFile{"addr_cities.bin", "addr_points.bin"},
                                  SideFile{"interp_postcodes.bin", "interp_ways.bin"}}) {
         const auto file = files.find(dir + side.name);
         if (file == files.end()) continue;
@@ -569,6 +575,70 @@ std::string admin_preset_dir(const std::string& out, const std::string& region, 
     for (const char* f : {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin"})
         fs::copy_file(out + "/" + region + "/quality/exact/" + f, into + "/" + f, fs::copy_options::overwrite_existing);
     return into;
+}
+
+// The fixture with five more addresses on Teststrasse, a building and a
+// POI relation with a house number, all but one named a town by addr:city
+// (none with `cities` false): Testville, the place node's name; Gemeinde 3
+// and Kanton, boundaries'; Teststrasse, only the street's; and Nirgendwo,
+// nothing's. Each address is at a point of its own, which `cities_at`
+// gives with the town ("" for none).
+struct CityAt {
+    double lat, lng;
+    std::string city;
+};
+
+std::vector<CityAt> cities_at() {
+    return {{47.141, 8.15, "Testville"},     {47.1412, 8.1502, "Gemeinde 3"}, {47.1414, 8.1504, ""},
+            {47.1416, 8.1506, ""},           {47.1418, 8.1508, ""},           {47.1425, 8.1525, "Testville"},
+            {47.1435, 8.1545, "Kanton"}};
+}
+
+std::vector<TestObject> with_cities(bool cities) {
+    std::vector<TestObject> objects = fixture();
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    auto tags = [&](const std::string& number, const char* city) {
+        std::vector<std::pair<std::string, std::string>> t = {{"addr:housenumber", number}, {"addr:street", "Teststrasse"}};
+        if (cities && city) t.push_back({"addr:city", city});
+        return t;
+    };
+    for (TestObject& o : objects)
+        if (o.type == OsmType::Node && o.id == 952) o.tags = tags("1", "Testville");
+    const char* towns[] = {"Gemeinde 3", "Teststrasse", "Nirgendwo", nullptr};
+    for (int k = 0; k < 4; k++)
+        objects.push_back(node(953 + k, lat0 + 1412000 + 2000 * k, lng0 + 1502000 + 2000 * k, tags(std::to_string(3 + 2 * k), towns[k])));
+    // A building round (47.1425, 8.1525) and a castle round (47.1435, 8.1545),
+    // squares of 0.0002 degrees.
+    auto square = [&](int64_t first, int32_t lat, int32_t lng) {
+        const int32_t corners[4][2] = {{lat - 1000, lng - 1000}, {lat - 1000, lng + 1000}, {lat + 1000, lng + 1000}, {lat + 1000, lng - 1000}};
+        for (int k = 0; k < 4; k++) objects.push_back(node(first + k, corners[k][0], corners[k][1]));
+        return std::vector<int64_t>{first, first + 1, first + 2, first + 3, first};
+    };
+    std::vector<std::pair<std::string, std::string>> building = tags("11", "Testville");
+    building.push_back({"building", "yes"});
+    objects.push_back(way(4020, square(980, lat0 + 1425000, lng0 + 1525000), building));
+    objects.push_back(way(4021, square(990, lat0 + 1435000, lng0 + 1545000)));
+    TestObject castle;
+    castle.type = OsmType::Relation;
+    castle.id = 60;
+    castle.tags = tags("13", "Kanton");
+    for (const auto& tag : std::vector<std::pair<std::string, std::string>>{{"name", "Schloss"}, {"tourism", "attraction"}, {"type", "multipolygon"}})
+        castle.tags.push_back(tag);
+    castle.members.emplace_back(OsmType::Way, 4021, "outer");
+    objects.push_back(castle);
+    std::stable_sort(objects.begin(), objects.end(), [](const TestObject& a, const TestObject& b) {
+        return a.type != b.type ? a.type < b.type : a.id < b.id;
+    });
+    return objects;
+}
+
+// The core strings of a tree's dir, as they sit back to back.
+std::string core_strings(const std::map<std::string, std::vector<char>>& files, const std::string& dir) {
+    const std::vector<char>& file = files.at(dir + "strings_core.bin");
+    std::string strings;
+    string_files::decode(reinterpret_cast<const uint8_t*>(file.data()), file.size(),
+                         [&](const char* p, size_t n) { strings.append(p, n); });
+    return strings;
 }
 
 }  // namespace
@@ -682,10 +752,12 @@ TEST(a_build_without_the_multi_flags_writes_whole_dirs_the_server_answers_from) 
     }
     CHECK_EQ(files.at("planet/admin_polygons.bin").size(), 7 * sizeof(AdminPolygonRecord));
     // Its side files hold a value for each street and each address: the
-    // street's parent, one of the seven polygons, and no postcode, of which
-    // the fixture has none; no interpolations, so no file of their postcodes.
+    // street's parent, one of the seven polygons, and no postcode or city,
+    // of which the fixture has none; no interpolations, so no file of their
+    // postcodes.
     const auto side = side_files(files, "planet/");
-    CHECK(names_of(side) == std::set<std::string>({"addr_postcodes.bin", "way_parents.bin", "way_postcodes.bin"}));
+    CHECK(names_of(side) ==
+          std::set<std::string>({"addr_cities.bin", "addr_postcodes.bin", "way_parents.bin", "way_postcodes.bin"}));
     for (const auto& [name, values] : side) {
         REQUIRE(values.size() == 1);
         CHECK(name == "way_parents.bin" ? values[0] < 7 : values[0] == NO_DATA);
@@ -742,13 +814,144 @@ TEST(a_build_without_the_multi_flags_writes_whole_dirs_the_server_answers_from) 
                   std::vector<char>({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'A', 'D', 'F', '1'}));
             CHECK(regions.at(region + "/addr_index.bin") == std::vector<char>({0, 0, 0, 0, 'A', 'D', 'X', '1'}));
         }
-        CHECK_EQ(names_of(side_files(regions, region + "/")).size(), kRegionsHeld.count(region) ? size_t(3) : size_t(0));
+        CHECK_EQ(names_of(side_files(regions, region + "/")).size(), kRegionsHeld.count(region) ? size_t(4) : size_t(0));
         CHECK_EQ(ways_of<WayHeader>(way_files::STREETS, regions, region + "/").ways.size(),
                  kRegionsHeld.count(region) ? size_t(1) : size_t(0));
         CHECK(ways_of<InterpWay>(way_files::INTERPS, regions, region + "/").ways.empty());
         CHECK_EQ(regions.count(region + "/interp_ways.bin") + regions.count(region + "/interp_nodes.bin"), size_t(2));
     }
     check_answers(continents, "continents");
+}
+
+// Each address keeps its addr:city in addr_cities.bin beside the full dir's
+// address points, where a place node or a boundary has that name: a core
+// string's offset, else NO_DATA (only the street's, or nothing's), as for a
+// node, a building and a relation, in the planet's dir and in Europe's of its
+// own strings. The values write no string, so a build of the same data
+// without them writes every other file as it does; a chained build of the
+// same data writes the same files.
+TEST(a_build_keeps_an_addresss_addr_city_where_a_place_has_its_name) {
+    const ScratchDir root("addr-cities-build");
+    const std::string with_pbf = root.path() + "/with.osm.pbf", without_pbf = root.path() + "/without.osm.pbf",
+                      log = root.path() + "/build.log";
+    write_test_pbf(with_pbf, with_cities(true), 1000);
+    write_test_pbf(without_pbf, with_cities(false), 1000);
+    auto build = [&](const std::string& pbf, const std::string& out, std::vector<std::string> extra) {
+        std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output",
+                                          "--multi-quality"};
+        words.insert(words.end(), extra.begin(), extra.end());
+        return gctest::run(words, log);
+    };
+    const std::string with = root.path() + "/with", without = root.path() + "/without", again = root.path() + "/again";
+    REQUIRE(build(with_pbf, with, {}));
+    REQUIRE(build(without_pbf, without, {}));
+    const auto files = tree(with), plain = tree(without);
+
+    for (const std::string& name : names_of(files))
+        if (fs::path(name).filename() == "addr_cities.bin") CHECK(fs::path(name).parent_path().filename() == "full");
+    for (const char* region : {"planet", "europe"}) {
+        const std::string dir = std::string(region) + "/full/";
+        REQUIRE(files.count(dir + "addr_cities.bin"));
+        const Addresses addresses = addresses_of(files, dir);
+        const std::vector<uint32_t> cities = side_files(files, dir).at("addr_cities.bin");
+        const std::string core = core_strings(files, dir);
+        const std::vector<CityAt> want = cities_at();
+        REQUIRE(addresses.points.size() == want.size());
+        size_t found = 0;
+        for (size_t i = 0; i < addresses.points.size(); i++) {
+            const AddrPoint& a = addresses.points[i];
+            for (const CityAt& w : want) {
+                if (std::fabs(a.lat - w.lat) > 5e-5 || std::fabs(a.lng - w.lng) > 5e-5) continue;
+                found++;
+                const uint32_t v = cities[i];
+                const int failures_before = gctest::failures();
+                if (w.city.empty()) {
+                    CHECK_EQ(v, NO_DATA);
+                } else {
+                    REQUIRE(v < core.size());
+                    CHECK(std::string(core.c_str() + v) == w.city);
+                }
+                if (gctest::failures() > failures_before) std::printf("    %s at %.4f %.4f\n", dir.c_str(), w.lat, w.lng);
+            }
+        }
+        CHECK_EQ(found, want.size());
+        CHECK(core.find("Nirgendwo") == std::string::npos);
+    }
+
+    // Without the tags: the same files but for addr_cities.bin, which holds
+    // only NO_DATA.
+    CHECK(names_of(plain) == names_of(files));
+    for (const auto& [name, bytes] : plain) {
+        if (fs::path(name).filename() != "addr_cities.bin") {
+            if (files.at(name) != bytes) std::printf("    %s differs\n", name.c_str());
+            CHECK(files.at(name) == bytes);
+            continue;
+        }
+        const std::string dir = name.substr(0, name.size() - std::string("addr_cities.bin").size());
+        const std::vector<uint32_t> cities = side_files(plain, dir).at("addr_cities.bin");
+        for (uint32_t v : cities) CHECK_EQ(v, NO_DATA);
+    }
+
+    // The same data again on top of the first build.
+    REQUIRE(build(with_pbf, again, {"--prev-output", with}));
+    CHECK(tree(again) == files);
+
+    // Changed data on top of the first build: the house of Gemeinde 3 gone,
+    // a new one of Testville further along. The houses kept keep their slots,
+    // so the slots are not a fresh build's order, and each value follows its
+    // house; a slot no house holds is NO_DATA.
+    std::vector<TestObject> changed = with_cities(true);
+    changed.erase(std::remove_if(changed.begin(), changed.end(),
+                                 [](const TestObject& o) { return o.type == OsmType::Node && o.id == 953; }),
+                  changed.end());
+    changed.push_back(node(961, 471420000, 81510000,
+                           {{"addr:housenumber", "15"}, {"addr:street", "Teststrasse"}, {"addr:city", "Testville"}}));
+    std::stable_sort(changed.begin(), changed.end(), [](const TestObject& a, const TestObject& b) {
+        return a.type != b.type ? a.type < b.type : a.id < b.id;
+    });
+    const std::string changed_pbf = root.path() + "/changed.osm.pbf", chained = root.path() + "/chained",
+                      fresh = root.path() + "/fresh";
+    write_test_pbf(changed_pbf, changed, 1000);
+    REQUIRE(build(changed_pbf, chained, {"--prev-output", with}));
+    REQUIRE(build(changed_pbf, fresh, {}));
+    std::vector<CityAt> moved = cities_at();
+    moved.erase(moved.begin() + 1);
+    moved.push_back({47.142, 8.151, "Testville"});
+    const auto chained_files = tree(chained), fresh_files = tree(fresh);
+    auto points_of = [](const Addresses& addresses) {
+        std::vector<std::pair<float, float>> out;
+        for (const AddrPoint& a : addresses.points) out.push_back({a.lat, a.lng});
+        return out;
+    };
+    for (const char* region : {"planet", "europe"}) {
+        const std::string dir = std::string(region) + "/full/";
+        const Addresses addresses = addresses_of(chained_files, dir);
+        const std::vector<uint32_t> cities = side_files(chained_files, dir).at("addr_cities.bin");
+        const std::string core = core_strings(chained_files, dir);
+        REQUIRE(cities.size() == addresses.points.size());
+        CHECK(points_of(addresses) != points_of(addresses_of(fresh_files, dir)));
+        size_t found = 0;
+        for (size_t i = 0; i < addresses.points.size(); i++) {
+            const AddrPoint& a = addresses.points[i];
+            if (a.lat == 0 && a.lng == 0) {
+                CHECK_EQ(cities[i], NO_DATA);
+                continue;
+            }
+            for (const CityAt& w : moved) {
+                if (std::fabs(a.lat - w.lat) > 5e-5 || std::fabs(a.lng - w.lng) > 5e-5) continue;
+                found++;
+                const int failures_before = gctest::failures();
+                if (w.city.empty()) {
+                    CHECK_EQ(cities[i], NO_DATA);
+                } else {
+                    REQUIRE(cities[i] < core.size());
+                    CHECK(std::string(core.c_str() + cities[i]) == w.city);
+                }
+                if (gctest::failures() > failures_before) std::printf("    chained %s at %.4f %.4f\n", dir.c_str(), w.lat, w.lng);
+            }
+        }
+        CHECK_EQ(found, moved.size());
+    }
 }
 
 TEST(an_admin_polygon_is_built_whatever_simplifying_would_leave_of_its_ring) {
@@ -969,7 +1172,9 @@ TEST(a_chained_build_on_a_previous_build_without_arc_fallback_sidecars_takes_slo
     fs::copy(out1, prev, fs::copy_options::recursive);
     std::vector<fs::path> fallbacks;
     for (const auto& e : fs::recursive_directory_iterator(prev))
-        if (e.path().filename() == "arc_index.fallback.osm_ids") fallbacks.push_back(e.path());
+        if (e.path().filename() == "arc_index.fallback.osm_ids" &&
+            fs::relative(e.path(), prev).string().find("/water/") == std::string::npos)
+            fallbacks.push_back(e.path());
     REQUIRE(fallbacks.size() == kRegions.size() + kRegionsHeld.size());
     for (const fs::path& p : fallbacks) fs::remove(p);
     REQUIRE(build(day_two, out2, {"--prev-output", prev}));
@@ -2265,8 +2470,9 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
         }
     for (const std::string& file : names_of(files))
         if (fs::path(file).filename() == name) CHECK(file.rfind("planet/", 0) == 0 || file.rfind("europe/", 0) == 0);
-    // The cities reach no other file: the same fixture without its addr:city
-    // tags builds every file but the postal cities to the same bytes.
+    // The cities reach no other file but addr_cities.bin, the houses' own
+    // addr:city: the same fixture without its addr:city tags builds every
+    // other file to the same bytes.
     {
         std::vector<TestObject> objects = postal_city_fixture();
         for (TestObject& o : objects)
@@ -2278,7 +2484,10 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
                              "--postal-places", places},
                             log));
         auto others = [&](std::map<std::string, std::vector<char>> t) {
-            for (auto it = t.begin(); it != t.end();) it = fs::path(it->first).filename() == name ? t.erase(it) : std::next(it);
+            for (auto it = t.begin(); it != t.end();) {
+                const std::string file = fs::path(it->first).filename().string();
+                it = file == name || file == "addr_cities.bin" ? t.erase(it) : std::next(it);
+            }
             return t;
         };
         const auto with = others(files), without = others(tree(bare));
@@ -2635,13 +2844,22 @@ TEST(each_mode_dir_credits_the_sources_of_its_data) {
         for (const char* dir : {"admin-minimal", "admin-minimal-poi"})
             if (kRegionsHeld.count(region)) CHECK(credited(files, region + "/" + dir + "/attribution.json") == osm);
     }
-    size_t credits = 0;
+    // Each region's three water dirs credit the data of their own
+    // (water_layer.h): OSM's alone in a build without --marine.
+    size_t credits = 0, water_credits = 0;
     for (const std::string& name : names_of(files)) {
         if (fs::path(name).filename() != "attribution.json") continue;
+        if (name.find("/water/") != std::string::npos) {
+            water_credits++;
+            if (credited(files, name) != osm) std::printf("    %s\n", name.c_str());
+            CHECK(credited(files, name) == osm);
+            continue;
+        }
         credits++;
         CHECK(name.find("/quality/") == std::string::npos && name.find("/poi/") == std::string::npos);
     }
     CHECK_EQ(credits, kRegions.size() * 3 + kRegionsHeld.size() * 2);
+    CHECK_EQ(water_credits, kRegions.size() * 3);
 
     // A GeoNames row whose pair OSM holds gives no centroid, so no credit.
     const auto taken = build("taken", {"--continents", "--multi-output", "--multi-quality", "--external-postcodes", zurich});

@@ -158,7 +158,9 @@ def load_template():
         return json.load(f)
 
 
-class CompressIndexTest(unittest.TestCase):
+class OutputTest(unittest.TestCase):
+    """An output dir of a few regions' files, its units, and the fake transport."""
+
     def setUp(self):
         # The tree goes, and the env comes back, in cleanups: after those a test adds, which end its child runs.
         self.tmp = tempfile.TemporaryDirectory()
@@ -231,6 +233,8 @@ class CompressIndexTest(unittest.TestCase):
         with open(self.log) as f:
             return [line.split()[1:] for line in f.read().splitlines() if line.split()[0] == verb]
 
+
+class CompressIndexTest(OutputTest):
     def test_compresses_each_content_once_and_links_its_copies(self):
         cfg = self.run_main()
 
@@ -348,6 +352,30 @@ class CompressIndexTest(unittest.TestCase):
         sent_rel = [f"{rel}.zst" for rel in self.files if rel not in self.members] + list(self.units)
         expected = [f"cp {self.path(rel)} s3://bucket/day/{rel}" for rel in sent_rel]
         self.assertEqual(sorted(sent), sorted(expected))
+
+    def test_a_water_dirs_json_files_are_published_with_its_index_files(self):
+        water = {"planet/water/all/exact/water_meta.json": b'{"types": []}',
+                 "planet/water/all/exact/attribution.json": b'[{"id": "osm"}]',
+                 "planet/water/all/exact/strings_layout.json": b'{"tiers": []}',
+                 "planet/water/all/exact/admin_cells.bin": content(20, 900)}
+        for rel, data in water.items():
+            write(self.path(rel), data)
+        write(self.path("planet/water/all/exact/admin_polygons.fallback.osm_ids"), content(21, 64))
+        log = os.path.join(self.tmp.name, "upload.log")
+        recorder = f"{sys.executable} -c \"import sys; open({log!r}, 'a').write(sys.stdin.read())\""
+
+        cfg = self.run_main("--upload", "s3://bucket/day/", "--upload-cmd", recorder)
+
+        for rel, data in water.items():
+            self.assertEqual(unzstd(self.path(rel) + ".zst"), data, rel)
+            self.assertEqual(cfg["files"][rel]["sha256"], sha(data), rel)
+        self.assertNotIn("planet/water/all/exact/admin_polygons.fallback.osm_ids", cfg["files"])
+        # And each goes up with the rest.
+        with open(log) as f:
+            sent = f.read().splitlines()
+        for rel in water:
+            self.assertIn(f"cp {self.path(rel)}.zst s3://bucket/day/{rel}.zst", sent, rel)
+        self.assertFalse([line for line in sent if "fallback.osm_ids" in line], sent)
 
     # The nightly's patch step compresses before it may write the date's prefix (yesterday's files not down yet):
     # with --upload-after, compression goes on, its uploads wait until the file exists, and the run's end waits for
@@ -771,6 +799,74 @@ sut.compress = compress
                 self.assertEqual(self.zst_files(), {})
 
 
+class ComponentSizesTest(OutputTest):
+    """configurations.json's component_sizes: each component's raw and wire bytes in each region."""
+
+    COMPONENTS = {
+        "mode.full": {"files": ["{region}/full/geo_cells.bin", "{region}/full/street_ways.bin", "{region}/full/place_cells.bin",
+                                "{region}/full/place_nodes.bin", "{region}/full/place_hidden.bin",
+                                "{region}/full/strings_layout.json"],
+                      "optional_files": ["{region}/full/interp_postcodes.bin", "{region}/full/addr_postcodes.bin"]},
+        "quality.simplified": {"files": ["{region}/quality/simplified/admin_polygons.bin",
+                                         "{region}/quality/simplified/admin_rings.bin",
+                                         "{region}/quality/simplified/arc_index.bin",
+                                         "{region}/quality/simplified/arc_vertices.bin"]},
+        "half": {"files": ["{region}/quality/exact/arc_index.bin"]},
+        "poi_tier.none": {"files": []},
+        "mode.admin-minimal": {"variants": [{"component": "half"}]},
+    }
+
+    def setUp(self):
+        super().setUp()
+        with open(self.path("configurations.json")) as f:
+            cfg = json.load(f)
+        cfg["axes"] = {"region": {"values": {"planet": {}, "europe": {}}}}
+        cfg["components"] = self.COMPONENTS
+        with open(self.path("configurations.json"), "w") as f:
+            json.dump(cfg, f)
+        # One of mode.full's optional files the build has; its other one it hasn't.
+        write(self.path("planet/full/interp_postcodes.bin"), content(17))
+
+    def test_each_component_counts_its_files_raw_and_each_unit_once_on_the_wire(self):
+        cfg = self.run_main()
+        sizes = cfg["component_sizes"]["planet"]
+        files, units = cfg["files"], cfg["units"]
+
+        full = [f"planet/full/{n}" for n in ("geo_cells.bin", "street_ways.bin", "place_cells.bin", "place_nodes.bin",
+                                             "place_hidden.bin", "strings_layout.json", "interp_postcodes.bin")]
+        self.assertNotIn("planet/full/addr_postcodes.bin", files)
+        self.assertEqual(sizes["mode.full"], {
+            "raw": sum(files[f]["size_raw"] for f in full),
+            "wire": files["planet/full/geo_cells.bin"]["size_zst"] + files["planet/full/strings_layout.json"]["size_zst"]
+            + files["planet/full/interp_postcodes.bin"]["size_zst"]
+            + units["planet/full/street_ways.tt.zst"]["size"] + units["planet/full/places.tt.zst"]["size"]})
+        # The files the build has (no admin_rings.bin here), the arcs unit once for its two files.
+        simplified = [f"planet/quality/simplified/{n}" for n in ("admin_polygons.bin", "arc_index.bin", "arc_vertices.bin")]
+        self.assertEqual(sizes["quality.simplified"], {
+            "raw": sum(files[f]["size_raw"] for f in simplified),
+            "wire": units["planet/quality/simplified/admin_polygons.tt.zst"]["size"]
+            + units["planet/quality/simplified/arcs.tt.zst"]["size"]})
+        # A component of some of a unit's files: its share of the unit, by their raw bytes.
+        arcs = units["planet/quality/exact/arcs.tt.zst"]
+        index = files["planet/quality/exact/arc_index.bin"]["size_raw"]
+        vertices = files["planet/quality/exact/arc_vertices.bin"]["size_raw"]
+        self.assertEqual(sizes["half"], {"raw": index, "wire": round(arcs["size"] * index / (index + vertices))})
+        # None for a component of no files, or of none the region has.
+        self.assertEqual(sorted(sizes), ["half", "mode.full", "quality.simplified"])
+        self.assertNotIn("europe", cfg["component_sizes"])
+
+    def test_a_unit_that_failed_counts_its_files_zst(self):
+        os.environ["FAKE_VERIFY_FAILS"] = "planet/quality/simplified/arcs.tt.zst"
+
+        cfg = self.run_main()
+
+        files = cfg["files"]
+        self.assertEqual(cfg["component_sizes"]["planet"]["quality.simplified"]["wire"],
+                         cfg["units"]["planet/quality/simplified/admin_polygons.tt.zst"]["size"]
+                         + files["planet/quality/simplified/arc_index.bin"]["size_zst"]
+                         + files["planet/quality/simplified/arc_vertices.bin"]["size_zst"])
+
+
 # The zstd command line before the shared thread budget: level 18 and a thread per 256 MiB, at least one and at most
 # 16, whatever the CPUs.
 PREVIOUS_LEVEL = "-18"
@@ -937,7 +1033,7 @@ class NightlyCompressTest(unittest.TestCase):
 
 class TemplateAttributionTest(unittest.TestCase):
     """The template's `attribution` list credits each source of the published data, and the
-    component of each mode dir lists the attribution.json the builder writes in it."""
+    component of each mode dir and water dir lists the attribution.json the builder writes in it."""
 
     def setUp(self):
         self.cfg = load_template()
@@ -948,14 +1044,15 @@ class TemplateAttributionTest(unittest.TestCase):
         return sorted(c for c in self.components if any(fnmatch.fnmatchcase(c, p) for p in entry["applies_to"]))
 
     def test_credits_each_source_under_its_licence(self):
-        self.assertEqual([e["id"] for e in self.entries], ["osm", "geonames", "codepoint-open", "tiger", "wikidata"])
+        self.assertEqual([e["id"] for e in self.entries],
+                         ["osm", "geonames", "codepoint-open", "tiger", "wikidata", "marine-regions"])
         self.assertEqual([e["licence"] for e in self.entries],
-                         ["ODbL 1.0", "CC BY 4.0", "OGL v3.0", "Public domain", "CC0 1.0"])
+                         ["ODbL 1.0", "CC BY 4.0", "OGL v3.0", "Public domain", "CC0 1.0", "CC BY 4.0"])
         for e in self.entries:
             self.assertEqual(set(e) - {"licence_url"}, {"id", "text", "url", "licence", "notices", "applies_to"}, e["id"])
             self.assertTrue(e["text"] and e["url"].startswith("https://") and e["notices"], e["id"])
         # Public domain has no licence to link.
-        self.assertEqual(["licence_url" in e for e in self.entries], [True, True, True, False, True])
+        self.assertEqual(["licence_url" in e for e in self.entries], [True, True, True, False, True, True])
         self.assertEqual(self.entries[0]["text"], "© OpenStreetMap contributors")
 
     def test_osm_applies_to_every_component_and_the_others_to_the_dirs_of_their_data(self):
@@ -980,6 +1077,8 @@ class TemplateAttributionTest(unittest.TestCase):
         self.assertEqual(self.applies(self.entries[3]), grids)
         # Wikidata's sitelinks rank the POIs of the tiers that hold any.
         self.assertEqual(self.applies(self.entries[4]), ["poi_tier.all", "poi_tier.major", "poi_tier.notable"])
+        # Marine Regions' seas and oceans are in the water dirs alone.
+        self.assertEqual(self.applies(self.entries[5]), ["water.all", "water.all-exact", "water.major"])
 
     def test_each_poi_tier_lists_its_poi_attribution_json_as_optional(self):
         # The builder writes it only where Wikidata's sitelinks ranked the POIs (--wikidata-sitelinks),
@@ -990,10 +1089,11 @@ class TemplateAttributionTest(unittest.TestCase):
             self.assertEqual([f for f in comp["files"] if f.endswith("attribution.json")], [], tier)
         self.assertEqual(self.components["poi_tier.none"].get("optional_files", []), [])
 
-    def test_each_mode_dir_lists_its_attribution_json(self):
+    def test_each_mode_dir_and_water_dir_lists_its_attribution_json(self):
         holding = {c: f for c, comp in self.components.items() for f in comp.get("files", [])
                    if os.path.basename(f) == "attribution.json"}
-        self.assertEqual(sorted(holding), ["dir.admin-minimal", "dir.admin-minimal-poi", "mode.admin", "mode.full", "mode.no-addresses"])
+        self.assertEqual(sorted(holding), ["dir.admin-minimal", "dir.admin-minimal-poi", "mode.admin", "mode.full", "mode.no-addresses",
+                                           "water.all", "water.all-exact", "water.major"])
         for c, f in holding.items():
             self.assertEqual({os.path.dirname(g) for g in self.components[c]["files"]}, {os.path.dirname(f)}, c)
 

@@ -15,8 +15,8 @@ struct WayTags {
     const char* housenumber = nullptr;
     const char* street = nullptr;
     const char* postcode = nullptr;
-    // A building address's addr:city, which only the postal cities' votes
-    // read (postal_cities_build.h).
+    // A building address's addr:city (addr_cities.bin, and the postal
+    // cities' votes: postal_cities_build.h).
     const char* city = nullptr;
     const char* highway = nullptr;
     const char* footway = nullptr;
@@ -41,6 +41,7 @@ struct WayTags {
     const char* power = nullptr;
     const char* place = nullptr;
     const char* waterway = nullptr;
+    const char* water = nullptr;
     const char* office = nullptr;
     const char* wikipedia = nullptr;
     const char* wikidata = nullptr;
@@ -138,6 +139,7 @@ inline WayTags parse_way_tags(const uint32_t* tag_keys, const uint32_t* tag_vals
             case 'I': if (k == "ISO3166-1:alpha2") t.iso = v; break;
             case 'w':
                 if (k == "waterway") t.waterway = v;
+                else if (k == "water") t.water = v;
                 else if (k == "wikipedia") t.wikipedia = v;
                 else if (k == "wikidata") t.wikidata = v;
                 break;

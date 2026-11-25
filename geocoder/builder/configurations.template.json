@@ -2,7 +2,7 @@
   "schema_version": 1,
   "build": {
     "version": 24,
-    "patch_version": 21
+    "patch_version": 23
   },
   "attribution": [
     {
@@ -18,7 +18,8 @@
         "mode.*",
         "dir.*",
         "quality.*",
-        "poi_tier.*"
+        "poi_tier.*",
+        "water.*"
       ]
     },
     {
@@ -88,6 +89,21 @@
         "poi_tier.major",
         "poi_tier.notable",
         "poi_tier.all"
+      ]
+    },
+    {
+      "id": "marine-regions",
+      "text": "Flanders Marine Institute (2024). The intersect of the Exclusive Economic Zones and IHO sea areas, version 5. Available online at https://www.marineregions.org/. https://doi.org/10.14284/699",
+      "url": "https://www.marineregions.org/",
+      "licence": "CC BY 4.0",
+      "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+      "notices": [
+        "Changes: each IHO sea area's parts in every EEZ dissolved into one, cut to the water off OpenStreetMap's land polygons and along a 1-degree grid, the coastal water the sea areas leave out given to the nearest sea area, and simplified in the simplified tiers. Cut to OpenStreetMap's land, the areas are part of this dataset's ODbL derivative database."
+      ],
+      "applies_to": [
+        "water.major",
+        "water.all",
+        "water.all-exact"
       ]
     }
   ],
@@ -204,6 +220,36 @@
         "all": {
           "label": "All (~24.5M POIs)",
           "description": "Every named POI (places of worship, peaks, memorials, artwork, gardens).",
+          "order": 4
+        }
+      }
+    },
+    "water": {
+      "label": "Bodies of water",
+      "description": "Lakes, rivers, canals, bays, straits, wetlands and glaciers as areas, and the seas and oceans in builds that pin the marine areas: the files of a water/ dir of their own beside the dataset's, published to download, which the server and its downloader don't read yet. Any boundary precision takes any of them.",
+      "order": 5,
+      "values": {
+        "none": {
+          "label": "None",
+          "description": "No water areas.",
+          "order": 1
+        },
+        "major": {
+          "label": "Major (~98K areas)",
+          "precision_m": 37.5,
+          "description": "The seas and oceans, in builds that pin the marine areas; every named water area of 100 km² or more, whatever its kind (lakes, reservoirs, bays, straits, wetlands, glaciers and the rest); and whole rivers and canals whose areas sum to 100 km², or 5 km² with a Wikidata item. Those are the thresholds to enter: one in the previous build's tier stays down to 90 km², or 4.5 km² for a river or canal with a Wikidata item. ~37 m shores.",
+          "order": 2
+        },
+        "all": {
+          "label": "All (~1.24M areas)",
+          "precision_m": 37.5,
+          "description": "Every named body of water mapped as an area, every river or canal area its waterway names, and the seas and oceans in builds that pin the marine areas. ~37 m shores.",
+          "order": 3
+        },
+        "all-exact": {
+          "label": "All, exact shores",
+          "precision_m": 0,
+          "description": "As All, with every OSM point of every shore.",
           "order": 4
         }
       }
@@ -363,6 +409,7 @@
         "{region}/full/attribution.json"
       ],
       "optional_files": [
+        "{region}/full/addr_cities.bin",
         "{region}/full/interp_postcodes.bin",
         "{region}/full/postcode_centroids.bin",
         "{region}/full/postcode_centroid_cells.bin",
@@ -430,6 +477,57 @@
       "optional_files": [
         "{region}/poi/all/poi_attribution.json"
       ]
+    },
+    "water.none": {
+      "files": []
+    },
+    "water.major": {
+      "description": "The major water areas, simplified. Its files go in the dataset's water/ dir, which patches on its own.",
+      "dir": "water",
+      "files": [
+        "{region}/water/major/simplified/admin_cells.bin",
+        "{region}/water/major/simplified/admin_entries.bin",
+        "{region}/water/major/simplified/admin_polygons.bin",
+        "{region}/water/major/simplified/admin_rings.bin",
+        "{region}/water/major/simplified/arc_index.bin",
+        "{region}/water/major/simplified/arc_vertices.bin",
+        "{region}/water/major/simplified/strings_core.bin",
+        "{region}/water/major/simplified/strings_layout.json",
+        "{region}/water/major/simplified/water_meta.json",
+        "{region}/water/major/simplified/attribution.json"
+      ]
+    },
+    "water.all": {
+      "description": "Every water area, simplified. Its files go in the dataset's water/ dir, which patches on its own.",
+      "dir": "water",
+      "files": [
+        "{region}/water/all/simplified/admin_cells.bin",
+        "{region}/water/all/simplified/admin_entries.bin",
+        "{region}/water/all/simplified/admin_polygons.bin",
+        "{region}/water/all/simplified/admin_rings.bin",
+        "{region}/water/all/simplified/arc_index.bin",
+        "{region}/water/all/simplified/arc_vertices.bin",
+        "{region}/water/all/simplified/strings_core.bin",
+        "{region}/water/all/simplified/strings_layout.json",
+        "{region}/water/all/simplified/water_meta.json",
+        "{region}/water/all/simplified/attribution.json"
+      ]
+    },
+    "water.all-exact": {
+      "description": "Every water area, with every OSM point. Its files go in the dataset's water/ dir, which patches on its own.",
+      "dir": "water",
+      "files": [
+        "{region}/water/all/exact/admin_cells.bin",
+        "{region}/water/all/exact/admin_entries.bin",
+        "{region}/water/all/exact/admin_polygons.bin",
+        "{region}/water/all/exact/admin_rings.bin",
+        "{region}/water/all/exact/arc_index.bin",
+        "{region}/water/all/exact/arc_vertices.bin",
+        "{region}/water/all/exact/strings_core.bin",
+        "{region}/water/all/exact/strings_layout.json",
+        "{region}/water/all/exact/water_meta.json",
+        "{region}/water/all/exact/attribution.json"
+      ]
     }
   },
   "presets": [
@@ -441,7 +539,8 @@
         "region": "planet",
         "mode": "admin-minimal",
         "quality": "simplified",
-        "poi_tier": "none"
+        "poi_tier": "none",
+        "water": "none"
       }
     },
     {
@@ -452,7 +551,8 @@
         "region": "planet",
         "mode": "admin",
         "quality": "simplified",
-        "poi_tier": "major"
+        "poi_tier": "major",
+        "water": "none"
       },
       "default": true
     },
@@ -464,18 +564,20 @@
         "region": "planet",
         "mode": "full",
         "quality": "simplified",
-        "poi_tier": "all"
+        "poi_tier": "all",
+        "water": "none"
       }
     },
     {
       "id": "max-quality",
       "label": "Maximum quality",
-      "description": "Full mode with exact boundaries, every OSM point. Largest configuration available.",
+      "description": "Full mode with exact boundaries, every OSM point and all POIs, without water.",
       "selections": {
         "region": "planet",
         "mode": "full",
         "quality": "exact",
-        "poi_tier": "all"
+        "poi_tier": "all",
+        "water": "none"
       }
     }
   ],

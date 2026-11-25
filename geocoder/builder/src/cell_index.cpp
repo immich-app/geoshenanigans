@@ -280,7 +280,7 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
 // = ObjectType (NODE / WAY / SYNTHETIC), bottom 56 bits = the id.
 // Reference sites updated:
 //   - data.sorted_addr_cells (item_id)
-//   - data.addr_postcode_ids (parallel array — reorder)
+//   - data.addr_postcode_ids, data.addr_city_ids (parallel arrays — reorder)
 // addr_vertices.bin is keyed by byte offset, not idx, so no remap.
 static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir) {
     using namespace gc::id_alloc;
@@ -307,6 +307,7 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
     reorder_by_remap(data.addr_points, remap, n_new, addr_point_tombstone());
     reorder_by_remap(data.addr_osm_ids, remap, n_new, uint64_t(0));
     if (!data.addr_postcode_ids.empty()) reorder_by_remap(data.addr_postcode_ids, remap, n_new, NO_DATA);
+    if (!data.addr_city_ids.empty()) reorder_by_remap(data.addr_city_ids, remap, n_new, NO_DATA);
 
     remap_cell_pairs(data.sorted_addr_cells, [&](uint32_t& v) { remap_index(v, remap); });
 
@@ -780,7 +781,7 @@ void collect_postcode_grid(ParsedData& data) {
         return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(GRID_LEVEL).id() >> cell_shift(GRID_LEVEL);
     };
     GridCells grid = grid_cells(
-        data.addr_points, data.addr_postcode_ids, data.addr_city_ids, data.interp_ways, data.interp_nodes,
+        data.addr_points, data.addr_postcode_ids, data.addr_vote_city_ids, data.interp_ways, data.interp_nodes,
         data.interp_postcode_ids, [&](uint32_t id) { return std::string_view(data.get_string(id)); },
         [&](double lat, double lng) { return country_at(data, countries, lat, lng); }, pos_at);
     data.postcode_grid_rows = grid_rows(grid.cells, grid.codes, GRID_LEVEL);
@@ -795,7 +796,8 @@ void collect_postcode_grid(ParsedData& data) {
     // gave their centroid's country, and its TIGER lines' own ZIPs, which a
     // US street's answer takes wherever the line runs, its middle in the
     // country or not) and the votes of its addresses with a city; then the
-    // cities go, before the strategy-2 remap.
+    // votes' cities go, before the strategy-2 remap (addr_cities.bin's
+    // stay).
     std::vector<GridCode> answered;
     const auto& rings = data.admin_exact_rings;
     for (size_t i = 0; i < data.admin_polygons.size() && i < rings.polygons.size(); i++) {
@@ -846,7 +848,7 @@ void collect_postcode_grid(ParsedData& data) {
         std::cerr << "Warning: no --postal-places: a ZIP of fewer than " << postal_cities::MIN_VOTES
                   << " votes keeps yesterday's name, having no GeoNames name" << std::endl;
     std::vector<uint64_t>().swap(grid.city_votes);
-    free_storage(data.addr_city_ids);
+    free_storage(data.addr_vote_city_ids);
     data.postal_vote_pool = StringPool();
 }
 
@@ -954,6 +956,13 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             if (!data.addr_postcode_ids.empty()) {
                 write_futures.push_back(std::async(std::launch::async, [&] {
                     write_side_file(output_dir, "addr_postcodes.bin", data.addr_postcode_ids, "addr_points.bin",
+                                    data.addr_points.size());
+                }));
+            }
+            // Per-addr addr:city, a core string (parallel to addr_points)
+            if (!data.addr_city_ids.empty()) {
+                write_futures.push_back(std::async(std::launch::async, [&] {
+                    write_side_file(output_dir, "addr_cities.bin", data.addr_city_ids, "addr_points.bin",
                                     data.addr_points.size());
                 }));
             }
@@ -1104,7 +1113,7 @@ struct ArcCells {
 };
 
 ArcCells tier_arc_cells(const AdminArcs& arcs, const AdminExactRings& store, size_t t, unsigned threads) {
-    const ArcTier& tier = kArcTiers[t];
+    const ArcTier& tier = arcs.stage->tiers[t];
     const size_t n = tier.set == ArcSet::Full ? arcs.arcs.size() : arcs.minimal.arcs.size();
     // Longest first, a few at a time: started last, a long arc would leave
     // one core working alone.
@@ -1156,7 +1165,7 @@ ArcCells tier_arc_cells(const AdminArcs& arcs, const AdminExactRings& store, siz
 AdminTierCells admin_tier_cells(const AdminArcs& arcs, const AdminExactRings& store, size_t t, unsigned threads,
                                 const std::function<void(const char*)>& phase_done) {
     if (threads == 0) threads = parallel_threads();
-    const ArcTier& tier = kArcTiers[t];
+    const ArcTier& tier = arcs.stage->tiers[t];
     // The exact tier's rings are the store's own: the same cycles its arcs chain.
     const bool exact = tier.set == ArcSet::Full && !tier.simplifies();
     const std::vector<uint32_t>& ring_refs = tier.set == ArcSet::Full ? arcs.ring_refs : arcs.minimal.ring_refs;
@@ -1311,6 +1320,32 @@ void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned
               << " interior) over the full set's tiers; admin-minimal " << count_cells(data.admin_minimal_index_cells)
               << " cells, " << data.admin_minimal_index_cells.size() << " entries ("
               << interior(data.admin_minimal_index_cells) << " interior)" << std::endl;
+}
+
+std::vector<CellItemPair> compute_water_index_cells(const AdminArcs& arcs, const AdminExactRings& store,
+                                                    unsigned threads) {
+    if (threads == 0) threads = parallel_threads();
+    auto clock = std::chrono::steady_clock::now();
+    auto cpu = CpuTicks::now();
+    std::ostringstream counts;
+    std::vector<std::vector<CellItemPair>> tiers;
+    for (size_t t = 0; t < arcs.stage->tier_count; t++) {
+        const ArcTier& tier = arcs.stage->tiers[t];
+        AdminTierCells covered = admin_tier_cells(arcs, store, t, threads, [&](const char* step) {
+            log_phase((std::string("      Water cells: ") + tier.dir + " " + step).c_str(), clock, cpu);
+        });
+        counts << "  Water cells " << tier.dir << ": " << arcs.arcs.size() << " arcs with " << covered.arc_cells
+               << " boundary cells, merged into " << covered.boundary_cells << " over the polygons' boundaries; "
+               << covered.cells.size() << " entries\n";
+        tiers.push_back(std::move(covered.cells));
+    }
+    std::vector<CellItemPair> cells = union_of_tiers(std::move(tiers), threads);
+    log_phase("      Water cells: union", clock, cpu);
+    const size_t interior =
+        parallel_count(cells.size(), [&](size_t k) { return (cells[k].item_id & INTERIOR_FLAG) != 0; }, threads);
+    std::cerr << counts.str() << "Water index cells: " << count_cells(cells) << " cells, " << cells.size()
+              << " entries (" << interior << " interior) over both tiers" << std::endl;
+    return cells;
 }
 
 // --- The admin dirs ---
