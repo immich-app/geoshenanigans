@@ -809,7 +809,8 @@ class NightlyReserveTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as workdir:
             out = os.path.join(workdir, "output")
             sizes = {"planet/full/street_ways.bin": 300 * 1024, "planet/full/strings_layout.json": 1700,
-                     "planet/full/poi_meta.json": 1900, "planet/poi/all/poi_records.bin": 5000,
+                     "planet/full/poi_meta.json": 1900, "planet/full/attribution.json": 1500,
+                     "planet/poi/all/poi_records.bin": 5000, "planet/poi/all/poi_attribution.json": 2048,
                      "planet/water/all/exact/water_meta.json": 1800, "planet/water/all/exact/attribution.json": 1600,
                      "planet/search/places.fst": 40 * 1024 + 1, "planet/search/packs/europe.pack": 3000,
                      # What the compressor leaves alone, or has written already.
@@ -823,7 +824,7 @@ class NightlyReserveTest(unittest.TestCase):
             printed = subprocess.run(["bash", "-c", reserve + '\necho "$RESERVE_KIB"'], env=dict(os.environ, WORKDIR=workdir),
                                      check=True, capture_output=True, text=True).stdout
 
-        self.assertEqual(compressed, 300 * 1024 + 1700 + 1900 + 5000 + 1800 + 1600 + 40 * 1024 + 1 + 3000)
+        self.assertEqual(compressed, 300 * 1024 + 1700 + 1900 + 1500 + 5000 + 2048 + 1800 + 1600 + 40 * 1024 + 1 + 3000)
         self.assertEqual(printed, "%d\n" % -(-compressed // 1024))
         self.assertEqual(assignments, ['GEOCODER_PATCH_SCRATCH_RESERVE_KIB="$RESERVE_KIB"',
                                        'GEOCODER_PATCH_MEM_RESERVE_KIB="$MEM_RESERVE_KIB"'])

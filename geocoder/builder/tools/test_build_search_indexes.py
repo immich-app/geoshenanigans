@@ -154,6 +154,21 @@ class BuildSearchIndexesTest(unittest.TestCase):
 
         self.assertEqual(self.run_main(), 1)
 
+    def test_a_full_selection_holds_the_addresses_cities_where_the_region_has_them(self):
+        # The builder writes addr_cities.bin beside a region's address points, an optional file
+        # of the full mode, which every shipped selection is.
+        self.write_output(["planet"])
+        cities = os.path.join(self.out, "planet", "full", "addr_cities.bin")
+        with open(cities, "w") as f:
+            f.write(cities)
+
+        self.assertEqual(self.run_main(), 0)
+        shipped = self.cfg["search_index"]["shipped"]
+        self.assertTrue(shipped)
+        for sel in shipped:
+            self.assertEqual(sel["mode"], "full")
+            self.assertEqual(self.call("planet", sel)["held"]["addr_cities.bin"], cities)
+
 
 class PlaceSearchJobTest(unittest.TestCase):
     """place_search_indexes.sh, which the nightly runs in the background from build-index's exit: compression
@@ -296,8 +311,8 @@ def flat(paths):
 
 class TemplateTest(unittest.TestCase):
     MINIMAL_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin",
-                     "arc_index.bin", "arc_vertices.bin", "place_cells.bin", "place_hidden.bin", "place_nodes.bin",
-                     "strings_core.bin", "strings_layout.json"]
+                     "arc_index.bin", "arc_vertices.bin", "attribution.json", "place_cells.bin", "place_hidden.bin",
+                     "place_nodes.bin", "postcode_grid.bin", "strings_core.bin", "strings_layout.json"]
 
     def test_admin_minimal_takes_its_poi_dir_beside_a_poi_tier(self):
         # admin-minimal/ holds strings of its own, which a POI tier's names and parent polygons don't
@@ -315,7 +330,7 @@ class TemplateTest(unittest.TestCase):
 
     def test_every_selection_takes_each_admin_geometry_file_once_from_its_dir(self):
         # Downloads land flat by name: a second copy of an admin geometry file, or a .bin name twice,
-        # would mix two sets of arcs.
+        # would mix two sets of arcs, and a sidecar name twice would keep one dir's sidecar alone.
         cfg = load_template()
         presets = [p["selections"] for p in cfg["presets"]]
         for sel in selections(cfg) + presets:
@@ -330,6 +345,9 @@ class TemplateTest(unittest.TestCase):
                 self.assertEqual([p for p in paths if os.path.basename(p) == name], [f"{dir_}/{name}"], sel)
             bins = [n for n in names if n.endswith(".bin")]
             self.assertEqual(len(bins), len(set(bins)), sel)
+            # Every dir holds the same strings_layout.json; any other JSON name is one file's.
+            sidecars = [n for n in names if n.endswith(".json") and n != "strings_layout.json"]
+            self.assertEqual(len(sidecars), len(set(sidecars)), sel)
             self.assertEqual([n for n in names if n == "admin_vertices.bin" or n.startswith("postal_")], [], sel)
 
     def test_presets_take_their_boundaries_from_the_tier_they_name(self):

@@ -123,11 +123,12 @@ UNIT_FAILED = 3
 CPU_BUDGET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpu_budget.sh")
 
 # The JSON files a dataset holds beside its .bin files: the sidecars the
-# server's Index::load reads, a water dir's kinds, and each dir's credit of
-# its data. They go into configurations.files like any index file so the
-# region downloader can fetch them; the raw copy stays for clients that read
-# it directly (test-portal).
-JSON_FILES = {"strings_layout.json", "poi_meta.json", "water_meta.json", "attribution.json"}
+# server's Index::load reads, a water dir's kinds, each mode dir's and water
+# dir's credit of its data, and a POI tier dir's credit of the Wikidata
+# sitelinks that rank its POIs. They go into configurations.files like any
+# index file so the region downloader can fetch them; the raw copy stays for
+# clients that read it directly (test-portal).
+JSON_FILES = {"strings_layout.json", "poi_meta.json", "water_meta.json", "attribution.json", "poi_attribution.json"}
 
 # Every file under a region's search/ dir is a place search index file
 # (build_search_indexes.py), published like the .bin files.

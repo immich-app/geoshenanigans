@@ -97,6 +97,10 @@ static constexpr size_t POSTCODE_CENTROID_STRIDE = 20;
 static constexpr size_t POSTCODE_CENTROID_POSTCODE_ID_OFF = 8;
 // The client file postcode_centroids.bin's section writes beside it.
 static constexpr const char* POSTCODE_SIDE_FILES[] = {"postcode_centroid_cells.bin"};
+// postcode_grid.bin's logical rows (postcode_grid.h LogicalRow): its section
+// replays the grid's runs, which its codec (gcs_codec.h grid) writes as
+// postcode_grid.bin. No string field: the grid holds its postcodes as text.
+static constexpr size_t POSTCODE_GRID_STRIDE = 24;
 // The client file addr_points.bin's and addr_vertices.bin's sections write
 // besides them (addr_files.h).
 static constexpr const char* ADDR_SIDE_FILES[] = {"addr_index.bin"};
@@ -271,11 +275,19 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // postcode_centroids.bin and postcode_centroid_cells.bin. No sparse delta
 // carries them (remap kind 3 is gone), no cell list delta (stride 0xFB)
 // carries any index, and file ids 24 and 25 name no file.
-// v23 (v20 to v22 are kept for other changes): file id 39 names a water
-// dir's water_cut_arcs.bin, a bit per arc slot in u32 words, sent as a sparse
-// delta of its words (SPARSE_DELTA_FILES). File ids 36 to 38, kept for other
-// files, name none.
-static constexpr uint32_t GCPATCH_VERSION = 23;
+// v20: the postcode grid (postcode_grid.h) merges as one logical stream of
+// 24-byte rows in cell order under file id 36, postcode_grid.bin, which the
+// patcher encodes again; a section of it right after the postcode
+// centroids', in every patch (an empty merge where neither day has it), with
+// the old file's hash before it where the old grid has rows
+// (HASHED_OLD_FILES).
+// v22: addr_cities.bin, an address point's addr:city as a core string
+// offset, follows addr_points.bin under file id 38 as a parallel delta of
+// string offsets after the other side files; id 37 names no file.
+// v24 (v23 is kept for another change): file id 39 names a water dir's
+// water_cut_arcs.bin, a bit per arc slot in u32 words, sent as a sparse delta
+// of its words (SPARSE_DELTA_FILES).
+static constexpr uint32_t GCPATCH_VERSION = 24;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -332,11 +344,14 @@ enum class PatchFileId : uint32_t {
     INTERP_POSTCODES = 34,
     // The geo index's blocks, beside its top file (GEO_CELLS).
     GEO_ENTRIES = 35,
-    // No files: ids kept for other files.
-    KEPT_36 = 36,
-    KEPT_37 = 37,
-    KEPT_38 = 38,
-    // A water dir's cut arcs: a bit per arc slot, in u32 words.
+    // The postcode grid's logical rows (v20).
+    POSTCODE_GRID = 36,
+    // No file (v22): names_no_file.
+    UNUSED_37 = 37,
+    // Per address point: its addr:city, a core string offset (NO_DATA for
+    // none), along addr_points (v22).
+    ADDR_CITIES = 38,
+    // A water dir's cut arcs: a bit per arc slot, in u32 words (v24).
     WATER_CUT_ARCS = 39,
     COUNT = 40
 };
@@ -356,7 +371,9 @@ static const char* patch_file_names[] = {
     "strings_postcode.bin", "strings_poi.bin",
     "interp_postcodes.bin",
     "geo_entries.bin",
-    "file id 36 (none)", "file id 37 (none)", "file id 38 (none)",
+    "postcode_grid.bin",
+    "unused (37)",
+    "addr_cities.bin",
     "water_cut_arcs.bin"
 };
 
@@ -392,6 +409,7 @@ static constexpr SparseDeltaFile SPARSE_DELTA_FILES[] = {
     {PatchFileId::WAY_POSTCODES, 4, 2},
     {PatchFileId::INTERP_POSTCODES, 4, 2},
     {PatchFileId::WATER_CUT_ARCS, 4, 0},
+    {PatchFileId::ADDR_CITIES, 4, 2},
 };
 
 inline const SparseDeltaFile* sparse_delta_file(PatchFileId fid) {
@@ -493,14 +511,13 @@ inline bool is_geo_list_id(uint32_t id) {
 }
 
 // Whether an id of the file table names no file, so no file section's: the
-// legacy strings.bin (no patch sends it), the geo index's lists, (v19) ids 24
-// and 25, the postcode centroid cells, which the patcher writes beside
-// postcode_centroids.bin, and the entries file the centroids had, and (v23)
-// ids 36 to 38, kept for other files.
+// legacy strings.bin (no patch sends it), the geo index's lists, (v19) ids
+// 24 and 25, the postcode centroid cells, which the patcher writes beside
+// postcode_centroids.bin, and the entries file the centroids had, and (v22)
+// id 37.
 inline bool names_no_file(uint32_t id) {
     return id == uint32_t(PatchFileId::STRINGS) || is_geo_list_id(id) || id == uint32_t(PatchFileId::POSTCODE_CENTROID_CELLS) ||
-           id == uint32_t(PatchFileId::POSTCODE_CENTROID_ENTRIES) ||
-           (id >= uint32_t(PatchFileId::KEPT_36) && id <= uint32_t(PatchFileId::KEPT_38));
+           id == uint32_t(PatchFileId::POSTCODE_CENTROID_ENTRIES) || id == uint32_t(PatchFileId::UNUSED_37);
 }
 
 // Secondary ID remap marker: 0xFFFFFFF6
@@ -709,8 +726,9 @@ inline void require_copy_old_sizes(const std::string& name, uint64_t old_size, u
 }
 
 // Stride sentinel (v8): a per-record side file (one value per record of a
-// parent file: way_parents / way_postcodes per street way, addr_postcodes per
-// address, interp_postcodes per interpolation) rebuilt along the parent's
+// parent file: way_parents / way_postcodes per street way, addr_postcodes and
+// (v22) addr_cities per address, interp_postcodes per interpolation) rebuilt
+// along the parent's
 // merge sequence: MATCH and REPLACE copy the old record's value (remapped like
 // the sparse delta's remap_kind), INSERT takes the next inline value, DELETE
 // skips one; then (pos, value) pairs at new positions overwrite the values
@@ -760,6 +778,7 @@ static constexpr ParallelDeltaFile PARALLEL_DELTA_FILES[] = {
     {PatchFileId::WAY_PARENTS, PatchFileId::STREET_WAYS, 4, 0},
     {PatchFileId::WAY_POSTCODES, PatchFileId::STREET_WAYS, 4, 2},
     {PatchFileId::INTERP_POSTCODES, PatchFileId::INTERP_WAYS, 4, 2},
+    {PatchFileId::ADDR_CITIES, PatchFileId::ADDR_POINTS, 4, 2},
 };
 inline const ParallelDeltaFile* parallel_delta_file(PatchFileId fid) {
     for (const auto& f : PARALLEL_DELTA_FILES)
@@ -810,15 +829,19 @@ static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 // (way_replay.h) the node blocks of the groups a day leaves whole and their
 // rows' anchors, counts and codes (both files of each way pair), the address
 // replay (addr_replay.h) the old footprint blobs and the records whose
-// points they sit under (addr_vertices.bin and addr_points.bin). The diff
-// sends one for each file of HASHED_OLD_FILES the old dir holds and whose
-// family has a section. The patcher refuses a second hash of a file, a hash
-// of any other file, and a replay without the hashes it checks by. A family
-// both of whose sections are unchanged is copied as its files sit, and POI
-// records sent unchanged over blocks that change go through the codecs: the
-// patcher holds each hashed file of such a family to its hash before it
-// reads it. The hash of an old file without records is read and checks
-// nothing.
+// points they sit under (addr_vertices.bin and addr_points.bin). The
+// postcode grid's is checked before its runs are replayed and before the
+// copy below: its postcodes are text, which no string tier's hash covers,
+// and a grid of other postcodes, as many runs, decodes as well as the old
+// one. The diff sends one for each file of
+// HASHED_OLD_FILES the old dir holds and whose family has a section, the
+// grid's where the old grid has rows. The patcher refuses a second hash of a
+// file, a hash of any other file, and a replay without the hashes it checks
+// by. A family both of whose sections are unchanged is copied as its files
+// sit, and POI records sent unchanged over blocks that change go through the
+// codecs: the patcher holds each hashed file of such a family to its hash
+// before it reads it. The hash of an old file without records is read and
+// checks nothing.
 static constexpr uint32_t OLD_FILE_HASH_MARKER = 0xFFFFFFF8;
 static constexpr PatchFileId HASHED_OLD_FILES[] = {
     PatchFileId::POI_RECORDS,
@@ -829,6 +852,7 @@ static constexpr PatchFileId HASHED_OLD_FILES[] = {
     PatchFileId::INTERP_NODES,
     PatchFileId::ADDR_POINTS,
     PatchFileId::ADDR_VERTICES,
+    PatchFileId::POSTCODE_GRID,
 };
 inline bool is_hashed_old_file(uint32_t fid) {
     return std::find(std::begin(HASHED_OLD_FILES), std::end(HASHED_OLD_FILES), static_cast<PatchFileId>(fid)) !=

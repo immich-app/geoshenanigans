@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 
 #include "admin_arcs.h"
+#include "attribution.h"
 #include "exact_pip.h"
 #include "packed_location.h"
 #include "polygon_rings.h"
@@ -32,16 +33,20 @@
 #include "id_allocator.h"
 #include "place_claims.h"
 #include "parallel.h"
+#include "postcode_grid_build.h"
 #include "ranked_bits.h"
 #include "water_layer_data.h"
 
 // The records one POI tier's files carry, in record order, and how many of
-// them are tombstones. A tombstone only goes to the tiers that held its
-// record (poi_shipped_tier). `slots` is the strategy-2 slot table, parallel
-// to `records`, or empty when strategy 2 did not run.
+// them are tombstones. A record goes to the tiers from its lowest on
+// (poi_lowest_tier), a tombstone only to the tiers that held its record
+// (poi_shipped_tier). `slots` is the strategy-2 slot table, parallel to
+// `records`, or empty when strategy 2 did not run. `max_tier` is the tier's,
+// which writes each record as poi_record_in_tier gives it.
 struct PoiTierSelection {
     std::vector<uint32_t> indices;
     size_t tombstones = 0;
+    uint8_t max_tier = POI_MAX_SHIPPED_TIER;
 };
 
 inline PoiTierSelection select_poi_tier(const std::vector<PoiRecord>& records,
@@ -52,8 +57,9 @@ inline PoiTierSelection select_poi_tier(const std::vector<PoiRecord>& records,
 
     auto slot_of = [&](size_t i) { return slots.empty() ? nullptr : &slots[i]; };
     PoiTierSelection out;
+    out.max_tier = max_tier;
     out.indices = parallel_filter(records.size(), [&](size_t i) {
-        return gc::id_alloc::poi_shipped_tier(records[i].tier, slot_of(i)) <= max_tier;
+        return gc::id_alloc::poi_shipped_tier(poi_lowest_tier(records[i]), slot_of(i)) <= max_tier;
     });
     out.tombstones = parallel_count(out.indices.size(), [&](size_t k) {
         const gc::id_alloc::SidecarSlot* slot = slot_of(out.indices[k]);
@@ -63,8 +69,9 @@ inline PoiTierSelection select_poi_tier(const std::vector<PoiRecord>& records,
 }
 
 // Categories a POI tier's poi_meta.json lists: those of the live records in
-// the tier's selection. A tombstone is memset to category 0 (MUSEUM), so
-// counting it would list museums in a tier that holds none.
+// the tier's selection, as the tier writes them (poi_record_in_tier). A
+// tombstone is memset to category 0 (MUSEUM), so counting it would list
+// museums in a tier that holds none.
 inline std::set<uint8_t> poi_meta_categories(const std::vector<PoiRecord>& records,
                                              const std::vector<gc::id_alloc::SidecarSlot>& slots,
                                              const PoiTierSelection& selection) {
@@ -75,7 +82,7 @@ inline std::set<uint8_t> poi_meta_categories(const std::vector<PoiRecord>& recor
             const uint32_t i = selection.indices[k];
             if (!slots.empty() && gc::id_alloc::is_tombstone(slots[i])) continue;
 
-            seen[b][records[i].category] = true;
+            seen[b][poi_record_in_tier(records[i], selection.max_tier).category] = true;
         }
     });
     std::set<uint8_t> cats;
@@ -242,6 +249,7 @@ constexpr const char* STR_TIER_NAMES[STR_TIER_COUNT] = {
 };
 // The POI names' tier, the one tier not in alphabetical order (see
 // order_poi_strings_by_record).
+constexpr size_t STR_TIER_CORE = 0;
 constexpr size_t STR_TIER_POI = 4;
 
 // Home tier of a string from its consumer mask. The mode tiers nest by who
@@ -469,6 +477,11 @@ struct ParsedData {
     // OSM_WAY, OSM_RELATION} since POIs come from any of three OSM
     // entity kinds. Strategy-2 IdAllocator uses this.
     std::vector<uint64_t> poi_osm_ids;
+    // Parallel once reorder_pois has run, where a record carries a water
+    // kind (POI_FLAG_WATER_MASK), else empty: each record's importance as
+    // that kind, which the tiers writing it as the kind give it
+    // (poi_record_in_tier), 0 for one of none. The build alone holds it.
+    std::vector<uint8_t> poi_water_importance;
     std::vector<NodeCoord> poi_vertices;
     std::vector<CellItemPair> sorted_poi_cells;
     std::vector<CollectedPoiRelation> collected_poi_relations;
@@ -481,6 +494,11 @@ struct ParsedData {
     std::vector<uint32_t> admin_parent_ids;  // poly → next-larger containing admin poly
     std::vector<uint32_t> way_postcode_ids;  // way → postcode string from containing postal boundary
     std::vector<uint32_t> addr_postcode_ids; // per-addr_point postcode (optional separate file)
+    // Per addr_point: its addr:city (addr_cities.bin). Interned but marking
+    // no tier, so it writes no string: partition_strings_into_tiers keeps it
+    // where a place node or a boundary has its string, a core one, and makes
+    // it NO_DATA where not.
+    std::vector<uint32_t> addr_city_ids;
 
     // External postcode centroids (TIGER segments, GeoNames rows) keyed by
     // postcode_key(country, postcode string id), like Nominatim's
@@ -496,6 +514,9 @@ struct ParsedData {
     // native coordinate precision.
     struct PostcodeAccum {
         int64_t sum_lat_e7 = 0; int64_t sum_lng_e7 = 0; uint64_t count = 0;
+        // The source of the centroid (attribution.h): OSM's addresses, or
+        // the external set that filled a pair OSM has none for.
+        uint8_t source = ATTRIBUTION_OSM;
         void add(double lat, double lng) {
             sum_lat_e7 += to_e7(lat);
             sum_lng_e7 += to_e7(lng);
@@ -505,6 +526,17 @@ struct ParsedData {
         double lng() const { return (sum_lng_e7 / 1e7) / static_cast<double>(count); }
     };
     std::unordered_map<uint64_t, PostcodeAccum> postcode_accum;
+
+    // The postcode grid (postcode_grid_build.h): the planet's runs, found
+    // once on the full data (collect_postcode_grid), which a continent's
+    // file is made of (region_rows) and which it doesn't keep, and the
+    // region's postcode_grid.bin, which every mode dir holds alike: empty for
+    // a region of no run. The sources of the planet's votes (attribution.h):
+    // OSM's addresses, and TIGER's lines, whose ZIPs a region's grid holds
+    // with the runs it takes.
+    std::vector<postcode_grid::LogicalRow> postcode_grid_rows;
+    std::vector<uint8_t> postcode_grid_file;
+    uint8_t postcode_grid_sources = 0;
 
     // The houses whose tag makes a centroid of another postcode than the
     // one they keep (normalise_addr_postcodes), those of a country of no
@@ -610,27 +642,30 @@ inline size_t grow_by(std::vector<T>& v, size_t n) {
 // Grows addr_points and the arrays parallel to it by n points, which
 // put_addr_point then fills (from many threads at once); returns the first.
 inline size_t grow_addr_points(ParsedData& data, size_t n) {
-    // put_addr_point writes one index into all four arrays.
+    // put_addr_point writes one index into all five arrays.
     const size_t size = data.addr_points.size();
-    if (data.addr_osm_ids.size() != size || data.addr_postcode_ids.size() != size || data.addr_cells.size() != size)
+    if (data.addr_osm_ids.size() != size || data.addr_postcode_ids.size() != size ||
+        data.addr_city_ids.size() != size || data.addr_cells.size() != size)
         throw std::logic_error("addr_points and its parallel arrays differ in length");
     grow_by(data.addr_osm_ids, n);
     grow_by(data.addr_postcode_ids, n);
+    grow_by(data.addr_city_ids, n);
     grow_by(data.addr_cells, n);
     return grow_by(data.addr_points, n);
 }
 
 // Stores address point i, its strings already interned (NO_DATA for a
-// missing street or postcode); `cell` is point_to_cell() of its location. A
-// building's polygon already sits at addr_vertices[vertex_offset].
+// missing street, postcode or city); `cell` is point_to_cell() of its
+// location. A building's polygon already sits at addr_vertices[vertex_offset].
 inline void put_addr_point(ParsedData& data, size_t i, float lat, float lng,
                            uint32_t housenumber_id, uint32_t street_id, uint32_t postcode_id,
-                           uint64_t cell, uint64_t osm_id_packed,
+                           uint32_t city_id, uint64_t cell, uint64_t osm_id_packed,
                            uint32_t vertex_offset = NO_DATA, uint32_t vertex_count = 0) {
     // parent_way_id is filled in during the nearest-street sweep.
     data.addr_points[i] = {lat, lng, housenumber_id, street_id, NO_DATA, vertex_offset, vertex_count};
     data.addr_osm_ids[i] = osm_id_packed;
     data.addr_postcode_ids[i] = postcode_id;
+    data.addr_city_ids[i] = city_id;
     data.addr_cells[i] = cell;
 }
 
@@ -716,6 +751,13 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
         parallel_for(n, [&](size_t b, size_t e, unsigned) {
             for (size_t s = b; s < e; s++) tier[s] = string_home_tier(mask[s].load(std::memory_order_relaxed));
         }, threads);
+        // An addr:city is none where no place node or boundary has its
+        // string, though a POI sharing it with a street puts it in core.
+        mark_each(data.addr_city_ids.size(), [&](size_t i) {
+            uint32_t& city = data.addr_city_ids[i];
+            const size_t s = city == NO_DATA ? RankedBits::npos : starts.index(city);
+            if (s == RankedBits::npos || !(mask[s].load(std::memory_order_relaxed) & STR_TIER_BIT_CORE)) city = NO_DATA;
+        });
     }
 
     // Each tier's string offsets in alphabetical order. Strings no shipped
@@ -850,6 +892,13 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
     remap_vec(data.way_postcode_ids);
     remap_vec(data.addr_postcode_ids);
     remap_vec(data.interp_postcode_ids);
+    // An addr:city marks no tier: one a place node or a boundary names (none
+    // else is left above) keeps its string, a core one.
+    remap_each(data.addr_city_ids.size(), [&](size_t i) {
+        uint32_t& city = data.addr_city_ids[i];
+        const size_t s = city == NO_DATA ? RankedBits::npos : starts.index(city);
+        city = s != RankedBits::npos && tier[s] == STR_TIER_CORE ? new_off[s] : NO_DATA;
+    });
     {
         // Re-keys the nodes rather than copying them: a planet's worth of
         // node allocations and frees on one core takes seconds.
@@ -887,7 +936,8 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
 
 // Lays the POI tier out in POI record order, so a reader walking the records
 // (the place search build) reads their names front to back instead of all
-// over the tier. A name's home is the lowest POI tier of a record using it;
+// over the tier. A name's home is the lowest POI tier of a record using it
+// (poi_lowest_tier);
 // the names of each home tier sit together, lowest tier first, each where the
 // first record of its home tier using it sits in the records' final order. So
 // the names of the POIs of tier <= t are the head of the tier
@@ -926,14 +976,15 @@ inline void order_poi_strings_by_record(ParsedData& data, unsigned threads = 0) 
         for (size_t i = b; i < e; i++) {
             const size_t s = name_of(records[i].name_id);
             if (s == RankedBits::npos) continue;
+            const uint8_t tier = poi_lowest_tier(records[i]);
             uint8_t seen = home[s].load(std::memory_order_relaxed);
-            while (records[i].tier < seen && !home[s].compare_exchange_weak(seen, records[i].tier, std::memory_order_relaxed)) {}
+            while (tier < seen && !home[s].compare_exchange_weak(seen, tier, std::memory_order_relaxed)) {}
         }
     }, threads);
     parallel_for(records.size(), [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) {
             const size_t s = name_of(records[i].name_id);
-            if (s == RankedBits::npos || records[i].tier != home[s].load(std::memory_order_relaxed)) continue;
+            if (s == RankedBits::npos || poi_lowest_tier(records[i]) != home[s].load(std::memory_order_relaxed)) continue;
             uint32_t seen = first[s].load(std::memory_order_relaxed);
             while (i < seen && !first[s].compare_exchange_weak(seen, static_cast<uint32_t>(i), std::memory_order_relaxed)) {}
         }

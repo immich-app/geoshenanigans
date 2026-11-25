@@ -22,6 +22,7 @@
 #include "patch_decompress.h"
 #include "patch_format.h"
 #include "place_test_files.h"
+#include "postcode_grid.h"
 #include "postcode_test_files.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
@@ -273,7 +274,8 @@ void put_identity_streets(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
 //   3:  3 -> 3  MATCH       (B, on street 4 -> 3), footprint 3 4, at byte 18 -> 22 of the footprints
 //   24: 4 -> 0  moved       (C, on street 1)
 //   25:      4  new         (D, on the new street 4)
-// addr_postcodes follows the addresses; new 3's postcode changes.
+// addr_postcodes and addr_cities follow the addresses; new 3's postcode
+// changes, new 0 loses its city, new 1's changes and new 2 gains one.
 void put_identity_addresses(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
     old_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{
         {48.0f, 11.0f, OLD_B, OLD_B, 3, NO_DATA, 0}, {48.0f, 11.0f, OLD_C, OLD_C, 2, 0, 2},
@@ -289,6 +291,8 @@ void put_identity_addresses(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
     ids.new_keys["addr"] = {24, 0, 21, 3, 25};
     old_d["addr_postcodes.bin"] = bytes_of(std::vector<uint32_t>{OLD_B, OLD_C, OLD_A, NO_DATA, OLD_C});
     new_d["addr_postcodes.bin"] = bytes_of(std::vector<uint32_t>{NEW_D, NEW_B, NEW_C, NEW_B, NO_DATA});
+    old_d["addr_cities.bin"] = bytes_of(std::vector<uint32_t>{OLD_A, NO_DATA, OLD_C, OLD_B, OLD_B});
+    new_d["addr_cities.bin"] = bytes_of(std::vector<uint32_t>{NO_DATA, NEW_C, NEW_D, NEW_B, NEW_C});
 }
 
 // Interpolations matched by identity (key: old id -> new id):
@@ -1273,6 +1277,108 @@ TEST(patch_round_trip_merges_postcode_centroids_as_logical_rows) {
     CHECK(!logged(same, "encode postcodes:"));
 }
 
+// --decode-logical writes a dir's postcode grid as its 24-byte rows, and none
+// for a dir without one; a grid the encoder would not write is refused.
+TEST(decode_logical_writes_the_postcode_grids_rows) {
+    ScratchDir dir("decode-logical-grid");
+    const std::string log = dir.path() + "/tools.log";
+    const uint16_t US = uint16_t('U' << 8 | 'S');
+    const std::vector<postcode_grid::LogicalRow> rows = {
+        postcode_grid::row_of(postcode_grid::cell_at(1000, 16), US, "19026"), postcode_grid::row_of(postcode_grid::cell_at(1150, 16), 0, ""),
+        postcode_grid::row_of(postcode_grid::cell_at(9000, 16), US, "19073")};
+    BuildDir d = with_pool(OLD_POOL);
+    put_grid(d, rows);
+    const std::string in = dir.path() + "/in", out = in + ".logical";
+    REQUIRE(write_dir(in, d));
+    REQUIRE(run({GEOCODER_DIFF_BIN, "--decode-logical", in, out}, log));
+    const char* p = reinterpret_cast<const char*>(rows.data());
+    CHECK(gctest::read_dir(out) == BuildDir({{postcode_grid::FILE_NAME, std::vector<char>(p, p + rows.size() * 24)}}));
+    const std::vector<char> text = read_file(log);
+    CHECK(std::string(text.begin(), text.end()).find("  grid: 72 logical bytes") != std::string::npos);
+
+    const std::string bare = dir.path() + "/bare";
+    REQUIRE(write_dir(bare, with_pool(OLD_POOL)));
+    REQUIRE(run({GEOCODER_DIFF_BIN, "--decode-logical", bare, bare + ".logical"}, log));
+    CHECK(gctest::read_dir(bare + ".logical").empty());
+
+    BuildDir bad = d;
+    bad[postcode_grid::FILE_NAME][0] ^= 4;  // its first block's count of entries
+    const std::string broken = dir.path() + "/broken";
+    REQUIRE(write_dir(broken, bad));
+    CHECK(!run({GEOCODER_DIFF_BIN, "--decode-logical", broken, broken + ".logical"}, log));
+    const std::vector<char> refused = read_file(log);
+    CHECK(std::string(refused.begin(), refused.end()).find("Malformed postcode grid") != std::string::npos);
+}
+
+// A grid's runs over three blocks on both days: a run whose postcode
+// changes, one split in two by a cell of another, one gone into the runs
+// round it. The content merge sends each changed row as a delete and an
+// insert, and the rest MATCH; a dir that gets its grid or loses it merges as
+// any other day; a day that changes no run sends the file unchanged, and the
+// patcher copies it from the old dir as it sits.
+TEST(patch_round_trip_merges_the_postcode_grid_as_logical_rows) {
+    const uint16_t US = uint16_t('U' << 8 | 'S');
+    auto row = [&](uint64_t pos, const std::string& code) {
+        return postcode_grid::row_of(postcode_grid::cell_at(pos, 16), code.empty() ? 0 : US, code);
+    };
+    std::vector<postcode_grid::LogicalRow> old_rows, new_rows;
+    for (uint64_t i = 0; i < 400; i++) old_rows.push_back(row(1000 + 20 * i, i % 5 == 4 ? "" : std::to_string(19000 + i % 4)));
+    for (uint64_t i = 0; i < 400; i++) {
+        if (i == 300) continue;  // gone: its cells are the run before it's
+        new_rows.push_back(old_rows[i]);
+        if (i == 10) new_rows.back() = row(1000 + 20 * i, "19099");  // another postcode
+        if (i == 200) {
+            new_rows.push_back(row(1000 + 20 * i + 7, "19098"));  // a cell of another postcode
+            new_rows.push_back(row(1000 + 20 * i + 8, std::string(postcode_grid::code_of(old_rows[i]))));
+        }
+    }
+    // Run 300's neighbours, 299 and 301, differ from each other.
+    REQUIRE(!postcode_grid::same_postcode(old_rows[299], old_rows[301]));
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(OLD_POOL);
+    put_grid(old_d, old_rows);
+    put_grid(new_d, new_rows);
+    const RoundTrip changed = round_trip(old_d, new_d);
+    CHECK(changed.mismatches.empty());
+    CHECK(logged(changed, "postcode_grid.bin: seq="));
+    CHECK(logged(changed, "recs m/i/d/r=398/3/2/0"));
+
+    const RoundTrip same = round_trip(old_d, old_d);
+    CHECK(same.mismatches.empty());
+    CHECK(logged(same, "postcode_grid.bin: unchanged (copied "));
+    CHECK(!logged(same, "encode grid:"));
+
+    // A dir's first grid, and its last.
+    const BuildDir without = with_pool(OLD_POOL);
+    CHECK(round_trip(without, new_d).mismatches.empty());
+    CHECK(round_trip(old_d, without).mismatches.empty());
+    CHECK(round_trip(without, without).mismatches.empty());
+}
+
+// A day whose new runs lie 12,000 in a row ahead of runs both days hold: the
+// merge walks both days' runs by cell, so each run both hold at the same cell
+// MATCHes however many new runs come before it, and only the new runs go in
+// the patch. The 500 kept runs are sent once, as a MATCH.
+TEST(patch_round_trip_matches_the_grid_runs_after_any_number_of_new_ones) {
+    const uint16_t US = uint16_t('U' << 8 | 'S');
+    auto row = [&](uint64_t pos, uint32_t code) {
+        return postcode_grid::row_of(postcode_grid::cell_at(pos, 16), US, std::to_string(code));
+    };
+    std::vector<postcode_grid::LogicalRow> old_rows, new_rows;
+    for (uint64_t i = 0; i < 12000; i++) new_rows.push_back(row(1000 + 3 * i, 19000 + i % 2));
+    for (uint64_t i = 0; i < 500; i++) old_rows.push_back(row(100000 + 5 * i, 19002 + i % 2));
+    new_rows.insert(new_rows.end(), old_rows.begin(), old_rows.end());
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(OLD_POOL);
+    put_grid(old_d, old_rows);
+    put_grid(new_d, new_rows);
+    const RoundTrip r = round_trip(old_d, new_d);
+    CHECK(r.mismatches.empty());
+    CHECK(logged(r, "recs m/i/d/r=500/12000/0/0"));
+    if (!logged(r, "recs m/i/d/r=500/12000/0/0")) {
+        const size_t at = r.log.find("postcode_grid.bin: seq=");
+        std::printf("    %s\n", at == std::string::npos ? "no grid merge line" : r.log.substr(at, r.log.find('\n', at) - at).c_str());
+    }
+}
+
 // The moved postcode's string fixups take 2 bytes each. Under a limit of 2
 // (--string-fixup-bytes-max, lower for tests) it round-trips; under 1 the
 // diff refuses it, and no patch is written: a merge section's header gives
@@ -1549,8 +1655,9 @@ TEST(patch_round_trip_by_identity_rebuilds_interp_ways) {
     CHECK(logged(r, "interp_ways identity: match=1 replace=1 insert=2 delete=2 moved=1"));
 }
 
-// The four side files, each beside the records it follows.
-const char* const SIDE_FILES[] = {"way_parents.bin", "way_postcodes.bin", "interp_postcodes.bin", "addr_postcodes.bin"};
+// The five side files, each beside the records it follows.
+const char* const SIDE_FILES[] = {"way_parents.bin", "way_postcodes.bin", "interp_postcodes.bin", "addr_postcodes.bin",
+                                  "addr_cities.bin"};
 
 // A side file is written only on a day that has a value for it. One the old
 // day lacks comes whole, a full replacement of its values (4 bytes each),
@@ -1730,7 +1837,8 @@ TEST(patch_round_trip_of_address_points_that_gain_their_first_footprint_or_lose_
 // footers, and from and to a dir without the files, each merged by content
 // and by slot. The day with addresses holds five on streets that move, two
 // with a footprint, the second's after the first's, in geo cells that list
-// them, with their postcodes; the day without has no addr_postcodes.bin.
+// them, with their postcodes and cities; the day without has no
+// addr_postcodes.bin or addr_cities.bin.
 TEST(patch_round_trip_of_a_dir_that_gains_its_first_address_or_loses_its_last) {
     struct Day {
         std::string name;
@@ -1747,7 +1855,8 @@ TEST(patch_round_trip_of_a_dir_that_gains_its_first_address_or_loses_its_last) {
             put_identity_streets(old_d, new_d, ids);
             put_identity_addresses(old_d, new_d, ids);
             BuildDir& without = day.gains ? old_d : new_d;
-            for (const char* file : {"addr_points.bin", "addr_vertices.bin", "addr_postcodes.bin"}) without.erase(file);
+            for (const char* file : {"addr_points.bin", "addr_vertices.bin", "addr_postcodes.bin", "addr_cities.bin"})
+                without.erase(file);
             if (day.footers) without["addr_points.bin"] = without["addr_vertices.bin"] = {};
             put_geo_cells(old_d, {{CELL, every, day.gains ? none : every, {}},
                                   {CELL_2, {2, 3, 4}, day.gains ? none : std::vector<uint32_t>{1, 4}, {}}});

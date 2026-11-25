@@ -1233,8 +1233,10 @@ const std::vector<FamilyFiles> FAMILY_FILES = {
     {"poi", {"poi_records.bin", "poi_vertices.bin"}},
     {"places", {"place_cells.bin", "place_nodes.bin", "place_hidden.bin"}},
     {"postcodes", {"postcode_centroids.bin", "postcode_centroid_cells.bin"}},
+    {"grid", {postcode_grid::FILE_NAME}},
     {"way_parents", {"way_parents.bin"}},
     {"addr_postcodes", {"addr_postcodes.bin"}},
+    {"addr_cities", {"addr_cities.bin"}},
 };
 
 // n place nodes, every fourth the hidden label of a polygon.
@@ -1262,16 +1264,28 @@ std::vector<postcode_files::LogicalCentroid> some_centroids(uint32_t n) {
     return rows;
 }
 
+// A postcode grid of 40 runs, each of three US postcodes from `first` in
+// turn but every fourth, of none: of any first of five digits, as many bytes.
+std::vector<postcode_grid::LogicalRow> some_grid(uint32_t first) {
+    std::vector<postcode_grid::LogicalRow> rows;
+    for (uint64_t i = 0; i < 40; i++) {
+        const std::string code = i % 4 == 3 ? "" : std::to_string(first + i % 3);
+        rows.push_back(postcode_grid::row_of(postcode_grid::cell_at(1000 + 7 * i, 16), code.empty() ? 0 : uint16_t('U' << 8 | 'S'), code));
+    }
+    return rows;
+}
+
 // A dir of every encoded family: 40 street ways of two nodes in a geo cell,
 // with a parent each; 30 interpolations of three nodes; 60 address points,
-// two in three with a footprint, with a postcode each; 50 POIs, two in three
-// polygons; 20 place nodes; 30 postcode centroids.
+// two in three with a footprint, with a postcode each and three in four with
+// a city; 50 POIs, two in three polygons; 20 place nodes; 30 postcode
+// centroids; a postcode grid of 40 runs.
 BuildDir every_family(std::mt19937& rng) {
     BuildDir d, meta;
     std::vector<uint32_t> names;
     for (uint32_t w = 0; w < 40; w++) names.push_back(w % 7);
     put_named_ways(d, meta, names);
-    std::vector<char> interps, interp_nodes, parents, postcodes;
+    std::vector<char> interps, interp_nodes, parents, postcodes, cities;
     for (uint32_t i = 0; i < 30; i++) {
         append(interps, InterpWay{3 * i, 3, 0, i % 5, 1 + 2 * i, 21 + 2 * i, 1});
         for (uint32_t k = 0; k < 3; k++) {
@@ -1285,14 +1299,17 @@ BuildDir every_family(std::mt19937& rng) {
     for (uint32_t i = 0; i < 60; i++) {
         addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, i % 3 == 0 ? std::vector<char>{} : block(rng, 1 + rng() % 8)});
         append(postcodes, i / 3 * 8);
+        append(cities, i % 4 == 1 ? NO_DATA : i / 7 * 8);
     }
     put_addrs(d, addrs);
     for (uint32_t w = 0; w < 40; w++) append(parents, w % 9);
     d["way_parents.bin"] = parents;
     d["addr_postcodes.bin"] = postcodes;
+    d["addr_cities.bin"] = cities;
     put_pois(d, pois_of(rng, 50, 0, true));
     put_places(d, some_places(20));
     put_centroids(d, some_centroids(30));
+    put_grid(d, some_grid(19000));
     return d;
 }
 
@@ -1345,9 +1362,9 @@ std::vector<char> unlisted(const std::vector<char>& raw, const std::string& file
 
 // A family the day leaves as it is, each of its sections sent as unchanged
 // (a way pair's, the address files', the POI files': the records' section and
-// the child's after it; the place files', the postcode centroid files' and a
-// side file's: their one section), is copied from the old dir as its files
-// sit there, the files no section names with them (addr_index.bin;
+// the child's after it; the place files', the postcode centroid files', the
+// postcode grid's and a side file's: their one section), is copied from the
+// old dir as its files sit there, the files no section names with them (addr_index.bin;
 // place_cells.bin and place_hidden.bin; postcode_centroid_cells.bin), and
 // none of its codecs runs: on a day that changes
 // nothing, and beside each family in turn that a day does change, in its
@@ -1386,8 +1403,15 @@ TEST(patch_copies_a_family_both_of_whose_sections_are_unchanged) {
              centroids[11].lat += 1e-3f;
              put_centroids(d, centroids);
          }},
+        {"grid-run", {"grid"},
+         [](BuildDir& d) {
+             std::vector<postcode_grid::LogicalRow> rows = some_grid(19000);
+             rows[5] = postcode_grid::row_of(rows[5].cell, uint16_t('U' << 8 | 'S'), "19099");
+             put_grid(d, rows);
+         }},
         {"way-parent", {"way_parents"}, [](BuildDir& d) { put_at(d["way_parents.bin"], 11 * 4, 99u); }},
         {"postcode", {"addr_postcodes"}, [](BuildDir& d) { put_at(d["addr_postcodes.bin"], 11 * 4, 800u); }},
+        {"city", {"addr_cities"}, [](BuildDir& d) { put_at(d["addr_cities.bin"], 13 * 4, 800u); }},
     };
     for (const Day& day : days) {
         BuildDir new_d = base;
@@ -1404,7 +1428,8 @@ TEST(patch_copies_a_family_both_of_whose_sections_are_unchanged) {
 
 // A family a day leaves unchanged is copied as its files sit, and each of its
 // files the patch gives a hash of is held to it first: with one byte of such
-// a file changed, its size kept, no mode applies the patch.
+// a file changed, its size kept, or a postcode grid of other postcodes in
+// place of the old one, no mode applies the patch.
 TEST(patch_holds_the_files_of_a_family_it_copies_to_their_hashes) {
     ScratchDir dir("lowmem-copied-hashes");
     std::mt19937 rng(20261116);
@@ -1423,6 +1448,43 @@ TEST(patch_holds_the_files_of_a_family_it_copies_to_their_hashes) {
         CHECK(not_refused(c, ALL_MODES, c.patch(), name, "Old " + name + " is not the one the patch was made from").empty());
         REQUIRE(write_file(path, written));
     }
+    // The grid holds its postcodes as text, which no string tier's hash
+    // covers: an old grid of other postcodes, as many bytes and runs, which
+    // the patch would copy as it sits, is refused too.
+    const std::string grid = c.dir("old") + "/" + postcode_grid::FILE_NAME;
+    const std::vector<char> written = read_file(grid);
+    BuildDir other;
+    put_grid(other, some_grid(19003));
+    REQUIRE(other[postcode_grid::FILE_NAME].size() == written.size() && other[postcode_grid::FILE_NAME] != written);
+    REQUIRE(write_file(grid, other[postcode_grid::FILE_NAME]));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "other-grid", "Old postcode_grid.bin is not the one the patch was made from").empty());
+    REQUIRE(write_file(grid, written));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// A day that changes runs of the grid replays them over the old file's: an
+// old grid of other postcodes, as many bytes and runs, decodes as well as the
+// one the patch was made from, so the patcher holds it to the old file's
+// hash first, and refuses it in every mode.
+TEST(patch_holds_the_old_postcode_grid_it_replays_to_its_hash) {
+    ScratchDir dir("lowmem-grid-replay-hash");
+    std::mt19937 rng(20261125);
+    const BuildDir base = every_family(rng);
+    BuildDir day = base;
+    std::vector<postcode_grid::LogicalRow> rows = some_grid(19000);
+    rows[5] = postcode_grid::row_of(rows[5].cell, uint16_t('U' << 8 | 'S'), "19099");
+    put_grid(day, rows);
+    const LowMemCase c{dir.path(), "grid-day"};
+    REQUIRE(prepare(c, base, day).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    const std::string grid = c.dir("old") + "/" + postcode_grid::FILE_NAME;
+    const std::vector<char> written = read_file(grid);
+    BuildDir other;
+    put_grid(other, some_grid(19003));
+    REQUIRE(other[postcode_grid::FILE_NAME].size() == written.size() && other[postcode_grid::FILE_NAME] != written);
+    REQUIRE(write_file(grid, other[postcode_grid::FILE_NAME]));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "other-grid", "Old postcode_grid.bin is not the one the patch was made from").empty());
+    REQUIRE(write_file(grid, written));
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
@@ -8005,6 +8067,7 @@ TEST(patch_refuses_a_section_sent_as_unchanged_whose_new_size_is_not_its_old_one
         {PatchFileId::POSTCODE_CENTROIDS, postcode_files::LOGICAL_STRIDE * 30, postcode_files::LOGICAL_STRIDE},
         {PatchFileId::WAY_PARENTS, logical("way_parents.bin"), 4},
         {PatchFileId::ADDR_POSTCODES, logical("addr_postcodes.bin"), 4},
+        {PatchFileId::ADDR_CITIES, logical("addr_cities.bin"), 4},
     };
     const std::vector<Section> of_arcs = {{PatchFileId::ARC_INDEX, arcs.at("arc_index.bin").size(), ARC_INDEX_STRIDE}};
     for (const auto& [name, d, sections] : {std::tuple<const char*, const BuildDir&, const std::vector<Section>&>{"families", families, of_families},

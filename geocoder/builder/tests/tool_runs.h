@@ -30,8 +30,8 @@ namespace gctest {
 // interp_nodes.bin their ways' nodes back to back, addr_points.bin the
 // 28-byte records, addr_vertices.bin their footprints' logical blobs back to
 // back, a side file (way_parents.bin, way_postcodes.bin,
-// interp_postcodes.bin, addr_postcodes.bin) its u32 values, a strings_*.bin
-// its pool.
+// interp_postcodes.bin, addr_postcodes.bin, addr_cities.bin) its u32 values,
+// a strings_*.bin its pool.
 using BuildDir = std::map<std::string, std::vector<char>>;
 
 inline bool is_string_tier(const std::string& name) {
@@ -135,6 +135,7 @@ inline const std::vector<WrittenFamily>& written_families() {
         {"way_postcodes.bin", write_side_file},
         {"interp_postcodes.bin", write_side_file},
         {"addr_postcodes.bin", write_side_file},
+        {"addr_cities.bin", write_side_file},
     };
     return f;
 }

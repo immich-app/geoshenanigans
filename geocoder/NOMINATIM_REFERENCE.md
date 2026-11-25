@@ -9,10 +9,10 @@ This document traces how Nominatim resolves admin boundaries to address fields, 
 | `settings/address-levels.json` | Country-specific admin_level → address_rank mapping |
 | `lib-sql/functions/ranking.sql` | `compute_place_rank()` — looks up rank from address_levels table |
 | `lib-sql/functions/placex_triggers.sql` | `find_linked_place()` — links boundaries to place nodes. `placex_update()` — rank adjustments for nested boundaries |
-| `src/nominatim_api/v1/classtypes.py` | `get_label_tag()` — determines the output field name (city, state, county, etc.) |
-| `src/nominatim_api/v1/format_json.py` | `_write_typed_address()` — writes the address JSON using labels from get_label_tag |
-| `src/nominatim_api/reverse.py` | `ReverseGeocoder.lookup()` — the reverse steps; `_find_closest_street_or_pois()` — the nearby lookup, tried first; `_lookup_area_others()` — the area fallback, which returns the bodies of water of `layer=natural` |
-| `lib-lua/themes/nominatim/presets.lua` | Which tags import as which class/type (`natural`, `water`, `waterway`, `place`) |
+| `src/nominatim_api/v1/classtypes.py` | `get_label_tag()` — determines the output field name (city, state, county, etc.); `OSM_ATTRIBUTION`, the `licence` string |
+| `src/nominatim_api/v1/format_json.py` | `_write_typed_address()` — writes the address JSON using labels from get_label_tag; `format_base_json()` puts `licence` in every result |
+| `src/nominatim_api/reverse.py` | `ReverseGeocoder.lookup()` — the reverse steps; `_find_closest_street_or_pois()` — the nearby lookup, tried first: the closest street, address point or rank-30 POI; `_lookup_area_others()` — the area fallback, which returns the bodies of water of `layer=natural` |
+| `lib-lua/themes/nominatim/presets.lua`, `init.lua` | The import's main tags (`MAIN_TAGS_POIS`, `MAIN_TAGS.natural`), which tags import as which class/type (`natural`, `water`, `waterway`, `place`), and how an object's main tags give its class and categories (`process_tags`) |
 
 ## Step 1: admin_level → address_rank
 
@@ -121,15 +121,15 @@ What the polygons at a point cannot tell, and Nominatim decides on the whole geo
 - Every place type ranks a boundary (place=locality makes Northern Ireland's townlands rank 25); the builder keeps 14 types.
 - Levels 11 and 12 (level 11 holds the postal areas here), and administrative ways only at levels 8 to 12.
 
-Nominatim ranks every boundary of a rank above 0 holding the point (getNearFeatures, :1273). Here the smallest of each admin_level is ranked, and of levels 3 to 10 every larger one that the smallest lies within (`polygon_within`): Bruxelles - Brussel (level 10, 18 in Belgium) round Quays Quarter (level 10, a neighbourhood) is the city district, its parent the city, as the level 9 boundary repeating the city is in no address. The address has a row a rank (`address_havelevel`): of the boundaries of one rank the smallest alone fills a field or joins display_name (`one_boundary_a_rank`), so a level 8 boundary tagged place=town round a level 8 city, both of rank 16, names nothing. One beside the smallest is left out, as the simplified presets' neighbours overlap along their shared borders, and of level 2 the smallest alone names the country. One rule waits for those: a boundary labelled city, town or village holds rank 16 from place nodes whatever its own rank, standing in for the linked place's rank that Nominatim gives it even below its own (the parish of Winsford ranks 16, its admin_level 20): holding only its own rank lets villages such as Argir in Tórshavn into the address.
+Nominatim ranks every boundary of a rank above 0 holding the point (getNearFeatures, :1273). Here the smallest of each admin_level is ranked, and of levels 3 to 10 every larger one that the smallest lies within (`polygon_within`): Bruxelles - Brussel (level 10, 18 in Belgium) round Quays Quarter (level 10, a neighbourhood) is the city district, its parent the city, as the level 9 boundary repeating the city is in no address. The address has a row a rank (`address_havelevel`): a larger boundary round the smallest of its level is no row at a rank a smaller boundary has (`one_boundary_a_rank`), so a level 8 boundary tagged place=town round a level 8 city, both of rank 16, names nothing; among the other polygons of one rank the rows below choose. One beside the smallest is left out, as the simplified presets' neighbours overlap along their shared borders, and of level 2 the smallest alone names the country. One rule waits for those: a boundary labelled city, town or village holds rank 16 from place nodes whatever its own rank, standing in for the linked place's rank that Nominatim gives it even below its own (the parish of Winsford ranks 16, its admin_level 20): holding only its own rank lets villages such as Argir in Tórshavn into the address.
 
-Smallest-area-wins then settles polygons that still map to the same output field (if two polygons both map to "county", the smaller one wins). The address names the winner, as Nominatim's keeps the first row of a label, and display_name lists the other at its rank as well, where no field's polygon has that rank (Nominatim's display_name joins every row): York County (rank 10, labelled county) beside the City of Fredericton (12). A polygon of the outline of the one that took its field is not listed, as Nominatim takes out a boundary repeating its parent's wikidata and geometry (Bruxelles - Brussel under Brussels). The outline is taken as the same where the two have the same area and the same ring block, or every edge of each lies along the other's edges (`same_outline`); the records carry no wikidata, so it is not compared.
+Each rank then shows one polygon, as Nominatim's `complete_address_details` orders a rank's rows (results.py:611-632). The street's index-time walk (`insert_addresslines`) takes the areas of a rank by getNearFeatures' distance, the street middle's distance to the area plus a hundred-thousandth of the street's to its centroid (partition-functions.sql:32-35), weighted at rank 16 by `rank_search` as place nodes are (0.25 for 16, 0.5 for 18, placex_triggers.sql:597-605), and accepts the first whose centroid lies in the area accepted before it (here an area smaller than that one is taken as lying in it and its centroid is not tested, a larger or equal one's is: `CurrentBoundaries::accepted`); that row scores 0, another area holding the result's centroid scores 1 and one that does not -1, the farthest by plain distance first, then the one of the higher `rank_search`. The result's centroid is the answering house's or POI's, else the street's point nearest the query (`ST_ClosestPoint`, reverse.py:46). A boundary's centroid is the place node it links where that lies inside it (:1121-1125), else here its point on surface; a boundary's `rank_search` is its level's, a place area's its own place tag's. getNearFeatures takes an area for a street only where the two share a stretch, so of two or more polygons of a rank holding the query point, one the street does not run through is left out where another is one it runs through. Here every polygon of a rank holds the query point, so a rank of two or more shows the farthest the walk does not accept where that holds the result's centroid, else the one it accepts: at 40 Mespil Road, County Dublin over the postal district Dublin 4 (a place area of rank 12 whose centre is the nearer the street); at Donegall Square North, Belfast, the County Borough over Belfast City District, whose centroid is the city node at the City Hall beside the street; and on Malone Road the district, as the walk takes the borough, a place=city area of `rank_search` 16, first. The others are no part. The same walk, over the boundaries and the place areas holding the point, gives the place nodes their `current_boundary`. A polygon of the field and the outline of one before it is none of a rank's and holds no rank, as Nominatim takes out a boundary repeating its parent's wikidata and geometry (Bruxelles - Brussel under Brussels). The outline is taken as the same where the two have the same area and the same ring block, or every edge of each lies along the other's edges (`same_outline`); the records carry no wikidata, so it is not compared.
+
+The answer is then a list of rows, finest first, as Nominatim's `complete_address_details` gives it: these polygons, and at each rank no polygon holds a place node. The street's walk takes the place nodes whose fuzzy area it crosses by rank, then by distance (weighted at rank 16 by `rank_search`), leaves out a node outside the area accepted before its rank (`current_boundary`, no row), and accepts the first of a rank that lies in the last accepted node's fuzzy area; one outside it is turned down but is a row all the same (placex_triggers.sql:606-669). The accepted node is its rank's row. A rank whose nodes the walk all turns down still shows one: their rows all score -1 at query time and none is an area, so `distance desc` puts the farthest first, by plain distance, then `rank_search desc` (results.py:611-632). Of Nislevvej's four hamlets of rank 20, outside the village Otterup's fuzzy area, that is Stormose; at Ngaio Road, the quarter Woodlands Park over the nearer Waimā. The node so shown sets no fuzzy area. A node whose fuzzy area misses the street, or which lies outside its rank's boundary, is no row (the White House's West End). A node of a rank an area holds is a row the answer does not show, the area's coming first (Hayes Valley inside the South of Market area at 24), but a house's `addr:city` naming it can still make it the rank's row (the crosscheck below). Only an area the walk accepts marks its rank as had and clears the last accepted node's fuzzy area (:645-652): at a rank whose areas the walk turns down a node can be accepted, which is no row shown, as an area holding the result's centroid shows there, but whose fuzzy area holds the next nodes. Each row is a part of display_name, and the address keeps the first row of each label, finest first (`_write_typed_address`, format_json.py:29-34), a place node's or a polygon's alike: Brentwood's town node, promoted to 18 inside the Town of Islip (a boundary of rank 16 labelled town), is the town, and the Town of Islip is a part of display_name only; the parish of Vernhams Dean (rank 20, a linked village) is the village over the village node Vernham Street (18), which display_name lists after it. The one exception is a region of the country's own name (the Netherlands' constituent country), which the address leaves out and display_name keeps.
 
 ## Step 5: Competing polygons
 
-Nominatim uses `isaddress` flag in the database to determine which boundaries appear in the address. When multiple boundaries exist at the same rank, only one gets `isaddress=true`.
-
-We use smallest-area-wins with PIP verification. This is a different mechanism but achieves a similar result for most cases.
+Nominatim's `insert_addresslines` sets `isaddress` on one area a rank, and `complete_address_details` puts an area holding the result's centroid before it at query time, so one row a rank is shown. We take the polygons holding the query point, walk them as `insert_addresslines` does and show the one of Step 4.
 
 ## boundary=place handling
 
@@ -157,13 +157,179 @@ In `get_label_tag()`, DC has `category=('place', 'city')` so it hits check 5 (li
 ### Our approach
 
 - At query time: apply Nominatim's rank adjustment to the polygons containing the point (Nominatim runs it at index time)
-- Then for each output field (city, county, state, etc.), keep the smallest-area polygon, admin boundaries before place areas — when two polygons map to the same field, the more specific (smaller) one wins
+- Then one polygon a rank (Step 4), and each label to the finest row that has it
 
 ### Difference impact
 
 Where Nominatim's rank adjustment matters:
 - Two admin levels that both map to the same rank range (e.g., level 5 and 6 both → county in some countries)
 - Nominatim bumps the inner one, and so do we. The difference left is that we only see the polygons containing the query point and judge containment between them by admin level, area and the rings' containment test (`polygon_within`, Step 4), where Nominatim tests the geometry with `ST_Contains`.
+
+## The primary POI: Nominatim's rank-30 lane
+
+`_find_closest_street_or_pois()` (`reverse.py:160-240`) takes, besides streets
+and address points, POIs of `rank_search = 30` whose class is not `place` or
+`building` and whose geometry is not a line (`reverse.py:192-195`). The
+closest wins, and an answer whose primary is a POI takes its `road` and
+`postcode` from it (its parent street, its own postcode). The server's
+`find_nearest_poi_with_parent()` is that lane.
+
+**Which objects rank 30.** An object gets one row, of all its main tags'
+categories (`init.lua` `process_tags`, lines 734-878): its class and type are
+its alphabetically first main tag that is no fallback tag, else its first
+fallback tag. Its ranks are those of the category with the lowest positive
+address rank, else the lowest search rank (`ranking.sql`
+`compute_place_rank`, lines 132-233). `address-levels.json` ranks (lines as
+of master 5348a803, 2026-11-21):
+
+| Main tag | rank_search, rank_address | Lines |
+|---|---|---|
+| `place=*` of an address rank: `county` 12, ..., `subdistrict` 14, ..., `locality` and `plot` 25, `square` 26 | as listed | 3-38 |
+| `natural=*` other than peak, volcano and mountain_range (18, 0), sea (4, 0) and tree, spring, cave_entrance, geyser, hot_spring, rock and stone (30, 30) | 22, 0 | 69-82 |
+| `water=*` (with `natural=water`) | 20 to 24, 0 | 83-90 |
+| `waterway=*` other than boatyard, lock_gate and access_point (30, 30) | 19 to 22, 0 | 91-100 |
+| `landuse=*` on an area | 24, 0 (residential and the other admin ones 24, 24) | 53-62 |
+| `landuse=*` on a node or line | 30, 30 (`ranking.sql:178-180`) | |
+| a key it doesn't list: `amenity`, `shop`, `tourism`, `emergency`, most `leisure`, ... | 30, 30 (`ranking.sql:195-198`) | |
+
+So no water kind ever reaches the lane: `natural=water`, `wetland`, `bay` and
+`glacier` rank 22, and `landuse=reservoir` and `basin` 24 on an area. The
+server never lets those categories (`NATURAL_WATER`, `WETLAND`, `BAY`,
+`GLACIER`, and `RESERVOIR` as a polygon) take the primary slot, nor set `road`
+or `postcode` from it (`Index::is_below_poi_rank`); a `RESERVOIR` point, a
+`landuse=reservoir|basin` node, is a rank-30 POI there and stays, but for one
+a main tag of a lower rank ranks, or whose class the lane takes none of
+(below), which the builder links no parent street. A reservoir or basin
+beside a `natural=*` value of rank 30 alone (`spring`, `hot_spring`, ...) is a
+rank-30 POI of it, class `natural`.
+
+**Water streets.** A water area a `highway=*` kind of rank 26 or 27 ranks
+(`area=yes`, `highway=pedestrian`, `natural=water`, ...), where no place or
+landuse kind of a rank below 26 ranks it lower (`place=square` ranks 26), is
+one placex row of class `highway` and `rank_address` 26 or 27 in Nominatim: a
+street, whose street lane takes address ranks 26 to 29 (`reverse.py:187-189`)
+by the distance to its geometry, 0 inside a polygon, and answers its own name
+(`lookup_street_poi`). A street has no parent street (`placex_update` parents
+`rank_search > 27` alone) and is no address point, whatever `addr:*` tags it
+carries (`IsAddressPoint` takes `rank_address = 30` alone). A multipolygon's
+geometry is its polygon; a closed way's is its polygon where `area=yes`
+alone, and its outline as a line else (`init.lua` `process_way`). The builder
+names one by its tags (`poi_classify.h` `poi_water_street`): its POI polygon
+takes the highway flag, but for a closed way of no `area=yes`, which is the
+line the street index holds, and it writes no address point of it. A
+reservoir or basin way of `area=yes` that is a street is a POI polygon of its
+own, with no POI main tag beside it (`way_tags.h` `has_poi_tags`). The
+server lets a water area of that flag compete as streets do, linked to a
+parent street or not, its own name the `road` wherever it wins
+(`Index::is_water_street`): no address node inside it takes its place, as a
+rank-30 one does in an area of `rank_search` above 27 alone
+(`lookup_street_poi`), nor does a tier-1 one take a landmark's head start. It
+reaches as far as a POI does (100 m), about as far as the street scan, of the
+query's street cell and its neighbours. Three differences stay: Nominatim's
+lane takes an area only where its centroid is within 0.007 degrees of the
+point too; its answer for a street of `addr:housenumber` carries that house
+number (`results.py` `_setup_address_details`), which a POI record holds none
+of, and its postcode is the street's own `addr:postcode` first
+(`placex_update`, `token_get_postcode`), where a street or POI here takes its
+postal boundary's, as below.
+Such a street ships in the POI tier of its water kind or in that of the
+category its tags give, whichever is lower: a lake that is an attraction is in
+`poi/notable`, as an attraction is.
+
+**Water with a POI main tag.** A water object that also carries a main tag of
+the import's POI list (`presets.lua` `MAIN_TAGS_POIS`, lines 170-262) with a
+category ranked 30 has a positive address rank, so it ranks 30 and is in the
+lane: `amenity=fountain` and `leisure=swimming_area` (class `amenity`,
+`leisure`, alphabetically before `natural`), `emergency=fire_water_pond`,
+`shop=*`, `man_made=pier`, and so on. A main tag of a lower positive address
+rank beside it ranks the object instead, out of the lane: `place=*` of an
+address rank (`locality` and `plot` 25, `suburb` 20, `subdistrict` 14, ...),
+and on an area `landuse=residential` and the other admin landuse kinds (24)
+and the `highway=*` kinds (26, 27); a landuse or highway node ranks 30. Such
+an object stays water (`poi_classify.h` `has_lower_rank_main_tag`), whatever
+its other tags. The builder classifies a rank-30 one by its rank-30 tags
+(`has_poi_main_tag`): `FOUNTAIN`, `SWIMMING_AREA`, `FIRE_WATER_POND`, `PIER`,
+..., or `GENERIC_RANK30` where they have no category of their own; a tag of a
+lower rank or of no main tag (`boundary=*`, `landuse=*` on an area,
+`leisure=park`, `natural=wood`, `place=island`, `waterway=waterfall`,
+`man_made=dam`, `power=*`) gives it none, though the classifier reads some of
+them before the water kind. Both rules run before any category. A generic
+rank-30 feature ships only with a wiki tag, as every one does; without one, the
+object stays water, so its name stays in `places` and as the `landmark`, out
+of the primary slot. Where its water kind ships in a lower POI tier than its
+category, the tiers between ship it as the water kind (`types.h`
+`poi_record_in_tier`): a bay (notable) that is a pier (all) is a `BAY` in
+`poi/notable` and a `PIER` in `poi/all`. The way pass resolves a named
+`emergency=fire_water_pond` way, and a named `landuse=reservoir|basin` way
+with a POI main tag, though the other `emergency=*` values and `shop=*` make
+no POI way alone (`way_tags.h` `has_poi_tags`). Values the import drops
+(`amenity=parking_space`, `emergency=fire_hydrant`, `tourism=yes`, ...) and
+tags of a rank below 30 and no address rank (`leisure=park`,
+`historic=neighbourhood`, `place=island`, `waterway=*`) leave the water
+category; beside a tag the object yields to, `shop=no` makes no shop.
+`building=*`, a fallback tag, ranks 30 beside `natural=*` (the class stays
+`natural`) but is the class beside `landuse=*`, also a fallback tag, and
+the lane takes no class `building`. So a reservoir or basin whose class the
+lane leaves out stays one, whatever tag ranks it 30
+(`reservoir_leaves_poi_lane`): `building` where it has fallback tags alone
+(`building`, `historic`, `tourism=attraction`), building sorting first
+among them, and `place` where `place=*` sorts before every other main tag of
+no fallback (`place=island` with `tourism=attraction` or `shop=bakery`, not
+with `amenity=fountain`).
+
+**Not matched.**
+- The builder reads no `club`, `military`, `healthcare` or `aerialway` key,
+  nor a node's `highway`: a water object whose only other main tag is one of
+  those keeps its water category, though it ranks 30 in Nominatim. So does
+  one beside `waterway=boatyard`, `lock_gate` or `access_point`, which rank
+  30 (`address-levels.json:96-98`) where the builder takes no `waterway=*`
+  for a POI main tag.
+- Multipolygons: Nominatim imports one as it does a closed way, and the
+  builder classifies a water multipolygon that is a rank-30 POI of another
+  main tag as it does a closed way (a bay or a lake that is a swimming area
+  is a `SWIMMING_AREA`). Otherwise its relation scan takes only some keys,
+  and of the water kinds bays, glaciers and streets alone: a multipolygon bay
+  or glacier the classifier keeps water (a lower rank, or rank-30 tags no
+  tier ships) is the `BAY` or `GLACIER` it is, and a water multipolygon a
+  highway kind ranks a street the water it is, of the highway flag, as the
+  closed way is; a lake, wetland or reservoir of no street is no POI as its
+  water kind, nor in the tiers that don't ship the POI it is, and one the
+  scan's own keys take (`leisure=nature_reserve`, `tourism=attraction`,
+  `place=island`, ...) keeps that category in `places` but never takes the
+  primary slot (the builder links it no parent street). A POI polygon of a
+  multipolygon is its outer rings, without its holes, so a water
+  multipolygon with an `inner` member the classifier makes one that could
+  take the slot (a rank-30 POI, or a street) takes the scan's own categories
+  instead, and never the slot: one the scan takes none of (a lake that is a
+  swimming area) is no POI, so a point on its island finds neither its name
+  nor its road, nor the address its `addr:*` tags give; the one it takes is
+  no street either. No water multipolygon of holes is an address point,
+  whatever its `addr:*` tags. A plain bay or glacier of holes keeps its
+  parent street.
+- Where no boundary and no street anchors the address (a coast no boundary
+  covers), Nominatim finds nothing; a water POI that would have won the slot
+  but for the lane still gives the answer its `landmark` and `places`,
+  without a `road` or `postcode` (`Index::query`). A bay or glacier would
+  have won it as an area label (below), only where no other POI is near.
+- A water object of a generic rank-30 tag without a wiki tag stays water,
+  out of the primary slot, where Nominatim's lane holds it as a POI.
+- The lower rank leaves out `boundary=administrative`, which ranks by an
+  admin_level the classifier doesn't read, and the country tables of
+  `address-levels.json` (`place=county` in ca and de, ...).
+- The area-label lane: peaks, volcanoes, beaches, capes, islands, parks,
+  nature reserves, stadiums, gardens, water parks, golf courses, national
+  parks, protected areas, campuses (university, college, hospital),
+  marketplaces, cemeteries, prisons, theme parks, zoos, camp sites, resorts,
+  battlefields, aerodromes and power plants (`Index::is_area_label_category`)
+  take the primary slot only where no other POI is near. Nominatim ranks many
+  of them below 30 (peak and volcano 18, beach and cape 22, island 17 or 22,
+  park and nature_reserve 24, garden 25, protected areas 25) and holds the
+  others in the lane like any POI. Bays and glaciers are not in it: as water
+  kinds, they never take the slot.
+- River and canal areas (`natural=water` with `water=river`, `canal`, ...)
+  are POIs here, though Nominatim imports none (`presets.lua:157-163` gives
+  them no category). As water they never take the primary slot; they can be
+  the `landmark` and are in `places`.
 
 ## How our implementation maps to Nominatim
 
@@ -174,15 +340,19 @@ Where Nominatim's rank adjustment matters:
 | get_label_tag() check 4 (ADMIN_LABELS rank//2) | rank_to_field() function | ✅ Implemented |
 | get_label_tag() check 5 (category[1] for place=* entities) | place_type_override covers this — boundary=place entities get place_type set | ✅ Implemented |
 | find_linked_place() node linking | Builder: label role member, wikidata match, a node of the boundary's own place type whose name holds the boundary's or is held in it, of any rank and at any distance, then name match (`link_places_by_name`, of a node the boundary covers, `ST_Covers`), in Nominatim's order, the boundary's own place tag where none links; one node a boundary, the best of its parts' (of the boundary's own name first, then the nearest to a part's vertex average), which labels every part; a boundary or place area of rank 0 in its country links nothing (find_linked_place returns at once); a linked place node is hidden from place results, except in admin-minimal when that set leaves its boundary out (L9-L11, place areas below rank 16): nothing there stands for the node | ✅ Implemented |
-| Rank adjustment for nested boundaries | At query time on the polygons containing the point, then smallest-area-wins per field | ✅ Implemented — containment judged by admin level, area and the rings' containment test; what that leaves out is listed under Step 4 |
+| Rank adjustment for nested boundaries | At query time on the polygons containing the point, then one polygon a rank by the address walk | ✅ Implemented — containment judged by admin level, area and the rings' containment test; what that leaves out is listed under Step 4 |
 | boundary=place entities (e.g., Washington DC) | Extracted in builder with admin_level=15 + place_type_override | ✅ Implemented |
-| Place node fallback (nearest city/town/village) | place_nodes.bin + find_places() with wide search; a field a boundary and a place node both fill names the one of the finer rank, the boundary at an equal rank (`label_field`: the address keeps the first row of a label, its rows the finest first, and at one rank the boundary's, isguess asc), and display_name lists the boundary that lost it: the place=suburb node St Crispin's (22) inside the parish of Upton (20) is the suburb. A place node is an address row only inside the walk's current_boundary, the last row insert_addresslines took that is no place node, a place area as much as a boundary (:583-586, :622-632): the node Al Khalidiyah outside the place=suburb way Al Bateen round the point is in no address there. It ranks two up inside a relation of its rank alone, a boundary of that rank_address or a place area of that place rank, not inside a closed way's area (osm_type = 'R', :984-1004): the place=suburb node Ramat HaNasi in the place=suburb way בת ים stays at 20, where the way's row comes first | ✅ Implemented — place nodes are indexed at the admin cell level (L10); the query cell and its 8 neighbours cover ~30 km |
+| Place nodes (`insert_addresslines`' walk over them, `complete_address_details`' row of each rank) | place_nodes.bin + find_places(): the street's walk over the nodes whose fuzzy area it crosses, one row a rank, the accepted node's, else the farthest the walk turned down inside its boundary. A place node is an address row only inside the walk's current_boundary, the last row insert_addresslines took that is no place node, a place area as much as a boundary (:583-586, :622-632): the node Al Khalidiyah outside the place=suburb way Al Bateen round the point is in no address there. It ranks two up inside a relation of its rank alone, a boundary of that rank_address or a place area of that place rank, not inside a closed way's area (osm_type = 'R', :984-1004): the place=suburb node Ramat HaNasi in the place=suburb way בת ים stays at 20, where the way's row comes first | ✅ Implemented — place nodes are indexed at the admin cell level (L10); the cells under the street (or round the point without one), grown by the largest fuzzy half side, hold every node that can cover it |
 | place_addressline pre-computed relationships | Not applicable — we do spatial lookup at query time | N/A — different architecture |
 | Postcodes from addr:postcode | addr_postcodes.bin (an address point's own addr:postcode) and postcode_centroids.bin (centroids of every addr:postcode, plus external ones) | ✅ Implemented — see "Postcode handling" section below |
+| The result's address values first in their rank (`CrosscheckNames`, results.py:610-632) | addr_cities.bin holds an address point's `addr:city` where a place or a boundary has that name (a core string, else none). When the house answers (it won, or a winning street takes its number from it), a row of the address named so takes its rank's place, unless a part of its rank, name and field is shown: a polygon by its own name or a place node's it links on any ring of its boundary (Nominatim's `_place_*` names), among the house's street's rows, the polygons the street meets in more than a point anywhere along it, the polygon taken at the street's f32 precision, on which a node the boundary shares lies on its vertex (a node inside, a segment crossing or running along an edge, or two touches; getNearFeatures takes the street whole: the admin cells under it are read, and a polygon ranked at the point is one only where the street meets it), or without a street those holding the point, each at the rank of the one of its level and place types ranked at the point, else its own (its level's, raised to its place tag's above its parent's as `placex_update` does), a boundary the point is outside at the rank it has at its own point on surface, under the boundaries round it there (`placex_update` ranks a boundary under the one round its centroid), the farthest from the street's middle first; else a place node that the street's walk writes a row for (every node of a rank inside its boundary until one is accepted, then those within twice the rank's nearest, as `insert_addresslines`), the farthest first, of equals the one of the higher rank_search, but one a place area links by find_linked_place's name match, which runs for ways as well as relations and which the builder runs for boundaries only (the area has the node's name, a rank_address its type has, holds it and links no other node). The address then keeps each label's first row, finest first, so a label the replaced row leaves goes to the next row of that label | ✅ Implemented for `addr:city` — Drexel Hill on Whalens Court. Not: the other `addr:*` keys; the index-time row a value adds for a place outside the street's rows (`create_poi_search_terms`); a place's other names (Nominatim matches every name variant, we keep one name, so a borough whose `name:cs` is the value loses its rank to a node of that name); a row's rank where our query-time ranks differ from Nominatim's stored ones (a promoted node can share the rank of a part it then replaces); a boundary's linked names are keyed by its record (name, level, place types, country), which another boundary of that record shares |
 | border_type tag | Not used: Nominatim never reads this tag | ✅ Ignored, as in Nominatim |
 | Wikidata-based place linking | Part of find_linked_place() above: a boundary's wikidata matched against the wikidata of the place nodes it holds (`_st_covers`) | ✅ Implemented |
-| Display name formatting (`display_name` in results.py) | `format_address`: the landmark, the house number with the road, the place parts finest first by the rank_address of the polygon or place node behind each field, with the polygons that lost their field to one of another rank or to a place node, then the postcode (rank 5) and the country (4); a part is left out only where it repeats the part just before it, and every answer with a part has one | ✅ Implemented — the house number joined to the road as the country writes it |
+| `licence` in every result (`format_base_json`) | `licence` first in every answer, `OSM_ATTRIBUTION`'s words (`Address::licence`); `{}` where no loaded region covers the point, as Nominatim's error carries none | ✅ Implemented |
+| The rank-30 POI lane of `_find_closest_street_or_pois` | `find_nearest_poi_with_parent()`: water kinds never in it, water with a POI main tag classified by that tag (The primary POI, above) | ✅ Implemented — the area-label lane is a divergence |
+| Display name formatting (`display_name` in results.py) | `format_address`: the landmark, the house number with the road, the address's rows finest first, each at the rank_address of its polygon or place node, then the postcode (rank 5) and the country (4); a part is left out only where it repeats the part just before it, and every answer with a part has one | ✅ Implemented — the house number joined to the road as the country writes it |
 | Street/road resolution | Minor differences in closest street selection | ℹ️ Our point-to-segment distance vs Nominatim's pre-computed parent streets. Causes occasional one-off differences at intersections. |
+| How far the closest street or address is looked for (`lookup_street_poi` runs `_find_closest_street_or_poi` within 0.006°) | `DEFAULT_SEARCH_DISTANCE`, 130 m: how far the street and address lookups reach, wherever the point lies in its street cell, and none farther: the nearest street way (measured to its segments) and address point that compete to be the answer's feature, and the interpolation lines that give a street that wins its house number | ℹ️ Divergence — Nominatim reaches 0.006° (about 660 m), but a road that far off is no longer the road the point is on: no street way past 130 m names the road. An address or POI that wins still gives the road it names, and a street that wins still takes its house number from within 100 m, as `_find_housenumber_for_street` does within 0.001° |
 | Suburb/neighbourhood rank adjustment | Covered by the query-time rank adjustment above | ✅ Implemented |
 | TIGER address interpolation | `--tiger-data` loads Nominatim's TIGER export (address ranges, one CSV per county) as interpolation lines, with each line's ZIP in interp_postcodes.bin | ✅ Implemented — a US street that wins without an address point takes its house number from the nearest interpolation line of that street, as Nominatim's `_find_tiger_number_for_street` does |
 | Postal city names | Not implemented | ❌ Deferred — in the US, USPS assigns city names to ZIP codes that may differ from the actual municipal jurisdiction (e.g., "Cumming, GA" for unincorporated Forsyth County). Neither we nor Nominatim handle this — would require external USPS data or addr:city extraction. |
@@ -353,6 +523,9 @@ The postcode is also populated from the `place_addressline` chain — if a stree
 
 0. A house's own addr:postcode (addr_postcodes.bin), where the pattern of the house's own country takes it, as the postcode the pattern makes of it: the clean-postcodes sanitizer matches it there (`PostcodeFormatter.match`, after an optional country code; a US ZIP+4 is its ZIP, DE-10115 10115; a country without a pattern takes `[A-Z0-9- ]{3,12}`) and makes one that fails an address term, so the builder stores none and the house takes its street's
 1. The street's postcode inherited from its postal boundary at build time (way_postcodes.bin), or a POI's (`parent_postcode_id`); for a US street that answers alone, the ZIP of a TIGER line of that street within ~100 m (interp_postcodes.bin)
-2. `get_nearest_postcode()` for a point: of the postal areas holding it of its country (any where the point has none known) whose postcode the country has, the one whose centroid is nearest it in plain degrees; else the postcode centroid of the same country nearest it in plain degrees among those whose box holds it (postcode_centroids.bin). A centroid of no country stands for one of the point's, and where the point has no country every centroid counts, each with its own country's box. The box is `expand_by_meters`' (`geography_box.rs`): the envelope of the centroid's buffer on the geography, a diamond of the extent in the point's UTM zone or, beyond 70°, the polar Lambert azimuthal equal-area, as PostGIS's `_ST_BestSRID` picks; a degree of latitude there is a meridian degree, 110,574 m at the equator. A box across the antimeridian spans the longitudes between its corners the long way round, as `ST_Envelope` makes it, and holds no point on the antimeridian. The server looks for the boxes holding a point among the centroids within its country's extent of it (`BOX_REACH_FACTOR`), and among the centroids within that extent of the antimeridian at the point's latitude, at any distance, unless none of those can be as near as the best so far: those are the boxes that reach across it, which can hold a point however far west or east of the centroid. The point is the street's centroid, the point halfway along it in plain degrees (`get_center_point`: `ST_LineInterpolatePoint(geometry, 0.5)`), for a street and a house of it, and the country the one there (`get_country_code` on the street's centroid; a house takes its street's), the smallest country polygon holding it, else the answer's; a street no postcode reaches has none, and neither has an answer that is that street. For a house whose street has none, the point is the house; for a POI, and where no street or house answers (admin mode), the query point
+2. `get_nearest_postcode()` for a point. The point is the street's centroid, the point halfway along it in plain degrees (`get_center_point`: `ST_LineInterpolatePoint(geometry, 0.5)`), for a street and a house of it, and the country the one there (`get_country_code` on the street's centroid; a house takes its street's), the smallest country polygon holding it, else the answer's; a street no postcode reaches has none, and neither has an answer that is that street. For a house whose street has none, the point is the house; for a POI, and where no street or house answers (admin mode), the query point. At that point:
+   1. Of the postal areas holding it of its country (any where the point has none known) whose postcode the country has, the one whose centroid is nearest it in plain degrees
+   2. Else, in the United States, the postcode grid's (postcode_grid.bin, `builder/src/postcode_grid_build.h`): the postcode most of the address points and the points halfway along the TIGER lines in the point's level-16 cell carry, as Nominatim's pattern takes their tags (`(ddddd)(?:-dddd)?`, the five digits), or, in a cell holding none, the nearer such cell's along the curve within the country's extent (25 km over the longest cell edge, 150 cells); none past that, and the centroids name the point. Nominatim has no such table: its `get_nearest_postcode()` takes the nearest centroid, whose ZIP area may end nearer the point than its own, where the houses round the point carry the postcode Nominatim answers with at zoom 18 (the house's or the TIGER line's it lands on). The grid stands in for it at the same point, after the postal areas, which `ORDER BY osm_id is null` puts before any centroid, and before the centroids. Only the US's: its postcodes are areas with next to no postal boundaries in OSM, where for other countries the centroids or the postal areas answer better
+   3. Else the postcode centroid of the same country nearest it in plain degrees among those whose box holds it (postcode_centroids.bin). A centroid of no country stands for one of the point's, and where the point has no country every centroid counts, each with its own country's box. The box is `expand_by_meters`' (`geography_box.rs`): the envelope of the centroid's buffer on the geography, a diamond of the extent in the point's UTM zone or, beyond 70°, the polar Lambert azimuthal equal-area, as PostGIS's `_ST_BestSRID` picks; a degree of latitude there is a meridian degree, 110,574 m at the equator. A box across the antimeridian spans the longitudes between its corners the long way round, as `ST_Envelope` makes it, and holds no point on the antimeridian. The server looks for the boxes holding a point among the centroids within its country's extent of it (`BOX_REACH_FACTOR`), and among the centroids within that extent of the antimeridian at the point's latitude, at any distance, unless none of those can be as near as the best so far: those are the boxes that reach across it, which can hold a point however far west or east of the centroid
 
 Nominatim keeps only postal areas whose postcode matches the country's pattern (`_update_postcode_areas`); the builder marks the others (place type 15) and neither it nor the server takes a postcode from them. A postal area's centroid is that of the ring holding the point, where Nominatim's is the whole relation's. Nominatim's street also takes the postcode of the finest of its address areas that has one (`insert_addresslines`: an area's own postcode tag, or the one postcode whose centroid lies inside it) before `get_nearest_postcode()`; the polygons carry no postcode, so the server leaves that step out.

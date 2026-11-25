@@ -4,6 +4,7 @@
 #include "parsed_data.h"
 #include "parallel.h"
 #include "ranked_bits.h"
+#include "s2_helpers.h"
 #include "string_subset.h"
 #include "subset_copy.h"
 #include "water_layer.h"
@@ -15,6 +16,7 @@
 #include <future>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
 
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
@@ -295,7 +297,10 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
             [](PoiRecord& p, uint32_t offset, uint32_t) { p.vertex_offset = offset; },
             out.poi_records, out.poi_vertices);
         out.poi_osm_ids = subset_osm_ids(used_poi_ids, poi_remap, out.poi_records.size(), full.poi_osm_ids);
-        drop(full.poi_records, full.poi_vertices, full.poi_osm_ids);
+        if (!full.poi_water_importance.empty())
+            out.poi_water_importance =
+                subset_osm_ids(used_poi_ids, poi_remap, out.poi_records.size(), full.poi_water_importance);
+        drop(full.poi_records, full.poi_vertices, full.poi_osm_ids, full.poi_water_importance);
     };
 
     // Place nodes — parent_poly_id remapped in a second pass below, after
@@ -405,6 +410,14 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
             out.addr_postcode_ids[new_aid] = full.addr_postcode_ids[old_aid];
         });
     }
+    if (!full.addr_city_ids.empty()) {
+        out.addr_city_ids.assign(out.addr_points.size(), NO_DATA);
+        parallel_each(used_addr_ids, [&](uint32_t old_aid) {
+            uint32_t new_aid = addr_remap[old_aid];
+            if (new_aid == NO_DATA || old_aid >= full.addr_city_ids.size()) return;
+            out.addr_city_ids[new_aid] = full.addr_city_ids[old_aid];
+        });
+    }
 
     // --- Copy postcode_accum (spatially filtered) ---
     // External entries carry their country in the key, so without a spatial
@@ -431,8 +444,28 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         for (const Postcode* p : inside) out.postcode_accum.emplace(p->first, p->second);
     }
 
+    // --- The postcode grid's file: the planet's runs a query routed here reads ---
+    // (region_rows), at the admin cells the server routes queries by
+    // (admin_cell_routed), so the continent answers as the planet does at
+    // every point routed to it; none in place of the other runs.
+    size_t grid_runs = 0;
+    {
+        std::unordered_map<uint64_t, bool> routed;
+        const std::vector<postcode_grid::LogicalRow> rows = postcode_grid::region_rows(
+            full.postcode_grid_rows, postcode_grid::GRID_LEVEL, kAdminCellLevel, [&](uint64_t cell) {
+                const auto [at, fresh] = routed.try_emplace(cell, false);
+                if (fresh) at->second = admin_cell_routed(cell, holds);
+                return at->second;
+            });
+        grid_runs = rows.size();
+        if (!rows.empty()) {
+            out.postcode_grid_file = postcode_grid::encode_file(rows);
+            out.postcode_grid_sources = full.postcode_grid_sources;
+        }
+    }
+
     drop(full.way_parent_ids, full.admin_parent_ids, full.way_postcode_ids, full.interp_postcode_ids,
-         full.addr_postcode_ids, full.postcode_accum);
+         full.addr_postcode_ids, full.addr_city_ids, full.postcode_accum, full.postcode_grid_rows);
     log_phase(("      " + std::string(bbox.name) + " filter: parent + postcode projection").c_str(), _ft, _fc);
 
     // --- Remap sorted cell arrays for all 5 types (preserving INTERIOR_FLAG) ---
@@ -511,6 +544,8 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     parallel_each(out.interp_postcode_ids, add_used);
     parallel_each(out.addr_postcode_ids, add_used);
     for (const auto& [key, _acc] : out.postcode_accum) add_used(postcode_key_pc(key));
+    // An addr:city keeps a string only another record of the region keeps,
+    // which the partition below then holds to a place's or a boundary's.
 
     // The kept strings, ascending by planet offset, back to back.
     StringSubset kept(old_sp, used_bits);
@@ -534,6 +569,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     parallel_each(out.way_postcode_ids, remap_offset);
     parallel_each(out.interp_postcode_ids, remap_offset);
     parallel_each(out.addr_postcode_ids, remap_offset);
+    parallel_each(out.addr_city_ids, remap_offset);
 
     // Rebuild postcode_accum with remapped keys (drop entries whose string didn't survive)
     {
@@ -565,6 +601,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
               << " admins=" << out.admin_polygons.size()
               << " waters=" << out.water.size()
               << " postcodes=" << out.postcode_accum.size()
+              << " postcode_grid_runs=" << grid_runs
               << std::endl;
 
     return out;

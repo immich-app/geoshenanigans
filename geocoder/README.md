@@ -410,6 +410,7 @@ Response follows [Nominatim](https://nominatim.org/release-docs/latest/api/Rever
 
 ```json
 {
+  "licence": "Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright",
   "display_name": "Avenue de la Costa 42, 98000 Monaco, Monaco",
   "address": {
     "house_number": "42",
@@ -424,7 +425,12 @@ Response follows [Nominatim](https://nominatim.org/release-docs/latest/api/Rever
 }
 ```
 
-Fields are omitted when not available.
+Fields are omitted when not available, but `licence`, which every answer
+carries first, as Nominatim's results do, worded as Nominatim words it
+(`OSM_ATTRIBUTION` in its `src/nominatim_api/v1/classtypes.py`); an answer
+that found nothing carries it too (`{"licence": "...", "address": {}}`).
+Where no loaded region covers the point the answer is `{}`, without it, as
+Nominatim's `{"error":"Unable to geocode"}` is.
 
 Where the dataset has a water dir (a `water` value other than `none`), an
 answer whose point lies in a body of water carries it last, beside the
@@ -528,6 +534,7 @@ to the same files ([builder/PATCHING.md](builder/PATCHING.md#transport-units)).
 | `way_parents.bin`, `way_postcodes.bin` | Per street: smallest containing admin polygon, postcode from its postal boundary; a value per street in blocks of 64 (`builder/src/side_blocks.h`) |
 | `addr_points.bin`, `addr_vertices.bin`, `addr_index.bin` | Address points (coordinates, house number, street) in blocks of 16 records, building outlines as a blob per building, and where each block and its blobs start (`builder/src/addr_files.h`); in cell order as the ways are, then by street and house number |
 | `addr_postcodes.bin` | Per address point: its own `addr:postcode` where its country's pattern takes it, in blocks as the streets' side files |
+| `addr_cities.bin` | Per address point: its `addr:city` where a place or a boundary has that name (a core string, else none), in blocks as the other side files |
 | `interp_ways.bin`, `interp_nodes.bin` | Interpolation ways and their nodes, in the street ways' format; in cell order as the ways are, then by street and range |
 | `interp_postcodes.bin` | Per interpolation way: its TIGER ZIP (TIGER regions only), in blocks as the other side files |
 | `admin_cells.bin`, `admin_entries.bin` | S2 cell index for admin boundaries: lists in blocks of 8 cells, each against the one before (the cell pair layout, `builder/src/cell_pairs.h`) |
@@ -536,10 +543,13 @@ to the same files ([builder/PATCHING.md](builder/PATCHING.md#transport-units)).
 | `admin_parents.bin` | Per admin polygon: the next larger polygon containing it |
 | `place_cells.bin`, `place_nodes.bin`, `place_hidden.bin` | Place nodes (city, town, village, suburb, ...): the visible ones in admin cell order, bit-packed in blocks of 64, with each cell's first row; the ones a boundary hides (its label for place search) beside them (`builder/src/place_files.h`) |
 | `postcode_centroids.bin`, `postcode_centroid_cells.bin` | Postcode centroids in admin cell order, Rice-coded steps in blocks of 32 with a box per block (PCC1, `builder/src/postcode_files.h`), and each admin cell's rows of them |
+| `postcode_grid.bin` | In the United States, the postcode of each level-16 S2 cell: the one most of the address points and TIGER lines in it carry, or in a cell holding none the nearer such cell's along the curve within the country's extent (25 km), none past that (`builder/src/postcode_grid_build.h`); as runs of cells in cell order, Rice-coded steps in blocks of 128 with each block's postcodes as text (PGR1, `builder/src/postcode_grid.h`); the same bytes in every mode dir of a region, the planet's runs a query routed there reads |
 | `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin` | Points of interest and their cell index (a list per cell) |
 | `strings_core.bin`, `strings_street.bin`, `strings_addr.bin`, `strings_postcode.bin`, `strings_poi.bin` | Deduplicated string pool, in five tiers so each variant ships only the strings it uses; each tier front-coded in buckets cut by content (FCC2, `builder/src/string_files.h`), a string's id still its offset in the tier's pool |
 | `strings_layout.json` | Start and end of each string tier, which place every string offset |
 | `poi_meta.json` | POI category names and scoring parameters |
+| `attribution.json` | In each mode dir: the credit of the data it holds, one entry per source ([PATCHING.md](PATCHING.md#attribution)) |
+| `poi_attribution.json` | In a POI tier dir: Wikidata's credit, where its sitelinks ranked a POI of it ([PATCHING.md](PATCHING.md#attribution)) |
 | `water/` | The water layer, a set of its own in the admin files' formats (`admin_polygons.bin`, `admin_rings.bin`, `arc_index.bin`, `arc_vertices.bin`, `admin_cells.bin`, `admin_entries.bin`, `strings_core.bin`, `strings_layout.json`), `water_cut_arcs.bin`, a bit per arc slot marking the cuts between two pieces of one water, and `water_meta.json`, each type code's class, type and Nominatim rank: a record per polygon carrying its OSM object's name, type code, area and flags, and nothing pointing into the other files (`server/src/water.rs`, `builder/src/water_layer.h`) |
 
 ## Building from Source
@@ -638,6 +648,21 @@ The server is designed to run inside memory-constrained deployments
 |----------|-------------|---------|
 | `GEOCODER_WORKER_THREADS` | Async worker pool size | `min(cores, 8)` |
 | `GEOCODER_ALLOW_ANONYMOUS` | `true` accepts requests without an API key, configuration changes included, with no rate limit: only for a server on a private container network | (disabled) |
+
+## Data and licences
+
+The indexes are a derivative database of [OpenStreetMap](https://www.openstreetmap.org/copyright)
+(© OpenStreetMap contributors, ODbL 1.0), with GB postcode centroids from
+[GeoNames](https://www.geonames.org/) (CC BY 4.0), derived from Ordnance
+Survey's Code-Point Open (OGL v3.0; contains OS, Royal Mail and National
+Statistics data), US address ranges and ZIP codes from the US Census
+Bureau's TIGER/Line files (public domain), and POI importance from
+[Wikidata](https://www.wikidata.org/)'s sitelink counts (CC0). The
+`attribution` list of each build's configurations.json gives every source's
+credit and licence, and each mode dir's `attribution.json` and POI tier dir's
+`poi_attribution.json` the ones of the data it holds
+([PATCHING.md](PATCHING.md#attribution));
+show those wherever the data is shown. The licence below is the code's.
 
 ## License
 

@@ -258,6 +258,12 @@ test('reverse geocoding finds a place in its cell', async () => {
   assert.equal(JSON.parse(await geocoder.reverseGeocode(10.7, 20.5)).address.town, 'Otherton');
 });
 
+test('every reverse answer carries the licence of its data', async () => {
+  const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));
+
+  assert.equal(JSON.parse(await geocoder.reverseGeocode(10.2, 20.5)).licence, 'Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright');
+});
+
 test('reverse geocoding inside the country finds it by its arcs', async () => {
   const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));
 
@@ -292,8 +298,8 @@ test('reverse geocoding a point in water outside every boundary finds the water 
 
   const wet = await Geocoder.load(dir).reverseGeocode(10.5, 20.5);
 
-  assert.equal(dry, '{"address":{}}');
-  assert.equal(wet, '{"address":{},"water":{"name":"Testsee","class":"water","type":"lake","landmark":true}}');
+  assert.equal(dry, '{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","address":{}}');
+  assert.equal(wet, '{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","address":{},"water":{"name":"Testsee","class":"water","type":"lake","landmark":true}}');
 });
 
 test('reverse geocoding off the globe finds nothing', async () => {
@@ -307,9 +313,10 @@ test('reverse geocoding off the globe finds nothing', async () => {
 test('reverse geocoding the edges of the globe looks them up', async () => {
   const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));
 
-  // The dataset's one admin cell is far from the poles, so a lookup finds an empty address.
+  // The dataset's one admin cell is far from the poles, so a lookup finds an empty address, with
+  // the licence every answer carries.
   for (const [lat, lng] of [[90, 180], [-90, -180]]) {
-    assert.equal(await geocoder.reverseGeocode(lat, lng), '{"address":{}}', `(${lat}, ${lng})`);
+    assert.equal(await geocoder.reverseGeocode(lat, lng), '{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","address":{}}', `(${lat}, ${lng})`);
   }
 });
 
