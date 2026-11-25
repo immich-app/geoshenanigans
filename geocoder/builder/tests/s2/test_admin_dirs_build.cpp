@@ -1342,13 +1342,13 @@ TEST(a_build_writes_the_postcode_grid_of_its_us_addresses_in_every_mode_dir_and_
     // to 8.12 E, 19018's from 8.135 to 8.15. At 8.121 E the nearest centroid
     // is 19018's (8.1425, 1.6 km) rather than 19026's (8.07, 3.9 km); the
     // house 76 m west of it is 19026's. A house in Testreich (DE) names a US
-    // ZIP and casts no vote.
+    // ZIP no other house names, 19099, and casts no vote: no run names it.
     const ScratchDir root("postcode-grid-build");
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log", out = root.path() + "/out";
     std::vector<Postcoded> houses;
     for (int i = 0; i <= 20; i++) houses.push_back({8100 + i, 470500000, 80200000 + 50000 * i, "19026"});
     for (int i = 0; i < 4; i++) houses.push_back({8200 + i, 470500000, 81350000 + 50000 * i, "19018-0002"});
-    houses.push_back({8300, 468500000, 80500000, "19026"});
+    houses.push_back({8300, 468500000, 80500000, "19099"});
     std::vector<TestObject> objects = with_postcodes(houses);
     for (TestObject& o : objects)
         if (o.type == OsmType::Relation && o.id == 40)
