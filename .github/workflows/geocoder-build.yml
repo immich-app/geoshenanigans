@@ -598,9 +598,11 @@ jobs:
           # whatever its build version, so a fresh night keeps the names a
           # near tie would flip (postal_cities_build.h). A rerun of a day
           # already uploaded takes the table its configurations.json says
-          # the day was built from (build.postal_cities_previous), so the
+          # the day was built from (build.postal_cities_previous), held to
+          # the sha256 it gives (build.postal_cities_previous_sha256), so the
           # same inputs give the same names, whatever latest.json names
-          # since. It goes to prev-state/, apart from old-output/, which
+          # since, or the night fails where that day was rebuilt with other
+          # names since. It goes to prev-state/, apart from old-output/, which
           # fetch_previous_index.sh fills beside the build. A build that
           # published none (the first night) leaves none; one that did and
           # can't be read fails the night, as does a latest.json or
@@ -624,9 +626,13 @@ jobs:
           BUILDS="s3://$S3_BUCKET/$S3_PREFIX/builds"
           DAY_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
           PREV_TABLE_DATE=""
+          RERUN=""
+          PINNED_SHA=""
           if s3_json "$BUILDS/$TODAY/configurations.json" "$WORKDIR/prev-state/today.json" \
             && jq -e '(.build // {}) | has("postal_cities_previous")' "$WORKDIR/prev-state/today.json" > /dev/null; then
             PREV_TABLE_DATE=$(jq -r '.build.postal_cities_previous // ""' "$WORKDIR/prev-state/today.json")
+            RERUN=1
+            PINNED_SHA=$(jq -r '.build.postal_cities_previous_sha256 // "" | tostring' "$WORKDIR/prev-state/today.json")
             echo "[postal] A rerun of $TODAY, which took the postal cities of ${PREV_TABLE_DATE:-no day}: taking them again"
           elif s3_json "$BUILDS/latest.json" "$WORKDIR/prev-state/latest.json"; then
             # A pointer names a build: latest a day, previous a day or null.
@@ -642,6 +648,11 @@ jobs:
           fi
           if [ -n "$PREV_TABLE_DATE" ] && ! [[ "$PREV_TABLE_DATE" =~ $DAY_RE && "$PREV_TABLE_DATE" < "$TODAY" ]]; then
             echo "::error::[postal] '$PREV_TABLE_DATE' is no day before $TODAY to take yesterday's postal cities from"
+            exit 1
+          fi
+          # A rerun's record of a day gives the sha256 of the table it took.
+          if [ -n "$RERUN" ] && [ -n "$PREV_TABLE_DATE" ] && ! [[ "$PINNED_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::[postal] The configurations.json of $TODAY names the postal cities of $PREV_TABLE_DATE it took without their sha256 — refusing to take any but those"
             exit 1
           fi
           PREV_TABLE_USED=""
@@ -666,6 +677,10 @@ jobs:
                 exit 1
               fi
             fi
+            if [ -n "$RERUN" ] && [ "$PREV_TABLE_SHA" != "$PINNED_SHA" ]; then
+              echo "::error::[postal] The postal cities of $PREV_TABLE_DATE are not the ones the first run of $TODAY took (sha256 $PINNED_SHA): $PREV_TABLE_DATE was rebuilt since — refusing to build with other names than that run's"
+              exit 1
+            fi
             if [ -n "$PREV_TABLE_SHA" ]; then
               $S5 cat "$BUILDS/$PREV_TABLE_DATE/planet/admin/postal_cities.bin.zst" 2>/dev/null \
                 | zstd -d -q -c > "$WORKDIR/prev-state/postal_cities.bin" || true
@@ -682,8 +697,10 @@ jobs:
           else
             echo "[postal] No build before $TODAY to take postal cities from: building without a margin"
           fi
-          # The day whose table this build takes, for its configurations.json.
+          # The day whose table this build takes and its sha256, for its
+          # configurations.json.
           echo "prev_postal_cities_date=${PREV_TABLE_USED:-null}" >> "$GITHUB_OUTPUT"
+          echo "prev_postal_cities_sha256=$([ -n "$PREV_TABLE_USED" ] && echo "$PREV_TABLE_SHA" || echo null)" >> "$GITHUB_OUTPUT"
           ) &
           EXTRAS_PID=$!
 
@@ -1429,6 +1446,7 @@ jobs:
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
           WIKIDATA_DATE: ${{ steps.download.outputs.wikidata_date || 'null' }}
           POSTAL_CITIES_PREVIOUS: ${{ steps.download.outputs.prev_postal_cities_date || 'null' }}
+          POSTAL_CITIES_PREVIOUS_SHA256: ${{ steps.download.outputs.prev_postal_cities_sha256 || 'null' }}
           PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
@@ -1471,19 +1489,21 @@ jobs:
 
           # ── Augment configurations.json with build metadata ─────────
           # Splices date / previous / built_at / wikidata_date /
-          # postal_cities_previous into the `build` block (which the static
-          # template stamps with build_version + patch_version). A build
-          # whose patches failed verify published none, so it must not
-          # claim a previous build. postal_cities_previous is the day whose
-          # postal cities gave this build yesterday's names, which a rerun
-          # of this day takes again.
+          # postal_cities_previous / postal_cities_previous_sha256 into the
+          # `build` block (which the static template stamps with
+          # build_version + patch_version). A build whose patches failed
+          # verify published none, so it must not claim a previous build.
+          # postal_cities_previous is the day whose postal cities gave this
+          # build yesterday's names, and its sha256 theirs, which a rerun of
+          # this day takes again.
           PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && [ -z "${PATCH_VERIFY_FAILED:-}" ] && echo "$OLD_DATE" || echo "null" )"
           jq --arg date "$NEW_DATE" \
              --arg previous "$PREV_VAL" \
              --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
              --arg wikidata_date "$WIKIDATA_DATE" \
              --arg postal_cities_previous "$POSTAL_CITIES_PREVIOUS" \
-             '.build = ((.build // {}) + {date: $date, previous: (if $previous == "null" then null else $previous end), built_at: $built_at, wikidata_date: (if $wikidata_date == "null" then null else $wikidata_date end), postal_cities_previous: (if $postal_cities_previous == "null" then null else $postal_cities_previous end)})' \
+             --arg postal_cities_previous_sha256 "$POSTAL_CITIES_PREVIOUS_SHA256" \
+             '.build = ((.build // {}) + {date: $date, previous: (if $previous == "null" then null else $previous end), built_at: $built_at, wikidata_date: (if $wikidata_date == "null" then null else $wikidata_date end), postal_cities_previous: (if $postal_cities_previous == "null" then null else $postal_cities_previous end), postal_cities_previous_sha256: (if $postal_cities_previous_sha256 == "null" then null else $postal_cities_previous_sha256 end)})' \
              "$WORKDIR/output/configurations.json" > "$WORKDIR/output/configurations.tmp" \
              && mv "$WORKDIR/output/configurations.tmp" "$WORKDIR/output/configurations.json"
           echo "configurations.json size: $(stat -c%s "$WORKDIR/output/configurations.json") bytes"

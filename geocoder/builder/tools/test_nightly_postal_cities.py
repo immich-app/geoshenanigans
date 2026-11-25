@@ -3,7 +3,8 @@
 Update GeoNames Postal Places fills and a missing or bad copy of fails the night; yesterday's
 postal_cities.bin comes from the newest build latest.json names before today's, whatever its
 version, so a fresh night keeps its names, and a rerun of a day from the day its first run took,
-which its configurations.json records; a pointer or manifest that can't be read fails the night,
+which its configurations.json records with the table's sha256; a pointer or manifest that can't be
+read fails the night,
 and only one the bucket holds no object for is no state; the build takes both.
 Run: python3 -m unittest discover -s geocoder/builder/tools"""
 import hashlib
@@ -125,9 +126,10 @@ class NightlyPostalCitiesTest(unittest.TestCase):
         self.serve("geocoder/geonames/latest.json", json.dumps(
             {"path": path, "size": len(data), "sha256": sha or hashlib.sha256(data).hexdigest(), "rows": 1}))
 
-    def build(self, date, table=None, listed=True, built_from=None):
+    def build(self, date, table=None, listed=True, built_from=None, built_from_sha=None):
         """A published build of `date`: its configurations.json, and its postal table (zstd); its
-        build.postal_cities_previous `built_from` where given ("" for null)."""
+        build.postal_cities_previous `built_from` where given ("" for null), and
+        build.postal_cities_previous_sha256 `built_from_sha`, the sha256 of the bytes given."""
         files = {}
         if table is not None:
             self.serve(f"s3/bucket/geocoder/builds/{date}/planet/admin/postal_cities.bin.zst",
@@ -136,7 +138,9 @@ class NightlyPostalCitiesTest(unittest.TestCase):
                 files["planet/admin/postal_cities.bin"] = {"sha256": hashlib.sha256(table).hexdigest()}
         manifest = {"files": files}
         if built_from is not None:
-            manifest["build"] = {"date": date, "postal_cities_previous": built_from or None}
+            manifest["build"] = {"date": date, "postal_cities_previous": built_from or None,
+                                 "postal_cities_previous_sha256": hashlib.sha256(built_from_sha).hexdigest()
+                                 if isinstance(built_from_sha, bytes) else built_from_sha}
         self.serve(f"s3/bucket/geocoder/builds/{date}/configurations.json", json.dumps(manifest))
 
     def latest(self, latest, previous):
@@ -225,12 +229,29 @@ class NightlyPostalCitiesTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self.table_of(outputs), b"day 22")
         self.assertEqual(outputs["prev_postal_cities_date"], "2026-11-22")
-        self.build("2026-11-23", b"day 23", built_from="2026-11-22")
+        self.assertEqual(outputs["prev_postal_cities_sha256"], hashlib.sha256(b"day 22").hexdigest())
+        self.build("2026-11-23", b"day 23", built_from="2026-11-22", built_from_sha=b"day 22")
         self.latest("2026-11-23", None)
         r, outputs = self.run_block(block)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self.table_of(outputs), b"day 22")
         self.assertEqual(outputs["prev_postal_cities_date"], "2026-11-22")
+        self.assertEqual(outputs["prev_postal_cities_sha256"], hashlib.sha256(b"day 22").hexdigest())
+        # Day 22 rebuilt since with other names, its manifest naming them: the rerun fails rather
+        # than take names its first run didn't; and so does a record of no sha256 of the day's.
+        self.build("2026-11-22", b"day 22 again")
+        r, outputs = self.run_block(block)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("::error::[postal] The postal cities of 2026-11-22 are not the ones the first run of 2026-11-23 took",
+                      r.stdout)
+        self.assertNotIn("prev_postal_cities", outputs)
+        self.build("2026-11-22", b"day 22")
+        for sha in (None, "", "ABC", 7):
+            self.build("2026-11-23", b"day 23", built_from="2026-11-22", built_from_sha=sha)
+            r, outputs = self.run_block(block)
+            self.assertEqual(r.returncode, 1, sha)
+            self.assertIn("names the postal cities of 2026-11-22 it took without their sha256", r.stdout)
+            self.assertNotIn("prev_postal_cities", outputs)
         # One that took none takes none again, whatever latest.json names; one after a gap, the
         # day before the gap.
         self.build("2026-11-23", b"day 23", built_from="")
@@ -239,7 +260,8 @@ class NightlyPostalCitiesTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertNotIn("prev_postal_cities", outputs)
         self.assertEqual(outputs["prev_postal_cities_date"], "null")
-        self.build("2026-11-23", b"day 23", built_from="2026-11-20")
+        self.assertEqual(outputs["prev_postal_cities_sha256"], "null")
+        self.build("2026-11-23", b"day 23", built_from="2026-11-20", built_from_sha=b"day 20")
         r, outputs = self.run_block(block)
         self.assertEqual(self.table_of(outputs), b"day 20")
         # A day of a build of before the record: latest.json's, as for a first run.
@@ -324,23 +346,28 @@ class NightlyPostalCitiesTest(unittest.TestCase):
         self.assertIsNotNone(block)
         text = workflow("geocoder-build.yml")
         self.assertIn("POSTAL_CITIES_PREVIOUS: ${{ steps.download.outputs.prev_postal_cities_date || 'null' }}", text)
+        self.assertIn("POSTAL_CITIES_PREVIOUS_SHA256: ${{ steps.download.outputs.prev_postal_cities_sha256 || 'null' }}", text)
         out = os.path.join(self.work, "output")
         os.makedirs(out)
 
-        def spliced(postal):
+        def spliced(postal, sha):
             with open(os.path.join(out, "configurations.json"), "w") as f:
                 json.dump({"build": {"version": 24, "patch_version": 21}, "files": {}}, f)
             env = {"PATH": os.environ["PATH"], "WORKDIR": self.work, "NEW_DATE": "2026-11-23", "OLD_DATE": "2026-11-22",
-                   "HAS_PREVIOUS": "false", "WIKIDATA_DATE": "null", "POSTAL_CITIES_PREVIOUS": postal}
+                   "HAS_PREVIOUS": "false", "WIKIDATA_DATE": "null", "POSTAL_CITIES_PREVIOUS": postal,
+                   "POSTAL_CITIES_PREVIOUS_SHA256": sha}
             r = subprocess.run(["bash", "-eo", "pipefail", "-c", block], env=env, capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             with open(os.path.join(out, "configurations.json")) as f:
                 return json.load(f)["build"]
 
-        build = spliced("2026-11-20")
+        build = spliced("2026-11-20", "ab" * 32)
         self.assertEqual(build["postal_cities_previous"], "2026-11-20")
+        self.assertEqual(build["postal_cities_previous_sha256"], "ab" * 32)
         self.assertEqual((build["version"], build["date"], build["previous"]), (24, "2026-11-23", None))
-        self.assertIsNone(spliced("null")["postal_cities_previous"])
+        none = spliced("null", "null")
+        self.assertIsNone(none["postal_cities_previous"])
+        self.assertIsNone(none["postal_cities_previous_sha256"])
 
     def test_the_build_takes_the_postal_places_and_yesterdays_postal_cities(self):
         block = build_args_block()
