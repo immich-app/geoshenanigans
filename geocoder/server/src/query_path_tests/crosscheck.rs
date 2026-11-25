@@ -349,6 +349,33 @@ fn a_polygon_holding_the_house_that_the_street_misses_is_no_row() {
 
 
 #[test]
+fn a_boundary_the_street_runs_into_ranks_by_its_own_place_type() {
+    // Saw Mill River Road runs east from Greenburgh, of level 8 and rank 16, into Fairview, of
+    // level 8 too and tagged place=suburb: placex_update gives a boundary that links no node its
+    // place tag's rank where that is above its parent's (placex_triggers.sql:1189-1199), 20, not
+    // Greenburgh's. The house's addr:city makes Fairview the suburb, and Greenburgh stays.
+    let index = |city: Option<&str>| {
+        let mut index = united_states();
+        index
+            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Fairview", 8, 4, (-3000.0, 3000.0, 3000.0, 9000.0))
+            .street("Saw Mill River Road", &[(0.0, 1500.0), (0.0, 4000.0)])
+            .address("9", 10.0, 2900.0);
+        if let Some(city) = city {
+            index.addr_city(city);
+        }
+        index.load()
+    };
+    let (display, address) = answer_at(&index(None), 10.0, 2900.0);
+    assert_eq!(display, "9 Saw Mill River Road, Greenburgh, United States");
+    assert_eq!(address["suburb"], serde_json::Value::Null);
+    let (display, address) = answer_at(&index(Some("Fairview")), 10.0, 2900.0);
+    assert_eq!(display, "9 Saw Mill River Road, Fairview, Greenburgh, United States");
+    assert_eq!((&address["city"], &address["suburb"]), (&serde_json::json!("Greenburgh"), &serde_json::json!("Fairview")));
+}
+
+
+#[test]
 fn a_place_node_a_place_area_of_its_name_and_rank_links_is_no_row() {
     // High Wycombe, a place=town area of rank 16, holds the town node of its name, whose rank is
     // its own: find_linked_place's name match, which runs for ways as well as relations, links the

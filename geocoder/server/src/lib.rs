@@ -3910,22 +3910,35 @@ impl Index {
     }
 
     /// The rank_address of `poly`, a row of an address that is none of the address's ranked
-    /// polygons `areas`: that of the polygon of `areas` of its level (and of its place types, for
-    /// a place area), else its own before any lift, its level's in `country` or a place area's
-    /// (place_area_ranks). A boundary that repeats its parent and links a place node ranks as
-    /// promote_nested_ranks ranks it: its node's rank, above 3 and below 26, else 0.
+    /// polygons `areas`: that of the polygon of `areas` of its level and place types, else for a
+    /// place area its own before any lift (place_area_ranks), and for a boundary the one
+    /// promote_nested_ranks gives it from its level's rank in `country` under the coarser
+    /// polygons of `areas`: a place tag's rank where that is above its parent's
+    /// (placex_triggers.sql:1189-1199). A boundary that repeats its parent and links a place node
+    /// ranks as promote_nested_ranks ranks it: its node's rank, above 3 and below 26, else 0.
     fn area_row_rank(&self, poly: &AdminPolygon, areas: &[RankedPoly], country: &str) -> u8 {
         if poly.admin_level != 15 && poly.own_place_type == BOUNDARY_REPEATS_PARENT {
             let linked = place_type_to_rank(poly.place_type_override, country);
             return if (4..26).contains(&linked) { linked } else { 0 };
         }
         let kin = |r: &&RankedPoly| r.poly.admin_level == poly.admin_level
-            && (poly.admin_level != 15 || (r.poly.place_type_override, r.poly.own_place_type) == (poly.place_type_override, poly.own_place_type));
-        match areas.iter().find(kin) {
-            Some(r) => r.rank_address,
-            None if poly.admin_level == 15 => place_area_ranks(poly, country).1,
-            None => self.admin_config.to_rank(country, poly.admin_level),
+            && (r.poly.place_type_override, r.poly.own_place_type) == (poly.place_type_override, poly.own_place_type);
+        if let Some(r) = areas.iter().find(kin) {
+            return r.rank_address;
         }
+        if poly.admin_level == 15 {
+            return place_area_ranks(poly, country).1;
+        }
+        let initial = self.admin_config.to_rank(country, poly.admin_level);
+        if initial == 0 {
+            return 0;
+        }
+        let mut ranked: Vec<RankedPoly> = areas.iter().filter(|r| r.poly.admin_level < poly.admin_level).copied().collect();
+        ranked.push(RankedPoly { poly: *poly, rank_address: initial });
+        let place_areas: Vec<AdminPolygon> = areas.iter().filter(|r| r.poly.admin_level == 15).map(|r| r.poly).collect();
+        promote_nested_ranks(&mut ranked, place_areas.iter(), country, |a, b| self.admin_geometry.polygon_within(a, b));
+        let same = |r: &&RankedPoly| r.poly.ring_offset == poly.ring_offset && r.poly.ring_bytes == poly.ring_bytes;
+        ranked.iter().find(same).map_or(initial, |r| r.rank_address)
     }
 
     /// getNearFeatures' distance of the area `poly` from `feature` (partition-functions.sql:32-36),
