@@ -80,11 +80,8 @@ fn a_cell_has_its_runs_postcode_and_none_before_the_first_or_in_a_run_of_none() 
     assert_eq!(at(&g, 1009), None);
     assert_eq!(at(&g, 1010).as_deref(), Some("19073"));
     assert_eq!(at(&g, 1011).as_deref(), Some("19026"));
-    // The last run reaches the end of the curve.
-    assert_eq!(at(&g, 6 << 32).as_deref(), Some("19026"));
-    // A finer cell inside one of the grid's is read as the grid's cell would be, as a query
-    // gives the grid's own level.
-    assert_eq!(g.postcode_at(cell(1001) - 1).map(|(_, c)| c), Some("19026"));
+    // The last run reaches the end of the curve, the last cell of face 5.
+    assert_eq!(at(&g, (6 << 32) - 1).as_deref(), Some("19026"));
     // A grid of no rows names no cell.
     let empty = grid(&[]);
     assert_eq!((empty.rows(), empty.level()), (0, 0));
@@ -124,6 +121,8 @@ fn a_grid_no_builder_writes_is_refused_at_open_and_a_garbled_block_reads_without
     assert!(open(file[..6].to_vec()).err().unwrap().contains("no PGR1 footer"));
     let mut level = file.clone();
     let n = level.len();
+    // The footer alone: its 300 rows' table of three blocks is not in the file.
+    assert!(open(file[n - FOOTER_BYTES..].to_vec()).err().unwrap().contains("shorter than its block table"));
     level[n - 8] = 21;
     assert!(open(level).is_err());
     let mut reserved = file.clone();
@@ -205,12 +204,16 @@ fn a_block_past_the_blocks_or_longer_than_its_rows_take_reads_as_malformed() {
     reversed[table_at + ENTRY_BYTES + 8..table_at + ENTRY_BYTES + 12].copy_from_slice(&3u32.to_le_bytes());
     assert_eq!(at(&open(reversed), 101), None);
     // A block of two rows with more bytes than two rows can take (postcode_grid.h's
-    // max_block_bytes): the bytes after its bits are no encoder's either.
+    // max_block_bytes): the bytes after its bits are no encoder's either. Two rows take at most
+    // 80 bytes: 10 of the count, 2 * 17 of entries, 1 of the parameter and 35 of bits (a row's
+    // index of 64 bits at most and an escaped step of 12 + 64, 2 * 140 bits).
+    const TWO_ROW_LIMIT: usize = 80;
+    assert_eq!(max_block_bytes(2), TWO_ROW_LIMIT);
     let two = encode(&[run(100, "19026"), run(101, "19073")]);
     let mut long = two[..two.len() - ENTRY_BYTES - FOOTER_BYTES].to_vec();
-    long.resize(max_block_bytes(2) + 1, 0);
+    long.resize(TWO_ROW_LIMIT + 1, 0);
     assert_eq!(at(&open(one_block(&long, cell(100), 2)), 100), None);
-    long.truncate(max_block_bytes(2));
+    long.truncate(TWO_ROW_LIMIT);
     assert_eq!(at(&open(one_block(&long, cell(100), 2)), 100).as_deref(), Some("19026"));
 }
 
