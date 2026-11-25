@@ -673,3 +673,17 @@ TEST(of_nodes_equal_in_the_steps_order_the_one_of_the_lowest_address_rank_links)
     v.link();
     CHECK_EQ(v.link_of(other).node, int64_t(30));
 }
+
+TEST(every_copy_of_a_place_node_two_extracts_share_takes_the_boundary_linking_it) {
+    // Two overlapping extracts list the city node Kreuzberg twice, as two place nodes of one osm
+    // id. The link pass takes the node once, and records the boundary that links it against each
+    // copy, so the rank pass leaves both unpromoted by it.
+    World w("DE");
+    const uint32_t district = w.relation(55764, 9, {52.48, 13.36, 52.51, 13.45}, {PlaceValue::NONE, "kreuzberg", "", 240109189});
+    w.node(240109189, PlaceValue::CITY, 52.49, 13.40, "Kreuzberg");
+    w.node(240109189, PlaceValue::CITY, 52.49, 13.40, "Kreuzberg");
+    w.link();
+    CHECK_EQ(w.link_of(district).node, int64_t{240109189});
+    const PlaceNodeLinks expected{{0, w.boundary(district)}, {1, w.boundary(district)}};
+    CHECK((w.data.place_node_links == expected));
+}

@@ -432,9 +432,11 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
                 }
                 stats.named += named;
             }
+            // Every copy of the node, as two overlapping extracts list it twice.
             const uint64_t node_id = pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, c.node);
-            const auto p = std::lower_bound(place_at.begin(), place_at.end(), std::make_pair(node_id, uint32_t(0)));
-            if (p != place_at.end() && p->first == node_id) data.place_node_links.push_back({p->second, o.id});
+            for (auto p = std::lower_bound(place_at.begin(), place_at.end(), std::make_pair(node_id, uint32_t(0)));
+                 p != place_at.end() && p->first == node_id; ++p)
+                data.place_node_links.push_back({p->second, o.id});
         }
         if (label == AdminPlaceType::NONE) label = place_label_of(static_cast<PlaceValue>(o.own));
         for (uint32_t m = o.first; m < o.first + o.count; m++)
