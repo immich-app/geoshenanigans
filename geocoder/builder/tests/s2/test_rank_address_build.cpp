@@ -454,6 +454,8 @@ TEST(a_rank_dump_is_a_new_file_and_a_build_without_boundaries_writes_its_header)
     std::ofstream(dump) << "kept\n";
     CHECK(!gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/out", pbf, "--rank-dump", dump}, log));
     CHECK((file_bytes(dump) == std::vector<char>{'k', 'e', 'p', 't', '\n'}));
+    const std::vector<char> refused = file_bytes(log);
+    CHECK(std::string(refused.begin(), refused.end()).find("--rank-dump: can't make " + dump + ": File exists") != std::string::npos);
 
     Fixture nodes;
     nodes.node(53.19, -2.52, {{"place", "town"}, {"name", "Winsford"}});
