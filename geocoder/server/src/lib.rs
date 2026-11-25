@@ -2174,13 +2174,11 @@ impl Index {
     }
 
     /// Whether the street `line` runs through the area `poly` along a stretch, as getNearFeatures
-    /// takes an area for a street (line_runs_through); never for an area without rings. The rings
-    /// are read only where no node of the line lies inside the area.
+    /// takes an area for a street (line_runs_through); never for an area without rings.
     fn runs_through(&self, poly: &AdminPolygon, line: &[NodeCoord]) -> bool {
         let geometry = &self.admin_geometry;
         geometry.has_rings(poly)
-            && (line.iter().any(|n| geometry.contains_once(poly, AdminPoint::new(f64::from(n.lat), f64::from(n.lng))))
-                || line_runs_through(line, &geometry.rings(poly), |_, _| false))
+            && line_runs_through(line, &geometry.rings(poly), |lat, lng| geometry.contains_once(poly, AdminPoint::new(lat, lng)))
     }
 
     /// The polygon of `ranked` each rank shows, as Nominatim's complete_address_details orders
@@ -3872,33 +3870,83 @@ pub fn is_address_area(poly: &AdminPolygon) -> bool {
     }
 }
 
-/// Whether segments a-b and c-d ([lng, lat] each) cross, each passing between the other's ends.
-fn segments_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
-    let side = |p: [f64; 2], q: [f64; 2], r: [f64; 2]| ((q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])).signum();
-    let (abc, abd, cda, cdb) = (side(a, b, c), side(a, b, d), side(c, d, a), side(c, d, b));
-    abc * abd < 0.0 && cda * cdb < 0.0
+/// The side of the line p-q ([lng, lat] each) that r lies on: 1 to the left, -1 to the right, 0
+/// on it.
+fn side(p: [f64; 2], q: [f64; 2], r: [f64; 2]) -> i8 {
+    let cross = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+    i8::from(cross > 0.0) - i8::from(cross < 0.0)
 }
 
-/// How far from a ring a street's node may lie and be one the boundary shares: the street's
-/// nodes are f32, 2^-17 degrees apart past 64 degrees, so a shared node lies within half that
-/// of the ring's own vertex.
-pub const SHARED_NODE_DEG: f64 = 4e-6;
+/// Where `p`, on the line of the segment a-b, lies along it: 0 at a, 1 at b, measured along the
+/// axis the segment runs further on. None for a segment of no length.
+fn along(a: [f64; 2], b: [f64; 2], p: [f64; 2]) -> Option<f64> {
+    let axis = usize::from((b[1] - a[1]).abs() > (b[0] - a[0]).abs());
+    (a[axis] != b[axis]).then(|| (p[axis] - a[axis]) / (b[axis] - a[axis]))
+}
+
+/// Whether `p` lies on the segment c-d, an end included.
+fn on_segment(p: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+    side(c, d, p) == 0 && (c[0].min(d[0])..=c[0].max(d[0])).contains(&p[0]) && (c[1].min(d[1])..=c[1].max(d[1])).contains(&p[1])
+}
 
 /// Whether `line` meets the polygon of `rings` (AdminGeometry::rings: [lng, lat] each, the outer
 /// ring then its holes) in more than a point, as getNearFeatures takes an area for a line
 /// (ST_NPoints(ST_Intersection) > 1, partition-functions.sql:44): a node of the line inside it
-/// (`inside(lat, lng)`), a segment of the line crossing an edge of a ring, or two nodes of the
-/// line on a ring (SHARED_NODE_DEG), a stretch along the boundary or two touches; one alone is a
-/// touch, a point.
+/// (`inside(lat, lng)`), a segment crossing an edge, running along one or passing inside between
+/// the vertices it meets, or two points where the line touches a ring. A node the boundary
+/// shares is the vertex its f32 coordinates round from, and takes the vertex's own: the line
+/// touches the boundary there, and runs along it between two such.
 pub fn line_runs_through(line: &[NodeCoord], rings: &[Vec<[f64; 2]>], mut inside: impl FnMut(f64, f64) -> bool) -> bool {
-    if line.iter().any(|n| inside(n.lat as f64, n.lng as f64)) {
-        return true;
+    let vertex = |n: &NodeCoord| rings.iter().flatten().find(|v| v[0] as f32 == n.lng && v[1] as f32 == n.lat).copied();
+    let points: Vec<[f64; 2]> = line.iter().map(|n| vertex(n).unwrap_or([f64::from(n.lng), f64::from(n.lat)])).collect();
+    let edges = || rings.iter().flat_map(|ring| ring.windows(2)).map(|e| (e[0], e[1]));
+    let on_ring = |p: [f64; 2]| edges().any(|(c, d)| on_segment(p, c, d));
+    let mut touches: Vec<[f64; 2]> = Vec::new();
+    for &p in &points {
+        if on_ring(p) {
+            touches.push(p);
+        } else if inside(p[1], p[0]) {
+            return true;
+        }
     }
-    let crosses = line.windows(2).any(|w| {
-        let (a, b) = ([w[0].lng as f64, w[0].lat as f64], [w[1].lng as f64, w[1].lat as f64]);
-        rings.iter().any(|ring| ring.windows(2).any(|e| segments_cross(a, b, e[0], e[1])))
-    });
-    crosses || line.iter().filter(|n| rings_distance(rings, n.lat as f64, n.lng as f64) <= SHARED_NODE_DEG).nth(1).is_some()
+    for w in points.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        // Where the segment meets a vertex between its ends: between two such, or such a vertex
+        // and an end, it lies wholly inside or wholly outside.
+        let mut cuts = vec![0.0, 1.0];
+        for (c, d) in edges() {
+            let (abc, abd) = (side(a, b, c), side(a, b, d));
+            if abc * abd < 0 && side(c, d, a) * side(c, d, b) < 0 {
+                return true;
+            }
+            if abc == 0 && abd == 0 {
+                if let (Some(tc), Some(td)) = (along(a, b, c), along(a, b, d)) {
+                    if tc.max(td).min(1.0) > tc.min(td).max(0.0) {
+                        return true;
+                    }
+                }
+            }
+            for (v, s) in [(c, abc), (d, abd)] {
+                if let Some(t) = along(a, b, v).filter(|&t| s == 0 && t > 0.0 && t < 1.0) {
+                    touches.push(v);
+                    cuts.push(t);
+                }
+            }
+        }
+        if cuts.len() > 2 || on_ring(a) || on_ring(b) {
+            cuts.sort_by(f64::total_cmp);
+            for t in cuts.windows(2).filter(|t| t[1] > t[0]) {
+                let m = (t[0] + t[1]) / 2.0;
+                let p = [a[0] + (b[0] - a[0]) * m, a[1] + (b[1] - a[1]) * m];
+                if !on_ring(p) && inside(p[1], p[0]) {
+                    return true;
+                }
+            }
+        }
+    }
+    touches.sort_by(|p, q| p[0].total_cmp(&q[0]).then(p[1].total_cmp(&q[1])));
+    touches.dedup();
+    touches.len() > 1
 }
 
 /// The planar distance in degrees from (lat, lng) to the nearest edge of `rings` ([lng, lat]
@@ -7097,6 +7145,21 @@ mod pure_helper_tests {
     }
 
     #[test]
+    fn a_closed_street_that_starts_and_ends_on_a_ring_meets_it_in_one_point() {
+        // A 1 km square north-east of (0, 0), its corners vertices the street's nodes may share.
+        let corners = line_m(&[(0.0, 0.0), (0.0, 1000.0), (1000.0, 1000.0), (1000.0, 0.0), (0.0, 0.0)]);
+        let rings = vec![corners.iter().map(|c| [f64::from(c.lng), f64::from(c.lat)]).collect::<Vec<_>>()];
+        let (top, right) = (f64::from(corners[2].lat), f64::from(corners[2].lng));
+        let inside = |lat: f64, lng: f64| lat > 0.0 && lat < top && lng > 0.0 && lng < right;
+        // A loop outside the square from its south-west corner back to it, the closing node the
+        // first one again: the street meets the square in that one point, which getNearFeatures
+        // leaves out (ST_NPoints(ST_Intersection) > 1, partition-functions.sql:44).
+        assert!(!line_runs_through(&line_m(&[(0.0, 0.0), (-500.0, -200.0), (-200.0, -500.0), (0.0, 0.0)]), &rings, inside));
+        // A loop outside it through two of its corners meets it in two points.
+        assert!(line_runs_through(&line_m(&[(0.0, 0.0), (-500.0, 500.0), (0.0, 1000.0), (-1000.0, 500.0), (0.0, 0.0)]), &rings, inside));
+    }
+
+    #[test]
     fn place_nodes_cover_and_measure_from_the_street() {
         // The street runs north along longitude 0 from 1 km south to 5 km
         // north of the query. A hamlet 3 km north and 200 m east is no
@@ -7619,6 +7682,20 @@ mod query_path_tests {
             let (lat_lo, lng_lo, lat_hi, lng_hi) = bounds(&ring);
             let poly = AdminPolygon { area: ((lat_hi - lat_lo) * (lng_hi - lng_lo)) as f32, ..self.polygons.last().unwrap().0 };
             self.polygons.push((poly, ring));
+            self
+        }
+
+        /// A boundary through `corners_m`, (north, east) metres each, closed: a rectangle with
+        /// vertices along its edges too, which a street's nodes may share, its area its box's.
+        fn boundary_through(&mut self, name: &str, admin_level: u8, place_type_override: u8, corners_m: &[(f64, f64)]) -> &mut Self {
+            let span = corners_m.iter().fold((f64::MAX, f64::MAX, f64::MIN, f64::MIN), |(s, w, n, e), &(north, east)| {
+                (s.min(north), w.min(east), n.max(north), e.max(east))
+            });
+            self.boundary(name, admin_level, place_type_override, span);
+            let origin = self.origin;
+            let mut ring: Vec<NodeCoord> = corners_m.iter().map(|&(north, east)| at_from(origin, north, east)).collect();
+            ring.push(ring[0]);
+            self.polygons.last_mut().unwrap().1 = ring;
             self
         }
 
