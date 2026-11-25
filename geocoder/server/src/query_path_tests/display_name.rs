@@ -55,21 +55,24 @@ fn a_village_node_inside_a_township_of_its_rank_comes_before_the_township() {
 
 #[test]
 fn a_district_inside_its_city_comes_before_the_city() {
-    // Bratislava: the okres Bratislava I (R388234, admin_level 6, place=district) lies inside the
-    // city (R1702499, admin_level 5, linked city: 16), so it ranks 18 and comes before the city;
-    // Staré Mesto (9, place=suburb) ranks 20. The place=suburb area of the city's name
-    // (W293814124, 20) names no field: Staré Mesto is the suburb.
+    // Bratislava, Astoria Palace (W23752623): the okres Bratislava I (R388234, admin_level 6,
+    // place=district) lies inside the city (R1702499, admin_level 5, linked city: 16), so it
+    // ranks 18 and comes before the city. Staré Mesto (9, place=suburb) and the place=suburb area
+    // of the city's name (W293814124) both rank 20 and hold the point; Staré Mesto's centre is
+    // the nearer the street, so the address walk accepts it, and the area is the rank's row, as
+    // Nominatim's.
     let index = TestIndex::country("Slovakia", b"SK")
         .boundary("Region of Bratislava", 4, 9, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
         .boundary("Bratislava", 5, 1, (-10_000.0, -10_000.0, 10_000.0, 10_000.0))
         .boundary("District of Bratislava I", 6, 11, (-2000.0, -2000.0, 2000.0, 2000.0))
         .boundary("Bratislava-Staré Mesto", 9, 4, (-2000.0, -2000.0, 2000.0, 2000.0))
-        .boundary("Bratislava", 15, 4, (-6000.0, -6000.0, 6000.0, 6000.0))
+        .boundary("Bratislava", 15, 4, (-4000.0, -4000.0, 8000.0, 8000.0))
         .place("Tivoli", 5, 100.0, 100.0)
         .street("Hodžovo námestie", &[(0.0, -200.0), (0.0, 200.0)])
         .load();
     assert_eq!(display_at(&index, 0.0, 0.0),
-               "Hodžovo námestie, Tivoli, Bratislava-Staré Mesto, District of Bratislava I, Bratislava, Region of Bratislava, Slovakia");
+               "Hodžovo námestie, Tivoli, Bratislava, District of Bratislava I, Bratislava, Region of Bratislava, Slovakia");
+    assert_eq!(address_at(&index, 0.0, 0.0)["suburb"], "Bratislava");
 }
 
 #[test]
@@ -173,14 +176,16 @@ fn a_place_area_inside_a_boundary_of_its_rank_comes_before_the_boundary() {
     assert_eq!(address_at(&index, 1000.0, 1000.0)["village"], "Saint-Laurent");
 
     // One that reaches 400 m past the city's edge is not inside it (ST_Contains), though its
-    // middle is: it keeps 16, beside the city's.
+    // middle is: it keeps 16, the city's rank. Its centre is the nearer the street, so the
+    // address walk accepts it, and the city, holding the point too, is the rank's row.
     let index = TestIndex::country("France", b"FR")
         .boundary("Bretagne", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("Rennes", 8, 0, (-5000.0, -5000.0, 5000.0, 5000.0))
         .boundary("Saint-Laurent", 15, 3, (500.0, 3000.0, 1500.0, 5400.0))
         .street("Rue de Fougères", &[(1000.0, 3900.0), (1000.0, 4100.0)])
         .load();
-    assert_eq!(display_at(&index, 1000.0, 4000.0), "Rue de Fougères, Rennes, Saint-Laurent, Bretagne, France");
+    assert_eq!(display_at(&index, 1000.0, 4000.0), "Rue de Fougères, Rennes, Bretagne, France");
+    assert_eq!(address_at(&index, 1000.0, 4000.0).get("village"), None);
 
     // A place=county area (rank 12) is not lifted, round a smaller boundary of its rank or not.
     let index = TestIndex::country("United Kingdom", b"GB")
@@ -220,7 +225,7 @@ fn a_boundary_that_loses_its_field_to_one_of_another_rank_is_still_listed() {
     assert_eq!(display_at(&index, 0.0, 0.0), "Rue Melsens - Melsensstraat, Brussels, Brussels-Capital, Belgium");
 
     // Of one area but another outline, the City of Fredericton is another place: it is listed,
-    // though the address names York County, the first of the two as large.
+    // and the address names it, the finer row of the label (format_json.py:29-34).
     let mut dataset = TestIndex::country("Canada", b"CA");
     dataset.boundary("New Brunswick", 4, 7, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("York County", 5, 10, (-8000.0, -8000.0, 8000.0, 8000.0))
@@ -229,7 +234,7 @@ fn a_boundary_that_loses_its_field_to_one_of_another_rank_is_still_listed() {
     let area = dataset.polygons[2].0.area;
     dataset.polygons[3].0.area = area;
     let index = dataset.load();
-    assert_eq!(address_at(&index, 0.0, 0.0)["county"], "York County");
+    assert_eq!(address_at(&index, 0.0, 0.0)["county"], "City of Fredericton");
     assert_eq!(display_at(&index, 0.0, 0.0), "Queen Street, City of Fredericton, York County, New Brunswick, Canada");
 }
 

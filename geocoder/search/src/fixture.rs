@@ -68,6 +68,15 @@ impl Geo {
         self.polygons.len() as u32 - 1
     }
 
+    /// A rectangular place area ([south, west, north, east]) of place type `place_type`
+    /// (query_server::place_type_to_field's), as the builder writes a place=* way or relation
+    /// (admin_level 15); returns its polygon id.
+    pub fn place_area(&mut self, name: &str, place_type: u8, rect: [f32; 4]) -> u32 {
+        let id = self.boundary(name, 15, rect);
+        self.polygons[id as usize].0.place_type_override = place_type;
+        id
+    }
+
     /// A place node of PlaceNode type `place_type` (0 city .. 6 quarter); returns its index.
     pub fn place(&mut self, name: &str, place_type: u8, lat: f32, lng: f32) -> u32 {
         let name_id = self.string(name);

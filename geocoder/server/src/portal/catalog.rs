@@ -350,6 +350,7 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
                         mode: mode.to_string(),
                         quality: quality.to_string(),
                         poi_tier: tier.to_string(),
+                        water: WATER.to_string(),
                     };
                     let id = dataset_id(&sel);
                     if !plain_name(&id) {
@@ -371,21 +372,21 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
                             return Err(format!("{id}: {path} is not in the manifest"));
                         }
                     }
-                    let fetches = downloader::fetches(cfg, &files).map_err(|e| format!("{id}: {e}"))?;
+                    let fetches = downloader::fetches(cfg, &resolved, &files).map_err(|e| format!("{id}: {e}"))?;
                     for fetch in &fetches {
-                        for path in std::iter::once(fetch.path()).chain(fetch.files().into_iter().map(|(path, _)| path)) {
+                        for path in std::iter::once(fetch.path()).chain(fetch.files().into_iter().map(|f| f.path)) {
                             check_path(path, region).map_err(|why| format!("{id}: {why}"))?;
                         }
                         // A unit decodes into its own dir.
                         let dir = |path: &str| path.rsplit_once('/').map(|(dir, _)| dir.to_string());
-                        if fetch.files().iter().any(|(path, _)| dir(path) != dir(fetch.path())) {
+                        if fetch.files().iter().any(|f| dir(f.path) != dir(fetch.path())) {
                             return Err(format!("{id}: {} holds files of another dir", fetch.path()));
                         }
                         objects.entry(fetch.path().to_string()).or_insert_with(|| Object {
                             path: fetch.path().to_string(),
                             unit: matches!(fetch, downloader::Fetch::Unit { .. }),
                             size: fetch.size(),
-                            files: fetch.files().iter().map(|(path, _)| path.to_string()).collect(),
+                            files: fetch.files().iter().map(|f| f.path.to_string()).collect(),
                             link: None,
                         });
                     }

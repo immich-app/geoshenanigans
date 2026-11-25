@@ -121,6 +121,15 @@ precision takes any water value. The seas and oceans (Marine Regions'
 sea areas, cut to OpenStreetMap's land) are in a continent's dirs where its
 region takes in the coastal sea; only the planet's reach the open ocean.
 
+The query server and the node binding load `<dataset>/water/` with the
+dataset, a dir of all its files but `attribution.json` or of none (some
+without the rest fail the load), and answer the water holding a point in a
+`water` field beside the address, which it never changes (README.md,
+NOMINATIM_REFERENCE.md). Place search's build loads the dataset, its water dir
+with it (one some of whose files are missing fails that load too), but does
+not derive its index from the water files, so adding, switching or patching
+just that layer does not invalidate a shipped search index.
+
 ## Transport units
 
 Some files download as a transport unit: a download-only form of them, their
@@ -481,8 +490,21 @@ Quality changes don't require patching — just download the new quality files:
 ### Switching Water
 
 The water dir is a set of its own, so a switch downloads the new value's
-files into `<dataset>/water/` (or removes that dir, for `none`), as a fresh
-install does, with no patch.
+files into `<dataset>/water/` (or removes the water layer's files, for
+`none`), as a fresh install does, with no patch. On the server, a
+`PUT /admin/configuration` downloads each loaded region again whose dir the
+downloader filled (it holds `.file_sha256` or `.build_date`; one laid out by
+hand stays as it is) unless the `.build_date` its dir held as its files loaded
+names the PUT's bucket and selection, as it doesn't where `water` (or another
+axis) changes: the download removes the files of `water/` the new value
+doesn't take and fetches the ones it does, its ledger naming each
+`water/<name>`, and the region loads again once that is in. Until then, or if
+the download or load fails, the running process keeps serving the old index
+and retries the switch on the next PUT, of whichever selection; if the failed
+download removed `.build_date`, a restart leaves that region unloaded until a
+download succeeds. A server restarted before a PUT's downloads went through
+runs them as it starts, from the configuration the PUT kept. Other names in
+`water/` stay, and a dir holding none of the water files has no water.
 
 ### Switching Region
 

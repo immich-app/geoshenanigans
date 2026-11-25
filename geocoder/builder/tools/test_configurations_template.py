@@ -53,11 +53,12 @@ class WaterAxisTest(unittest.TestCase):
             if not cid.startswith("water."):
                 self.assertNotIn("dir", component, cid)
 
-    def test_the_water_axis_offers_its_dirs_files_and_promises_no_answer_from_them(self):
-        axis = load_template()["axes"]["water"]
-        for text in [axis["description"]] + [v["description"] for v in axis["values"].values()]:
-            self.assertNotIn("answer", text.lower(), text)
-        self.assertIn("water/", axis["description"])
+    def test_the_water_axis_offers_its_dirs_files_answered_in_a_water_field(self):
+        description = load_template()["axes"]["water"]["description"]
+        self.assertIn("`<dataset>/water/`", description)
+        self.assertNotIn("beside the dataset", description)
+        self.assertIn("in a `water` field without changing the address", description)
+        self.assertNotIn("yet", description)
 
     def test_the_seas_and_oceans_are_offered_as_in_builds_that_pin_the_marine_areas(self):
         axis = load_template()["axes"]["water"]
