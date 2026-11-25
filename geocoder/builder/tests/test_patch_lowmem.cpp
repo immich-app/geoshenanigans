@@ -1233,6 +1233,7 @@ const std::vector<FamilyFiles> FAMILY_FILES = {
     {"poi", {"poi_records.bin", "poi_vertices.bin"}},
     {"places", {"place_cells.bin", "place_nodes.bin", "place_hidden.bin"}},
     {"postcodes", {"postcode_centroids.bin", "postcode_centroid_cells.bin"}},
+    {"grid", {postcode_grid::FILE_NAME}},
     {"way_parents", {"way_parents.bin"}},
     {"addr_postcodes", {"addr_postcodes.bin"}},
 };
@@ -1368,9 +1369,9 @@ std::vector<char> unlisted(const std::vector<char>& raw, const std::string& file
 
 // A family the day leaves as it is, each of its sections sent as unchanged
 // (a way pair's, the address files', the POI files': the records' section and
-// the child's after it; the place files', the postcode centroid files' and a
-// side file's: their one section), is copied from the old dir as its files
-// sit there, the files no section names with them (addr_index.bin;
+// the child's after it; the place files', the postcode centroid files', the
+// postcode grid's and a side file's: their one section), is copied from the
+// old dir as its files sit there, the files no section names with them (addr_index.bin;
 // place_cells.bin and place_hidden.bin; postcode_centroid_cells.bin), and
 // none of its codecs runs: on a day that changes
 // nothing, and beside each family in turn that a day does change, in its
@@ -1408,6 +1409,12 @@ TEST(patch_copies_a_family_both_of_whose_sections_are_unchanged) {
              std::vector<postcode_files::LogicalCentroid> centroids = some_centroids(30);
              centroids[11].lat += 1e-3f;
              put_centroids(d, centroids);
+         }},
+        {"grid-run", {"grid"},
+         [](BuildDir& d) {
+             std::vector<postcode_grid::LogicalRow> rows = some_grid(19000);
+             rows[5] = postcode_grid::row_of(rows[5].cell, uint16_t('U' << 8 | 'S'), "19099");
+             put_grid(d, rows);
          }},
         {"way-parent", {"way_parents"}, [](BuildDir& d) { put_at(d["way_parents.bin"], 11 * 4, 99u); }},
         {"postcode", {"addr_postcodes"}, [](BuildDir& d) { put_at(d["addr_postcodes.bin"], 11 * 4, 800u); }},

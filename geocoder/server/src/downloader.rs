@@ -1282,7 +1282,7 @@ mod tests {
             .collect();
         assert_eq!(minimal.len(), axis_values(&v, "poi_tier").len());
         for s in minimal {
-            let paths = resolve_files(&c, &s).unwrap().paths;
+            let ResolvedFiles { paths, optional } = resolve_files(&c, &s).unwrap();
             let (dir, other) = if s.poi_tier == "none" {
                 ("europe/admin-minimal/", "europe/admin-minimal-poi/")
             } else {
@@ -1290,6 +1290,8 @@ mod tests {
             };
             let in_dir: Vec<&str> = paths.iter().filter_map(|p| p.strip_prefix(dir)).collect();
             assert_eq!(in_dir, files, "{:?}", s);
+            // A region of no grid has no postcode_grid.bin in its manifest: the dir's is optional.
+            assert!(optional.contains(&format!("{dir}postcode_grid.bin")), "{:?}", s);
             let stray: Vec<&String> = paths.iter()
                 .filter(|p| p.starts_with(other) || p.starts_with("europe/quality/"))
                 .collect();

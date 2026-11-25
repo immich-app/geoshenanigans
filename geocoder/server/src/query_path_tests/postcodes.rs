@@ -473,6 +473,7 @@ fn the_postcode_grid_names_a_point_before_the_nearest_centroid() {
     let point = (40.0033, -75.40011);
     let mut dataset = country_at(point, b"US");
     dataset.centroid("19333", 4700.0, -2000.0).centroid("19073", -3500.0, -5800.0);
+    assert_eq!(postcode_from(&dataset.load(), point, 0.0, 0.0), "19333");
     dataset.grid_run("19073", grid_cell(point, 0.0, 0.0, 0)).grid_run("", grid_cell(point, 0.0, 0.0, 1));
     assert_eq!(postcode_from(&dataset.load(), point, 0.0, 0.0), "19073");
 }
@@ -548,6 +549,25 @@ fn the_grid_names_a_point_of_its_runs_country_only() {
     dataset.centroid("J0L 1A0", 500.0, 0.0).grid_run("12919", grid_cell(point, 0.0, 0.0, 0));
     dataset.grid.last_mut().unwrap().country_code = u16::from_be_bytes(*b"US");
     assert_eq!(postcode_from(&dataset.load(), point, 0.0, 0.0), "J0L 1A0");
+}
+
+#[test]
+fn a_street_across_a_border_takes_the_grid_s_postcode_of_its_middle_s_country() {
+    // The point is in Canada, 400 m west of the US border, and the street that wins runs from
+    // 500 m west to 3,500 m east, its middle 1,500 m into the US: the grid's US run there names
+    // it, as the US centroid get_nearest_postcode would take there, not the Canadian one by the
+    // point.
+    let origin = (45.0, -73.5);
+    let mut dataset = border_at(origin, b"CA", b"US");
+    dataset.street("Chemin de la Frontiere", &[(0.0, -500.0), (0.0, 3500.0)]).centroid("J0L 1A0", 0.0, -450.0);
+    grid_of(&mut dataset, &[(grid_cell(origin, 0.0, 1500.0, 0), "12919")]);
+    let us = u16::from_be_bytes(*b"US");
+    for row in dataset.grid.iter_mut().filter(|r| !r.code.is_empty()) {
+        row.country_code = us;
+    }
+    let address = address_from(&dataset.load(), origin, 5.0, -400.0);
+    assert_eq!(address["road"], "Chemin de la Frontiere");
+    assert_eq!(address["postcode"], "12919");
 }
 
 #[test]

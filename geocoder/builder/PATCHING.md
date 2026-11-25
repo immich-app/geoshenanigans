@@ -663,7 +663,8 @@ Old file hash: marker 0xFFFFFFF8 (u32) + file_id (u32) + lane_hash of the
   `poi_vertices.bin` (15), in that order right before the POI records'
   section of a dir with POI files, and `addr_points.bin` (3) and
   `addr_vertices.bin` (28), in that order right before the address points'
-  section of a dir with address points. The patcher
+  section of a dir with address points, and (v20) `postcode_grid.bin` (36)
+  right before the postcode grid's section where the old grid has rows. The patcher
   refuses a second hash of a file, a hash of any other file, and a replay
   without the hashes it checks by. A family both of whose sections are
   unchanged is copied as its files sit, and POI records sent unchanged over
@@ -790,8 +791,10 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   the old file strictly and encodes the new rows as `postcode_grid.bin`,
   whose size the client list gives; a grid sent unchanged is copied as it
   sits, without decoding it. A dir that gets its first grid or loses its
-  last merges as any other day. A run whose postcode or first cell
-  moved goes as a DELETE and an INSERT.
+  last merges as any other day. The diff walks both days' runs by their
+  first cells, which ascend on each: a run both hold at the same cell with
+  the same postcode is a MATCH however many new runs come before it, and a
+  run whose postcode or first cell moved goes as a DELETE and an INSERT.
   (v21) The postal cities merge as their logical rows (64 bytes: the
   postcode's country, its code and its name, as `src/postal_cities.h` lays
   a LogicalRow out) under `postal_cities.bin`'s id, right after the postcode

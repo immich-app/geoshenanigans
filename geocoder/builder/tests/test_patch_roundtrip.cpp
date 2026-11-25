@@ -1423,6 +1423,31 @@ TEST(patch_round_trip_merges_the_postal_cities_as_logical_rows) {
     CHECK(round_trip(without, without).mismatches.empty());
 }
 
+// A day whose new runs lie 12,000 in a row ahead of runs both days hold: the
+// merge walks both days' runs by cell, so each run both hold at the same cell
+// MATCHes however many new runs come before it, and only the new runs go in
+// the patch. The 500 kept runs are sent once, as a MATCH.
+TEST(patch_round_trip_matches_the_grid_runs_after_any_number_of_new_ones) {
+    const uint16_t US = uint16_t('U' << 8 | 'S');
+    auto row = [&](uint64_t pos, uint32_t code) {
+        return postcode_grid::row_of(postcode_grid::cell_at(pos, 16), US, std::to_string(code));
+    };
+    std::vector<postcode_grid::LogicalRow> old_rows, new_rows;
+    for (uint64_t i = 0; i < 12000; i++) new_rows.push_back(row(1000 + 3 * i, 19000 + i % 2));
+    for (uint64_t i = 0; i < 500; i++) old_rows.push_back(row(100000 + 5 * i, 19002 + i % 2));
+    new_rows.insert(new_rows.end(), old_rows.begin(), old_rows.end());
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(OLD_POOL);
+    put_grid(old_d, old_rows);
+    put_grid(new_d, new_rows);
+    const RoundTrip r = round_trip(old_d, new_d);
+    CHECK(r.mismatches.empty());
+    CHECK(logged(r, "recs m/i/d/r=500/12000/0/0"));
+    if (!logged(r, "recs m/i/d/r=500/12000/0/0")) {
+        const size_t at = r.log.find("postcode_grid.bin: seq=");
+        std::printf("    %s\n", at == std::string::npos ? "no grid merge line" : r.log.substr(at, r.log.find('\n', at) - at).c_str());
+    }
+}
+
 // The moved postcode's string fixups take 2 bytes each. Under a limit of 2
 // (--string-fixup-bytes-max, lower for tests) it round-trips; under 1 the
 // diff refuses it, and no patch is written: a merge section's header gives

@@ -2112,13 +2112,14 @@ static int run(int argc, char* argv[]) {
             log_time("  group:grid (empty)", gs);
             return;
         }
-        // A merge of the runs in cell order: a day's new run is an INSERT
+        // A merge of the runs walked by their first cells, which ascend on
+        // both days (build_keyed_merge_seq): a day's new run is an INSERT
         // among MATCH runs, one whose postcode or first cell moved a DELETE
-        // and an INSERT. No id remap: no file the patch rebuilds holds a
-        // run's row.
+        // and an INSERT, however many new runs come before a kept one. No id
+        // remap: no file the patch rebuilds holds a run's row.
         const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
         auto seq = unchanged ? match_all(old_data.size / grid_stride)
-                             : build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, grid_stride);
+                             : build_keyed_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, grid_stride);
         res_grid = {PatchFileId::POSTCODE_GRID, postcode_grid::FILE_NAME, grid_stride, old_data.size, new_data.size, seq, {}};
         log_merge(res_grid);
         if (old_data.data) unmap_file(old_data);
