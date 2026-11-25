@@ -6,7 +6,10 @@
 //! row or in a row of no postcode.
 //!
 //! The reader checks the footer and the table's size at open, and reads a block without trusting
-//! it: a malformed block reads as no postcode or a wrong one, never a panic.
+//! it: a malformed block reads as no postcode or a wrong one, never a panic, and a query reads no
+//! more than the bytes a block of its rows can have. A block that ends past the blocks or before
+//! it starts, is longer than its rows can take, names a code longer than CODE_BYTES or gives a
+//! parameter past RICE_K_MAX reads as none.
 
 use crate::FileBytes;
 
@@ -18,7 +21,18 @@ const FOOTER_BYTES: usize = 12;
 /// The longest code, and the finest level a grid can be at.
 pub const CODE_BYTES: usize = 14;
 pub const MAX_LEVEL: u64 = 20;
+/// A Rice code's zero bits before its escape, the parameters a block may give, and the most bytes
+/// of a varint.
 const RICE_ESCAPE: u32 = 12;
+const RICE_K_MAX: u32 = 63;
+const VARINT_MAX_BYTES: usize = 10;
+
+/// The most bytes a block of `rows` rows (1 to BLOCK_ROWS) can have, postcode_grid.h's
+/// max_block_bytes: a count, an entry of a country, CODE_BYTES and a 0 a row, a parameter, and an
+/// index and an escaped step a row.
+fn max_block_bytes(rows: usize) -> usize {
+    VARINT_MAX_BYTES + rows * (3 + CODE_BYTES) + 1 + (rows * (64 + RICE_ESCAPE as usize + 64)).div_ceil(8)
+}
 
 /// A run as the patch tools diff it (postcode_grid.h's LogicalRow): its first cell, its country
 /// (two upper-case letters, 0 for none) and its code (empty for none).
@@ -129,7 +143,8 @@ impl PostcodeGrid {
         self.rows.div_ceil(BLOCK_ROWS as u32)
     }
 
-    /// Block b's first cell and its bytes.
+    /// Block b's first cell and its bytes: None for a block that ends past the blocks or before
+    /// it starts, or has more bytes than its rows can take.
     fn block(&self, b: u32) -> Option<(u64, &[u8])> {
         if b >= self.blocks() {
             return None;
@@ -138,7 +153,11 @@ impl PostcodeGrid {
         let at = self.table_at + b as usize * ENTRY_BYTES;
         let start = u32_at(f, at + 8) as usize;
         let end = if b + 1 < self.blocks() { u32_at(f, at + ENTRY_BYTES + 8) as usize } else { self.table_at };
-        Some((u64_at(f, at), f.get(start..end.min(self.table_at))?))
+        let rows = (self.rows as usize - b as usize * BLOCK_ROWS).min(BLOCK_ROWS);
+        if start > end || end > self.table_at || end - start > max_block_bytes(rows) {
+            return None;
+        }
+        Some((u64_at(f, at), &f[start..end]))
     }
 
     /// Block b's entries, its parameter and its bits.
@@ -161,12 +180,15 @@ impl PostcodeGrid {
         for e in entries.list.iter_mut().take(n as usize) {
             let country = u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?);
             at += 2;
-            let len = bytes.get(at..)?.iter().position(|&c| c == 0)?;
+            let len = bytes.get(at..)?.iter().take(CODE_BYTES + 1).position(|&c| c == 0)?;
             let code = std::str::from_utf8(&bytes[at..at + len]).ok()?;
             at += len + 1;
             *e = (country, code);
         }
         let k = *bytes.get(at)? as u32;
+        if k > RICE_K_MAX {
+            return None;
+        }
         Some((entries, k, Bits { b: &bytes[at + 1..], bit: 0 }))
     }
 
