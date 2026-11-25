@@ -791,8 +791,10 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   the old file strictly and encodes the new rows as `postcode_grid.bin`,
   whose size the client list gives; a grid sent unchanged is copied as it
   sits, without decoding it. A dir that gets its first grid or loses its
-  last merges as any other day. A run whose postcode or first cell
-  moved goes as a DELETE and an INSERT.
+  last merges as any other day. The diff walks both days' runs by their
+  first cells, which ascend on each: a run both hold at the same cell with
+  the same postcode is a MATCH however many new runs come before it, and a
+  run whose postcode or first cell moved goes as a DELETE and an INSERT.
   A child stream (street_nodes, interp_nodes, addr_vertices, poi_vertices,
   in the section right after its parent's) replays along its parent by
   position: its MATCH bytes are the old bytes of the parent records at the
