@@ -249,6 +249,7 @@ constexpr const char* STR_TIER_NAMES[STR_TIER_COUNT] = {
 };
 // The POI names' tier, the one tier not in alphabetical order (see
 // order_poi_strings_by_record).
+constexpr size_t STR_TIER_CORE = 0;
 constexpr size_t STR_TIER_POI = 4;
 
 // Home tier of a string from its consumer mask. The mode tiers nest by who
@@ -493,6 +494,11 @@ struct ParsedData {
     std::vector<uint32_t> admin_parent_ids;  // poly → next-larger containing admin poly
     std::vector<uint32_t> way_postcode_ids;  // way → postcode string from containing postal boundary
     std::vector<uint32_t> addr_postcode_ids; // per-addr_point postcode (optional separate file)
+    // Per addr_point: its addr:city (addr_cities.bin). Interned but marking
+    // no tier, so it writes no string: partition_strings_into_tiers keeps it
+    // where a place node or a boundary has its string, a core one, and makes
+    // it NO_DATA where not.
+    std::vector<uint32_t> addr_city_ids;
 
     // External postcode centroids (TIGER segments, GeoNames rows) keyed by
     // postcode_key(country, postcode string id), like Nominatim's
@@ -636,27 +642,30 @@ inline size_t grow_by(std::vector<T>& v, size_t n) {
 // Grows addr_points and the arrays parallel to it by n points, which
 // put_addr_point then fills (from many threads at once); returns the first.
 inline size_t grow_addr_points(ParsedData& data, size_t n) {
-    // put_addr_point writes one index into all four arrays.
+    // put_addr_point writes one index into all five arrays.
     const size_t size = data.addr_points.size();
-    if (data.addr_osm_ids.size() != size || data.addr_postcode_ids.size() != size || data.addr_cells.size() != size)
+    if (data.addr_osm_ids.size() != size || data.addr_postcode_ids.size() != size ||
+        data.addr_city_ids.size() != size || data.addr_cells.size() != size)
         throw std::logic_error("addr_points and its parallel arrays differ in length");
     grow_by(data.addr_osm_ids, n);
     grow_by(data.addr_postcode_ids, n);
+    grow_by(data.addr_city_ids, n);
     grow_by(data.addr_cells, n);
     return grow_by(data.addr_points, n);
 }
 
 // Stores address point i, its strings already interned (NO_DATA for a
-// missing street or postcode); `cell` is point_to_cell() of its location. A
-// building's polygon already sits at addr_vertices[vertex_offset].
+// missing street, postcode or city); `cell` is point_to_cell() of its
+// location. A building's polygon already sits at addr_vertices[vertex_offset].
 inline void put_addr_point(ParsedData& data, size_t i, float lat, float lng,
                            uint32_t housenumber_id, uint32_t street_id, uint32_t postcode_id,
-                           uint64_t cell, uint64_t osm_id_packed,
+                           uint32_t city_id, uint64_t cell, uint64_t osm_id_packed,
                            uint32_t vertex_offset = NO_DATA, uint32_t vertex_count = 0) {
     // parent_way_id is filled in during the nearest-street sweep.
     data.addr_points[i] = {lat, lng, housenumber_id, street_id, NO_DATA, vertex_offset, vertex_count};
     data.addr_osm_ids[i] = osm_id_packed;
     data.addr_postcode_ids[i] = postcode_id;
+    data.addr_city_ids[i] = city_id;
     data.addr_cells[i] = cell;
 }
 
@@ -742,6 +751,13 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
         parallel_for(n, [&](size_t b, size_t e, unsigned) {
             for (size_t s = b; s < e; s++) tier[s] = string_home_tier(mask[s].load(std::memory_order_relaxed));
         }, threads);
+        // An addr:city is none where no place node or boundary has its
+        // string, though a POI sharing it with a street puts it in core.
+        mark_each(data.addr_city_ids.size(), [&](size_t i) {
+            uint32_t& city = data.addr_city_ids[i];
+            const size_t s = city == NO_DATA ? RankedBits::npos : starts.index(city);
+            if (s == RankedBits::npos || !(mask[s].load(std::memory_order_relaxed) & STR_TIER_BIT_CORE)) city = NO_DATA;
+        });
     }
 
     // Each tier's string offsets in alphabetical order. Strings no shipped
@@ -876,6 +892,13 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
     remap_vec(data.way_postcode_ids);
     remap_vec(data.addr_postcode_ids);
     remap_vec(data.interp_postcode_ids);
+    // An addr:city marks no tier: one a place node or a boundary names (none
+    // else is left above) keeps its string, a core one.
+    remap_each(data.addr_city_ids.size(), [&](size_t i) {
+        uint32_t& city = data.addr_city_ids[i];
+        const size_t s = city == NO_DATA ? RankedBits::npos : starts.index(city);
+        city = s != RankedBits::npos && tier[s] == STR_TIER_CORE ? new_off[s] : NO_DATA;
+    });
     {
         // Re-keys the nodes rather than copying them: a planet's worth of
         // node allocations and frees on one core takes seconds.

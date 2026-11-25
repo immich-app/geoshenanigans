@@ -2,7 +2,7 @@
   "schema_version": 1,
   "build": {
     "version": 24,
-    "patch_version": 20
+    "patch_version": 22
   },
   "attribution": [
     {
@@ -402,6 +402,7 @@
         "{region}/full/attribution.json"
       ],
       "optional_files": [
+        "{region}/full/addr_cities.bin",
         "{region}/full/interp_postcodes.bin",
         "{region}/full/postcode_centroids.bin",
         "{region}/full/postcode_centroid_cells.bin",

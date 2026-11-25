@@ -274,7 +274,8 @@ void put_identity_streets(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
 //   3:  3 -> 3  MATCH       (B, on street 4 -> 3), footprint 3 4, at byte 18 -> 22 of the footprints
 //   24: 4 -> 0  moved       (C, on street 1)
 //   25:      4  new         (D, on the new street 4)
-// addr_postcodes follows the addresses; new 3's postcode changes.
+// addr_postcodes and addr_cities follow the addresses; new 3's postcode
+// changes, new 0 loses its city, new 1's changes and new 2 gains one.
 void put_identity_addresses(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
     old_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{
         {48.0f, 11.0f, OLD_B, OLD_B, 3, NO_DATA, 0}, {48.0f, 11.0f, OLD_C, OLD_C, 2, 0, 2},
@@ -290,6 +291,8 @@ void put_identity_addresses(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
     ids.new_keys["addr"] = {24, 0, 21, 3, 25};
     old_d["addr_postcodes.bin"] = bytes_of(std::vector<uint32_t>{OLD_B, OLD_C, OLD_A, NO_DATA, OLD_C});
     new_d["addr_postcodes.bin"] = bytes_of(std::vector<uint32_t>{NEW_D, NEW_B, NEW_C, NEW_B, NO_DATA});
+    old_d["addr_cities.bin"] = bytes_of(std::vector<uint32_t>{OLD_A, NO_DATA, OLD_C, OLD_B, OLD_B});
+    new_d["addr_cities.bin"] = bytes_of(std::vector<uint32_t>{NO_DATA, NEW_C, NEW_D, NEW_B, NEW_C});
 }
 
 // Interpolations matched by identity (key: old id -> new id):
@@ -1652,8 +1655,9 @@ TEST(patch_round_trip_by_identity_rebuilds_interp_ways) {
     CHECK(logged(r, "interp_ways identity: match=1 replace=1 insert=2 delete=2 moved=1"));
 }
 
-// The four side files, each beside the records it follows.
-const char* const SIDE_FILES[] = {"way_parents.bin", "way_postcodes.bin", "interp_postcodes.bin", "addr_postcodes.bin"};
+// The five side files, each beside the records it follows.
+const char* const SIDE_FILES[] = {"way_parents.bin", "way_postcodes.bin", "interp_postcodes.bin", "addr_postcodes.bin",
+                                  "addr_cities.bin"};
 
 // A side file is written only on a day that has a value for it. One the old
 // day lacks comes whole, a full replacement of its values (4 bytes each),
@@ -1833,7 +1837,8 @@ TEST(patch_round_trip_of_address_points_that_gain_their_first_footprint_or_lose_
 // footers, and from and to a dir without the files, each merged by content
 // and by slot. The day with addresses holds five on streets that move, two
 // with a footprint, the second's after the first's, in geo cells that list
-// them, with their postcodes; the day without has no addr_postcodes.bin.
+// them, with their postcodes and cities; the day without has no
+// addr_postcodes.bin or addr_cities.bin.
 TEST(patch_round_trip_of_a_dir_that_gains_its_first_address_or_loses_its_last) {
     struct Day {
         std::string name;
@@ -1850,7 +1855,8 @@ TEST(patch_round_trip_of_a_dir_that_gains_its_first_address_or_loses_its_last) {
             put_identity_streets(old_d, new_d, ids);
             put_identity_addresses(old_d, new_d, ids);
             BuildDir& without = day.gains ? old_d : new_d;
-            for (const char* file : {"addr_points.bin", "addr_vertices.bin", "addr_postcodes.bin"}) without.erase(file);
+            for (const char* file : {"addr_points.bin", "addr_vertices.bin", "addr_postcodes.bin", "addr_cities.bin"})
+                without.erase(file);
             if (day.footers) without["addr_points.bin"] = without["addr_vertices.bin"] = {};
             put_geo_cells(old_d, {{CELL, every, day.gains ? none : every, {}},
                                   {CELL_2, {2, 3, 4}, day.gains ? none : std::vector<uint32_t>{1, 4}, {}}});

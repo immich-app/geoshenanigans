@@ -402,7 +402,8 @@ TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread_or_copies
     CHECK(is_hashed_old_file(static_cast<uint32_t>(PatchFileId::ADDR_POINTS)));
     // The place files and the side files are decoded, and no id past the
     // table names a file.
-    for (const PatchFileId decoded : {PatchFileId::PLACE_NODES, PatchFileId::WAY_PARENTS, PatchFileId::ADDR_POSTCODES})
+    for (const PatchFileId decoded : {PatchFileId::PLACE_NODES, PatchFileId::WAY_PARENTS, PatchFileId::ADDR_POSTCODES,
+                                      PatchFileId::ADDR_CITIES})
         CHECK(!is_hashed_old_file(static_cast<uint32_t>(decoded)));
     CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::STRINGS)));
     CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::COUNT)));
@@ -413,24 +414,26 @@ TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread_or_copies
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v20 = the postcode grid's logical stream (v19: the
-    // postcode centroids'). The patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(20));
+    // diff/patch tools. v22 = the address points' addr:city side file (v20:
+    // the postcode grid's logical stream; v19: the postcode centroids'). The
+    // patcher accepts this version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(22));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
 
 TEST(patch_format_fileid_count_and_names_aligned) {
     // The names table must have exactly COUNT entries (one per PatchFileId).
-    CHECK_EQ(static_cast<uint32_t>(PatchFileId::COUNT), uint32_t(37));
+    CHECK_EQ(static_cast<uint32_t>(PatchFileId::COUNT), uint32_t(39));
     const size_t n_names = sizeof(patch_file_names) / sizeof(patch_file_names[0]);
-    CHECK_EQ(n_names, size_t(37));
+    CHECK_EQ(n_names, size_t(39));
     // Spot-check that index lines up with the enum value.
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::STRINGS)]) == "strings.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::POI_RECORDS)]) == "poi_records.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::STRINGS_POI)]) == "strings_poi.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::INTERP_POSTCODES)]) == "interp_postcodes.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::POSTCODE_GRID)]) == "postcode_grid.bin");
+    CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::ADDR_CITIES)]) == "addr_cities.bin");
     // The geo index's two files; its lists by table are no files.
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::GEO_CELLS)]) == "geo_cells.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::GEO_ENTRIES)]) == "geo_entries.bin");
@@ -809,7 +812,8 @@ TEST(patch_format_string_fields_match_the_record_layouts) {
         CHECK(f.remap_kind == 0 || f.remap_kind == 2);
         (f.remap_kind == 2 ? strings : raw).push_back(name);
     }
-    CHECK(strings == std::vector<std::string>({"addr_postcodes.bin", "way_postcodes.bin", "interp_postcodes.bin"}));
+    CHECK(strings == std::vector<std::string>({"addr_postcodes.bin", "way_postcodes.bin", "interp_postcodes.bin",
+                                               "addr_cities.bin"}));
     CHECK(raw == std::vector<std::string>({"admin_parents.bin", "way_parents.bin"}));
 }
 
@@ -829,13 +833,36 @@ TEST(patch_format_v19_names_no_file_for_ids_24_and_25) {
         for (const PatchFileId f : UNSECTIONED_OLD_FILES) CHECK(uint32_t(f) != id);
     }
     for (const uint32_t id : {0u, 9u, 10u, 11u}) CHECK(names_no_file(id));
-    for (const uint32_t id : {1u, 8u, 18u, 23u, 26u, 35u}) CHECK(!names_no_file(id));
+    for (const uint32_t id : {1u, 8u, 18u, 23u, 26u, 35u, 36u, 38u}) CHECK(!names_no_file(id));
     CHECK(!names_no_file(uint32_t(PatchFileId::COUNT)));
     CHECK(std::vector<std::string>(std::begin(POSTCODE_SIDE_FILES), std::end(POSTCODE_SIDE_FILES)) ==
           std::vector<std::string>({"postcode_centroid_cells.bin"}));
     CHECK(sparse_delta_file(PatchFileId::POSTCODE_CENTROIDS) == nullptr);
     CHECK(!cell_pairs::format_named("postcode_centroid"));
     CHECK(cell_pairs::format_named("admin") && cell_pairs::format_named("poi"));
+}
+
+// v22: file id 38 names addr_cities.bin, an address point's addr:city as a
+// core string offset, which follows addr_points.bin as a parallel delta of
+// string offsets (remap kind 2) after the other side files; id 37 names no
+// file, and id 36 is still the postcode grid's (v20).
+TEST(patch_format_v22_sends_the_addr_cities_after_the_other_side_files) {
+    CHECK(uint32_t(PatchFileId::ADDR_CITIES) == 38);
+    CHECK_EQ(std::string(patch_file_names[38]), std::string("addr_cities.bin"));
+    CHECK(uint32_t(PatchFileId::POSTCODE_GRID) == 36);
+    CHECK(!names_no_file(36));
+    for (const uint32_t id : {37u}) {
+        CHECK(names_no_file(id));
+        CHECK(std::string(patch_file_names[id]).find(".bin") == std::string::npos);
+        CHECK(sparse_delta_file(static_cast<PatchFileId>(id)) == nullptr);
+        CHECK(parallel_delta_file(static_cast<PatchFileId>(id)) == nullptr);
+    }
+    const SparseDeltaFile* sparse = sparse_delta_file(PatchFileId::ADDR_CITIES);
+    REQUIRE(sparse != nullptr);
+    CHECK(sparse->value_stride == 4 && sparse->remap_kind == 2);
+    CHECK(SPARSE_DELTA_FILES[std::size(SPARSE_DELTA_FILES) - 1].fid == PatchFileId::ADDR_CITIES);
+    CHECK(string_field_offsets(PatchFileId::ADDR_CITIES).empty());
+    CHECK(!is_hashed_old_file(uint32_t(PatchFileId::ADDR_CITIES)));
 }
 
 // v14: file ids 7, 26 and 27 name the arc files, of no string field, which
@@ -3634,6 +3661,10 @@ TEST(patch_format_parallel_delta_files_follow_their_parent) {
     CHECK(f->parent == PatchFileId::STREET_WAYS);
     CHECK_EQ(f->remap_kind, 0u);
     f = parallel_delta_file(PatchFileId::ADDR_POSTCODES);
+    REQUIRE(f != nullptr);
+    CHECK(f->parent == PatchFileId::ADDR_POINTS);
+    CHECK_EQ(f->remap_kind, 2u);
+    f = parallel_delta_file(PatchFileId::ADDR_CITIES);
     REQUIRE(f != nullptr);
     CHECK(f->parent == PatchFileId::ADDR_POINTS);
     CHECK_EQ(f->remap_kind, 2u);

@@ -1,8 +1,9 @@
 //! A side file as the builder writes it (builder/src/side_blocks.h, which lays the format out):
 //! a u32 for each record of the record file it sits beside (way_parents.bin, way_postcodes.bin,
-//! interp_postcodes.bin, addr_postcodes.bin), in blocks of BLOCK_VALUES values, each FOR or a
-//! dictionary, with a table of the blocks' offsets and a footer after them. A value's id is its
-//! record's, and it is read from its block in place. NO_DATA is a value like any other.
+//! interp_postcodes.bin, addr_postcodes.bin, addr_cities.bin), in blocks of BLOCK_VALUES values,
+//! each FOR or a dictionary, with a table of the blocks' offsets and a footer after them. A
+//! value's id is its record's, and it is read from its block in place. NO_DATA is a value like
+//! any other.
 
 use crate::coord_keys::{bit_length, bits_at};
 use crate::FileBytes;

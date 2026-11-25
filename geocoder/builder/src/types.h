@@ -1228,9 +1228,11 @@ struct CollectedPoiRelation {
     // relation's addr:street / addr:housenumber / addr:postcode win
     // as the primary feature's road/house_number/postcode fields.
     // Mirrors Nominatim's rank-30 row creation for relations with
-    // addr:housenumber (e.g. White House R19761182).
+    // addr:housenumber (e.g. White House R19761182). Its addr:city goes
+    // with the point too.
     std::string addr_housenumber;
     std::string addr_street;
     std::string addr_postcode;
+    std::string addr_city;
     std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
 };

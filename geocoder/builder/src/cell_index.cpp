@@ -279,7 +279,7 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
 // = ObjectType (NODE / WAY / SYNTHETIC), bottom 56 bits = the id.
 // Reference sites updated:
 //   - data.sorted_addr_cells (item_id)
-//   - data.addr_postcode_ids (parallel array — reorder)
+//   - data.addr_postcode_ids, data.addr_city_ids (parallel arrays — reorder)
 // addr_vertices.bin is keyed by byte offset, not idx, so no remap.
 static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir) {
     using namespace gc::id_alloc;
@@ -306,6 +306,7 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
     reorder_by_remap(data.addr_points, remap, n_new, addr_point_tombstone());
     reorder_by_remap(data.addr_osm_ids, remap, n_new, uint64_t(0));
     if (!data.addr_postcode_ids.empty()) reorder_by_remap(data.addr_postcode_ids, remap, n_new, NO_DATA);
+    if (!data.addr_city_ids.empty()) reorder_by_remap(data.addr_city_ids, remap, n_new, NO_DATA);
 
     remap_cell_pairs(data.sorted_addr_cells, [&](uint32_t& v) { remap_index(v, remap); });
 
@@ -876,6 +877,13 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             if (!data.addr_postcode_ids.empty()) {
                 write_futures.push_back(std::async(std::launch::async, [&] {
                     write_side_file(output_dir, "addr_postcodes.bin", data.addr_postcode_ids, "addr_points.bin",
+                                    data.addr_points.size());
+                }));
+            }
+            // Per-addr addr:city, a core string (parallel to addr_points)
+            if (!data.addr_city_ids.empty()) {
+                write_futures.push_back(std::async(std::launch::async, [&] {
+                    write_side_file(output_dir, "addr_cities.bin", data.addr_city_ids, "addr_points.bin",
                                     data.addr_points.size());
                 }));
             }

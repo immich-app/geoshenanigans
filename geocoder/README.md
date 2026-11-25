@@ -423,6 +423,7 @@ to the same files ([builder/PATCHING.md](builder/PATCHING.md#transport-units)).
 | `way_parents.bin`, `way_postcodes.bin` | Per street: smallest containing admin polygon, postcode from its postal boundary; a value per street in blocks of 64 (`builder/src/side_blocks.h`) |
 | `addr_points.bin`, `addr_vertices.bin`, `addr_index.bin` | Address points (coordinates, house number, street) in blocks of 16 records, building outlines as a blob per building, and where each block and its blobs start (`builder/src/addr_files.h`); in cell order as the ways are, then by street and house number |
 | `addr_postcodes.bin` | Per address point: its own `addr:postcode` where its country's pattern takes it, in blocks as the streets' side files |
+| `addr_cities.bin` | Per address point: its `addr:city` where a place or a boundary has that name (a core string, else none), in blocks as the other side files |
 | `interp_ways.bin`, `interp_nodes.bin` | Interpolation ways and their nodes, in the street ways' format; in cell order as the ways are, then by street and range |
 | `interp_postcodes.bin` | Per interpolation way: its TIGER ZIP (TIGER regions only), in blocks as the other side files |
 | `admin_cells.bin`, `admin_entries.bin` | S2 cell index for admin boundaries: lists in blocks of 8 cells, each against the one before (the cell pair layout, `builder/src/cell_pairs.h`) |

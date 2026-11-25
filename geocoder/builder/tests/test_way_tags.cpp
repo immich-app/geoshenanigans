@@ -57,6 +57,16 @@ TEST(way_tags_parse_picks_known_keys) {
     CHECK_EQ(std::string(pond.ele), "412");
 }
 
+TEST(way_tags_parse_reads_a_buildings_address_keys) {
+    TagBlock b({{"building", "house"}, {"addr:housenumber", "2"}, {"addr:street", "Whalens Ct"},
+                {"addr:city", "Drexel Hill"}, {"addr:postcode", "19026"}, {"addr:state", "PA"}});
+    WayTags t = b.parse();
+    REQUIRE(t.housenumber && t.street && t.city && t.postcode);
+    CHECK_EQ(std::string(t.city), "Drexel Hill");
+    CHECK_EQ(std::string(t.postcode), "19026");
+    CHECK(TagBlock({{"building", "house"}, {"addr:housenumber", "2"}}).parse().city == nullptr);
+}
+
 TEST(way_tags_parse_ignores_out_of_range_indices) {
     TagBlock b({{"name", "Kept"}});
     uint32_t bad = static_cast<uint32_t>(b.st.size() + 5);

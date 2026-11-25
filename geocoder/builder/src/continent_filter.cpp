@@ -410,6 +410,14 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
             out.addr_postcode_ids[new_aid] = full.addr_postcode_ids[old_aid];
         });
     }
+    if (!full.addr_city_ids.empty()) {
+        out.addr_city_ids.assign(out.addr_points.size(), NO_DATA);
+        parallel_each(used_addr_ids, [&](uint32_t old_aid) {
+            uint32_t new_aid = addr_remap[old_aid];
+            if (new_aid == NO_DATA || old_aid >= full.addr_city_ids.size()) return;
+            out.addr_city_ids[new_aid] = full.addr_city_ids[old_aid];
+        });
+    }
 
     // --- Copy postcode_accum (spatially filtered) ---
     // External entries carry their country in the key, so without a spatial
@@ -457,7 +465,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     }
 
     drop(full.way_parent_ids, full.admin_parent_ids, full.way_postcode_ids, full.interp_postcode_ids,
-         full.addr_postcode_ids, full.postcode_accum, full.postcode_grid_rows);
+         full.addr_postcode_ids, full.addr_city_ids, full.postcode_accum, full.postcode_grid_rows);
     log_phase(("      " + std::string(bbox.name) + " filter: parent + postcode projection").c_str(), _ft, _fc);
 
     // --- Remap sorted cell arrays for all 5 types (preserving INTERIOR_FLAG) ---
@@ -536,6 +544,8 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     parallel_each(out.interp_postcode_ids, add_used);
     parallel_each(out.addr_postcode_ids, add_used);
     for (const auto& [key, _acc] : out.postcode_accum) add_used(postcode_key_pc(key));
+    // An addr:city keeps a string only another record of the region keeps,
+    // which the partition below then holds to a place's or a boundary's.
 
     // The kept strings, ascending by planet offset, back to back.
     StringSubset kept(old_sp, used_bits);
@@ -559,6 +569,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     parallel_each(out.way_postcode_ids, remap_offset);
     parallel_each(out.interp_postcode_ids, remap_offset);
     parallel_each(out.addr_postcode_ids, remap_offset);
+    parallel_each(out.addr_city_ids, remap_offset);
 
     // Rebuild postcode_accum with remapped keys (drop entries whose string didn't survive)
     {
