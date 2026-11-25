@@ -420,6 +420,19 @@ fn origin_in_ring(points: &[(f64, f64)]) -> bool {
     inside
 }
 
+/// The interpolation ways in a lookup's lists of `cells`, in the order read, each once a scan, as
+/// a street is in nearest_street: a line several cells list is measured once, unless another
+/// read between takes its slot of a table of 64.
+fn interps_once<'a>(lists: &'a GeoLists, cells: &NearCells) -> impl Iterator<Item = u32> + 'a {
+    let mut seen = [u32::MAX; 64];
+    (0..cells.ids.len()).flat_map(move |i| lists.list(i, geo_index::INTERPOLATIONS).iter().copied()).filter(move |&id| {
+        let slot = (id as usize) & 0x3F;
+        let first = seen[slot] != id;
+        seen[slot] = id;
+        first
+    })
+}
+
 /// The cells a lookup round a point reads (cells_within), nearest first: their ids, and the
 /// squared distance (radians², as the scans measure one) that nothing in each comes nearer than.
 struct NearCells {
@@ -2108,20 +2121,18 @@ impl Index {
         let mut best_interp: Option<(u32, WayRow)> = None;
         let mut best_interp_t: f64 = 0.0;
         // Every cell of the cover, as for a street.
-        for i in 0..cells.ids.len() {
-            for &id in lists.list(i, geo_index::INTERPOLATIONS) {
-                // A corrupt cell entry reads as no way. The row comes first: a way without
-                // numbers costs no node.
-                let Some(iw) = interps.row(id) else { continue };
-                if iw.start_number == 0 || iw.end_number == 0 { continue; }
-                let Some((dist, t)) = self.interp_way_position(interps, id, origin) else { continue };
-                // A line several cells list ties with itself, which needs no key.
-                let keys = || best_interp.as_ref().filter(|(best, _)| *best != id).map(|(best, b)| (self.interp_tie_key(interps, id, &iw), self.interp_tie_key(interps, *best, b)));
-                if beats(dist, best_interp_dist, keys) {
-                    best_interp_dist = dist;
-                    best_interp = Some((id, iw));
-                    best_interp_t = t;
-                }
+        for id in interps_once(lists, cells) {
+            // A corrupt cell entry reads as no way. The row comes first: a way without
+            // numbers costs no node.
+            let Some(iw) = interps.row(id) else { continue };
+            if iw.start_number == 0 || iw.end_number == 0 { continue; }
+            let Some((dist, t)) = self.interp_way_position(interps, id, origin) else { continue };
+            // A line several cells list ties with itself, which needs no key.
+            let keys = || best_interp.as_ref().filter(|(best, _)| *best != id).map(|(best, b)| (self.interp_tie_key(interps, id, &iw), self.interp_tie_key(interps, *best, b)));
+            if beats(dist, best_interp_dist, keys) {
+                best_interp_dist = dist;
+                best_interp = Some((id, iw));
+                best_interp_t = t;
             }
         }
         best_interp.map(|(id, iw)| {
@@ -2196,26 +2207,24 @@ impl Index {
 
         let mut best: Option<(f64, u32, WayRow, f64)> = None;
         // Every cell of the cover, as in nearest_interp.
-        for i in 0..cells.ids.len() {
-            for &id in lists.list(i, geo_index::INTERPOLATIONS) {
-                // The row comes first: only a line of the street's name costs its nodes.
-                let Some(iw) = interps.row(id) else { continue };
-                if iw.start_number == 0 || iw.end_number == 0 { continue; }
-                if !street_tokens_overlap(&self.get_string(iw.name), street_name) { continue; }
-                let Some((dist, t)) = self.interp_way_position(interps, id, &origin) else { continue };
-                if dist >= max_dist_sq { continue; }
-                let range = |w: &WayRow| (w.start_number, w.interpolation);
-                let better = match &best {
-                    None => true,
-                    Some((bd, best_id, bw, _)) => dist < *bd
-                        || (dist == *bd
-                            && (range(&iw) < range(bw)
-                                || (range(&iw) == range(bw)
-                                    && *best_id != id
-                                    && self.interp_tie_key(interps, id, &iw) < self.interp_tie_key(interps, *best_id, bw)))),
-                };
-                if better { best = Some((dist, id, iw, t)); }
-            }
+        for id in interps_once(&lists, &cells) {
+            // The row comes first: only a line of the street's name costs its nodes.
+            let Some(iw) = interps.row(id) else { continue };
+            if iw.start_number == 0 || iw.end_number == 0 { continue; }
+            if !street_tokens_overlap(&self.get_string(iw.name), street_name) { continue; }
+            let Some((dist, t)) = self.interp_way_position(interps, id, &origin) else { continue };
+            if dist >= max_dist_sq { continue; }
+            let range = |w: &WayRow| (w.start_number, w.interpolation);
+            let better = match &best {
+                None => true,
+                Some((bd, best_id, bw, _)) => dist < *bd
+                    || (dist == *bd
+                        && (range(&iw) < range(bw)
+                            || (range(&iw) == range(bw)
+                                && *best_id != id
+                                && self.interp_tie_key(interps, id, &iw) < self.interp_tie_key(interps, *best_id, bw)))),
+            };
+            if better { best = Some((dist, id, iw, t)); }
         }
         GEO_LISTS.with(|g| g.set(lists));
         best.map(|(_, _, iw, t)| interpolate_house_number(iw.start_number, iw.end_number, iw.interpolation, t))
