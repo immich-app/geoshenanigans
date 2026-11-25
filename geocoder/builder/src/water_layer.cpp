@@ -18,6 +18,7 @@
 #include <unordered_map>
 
 #include "admin_cover.h"
+#include "attribution.h"
 #include "cell_index.h"
 #include "cell_index_io.h"
 #include "exact_pip.h"
@@ -1407,37 +1408,7 @@ std::string sitelinks_rows(const Build& b, const Layer& planet, const std::vecto
 }
 
 std::string attribution_json(bool marine) {
-    std::string out =
-        "[\n"
-        "  {\n"
-        "    \"id\": \"osm\",\n"
-        "    \"text\": \"\xC2\xA9 OpenStreetMap contributors\",\n"
-        "    \"url\": \"https://www.openstreetmap.org/copyright\",\n"
-        "    \"licence\": \"ODbL 1.0\",\n"
-        "    \"licence_url\": \"https://opendatacommons.org/licenses/odbl/1-0/\",\n"
-        "    \"notices\": [\n"
-        "      \"This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0.\"\n"
-        "    ]\n"
-        "  }";
-    if (marine)
-        out +=
-            ",\n"
-            "  {\n"
-            "    \"id\": \"marine-regions\",\n"
-            "    \"text\": \"Flanders Marine Institute (2024). The intersect of the Exclusive Economic Zones and IHO "
-            "sea areas, version 5. Available online at https://www.marineregions.org/. "
-            "https://doi.org/10.14284/699\",\n"
-            "    \"url\": \"https://www.marineregions.org/\",\n"
-            "    \"licence\": \"CC BY 4.0\",\n"
-            "    \"licence_url\": \"https://creativecommons.org/licenses/by/4.0/\",\n"
-            "    \"notices\": [\n"
-            "      \"Changes: each IHO sea area's parts in every EEZ dissolved into one, cut to the water off "
-            "OpenStreetMap's land polygons and along a 1-degree grid, the coastal water the sea areas leave out "
-            "given to the nearest sea area, and simplified in the simplified tiers. Cut to OpenStreetMap's land, "
-            "the areas are part of this dataset's ODbL derivative database.\"\n"
-            "    ]\n"
-            "  }";
-    return out + "\n]\n";
+    return ::attribution_json(ATTRIBUTION_OSM | (marine ? ATTRIBUTION_MARINE : 0));
 }
 
 namespace {

@@ -1,0 +1,234 @@
+use super::*;
+use crate::test_rng::Rng;
+
+const US: u16 = (b'U' as u16) << 8 | b'S' as u16;
+const STEP: u64 = 1 << 29;
+
+/// The level-16 cell of position `pos` along the curve.
+fn cell(pos: u64) -> u64 {
+    pos << 29 | 1 << 28
+}
+
+fn run(pos: u64, code: &str) -> LogicalRow {
+    LogicalRow { cell: cell(pos), country_code: if code.is_empty() { 0 } else { US }, code: code.to_string() }
+}
+
+fn grid(rows: &[LogicalRow]) -> PostcodeGrid {
+    PostcodeGrid::open(FileBytes::Owned(encode(rows))).unwrap()
+}
+
+fn at(g: &PostcodeGrid, pos: u64) -> Option<String> {
+    g.postcode_at(cell(pos)).map(|(country, code)| {
+        assert_eq!(country, *b"US");
+        code.to_string()
+    })
+}
+
+#[test]
+fn postcode_grid_reads_as_the_shared_vectors_say_and_the_test_encoder_writes_them() {
+    let rows = crate::exact_pip::tests::testdata_rows("postcode_grid.tsv");
+    let hex = |s: &str| (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect::<Vec<u8>>();
+    let mut zero = false;
+    for r in &rows {
+        assert_eq!(r.len(), 3, "{r:?}");
+        let logical: Vec<LogicalRow> = r[1]
+            .split(';')
+            .filter(|s| !s.is_empty() && *s != "-")
+            .map(|s| {
+                let f: Vec<&str> = s.splitn(3, ',').collect();
+                LogicalRow {
+                    cell: u64::from_str_radix(f[0], 16).unwrap(),
+                    country_code: u16::from_str_radix(f[1], 16).unwrap(),
+                    code: f[2].to_string(),
+                }
+            })
+            .collect();
+        let want = hex(&r[2]);
+        assert_eq!(encode(&logical), want, "{}", r[0]);
+        let g = PostcodeGrid::open(FileBytes::Owned(want)).unwrap_or_else(|e| panic!("{}: {e}", r[0]));
+        let mut got = Vec::new();
+        assert!(g.for_rows(|row| got.push(row)), "{}", r[0]);
+        assert_eq!(got, logical, "{}", r[0]);
+        assert_eq!(g.rows() as usize, logical.len(), "{}", r[0]);
+        // Each row's cell has its postcode, and the cell before it the row before it's.
+        for (k, row) in logical.iter().enumerate() {
+            let want = (row.country_code != 0).then(|| (row.country_code.to_be_bytes(), row.code.as_str()));
+            assert_eq!(g.postcode_at(row.cell), want, "{} row {k}", r[0]);
+            let before = match k {
+                0 => None,
+                _ => (logical[k - 1].country_code != 0).then(|| (logical[k - 1].country_code.to_be_bytes(), logical[k - 1].code.as_str())),
+            };
+            let step = 1u64 << (row.cell.trailing_zeros() + 1);
+            if row.cell > step {
+                assert_eq!(g.postcode_at(row.cell - step), before, "{} before row {k}", r[0]);
+            }
+        }
+        zero |= logical.is_empty();
+    }
+    assert!(rows.len() >= 8 && zero);
+}
+
+#[test]
+fn a_cell_has_its_runs_postcode_and_none_before_the_first_or_in_a_run_of_none() {
+    let g = grid(&[run(1000, "19026"), run(1003, ""), run(1010, "19073"), run(1011, "19026")]);
+    assert_eq!(g.level(), 16);
+    assert_eq!(at(&g, 999), None);
+    assert_eq!(at(&g, 0), None);
+    assert_eq!(at(&g, 1000).as_deref(), Some("19026"));
+    assert_eq!(at(&g, 1002).as_deref(), Some("19026"));
+    assert_eq!(at(&g, 1003), None);
+    assert_eq!(at(&g, 1009), None);
+    assert_eq!(at(&g, 1010).as_deref(), Some("19073"));
+    assert_eq!(at(&g, 1011).as_deref(), Some("19026"));
+    // The last run reaches the end of the curve, the last cell of face 5.
+    assert_eq!(at(&g, (6 << 32) - 1).as_deref(), Some("19026"));
+    // A grid of no rows names no cell.
+    let empty = grid(&[]);
+    assert_eq!((empty.rows(), empty.level()), (0, 0));
+    assert_eq!(at(&empty, 1000), None);
+}
+
+#[test]
+fn every_cell_reads_its_run_across_blocks() {
+    // Runs over three blocks and a few rows: every cell from before the first row to past the
+    // last reads its run's postcode.
+    let mut rng = Rng::new(9);
+    let mut rows = Vec::new();
+    let mut pos = 500;
+    for i in 0..3 * BLOCK_ROWS + 7 {
+        let code = if i > 0 && rng.next() % 4 == 0 { String::new() } else { format!("{}", 19000 + i % 5) };
+        rows.push(run(pos, &code));
+        pos += 1 + rng.next() % 6;
+    }
+    rows.dedup_by(|b, a| a.code == b.code);
+    let g = grid(&rows);
+    let mut k = 0;
+    for p in 400..pos + 20 {
+        while k < rows.len() && cell(p) >= rows[k].cell {
+            k += 1;
+        }
+        let want = if k == 0 || rows[k - 1].code.is_empty() { None } else { Some(rows[k - 1].code.clone()) };
+        assert_eq!(at(&g, p), want, "cell {p}");
+    }
+}
+
+#[test]
+fn a_grid_no_builder_writes_is_refused_at_open_and_a_garbled_block_reads_without_a_panic() {
+    let rows: Vec<LogicalRow> = (0..300).map(|i| run(100 + 3 * i, if i % 4 == 3 { "" } else { ["19026", "19073", "19008"][(i % 3) as usize] })).collect();
+    let file = encode(&rows);
+    let open = |b: Vec<u8>| PostcodeGrid::open(FileBytes::Owned(b));
+    assert!(open(file[..file.len() - 13].to_vec()).is_err());
+    assert!(open(file[..6].to_vec()).err().unwrap().contains("no PGR1 footer"));
+    let mut level = file.clone();
+    let n = level.len();
+    // The footer alone: its 300 rows' table of three blocks is not in the file.
+    assert!(open(file[n - FOOTER_BYTES..].to_vec()).err().unwrap().contains("shorter than its block table"));
+    level[n - 8] = 21;
+    assert!(open(level).is_err());
+    let mut reserved = file.clone();
+    reserved[n - 7] = 1;
+    assert!(open(reserved).is_err());
+    // Every byte flipped but the footer's: whatever it reads, it reads without a panic.
+    let mut rng = Rng::new(4);
+    for at_byte in 0..n - FOOTER_BYTES {
+        let mut b = file.clone();
+        b[at_byte] ^= 1 << (rng.next() % 8);
+        let Ok(g) = open(b) else { continue };
+        for p in (90..1100).step_by(7) {
+            let _ = g.postcode_at(cell(p));
+        }
+        let _ = g.for_rows(|_| {});
+    }
+    assert_eq!(STEP, cell(1) - cell(0));
+}
+
+/// The file of one block, `block`, of `rows` rows whose first cell is `first`: the block, its
+/// table entry and the footer, at level 16.
+fn one_block(block: &[u8], first: u64, rows: u32) -> Vec<u8> {
+    let mut b = block.to_vec();
+    b.extend_from_slice(&first.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&rows.to_le_bytes());
+    b.extend_from_slice(&[16, 0, 0, 0]);
+    b.extend_from_slice(MAGIC);
+    b
+}
+
+#[test]
+fn a_block_whose_parameter_is_past_63_reads_as_malformed() {
+    // Two runs, 19026 and 19073, a cell apart: the block's entries, its parameter (0) at byte 17,
+    // and its bits, row 0's entry and the step's Rice code. With a parameter of 65 and enough
+    // bytes after it for the step's 65 low bits, the block is no encoder's.
+    let file = encode(&[run(100, "19026"), run(101, "19073")]);
+    let block = &file[..file.len() - ENTRY_BYTES - FOOTER_BYTES];
+    assert_eq!((block.len(), block[17]), (19, 0));
+    let mut bad = block.to_vec();
+    bad[17] = 65;
+    bad.extend_from_slice(&[0; 9]);
+    let g = PostcodeGrid::open(FileBytes::Owned(one_block(&bad, cell(100), 2))).unwrap();
+    assert_eq!(at(&g, 101), None);
+    assert!(!g.for_rows(|_| {}));
+}
+
+#[test]
+fn a_block_that_breaks_off_after_its_first_row_reads_as_no_postcode() {
+    // Two runs a cell apart, 19026 and 19073, the block's bits all 0: row 0 reads as 19026, and
+    // the step's Rice code runs past the block, so where the next run starts is not known. No cell
+    // of the block reads a postcode, past row 0 neither.
+    let file = encode(&[run(100, "19026"), run(101, "19073")]);
+    let mut block = file[..file.len() - ENTRY_BYTES - FOOTER_BYTES].to_vec();
+    assert_eq!((block.len(), block[17]), (19, 0));
+    block[18] = 0;
+    let g = PostcodeGrid::open(FileBytes::Owned(one_block(&block, cell(100), 2))).unwrap();
+    for pos in [100, 101, 200] {
+        assert_eq!(at(&g, pos), None, "cell {pos}");
+    }
+    assert!(!g.for_rows(|_| {}));
+}
+
+#[test]
+fn a_block_past_the_blocks_or_longer_than_its_rows_take_reads_as_malformed() {
+    let rows: Vec<LogicalRow> = (0..2 * BLOCK_ROWS as u64).map(|i| run(100 + 2 * i, ["19026", "19073"][(i % 2) as usize])).collect();
+    let file = encode(&rows);
+    let n = file.len();
+    let table_at = n - FOOTER_BYTES - 2 * ENTRY_BYTES;
+    let open = |b: Vec<u8>| PostcodeGrid::open(FileBytes::Owned(b)).unwrap();
+    assert_eq!(at(&open(file.clone()), 101).as_deref(), Some("19026"));
+    // Block 1 starting past the blocks: block 0 ends past them.
+    let mut past = file.clone();
+    past[table_at + ENTRY_BYTES + 8..table_at + ENTRY_BYTES + 12].copy_from_slice(&(table_at as u32 + 1).to_le_bytes());
+    assert_eq!(at(&open(past), 101), None);
+    // Block 1 starting before block 0.
+    let mut reversed = file.clone();
+    reversed[table_at + 8..table_at + 12].copy_from_slice(&9u32.to_le_bytes());
+    reversed[table_at + ENTRY_BYTES + 8..table_at + ENTRY_BYTES + 12].copy_from_slice(&3u32.to_le_bytes());
+    assert_eq!(at(&open(reversed), 101), None);
+    // A block of two rows with more bytes than two rows can take (postcode_grid.h's
+    // max_block_bytes): the bytes after its bits are no encoder's either. Two rows take at most
+    // 80 bytes: 10 of the count, 2 * 17 of entries, 1 of the parameter and 35 of bits (a row's
+    // index of 64 bits at most and an escaped step of 12 + 64, 2 * 140 bits).
+    const TWO_ROW_LIMIT: usize = 80;
+    assert_eq!(max_block_bytes(2), TWO_ROW_LIMIT);
+    let two = encode(&[run(100, "19026"), run(101, "19073")]);
+    let mut long = two[..two.len() - ENTRY_BYTES - FOOTER_BYTES].to_vec();
+    long.resize(TWO_ROW_LIMIT + 1, 0);
+    assert_eq!(at(&open(one_block(&long, cell(100), 2)), 100), None);
+    long.truncate(TWO_ROW_LIMIT);
+    assert_eq!(at(&open(one_block(&long, cell(100), 2)), 100).as_deref(), Some("19026"));
+}
+
+#[test]
+fn an_entry_whose_code_runs_past_the_longest_reads_as_malformed() {
+    // One run of a code of CODE_BYTES + 1 bytes: no encoder writes it.
+    let mut block = vec![1u8];
+    block.extend_from_slice(&US.to_le_bytes());
+    block.extend_from_slice(&[b'1'; CODE_BYTES + 1]);
+    block.extend_from_slice(&[0, 0]);
+    assert_eq!(at(&PostcodeGrid::open(FileBytes::Owned(one_block(&block, cell(100), 1))).unwrap(), 100), None);
+    // The longest code reads.
+    let mut longest = vec![1u8];
+    longest.extend_from_slice(&US.to_le_bytes());
+    longest.extend_from_slice(&[b'1'; CODE_BYTES]);
+    longest.extend_from_slice(&[0, 0]);
+    assert_eq!(at(&PostcodeGrid::open(FileBytes::Owned(one_block(&longest, cell(100), 1))).unwrap(), 100).as_deref(), Some("11111111111111"));
+}

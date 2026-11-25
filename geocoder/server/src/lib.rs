@@ -31,6 +31,7 @@ pub mod place_files;
 pub mod poi_files;
 pub mod geography_box;
 pub mod postcode_files;
+pub mod postcode_grid;
 pub mod side_blocks;
 pub mod strings;
 pub mod transport;
@@ -158,11 +159,11 @@ impl FileBytes {
 
 pub const DEFAULT_STREET_CELL_LEVEL: u64 = 17;
 pub const DEFAULT_ADMIN_CELL_LEVEL: u64 = 10;
-// Default primary-feature search radius. Matches Nominatim's
-// lookup_street_poi default of 0.006 degrees ≈ 660m. This is the
-// radius inside which we'll accept a street/addr/interp/POI as the
-// primary feature for the reverse result.
-pub const DEFAULT_SEARCH_DISTANCE: f64 = 660.0;
+/// How far the street, address and interpolation lookups reach from the point, in metres: the
+/// nearest street within it, measured to the way's segments, wherever the point lies in its
+/// cell, and none past it. Nominatim's _find_closest_street_or_poi reaches 0.006° (about
+/// 660 m), but a road that far off is no longer the road the point is on (NOMINATIM_REFERENCE.md).
+pub const DEFAULT_SEARCH_DISTANCE: f64 = 130.0;
 
 // Matches POI_FLAG_HIGHWAY in builder/src/types.h — feature is a
 // highway-class polygon (highway=pedestrian/footway/etc.). Nominatim
@@ -184,6 +185,396 @@ pub fn cell_id_at_level(lat: f64, lng: f64, level: u64) -> u64 {
 pub fn cell_neighbors_at_level(cell_id: u64, level: u64) -> Vec<u64> {
     let cell = CellID(cell_id);
     cell.all_neighbors(level).into_iter().map(|c| c.0).collect()
+}
+
+/// How far the scans' distances (GeoOrigin) may stray from the sphere's round the point,
+/// relatively: planar ones by no more than half of it, as GeoOrigin measures on the gnomonic
+/// projection where they would stray more. The cells round a point are read that much past the
+/// reach, and each counts that much nearer.
+const CELL_REACH_SLACK: f64 = 1e-3;
+
+/// S2's kMaxDiag for its quadratic projection (s2metrics.cc): no cell of level k has a diagonal
+/// longer than this times 2^-k radians, nor, being convex, two points farther apart.
+const S2_MAX_DIAG: f64 = 2.438654594434021;
+
+/// S2's kMinArea for its quadratic projection (s2metrics.cc), 8√2/9: no cell of level k is
+/// smaller than this times 4^-k steradians.
+const S2_MIN_AREA: f64 = 1.257_078_722_109_418;
+
+/// The most street cells the geo lookups may read round a point (geo_cover): what bounds a
+/// query's work, and the lists GEO_LISTS keeps, whatever the search distance.
+const MAX_GEO_CELLS: f64 = 4096.0;
+
+/// The widest cover, in radians, cells_within reads the cells of: every point of a face of S2's
+/// cube lies within 54.74° of its middle, so the faces it reads, those whose middle the point lies
+/// within 60° of, hold every point within 5.26° of it.
+const MAX_GEO_COVER: f64 = 5.0 * std::f64::consts::PI / 180.0;
+
+/// How far across a street cell of `level` is at the most, in radians.
+fn cell_diameter(level: u64) -> f64 {
+    S2_MAX_DIAG * (-(level as f64)).exp2()
+}
+
+/// How far the point of an edge nearest a point can lie from every cell the builder lists the
+/// edge in, at the most, in radians at `level`: half a cell's diameter. The builder (cover_edge,
+/// builder/src/s2_helpers.cpp) lists an edge whose middle lies in the cell of one of its ends in
+/// the cells of its two ends alone, though the edge may cross a third by their corner. Its half
+/// from that end to its middle lies in that cell; the other half, as long and so no longer than
+/// the cell is across, lies within half of that of its middle or its other end.
+fn listing_gap(level: u64) -> f64 {
+    cell_diameter(level) / 2.0
+}
+
+/// How far round a point the geo lookups read the street cells, in radians, for a search
+/// distance of `reach` radians: every cell a way within the reach is listed in comes that near.
+/// The point of the way nearest the point lies in a cell the way is listed in, or on an edge square
+/// to the line to it, within the listing gap of a point of the edge in such a cell, so within
+/// √(reach² + gap²), on the scans' plane. And at the least the cells next to the point's own
+/// (address_cover).
+fn geo_cover(reach: f64, level: u64) -> f64 {
+    (reach.hypot(listing_gap(level)) * (1.0 + CELL_REACH_SLACK)).max(address_cover(reach, level))
+}
+
+/// How far round a point the address lookups read the cells' addresses, in radians: as far as
+/// the search distance, an address being listed in the cell of its point, but at the least the
+/// cells next to the point's own, which come within a cell's diameter of it, where a building
+/// round the point lists its point.
+fn address_cover(reach: f64, level: u64) -> f64 {
+    reach.max(cell_diameter(level))
+}
+
+/// Why the geo lookups can't reach `search_distance` metres at street level `level`: no
+/// distance, a cover wider than MAX_GEO_COVER, or more street cells round a point than
+/// MAX_GEO_CELLS; none where they can.
+fn geo_reach_refused(search_distance: f64, level: u64) -> Option<String> {
+    if !(search_distance > 0.0 && search_distance.is_finite()) {
+        return Some(format!("search distance {search_distance} m is no distance"));
+    }
+    let cover = geo_cover(search_distance / 6_371_000.0, level);
+    if cover > MAX_GEO_COVER {
+        return Some(format!(
+            "search distance {search_distance} m reads street cells {:.2}° round a point at level {level}, \
+             past the {:.0}° a query's scan of them holds within", cover.to_degrees(), MAX_GEO_COVER.to_degrees()));
+    }
+    // The cells within the cover lie within a cell's diameter past it, none smaller than kMinArea.
+    let disc = (cover + cell_diameter(level)).min(std::f64::consts::PI);
+    let cells = 4.0 * std::f64::consts::PI * (disc / 2.0).sin().powi(2) / (S2_MIN_AREA * (-2.0 * level as f64).exp2());
+    (cells > MAX_GEO_CELLS).then(|| format!(
+        "search distance {search_distance} m reads up to {cells:.0} street cells round a point at level {level}, \
+         more than the {MAX_GEO_CELLS} a query may read"))
+}
+
+/// A point of the sphere as a unit vector.
+fn unit_vector(lat: f64, lng: f64) -> [f64; 3] {
+    let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
+    let (sin_lng, cos_lng) = lng.to_radians().sin_cos();
+    [cos_lat * cos_lng, cos_lat * sin_lng, sin_lat]
+}
+
+/// Where a geo lookup measures from, and on what plane, squared distances in radians² as
+/// `max_distance_sq` is: the plane where a degree of longitude is cos(lat) of a degree of latitude
+/// at the point (point_to_segment_distance), each longitude taken the short way round from the
+/// point's, so across the antimeridian too. Near a pole, where that plane would stray from the
+/// sphere by more than half CELL_REACH_SLACK within the cover round the point, the gnomonic
+/// projection about the point instead, where a point is as far as it is and an edge is its great
+/// circle, as the builder lists it (cover_edge). Wherever the point lies, an edge whose line in
+/// degrees can stray from its great circle by more than half CELL_REACH_SLACK of the cover is
+/// measured on that projection too, unless an end lies past where the projection holds.
+#[derive(Clone, Copy)]
+struct GeoOrigin {
+    lat: f64,
+    lng: f64,
+    cos_lat: f64,
+    /// Near a pole, the point and its directions east and north, as unit vectors.
+    polar: Option<[[f64; 3]; 3]>,
+    /// The point and its directions east and north, as unit vectors.
+    basis: [[f64; 3]; 3],
+    /// How far an edge measured on the plane may stray from its great circle, in radians.
+    stray: f64,
+}
+
+impl GeoOrigin {
+    /// The point (lat, lng), whose lookups read the cells within `cover` radians of it.
+    fn new(lat: f64, lng: f64, cover: f64) -> Self {
+        let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
+        let (sin_lng, cos_lng) = lng.to_radians().sin_cos();
+        let basis = [unit_vector(lat, lng), [-sin_lng, cos_lng, 0.0], [-sin_lat * cos_lng, -sin_lat * sin_lng, cos_lat]];
+        // The plane's scale strays by up to the cover times tan(lat) within the cover.
+        let polar = (cover * lat.abs().to_radians().tan() > CELL_REACH_SLACK / 2.0).then_some(basis);
+        GeoOrigin { lat, lng, cos_lat: lat.to_radians().cos(), polar, basis, stray: cover * CELL_REACH_SLACK / 2.0 }
+    }
+
+    /// Whether the line in degrees of the edge from `a` to `b` can stray from its great circle by
+    /// more than `stray`: by up to Δλ (Δλ + 2 |Δφ|) / 8 radians, to second order, at any latitude.
+    fn strays(&self, a: NodeCoord, b: NodeCoord) -> bool {
+        let dlng = (self.near_lng(b.lng as f64) - self.near_lng(a.lng as f64)).to_radians().abs();
+        let dlat = (b.lat as f64 - a.lat as f64).to_radians().abs();
+        dlng * (dlng + 2.0 * dlat) > 8.0 * self.stray
+    }
+
+    /// `lng` the short way round from the point's: within 180° of it.
+    fn near_lng(&self, lng: f64) -> f64 {
+        let east = lng - self.lng;
+        if east > 180.0 { lng - 360.0 } else if east < -180.0 { lng + 360.0 } else { lng }
+    }
+
+    /// A node on the gnomonic projection about the point: None for one 84° or more away, where the
+    /// projection fails.
+    fn project(basis: &[[f64; 3]; 3], node: NodeCoord) -> Option<(f64, f64)> {
+        let v = unit_vector(node.lat as f64, node.lng as f64);
+        let dot = |a: &[f64; 3]| a[0] * v[0] + a[1] * v[1] + a[2] * v[2];
+        let toward = dot(&basis[0]);
+        (toward > 0.1).then(|| (dot(&basis[1]) / toward, dot(&basis[2]) / toward))
+    }
+
+    /// The squared distance to the point (lat, lng).
+    fn point_sq(&self, lat: f64, lng: f64) -> f64 {
+        match &self.polar {
+            None => dist_sq((lat - self.lat).to_radians(), (self.near_lng(lng) - self.lng).to_radians(), self.cos_lat),
+            Some(basis) => {
+                let v = unit_vector(lat, lng);
+                let (p, along) = (basis[0], v[0] * basis[0][0] + v[1] * basis[0][1] + v[2] * basis[0][2]);
+                let across = [p[1] * v[2] - p[2] * v[1], p[2] * v[0] - p[0] * v[2], p[0] * v[1] - p[1] * v[0]];
+                (across[0] * across[0] + across[1] * across[1] + across[2] * across[2]).sqrt().atan2(along).powi(2)
+            }
+        }
+    }
+
+    /// The squared distance to the edge from `a` to `b`, and the fraction along it of its point
+    /// nearest the point.
+    fn segment(&self, a: NodeCoord, b: NodeCoord) -> (f64, f64) {
+        if self.polar.is_some() || self.strays(a, b) {
+            match (Self::project(&self.basis, a), Self::project(&self.basis, b)) {
+                (Some(a), Some(b)) => {
+                    let (r, t) = nearest_to_origin(a, b);
+                    return (r.atan().powi(2), t);
+                }
+                // An end the projection fails for: by a pole, an edge out of reach; else on the plane.
+                _ if self.polar.is_some() => return (f64::MAX, 0.0),
+                _ => {}
+            }
+        }
+        let c = self.cos_lat;
+        point_to_segment_with_t(self.lat, self.lng * c, a.lat as f64, self.near_lng(a.lng as f64) * c,
+                                b.lat as f64, self.near_lng(b.lng as f64) * c, PLANAR)
+    }
+
+    /// The squared distance in plain degrees (as radians², as PostGIS measures a lon/lat line) to
+    /// the point of the edge from `a` to `b` nearest in degrees, and the fraction along the edge
+    /// of that point: at any latitude, as Nominatim locates a house number on its lon/lat line.
+    fn segment_in_degrees(&self, a: NodeCoord, b: NodeCoord) -> (f64, f64) {
+        point_to_segment_with_t(self.lat, self.lng, a.lat as f64, self.near_lng(a.lng as f64),
+                                b.lat as f64, self.near_lng(b.lng as f64), PLANAR)
+    }
+
+    /// The length of the edge from `a` to `b` in plain degrees (as radians), as PostGIS measures
+    /// a lon/lat line.
+    fn length(&self, a: NodeCoord, b: NodeCoord) -> f64 {
+        let dlat = (b.lat as f64 - a.lat as f64).to_radians();
+        let dlng = (self.near_lng(b.lng as f64) - self.near_lng(a.lng as f64)).to_radians();
+        dist_sq(dlat, dlng, PLANAR).sqrt()
+    }
+
+    /// The squared distance to the polygon through `vertices`: 0 for the point inside it, as
+    /// polygon_distance_sq measures one.
+    fn polygon_sq(&self, vertices: &[NodeCoord]) -> f64 {
+        let Some(basis) = &self.polar else {
+            let wraps = |v: &NodeCoord| self.near_lng(v.lng as f64) != v.lng as f64;
+            if !vertices.iter().any(wraps) {
+                return polygon_distance_sq(self.lat, self.lng, vertices, self.cos_lat);
+            }
+            // A vertex across the antimeridian, near the point's side of it: past 128° in f32 a
+            // turn of 360° is exact.
+            let near: Vec<NodeCoord> = vertices.iter()
+                .map(|v| NodeCoord { lat: v.lat, lng: self.near_lng(v.lng as f64) as f32 })
+                .collect();
+            return polygon_distance_sq(self.lat, self.lng, &near, self.cos_lat);
+        };
+        let Some(ring) = vertices.iter().map(|&v| Self::project(basis, v)).collect::<Option<Vec<_>>>() else {
+            return f64::MAX;
+        };
+        if ring.is_empty() {
+            return f64::MAX;
+        }
+        if origin_in_ring(&ring) {
+            return 0.0;
+        }
+        (0..ring.len()).map(|i| nearest_to_origin(ring[i], ring[(i + 1) % ring.len()]).0).fold(f64::MAX, f64::min).atan().powi(2)
+    }
+}
+
+/// How far the origin of a plane is from the segment from `a` to `b`, and the fraction along it
+/// of the segment's point nearest the origin.
+fn nearest_to_origin(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let length_sq = dx * dx + dy * dy;
+    let t = if length_sq > 0.0 { (-(a.0 * dx + a.1 * dy) / length_sq).clamp(0.0, 1.0) } else { 0.0 };
+    ((a.0 + t * dx).hypot(a.1 + t * dy), t)
+}
+
+/// Whether the origin of a plane lies inside the ring through `points`, by ray casting as
+/// point_in_polygon does.
+fn origin_in_ring(points: &[(f64, f64)]) -> bool {
+    let mut inside = false;
+    let mut j = points.len() - 1;
+    for (i, &(xi, yi)) in points.iter().enumerate() {
+        let (xj, yj) = points[j];
+        if (yi > 0.0) != (yj > 0.0) && 0.0 < (xj - xi) * (0.0 - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// The interpolation ways in a lookup's lists of `cells`, in the order read, each once a scan: a
+/// line several cells list is measured once.
+fn interps_once<'a>(lists: &'a GeoLists, cells: &NearCells) -> impl Iterator<Item = u32> + 'a {
+    let mut seen = std::collections::HashSet::new();
+    (0..cells.ids.len())
+        .flat_map(move |i| lists.list(i, geo_index::INTERPOLATIONS).iter().copied())
+        .filter(move |&id| seen.insert(id))
+}
+
+/// The cells a lookup round a point reads (cells_within), nearest first: their ids, and the
+/// squared distance (radians², as the scans measure one) that nothing in each comes nearer than.
+struct NearCells {
+    ids: Vec<u64>,
+    near: Vec<f64>,
+}
+
+impl NearCells {
+    /// How many of the cells, nearest first, come within `reach` radians of the point, as
+    /// cells_within takes a cell in.
+    fn within(&self, reach: f64) -> usize {
+        let near_reach = reach * (1.0 + CELL_REACH_SLACK) * (1.0 - CELL_REACH_SLACK);
+        self.near.partition_point(|&near| near <= near_reach * near_reach)
+    }
+}
+
+/// The cells of `level` that come within `reach` radians of (lat, lng), nearest first, equally
+/// near ones by id. On each face of S2's cube the reach meets, the cells of the box of (u, v)
+/// holding every point within reach are measured on the gnomonic projection about the point,
+/// where a cell is the quadrilateral of its corners and distances from the point keep their
+/// order.
+fn cells_within(lat: f64, lng: f64, level: u64, reach: f64) -> NearCells {
+    let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
+    let (sin_lng, cos_lng) = lng.to_radians().sin_cos();
+    let p = [cos_lat * cos_lng, cos_lat * sin_lng, sin_lat];
+    let (east, north) = ([-sin_lng, cos_lng, 0.0], [-sin_lat * cos_lng, -sin_lat * sin_lng, cos_lat]);
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    // A point of the sphere (any length) on the projection: the tangent of its distance from p,
+    // split east and north.
+    let project = |q: [f64; 3]| {
+        let t = dot(q, p);
+        (dot(q, east) / t, dot(q, north) / t)
+    };
+    let cover = reach * (1.0 + CELL_REACH_SLACK);
+    let (sin_cover, tan_cover) = (cover.sin(), cover.tan());
+    let (size, shift) = (1u64 << level, 30 - level);
+    let mut found: Vec<(f64, u64)> = Vec::new();
+    let (mut us, mut vs, mut corners) = (Vec::new(), Vec::new(), Vec::new());
+    for face in 0..6u8 {
+        // Every point of a face lies within 55° of its middle, so p lies within 60° of the middle
+        // of a face that holds a point within a reach of MAX_GEO_COVER.
+        let toward = p[usize::from(face % 3)] * if face < 3 { 1.0 } else { -1.0 };
+        if toward <= 0.5 {
+            continue;
+        }
+        let (u, v) = face_xyz_to_uv(face, p);
+        let (u_lo, u_hi) = (expand_uv(u, v.abs(), -sin_cover), expand_uv(u, v.abs(), sin_cover));
+        let (v_lo, v_hi) = (expand_uv(v, u.abs(), -sin_cover), expand_uv(v, u.abs(), sin_cover));
+        if u_hi < -1.0 || u_lo > 1.0 || v_hi < -1.0 || v_lo > 1.0 {
+            continue;
+        }
+        let index = |uv: f64| ((uv_to_st(uv.clamp(-1.0, 1.0)) * size as f64) as u64).min(size - 1);
+        let (i_lo, i_hi, j_lo, j_hi) = (index(u_lo), index(u_hi), index(v_lo), index(v_hi));
+        let side = |k: u64| st_to_uv(k as f64 / size as f64);
+        us.clear();
+        us.extend((i_lo..=i_hi + 1).map(side));
+        vs.clear();
+        vs.extend((j_lo..=j_hi + 1).map(side));
+        corners.clear();
+        for &v in &vs {
+            corners.extend(us.iter().map(|&u| project(face_uv_to_xyz(face, u, v))));
+        }
+        let row = us.len();
+        for (b, j) in (j_lo..=j_hi).enumerate() {
+            for (a, i) in (i_lo..=i_hi).enumerate() {
+                let at = b * row + a;
+                let tan_sq = origin_to_quad_sq([corners[at], corners[at + 1], corners[at + row + 1], corners[at + row]]);
+                if tan_sq <= tan_cover * tan_cover {
+                    let id = CellID::from_face_ij(face, (i << shift) as i32, (j << shift) as i32).parent(level);
+                    found.push((tan_sq.sqrt().atan(), id.0));
+                }
+            }
+        }
+    }
+    found.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let near = |angle: f64| (angle * (1.0 - CELL_REACH_SLACK)).powi(2);
+    NearCells { ids: found.iter().map(|&(_, id)| id).collect(), near: found.iter().map(|&(angle, _)| near(angle)).collect() }
+}
+
+/// The point (of any length) at (u, v) on the plane of face `face` of S2's cube: S2's
+/// FaceUVtoXYZ.
+fn face_uv_to_xyz(face: u8, u: f64, v: f64) -> [f64; 3] {
+    match face {
+        0 => [1.0, u, v],
+        1 => [-u, 1.0, v],
+        2 => [-u, -v, 1.0],
+        3 => [-1.0, -v, -u],
+        4 => [v, -1.0, -u],
+        _ => [v, u, -1.0],
+    }
+}
+
+/// (u, v) of a point in the half of the sphere round face `face`, on the face's plane: S2's
+/// ValidFaceXYZtoUV.
+fn face_xyz_to_uv(face: u8, [x, y, z]: [f64; 3]) -> (f64, f64) {
+    match face {
+        0 => (y / x, z / x),
+        1 => (-x / y, z / y),
+        2 => (-x / z, -y / z),
+        3 => (z / x, y / x),
+        4 => (z / y, -x / y),
+        _ => (-y / z, -x / z),
+    }
+}
+
+/// S2's quadratic projection of s (or t) in [0, 1] on u (or v) in [-1, 1], and back: STtoUV
+/// and UVtoST.
+fn st_to_uv(s: f64) -> f64 {
+    if s >= 0.5 { (4.0 * s * s - 1.0) / 3.0 } else { (1.0 - 4.0 * (1.0 - s) * (1.0 - s)) / 3.0 }
+}
+
+fn uv_to_st(u: f64) -> f64 {
+    if u >= 0.0 { 0.5 * (1.0 + 3.0 * u).sqrt() } else { 1.0 - 0.5 * (1.0 - 3.0 * u).sqrt() }
+}
+
+/// Where the side at `u` of a box of (u, v) whose largest |v| is `max_v` moves to for the box to
+/// hold every point within the distance whose sine is `sin_dist` of it (negative for the low
+/// side): S2's ExpandEndpoint (s2cell_id.cc), tan(atan(u) + the side's turn).
+fn expand_uv(u: f64, max_v: f64, sin_dist: f64) -> f64 {
+    let sin_turn = sin_dist * ((1.0 + u * u + max_v * max_v) / (1.0 + u * u)).sqrt();
+    let cos_turn = (1.0 - sin_turn * sin_turn).sqrt();
+    (cos_turn * u + sin_turn) / (cos_turn - sin_turn * u)
+}
+
+/// The squared distance from the origin to the convex quadrilateral through `corners` in order:
+/// 0 for the origin inside it or on a side.
+fn origin_to_quad_sq(corners: [(f64, f64); 4]) -> f64 {
+    let (mut turns, mut nearest) = ([0.0; 4], f64::MAX);
+    for k in 0..4 {
+        let ((ax, ay), (bx, by)) = (corners[k], corners[(k + 1) % 4]);
+        turns[k] = ax * by - ay * bx;
+        let (dx, dy) = (bx - ax, by - ay);
+        let length_sq = dx * dx + dy * dy;
+        let t = if length_sq > 0.0 { (-(ax * dx + ay * dy) / length_sq).clamp(0.0, 1.0) } else { 0.0 };
+        let (x, y) = (ax + t * dx, ay + t * dy);
+        nearest = nearest.min(x * x + y * y);
+    }
+    let inside = turns.iter().all(|&turn| turn >= 0.0) || turns.iter().all(|&turn| turn <= 0.0);
+    if inside { 0.0 } else { nearest }
 }
 
 // --- Binary format structs (must match C++ build pipeline) ---
@@ -561,6 +952,9 @@ pub fn poi_category_to_osm_class(cat: u8) -> Option<&'static str> {
         142..=152 => Some("landuse"),
         // office=government
         160 => Some("office"),
+        // leisure=swimming_area, emergency=fire_water_pond
+        161 => Some("leisure"),
+        162 => Some("emergency"),
         // Small-amenity sub-categories (171..=179) — toilets, clock…
         171..=179 => Some("amenity"),
         // Food / civic / health / finance / mail / transport extras
@@ -852,6 +1246,11 @@ pub const MAX_NESTED_RANK: u8 = 25;
 /// (placex_triggers.sql:1218-1226, partition-functions.sql:46). An area of
 /// rank 25 names nothing, nor does one of rank 0.
 pub const ADDRESS_AREA_RANKS: std::ops::Range<u8> = 1..25;
+
+/// The margin round a street of the admin cells the crosscheck reads areas from
+/// (Index::crosscheck_rows): the street runs through an area only in a cell under it, and
+/// cells_under_line cuts the street into boxes twice this across.
+pub const STREET_CELLS_MARGIN_M: f64 = 50.0;
 
 // --- String pool (tiered) ---
 //
@@ -1148,10 +1547,15 @@ pub struct Index {
     pub way_parents: Option<SideBlocks>,    // per way → smallest containing admin poly
     pub admin_parents: Option<FileBytes>,   // u32 per poly → next-larger containing admin poly
     pub addr_postcodes: Option<SideBlocks>, // per addr_point → postcode string (optional)
+    /// Per address point: its addr:city, a core string where a place or a boundary has that name,
+    /// addr_cities.bin; none in a dir without it.
+    pub addr_cities: Option<SideBlocks>,
     pub way_postcodes: Option<SideBlocks>,  // per way → postcode string from postal boundary
     /// The postcode centroids: postcode_centroids.bin and postcode_centroid_cells.bin
     /// (postcode_files.rs).
     pub postcode_centroids: Option<PostcodeFiles>,
+    /// The postcode grid (postcode_grid.bin): each cell's postcode in the countries it covers
+    pub postcode_grid: Option<postcode_grid::PostcodeGrid>,
     pub admin_config: AdminLevelConfig,
     pub strings: StringPool,
     /// The water layer of the dataset's water dir (water.rs); none without one.
@@ -1159,6 +1563,15 @@ pub struct Index {
     pub street_cell_level: u64,
     pub admin_cell_level: u64,
     pub max_distance_sq: f64,
+    /// (boundary_key, name_id) of the place nodes each boundary links, ascending: Nominatim
+    /// merges a linked node's names into its boundary's as `_place_*` (placex_indexing_prepare),
+    /// which the crosscheck reads, and a boundary links one node at most (find_linked_place). A
+    /// node labels one polygon of its boundary, the largest outer ring, and the key holds for
+    /// every ring. From place_hidden.bin's labels, on first use.
+    pub linked_names: std::sync::OnceLock<Vec<(u64, u32)>>,
+    /// The credit of the data in the dir as it loaded (dir_credits): a download may replace the
+    /// dir's files later, while this index answers from those it mapped.
+    pub credits: Vec<serde_json::Value>,
 }
 
 /// Normalised street-name token overlap, mirroring the builder's
@@ -1198,34 +1611,30 @@ fn street_tokens_overlap(a: &str, b: &str) -> bool {
 /// even/odd grid relative to start_number and clamps into [min, max] of the
 /// range — the old open-coded version computed the offset in unsigned space,
 /// so descending ranges (start > end) saturated the negative offset to 0.
-/// Squared distance (radians²) from the point to an interpolation line and
-/// the fraction along it, by length, of the closest point. None for a line
-/// without length.
-fn interp_position(nodes: &[NodeCoord], lat: f64, lng: f64, cos_lat: f64) -> Option<(f64, f64)> {
+/// Squared distance (radians²) from `origin` to an interpolation line, as far
+/// as its point nearest in metres, as a street is (GeoOrigin::segment); and
+/// the fraction along it, by its length in degrees, of its point nearest in
+/// degrees, where Nominatim takes the house number (_locate_interpolation in
+/// reverse.py: ST_LineLocatePoint on the lon/lat line, its first segment of
+/// the least distance in degrees). None for a line without length.
+fn interp_position(nodes: &[NodeCoord], origin: &GeoOrigin) -> Option<(f64, f64)> {
     if nodes.len() < 2 { return None; }
-    let seg_len = |i: usize| {
-        let dlat = (nodes[i + 1].lat as f64 - nodes[i].lat as f64).to_radians();
-        let dlng = (nodes[i + 1].lng as f64 - nodes[i].lng as f64).to_radians();
-        // sqrt: dist_sq is squared length; accumulating squares
-        // skews the along-way fraction toward long segments.
-        dist_sq(dlat, dlng, cos_lat).sqrt()
-    };
+    // Lengths, not their squares: accumulating squares skews the along-way
+    // fraction toward long segments.
+    let seg_len = |i: usize| origin.length(nodes[i], nodes[i + 1]);
     let total_len: f64 = (0..nodes.len() - 1).map(seg_len).sum();
     if total_len == 0.0 { return None; }
 
     let mut best_dist = f64::MAX;
-    let mut best_t = 0.0;
+    // The segment of the point nearest in degrees: the one least far at its own such point.
+    let (mut best_at, mut best_t) = (f64::MAX, 0.0);
     let mut accumulated = 0.0;
     for i in 0..nodes.len() - 1 {
         let len = seg_len(i);
-        let (dist, seg_t) = point_to_segment_with_t(
-            lat, lng,
-            nodes[i].lat as f64, nodes[i].lng as f64,
-            nodes[i + 1].lat as f64, nodes[i + 1].lng as f64,
-            cos_lat,
-        );
-        if dist < best_dist {
-            best_dist = dist;
+        best_dist = best_dist.min(origin.segment(nodes[i], nodes[i + 1]).0);
+        let (at, seg_t) = origin.segment_in_degrees(nodes[i], nodes[i + 1]);
+        if at < best_at {
+            best_at = at;
             best_t = (accumulated + seg_t * len) / total_len;
         }
         accumulated += len;
@@ -1417,8 +1826,11 @@ thread_local! {
 
 impl Index {
     pub fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
-        // Distance budget used by the primary-feature selection. The
-        // internal distances are stored in radians² (via `to_radians()`
+        if let Some(why) = geo_reach_refused(search_distance, street_cell_level) {
+            return Err(why);
+        }
+        // The reach of the geo lookups and the primary-feature selection.
+        // The internal distances are stored in radians² (via `to_radians()`
         // before squaring), so convert metres → radians → radians².
         // Earth radius is 6 371 000 m.
         let radians = search_distance / 6_371_000.0;
@@ -1465,6 +1877,9 @@ impl Index {
             }
             _ => None,
         };
+        let postcode_grid = file(postcode_grid::FILE)
+            .map(|f| postcode_grid::PostcodeGrid::open(f).map_err(|e| format!("{dir}: {e}")))
+            .transpose()?;
         // A cell pair index (cell_pairs.rs) of the dir, an error naming its cells file.
         let pairs = |prefix: &str, cells: FileBytes, entries: FileBytes, format: cell_pairs::Format| {
             CellPairs::open(cells, entries, format, admin_cell_level).map_err(|e| format!("{dir}/{prefix}_cells.bin: {e}"))
@@ -1484,8 +1899,9 @@ impl Index {
         let ways = |files: &Option<WayFiles>| files.as_ref().map(|files| u64::from(files.count()));
         let way_parents = load_side(dir, "way_parents.bin", "street_ways.bin", ways(&streets))?;
         let way_postcodes = load_side(dir, "way_postcodes.bin", "street_ways.bin", ways(&streets))?;
-        let addr_postcodes =
-            load_side(dir, "addr_postcodes.bin", addr_files::POINTS_FILE, addrs.as_ref().map(|addrs| u64::from(addrs.count())))?;
+        let addr_records = addrs.as_ref().map(|addrs| u64::from(addrs.count()));
+        let addr_postcodes = load_side(dir, "addr_postcodes.bin", addr_files::POINTS_FILE, addr_records)?;
+        let addr_cities = load_side(dir, "addr_cities.bin", addr_files::POINTS_FILE, addr_records)?;
         let interp_postcodes = load_side(dir, "interp_postcodes.bin", "interp_ways.bin", ways(&interps))?;
 
         Ok(Index {
@@ -1505,14 +1921,18 @@ impl Index {
             way_parents,
             admin_parents: mmap_file_optional(&format!("{}/admin_parents.bin", dir)),
             addr_postcodes,
+            addr_cities,
             way_postcodes,
             postcode_centroids,
+            postcode_grid,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::load(dir)?,
             water: WaterLayer::open(&format!("{dir}/{WATER_DIR}"), admin_cell_level)?,
             street_cell_level,
             admin_cell_level,
             max_distance_sq,
+            linked_names: Default::default(),
+            credits: dir_credits(dir),
         })
     }
 
@@ -1586,17 +2006,29 @@ impl Index {
 
     // --- Geo lookup (streets, addresses, interpolation from merged index) ---
 
-    /// The point's street-level cell and its neighbours, in the order the geo lookups read them.
-    fn geo_cells_around(&self, lat: f64, lng: f64) -> Vec<u64> {
-        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
-        std::iter::once(cell).chain(cell_neighbors_at_level(cell, self.street_cell_level)).collect()
+    /// The street-level cells every geo lookup reads round the point, nearest first, whose lists
+    /// GEO_LISTS keeps for the lookups after the first: those of the cover (geo_cover), which
+    /// every way within the search distance is listed in some of.
+    fn geo_cells_around(&self, lat: f64, lng: f64) -> NearCells {
+        cells_within(lat, lng, self.street_cell_level, geo_cover(self.max_distance_sq.sqrt(), self.street_cell_level))
+    }
+
+    /// How many of a lookup's cells (geo_cells_around) the address scans read: those within the
+    /// address cover, which lists every address point within the search distance.
+    fn address_cells(&self, cells: &NearCells) -> usize {
+        cells.within(address_cover(self.max_distance_sq.sqrt(), self.street_cell_level))
+    }
+
+    /// Where the geo lookups at (lat, lng) measure from.
+    fn geo_origin(&self, lat: f64, lng: f64) -> GeoOrigin {
+        GeoOrigin::new(lat, lng, geo_cover(self.max_distance_sq.sqrt(), self.street_cell_level))
     }
 
     /// What decides between two address points at one exact distance (see
     /// `beats`): the distance of the point itself (a building's distance is
     /// its outline's), then its house number and street as text.
-    fn addr_tie_key(&self, a: &AddrRecord, lat: f64, lng: f64, cos_lat: f64) -> (f64, Cow<'_, str>, Cow<'_, str>) {
-        let d = dist_sq((a.lat as f64 - lat).to_radians(), (a.lng as f64 - lng).to_radians(), cos_lat);
+    fn addr_tie_key(&self, a: &AddrRecord, origin: &GeoOrigin) -> (f64, Cow<'_, str>, Cow<'_, str>) {
+        let d = origin.point_sq(a.lat as f64, a.lng as f64);
         (d, self.get_string(a.housenumber_id), self.get_string(a.street_id))
     }
 
@@ -1620,9 +2052,9 @@ impl Index {
         (self.get_string(iw.name), iw.start_number, iw.end_number, iw.interpolation, nodes)
     }
 
-    /// The address point, the interpolation and the street way nearest (lat, lng), each with
-    /// its squared distance and its id: the address's record, the interpolation's street and
-    /// the house number at the point, the street's row.
+    /// The address point, the interpolation and the street way nearest (lat, lng) within the
+    /// search distance, each with its squared distance and its id: the address's record, the
+    /// interpolation's street and the house number at the point, the street's row.
     pub fn query_geo(&self, lat: f64, lng: f64)
         -> (Option<(f64, AddrRecord, u32)>, Option<(f64, Cow<'_, str>, u32, u32)>, Option<(f64, WayRow, u32)>)
     {
@@ -1638,43 +2070,43 @@ impl Index {
         };
         let cells = self.geo_cells_around(lat, lng);
         let mut lists = GEO_LISTS.with(std::cell::Cell::take);
-        self.geo_index.lookup_many(&cells, geo_index::ALL_TABLES, &mut lists);
+        self.geo_index.lookup_many(&cells.ids, geo_index::ALL_TABLES, &mut lists);
 
-        let cos_lat = lat.to_radians().cos();
-        let addr_result = self.nearest_addr(&lists, cells.len(), lat, lng, cos_lat);
-        let street_result = self.nearest_street(streets, &lists, cells.len(), lat, lng, cos_lat);
-        let interp_result = self.nearest_interp(&lists, cells.len(), lat, lng, cos_lat);
+        let origin = self.geo_origin(lat, lng);
+        let addr_result = self.nearest_addr(&lists, &cells, &origin);
+        let street_result = self.nearest_street(streets, &lists, &cells, &origin);
+        let interp_result = self.nearest_interp(&lists, &cells, &origin);
 
         GEO_LISTS.with(|g| g.set(lists));
 
         (addr_result, interp_result, street_result)
     }
 
-    /// The address point nearest (lat, lng) in `lists`, a lookup's lists of `cells` cells: its
-    /// squared distance, its record and its id. An exact tie goes by `addr_tie_key`, then to the
-    /// point read first: cells are read in the order the lookup asked for them, a cell's ids in
-    /// its list's.
-    fn nearest_addr(&self, lists: &GeoLists, cells: usize, lat: f64, lng: f64, cos_lat: f64)
+    /// The address point nearest `origin` within the search distance in `lists`, a lookup's
+    /// lists of `cells`: its squared distance, its record and its id. An exact tie goes by
+    /// `addr_tie_key`, then to the point read first: cells are read in the order the lookup
+    /// asked for them, a cell's ids in its list's.
+    fn nearest_addr(&self, lists: &GeoLists, cells: &NearCells, origin: &GeoOrigin)
         -> Option<(f64, AddrRecord, u32)>
     {
         let addrs = self.addrs.as_ref()?;
-        let addr_key = |a: &AddrRecord| self.addr_tie_key(a, lat, lng, cos_lat);
+        let addr_key = |a: &AddrRecord| self.addr_tie_key(a, origin);
 
-        let mut best_addr_dist = f64::MAX;
+        let mut best_addr_dist = self.max_distance_sq;
         let mut best_addr: Option<AddrRecord> = None;
         let mut best_addr_id: u32 = NO_DATA;
-        // One run over the cells' lists. A corrupt cell entry reads as no record: an id past
-        // the last address, a record whose block can't be read.
-        let ids = (0..cells).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
+        // One run over the lists of every cell of the address cover: a building is listed in the
+        // cell of its point but is as far as its outline, which can come nearer than that cell. A
+        // corrupt cell entry reads as no record: an id past the last address, a record whose
+        // block can't be read.
+        let ids = (0..self.address_cells(cells)).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
         with_footprint(|footprint| {
             addrs.for_ids(ids, |id, point| {
-                let dlat = (point.lat as f64 - lat).to_radians();
-                let dlng = (point.lng as f64 - lng).to_radians();
-                let mut dist = dist_sq(dlat, dlng, cos_lat);
+                let mut dist = origin.point_sq(point.lat as f64, point.lng as f64);
                 // A building is as far as its outline, matching ST_Distance behaviour; one
                 // whose footprint can't be read, as its point.
                 if point.is_building() && addrs.footprint(&point, footprint) {
-                    dist = polygon_distance_sq(lat, lng, footprint, cos_lat);
+                    dist = origin.polygon_sq(footprint);
                 }
                 if beats(dist, best_addr_dist, || best_addr.as_ref().filter(|_| best_addr_id != id).map(|b| (addr_key(&point), addr_key(b)))) {
                     best_addr_dist = dist;
@@ -1686,20 +2118,22 @@ impl Index {
         best_addr.map(|p| (best_addr_dist, p, best_addr_id))
     }
 
-    /// The street way nearest (lat, lng) in `lists`, read in `nearest_addr`'s order: its squared
-    /// distance, its row and its id. An exact tie goes by `street_tie_key`, then to the way
-    /// read first.
-    fn nearest_street(&self, streets: &WayFiles, lists: &GeoLists, cells: usize, lat: f64, lng: f64, cos_lat: f64)
+    /// The street way nearest `origin` within the search distance in `lists`, read in
+    /// `nearest_addr`'s order, from every cell: its squared distance, its row and its id. An exact
+    /// tie goes by `street_tie_key`, then to the way read first.
+    fn nearest_street(&self, streets: &WayFiles, lists: &GeoLists, cells: &NearCells, origin: &GeoOrigin)
         -> Option<(f64, WayRow, u32)>
     {
-        let mut best_street_dist = f64::MAX;
+        let mut best_street_dist = self.max_distance_sq;
         let mut best_street: Option<u32> = None;
 
         // Fixed-size hash set on stack to skip duplicate street IDs across cells
         let mut seen_streets: [u32; 64] = [u32::MAX; 64];
 
         with_way_nodes(|nodes| {
-            for i in 0..cells {
+            // Every cell of the cover: the builder lists a way in some of them, though not
+            // always in the cells it crosses (listing_gap).
+            for i in 0..cells.ids.len() {
                 for &id in lists.list(i, geo_index::STREETS) {
                     let slot = (id as usize) & 0x3F;
                     if seen_streets[slot] == id { continue; }
@@ -1709,12 +2143,7 @@ impl Index {
                     // whose block can't be read.
                     if !streets.way(id, nodes) || nodes.len() < 2 { continue; }
                     for i in 0..nodes.len() - 1 {
-                        let dist = point_to_segment_distance(
-                            lat, lng,
-                            nodes[i].lat as f64, nodes[i].lng as f64,
-                            nodes[i + 1].lat as f64, nodes[i + 1].lng as f64,
-                            cos_lat,
-                        );
+                        let (dist, _) = origin.segment(nodes[i], nodes[i + 1]);
                         // A tie with the way's own earlier segment (the node two segments
                         // share is the nearest point) needs no key.
                         let keys = || best_street.filter(|&best| best != id).map(|best| (self.street_tie_key(streets, id), self.street_tie_key(streets, best)));
@@ -1730,31 +2159,31 @@ impl Index {
         Some((best_street_dist, streets.row(id)?, id))
     }
 
-    /// The interpolation way nearest (lat, lng) in `lists`, read in `nearest_addr`'s order: its
-    /// squared distance, its street, the house number at the point of its line nearest
-    /// (lat, lng), and its id. Equally near ways go to the lesser `interp_tie_key`.
-    fn nearest_interp(&self, lists: &GeoLists, cells: usize, lat: f64, lng: f64, cos_lat: f64)
+    /// The interpolation way nearest `origin` within the search distance in `lists`, read in
+    /// `nearest_addr`'s order, from every cell: its squared distance, its street, the house
+    /// number at the point of its line nearest `origin`, and its id. Equally near ways go to the
+    /// lesser `interp_tie_key`.
+    fn nearest_interp(&self, lists: &GeoLists, cells: &NearCells, origin: &GeoOrigin)
         -> Option<(f64, Cow<'_, str>, u32, u32)>
     {
         let interps = self.interps.as_ref()?;
 
-        let mut best_interp_dist = f64::MAX;
+        let mut best_interp_dist = self.max_distance_sq;
         let mut best_interp: Option<(u32, WayRow)> = None;
         let mut best_interp_t: f64 = 0.0;
-        for i in 0..cells {
-            for &id in lists.list(i, geo_index::INTERPOLATIONS) {
-                // A corrupt cell entry reads as no way. The row comes first: a way without
-                // numbers costs no node.
-                let Some(iw) = interps.row(id) else { continue };
-                if iw.start_number == 0 || iw.end_number == 0 { continue; }
-                let Some((dist, t)) = self.interp_way_position(interps, id, lat, lng, cos_lat) else { continue };
-                // A line several cells list ties with itself, which needs no key.
-                let keys = || best_interp.as_ref().filter(|(best, _)| *best != id).map(|(best, b)| (self.interp_tie_key(interps, id, &iw), self.interp_tie_key(interps, *best, b)));
-                if beats(dist, best_interp_dist, keys) {
-                    best_interp_dist = dist;
-                    best_interp = Some((id, iw));
-                    best_interp_t = t;
-                }
+        // Every cell of the cover, as for a street.
+        for id in interps_once(lists, cells) {
+            // A corrupt cell entry reads as no way. The row comes first: a way without
+            // numbers costs no node.
+            let Some(iw) = interps.row(id) else { continue };
+            if iw.start_number == 0 || iw.end_number == 0 { continue; }
+            let Some((dist, t)) = self.interp_way_position(interps, id, origin) else { continue };
+            // A line several cells list ties with itself, which needs no key.
+            let keys = || best_interp.as_ref().filter(|(best, _)| *best != id).map(|(best, b)| (self.interp_tie_key(interps, id, &iw), self.interp_tie_key(interps, *best, b)));
+            if beats(dist, best_interp_dist, keys) {
+                best_interp_dist = dist;
+                best_interp = Some((id, iw));
+                best_interp_t = t;
             }
         }
         best_interp.map(|(id, iw)| {
@@ -1769,6 +2198,8 @@ impl Index {
     // nearest address whose parent_way_id matches that street's
     // index, gated by `ST_DWithin(query, 0.001)` (~100m). Returns the
     // address whose housenumber should refine the result, with its record id.
+    // Like every geo lookup it reaches no farther than the search distance,
+    // in the cells query_geo read.
     pub fn find_addr_on_way(&self, lat: f64, lng: f64, parent_way_idx: u32, max_dist_sq: f64)
         -> Option<(u32, AddrRecord)>
     {
@@ -1776,21 +2207,20 @@ impl Index {
 
         let cells = self.geo_cells_around(lat, lng);
         let mut lists = GEO_LISTS.with(std::cell::Cell::take);
-        self.geo_index.lookup_many(&cells, 1 << geo_index::ADDRESSES, &mut lists);
-        let cos_lat = lat.to_radians().cos();
-        let addr_key = |a: &AddrRecord| self.addr_tie_key(a, lat, lng, cos_lat);
+        self.geo_index.lookup_many(&cells.ids, 1 << geo_index::ADDRESSES, &mut lists);
+        let origin = self.geo_origin(lat, lng);
+        let addr_key = |a: &AddrRecord| self.addr_tie_key(a, &origin);
 
-        let mut best_dist = max_dist_sq;
+        let mut best_dist = max_dist_sq.min(self.max_distance_sq);
         let mut best: Option<(u32, AddrRecord)> = None;
-        // Of an address under another way no more than its street and its parent is read.
-        let ids = (0..cells.len()).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
+        // The lists nearest_addr reads. Of an address under another way no more than its street
+        // and its parent is read.
+        let ids = (0..self.address_cells(&cells)).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
         with_footprint(|footprint| {
             addrs.for_ids_on_way(ids, parent_way_idx, |id, point| {
-                let dlat = (point.lat as f64 - lat).to_radians();
-                let dlng = (point.lng as f64 - lng).to_radians();
-                let mut dist = dist_sq(dlat, dlng, cos_lat);
+                let mut dist = origin.point_sq(point.lat as f64, point.lng as f64);
                 if point.is_building() && addrs.footprint(&point, footprint) {
-                    dist = polygon_distance_sq(lat, lng, footprint, cos_lat);
+                    dist = origin.polygon_sq(footprint);
                 }
                 if beats(dist, best_dist, || best.as_ref().map(|(_, b)| (addr_key(&point), addr_key(b)))) {
                     best_dist = dist;
@@ -1804,8 +2234,8 @@ impl Index {
 
     /// interp_position over interpolation way `id`'s nodes; None for a way
     /// whose nodes can't be read.
-    fn interp_way_position(&self, interps: &WayFiles, id: u32, lat: f64, lng: f64, cos_lat: f64) -> Option<(f64, f64)> {
-        with_way_nodes(|nodes| if interps.way(id, nodes) { interp_position(nodes, lat, lng, cos_lat) } else { None })
+    fn interp_way_position(&self, interps: &WayFiles, id: u32, origin: &GeoOrigin) -> Option<(f64, f64)> {
+        with_way_nodes(|nodes| if interps.way(id, nodes) { interp_position(nodes, origin) } else { None })
     }
 
     /// Nominatim's `_find_tiger_number_for_street` (reverse.py): when a US
@@ -1815,36 +2245,37 @@ impl Index {
     /// street" is the name-token gate the TIGER postcode tier uses.
     /// Equally near lines (TIGER's odd and even sides share the street
     /// centreline) go to the lower start number and type, then to the lesser
-    /// interp_tie_key, never to record order.
+    /// interp_tie_key, never to record order. Like every geo lookup it reaches
+    /// no farther than the search distance.
     pub fn find_interp_on_way(&self, lat: f64, lng: f64, street_name: &str, max_dist_sq: f64) -> Option<u32> {
         let interps = self.interps.as_ref()?;
 
         let cells = self.geo_cells_around(lat, lng);
         let mut lists = GEO_LISTS.with(std::cell::Cell::take);
-        self.geo_index.lookup_many(&cells, 1 << geo_index::INTERPOLATIONS, &mut lists);
-        let cos_lat = lat.to_radians().cos();
+        self.geo_index.lookup_many(&cells.ids, 1 << geo_index::INTERPOLATIONS, &mut lists);
+        let origin = self.geo_origin(lat, lng);
+        let max_dist_sq = max_dist_sq.min(self.max_distance_sq);
 
         let mut best: Option<(f64, u32, WayRow, f64)> = None;
-        for i in 0..cells.len() {
-            for &id in lists.list(i, geo_index::INTERPOLATIONS) {
-                // The row comes first: only a line of the street's name costs its nodes.
-                let Some(iw) = interps.row(id) else { continue };
-                if iw.start_number == 0 || iw.end_number == 0 { continue; }
-                if !street_tokens_overlap(&self.get_string(iw.name), street_name) { continue; }
-                let Some((dist, t)) = self.interp_way_position(interps, id, lat, lng, cos_lat) else { continue };
-                if dist >= max_dist_sq { continue; }
-                let range = |w: &WayRow| (w.start_number, w.interpolation);
-                let better = match &best {
-                    None => true,
-                    Some((bd, best_id, bw, _)) => dist < *bd
-                        || (dist == *bd
-                            && (range(&iw) < range(bw)
-                                || (range(&iw) == range(bw)
-                                    && *best_id != id
-                                    && self.interp_tie_key(interps, id, &iw) < self.interp_tie_key(interps, *best_id, bw)))),
-                };
-                if better { best = Some((dist, id, iw, t)); }
-            }
+        // Every cell of the cover, as in nearest_interp.
+        for id in interps_once(&lists, &cells) {
+            // The row comes first: only a line of the street's name costs its nodes.
+            let Some(iw) = interps.row(id) else { continue };
+            if iw.start_number == 0 || iw.end_number == 0 { continue; }
+            if !street_tokens_overlap(&self.get_string(iw.name), street_name) { continue; }
+            let Some((dist, t)) = self.interp_way_position(interps, id, &origin) else { continue };
+            if dist >= max_dist_sq { continue; }
+            let range = |w: &WayRow| (w.start_number, w.interpolation);
+            let better = match &best {
+                None => true,
+                Some((bd, best_id, bw, _)) => dist < *bd
+                    || (dist == *bd
+                        && (range(&iw) < range(bw)
+                            || (range(&iw) == range(bw)
+                                && *best_id != id
+                                && self.interp_tie_key(interps, id, &iw) < self.interp_tie_key(interps, *best_id, bw)))),
+            };
+            if better { best = Some((dist, id, iw, t)); }
         }
         GEO_LISTS.with(|g| g.set(lists));
         best.map(|(_, _, iw, t)| interpolate_house_number(iw.start_number, iw.end_number, iw.interpolation, t))
@@ -1864,10 +2295,10 @@ impl Index {
         let to_m = |d2: f64| (d2.sqrt() * 6_371_000.0) as f64;
         let bits = |d: f64| format!("{:016x}", d.to_bits());
         let float_bits = |v: f32| format!("{:08x}", if v == 0.0 { 0 } else { v.to_bits() });
-        let cos_lat = lat.to_radians().cos();
+        let origin = self.geo_origin(lat, lng);
         serde_json::json!({
             "addr": addr.map(|(d, p, id)| {
-                let (point_dist, house_number, street) = self.addr_tie_key(&p, lat, lng, cos_lat);
+                let (point_dist, house_number, street) = self.addr_tie_key(&p, &origin);
                 serde_json::json!({
                     "dist_m": to_m(d),
                     "house_number": if p.housenumber_id != NO_DATA { self.get_string(p.housenumber_id) } else { Cow::Borrowed("") },
@@ -1916,7 +2347,7 @@ impl Index {
         let mut admin_scan = AdminScan::new(self, lat, lng);
         let admin = self.find_admin_in(&mut admin_scan);
         let current_boundaries = self.find_current_boundaries(&mut admin_scan, admin.country_code);
-        let place = self.find_places(PlaceFeature::Point(lat, lng), &current_boundaries, 0);
+        let place = self.find_places(PlaceFeature::Point(lat, lng), &current_boundaries, 0, None);
 
         if self.places.is_none() { return serde_json::json!({"error": "no place nodes"}); }
         let to_m = |d2: f64| (d2.sqrt() * 6_371_000.0) as f64;
@@ -2238,13 +2669,7 @@ impl Index {
         // address rows but doesn't let them claim "neighbourhood" or
         // "suburb" in the address dict, so they don't suppress the actual
         // place=neighbourhood nodes found by find_places.
-        let field_for = |r: &RankedPoly| -> Option<&'static str> {
-            if r.poly.place_type_override > 0 {
-                place_type_to_field(r.poly.place_type_override)
-            } else {
-                rank_to_field(r.rank_address)
-            }
-        };
+        let field_for = polygon_field;
         let candidate = |r: &RankedPoly, index: usize| FieldCandidate {
             area: r.poly.area, name: self.get_string(r.poly.name_id), country_code: r.poly.country_code, rank: r.rank_address,
             index,
@@ -2305,6 +2730,7 @@ impl Index {
         result.quarter        = best_by_field[15].take().map(|c| c.name);
         result.neighbourhood  = best_by_field[16].take().map(|c| c.name);
         result.city_block     = best_by_field[17].take().map(|c| c.name);
+        result.rows = ranked;
 
         result
     }
@@ -2361,7 +2787,10 @@ impl Index {
         CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter(), &cc, inside, within)
     }
 
-    pub fn find_places(&self, feature: PlaceFeature<'_>, current_boundaries: &CurrentBoundaries, held_ranks: u32) -> PlaceResult<'_> {
+    /// The place nodes of an address along `feature` (Nominatim's address walk, place_node_walk),
+    /// and the address rows of those named `named` (a string id).
+    pub fn find_places(&self, feature: PlaceFeature<'_>, current_boundaries: &CurrentBoundaries, held_ranks: u32,
+                       named: Option<u32>) -> PlaceResult<'_> {
         if self.places.is_none() { return PlaceResult::default(); }
 
         // Every node whose fuzzy area covers the feature, with its squared
@@ -2411,7 +2840,14 @@ impl Index {
                 (pn.place_type as usize, rank, *dist_sq, pn.lat, pn.lng)
             })
             .collect();
-        let accepted = accept_place_nodes(&nodes, held_ranks, |k| node_inside_boundary(&candidates[k].0, nodes[k].1));
+        // The walk tests every node's boundary for its rows, so it lists them only where a node
+        // has the name asked for.
+        let rows = named.is_some_and(|name| candidates.iter().any(|(pn, _)| pn.name_id == name));
+        let (accepted, written) = place_node_walk(&nodes, held_ranks, |k| node_inside_boundary(&candidates[k].0, nodes[k].1), rows);
+        result.named_rows = written.into_iter()
+            .filter(|&k| Some(candidates[k].0.name_id) == named)
+            .map(|k| NamedRow { rank: nodes[k].1, field: PLACE_NODE_FIELDS[nodes[k].0], distance: nodes[k].2.sqrt(), node: candidates[k].0 })
+            .collect();
         for (pt, slot) in [&mut result.city, &mut result.town, &mut result.village, &mut result.suburb,
                            &mut result.hamlet, &mut result.neighbourhood, &mut result.quarter].into_iter().enumerate() {
             if let Some(k) = accepted[pt] {
@@ -2432,7 +2868,7 @@ impl Index {
     pub fn is_area_label_category(cat: u8) -> bool {
         matches!(cat,
             // natural: large polygons
-            80 | 81 | 82 | 86 | 91 | 92 | 93 | // peak, volcano, beach, glacier, bay, cape, island
+            80 | 81 | 82 | 92 | 93 | // peak, volcano, beach, cape, island
             // boundary/leisure: parks, reserves
             60 | 61 | 62 | 63 | 64 | 65 | // park, nature_reserve, stadium, garden, water_park, golf_course
             130 | 131 | // national_park, protected_area
@@ -2446,6 +2882,44 @@ impl Index {
             100 | // aerodrome
             150   // power_plant
         )
+    }
+
+    // Water kinds, which never take the primary slot, so never set `road`
+    // or `postcode`. Nominatim's POI lane takes rank_search 30 alone
+    // (reverse.py _find_closest_street_or_pois), and it ranks
+    // natural=water, wetland, bay and glacier 22 ("natural": {"": [22, 0]})
+    // and landuse=reservoir|basin on an area 24 ("landuse": {"": [24, 0]},
+    // settings/address-levels.json), while a landuse node ranks 30
+    // (lib-sql/functions/ranking.sql compute_place_rank): a point RESERVOIR
+    // stays in the lane. A water object that also carries a POI main tag is
+    // a rank-30 POI there, and the builder classifies it by that tag
+    // (poi_classify.h), so it stays too.
+    pub fn is_below_poi_rank(cat: u8, polygon: bool) -> bool {
+        match cat {
+            86 | 91 | 97 | 99 => true, // glacier, bay, wetland, natural_water
+            148 => polygon,            // reservoir
+            _ => false,
+        }
+    }
+
+    // Whether `poi` is a water street: a water area of the highway flag, which
+    // a highway kind of rank 26 or 27 ranks (the builder flags it only there,
+    // poi_classify.h poi_water_street). Nominatim imports it as one placex row
+    // of class highway, its polygon the geometry and rank_address 26 or 27
+    // (init.lua process_tags, ranking.sql compute_place_rank), which its
+    // street lane, of address ranks 26 to 29, finds by the distance to that
+    // polygon, 0 inside (reverse.py _find_closest_street_or_pois), and which
+    // answers by its own name as a street does, of no parent street
+    // (placex_update parents rank_search > 27 alone): it competes as one,
+    // wherever it wins, linked to a parent street or not.
+    pub fn is_water_street(poi: &PoiRecord) -> bool {
+        poi.is_polygon() && poi.flags & POI_FLAG_HIGHWAY != 0 && Self::is_below_poi_rank(poi.category, true)
+    }
+
+    // Whether `poi` stays out of the primary slot: a water kind below the
+    // POI rank, but a water street (is_water_street).
+    pub fn is_out_of_the_primary_lanes(poi: &PoiRecord) -> bool {
+        Self::is_below_poi_rank(poi.category, poi.is_polygon()) && !Self::is_water_street(poi)
     }
 
     // Chain-containment check for a POI primary candidate.
@@ -2469,8 +2943,9 @@ impl Index {
 
     // --- POI primary-feature lookup ---
     //
-    // Returns the nearest POI with a valid parent_street_id to the
-    // query point. Used by query() as an additional primary-feature
+    // Returns the nearest POI with a valid parent_street_id, or water
+    // street (is_water_street), to the query point. Used by query() as an
+    // additional primary-feature
     // candidate alongside the raw address / interpolation / street
     // lookups — mirrors Nominatim's _find_closest_street_or_pois
     // which returns the closest rank-26+ feature regardless of
@@ -2480,6 +2955,17 @@ impl Index {
     // the polygon, otherwise the distance to the nearest edge. None for
     // a point off the globe (see find_pois).
     pub fn find_nearest_poi_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, PoiRecord)> {
+        self.nearest_linked_poi(lat, lng, false)
+    }
+
+    /// The POI find_nearest_poi_with_parent would find if the primary lanes took the water they
+    /// leave out (is_out_of_the_primary_lanes) too. A glacier or bay labels an area there, as an
+    /// island does: it wins only where no specific POI is found, however far.
+    pub fn find_nearest_poi_or_water_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, PoiRecord)> {
+        self.nearest_linked_poi(lat, lng, true)
+    }
+
+    fn nearest_linked_poi(&self, lat: f64, lng: f64, water: bool) -> Option<(f64, PoiRecord)> {
         let poi_index = self.poi_index.as_ref()?;
         if self.poi_records.is_none() || !coords_in_range(lat, lng) { return None; }
 
@@ -2490,7 +2976,7 @@ impl Index {
         let mut best_dist_sq = f64::MAX;
         let mut best_idx: Option<u32> = None;
         // Fallback tier: the closest area-label POI (national park,
-        // island, bay, campus). Only wins primary if no specific
+        // island, cape, campus). Only wins primary if no specific
         // POI qualifies — so "middle of Yosemite with no roads" can
         // surface the park, while urban queries never get "Manhattan
         // Island" as the primary feature.
@@ -2512,8 +2998,10 @@ impl Index {
                 let Some(poi) = self.poi_record(poi_id) else { return; };
                 // Need a linked parent street (for the `road` field)
                 // when this POI wins — without it we have nothing to
-                // surface as the road name.
-                if poi.parent_street_id == NO_DATA {
+                // surface as the road name; a water street's own name is
+                // its road.
+                if (poi.parent_street_id == NO_DATA && !Self::is_water_street(&poi))
+                    || (!water && Self::is_out_of_the_primary_lanes(&poi)) {
                     return;
                 }
 
@@ -2546,8 +3034,10 @@ impl Index {
                     dist_sq_val = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
                 }
 
-                if Self::is_area_label_category(poi.category) {
-                    // Split lane: area labels (islands, parks, bays,
+                // Glaciers and bays (86, 91) label an area too where
+                // the lanes take water.
+                if Self::is_area_label_category(poi.category) || (water && matches!(poi.category, 86 | 91)) {
+                    // Split lane: area labels (islands, parks, capes,
                     // campuses) only win primary when nothing more
                     // specific competes. Track them separately so a
                     // "middle-of-nowhere in Yosemite" query still has
@@ -3070,12 +3560,16 @@ impl Index {
         // there (get_country_code), for the street and a house of it, which
         // takes its street's country; a street none reaches has no postcode.
         // Then at the house; else at the query point, of its postcode area.
+        // At each, the postal areas first (ORDER BY osm_id is null), then the
+        // postcode grid in place of the nearest centroid, where the dir has
+        // one of the point's country, then the centroid.
         let mut country_code = country_code;
         if let Some((way_id, _)) = street {
             if let Some((m_lat, m_lng)) = u32::try_from(way_id).ok().and_then(|id| self.street_middle(id)) {
                 let (areas, point, country_there) = self.postal_areas_at(m_lat, m_lng, true);
                 country_code = country_there.or(country_code);
                 let found = self.postal_area_postcode(&areas, &upper_country(country_code), point)
+                    .or_else(|| self.grid_postcode(m_lat, m_lng, country_code))
                     .or_else(|| self.centroid_postcode(m_lat, m_lng, country_code));
                 if found.is_some() || addr.is_none() {
                     return found.map(|postcode| (postcode, country_code));
@@ -3085,12 +3579,31 @@ impl Index {
         if let Some((_, house)) = addr {
             let (h_lat, h_lng) = (house.lat as f64, house.lng as f64);
             return self.postal_area_at(h_lat, h_lng, country_code)
+                .or_else(|| self.grid_postcode(h_lat, h_lng, country_code))
                 .or_else(|| self.centroid_postcode(h_lat, h_lng, country_code))
                 .map(|postcode| (postcode, country_code));
         }
         // The postcode area covering the point: get_nearest_postcode takes
         // one before any centroid (ORDER BY osm_id is null).
-        postcode_area.or_else(|| self.centroid_postcode(lat, lng, country_code)).map(|postcode| (postcode, country_code))
+        postcode_area
+            .or_else(|| self.grid_postcode(lat, lng, country_code))
+            .or_else(|| self.centroid_postcode(lat, lng, country_code))
+            .map(|postcode| (postcode, country_code))
+    }
+
+    /// The postcode grid's at the point (lat, lng), where the cell's run is of the country
+    /// `country_code`: the postcode most of the houses round the point carry
+    /// (postcode_grid_build.h). It stands in for get_nearest_postcode's nearest centroid at each
+    /// point that rule runs at, after the postal areas, which the rule takes before any centroid
+    /// (ORDER BY osm_id is null): a US ZIP is an area OSM barely maps, and the centroid of a large
+    /// one lies farther from its edge than a neighbour's, where the houses round the point carry
+    /// their own. A cell of no postcode, past the reach of every house, has none, nor has one of a
+    /// postcode the answer refuses (postcode_looks_valid), which then leaves the point to the
+    /// centroids, as such a postal area's does.
+    fn grid_postcode<'a>(&'a self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
+        let (grid, cc) = (self.postcode_grid.as_ref()?, country_code?);
+        let (country, code) = grid.postcode_at(cell_id_at_level(lat, lng, grid.level()))?;
+        (country == cc && postcode_looks_valid(&cc, code)).then_some(Cow::Borrowed(code))
     }
 
     /// The postcode of the postcode centroid nearest the point (lat, lng) whose box holds it,
@@ -3268,6 +3781,7 @@ impl Index {
                 boundary_ranks: admin_pip.boundary_ranks,
                 postcode_area: admin_pip.postcode_area,
                 unlabelled: admin_pip.unlabelled,
+                rows: admin_pip.rows,
             },
             None => admin_pip,
         }
@@ -3450,7 +3964,10 @@ impl Index {
         // We implement the real containment check: if the nearest
         // containing POI has a polygon and the nearest addr_point is a
         // node (no footprint) that point_in_polygon reports as
-        // inside, demote the POI so the node wins.
+        // inside, demote the POI so the node wins. A water street
+        // (is_water_street), of rank_search 26 or 27, takes no such node
+        // in its place: a street that wins refines to a house number it is
+        // the parent of alone (reverse.py lookup_street_poi).
         let mut effective_poi_dist = poi_dist;
         if poi_dist == 0.0 {
             if let (Some((_, addr_pt, _)), Some((_, poi))) = (addr.as_ref(), poi_primary.as_ref()) {
@@ -3461,7 +3978,7 @@ impl Index {
                 // (housenumber, street) drive the result.
                 if addr_dist == 0.0 {
                     effective_poi_dist = f64::MAX;
-                } else if !addr_pt.is_building() && poi.is_polygon() {
+                } else if !addr_pt.is_building() && poi.is_polygon() && !Self::is_water_street(poi) {
                     let mut inside = false;
                     if let Some(verts) = self.poi_verts(&poi) {
                         inside = point_in_polygon(addr_pt.lat, addr_pt.lng, &verts);
@@ -3511,6 +4028,8 @@ impl Index {
         // they typically lack parent_postcode and would drop the
         // address' postcode when they win — Moscow 109012 regressed
         // to '—' when the tier-1 boost applied to a point attraction.
+        // A water street is a street, which competes by its distance
+        // alone.
         let tier1_bonus_sq: f64 = {
             let r = 50.0_f64 / 6_371_000.0_f64;
             r * r
@@ -3518,6 +4037,7 @@ impl Index {
         let compare_poi_dist = match poi_primary.as_ref() {
             Some((_, poi)) if poi.tier == 1
                 && poi.is_polygon()
+                && !Self::is_water_street(poi)
                 && effective_poi_dist < max_dist => {
                 if effective_poi_dist > tier1_bonus_sq {
                     effective_poi_dist - tier1_bonus_sq
@@ -3554,10 +4074,11 @@ impl Index {
                 // POI_FLAG_HIGHWAY is set by the builder for highway-
                 // class polygons; without the flag we default to
                 // parent_street even when the polygon contains the
-                // query, matching nominatim's rank-30 chain walk.
+                // query, matching nominatim's rank-30 chain walk. A
+                // water street is a street wherever it wins.
                 let (_, poi) = poi_primary.unwrap();
                 let is_highway_poi = (poi.flags & POI_FLAG_HIGHWAY) != 0;
-                let use_poi_name = is_highway_poi && poi.is_polygon() && poi_dist == 0.0;
+                let use_poi_name = Self::is_water_street(&poi) || (is_highway_poi && poi.is_polygon() && poi_dist == 0.0);
                 if use_poi_name {
                     road = Some(self.get_string(poi.name_id));
                 } else if poi.parent_street_id != NO_DATA {
@@ -3616,13 +4137,14 @@ impl Index {
         // (results.py _get_address_lookup_id). That is the street that won,
         // the address point's parent way, or for a POI the nearest street
         // when it carries the POI's parent street name (POIs keep only the
-        // name). Without one, the query point stands in.
+        // name). Without one, the query point stands in, as it does for a
+        // water street, whose address is its own (rank_search <= 27).
         let address_street: Option<u32> = if closest_feature_dist >= max_dist {
             None
         } else if poi_won_primary {
             let (_, poi) = poi_primary.unwrap();
             street.as_ref().filter(|(_, w, _)| {
-                poi.parent_street_id != NO_DATA && w.name != NO_DATA
+                !Self::is_water_street(&poi) && poi.parent_street_id != NO_DATA && w.name != NO_DATA
                     && self.get_string(w.name) == self.get_string(poi.parent_street_id)
             }).map(|(_, _, id)| *id)
         } else if addr_won_primary {
@@ -3635,13 +4157,21 @@ impl Index {
             Some(line) => PlaceFeature::Line(line),
             None => PlaceFeature::Point(lat, lng),
         };
-        let place = self.find_places(feature, &current_boundaries, held_ranks);
+        // The answering house's addr:city: the address point that won, or the house a winning
+        // street takes its number from, which is then Nominatim's result (a POI keeps no address,
+        // and a street alone or a TIGER number has none).
+        let addr_city: Option<u32> = self.addr_cities.as_ref().and_then(|cities| {
+            let house = if addr_won_primary { addr.as_ref().map(|(_, _, id)| *id) } else { street_house.as_ref().map(|(id, _)| *id) };
+            Self::sidecar_u32(cities, u64::from(house?))
+        });
+        let place = self.find_places(feature, &current_boundaries, held_ranks, addr_city);
 
         // Resolve postcode: mirror Nominatim's stored placex.postcode chain
         // (Tier 0 the house's own / Tier 1 its street's or the primary
         // feature's calculated_postcode / Tier 2 get_nearest_postcode at the
         // street's centroid, the house or the point: the postal area round
-        // it, else the nearest centroid). Build-time postal-boundary
+        // it, else the postcode grid's cell of it, else the nearest
+        // centroid). Build-time postal-boundary
         // inheritance feeds Tier 1 (way_postcodes.bin for streets,
         // parent_postcode_id for POIs); at the query point Tier 2 takes the
         // postal area find_admin found there. Tier 0 and Tier 1 are
@@ -3690,9 +4220,25 @@ impl Index {
         // country polygon misses.
         let anchored = road.is_some() || admin.country.is_some() || admin.city.is_some() || admin.state.is_some();
         let place_nodes_only = admin.is_empty() && !place.is_empty();
-        if !anchored && !place_nodes_only {
+        // Water the primary lanes leave out gives no road nor postcode, but a
+        // point where it would win the slot keeps its landmark and `places`
+        // where nothing else anchors the address (a glacier on a coast no
+        // boundary holds): where it is the POI the lanes would find if they
+        // took it too, within reach of the slot as poi_primary is. A glacier
+        // or bay is an area label there: a specific POI found near takes the
+        // lane from it, and one too far for the slot leaves the point nothing.
+        let water_holds = || {
+            self.find_nearest_poi_or_water_with_parent(lat, lng)
+                .filter(|(d, p)| {
+                    Self::is_out_of_the_primary_lanes(p) && *d <= poi_max_sq && self.poi_chain_contains_query(p, lat, lng)
+                })
+                .is_some()
+        };
+        if !anchored && !place_nodes_only && !water_holds() {
             return Address { water, ..Address::default() };
         }
+        // Nor does the nearest postcode centroid give one where water alone holds the point.
+        let resolved_postcode = resolved_postcode.filter(|_| anchored || place_nodes_only);
 
         let (landmark_name, places) = self.collect_landmark_and_places(lat, lng);
 
@@ -3771,7 +4317,8 @@ impl Index {
             (Some(r), Some(c)) if r == *c => (None, Some((ranks.get("region"), r))),
             (r, _) => (r, None),
         };
-        let address = AddressDetails {
+        let (area_rows, node_rows) = (admin.rows, place.named_rows);
+        let mut address = AddressDetails {
             ranks,
             unlabelled: unlabelled.into_iter().chain(country_region).collect(),
             landmark: landmark_name,
@@ -3797,7 +4344,7 @@ impl Index {
             neighbourhood,
             city_block: admin.city_block,
             // Postcode from resolve_postcode(): 3-tier chain
-            // (own → inherited → postal area or nearest centroid).
+            // (own → inherited → postal area, grid or nearest centroid).
             // Reject if its country has no postal-code system or if
             // the string doesn't match the country's pattern, then
             // normalise whitespace/separators per country.
@@ -3822,9 +4369,341 @@ impl Index {
             country: admin.country,
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
         };
+        if let Some(addr_city) = addr_city {
+            let country = address.country_code.as_deref().unwrap_or_default().to_ascii_uppercase();
+            let rows = self.crosscheck_rows(addr_city, &area_rows, &mut admin_scan, &node_rows, feature, &country);
+            let areas: Vec<CrosscheckRow> = area_rows.iter().map(|r| self.area_row(r)).collect();
+            address.crosscheck(&rows, &areas);
+        }
         let display_name = format_address(&address);
-        Address { display_name, address, places, water }
+        Address { licence: Licence, display_name, address, places, water }
     }
+
+    /// The rows of an address that are named `name` (a string id), in Nominatim's order within a
+    /// rank (results.py:617-622: fromarea, then distance, descending, then rank_search): the
+    /// polygons named so, by their own name or by a place node's they link, the farthest from
+    /// `feature` first (area_row_distance), then the place nodes of `nodes`
+    /// (PlaceResult::named_rows), the farthest first, equals by rank_search, but those a place
+    /// area links (links_by_name). The polygons are those that
+    /// are rows of `feature` as getNearFeatures takes them (partition-functions.sql:39-44): of a
+    /// point, the polygons holding it, of a street (a house's rows are its street's), those the
+    /// street runs through. They are those of `areas`, the address's ranked polygons (found by
+    /// `scan`), and the others: of the scan where the feature is a point, such as a larger
+    /// boundary of a level `areas` holds it by, else of any admin cell under the street, each at
+    /// area_row_rank's rank, a boundary the point is outside at own_area_rank's; `country` is the
+    /// point's, upper case.
+    fn crosscheck_rows(&self, name: u32, areas: &[RankedPoly], scan: &mut AdminScan, nodes: &[NamedRow],
+                       feature: PlaceFeature<'_>, country: &str) -> Vec<CrosscheckRow<'_>> {
+        let named = |poly: &AdminPolygon| poly.name_id == name || self.links_name(poly, name);
+        let same = |a: &AdminPolygon, b: &AdminPolygon| a.ring_offset == b.ring_offset && a.ring_bytes == b.ring_bytes;
+        let geometry = &self.admin_geometry;
+        let runs_through = |line: &[NodeCoord], poly: &AdminPolygon| geometry.has_rings(poly)
+            && line_runs_through(line, &geometry.rings(poly), |lat, lng| geometry.contains_once(poly, AdminPoint::new(lat, lng)));
+        // A polygon holding the point is a row of a street only where the street runs through it.
+        let mut polygons: Vec<RankedPoly> = areas.iter()
+            .filter(|r| named(&r.poly) && match feature {
+                PlaceFeature::Point(..) => true,
+                PlaceFeature::Line(line) => runs_through(line, &r.poly),
+            })
+            .copied().collect();
+        // The scan lists the point's admin cell alone, and a street runs through the areas of
+        // every cell under it.
+        let mut candidates = scan.rings.clone();
+        if let PlaceFeature::Line(line) = feature {
+            let (lat, lng) = scan.pip.point.degrees();
+            let here = cell_id_at_level(lat, lng, self.admin_cell_level);
+            let mut listed: std::collections::HashSet<u32> = candidates.iter().map(|&(id, _)| id & ID_MASK).collect();
+            for cell in cells_under_line(line, STREET_CELLS_MARGIN_M, self.admin_cell_level) {
+                if cell == here { continue; }
+                self.admin_index.with_ids(cell, |ids| {
+                    for &id in ids {
+                        if !listed.insert(id & ID_MASK) { continue; }
+                        if let Some(poly) = self.admin_polygon(id & ID_MASK) { candidates.push((id & ID_MASK, poly)); }
+                    }
+                });
+            }
+        }
+        let mut seen: Vec<u32> = Vec::new();
+        let scanned = scan.rings.len();
+        for (k, &(id, poly)) in candidates.iter().enumerate() {
+            if !is_address_area(&poly) || !named(&poly) || seen.contains(&(id & ID_MASK)) { continue; }
+            seen.push(id & ID_MASK);
+            if areas.iter().any(|r| same(&r.poly, &poly)) { continue; }
+            let (row, at_point) = match feature {
+                PlaceFeature::Point(..) => (scan.pip.holds(self, id, &poly), true),
+                PlaceFeature::Line(line) => (runs_through(line, &poly), k < scanned && scan.pip.holds(self, id, &poly)),
+            };
+            if !row { continue; }
+            // A boundary the point is outside ranks under the polygons round it, not the point's.
+            let rank = if at_point || poly.admin_level == 15 { self.area_row_rank(&poly, areas, country) } else { self.own_area_rank(&poly) };
+            if ADDRESS_AREA_RANKS.contains(&rank) {
+                polygons.push(RankedPoly { poly, rank_address: rank });
+            }
+        }
+        // Most ranks have one polygon of the name, which needs no distance.
+        if polygons.iter().enumerate().any(|(i, a)| polygons[..i].iter().any(|b| b.rank_address == a.rank_address)) {
+            let mut far: Vec<(f64, RankedPoly)> = polygons.iter().map(|r| (self.area_row_distance(&r.poly, feature), *r)).collect();
+            far.sort_by(|a, b| b.0.total_cmp(&a.0));
+            polygons = far.into_iter().map(|(_, r)| r).collect();
+        }
+        let place_area = |poly: &AdminPolygon| poly.admin_level == 15 && poly.name_id == name;
+        let place_areas: Vec<RankedPoly> = areas.iter().filter(|r| place_area(&r.poly)).copied()
+            .chain(candidates.iter().filter(|(_, poly)| place_area(poly) && !areas.iter().any(|r| same(&r.poly, poly)))
+                .map(|&(_, poly)| RankedPoly { poly, rank_address: self.area_row_rank(&poly, areas, country) }))
+            .collect();
+        let mut nodes: Vec<NamedRow> = nodes.iter().filter(|row| !place_areas.iter().any(|r| self.links_by_name(r, &row.node))).copied().collect();
+        // Equals by rank_search, the higher first (results.py:622).
+        let search_rank = |row: &NamedRow| PLACE_NODE_SEARCH_RANK.get(usize::from(row.node.place_type)).copied().unwrap_or(0);
+        nodes.sort_by(|a, b| b.distance.total_cmp(&a.distance).then_with(|| search_rank(b).cmp(&search_rank(a))));
+        let mut rows: Vec<CrosscheckRow> = polygons.iter()
+            .map(|r| self.area_row(r))
+            .chain(nodes.iter().map(|row| CrosscheckRow { rank: row.rank, name: self.get_string(name), field: Some(row.field) }))
+            .collect();
+        // Stable: within a rank the polygons stay ahead of the nodes.
+        rows.sort_by_key(|row| row.rank);
+        rows
+    }
+
+    /// The address row of a ranked polygon: its rank, its own name and its field.
+    fn area_row(&self, r: &RankedPoly) -> CrosscheckRow<'_> {
+        CrosscheckRow { rank: r.rank_address, name: self.get_string(r.poly.name_id), field: polygon_field(r) }
+    }
+
+    /// The rank_address of `poly`, a row of an address that is none of the address's ranked
+    /// polygons `areas`: that of the polygon of `areas` of its level and place types, else for a
+    /// place area its own before any lift (place_area_ranks), and for a boundary the one
+    /// promote_nested_ranks gives it from its level's rank in `country` under the coarser
+    /// polygons of `areas`: a place tag's rank where that is above its parent's
+    /// (placex_triggers.sql:1189-1199). A boundary that repeats its parent and links a place node
+    /// ranks as promote_nested_ranks ranks it: its node's rank, above 3 and below 26, else 0.
+    fn area_row_rank(&self, poly: &AdminPolygon, areas: &[RankedPoly], country: &str) -> u8 {
+        if poly.admin_level != 15 && poly.own_place_type == BOUNDARY_REPEATS_PARENT {
+            let linked = place_type_to_rank(poly.place_type_override, country);
+            return if (4..26).contains(&linked) { linked } else { 0 };
+        }
+        let kin = |r: &&RankedPoly| r.poly.admin_level == poly.admin_level
+            && (r.poly.place_type_override, r.poly.own_place_type) == (poly.place_type_override, poly.own_place_type);
+        if let Some(r) = areas.iter().find(kin) {
+            return r.rank_address;
+        }
+        if poly.admin_level == 15 {
+            return place_area_ranks(poly, country).1;
+        }
+        let initial = self.admin_config.to_rank(country, poly.admin_level);
+        if initial == 0 {
+            return 0;
+        }
+        let mut ranked: Vec<RankedPoly> = areas.iter().filter(|r| r.poly.admin_level < poly.admin_level).copied().collect();
+        ranked.push(RankedPoly { poly: *poly, rank_address: initial });
+        let place_areas: Vec<AdminPolygon> = areas.iter().filter(|r| r.poly.admin_level == 15).map(|r| r.poly).collect();
+        promote_nested_ranks(&mut ranked, place_areas.iter(), country, |a, b| self.admin_geometry.polygon_within(a, b));
+        let same = |r: &&RankedPoly| r.poly.ring_offset == poly.ring_offset && r.poly.ring_bytes == poly.ring_bytes;
+        ranked.iter().find(same).map_or(initial, |r| r.rank_address)
+    }
+
+    /// The rank_address of the boundary `poly`, a row of an address whose point it does not hold:
+    /// the one find_admin gives it at its own point on surface, as placex_update ranks a boundary
+    /// under the boundary of the highest level below its own round its centroid
+    /// (placex_triggers.sql:881-906); where find_admin there ranks it in no row, area_row_rank's
+    /// under the polygons of the other levels round that point, in their country. 0 without rings.
+    fn own_area_rank(&self, poly: &AdminPolygon) -> u8 {
+        let Some((lat, lng)) = self.admin_geometry.point_on_surface(poly) else { return 0 };
+        let there = self.find_admin(f64::from(lat), f64::from(lng));
+        let same = |r: &&RankedPoly| r.poly.ring_offset == poly.ring_offset && r.poly.ring_bytes == poly.ring_bytes;
+        if let Some(r) = there.rows.iter().find(same) {
+            return r.rank_address;
+        }
+        let others: Vec<RankedPoly> = there.rows.iter().filter(|r| r.poly.admin_level != poly.admin_level).copied().collect();
+        self.area_row_rank(poly, &others, &upper_country(there.country_code))
+    }
+
+    /// getNearFeatures' distance of the area `poly` from `feature` (partition-functions.sql:32-36),
+    /// planar in degrees as ST_Distance is on lon/lat: the distance from the feature's centre to
+    /// the area, none inside it, and a hundred-thousandth of the feature's to the area's centre as
+    /// a tie breaker. A street's centre is its middle (line_middle), an area's its point on
+    /// surface (get_center_point).
+    fn area_row_distance(&self, poly: &AdminPolygon, feature: PlaceFeature<'_>) -> f64 {
+        let geometry = &self.admin_geometry;
+        let centre = match feature {
+            PlaceFeature::Point(lat, lng) => Some((lat, lng)),
+            PlaceFeature::Line(line) => line_middle(line),
+        };
+        let to_area = centre.map_or(0.0, |(lat, lng)| {
+            if geometry.contains_once(poly, AdminPoint::new(lat, lng)) { 0.0 } else { rings_distance(&geometry.rings(poly), lat, lng) }
+        });
+        let to_centre = geometry.point_on_surface(poly).map_or(0.0, |(lat, lng)| feature_distance(feature, lat as f64, lng as f64));
+        to_area + 0.00001 * to_centre
+    }
+
+    /// Whether the boundary of polygon `poly` links a place node named `name` (linked_names).
+    fn links_name(&self, poly: &AdminPolygon, name: u32) -> bool {
+        self.linked_names.get_or_init(|| self.read_linked_names()).binary_search(&(boundary_key(poly), name)).is_ok()
+    }
+
+    /// Whether the ranked place area `area` (admin_level 15) links the place node `node` by
+    /// find_linked_place's name match, which runs for ways as well as relations and which the
+    /// builder runs for boundaries only (placex_triggers.sql:359-385): the area has the node's
+    /// name, its rank_address is the one the node's type has (compute_place_rank), which an area
+    /// lifted by one round it no longer has, and it holds the node, where it links no node by its
+    /// label or wikidata: find_linked_place links one node, which may have the area's name and
+    /// type too.
+    fn links_by_name(&self, area: &RankedPoly, node: &PlaceNode) -> bool {
+        let (poly, geometry) = (&area.poly, &self.admin_geometry);
+        poly.admin_level == 15 && poly.name_id == node.name_id && poly.own_place_type == 0
+            && PLACE_NODE_RANK.get(usize::from(node.place_type)) == Some(&area.rank_address)
+            && geometry.has_rings(poly) && geometry.contains_once(poly, AdminPoint::new(f64::from(node.lat), f64::from(node.lng)))
+            && !self.links_any(poly)
+    }
+
+    /// Whether the boundary of polygon `poly` links a place node (linked_names), of its own name
+    /// or another.
+    fn links_any(&self, poly: &AdminPolygon) -> bool {
+        let key = boundary_key(poly);
+        let linked = self.linked_names.get_or_init(|| self.read_linked_names());
+        linked.get(linked.partition_point(|&(k, _)| k < key)).is_some_and(|&(k, _)| k == key)
+    }
+
+    /// linked_names from place_hidden.bin: each label's boundary and name.
+    fn read_linked_names(&self) -> Vec<(u64, u32)> {
+        let mut linked = Vec::new();
+        if let Some(places) = &self.places {
+            places.for_each_label(|polygon, name| {
+                if let Some(poly) = self.admin_polygon(polygon) {
+                    linked.push((boundary_key(&poly), name));
+                }
+            });
+        }
+        linked.sort_unstable();
+        linked.dedup();
+        linked.shrink_to_fit();
+        linked
+    }
+}
+
+/// What the polygons of one boundary share: their record but for the ring and the area (name,
+/// level, place types, country). The builder writes each outer ring of a relation as a polygon of
+/// its own, and a node links the boundary by its largest (place_claims.h boundary_polygons).
+pub fn boundary_key(poly: &AdminPolygon) -> u64 {
+    u64::from(poly.name_id) << 32 | u64::from(poly.country_code) << 16 | u64::from(poly.admin_level & 15) << 12
+        | u64::from(poly.place_type_override & 15) << 8 | u64::from(poly.own_place_type)
+}
+
+/// Whether `poly` is a polygon find_admin_in ranks: a boundary of a level below 12 but a postal
+/// area's, of a country at level 2, or a place area with a place type; of an area. A boundary
+/// that repeats its parent and links no place node is none (BOUNDARY_REPEATS_PARENT).
+pub fn is_address_area(poly: &AdminPolygon) -> bool {
+    poly.area > 0.0 && match poly.admin_level {
+        15 => poly.place_type_override != 0,
+        _ if poly.place_type_override == BOUNDARY_REPEATS_PARENT => false,
+        2 => poly.country_code != 0,
+        level => level < 12 && level != POSTCODE_AREA_LEVEL,
+    }
+}
+
+/// The side of the line p-q ([lng, lat] each) that r lies on: 1 to the left, -1 to the right, 0
+/// on it.
+fn side(p: [f64; 2], q: [f64; 2], r: [f64; 2]) -> i8 {
+    let cross = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+    i8::from(cross > 0.0) - i8::from(cross < 0.0)
+}
+
+/// Where `p`, on the line of the segment a-b, lies along it: 0 at a, 1 at b, measured along the
+/// axis the segment runs further on. None for a segment of no length.
+fn along(a: [f64; 2], b: [f64; 2], p: [f64; 2]) -> Option<f64> {
+    let axis = usize::from((b[1] - a[1]).abs() > (b[0] - a[0]).abs());
+    (a[axis] != b[axis]).then(|| (p[axis] - a[axis]) / (b[axis] - a[axis]))
+}
+
+/// Whether `p` lies on the segment c-d, an end included.
+fn on_segment(p: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+    side(c, d, p) == 0 && (c[0].min(d[0])..=c[0].max(d[0])).contains(&p[0]) && (c[1].min(d[1])..=c[1].max(d[1])).contains(&p[1])
+}
+
+/// Whether `line` meets the polygon of `rings` (AdminGeometry::rings: [lng, lat] each, the outer
+/// ring then its holes) in more than a point, as getNearFeatures takes an area for a line
+/// (ST_NPoints(ST_Intersection) > 1, partition-functions.sql:44): a node of the line inside it
+/// (`inside(lat, lng)`), a segment crossing an edge, running along one or passing inside between
+/// the vertices it meets, or two points where the line touches a ring. A node the boundary
+/// shares is the vertex its f32 coordinates round from, and takes the vertex's own: the line
+/// touches the boundary there, and runs along it between two such.
+pub fn line_runs_through(line: &[NodeCoord], rings: &[Vec<[f64; 2]>], mut inside: impl FnMut(f64, f64) -> bool) -> bool {
+    let vertex = |n: &NodeCoord| rings.iter().flatten().find(|v| v[0] as f32 == n.lng && v[1] as f32 == n.lat).copied();
+    let points: Vec<[f64; 2]> = line.iter().map(|n| vertex(n).unwrap_or([f64::from(n.lng), f64::from(n.lat)])).collect();
+    let edges = || rings.iter().flat_map(|ring| ring.windows(2)).map(|e| (e[0], e[1]));
+    let on_ring = |p: [f64; 2]| edges().any(|(c, d)| on_segment(p, c, d));
+    let mut touches: Vec<[f64; 2]> = Vec::new();
+    for &p in &points {
+        if on_ring(p) {
+            touches.push(p);
+        } else if inside(p[1], p[0]) {
+            return true;
+        }
+    }
+    for w in points.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        // Where the segment meets a vertex between its ends: between two such, or such a vertex
+        // and an end, it lies wholly inside or wholly outside.
+        let mut cuts = vec![0.0, 1.0];
+        for (c, d) in edges() {
+            let (abc, abd) = (side(a, b, c), side(a, b, d));
+            if abc * abd < 0 && side(c, d, a) * side(c, d, b) < 0 {
+                return true;
+            }
+            if abc == 0 && abd == 0 {
+                if let (Some(tc), Some(td)) = (along(a, b, c), along(a, b, d)) {
+                    if tc.max(td).min(1.0) > tc.min(td).max(0.0) {
+                        return true;
+                    }
+                }
+            }
+            for (v, s) in [(c, abc), (d, abd)] {
+                if let Some(t) = along(a, b, v).filter(|&t| s == 0 && t > 0.0 && t < 1.0) {
+                    touches.push(v);
+                    cuts.push(t);
+                }
+            }
+        }
+        if cuts.len() > 2 || on_ring(a) || on_ring(b) {
+            cuts.sort_by(f64::total_cmp);
+            for t in cuts.windows(2).filter(|t| t[1] > t[0]) {
+                let m = (t[0] + t[1]) / 2.0;
+                let p = [a[0] + (b[0] - a[0]) * m, a[1] + (b[1] - a[1]) * m];
+                if !on_ring(p) && inside(p[1], p[0]) {
+                    return true;
+                }
+            }
+        }
+    }
+    touches.sort_by(|p, q| p[0].total_cmp(&q[0]).then(p[1].total_cmp(&q[1])));
+    touches.dedup();
+    touches.len() > 1
+}
+
+/// The planar distance in degrees from (lat, lng) to the nearest edge of `rings` ([lng, lat]
+/// each); infinite without an edge.
+pub fn rings_distance(rings: &[Vec<[f64; 2]>], lat: f64, lng: f64) -> f64 {
+    rings.iter()
+        .flat_map(|ring| ring.windows(2))
+        .map(|e| planar_segment_distance((lat, lng), (e[0][1], e[0][0]), (e[1][1], e[1][0])))
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// The planar distance in degrees from (lat, lng) to `feature`.
+pub fn feature_distance(feature: PlaceFeature<'_>, lat: f64, lng: f64) -> f64 {
+    match feature {
+        PlaceFeature::Point(plat, plng) => (lat - plat).hypot(lng - plng),
+        PlaceFeature::Line(line) => line.windows(2)
+            .map(|w| planar_segment_distance((lat, lng), (w[0].lat as f64, w[0].lng as f64), (w[1].lat as f64, w[1].lng as f64)))
+            .fold(f64::INFINITY, f64::min),
+    }
+}
+
+/// The planar distance in degrees from p to the segment a-b, each (lat, lng).
+fn planar_segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len_sq = dx * dx + dy * dy;
+    let t = if len_sq == 0.0 { 0.0 } else { (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len_sq).clamp(0.0, 1.0) };
+    (p.0 - (a.0 + t * dx)).hypot(p.1 - (a.1 + t * dy))
 }
 
 // --- Multi-continent dispatcher ---
@@ -4137,6 +5016,10 @@ impl MultiIndex {
     /// like a flat layout. Either way, returns a MultiIndex whose query()
     /// behaves the same — single-region setups just see one slot.
     pub fn load(root: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
+        // Refused before any continent, each of which Index::load would refuse.
+        if let Some(why) = geo_reach_refused(search_distance, street_cell_level) {
+            return Err(why);
+        }
         // Flat-layout fast path: keep existing single-region deployments
         // working without changes. The "world" slot covers the globe.
         if std::path::Path::new(&format!("{}/admin_cells.bin", root)).exists() {
@@ -4186,6 +5069,29 @@ impl MultiIndex {
 
     pub fn loaded_count(&self) -> usize {
         self.continents.iter().filter(|c| c.index.load().is_some()).count()
+    }
+
+    /// The credit of the data the loaded datasets hold (Index::credits, as each loaded), each
+    /// source once, in the order the datasets list them, of every notice any of them gives it
+    /// (a dataset of GB centroids owes GeoNames a notice others don't); none where none is
+    /// loaded.
+    pub fn credits(&self) -> Vec<serde_json::Value> {
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for index in self.continents.iter().filter_map(|c| c.index.load_full()) {
+            for entry in &index.credits {
+                let Some(seen) = out.iter_mut().find(|e| e["id"] == entry["id"]) else {
+                    out.push(entry.clone());
+                    continue;
+                };
+                let Some(have) = seen.get_mut("notices").and_then(serde_json::Value::as_array_mut) else { continue };
+                for notice in entry["notices"].as_array().into_iter().flatten() {
+                    if !have.contains(notice) {
+                        have.push(notice.clone());
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// A point off the globe is in no slot: S2 would wrap it onto a cell of the globe.
@@ -4294,17 +5200,18 @@ mod multi_index_tests {
     #[test]
     fn interp_position_measures_along_the_line() {
         let line = [NodeCoord { lat: 0.0, lng: 0.0 }, NodeCoord { lat: 0.0, lng: 0.002 }];
-        let (d, t) = interp_position(&line, 0.0001, 0.0005, 1.0).unwrap();
+        let origin = |lat: f64, lng: f64| GeoOrigin::new(lat, lng, geo_cover(DEFAULT_SEARCH_DISTANCE / 6_371_000.0, DEFAULT_STREET_CELL_LEVEL));
+        let (d, t) = interp_position(&line, &origin(0.0001, 0.0005)).unwrap();
         assert!((t - 0.25).abs() < 1e-6, "t={}", t);
         assert!((d.sqrt().to_degrees() - 0.0001).abs() < 1e-9);
 
         // Past the end clamps to the last node.
-        let (_, t_end) = interp_position(&line, 0.0, 0.01, 1.0).unwrap();
+        let (_, t_end) = interp_position(&line, &origin(0.0, 0.01)).unwrap();
         assert!((t_end - 1.0).abs() < 1e-9);
 
         // Degenerate lines have no position.
-        assert!(interp_position(&line[..1], 0.0, 0.0, 1.0).is_none());
-        assert!(interp_position(&[line[0], line[0]], 0.0, 0.0, 1.0).is_none());
+        assert!(interp_position(&line[..1], &origin(0.0, 0.0)).is_none());
+        assert!(interp_position(&[line[0], line[0]], &origin(0.0, 0.0)).is_none());
     }
 
     #[test]
@@ -4463,14 +5370,18 @@ mod query_tests {
             way_parents: None,
             admin_parents: None,
             addr_postcodes: None,
+            addr_cities: None,
             way_postcodes: None,
             postcode_centroids: None,
+            postcode_grid: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, end, end, end, end, end]),
             water: None,
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
             admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
             max_distance_sq: (DEFAULT_SEARCH_DISTANCE / 6_371_000.0).powi(2),
+            linked_names: Default::default(),
+            credits: Vec::new(),
         }
     }
 
@@ -4508,7 +5419,7 @@ mod query_tests {
     fn a_boundary_without_a_country_city_or_state_has_no_answer() {
         let idx = index(&[SHOALS], &[SHOALS_VILLAGE]);
 
-        assert_eq!(answer(&idx, 5.05, 112.65), serde_json::json!({"address": {}}));
+        assert_eq!(answer(&idx, 5.05, 112.65), serde_json::json!({"licence": OSM_LICENCE, "address": {}}));
     }
 
     #[test]
@@ -4516,7 +5427,7 @@ mod query_tests {
         let idx = index(&[SHOALS], &[MCMURDO]);
 
         for (lat, lng) in [(-82.0, 60.0), (5.2, 112.65)] {
-            assert_eq!(answer(&idx, lat, lng), serde_json::json!({"address": {}}), "({}, {})", lat, lng);
+            assert_eq!(answer(&idx, lat, lng), serde_json::json!({"licence": OSM_LICENCE, "address": {}}), "({}, {})", lat, lng);
         }
     }
 
@@ -4526,7 +5437,7 @@ mod query_tests {
         let elsewhere = idx.admin_polygon(1).unwrap();
         let village = |gate: AdminPolygon| {
             let gates = CurrentBoundaries::walk([(CurrentBoundaries::CITY, gate)], |_, _| true);
-            idx.find_places(PlaceFeature::Point(5.05, 112.65), &gates, 0).village
+            idx.find_places(PlaceFeature::Point(5.05, 112.65), &gates, 0, None).village
         };
 
         assert_eq!(village(elsewhere), None);
@@ -4564,11 +5475,11 @@ mod query_tests {
         let mut idx = index(&[SHOALS], &[]);
         idx.water = Some(WaterFixture::new().area("South China Sea", SEA, (4.0, 111.0, 6.0, 114.0), &[]).layer());
 
-        let sea = serde_json::json!({"address": {}, "water": {"name": "South China Sea", "class": "place", "type": "sea"}});
+        let sea = serde_json::json!({"licence": OSM_LICENCE, "address": {}, "water": {"name": "South China Sea", "class": "place", "type": "sea"}});
         assert_eq!(answer(&idx, 5.5, 113.5), sea);
         assert_eq!(answer(&idx, 5.05, 112.65), sea);
-        assert_eq!(answer(&idx, 7.0, 113.5), serde_json::json!({"address": {}}));
-        assert_eq!(answer(&idx, 5.5, 473.5), serde_json::json!({"address": {}}));
+        assert_eq!(answer(&idx, 7.0, 113.5), serde_json::json!({"licence": OSM_LICENCE, "address": {}}));
+        assert_eq!(answer(&idx, 5.5, 473.5), serde_json::json!({"licence": OSM_LICENCE, "address": {}}));
     }
 
     /// A dispatcher over the continents named (of continents()), each with the index given, in
@@ -4630,8 +5541,8 @@ mod query_tests {
         // Water counts for nothing in the pick: of two empty addresses the first answers, with
         // the water of the second, and so does the first of two that tie, a state each.
         let got = json(vec![("africa", index(&[], &[])), ("asia", with(index(&[], &[]), water("Gulf of Suez", BAY, gulf)))]);
-        assert_eq!(got, serde_json::json!({"address": {}, "water": named("Gulf of Suez", "natural", "bay")}));
-        assert_eq!(json(vec![("africa", index(&[], &[])), ("asia", index(&[], &[]))]), serde_json::json!({"address": {}}));
+        assert_eq!(got, serde_json::json!({"licence": OSM_LICENCE, "address": {}, "water": named("Gulf of Suez", "natural", "bay")}));
+        assert_eq!(json(vec![("africa", index(&[], &[])), ("asia", index(&[], &[]))]), serde_json::json!({"licence": OSM_LICENCE, "address": {}}));
         let north = ("North Sinai", 4, [27.5, 32.6, 29.5, 34.6]);
         for (first, second) in [(egypt, north), (north, egypt)] {
             let mut want = serde_json::to_value(index(&[first], &[]).query(lat, lng)).unwrap();
@@ -4763,6 +5674,71 @@ mod query_tests {
         let before = STRING_READS.with(|n| n.get());
         let got = f();
         (got, STRING_READS.with(|n| n.get()) - before)
+    }
+
+    /// An index of polygon POIs of POI_META's categories in `origin()`'s cell, each (its corners
+    /// as metres north of `origin()` and east, its name, category, importance), its vertices to
+    /// 1e-7°, with a parent street of its own name.
+    fn polygon_pois(pois: &[(&[(f64, f64)], &str, u8, u8)]) -> Index {
+        let own = cell_id_at_level(origin().0, origin().1, DEFAULT_ADMIN_CELL_LEVEL);
+        let mut strings = Vec::new();
+        let (mut records, mut pairs) = (Vec::new(), Vec::new());
+        for (id, &(corners, name, category, importance)) in pois.iter().enumerate() {
+            let name_id = strings.len() as u32;
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            let corners: Vec<(f64, f64)> = corners.iter().map(|&(north, east)| at(north, east)).collect();
+            for &(lat, lng) in &corners {
+                assert_eq!(cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL), own, "({lat}, {lng})");
+            }
+            let (bmin_lat, bmin_lng) = corners.iter().fold((f32::MAX, f32::MAX), |(a, b), &(lat, lng)| (a.min(lat as f32), b.min(lng as f32)));
+            let q = corners.iter()
+                .map(|&(lat, lng)| (((lat - bmin_lat as f64) / 1e-7).round() as u32, ((lng - bmin_lng as f64) / 1e-7).round() as u32))
+                .collect();
+            let record = PoiRecord {
+                lat: corners[0].0 as f32, lng: corners[0].1 as f32, vertex_offset: 0, name_id, category, tier: 2, flags: 0, importance,
+                parent_street_id: name_id, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
+            };
+            records.push((record, Some(poi_files::PoiPolygon { encoding: 3, bmin_lat, bmin_lng, q })));
+            pairs.push((own, id as u32));
+        }
+        let (records, vertices) = poi_files::encode(&records);
+        let end = strings.len() as u32;
+        Index {
+            poi_index: Some(cell_pairs::from_pairs(pairs, cell_pairs::POI)),
+            poi_records: Some(PoiRecords::open(FileBytes::Owned(records)).unwrap()),
+            poi_vertices: Some(FileBytes::Owned(vertices)),
+            poi_meta: PoiMeta::from_json(POI_META),
+            strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, end, end, end, end, end]),
+            ..index(&[], &[])
+        }
+    }
+
+    /// A triangle whose side nearest `origin()` runs north-east, `metres` south-east of it at its
+    /// point nearest in metres, and 400 m long.
+    fn north_east_side(metres: f64) -> [(f64, f64); 3] {
+        let (foot, half) = ((-metres / 2f64.sqrt(), metres / 2f64.sqrt()), 200.0 / 2f64.sqrt());
+        [(foot.0 - half, foot.1 - half), (foot.0 + half, foot.1 + half), (foot.0 - 40.0, foot.1 + 40.0)]
+    }
+
+    #[test]
+    fn a_poi_polygon_is_as_far_as_its_point_nearest_in_metres() {
+        // In Paris, a polygon whose side nearest the point runs north-east is as far as that
+        // side's point nearest in metres, not its point nearest in degrees, 7.5 % farther: one
+        // 290 m off scores 5 / (1 + 2.9²), over the 0.5 a cafe (importance 5) is listed at, where
+        // 312 m would not; and one 100 m off is nearer than a square 104 m off, so it is the first
+        // listed and the nearest POI, where 107.5 m would put the square first.
+        let idx = polygon_pois(&[(&north_east_side(290.0), "Far Cafe", 0, 0)]);
+        let listed = idx.find_pois(origin().0, origin().1);
+        assert!(listed.len() == 1 && (listed[0].distance_m - 290.0).abs() < 0.1, "{:?}", listed.iter().map(|p| p.distance_m).collect::<Vec<_>>());
+
+        let square = [(104.0, -50.0), (104.0, 50.0), (154.0, 50.0), (154.0, -50.0)];
+        let idx = polygon_pois(&[(&square, "Square", 1, 0), (&north_east_side(100.0), "Diagonal", 1, 0)]);
+        let listed: Vec<_> = idx.find_pois(origin().0, origin().1).iter().map(|p| (p.name.to_string(), p.distance_m)).collect();
+        assert!(listed.len() == 2 && listed[0].0 == "Diagonal" && (listed[0].1 - 100.0).abs() < 0.1 && listed[1].0 == "Square", "{listed:?}");
+        let (d, nearest) = idx.find_nearest_poi_with_parent(origin().0, origin().1).unwrap();
+        assert_eq!(idx.get_string(nearest.name_id), "Diagonal");
+        assert!((d.sqrt() * 6_371_000.0 - 100.0).abs() < 0.1, "{}", d.sqrt() * 6_371_000.0);
     }
 
     #[test]
@@ -5021,8 +5997,9 @@ mod query_tests {
     #[test]
     fn poi_lookups_answer_as_the_old_reader_did() {
         // The answers today's 36-byte records and vertex stream gave for the jumble (the reader
-        // before R2 and V2, at 447a8a3), match for match and bit for bit.
-        assert_eq!(poi_jumble_answers(), (1593, 122, 4_340_307_441_197_094_589));
+        // before R2 and V2, at 447a8a3), match for match and bit for bit, with a polygon as far
+        // as its edges' points nearest in metres (point_to_segment_distance).
+        assert_eq!(poi_jumble_answers(), (1593, 122, 375_056_972_952_063_247));
     }
 
     #[test]
@@ -5370,13 +6347,17 @@ pub fn line_middle(nodes: &[NodeCoord]) -> Option<(f64, f64)> {
     Some((reduce(middle.0), reduce(middle.1)))
 }
 
+/// Squared distance (radians²) from the point (px, py) to the segment from
+/// (ax, ay) to (bx, by), latitudes and longitudes in degrees, on the plane
+/// where a degree of longitude is `cos_lat` of a degree of latitude: to the
+/// segment's point nearest in metres, at any latitude.
 pub fn point_to_segment_distance(
     px: f64, py: f64,
     ax: f64, ay: f64,
     bx: f64, by: f64,
     cos_lat: f64,
 ) -> f64 {
-    point_to_segment_with_t(px, py, ax, ay, bx, by, cos_lat).0
+    point_to_segment_with_t(px, py * cos_lat, ax, ay * cos_lat, bx, by * cos_lat, PLANAR).0
 }
 
 // Squared distance (radians²) from query point to nearest polygon edge,
@@ -5665,6 +6646,10 @@ pub fn coarse_fields<T: PartialEq>(chain: [Option<T>; 3], query: [Option<T>; 3],
 /// (22) and neighbourhood (24) are ranks of their own.
 pub const PLACE_NODE_RANK: [u8; 7] = [16, 16, 16, 20, 20, 24, 22];
 
+/// rank_search of each PlaceNode type, from address-levels.json (no country there sets one of
+/// these types): a town 18, a village and a suburb 19, a quarter 20.
+pub const PLACE_NODE_SEARCH_RANK: [u8; 7] = [16, 18, 19, 19, 20, 24, 20];
+
 /// insert_addresslines' weight on a place node's distance by its
 /// rank_search (placex_triggers.sql:597-605): city (16) 0.25, town (18) 0.5,
 /// all others 1. (A capital, rank_search 15, weighs 0.2 there; place nodes
@@ -5750,14 +6735,27 @@ pub fn place_node_covering(pn: &PlaceNode, feature: PlaceFeature<'_>) -> Option<
 /// (current_node_area := NULL, :651). Returns the accepted node's index per
 /// type, of the highest rank when a type has entries at two: the address
 /// keeps a label's first row, finest first (v1/format_json.py:31-34).
-pub fn accept_place_nodes(nodes: &[(usize, u8, f64, f32, f32)], held_ranks: u32, mut in_boundary: impl FnMut(usize) -> bool) -> [Option<usize>; 7] {
+pub fn accept_place_nodes(nodes: &[(usize, u8, f64, f32, f32)], held_ranks: u32, in_boundary: impl FnMut(usize) -> bool) -> [Option<usize>; 7] {
+    place_node_walk(nodes, held_ranks, in_boundary, false).0
+}
+
+/// accept_place_nodes' walk, and with `rows` the nodes it writes an address
+/// row for (placex_triggers.sql:666-669), in walk order: each node inside its
+/// rank's current boundary until one of the rank is accepted, those its
+/// fuzzy area cascade turns down among them, and after that, or in a rank a
+/// boundary holds, the ones within twice the nearest the rank had (:614-622,
+/// place_min_distance, from 1 degree). The nodes accepted are the same
+/// either way; without `rows` the walk tests no boundary of a node it can't
+/// accept.
+pub fn place_node_walk(nodes: &[(usize, u8, f64, f32, f32)], held_ranks: u32, mut in_boundary: impl FnMut(usize) -> bool, rows: bool)
+    -> ([Option<usize>; 7], Vec<usize>) {
     let held = |rank: u8| held_ranks & (1 << rank) != 0;
     let rank = |k: usize| nodes[k].1;
     let weighed = |k: usize| {
         let (pt, rank, dist_sq, _, _) = nodes[k];
         dist_sq.sqrt() * if rank == CurrentBoundaries::CITY { PLACE_NODE_DISTANCE_WEIGHT[pt] } else { 1.0 }
     };
-    let mut order: Vec<usize> = (0..nodes.len()).filter(|&k| !held(rank(k))).collect();
+    let mut order: Vec<usize> = (0..nodes.len()).filter(|&k| rows || !held(rank(k))).collect();
     // Ties: type, then position, so the walk doesn't depend on record order.
     order.sort_by(|&a, &b| {
         rank(a).cmp(&rank(b))
@@ -5768,23 +6766,40 @@ pub fn accept_place_nodes(nodes: &[(usize, u8, f64, f32, f32)], held_ranks: u32,
     });
 
     let mut accepted = [None; 7];
+    let mut written = Vec::new();
+    // The ranks that have their entry (address_havelevel), and the nearest
+    // node each rank had (place_min_distance), in degrees.
+    let mut had = held_ranks;
+    let mut nearest = [1.0f64; u32::BITS as usize];
     let mut last_rank = 0;
     // The last accepted node's fuzzy area: (lat, lng, half side in metres).
     let mut fuzzy: Option<(f32, f32, f64)> = None;
     for k in order {
-        let (pt, _, _, lat, lng) = nodes[k];
-        if rank(k) == last_rank { continue; }
-        if (last_rank + 1..=rank(k)).any(held) {
+        let (pt, r, dist_sq, lat, lng) = nodes[k];
+        let first = had & (1 << r) == 0;
+        if !first && !rows { continue; }
+        if (last_rank + 1..=r).any(held) {
             fuzzy = None;
         }
-        let in_fuzzy = fuzzy.map_or(true, |(lat0, lng0, half_m)| fuzzy_area_holds(lat0, lng0, half_m, lat as f64, lng as f64));
-        if !in_fuzzy || !in_boundary(k) { continue; }
+        let in_fuzzy = || fuzzy.map_or(true, |(lat0, lng0, half_m)| fuzzy_area_holds(lat0, lng0, half_m, lat as f64, lng as f64));
+        if rows {
+            if !in_boundary(k) { continue; }
+            let distance = dist_sq.sqrt();
+            let slot = &mut nearest[usize::from(r)];
+            if !first && distance > 2.0 * *slot { continue; }
+            *slot = slot.min(distance);
+            written.push(k);
+            if !first || !in_fuzzy() { continue; }
+        } else if !in_fuzzy() || !in_boundary(k) {
+            continue;
+        }
 
         accepted[pt] = Some(k);
-        last_rank = rank(k);
+        had |= 1 << r;
+        last_rank = r;
         fuzzy = Some((lat, lng, place_fuzzy_half_side_m(pt)));
     }
-    accepted
+    (accepted, written)
 }
 
 /// The rank_address range of place nodes that a boundary of their own rank
@@ -5908,6 +6923,19 @@ pub struct PlaceResult<'a> {
     pub neighbourhood: Option<Cow<'a, str>>,
     /// The rank_address of the node behind each field.
     pub ranks: FieldRanks,
+    /// The address rows of the nodes of the name find_places was asked for
+    /// (place_node_walk).
+    pub named_rows: Vec<NamedRow>,
+}
+
+/// A place node's address row: its rank_address, its field, its distance from
+/// the feature in degrees, and the node.
+#[derive(Clone, Copy)]
+pub struct NamedRow {
+    pub rank: u8,
+    pub field: &'static str,
+    pub distance: f64,
+    pub node: PlaceNode,
 }
 
 impl PlaceResult<'_> {
@@ -5950,6 +6978,10 @@ pub struct AdminResult<'a> {
     /// The polygons in the address that fill no field (unlabelled_rows), as
     /// (rank_address, name), the finest first: display_name lists them.
     pub unlabelled: Vec<(u8, Cow<'a, str>)>,
+    /// The polygons of the address's rows with their rank_address
+    /// (find_admin_in's ranked polygons), those that fill no field or part of
+    /// display_name among them.
+    pub rows: Vec<RankedPoly>,
 }
 
 impl AdminResult<'_> {
@@ -5959,6 +6991,16 @@ impl AdminResult<'_> {
          &self.district, &self.municipality, &self.city, &self.town, &self.village, &self.hamlet,
          &self.city_district, &self.borough, &self.suburb, &self.quarter, &self.neighbourhood, &self.city_block]
             .iter().all(|f| f.is_none())
+    }
+}
+
+/// The field a polygon of an address fills: its place type's, else its
+/// rank's (rank_to_field).
+pub fn polygon_field(r: &RankedPoly) -> Option<&'static str> {
+    if r.poly.place_type_override > 0 {
+        place_type_to_field(r.poly.place_type_override)
+    } else {
+        rank_to_field(r.rank_address)
     }
 }
 
@@ -6097,6 +7139,152 @@ pub struct AddressDetails<'a> {
     pub country_code: Option<String>,
 }
 
+/// The place parts of display_name, each field with the rank_address of its
+/// label in Nominatim's settings/address-levels.json, which a part without a
+/// known rank takes (format_address), finest first.
+const PLACE_PARTS: [(&str, u8); 17] = [
+    ("city_block", 25), ("neighbourhood", 24), ("quarter", 22), ("hamlet", 20), ("suburb", 20), ("borough", 18),
+    ("city", 16), ("city_district", 16), ("town", 16), ("village", 16), ("municipality", 14), ("district", 12),
+    ("county", 12), ("state", 8), ("state_district", 6), ("region", 6), ("province", 6),
+];
+
+impl<'a> AddressDetails<'a> {
+    /// The place part `field` of PLACE_PARTS; None for another field.
+    fn place_part(&mut self, field: &str) -> Option<&mut Option<Cow<'a, str>>> {
+        Some(match field {
+            "city_block" => &mut self.city_block,
+            "neighbourhood" => &mut self.neighbourhood,
+            "quarter" => &mut self.quarter,
+            "hamlet" => &mut self.hamlet,
+            "suburb" => &mut self.suburb,
+            "borough" => &mut self.borough,
+            "city" => &mut self.city,
+            "city_district" => &mut self.city_district,
+            "town" => &mut self.town,
+            "village" => &mut self.village,
+            "municipality" => &mut self.municipality,
+            "district" => &mut self.district,
+            "county" => &mut self.county,
+            "state" => &mut self.state,
+            "state_district" => &mut self.state_district,
+            "region" => &mut self.region,
+            "province" => &mut self.province,
+            _ => return None,
+        })
+    }
+
+    /// The rank of place part `field` as display_name lists it: its polygon's
+    /// or its node's, else its label's.
+    fn part_rank(&self, field: &str) -> u8 {
+        match self.ranks.get(field) {
+            0 => PLACE_PARTS.iter().find(|(f, _)| *f == field).map_or(0, |&(_, rank)| rank),
+            rank => rank,
+        }
+    }
+
+    /// The place parts that fill a field, as (rank, name), in PLACE_PARTS' order.
+    fn place_parts(&self) -> impl Iterator<Item = (u8, &str)> + '_ {
+        self.labelled_parts().map(|(_, rank, name)| (rank, name))
+    }
+
+    /// The place parts that fill a field, as (field, rank, name), in PLACE_PARTS' order.
+    fn labelled_parts(&self) -> impl Iterator<Item = (&'static str, u8, &str)> + '_ {
+        let value = |field: &str| match field {
+            "city_block" => &self.city_block,
+            "neighbourhood" => &self.neighbourhood,
+            "quarter" => &self.quarter,
+            "hamlet" => &self.hamlet,
+            "suburb" => &self.suburb,
+            "borough" => &self.borough,
+            "city" => &self.city,
+            "city_district" => &self.city_district,
+            "town" => &self.town,
+            "village" => &self.village,
+            "municipality" => &self.municipality,
+            "district" => &self.district,
+            "county" => &self.county,
+            "state" => &self.state,
+            "state_district" => &self.state_district,
+            "region" => &self.region,
+            _ => &self.province,
+        };
+        PLACE_PARTS.iter().filter_map(move |&(field, _)| value(field).as_deref().map(|v| (field, self.part_rank(field), v)))
+    }
+
+    /// Nominatim's crosscheck of an answer's address values (results.py:610-632):
+    /// CrosscheckNames puts a row named by one of them first in its rank, and
+    /// only a rank's first row is a part. The first of each rank's rows of
+    /// `rows`, the rows named by a value in Nominatim's order within a rank,
+    /// takes the place of the rank's parts unless it is one of them (a part
+    /// of its rank, name and field, or of no field): in its field (rank and
+    /// all) where that is free or holds a coarser part, which then names no
+    /// field, else as a part of no field. A field the rank's parts leave goes
+    /// to the finest part of no field that fills it, one of `areas` (the
+    /// address's polygons as rows) of a rank no field's part has, as a label's
+    /// first row is its field (v1/format_json.py:31-34). A row of another
+    /// field (the country) is left out.
+    pub fn crosscheck(&mut self, rows: &[CrosscheckRow<'a>], areas: &[CrosscheckRow<'a>]) {
+        let mut done = 0u32;
+        for row in rows {
+            if row.field.is_some_and(|field| !PLACE_PARTS.iter().any(|(part, _)| *part == field)) { continue; }
+            let bit = 1u32.checked_shl(u32::from(row.rank)).unwrap_or(0);
+            if done & bit != 0 { continue; }
+            done |= bit;
+            let shown = self.labelled_parts().any(|(field, rank, name)| rank == row.rank && name == row.name && row.field == Some(field))
+                || self.unlabelled.iter().any(|(rank, name)| *rank == row.rank && *name == row.name);
+            if shown { continue; }
+            let mut freed = Vec::new();
+            for (field, _) in PLACE_PARTS {
+                if self.part_rank(field) == row.rank {
+                    if let Some(part) = self.place_part(field) {
+                        if part.take().is_some() { freed.push(field); }
+                    }
+                    self.ranks.set(field, 0);
+                }
+            }
+            self.unlabelled.retain(|(rank, _)| *rank != row.rank);
+            let name = row.name.clone();
+            match row.field {
+                Some(field) => {
+                    let rank = self.part_rank(field);
+                    let Some(part) = self.place_part(field) else { continue };
+                    if part.is_none() || rank < row.rank {
+                        let coarser = part.replace(name);
+                        self.ranks.set(field, row.rank);
+                        if let Some(coarser) = coarser { self.unlabelled.push((rank, coarser)); }
+                    } else {
+                        self.unlabelled.push((row.rank, name));
+                    }
+                }
+                None => self.unlabelled.push((row.rank, name)),
+            }
+            for field in freed {
+                if self.place_part(field).is_some_and(|part| part.is_some()) { continue; }
+                let labelled: Vec<u8> = self.labelled_parts().map(|(_, rank, _)| rank).collect();
+                let finest = self.unlabelled.iter().enumerate()
+                    .filter(|(_, (rank, name))| !labelled.contains(rank)
+                        && areas.iter().any(|a| a.rank == *rank && a.name == *name && a.field == Some(field)))
+                    .max_by_key(|(_, (rank, _))| *rank)
+                    .map(|(k, _)| k);
+                if let Some(k) = finest {
+                    let (rank, name) = self.unlabelled.remove(k);
+                    if let Some(part) = self.place_part(field) { *part = Some(name); }
+                    self.ranks.set(field, rank);
+                }
+            }
+        }
+    }
+}
+
+/// A row of an address that a crosscheck may make its rank's part (AddressDetails::crosscheck):
+/// its rank_address, its name (a polygon's own, where a node it links has the value's) and the
+/// field it fills, none for a polygon that fills none.
+pub struct CrosscheckRow<'a> {
+    pub rank: u8,
+    pub name: Cow<'a, str>,
+    pub field: Option<&'static str>,
+}
+
 #[derive(Serialize)]
 pub struct PoiDetail {
     pub name: String,
@@ -6104,8 +7292,99 @@ pub struct PoiDetail {
     pub distance_m: f64,
 }
 
+/// The licence of every answer, Nominatim's (src/nominatim_api/v1/
+/// classtypes.py OSM_ATTRIBUTION): its json and jsonv2 results carry it
+/// first after their place_id (v1/format_json.py format_base_json), and
+/// these answers have no place_id.
+pub const OSM_LICENCE: &str = "Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright";
+
+/// An answer's `licence`, OSM_LICENCE.
+#[derive(Clone, Copy, Default)]
+pub struct Licence;
+
+impl Serialize for Licence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(OSM_LICENCE)
+    }
+}
+
+/// OpenStreetMap's entry of the builder's credits (builder/src/attribution.h kAttribution), the
+/// credit of a dataset whose dir holds no attribution.json.
+pub fn osm_credit() -> serde_json::Value {
+    serde_json::json!({
+        "id": "osm",
+        "text": "© OpenStreetMap contributors",
+        "url": "https://www.openstreetmap.org/copyright",
+        "licence": "ODbL 1.0",
+        "licence_url": "https://opendatacommons.org/licenses/odbl/1-0/",
+        "notices": ["This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0."],
+    })
+}
+
+/// The credit of the data in dataset dir `dir`: the entries of its attribution.json and
+/// poi_attribution.json, as the builder writes them; OpenStreetMap's alone in place of an
+/// attribution.json the dir holds none of, or one that is no list.
+pub fn dir_credits(dir: &str) -> Vec<serde_json::Value> {
+    let read = |name: &str| -> Option<Vec<serde_json::Value>> {
+        serde_json::from_str(&std::fs::read_to_string(format!("{dir}/{name}")).ok()?).ok()
+    };
+    let mut credits = read("attribution.json").unwrap_or_else(|| vec![osm_credit()]);
+    credits.extend(read("poi_attribution.json").unwrap_or_default());
+    credits
+}
+
+/// `credits` as query-server's /test/credits gives them (main.rs): a disclosure whose summary
+/// names each source, and a paragraph of each, its text linked to its URL and its licence to the
+/// licence's, then its notices, all as text. A URL of no http(s) scheme links nothing. No
+/// credits, no disclosure.
+pub fn credits_html(credits: &[serde_json::Value]) -> String {
+    fn escape(s: &str) -> String {
+        s.chars().fold(String::with_capacity(s.len()), |mut out, c| {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&#39;"),
+                _ => out.push(c),
+            }
+            out
+        })
+    }
+    fn link(url: &str, label: &str) -> String {
+        if url.starts_with("https://") || url.starts_with("http://") {
+            format!(r#"<a href="{}" target="_blank" rel="noopener">{}</a>"#, escape(url), escape(label))
+        } else {
+            escape(label)
+        }
+    }
+    if credits.is_empty() {
+        return String::new();
+    }
+    let field = |e: &serde_json::Value, key: &str| e[key].as_str().unwrap_or("").to_owned();
+    let names: Vec<String> = credits.iter().map(|e| escape(&field(e, "text"))).collect();
+    let mut out = format!("<details><summary>Data: {}</summary>\n", names.join(", "));
+    for e in credits {
+        out += "<p>";
+        out += &link(&field(e, "url"), &field(e, "text"));
+        let licence = field(e, "licence");
+        if !licence.is_empty() {
+            out += ", ";
+            out += &link(&field(e, "licence_url"), &licence);
+        }
+        out += ".";
+        for notice in e["notices"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) {
+            out += " ";
+            out += &escape(notice);
+        }
+        out += "</p>\n";
+    }
+    out + "</details>\n"
+}
+
 #[derive(Serialize, Default)]
 pub struct Address<'a> {
+    pub licence: Licence,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub address: AddressDetails<'a>,
@@ -6182,33 +7461,9 @@ pub fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
         None => road.to_string(),
     });
 
-    // The place parts, finest first: a stable sort keeps the order above
-    // among parts of one rank.
-    let fields: [(&str, &Option<Cow<'_, str>>, u8); 17] = [
-        ("city_block", &addr.city_block, 25),
-        ("neighbourhood", &addr.neighbourhood, 24),
-        ("quarter", &addr.quarter, 22),
-        ("hamlet", &addr.hamlet, 20),
-        ("suburb", &addr.suburb, 20),
-        ("borough", &addr.borough, 18),
-        ("city", &addr.city, 16),
-        ("city_district", &addr.city_district, 16),
-        ("town", &addr.town, 16),
-        ("village", &addr.village, 16),
-        ("municipality", &addr.municipality, 14),
-        ("district", &addr.district, 12),
-        ("county", &addr.county, 12),
-        ("state", &addr.state, 8),
-        ("state_district", &addr.state_district, 6),
-        ("region", &addr.region, 6),
-        ("province", &addr.province, 6),
-    ];
-    let mut places: Vec<(u8, &str)> = fields.iter()
-        .filter_map(|&(field, value, label_rank)| {
-            let rank = match addr.ranks.get(field) { 0 => label_rank, rank => rank };
-            value.as_deref().map(|v| (rank, v))
-        })
-        .collect();
+    // The place parts, finest first: a stable sort keeps PLACE_PARTS' order
+    // (the one above) among parts of one rank.
+    let mut places: Vec<(u8, &str)> = addr.place_parts().collect();
     // A part without a field is a row of a rank no field's part has: an address has a row a rank.
     let labelled = places.len();
     for (rank, v) in &addr.unlabelled {
@@ -6608,6 +7863,8 @@ mod pure_helper_tests {
         // arm precedes the 142..=152 landuse band.
         assert_eq!(poi_category_to_osm_class(150), None);
         assert_eq!(poi_category_to_osm_class(160), Some("office"));
+        assert_eq!(poi_category_to_osm_class(161), Some("leisure"));
+        assert_eq!(poi_category_to_osm_class(162), Some("emergency"));
         // NOTE: GENERIC_RANK30=170 -> None (generic filler).
         assert_eq!(poi_category_to_osm_class(170), None);
         assert_eq!(poi_category_to_osm_class(171), Some("amenity"));
@@ -6625,12 +7882,13 @@ mod pure_helper_tests {
     #[test]
     fn is_area_label_category_snapshot() {
         // A representative sample of the matched set.
-        for cat in [80u8, 81, 82, 86, 91, 92, 93, 60, 61, 62, 63, 64, 65,
+        for cat in [80u8, 81, 82, 92, 93, 60, 61, 62, 63, 64, 65,
                     130, 131, 41, 42, 43, 47, 51, 54, 3, 4, 9, 11, 25, 100, 150] {
             assert!(Index::is_area_label_category(cat), "expected {cat} to be an area label");
         }
-        // A representative sample of non-matches.
-        for cat in [0u8, 1, 2, 5, 40, 44, 50, 66, 70, 90, 120, 170, 200, 255] {
+        // A representative sample of non-matches. Bays (91) and glaciers (86) never take the
+        // primary slot at all.
+        for cat in [0u8, 1, 2, 5, 40, 44, 50, 66, 70, 86, 90, 91, 120, 170, 200, 255] {
             assert!(!Index::is_area_label_category(cat), "expected {cat} to NOT be an area label");
         }
     }
@@ -7187,6 +8445,44 @@ mod pure_helper_tests {
     }
 
     #[test]
+    fn place_node_rows_are_a_rank_s_nodes_until_one_is_accepted_and_then_those_within_twice_the_nearest() {
+        // insert_addresslines (placex_triggers.sql:606-669): Whalens Court's rank 20 has Addingham
+        // at 300 m, accepted, and Drexel Hill at 500 m and Kellyville at 590 m as rows; a node at
+        // 700 m is more than twice the nearest away and no row.
+        let d = |m: f64| (m / METRES_PER_DEGREE).powi(2);
+        let nodes = [node_at(4, 0.0, d(300.0)), node_at(3, 50.0, d(500.0)), node_at(4, 100.0, d(590.0)), node_at(3, 150.0, d(700.0))];
+        let (accepted, rows) = place_node_walk(&nodes, 0, |_| true, true);
+        assert_eq!(accepted, accept_place_nodes(&nodes, 0, |_| true));
+        assert_eq!(accepted[4], Some(0));
+        assert_eq!(rows, [0, 1, 2]);
+        // A node outside its rank's boundary is no row and no nearest: Drexel Hill is accepted,
+        // and the rest are within twice its distance.
+        let (accepted, rows) = place_node_walk(&nodes, 0, |k| k != 0, true);
+        assert_eq!(accepted[3], Some(1));
+        assert_eq!(rows, [1, 2, 3]);
+        // A rank a boundary holds takes no node, and its first node is the nearest.
+        let (accepted, rows) = place_node_walk(&nodes, 1 << 20, |_| true, true);
+        assert_eq!(accepted, [None; 7]);
+        assert_eq!(rows, [0, 1, 2]);
+        // Without rows the walk accepts the same nodes, Addingham alone, and lists none.
+        assert_eq!(place_node_walk(&nodes, 0, |_| true, false), ([None, None, None, None, Some(0), None, None], Vec::new()));
+    }
+
+    #[test]
+    fn place_node_rows_of_a_rank_none_accepts_all_count() {
+        // A village at 16, whose fuzzy area reaches 2000 m east: the hamlets 2500 m and 2600 m
+        // east are outside it, so each is a row and none is accepted, however far; the one 1000 m
+        // east is accepted, and one past twice the nearest (300 m) after it is no row.
+        let d = |m: f64| (m / METRES_PER_DEGREE).powi(2);
+        let nodes = [node_at(2, 0.0, d(100.0)), node_at(4, 2500.0, d(300.0)), node_at(4, 2600.0, d(900.0)),
+                     node_at(4, 1000.0, d(1000.0)), node_at(4, 1100.0, d(1500.0))];
+        let (accepted, rows) = place_node_walk(&nodes, 0, |_| true, true);
+        assert_eq!(accepted, [None, None, Some(0), None, Some(3), None, None]);
+        assert_eq!(accepted, accept_place_nodes(&nodes, 0, |_| true));
+        assert_eq!(rows, [0, 1, 2, 3]);
+    }
+
+    #[test]
     fn place_nodes_after_a_boundary_leave_the_fuzzy_area_behind() {
         // A village's fuzzy area reaches 2000 m: a suburb 3000 m away stays
         // out, unless a boundary between them (rank 18) took over.
@@ -7312,6 +8608,23 @@ mod pure_helper_tests {
     }
 
     #[test]
+    fn a_segment_is_as_far_as_its_point_nearest_in_metres_at_any_latitude() {
+        // A line running north-east whose nearest point lies 100 m south-east of the point. A
+        // degree of longitude is cos(lat) of a degree of latitude long, so away from the
+        // equator the line's point nearest in degrees is not the one nearest in metres: at 60°
+        // north it is 117 m away.
+        let metres_per_degree = 6_371_000.0_f64.to_radians();
+        let (half, foot) = (300.0 / 2f64.sqrt(), 100.0 / 2f64.sqrt());
+        for lat in [0.0_f64, 30.0, 52.0, 60.0, 75.0] {
+            let cos_lat = lat.to_radians().cos();
+            let at = |north: f64, east: f64| (lat + north / metres_per_degree, 10.0 + east / (metres_per_degree * cos_lat));
+            let (a, b) = (at(-foot - half, foot - half), at(-foot + half, foot + half));
+            let metres = point_to_segment_distance(lat, 10.0, a.0, a.1, b.0, b.1, cos_lat).sqrt() * 6_371_000.0;
+            assert!((metres - 100.0).abs() < 1e-6, "{lat}°: {metres} m");
+        }
+    }
+
+    #[test]
     fn point_to_segment_with_t_zero_length() {
         // Degenerate (zero-length) segment: t forced to 0, distance is the
         // radian-space distance to the single point.
@@ -7367,9 +8680,11 @@ mod query_path_tests {
     use crate::scratch_dir::ScratchDir;
     use std::collections::BTreeMap;
 
+    mod crosscheck;
     mod display_name;
     mod postcodes;
     mod ranks;
+    mod reach;
 
     /// The fixtures' origin unless one is given: everything sits metres
     /// north and east of it.
@@ -7510,13 +8825,17 @@ mod query_path_tests {
         /// The street cells' lists of streets, addresses and interpolations.
         geo_cells: BTreeMap<u64, [Vec<u32>; geo_index::TABLES]>,
         /// What each side file holds other than NO_DATA, as (record, value): a street's parent
-        /// polygon, its postcode, an address's postcode and an interpolation's.
+        /// polygon, its postcode, an address's postcode and addr:city, and an interpolation's
+        /// postcode.
         way_parents: Vec<(u32, u32)>,
         way_postcodes: Vec<(u32, u32)>,
         addr_postcodes: Vec<(u32, u32)>,
+        addr_cities: Vec<(u32, u32)>,
         interp_postcodes: Vec<(u32, u32)>,
         /// The postcode centroids, each one's point, postcode and country.
         centroids: Vec<postcode_files::Centroid>,
+        /// The postcode grid's runs, in cell order.
+        grid: Vec<postcode_grid::LogicalRow>,
     }
 
     impl TestIndex {
@@ -7546,6 +8865,19 @@ mod query_path_tests {
             offset
         }
 
+        /// The offset of the first string `s` already in the pool, as the builder's pool holds
+        /// each string once; a new string where there is none.
+        fn interned(&mut self, s: &str) -> u32 {
+            let mut at = 0;
+            for held in self.strings.split(|&b| b == 0) {
+                if at < self.strings.len() && held == s.as_bytes() {
+                    return at as u32;
+                }
+                at += held.len() + 1;
+            }
+            self.string(s)
+        }
+
         /// A rectangular boundary; admin_level 15 makes it a place area.
         fn boundary(&mut self, name: &str, admin_level: u8, place_type_override: u8, (s, w, n, e): Span) -> &mut Self {
             let at = |north_m, east_m| at_from(self.origin, north_m, east_m);
@@ -7566,16 +8898,43 @@ mod query_path_tests {
             self
         }
 
+        /// Another outer ring of the boundary added last, a polygon of its own with the
+        /// boundary's record (name, level, place types, country), as the builder writes each
+        /// outer ring of a relation.
+        fn boundary_ring(&mut self, (s, w, n, e): Span) -> &mut Self {
+            let at = |north_m, east_m| at_from(self.origin, north_m, east_m);
+            let ring = vec![at(s, w), at(s, e), at(n, e), at(n, w), at(s, w)];
+            let (lat_lo, lng_lo, lat_hi, lng_hi) = bounds(&ring);
+            let poly = AdminPolygon { area: ((lat_hi - lat_lo) * (lng_hi - lng_lo)) as f32, ..self.polygons.last().unwrap().0 };
+            self.polygons.push((poly, ring));
+            self
+        }
+
+        /// A boundary through `corners_m`, (north, east) metres each, closed: a rectangle with
+        /// vertices along its edges too, which a street's nodes may share, its area its box's.
+        fn boundary_through(&mut self, name: &str, admin_level: u8, place_type_override: u8, corners_m: &[(f64, f64)]) -> &mut Self {
+            let span = corners_m.iter().fold((f64::MAX, f64::MAX, f64::MIN, f64::MIN), |(s, w, n, e), &(north, east)| {
+                (s.min(north), w.min(east), n.max(north), e.max(east))
+            });
+            self.boundary(name, admin_level, place_type_override, span);
+            let origin = self.origin;
+            let mut ring: Vec<NodeCoord> = corners_m.iter().map(|&(north, east)| at_from(origin, north, east)).collect();
+            ring.push(ring[0]);
+            self.polygons.last_mut().unwrap().1 = ring;
+            self
+        }
+
         /// Makes the polygon added last a closed way's, not a relation's.
         fn of_way(&mut self) -> &mut Self {
             self.polygons.last_mut().unwrap().0.of_way = true;
             self
         }
 
-        /// A place node of PlaceNode type `place_type`.
+        /// A place node of PlaceNode type `place_type`, its name a string of the pool's, as the
+        /// builder's pool holds each string once.
         fn place(&mut self, name: &str, place_type: u8, north_m: f64, east_m: f64) -> &mut Self {
             let NodeCoord { lat, lng } = at_from(self.origin, north_m, east_m);
-            let name_id = self.string(name);
+            let name_id = self.interned(name);
             self.place_nodes.push(PlaceNode { lat, lng, name_id, place_type, _pad1: 0, _pad2: 0, parent_poly_id: NO_DATA });
             self
         }
@@ -7587,28 +8946,48 @@ mod query_path_tests {
             self
         }
 
+        /// A place node the polygon added last links (find_linked_place): hidden, the polygon's
+        /// label.
+        fn linked_place(&mut self, name: &str, place_type: u8, north_m: f64, east_m: f64) -> &mut Self {
+            self.place(name, place_type, north_m, east_m);
+            let polygon = self.polygons.len() as u32 - 1;
+            let node = self.place_nodes.last_mut().unwrap();
+            node._pad1 = PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF;
+            node.parent_poly_id = polygon;
+            self
+        }
+
         /// Lists record `id` of geo table `table` in the street cell `cell`.
         fn list(&mut self, table: usize, id: u32, cell: u64) {
             let ids = &mut self.geo_cells.entry(cell).or_default()[table];
             if !ids.contains(&id) { ids.push(id); }
         }
 
-        /// A way of geo table `table` through points given as (north, east) metres, listed in
-        /// the street cells along it: its nodes.
-        fn way_along(&mut self, table: usize, id: usize, points_m: &[(f64, f64)]) -> Vec<NodeCoord> {
-            let nodes: Vec<NodeCoord> = points_m.iter().map(|&(n, e)| at_from(self.origin, n, e)).collect();
+        /// The nodes of a way through points given as (north, east) metres.
+        fn nodes_at(&self, points_m: &[(f64, f64)]) -> Vec<NodeCoord> {
+            points_m.iter().map(|&(n, e)| at_from(self.origin, n, e)).collect()
+        }
+
+        /// Lists record `id` of geo table `table`, a way through `nodes`, in the street cells
+        /// the builder lists each of its edges in (edge_cells).
+        fn list_way(&mut self, table: usize, id: usize, nodes: &[NodeCoord]) {
             for segment in nodes.windows(2) {
-                for cell in cells_meeting(segment, DEFAULT_STREET_CELL_LEVEL) {
+                for cell in edge_cells(segment[0], segment[1]) {
                     self.list(table, id as u32, cell);
                 }
             }
-            nodes
         }
 
         /// A named street through points given as (north, east) metres.
         fn street(&mut self, name: &str, points_m: &[(f64, f64)]) -> &mut Self {
+            let nodes = self.nodes_at(points_m);
+            self.street_through(name, nodes)
+        }
+
+        /// A named street through `nodes`.
+        fn street_through(&mut self, name: &str, nodes: Vec<NodeCoord>) -> &mut Self {
             let name_id = self.string(name);
-            let nodes = self.way_along(geo_index::STREETS, self.streets.len(), points_m);
+            self.list_way(geo_index::STREETS, self.streets.len(), &nodes);
             self.streets.push(Way { name_id, nodes, numbers: (0, 0, 0) });
             self
         }
@@ -7616,10 +8995,17 @@ mod query_path_tests {
         /// An interpolation way of the street named `street`, from house number `start` at its
         /// first point to `end` at its last; `interpolation` is 0 for every number, 1 for the
         /// even ones, 2 for the odd ones.
-        fn interpolation(&mut self, street: &str, (start, end, interpolation): (u32, u32, u8), points_m: &[(f64, f64)]) -> &mut Self {
+        fn interpolation(&mut self, street: &str, numbers: (u32, u32, u8), points_m: &[(f64, f64)]) -> &mut Self {
+            let nodes = self.nodes_at(points_m);
+            self.interpolation_through(street, numbers, nodes)
+        }
+
+        /// An interpolation way of the street named `street` through `nodes`, numbered as
+        /// `interpolation` numbers one.
+        fn interpolation_through(&mut self, street: &str, numbers: (u32, u32, u8), nodes: Vec<NodeCoord>) -> &mut Self {
             let name_id = self.string(street);
-            let nodes = self.way_along(geo_index::INTERPOLATIONS, self.interps.len(), points_m);
-            self.interps.push(Way { name_id, nodes, numbers: (start, end, interpolation) });
+            self.list_way(geo_index::INTERPOLATIONS, self.interps.len(), &nodes);
+            self.interps.push(Way { name_id, nodes, numbers });
             self
         }
 
@@ -7699,6 +9085,13 @@ mod query_path_tests {
             self
         }
 
+        /// The addr:city of the address added last, a string of the pool's.
+        fn addr_city(&mut self, city: &str) -> &mut Self {
+            let city_id = self.interned(city);
+            self.addr_cities.push((self.addrs.len() as u32 - 1, city_id));
+            self
+        }
+
         /// The postcode of the interpolation way added last.
         fn interp_postcode(&mut self, postcode: &str) -> &mut Self {
             let postcode_id = self.string(postcode);
@@ -7714,6 +9107,14 @@ mod query_path_tests {
             self
         }
 
+        /// A run of the postcode grid from `cell`, a level-16 cell, of Testland's country and
+        /// `postcode`, or of no postcode for "": runs go in cell order.
+        fn grid_run(&mut self, postcode: &str, cell: u64) -> &mut Self {
+            let country_code = if postcode.is_empty() { 0 } else { self.polygons[0].0.country_code };
+            self.grid.push(postcode_grid::LogicalRow { cell, country_code, code: postcode.to_string() });
+            self
+        }
+
         /// The side files with a value set, each with its values: NO_DATA for every other record
         /// of the file it sits beside.
         fn side_values(&self) -> Vec<(&'static str, Vec<u32>)> {
@@ -7721,6 +9122,7 @@ mod query_path_tests {
                 ("way_parents.bin", &self.way_parents, self.streets.len()),
                 ("way_postcodes.bin", &self.way_postcodes, self.streets.len()),
                 ("addr_postcodes.bin", &self.addr_postcodes, self.addrs.len()),
+                ("addr_cities.bin", &self.addr_cities, self.addrs.len()),
                 ("interp_postcodes.bin", &self.interp_postcodes, self.interps.len()),
             ];
             side_files.into_iter()
@@ -7772,6 +9174,10 @@ mod query_path_tests {
                 files.extend([(postcode_files::CENTROIDS_FILE, centroids), (postcode_files::CELLS_FILE, cells)]);
             }
 
+            if !self.grid.is_empty() {
+                files.push((postcode_grid::FILE, postcode_grid::encode(&self.grid)));
+            }
+
             if !(self.streets.is_empty() && self.addrs.is_empty() && self.interps.is_empty()) {
                 let rows: Vec<(u64, [Vec<u32>; geo_index::TABLES])> = self.geo_cells.iter()
                     .map(|(&cell, lists)| (cell, lists.clone().map(|mut ids| { ids.sort_unstable(); ids })))
@@ -7809,10 +9215,50 @@ mod query_path_tests {
         /// Writes the files into a fresh directory and loads them. The
         /// directory is removed once loaded; the maps keep the bytes.
         fn load(&self) -> Index {
+            self.load_reaching(DEFAULT_SEARCH_DISTANCE)
+        }
+
+        /// As load, the geo lookups reaching `search_distance` metres.
+        fn load_reaching(&self, search_distance: f64) -> Index {
             let dir = ScratchDir::new();
             self.write(dir.path());
-            load_dir(dir.path())
+            Index::load(dir.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, search_distance).unwrap()
         }
+    }
+
+    /// The street cells the builder lists an edge from `a` to `b` in (cover_edge,
+    /// builder/src/s2_helpers.cpp): the cell of both ends where they share one; the cells of its
+    /// two ends alone where its middle in degrees lies in one of them, though it may cross a third
+    /// by their corner; else the cells its great circle crosses. Those are here the cells of
+    /// points of its great circle 25 cm apart, which may leave out a cell it clips by less, never
+    /// list one it misses.
+    fn edge_cells(a: NodeCoord, b: NodeCoord) -> Vec<u64> {
+        let cell = |lat: f64, lng: f64| cell_id_at_level(lat, lng, DEFAULT_STREET_CELL_LEVEL);
+        let (alat, alng, blat, blng) = (a.lat as f64, a.lng as f64, b.lat as f64, b.lng as f64);
+        let (first, last) = (cell(alat, alng), cell(blat, blng));
+        if first == last {
+            return vec![first];
+        }
+        let middle = cell((alat + blat) / 2.0, (alng + blng) / 2.0);
+        if middle == first || middle == last {
+            return vec![first, last];
+        }
+        let (pa, pb) = (unit_vector(alat, alng), unit_vector(blat, blng));
+        let cross = [pa[1] * pb[2] - pa[2] * pb[1], pa[2] * pb[0] - pa[0] * pb[2], pa[0] * pb[1] - pa[1] * pb[0]];
+        let angle = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt()
+            .atan2(pa[0] * pb[0] + pa[1] * pb[1] + pa[2] * pb[2]);
+        let steps = (angle * 6_371_000.0 / 0.25).ceil() as usize;
+        let mut cells: Vec<u64> = (0..=steps)
+            .map(|k| {
+                let t = k as f64 / steps as f64;
+                let (wa, wb) = (((1.0 - t) * angle).sin(), (t * angle).sin());
+                let p = [wa * pa[0] + wb * pb[0], wa * pa[1] + wb * pb[1], wa * pa[2] + wb * pb[2]];
+                cell(p[2].atan2(p[0].hypot(p[1])).to_degrees(), p[1].atan2(p[0]).to_degrees())
+            })
+            .collect();
+        cells.sort_unstable();
+        cells.dedup();
+        cells
     }
 
     fn load_dir(dir: &std::path::Path) -> Index {
@@ -8059,6 +9505,182 @@ mod query_path_tests {
     fn loaded_continents(root: &std::path::Path) -> Vec<&'static str> {
         let mi = MultiIndex::load(root.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
         mi.continents.iter().filter(|c| c.index.load().is_some()).map(|c| c.name).collect()
+    }
+
+    /// The template's credits (configurations.template.json `attribution`), each without its
+    /// `applies_to`: what the builder writes for each source.
+    fn template_credits() -> Vec<serde_json::Value> {
+        let template: serde_json::Value = serde_json::from_str(include_str!("../../builder/configurations.template.json")).unwrap();
+        template["attribution"].as_array().unwrap().iter()
+            .map(|e| {
+                let mut e = e.clone();
+                e.as_object_mut().unwrap().remove("applies_to");
+                e
+            })
+            .collect()
+    }
+
+    /// The ids of `credits`, in order.
+    fn ids(credits: &[serde_json::Value]) -> Vec<&str> {
+        credits.iter().map(|e| e["id"].as_str().unwrap()).collect()
+    }
+
+    /// The template's entry `id` (template_credits).
+    fn template_entry(id: &str) -> serde_json::Value {
+        template_credits().into_iter().find(|e| e["id"] == id).unwrap()
+    }
+
+    /// Writes `name` in `dir`: the template's entries of `ids`, as the builder writes a credit file.
+    fn write_credits(dir: &std::path::Path, name: &str, ids: &[&str]) {
+        let entries: Vec<serde_json::Value> = ids.iter().map(|&id| template_entry(id)).collect();
+        std::fs::write(dir.join(name), serde_json::to_string(&entries).unwrap()).unwrap();
+    }
+
+    // A server credits the data of the datasets it loaded, as their dirs credit it: each
+    // source once. Europe's dataset holds OpenStreetMap's data and GeoNames's, and Wikidata
+    // ranked its POIs; Asia's of a build before attribution.json, OpenStreetMap's alone. A
+    // dataset whose credit names no GeoNames gives none; one of a minimal selection, of
+    // OpenStreetMap alone, OpenStreetMap's.
+    #[test]
+    fn a_server_credits_the_sources_of_the_datasets_it_loaded() {
+        let load = |root: &std::path::Path| {
+            MultiIndex::load(root.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap()
+        };
+
+        let root = two_continents();
+        write_credits(&root.path().join("europe"), "attribution.json", &["osm", "geonames", "codepoint-open"]);
+        write_credits(&root.path().join("europe"), "poi_attribution.json", &["wikidata"]);
+        let credits = load(root.path()).credits();
+        assert_eq!(ids(&credits), ["osm", "geonames", "codepoint-open", "wikidata"]);
+        // Asia's, first, of no file.
+        assert_eq!(credits[0], osm_credit());
+        assert_eq!(credits[1], template_entry("geonames"));
+
+        for (written, want) in [(vec!["osm", "tiger"], vec!["osm", "tiger"]), (vec!["osm"], vec!["osm"]), (vec![], vec!["osm"])] {
+            let flat = ScratchDir::new();
+            oldtown().write(flat.path());
+            if !written.is_empty() {
+                write_credits(flat.path(), "attribution.json", &written);
+            }
+            let credits = load(flat.path()).credits();
+            assert_eq!(ids(&credits), want, "{written:?}");
+            assert_eq!(credits[0], template_entry("osm"));
+        }
+    }
+
+    // A source two datasets credit is credited once, of the notices of both: Asia's GeoNames
+    // centroids, of no GB postcode, owe no GB_full notice, which Europe's, of GB's, do.
+    #[test]
+    fn a_server_credits_a_source_of_two_datasets_once_of_both_their_notices() {
+        let root = two_continents();
+        let geonames = template_entry("geonames");
+        let notices = geonames["notices"].as_array().unwrap().clone();
+        assert!(notices[0].as_str().unwrap().starts_with("UK (GB_full.csv.zip)"));
+        let mut without_gb = geonames.clone();
+        without_gb["notices"] = serde_json::Value::Array(notices[1..].to_vec());
+        let asia = serde_json::json!([template_entry("osm"), without_gb]);
+        std::fs::write(root.path().join("asia").join("attribution.json"), asia.to_string()).unwrap();
+        write_credits(&root.path().join("europe"), "attribution.json", &["osm", "geonames", "codepoint-open"]);
+
+        let mi = MultiIndex::load(root.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+        let credits = mi.credits();
+        assert_eq!(ids(&credits), ["osm", "geonames", "codepoint-open"]);
+        let mut merged = credits[1].clone();
+        let mut given: Vec<String> = merged["notices"].as_array().unwrap().iter().map(|n| n.as_str().unwrap().to_owned()).collect();
+        let mut owed: Vec<String> = notices.iter().map(|n| n.as_str().unwrap().to_owned()).collect();
+        given.sort();
+        owed.sort();
+        assert_eq!(given, owed, "{merged}");
+        merged["notices"] = geonames["notices"].clone();
+        assert_eq!(merged, geonames);
+        assert_eq!(credits[2], template_entry("codepoint-open"));
+    }
+
+    // A server credits the datasets it loaded, not those their dirs hold now: a server sharing
+    // the data dir may have replaced Europe's selection with a minimal one since, while this one
+    // still answers from the files it mapped. Once it loads Europe's dir again it credits what
+    // that holds, in a flat dir as in a continent's.
+    #[test]
+    fn a_server_credits_the_datasets_it_loaded_until_it_loads_their_dirs_again() {
+        let root = two_continents();
+        let europe = root.path().join("europe");
+        write_credits(&europe, "attribution.json", &["osm", "geonames"]);
+        write_credits(&europe, "poi_attribution.json", &["wikidata"]);
+        let mi = MultiIndex::load(root.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+        write_credits(&europe, "attribution.json", &["osm"]);
+        std::fs::remove_file(europe.join("poi_attribution.json")).unwrap();
+
+        assert_eq!(ids(&mi.credits()), ["osm", "geonames", "wikidata"]);
+        mi.install_region("europe").unwrap();
+        assert_eq!(ids(&mi.credits()), ["osm"]);
+
+        let flat = ScratchDir::new();
+        oldtown().write(flat.path());
+        write_credits(flat.path(), "attribution.json", &["osm", "tiger"]);
+        let mi = MultiIndex::load(flat.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+        std::fs::remove_file(flat.path().join("attribution.json")).unwrap();
+        assert_eq!(ids(&mi.credits()), ["osm", "tiger"]);
+    }
+
+    // A dataset of no attribution.json is OpenStreetMap's data: its credit is the builder's
+    // OpenStreetMap entry, the template's.
+    #[test]
+    fn the_credit_of_a_dataset_of_no_attribution_file_is_the_templates_osm_entry() {
+        assert_eq!(osm_credit(), template_credits()[0]);
+    }
+
+    /// Each paragraph of `html`: the hrefs of its links, and its text, tags left out and
+    /// entities decoded.
+    fn paragraphs(html: &str) -> Vec<(Vec<String>, String)> {
+        let decode = |s: &str| s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&amp;", "&");
+        html.split("<p>").skip(1).map(|p| {
+            let p = &p[..p.find("</p>").unwrap()];
+            let hrefs = p.split("href=\"").skip(1).map(|h| decode(&h[..h.find('"').unwrap()])).collect();
+            let mut text = String::new();
+            let mut in_tag = false;
+            for c in p.chars() {
+                match c {
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    _ if !in_tag => text.push(c),
+                    _ => {}
+                }
+            }
+            (hrefs, decode(&text))
+        }).collect()
+    }
+
+    // The test page's credits: a paragraph a source, its URL and its licence's the hrefs of
+    // its links, its text, licence and notices its text. Text is text, whatever it holds, and
+    // a URL of another scheme than http(s) links nothing.
+    #[test]
+    fn the_test_pages_credits_link_each_source_and_its_licence_and_give_its_notices() {
+        let credits = template_credits();
+        let html = credits_html(&credits);
+        let names: Vec<&str> = credits.iter().map(|e| e["text"].as_str().unwrap()).collect();
+        assert!(html.starts_with(&format!("<details><summary>Data: {}</summary>", names.join(", ").replace('&', "&amp;"))), "{html}");
+        let found = paragraphs(&html);
+        assert_eq!(found.len(), credits.len());
+        for (entry, (hrefs, text)) in credits.iter().zip(&found) {
+            let mut links = vec![entry["url"].as_str().unwrap()];
+            links.extend(entry["licence_url"].as_str());
+            assert_eq!(hrefs, &links, "{}", entry["id"]);
+            for field in ["text", "licence"] {
+                assert!(text.contains(entry[field].as_str().unwrap()), "{} {field}: {text}", entry["id"]);
+            }
+            for notice in entry["notices"].as_array().unwrap() {
+                assert!(text.contains(notice.as_str().unwrap()), "{}: {text}", entry["id"]);
+            }
+        }
+
+        let hostile = serde_json::json!([{"id": "x", "text": "<b>X</b> & Co", "url": "javascript:alert(1)",
+                                          "licence": "L", "licence_url": "https://l.example/?a=1&b=\"2\"",
+                                          "notices": ["<script>alert(1)</script> 'q'"]}]);
+        let html = credits_html(hostile.as_array().unwrap());
+        assert!(!html.contains("<script>") && !html.contains("<b>") && !html.contains("javascript:"), "{html}");
+        assert_eq!(paragraphs(&html), [(vec![r#"https://l.example/?a=1&b="2""#.to_owned()],
+                                         "<b>X</b> & Co, L. <script>alert(1)</script> 'q'".to_owned())]);
+        assert_eq!(credits_html(&[]), "");
     }
 
     // A dir holding the downloader's ledger but no stamp is one whose
@@ -8543,10 +10165,29 @@ mod query_path_tests {
         };
         let (lat, lng) = ORIGIN;
         assert!(world.query_json(lat, lng).contains("Testland"));
+        assert!(world.query_json(lat, lng).starts_with(r#"{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","#));
         // The first two are the origin's own point once S2 wraps them onto the globe.
         for (lat, lng) in [(lat, lng + 360.0), (180.0 - lat, lng - 180.0), (f64::NAN, lng), (lat, f64::INFINITY), (90.5, lng), (lat, -180.5)] {
             assert_eq!(world.query_json(lat, lng), "{}", "({}, {})", lat, lng);
         }
+    }
+
+    /// What a lookup that finds nothing answers: Nominatim's licence, and no address.
+    const NOTHING_FOUND: &str = r#"{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","address":{}}"#;
+
+    #[test]
+    fn every_answer_carries_nominatims_licence_at_its_head() {
+        // Nominatim's json and jsonv2 write "licence" first in every result but for its
+        // place_id, which these answers have none of (v1/format_json.py format_base_json),
+        // worded as its v1/classtypes.py OSM_ATTRIBUTION. An answer of nothing found carries
+        // it too.
+        let index = TestIndex::new().street("Main Street", &parallel(0.0, 200.0)).load();
+        let (lat, lng) = query_point(1.0, 0.0);
+        let answer = serde_json::to_string(&index.query(lat, lng)).unwrap();
+        assert!(answer.starts_with(r#"{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","display_name":"Main Street"#), "{answer}");
+        // 60 km north: outside Testland.
+        let (lat, lng) = query_point(60_000.0, 0.0);
+        assert_eq!(serde_json::to_string(&index.query(lat, lng)).unwrap(), NOTHING_FOUND);
     }
 
     #[test]
@@ -8565,10 +10206,10 @@ mod query_path_tests {
         // Each is p once S2 wraps it onto the globe.
         for (wlat, wlng) in [(lat, lng + 360.0), (lat, lng - 360.0), (180.0 - lat, lng - 180.0), (-180.0 - lat, lng + 180.0)] {
             assert_eq!(cell(wlat, wlng), cell(lat, lng), "({wlat}, {wlng})");
-            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), r#"{"address":{}}"#, "({wlat}, {wlng})");
+            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), NOTHING_FOUND, "({wlat}, {wlng})");
         }
         for (wlat, wlng) in [(f64::NAN, lng), (lat, f64::NAN), (lat, f64::INFINITY), (f64::NEG_INFINITY, lng)] {
-            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), r#"{"address":{}}"#, "({wlat}, {wlng})");
+            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), NOTHING_FOUND, "({wlat}, {wlng})");
         }
     }
 
@@ -9134,7 +10775,7 @@ mod query_path_tests {
         let mut dataset = TestIndex::new();
         dataset
             .street("Main Street", &parallel(0.0, 200.0)).way_parent(0).way_postcode("2020")
-            .address("7", 30.0, 0.0).addr_postcode("1010")
+            .address("7", 30.0, 0.0).addr_postcode("1010").addr_city("Springfield")
             .interpolation("Main St", (1, 99, 0), &parallel(5.0, 100.0)).interp_postcode("3030")
             .street("High Street", &parallel(1000.0, 200.0))
             .address("9", 1030.0, 0.0)
@@ -9143,9 +10784,10 @@ mod query_path_tests {
     }
 
     /// Each side file and the file whose records its values are for.
-    const SIDE_FILES: [(&str, &str); 4] = [
+    const SIDE_FILES: [(&str, &str); 5] = [
         ("way_parents.bin", "street_ways.bin"), ("way_postcodes.bin", "street_ways.bin"),
-        ("addr_postcodes.bin", "addr_points.bin"), ("interp_postcodes.bin", "interp_ways.bin"),
+        ("addr_postcodes.bin", "addr_points.bin"), ("addr_cities.bin", "addr_points.bin"),
+        ("interp_postcodes.bin", "interp_ways.bin"),
     ];
 
     /// What Index::load refuses the files of `dataset` with once `edit` has changed them in
@@ -9181,10 +10823,12 @@ mod query_path_tests {
         // The street files come with the geo index. Without them the other side file of the
         // streets goes too, so that the one left is the one refused.
         let streets = ["geo_cells.bin", "geo_entries.bin", "street_ways.bin", "street_nodes.bin"];
-        let cases: [(&str, &str, Vec<&str>); 4] = [
+        let addresses = ["addr_points.bin", "addr_vertices.bin", "addr_index.bin"];
+        let cases: [(&str, &str, Vec<&str>); 5] = [
             ("way_parents.bin", "street_ways.bin", [&streets[..], &["way_postcodes.bin"][..]].concat()),
             ("way_postcodes.bin", "street_ways.bin", [&streets[..], &["way_parents.bin"][..]].concat()),
-            ("addr_postcodes.bin", "addr_points.bin", vec!["addr_points.bin", "addr_vertices.bin", "addr_index.bin"]),
+            ("addr_postcodes.bin", "addr_points.bin", addresses.to_vec()),
+            ("addr_cities.bin", "addr_points.bin", [&addresses[..], &["addr_postcodes.bin"][..]].concat()),
             ("interp_postcodes.bin", "interp_ways.bin", vec!["interp_ways.bin", "interp_nodes.bin"]),
         ];
         for (name, parent, without) in cases {
@@ -9276,10 +10920,11 @@ mod query_path_tests {
     fn load_refuses_part_of_the_address_files() {
         let dataset = two_of_each();
         let (points, vertices, index) = (addr_files::POINTS_FILE, addr_files::VERTICES_FILE, addr_files::INDEX_FILE);
-        // Without the addresses' postcodes too, which no dir holds without addr_points.bin.
+        // Without the addresses' postcodes and cities too, which no dir holds without
+        // addr_points.bin.
         let without = |files: &[&str]| {
             let said = load_refusal(&dataset, |dir| {
-                for file in files.iter().chain(&["addr_postcodes.bin"]) {
+                for file in files.iter().chain(&["addr_postcodes.bin", "addr_cities.bin"]) {
                     std::fs::remove_file(dir.join(file)).unwrap();
                 }
             });
@@ -9406,21 +11051,43 @@ mod query_path_tests {
 
     /// `index` with one polygon POI, the rectangle: `name_id` its name and `parent_street_id`
     /// its parent street's, strings of the index's. The admin cell of its middle lists it.
-    fn with_polygon_poi(mut index: Index, name_id: u32, parent_street_id: u32, (s, w, n, e): Span) -> Index {
-        let (low, middle) = (at(s, w), at((s + n) / 2.0, (w + e) / 2.0));
-        // Its corners at 1e-7 degrees (encoding 3) from its low corner.
-        let steps = |v: f32, from: f32| ((v as f64 - from as f64) / 1e-7).round() as u32;
-        let polygon = poi_files::PoiPolygon {
-            encoding: 3, bmin_lat: low.lat, bmin_lng: low.lng,
-            q: [at(s, w), at(s, e), at(n, e), at(n, w)].iter().map(|c| (steps(c.lat, low.lat), steps(c.lng, low.lng))).collect(),
-        };
-        let record = PoiRecord {
-            lat: middle.lat, lng: middle.lng, vertex_offset: 0, name_id, category: 1, tier: 0, flags: 0, importance: 0,
-            parent_street_id, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
-        };
-        let (records, vertices) = poi_files::encode(&[(record, Some(polygon))]);
-        let cell = cell_id_at_level(middle.lat as f64, middle.lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
-        index.poi_index = Some(cell_pairs::from_pairs([(cell, 0)], cell_pairs::POI));
+    fn with_polygon_poi(index: Index, name_id: u32, parent_street_id: u32, span: Span) -> Index {
+        with_poi(index, (1, 0), name_id, (parent_street_id, NO_DATA), span, true)
+    }
+
+    /// `index` with one POI of `category` and `flags`: the rectangle, or a point at its middle
+    /// where `polygon` is false. `name_id` its name and `parents` its parent street's and
+    /// postcode's, strings of the index's. The admin cell of its middle lists it.
+    fn with_poi(index: Index, kind: (u8, u8), name_id: u32, parents: (u32, u32), span: Span, polygon: bool) -> Index {
+        with_pois(index, &[(kind, name_id, parents, span, polygon)])
+    }
+
+    /// `index` with `pois`, each as with_poi takes one, record i the i-th.
+    fn with_pois(index: Index, pois: &[((u8, u8), u32, (u32, u32), Span, bool)]) -> Index {
+        with_pois_of_tier(index, pois, 0)
+    }
+
+    /// with_pois, every record of `tier`.
+    fn with_pois_of_tier(mut index: Index, pois: &[((u8, u8), u32, (u32, u32), Span, bool)], tier: u8) -> Index {
+        let mut records = Vec::new();
+        let mut cells = Vec::new();
+        for (i, &((category, flags), name_id, (parent_street_id, parent_postcode_id), (s, w, n, e), polygon)) in pois.iter().enumerate() {
+            let (low, middle) = (at(s, w), at((s + n) / 2.0, (w + e) / 2.0));
+            // Its corners at 1e-7 degrees (encoding 3) from its low corner.
+            let steps = |v: f32, from: f32| ((v as f64 - from as f64) / 1e-7).round() as u32;
+            let outline = polygon.then(|| poi_files::PoiPolygon {
+                encoding: 3, bmin_lat: low.lat, bmin_lng: low.lng,
+                q: [at(s, w), at(s, e), at(n, e), at(n, w)].iter().map(|c| (steps(c.lat, low.lat), steps(c.lng, low.lng))).collect(),
+            });
+            let record = PoiRecord {
+                lat: middle.lat, lng: middle.lng, vertex_offset: if polygon { 0 } else { NO_DATA }, name_id, category, tier, flags,
+                importance: 0, parent_street_id, parent_postcode_id, parent_poly_id: NO_DATA,
+            };
+            records.push((record, outline));
+            cells.push((cell_id_at_level(middle.lat as f64, middle.lng as f64, DEFAULT_ADMIN_CELL_LEVEL), i as u32));
+        }
+        let (records, vertices) = poi_files::encode(&records);
+        index.poi_index = Some(cell_pairs::from_pairs(cells, cell_pairs::POI));
         index.poi_records = Some(PoiRecords::open(FileBytes::Owned(records)).unwrap());
         index.poi_vertices = Some(FileBytes::Owned(vertices));
         index
@@ -9451,6 +11118,223 @@ mod query_path_tests {
         // The building's nearest wall is 21 m from the query: the town hall answers, on its
         // parent street.
         assert_eq!(answer(true), (None, Some("Mill Lane".to_owned())));
+    }
+
+    #[test]
+    fn a_water_poi_never_takes_the_primary_slot_nor_gives_its_road_or_postcode() {
+        // A POI 40 m by 60 m holds the query, its parent street Mill Lane and its postcode 4510;
+        // Main Street, of postcode 2020, runs 70 m south of the query. Nominatim's POI lane
+        // takes rank 30 alone (reverse.py _find_closest_street_or_pois), and it ranks
+        // natural=water, wetland, bay and glacier 22, and landuse=reservoir|basin on an area 24
+        // (address-levels.json): the street answers there, with its postcode. A landuse node
+        // ranks 30 (ranking.sql compute_place_rank), and so do a swimming area, a fire pond
+        // and a fountain: the POI answers, on its parent street with its postcode.
+        let answer = |category: u8, polygon: bool| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Main Street", &parallel(-40.0, 200.0)).way_postcode("2020");
+            let (name, lane, postcode) = (dataset.string("Water"), dataset.string("Mill Lane"), dataset.string("4510"));
+            let index = with_poi(dataset.load(), (category, 0), name, (lane, postcode), (0.0, 0.0, 40.0, 60.0), polygon);
+            let primary = primary_at(&index, 30.0, 10.0);
+            let address = address_at(&index, 30.0, 10.0);
+            (primary["poi"]["category"].as_u64(), address["road"].as_str().map(str::to_owned), address["postcode"].as_str().map(str::to_owned))
+        };
+        let street = (None, Some("Main Street".to_owned()), Some("2020".to_owned()));
+        let poi = |category: u8| (Some(category as u64), Some("Mill Lane".to_owned()), Some("4510".to_owned()));
+
+        // NATURAL_WATER, WETLAND, BAY, GLACIER and RESERVOIR, areas.
+        for category in [99, 97, 91, 86, 148] {
+            assert_eq!(answer(category, true), street, "category {category}");
+        }
+        // NATURAL_WATER, WETLAND, BAY and GLACIER nodes rank 22 too.
+        for category in [99, 97, 91, 86] {
+            assert_eq!(answer(category, false), street, "category {category}, a point");
+        }
+        // A RESERVOIR node, SWIMMING_AREA, FIRE_WATER_POND and FOUNTAIN.
+        assert_eq!(answer(148, false), poi(148));
+        for category in [161, 162, 49] {
+            assert_eq!(answer(category, true), poi(category), "category {category}");
+        }
+    }
+
+    #[test]
+    fn a_water_area_of_the_highway_flag_answers_its_own_name_as_a_street_does() {
+        // A water area a highway kind of rank 26 or 27 ranks (area=yes, highway=pedestrian,
+        // natural=water, tourism=attraction: the builder's NATURAL_WATER of the highway flag)
+        // is a street in Nominatim, whose street lane takes address ranks 26 to 29 (reverse.py
+        // _find_closest_street_or_pois): inside it, its own name answers, though Main Street,
+        // 5 m south of the query, is nearer than its outline, 10 m west, and its parent street
+        // is Mill Lane. Of no flag, the water stays out of both lanes and Main Street answers;
+        // a node of the flag stays out too.
+        let answer = |flags: u8, polygon: bool| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Main Street", &parallel(25.0, 200.0));
+            let (name, lane) = (dataset.string("Seeplatz"), dataset.string("Mill Lane"));
+            let index = with_poi(dataset.load(), (99, flags), name, (lane, NO_DATA), (0.0, 0.0, 40.0, 60.0), polygon);
+            address_at(&index, 30.0, 10.0)["road"].as_str().map(str::to_owned)
+        };
+        assert_eq!(answer(POI_FLAG_HIGHWAY, true).as_deref(), Some("Seeplatz"));
+        assert_eq!(answer(0, true).as_deref(), Some("Main Street"));
+        assert_eq!(answer(POI_FLAG_HIGHWAY, false).as_deref(), Some("Main Street"));
+        for category in [86, 91, 97, 148] {
+            let record = PoiRecord {
+                lat: 0.0, lng: 0.0, vertex_offset: 0, name_id: 0, category, tier: 0, flags: POI_FLAG_HIGHWAY,
+                importance: 0, parent_street_id: 0, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
+            };
+            assert!(!Index::is_out_of_the_primary_lanes(&record), "category {category}");
+            assert!(Index::is_out_of_the_primary_lanes(&PoiRecord { flags: 0, ..record }), "category {category}");
+        }
+    }
+
+    #[test]
+    fn a_water_street_answers_its_own_name_wherever_it_wins_and_needs_no_parent_street() {
+        // A water street, a water area of the highway flag, is one placex row of class highway
+        // in Nominatim, its polygon the geometry and rank_address 26 or 27 (init.lua
+        // process_tags, ranking.sql compute_place_rank): the street lane finds it by its
+        // distance to the polygon, 0 inside, and answers its own name (reverse.py
+        // lookup_street_poi), and a street has no parent street (placex_update parents
+        // rank_search > 27 alone). Main Street runs 10 m south of a point 3 m west of the
+        // outline, 40 m by 60 m, and of one inside it 10 m from the outline: the water street
+        // wins at both, and answers its own name, not that of its parent street, Mill Lane, nor
+        // Main Street where it links none. A polygon of the flag that is no water keeps its
+        // parent street outside it, and takes no slot without one.
+        let answer = |category: u8, linked: bool, (north, east): (f64, f64)| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Main Street", &parallel(20.0, 200.0));
+            let (name, lane) = (dataset.string("Seeplatz"), dataset.string("Mill Lane"));
+            let parents = (if linked { lane } else { NO_DATA }, NO_DATA);
+            let index = with_poi(dataset.load(), (category, POI_FLAG_HIGHWAY), name, parents, (0.0, 0.0, 40.0, 60.0), true);
+            address_at(&index, north, east)["road"].as_str().map(str::to_owned)
+        };
+        let (outside, inside) = ((30.0, -3.0), (30.0, 10.0));
+        // NATURAL_WATER, WETLAND, BAY, GLACIER and RESERVOIR.
+        for category in [99, 97, 91, 86, 148] {
+            for linked in [true, false] {
+                for point in [outside, inside] {
+                    assert_eq!(answer(category, linked, point).as_deref(), Some("Seeplatz"), "category {category}, linked {linked}, {point:?}");
+                }
+            }
+        }
+        // An ATTRACTION.
+        assert_eq!(answer(1, true, inside).as_deref(), Some("Seeplatz"));
+        assert_eq!(answer(1, true, outside).as_deref(), Some("Mill Lane"));
+        assert_eq!(answer(1, false, inside).as_deref(), Some("Main Street"));
+    }
+
+    #[test]
+    fn a_water_street_competes_by_the_rules_of_a_street_not_those_of_a_poi() {
+        // A water street is a street in Nominatim, of rank_address 26 or 27: a street that wins
+        // its street lane refines to a house number it is the parent of alone, and a rank-30 node
+        // inside the closest feature takes its place where that is an area of rank_search above
+        // 27 alone (reverse.py lookup_street_poi), nor does a street take a head start. The lake,
+        // 40 m by 60 m, of the highway flag, its parent street Mill Lane, holds the point asked
+        // and an address node on Main Street 28 m off, Main Street 70 m south: the lake answers,
+        // with no house number. Of tier 1, which gives a landmark polygon its head start of 50 m,
+        // and 30 m east of the point asked, with Main Street 10 m north, it leaves the answer to
+        // Main Street. An ATTRACTION of the flag keeps the POIs' rules: the node answers inside
+        // it, on its street, and of tier 1 it wins beside it, on its parent street.
+        let answer = |category: u8, tier: u8, address: bool, street_north: f64, (north, east): (f64, f64)| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Main Street", &parallel(street_north, 200.0));
+            if address {
+                dataset.address("1", 10.0, 30.0);
+            }
+            let (name, lane) = (dataset.string("Seeplatz"), dataset.string("Mill Lane"));
+            let pois = [((category, POI_FLAG_HIGHWAY), name, (lane, NO_DATA), (0.0, 0.0, 40.0, 60.0), true)];
+            let address = address_at(&with_pois_of_tier(dataset.load(), &pois, tier), north, east);
+            (address["road"].as_str().map(str::to_owned), address["house_number"].as_str().map(str::to_owned))
+        };
+        let road = |name: &str, house_number: Option<&str>| (Some(name.to_owned()), house_number.map(str::to_owned));
+        let (inside, beside) = ((30.0, 10.0), (20.0, -30.0));
+        // NATURAL_WATER, WETLAND, BAY, GLACIER and RESERVOIR.
+        for category in [99, 97, 91, 86, 148] {
+            assert_eq!(answer(category, 0, true, -40.0, inside), road("Seeplatz", None), "category {category}");
+            assert_eq!(answer(category, 1, false, 30.0, beside), road("Main Street", None), "category {category}");
+        }
+        // An ATTRACTION.
+        assert_eq!(answer(1, 0, true, -40.0, inside), road("Main Street", Some("1")));
+        assert_eq!(answer(1, 1, false, 30.0, beside), road("Mill Lane", None));
+    }
+
+    #[test]
+    fn a_water_street_matches_place_nodes_against_the_point_not_its_parent_street() {
+        // Nominatim takes a street's address from the street itself, a rank-30 answer's from its
+        // parent street (results.py _get_address_lookup_id). The lake, 40 m by 60 m, of the
+        // highway flag, holds the point asked, 40 m east of Long Road, its parent street and the
+        // nearest street, whose line the hamlet's 1000 m square crosses 3 km north of the point,
+        // which it leaves out: the lake answers, and no hamlet. An ATTRACTION there answers on
+        // Long Road, in the hamlet.
+        let answer = |(category, flags): (u8, u8)| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Long Road", &[(-1000.0, 0.0), (5000.0, 0.0)]).place("Justice", 4, 3000.0, 200.0);
+            let (name, lane) = (dataset.string("Seeplatz"), dataset.string("Long Road"));
+            let index = with_poi(dataset.load(), (category, flags), name, (lane, NO_DATA), (-20.0, 20.0, 20.0, 80.0), true);
+            let address = address_at(&index, 0.0, 40.0);
+            (address["road"].as_str().map(str::to_owned), address["hamlet"].as_str().map(str::to_owned))
+        };
+        // NATURAL_WATER, WETLAND, BAY, GLACIER and RESERVOIR.
+        for category in [99, 97, 91, 86, 148] {
+            assert_eq!(answer((category, POI_FLAG_HIGHWAY)), (Some("Seeplatz".to_owned()), None), "category {category}");
+        }
+        assert_eq!(answer((1, 0)), (Some("Long Road".to_owned()), Some("Justice".to_owned())));
+    }
+
+    #[test]
+    fn water_no_address_anchors_keeps_its_landmark_and_places_but_gives_no_road_nor_postcode() {
+        // A glacier 60 km north, outside Testland, holds the query, its parent street Coast
+        // Road and its postcode 4510; no boundary holds the point and no street is near, and a
+        // postcode centroid, 4520, is 10 m off. Water never takes the primary slot, so its road
+        // and postcode don't answer, nor the centroid's, but where it would have taken the slot
+        // its name answers as the landmark and in `places`. One of no linked parent street
+        // never could, and the point finds nothing, as one in no POI.
+        let answer = |linked: bool| {
+            let mut dataset = TestIndex::new();
+            dataset.centroid("4520", 60_030.0, 20.0);
+            let (name, road, postcode) = (dataset.string("Coast Glacier"), dataset.string("Coast Road"), dataset.string("4510"));
+            let parents = if linked { (road, postcode) } else { (NO_DATA, NO_DATA) };
+            let index = with_poi(dataset.load(), (86, 0), name, parents, (60_000.0, 0.0, 60_040.0, 60.0), true);
+            let (lat, lng) = query_point(60_030.0, 10.0);
+            serde_json::to_string(&index.query(lat, lng)).unwrap()
+        };
+        let linked: serde_json::Value = serde_json::from_str(&answer(true)).unwrap();
+        assert_eq!(linked["address"], serde_json::json!({"landmark": "Coast Glacier"}), "{linked}");
+        assert_eq!(linked["places"][0]["name"], "Coast Glacier", "{linked}");
+        assert_eq!(linked["licence"], OSM_LICENCE);
+        assert_eq!(answer(false), NOTHING_FOUND);
+    }
+
+    #[test]
+    fn a_bay_or_glacier_no_address_anchors_answers_nothing_where_a_specific_poi_is_found() {
+        // A bay or glacier 60 km north, outside Testland, holds the query, its parent street
+        // Coast Road; no boundary holds the point and no street is near. 150 m east of the
+        // query, past the 100 m a POI takes the primary slot within, is a POI of Hill Road.
+        // Were water in the lanes, a bay or glacier would be an area label there, as an island
+        // is, and win the slot only where no specific POI is found: a school or a lake takes
+        // the lane from it, too far to take the slot, and the point finds nothing, as one in
+        // no water. An area label (a protected area) or a school of no linked parent street
+        // leaves it the lane, and a lake, itself specific, keeps the lane from the farther
+        // school: the water's name answers as the landmark.
+        let answer = |water: u8, (category, linked): (u8, bool)| {
+            let mut dataset = TestIndex::new();
+            let (name, road) = (dataset.string("Coast Water"), dataset.string("Coast Road"));
+            let (other, hill_road) = (dataset.string("Hilltop"), dataset.string("Hill Road"));
+            let pois = [
+                ((water, 0), name, (road, NO_DATA), (60_000.0, 0.0, 60_040.0, 60.0), true),
+                ((category, 0), other, (if linked { hill_road } else { NO_DATA }, NO_DATA), (60_030.0, 160.0, 60_030.0, 160.0), false),
+            ];
+            let index = with_pois(dataset.load(), &pois);
+            let (lat, lng) = query_point(60_030.0, 10.0);
+            serde_json::to_value(index.query(lat, lng)).unwrap()
+        };
+        let nothing: serde_json::Value = serde_json::from_str(NOTHING_FOUND).unwrap();
+        let (bay, glacier, lake, school, protected_area) = (91, 86, 99, 56, 131);
+        for water in [bay, glacier] {
+            assert_eq!(answer(water, (school, true)), nothing, "category {water}, a school");
+            assert_eq!(answer(water, (lake, true)), nothing, "category {water}, a lake");
+        }
+        for (water, other) in [(glacier, (protected_area, true)), (glacier, (school, false)), (lake, (school, true))] {
+            let held = answer(water, other);
+            assert_eq!(held["address"], serde_json::json!({"landmark": "Coast Water"}), "category {water}, {other:?}: {held}");
+        }
     }
 
     #[test]
@@ -9768,14 +11652,14 @@ mod query_path_tests {
     }
 
     /// The families a dump reports, each by its first file.
-    const DUMP_FAMILIES: [&str; 8] = [
-        "street_ways.bin", "interp_ways.bin", "addr_points.bin",
-        "way_parents.bin", "way_postcodes.bin", "addr_postcodes.bin", "interp_postcodes.bin", "postcode_centroids.bin",
+    const DUMP_FAMILIES: [&str; 9] = [
+        "street_ways.bin", "interp_ways.bin", "addr_points.bin", "way_parents.bin", "way_postcodes.bin",
+        "addr_postcodes.bin", "addr_cities.bin", "interp_postcodes.bin", "postcode_centroids.bin",
     ];
 
     /// The report of a dump in which no read disagreed with another: for each family what it
     /// read and how many of its reads gave nothing, and none of a family the dir is without.
-    fn dump_report(families: [Option<(String, u64)>; 8]) -> String {
+    fn dump_report(families: [Option<(String, u64)>; 9]) -> String {
         let (mut report, mut nothing) = (String::new(), 0);
         for (file, family) in DUMP_FAMILIES.iter().zip(families) {
             report += &match family {
@@ -9790,7 +11674,7 @@ mod query_path_tests {
     }
 
     /// What a dump reports of the dataset's families, every read giving its record.
-    fn whole_dump_report(dataset: &TestIndex) -> [Option<(String, u64)>; 8] {
+    fn whole_dump_report(dataset: &TestIndex) -> [Option<(String, u64)>; 9] {
         let ways = |ways: &[Way]| {
             let nodes: usize = ways.iter().map(|way| way.nodes.len()).sum();
             (format!("{} ways, {nodes} nodes", ways.len()), 0)
@@ -9803,7 +11687,8 @@ mod query_path_tests {
             has.then(|| ways(&dataset.streets)),
             (!dataset.interps.is_empty()).then(|| ways(&dataset.interps)),
             (!dataset.addrs.is_empty()).then(|| (format!("{} records, {footprints} footprints", dataset.addrs.len()), 0)),
-            side("way_parents.bin"), side("way_postcodes.bin"), side("addr_postcodes.bin"), side("interp_postcodes.bin"),
+            side("way_parents.bin"), side("way_postcodes.bin"), side("addr_postcodes.bin"), side("addr_cities.bin"),
+            side("interp_postcodes.bin"),
             (!dataset.centroids.is_empty())
                 .then(|| (format!("{} centroids in {} cells", dataset.centroids.len(), logical_centroids(dataset).1), 0)),
         ]
@@ -9825,7 +11710,7 @@ mod query_path_tests {
     /// interpolations of every type, one counting down; addresses that are nodes, closed and
     /// open outlines, a single vertex, a building kilometres from its point and an outline of
     /// more vertices than a blob holds; one before any street; each side file with values for
-    /// some of its records; and postcode centroids, a cell of one, cells of a block's worth either
+    /// some of its records (addr:city among them); and postcode centroids, a cell of one, cells of a block's worth either
     /// side of 32 and one of hundreds, of two countries, a postcode of both.
     fn every_kind_of_record() -> TestIndex {
         let mut dataset = TestIndex::new();
@@ -9852,6 +11737,9 @@ mod query_path_tests {
                 };
                 if j % 7 == 2 {
                     dataset.addr_postcode(&format!("{}", 2000 + j));
+                }
+                if j % 5 == 1 {
+                    dataset.addr_city(&format!("Town {}", j % 3));
                 }
             }
             dataset.interpolation(&format!("Street {i}"), (1 + 2 * i, 199 - i, (i % 3) as u8), &parallel(north + 1.0, 100.0));
@@ -9891,26 +11779,27 @@ mod query_path_tests {
         let vertices = |addr: &Addr| addr.footprint.as_ref().map_or(0, |footprint| footprint.steps.len());
         let outlines: Vec<usize> = dataset.addrs.iter().map(vertices).collect();
         assert!([0, 1, 3, 4, 5, 65_536].iter().all(|count| outlines.contains(count)) && dataset.addrs.len() == 1205);
-        assert_eq!(dataset.side_values().len(), 4);
+        assert_eq!(dataset.side_values().len(), 5);
 
         let dir = ScratchDir::new();
         dataset.write(dir.path());
         let dump = dump_of(dir.path());
         assert_eq!((dump.status, dump.errors.as_str()), (0, ""));
         let want = logical_files(&dataset);
-        assert_eq!(want.len(), 11);
+        assert_eq!(want.len(), 12);
         assert_dumped(&dump, &want, &[]);
         assert_eq!(dump.report, dump_report(whole_dump_report(&dataset)));
         let lines: Vec<&str> = dump.report.lines().collect();
-        assert_eq!(lines.len(), 9);
+        assert_eq!(lines.len(), 10);
         assert_eq!(lines[0], "street_ways.bin: 44 ways, 65616 nodes, 0 reads gave nothing, 0 disagreed");
         assert_eq!(lines[1], "interp_ways.bin: 43 ways, 82 nodes, 0 reads gave nothing, 0 disagreed");
         assert_eq!(lines[2], "addr_points.bin: 1205 records, 803 footprints, 0 reads gave nothing, 0 disagreed");
-        assert_eq!(lines[6], "interp_postcodes.bin: 43 values, 0 reads gave nothing, 0 disagreed");
+        assert_eq!(lines[6], "addr_cities.bin: 1205 values, 0 reads gave nothing, 0 disagreed");
+        assert_eq!(lines[7], "interp_postcodes.bin: 43 values, 0 reads gave nothing, 0 disagreed");
         let cells = logical_centroids(&dataset).1;
         assert!(cells >= 4);
-        assert_eq!(lines[7], format!("postcode_centroids.bin: 366 centroids in {cells} cells, 0 reads gave nothing, 0 disagreed"));
-        assert_eq!(lines[8], "0 reads gave nothing, 0 disagreed");
+        assert_eq!(lines[8], format!("postcode_centroids.bin: 366 centroids in {cells} cells, 0 reads gave nothing, 0 disagreed"));
+        assert_eq!(lines[9], "0 reads gave nothing, 0 disagreed");
 
         // The dir is one the server answers from.
         let address = address_at(&load_dir(dir.path()), 4.0, -148.0);
@@ -9982,7 +11871,7 @@ mod query_path_tests {
         let want = BTreeMap::from([(addr_files::POINTS_FILE.to_owned(), points), (addr_files::VERTICES_FILE.to_owned(), vertices)]);
         assert_dumped(&dump, &want, &[]);
         let read = Some(("11 records, 9 footprints".to_owned(), 0));
-        assert_eq!(dump.report, dump_report([None, None, read, None, None, None, None, None]));
+        assert_eq!(dump.report, dump_report([None, None, read, None, None, None, None, None, None]));
     }
 
     /// `two_of_each` with a building, the third address, and 40 postcode centroids in a cell.
@@ -10044,7 +11933,7 @@ mod query_path_tests {
         let size = dataset.files().into_iter().find(|(name, _)| *name == centroids).unwrap().1.len();
         // Two blocks, their entries of 29 bytes before the footer's 8.
         let read = format!("40 centroids in {} cells", logical_centroids(&dataset).1);
-        let dump = damaged(centroids, size - 8 - 2 * 29 + 15, |_| 0xFF, 7, (&read, 64));
+        let dump = damaged(centroids, size - 8 - 2 * 29 + 15, |_| 0xFF, 8, (&read, 64));
         let mut first_zeros = vec![0; 32 * 20];
         first_zeros.extend(&want[centroids][32 * 20..]);
         assert_dumped(&dump, &want, &[(centroids, first_zeros)]);
@@ -10086,6 +11975,7 @@ mod query_path_tests {
         assert_eq!(without(&["street_ways.bin", "street_nodes.bin"]), "way_parents.bin without street_ways.bin");
         assert_eq!(without(&["street_ways.bin", "street_nodes.bin", "way_parents.bin"]), "way_postcodes.bin without street_ways.bin");
         assert_eq!(without(&[points, vertices, index]), format!("addr_postcodes.bin without {points}"));
+        assert_eq!(without(&[points, vertices, index, "addr_postcodes.bin"]), format!("addr_cities.bin without {points}"));
         assert_eq!(without(&["interp_ways.bin", "interp_nodes.bin"]), "interp_postcodes.bin without interp_ways.bin");
         // One file of the postcode centroids' pair.
         let (centroids, cells) = (postcode_files::CENTROIDS_FILE, postcode_files::CELLS_FILE);
@@ -10148,7 +12038,7 @@ mod query_path_tests {
         let admin = TestIndex::new();
         let dump = dump_after(&admin, |_| ());
         assert_eq!((dump.status, dump.errors.as_str(), dump.files.len()), (0, "", 0));
-        assert_eq!(dump.report, dump_report([None, None, None, None, None, None, None, None]));
+        assert_eq!(dump.report, dump_report([None, None, None, None, None, None, None, None, None]));
         assert!(dump.report.starts_with("street_ways.bin: none\ninterp_ways.bin: none\naddr_points.bin: none\nway_parents.bin: none\n"));
 
         // Streets alone, one with a postcode.
@@ -10269,14 +12159,17 @@ mod admin_scan_tests {
             poi_index: None, poi_records: None, poi_vertices: None,
             poi_meta: PoiMeta { categories: HashMap::new() },
             places: None,
-            way_parents: None, admin_parents: None, addr_postcodes: None, way_postcodes: None,
+            way_parents: None, admin_parents: None, addr_postcodes: None, addr_cities: None, way_postcodes: None,
             postcode_centroids: None,
+            postcode_grid: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, len, len, len, len, len]),
             water: None,
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
             admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
             max_distance_sq: 1.0,
+            linked_names: Default::default(),
+            credits: Vec::new(),
         }
     }
 
@@ -10621,6 +12514,9 @@ mod admin_scan_tests {
         idx
     }
 
+    /// What a lookup that finds nothing answers: Nominatim's licence, and no address.
+    const NOTHING_FOUND: &str = r#"{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","address":{}}"#;
+
     #[test]
     fn a_point_off_the_globe_is_in_no_poi_though_its_wrapped_cell_lists_one_interior() {
         let around_q = (21.99, 27.5, 22.05, 27.6);
@@ -10636,7 +12532,7 @@ mod admin_scan_tests {
                 assert_eq!(cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL), cells()[0], "({lat}, {lng})");
                 assert_eq!(pois(lat, lng), [], "({lat}, {lng}) interior {interior}");
                 assert!(idx.find_nearest_poi_with_parent(lat, lng).is_none(), "({lat}, {lng}) interior {interior}");
-                assert_eq!(serde_json::to_string(&idx.query(lat, lng)).unwrap(), r#"{"address":{}}"#, "({lat}, {lng}) interior {interior}");
+                assert_eq!(serde_json::to_string(&idx.query(lat, lng)).unwrap(), NOTHING_FOUND, "({lat}, {lng}) interior {interior}");
             }
             for (lat, lng) in [(f64::NAN, Q.1), (Q.0, f64::NAN), (Q.0, f64::INFINITY), (f64::NEG_INFINITY, Q.1)] {
                 assert_eq!(pois(lat, lng), [], "({lat}, {lng})");

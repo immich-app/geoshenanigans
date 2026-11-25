@@ -5,6 +5,7 @@
 #include "reorder.h"
 #include "test_framework.h"
 
+#include <cstring>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -169,6 +170,19 @@ TEST(order_poi_strings_puts_each_poi_tiers_names_first) {
     order_poi_strings_by_record(d);
     CHECK(tier_bytes(d, STR_TIER_POI) == std::string("zoo\0pub\0inn\0bar\0", 16));
     CHECK(d.poi_tier_string_ends == (std::array<uint32_t, POI_MAX_SHIPPED_TIER + 1>{0, 8, 12, 16}));
+    CHECK(poi_names(d) == names);
+}
+
+TEST(order_poi_strings_homes_a_name_in_the_tier_of_its_records_water_kind) {
+    // A pier (tier 3) that is a bay (tier 2) ships in poi/notable as the
+    // bay, whose head of the tier then holds its name.
+    ParsedData d = poi_build({{"zoo", 1}, {"Harbour Bay", 3}, {"bar", 3}});
+    d.poi_records[1].category = static_cast<uint8_t>(PoiCategory::PIER);
+    d.poi_records[1].flags = poi_flags_with_water(0, PoiCategory::BAY);
+    const std::vector<std::string> names = poi_names(d);
+    order_poi_strings_by_record(d);
+    CHECK(tier_bytes(d, STR_TIER_POI) == std::string("zoo\0Harbour Bay\0bar\0", 20));
+    CHECK(d.poi_tier_string_ends == (std::array<uint32_t, POI_MAX_SHIPPED_TIER + 1>{0, 4, 16, 20}));
     CHECK(poi_names(d) == names);
 }
 
@@ -367,4 +381,78 @@ TEST(partition_keeps_a_string_a_way_s_original_name_shares_where_a_street_name_w
     std::vector<uint32_t> qids;
     reorder_pois(d, elevations, qids, {});
     CHECK(poi_names(d) == std::vector<std::string>({"Zulu", "Alpha"}));
+}
+
+TEST(partition_keeps_an_addr_city_only_where_its_string_is_a_core_one_and_writes_none) {
+    // Drexel Hill names a place node and Upper Darby a boundary, so both are
+    // core strings; Garrett Road names only a street, Lansdowne nothing at
+    // all. The values mark no tier: the tiers are the ones a build without
+    // them lays out, and a value that isn't a core string is none.
+    auto build = [](bool cities) {
+        ParsedData d;
+        PlaceNode pn{};
+        pn.name_id = d.string_pool.intern("Drexel Hill");
+        d.place_nodes.push_back(pn);
+        AdminPolygon ap{};
+        ap.name_id = d.string_pool.intern("Upper Darby");
+        d.admin_polygons.push_back(ap);
+        WayHeader way{};
+        way.name_id = d.string_pool.intern("Garrett Road");
+        d.ways.push_back(way);
+        for (const char* number : {"1", "2", "3", "4", "5"}) {
+            AddrPoint a{};
+            a.street_id = way.name_id;
+            a.housenumber_id = d.string_pool.intern(number);
+            a.vertex_offset = NO_DATA;
+            d.addr_points.push_back(a);
+        }
+        if (cities)
+            for (const char* city : {"Drexel Hill", "Upper Darby", "Garrett Road", "Lansdowne"})
+                d.addr_city_ids.push_back(d.string_pool.intern(city));
+        if (cities) d.addr_city_ids.push_back(NO_DATA);
+        partition_strings_into_tiers(d);
+        return d;
+    };
+    const ParsedData with = build(true), without = build(false);
+    CHECK(with.strings_tiers == without.strings_tiers);
+    CHECK(with.strings_tier_bases == without.strings_tier_bases);
+    REQUIRE(with.addr_points.size() == without.addr_points.size());
+    CHECK(std::memcmp(with.addr_points.data(), without.addr_points.data(), with.addr_points.size() * sizeof(AddrPoint)) == 0);
+    REQUIRE(with.addr_city_ids.size() == size_t(5));
+    CHECK(tier_bytes(with, 0) == std::string("Drexel Hill\0Upper Darby\0", 24));
+    CHECK_EQ(with.addr_city_ids[0], with.place_nodes[0].name_id);
+    CHECK_EQ(with.addr_city_ids[1], with.admin_polygons[0].name_id);
+    CHECK(with.addr_city_ids[1] != with.addr_city_ids[0]);
+    for (size_t i = 2; i < 5; i++) CHECK_EQ(with.addr_city_ids[i], NO_DATA);
+    CHECK(without.addr_city_ids.empty());
+}
+
+TEST(partition_keeps_no_addr_city_a_place_or_boundary_does_not_name_though_its_string_is_core) {
+    // Kingsway names a street and a POI, which puts it in core though no
+    // place node or boundary has it; Drexel Hill names a place node. An
+    // addr:city of Kingsway is none.
+    ParsedData d;
+    PlaceNode pn{};
+    pn.name_id = d.string_pool.intern("Drexel Hill");
+    d.place_nodes.push_back(pn);
+    WayHeader way{};
+    way.name_id = d.string_pool.intern("Kingsway");
+    d.ways.push_back(way);
+    PoiRecord pr{};
+    pr.name_id = way.name_id;
+    pr.vertex_offset = NO_DATA;
+    pr.tier = 1;
+    d.poi_records.push_back(pr);
+    for (const char* number : {"1", "2"}) {
+        AddrPoint a{};
+        a.street_id = way.name_id;
+        a.housenumber_id = d.string_pool.intern(number);
+        a.vertex_offset = NO_DATA;
+        d.addr_points.push_back(a);
+    }
+    d.addr_city_ids = {way.name_id, pn.name_id};
+    partition_strings_into_tiers(d);
+    REQUIRE(tier_bytes(d, 0) == std::string("Drexel Hill\0Kingsway\0", 21));
+    CHECK_EQ(d.addr_city_ids[0], NO_DATA);
+    CHECK_EQ(d.addr_city_ids[1], d.place_nodes[0].name_id);
 }

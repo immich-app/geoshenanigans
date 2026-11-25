@@ -362,6 +362,7 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t
     regroup_by_cell(order, starts, data.sorted_addr_cells, threads);
     const size_t kept = starts.size();
     const bool have_postcodes = data.addr_postcode_ids.size() == n;
+    const bool have_cities = data.addr_city_ids.size() == n;
     auto sorted_buffer = vector_beside<AddrPoint>(beside ? kept : 0);
 
     // Reorder the vertex buffer alongside addr_points. Duplicates keep
@@ -379,6 +380,7 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t
     parallel_resize(sorted, kept);
     auto osm_buffer = vector_beside<uint64_t>(have_osm && beside ? kept : 0);
     auto postcode_buffer = vector_beside<uint32_t>(have_postcodes && beside ? kept : 0);
+    auto city_buffer = vector_beside<uint32_t>(have_cities && beside ? kept : 0);
     parallel_for(kept, [&](size_t b, size_t e, unsigned) {
         for (size_t k = b; k < e; k++) {
             AddrPoint p = points[order[starts[k]]];
@@ -402,6 +404,8 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t
     if (have_postcodes)
         data.addr_postcode_ids =
             first_set_per_run(data.addr_postcode_ids, order, starts, NO_DATA, threads, postcode_buffer.get());
+    if (have_cities)
+        data.addr_city_ids = first_set_per_run(data.addr_city_ids, order, starts, NO_DATA, threads, city_buffer.get());
     if (kept < n)
         std::cerr << "  Deduped addr_points: " << n << " → " << kept
                   << " (-" << (n - kept) << ")" << std::endl;
@@ -937,12 +941,21 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
     }, threads);
     std::cerr << "  POI records sorted: " << n << " (" << (n - kept) << " duplicates removed)" << std::endl;
 
-    // Compute importance
+    // Compute importance. A record that carries a water kind takes one as
+    // that kind too, of the kind's base and the same multipliers, which the
+    // tiers writing it as the kind give it (poi_record_in_tier); one whose
+    // Wikidata item's sitelink count it took says so (POI_FLAG_SITELINKS).
+    const bool any_water = parallel_count(data.poi_records.size(), [&](size_t i) {
+        return poi_water_of(data.poi_records[i].flags) != PoiCategory::UNKNOWN;
+    }, threads) > 0;
+    data.poi_water_importance.clear();
+    if (any_water) parallel_resize(data.poi_water_importance, data.poi_records.size(), uint8_t(0));
     parallel_for(data.poi_records.size(), [&](size_t first, size_t last, unsigned) {
         for (size_t i = first; i < last; i++) {
             auto& pr = data.poi_records[i];
             PoiCategory cat = static_cast<PoiCategory>(pr.category);
             double base = category_base_importance(cat);
+            const PoiCategory water = poi_water_of(pr.flags);
 
             // Wiki multiplier
             bool has_wp = (pr.flags & POI_FLAG_WIKIPEDIA) != 0;
@@ -953,6 +966,7 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
                 if (sl > 0) {
                     // Smooth curve: 1 sitelink=1.2x, 10=1.8x, 50=2.9x, 200=3.6x
                     wiki_mult = 1.0 + std::log2(1.0 + sl) / 3.0;
+                    pr.flags |= POI_FLAG_SITELINKS;
                 } else if (has_wp && has_wd) {
                     wiki_mult = 3.0;  // fallback to binary flags
                 } else if (has_wp) {
@@ -968,6 +982,8 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
             }
 
             double raw = base * wiki_mult;
+            // No water kind is a peak or a volcano.
+            double water_raw = category_base_importance(water) * wiki_mult;
 
             // Peak/volcano elevation scaling
             if ((cat == PoiCategory::PEAK || cat == PoiCategory::VOLCANO) && i < poi_elevations.size()) {
@@ -990,10 +1006,16 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
                 double lat_mid = std::abs((double)pr.lat);
                 double deg_to_km = 111.32 * std::cos(lat_mid * M_PI / 180.0);
                 double area_km2 = area_deg2 * 111.32 * deg_to_km;
-                if (area_km2 > 0) raw *= std::min(1.0 + std::log2(1.0 + area_km2) / 4.0, 2.0);
+                if (area_km2 > 0) {
+                    const double area_mult = std::min(1.0 + std::log2(1.0 + area_km2) / 4.0, 2.0);
+                    raw *= area_mult;
+                    water_raw *= area_mult;
+                }
             }
 
             pr.importance = static_cast<uint8_t>(std::max(1.0, std::min(255.0, raw)));
+            if (water != PoiCategory::UNKNOWN)
+                data.poi_water_importance[i] = static_cast<uint8_t>(std::max(1.0, std::min(255.0, water_raw)));
         }
     }, threads);
     std::cerr << "  POI importance computed" << std::endl;

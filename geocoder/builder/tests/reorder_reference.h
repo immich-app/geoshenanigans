@@ -213,6 +213,13 @@ inline void partition_strings_into_tiers(ParsedData& data) {
     remap_pc_vec(data.way_postcode_ids);
     remap_pc_vec(data.addr_postcode_ids);
     remap_pc_vec(data.interp_postcode_ids);
+    // An addr:city keeps its string where a place node or a boundary has it.
+    for (auto& city : data.addr_city_ids) {
+        auto it = city == NO_DATA ? rm.end() : rm.find(city);
+        auto bits = city == NO_DATA ? tier_mask.end() : tier_mask.find(city);
+        const bool named = bits != tier_mask.end() && (bits->second & STR_TIER_BIT_CORE);
+        city = it != rm.end() && named ? it->second : NO_DATA;
+    }
     {
         std::unordered_map<uint64_t, ParsedData::PostcodeAccum> remapped;
         remapped.reserve(data.postcode_accum.size());
@@ -286,6 +293,7 @@ inline void reorder_addr_points(ParsedData& data) {
         }
         const bool cell_order_osm = data.addr_osm_ids.size() == n;
         const bool cell_order_postcodes = data.addr_postcode_ids.size() == n;
+        const bool cell_order_cities = data.addr_city_ids.size() == n;
         std::vector<uint32_t> old_to_new(n);
         for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
         std::vector<AddrPoint> sorted(n);
@@ -363,6 +371,15 @@ inline void reorder_addr_points(ParsedData& data) {
             }
             data.addr_postcode_ids = std::move(deduped_pc);
         }
+        // addr_city_ids alike: the first copy's addr:city that is set.
+        if (cell_order_cities) {
+            std::vector<uint32_t> deduped_city(write_pos, NO_DATA);
+            for (size_t i = 0; i < n; i++) {
+                uint32_t& kept = deduped_city[dedup_remap[i]];
+                if (kept == NO_DATA) kept = data.addr_city_ids[order[i]];
+            }
+            data.addr_city_ids = std::move(deduped_city);
+        }
         if (write_pos < n)
             std::cerr << "  Deduped addr_points: " << n << " → " << write_pos
                       << " (-" << (n - write_pos) << ")" << std::endl;
@@ -391,6 +408,7 @@ inline void reorder_addr_points(ParsedData& data) {
             data.addr_vertices = std::move(vertices);
             if (cell_order_osm) move_to(data.addr_osm_ids, by_cell);
             if (cell_order_postcodes) move_to(data.addr_postcode_ids, by_cell);
+            if (cell_order_cities) move_to(data.addr_city_ids, by_cell);
             renumber_cells(data.sorted_addr_cells, by_cell);
         }
         std::cerr << "  Addr points sorted: " << n << std::endl;
@@ -849,10 +867,17 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
 
         // Compute importance
         {
+            data.poi_water_importance.clear();
+            for (const auto& pr : data.poi_records)
+                if (poi_water_of(pr.flags) != PoiCategory::UNKNOWN) {
+                    data.poi_water_importance.assign(data.poi_records.size(), 0);
+                    break;
+                }
             for (size_t i = 0; i < data.poi_records.size(); i++) {
                 auto& pr = data.poi_records[i];
                 PoiCategory cat = static_cast<PoiCategory>(pr.category);
                 double base = category_base_importance(cat);
+                const PoiCategory water = poi_water_of(pr.flags);
 
                 // Wiki multiplier
                 bool has_wp = (pr.flags & POI_FLAG_WIKIPEDIA) != 0;
@@ -863,6 +888,7 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
                     if (sl > 0) {
                         // Smooth curve: 1 sitelink=1.2x, 10=1.8x, 50=2.9x, 200=3.6x
                         wiki_mult = 1.0 + std::log2(1.0 + sl) / 3.0;
+                        pr.flags |= POI_FLAG_SITELINKS;
                     } else if (has_wp && has_wd) {
                         wiki_mult = 3.0;  // fallback to binary flags
                     } else if (has_wp) {
@@ -878,6 +904,7 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
                 }
 
                 double raw = base * wiki_mult;
+                double water_raw = category_base_importance(water) * wiki_mult;
 
                 // Peak/volcano elevation scaling
                 if ((cat == PoiCategory::PEAK || cat == PoiCategory::VOLCANO) && i < poi_elevations.size()) {
@@ -900,10 +927,15 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
                     double lat_mid = std::abs((double)pr.lat);
                     double deg_to_km = 111.32 * std::cos(lat_mid * M_PI / 180.0);
                     double area_km2 = area_deg2 * 111.32 * deg_to_km;
-                    if (area_km2 > 0) raw *= std::min(1.0 + std::log2(1.0 + area_km2) / 4.0, 2.0);
+                    if (area_km2 > 0) {
+                        raw *= std::min(1.0 + std::log2(1.0 + area_km2) / 4.0, 2.0);
+                        water_raw *= std::min(1.0 + std::log2(1.0 + area_km2) / 4.0, 2.0);
+                    }
                 }
 
                 pr.importance = static_cast<uint8_t>(std::max(1.0, std::min(255.0, raw)));
+                if (water != PoiCategory::UNKNOWN)
+                    data.poi_water_importance[i] = static_cast<uint8_t>(std::max(1.0, std::min(255.0, water_raw)));
             }
             std::cerr << "  POI importance computed" << std::endl;
         }
