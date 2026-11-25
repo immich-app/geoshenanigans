@@ -107,11 +107,13 @@ UNIT_FAILED = 3
 # Prints the CPUs the nightly's tools size their threads by.
 CPU_BUDGET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpu_budget.sh")
 
-# JSON sidecars the server's Index::load reads alongside the .bin files. They
-# go into configurations.files like any index file so the region downloader
-# can fetch them; the raw copy stays for clients that read it directly
+# The JSON files a dataset holds beside its .bin files: the sidecars the
+# server's Index::load reads, each mode dir's credit of its data, and a POI
+# tier dir's credit of the Wikidata sitelinks that rank its POIs. They go
+# into configurations.files like any index file so the region downloader can
+# fetch them; the raw copy stays for clients that read it directly
 # (test-portal).
-LOAD_SIDECARS = {"strings_layout.json", "poi_meta.json"}
+JSON_FILES = {"strings_layout.json", "poi_meta.json", "attribution.json", "poi_attribution.json"}
 
 # Every file under a region's search/ dir is a place search index file
 # (build_search_indexes.py), published like the .bin files.
@@ -132,7 +134,7 @@ def index_files(out, search=None):
         for name in names:
             # Strategy-2 sidecars (*.osm_ids) stay uncompressed: they're cached
             # only and the next build's IdAllocator reads them directly.
-            if name.endswith(".bin") or name in LOAD_SIDECARS or (in_search and not name.endswith(".zst")):
+            if name.endswith(".bin") or name in JSON_FILES or (in_search and not name.endswith(".zst")):
                 found.append(os.path.join(root, name))
     return sorted(found, key=lambda p: (-os.path.getsize(p), p))
 

@@ -1095,14 +1095,15 @@ jobs:
           fi
           # The compressor writes into the volume the diffs and verifies use
           # for scratch: at most the bytes of the files it compresses (every
-          # .bin, the load sidecars, the search indexes), none once it has
+          # .bin, the JSON files, the search indexes), none once it has
           # ended (what it wrote has left the free space then). The patch jobs
           # leave that much of the free space alone, with what the place search
           # may still write.
           RESERVE_KIB=0
           if compressing; then
             RESERVE_KIB=$(find "$WORKDIR/output" -type f \
-              \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -path '*/search/*' \) \
+              \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -name attribution.json \
+              -o -name poi_attribution.json -o -path '*/search/*' \) \
               ! -name '*.zst' -printf '%s\n' | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}')
           fi
           RESERVE_KIB=$((RESERVE_KIB + SEARCH_RESERVE_KIB))

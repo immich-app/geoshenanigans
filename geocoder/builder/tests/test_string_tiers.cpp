@@ -172,6 +172,19 @@ TEST(order_poi_strings_puts_each_poi_tiers_names_first) {
     CHECK(poi_names(d) == names);
 }
 
+TEST(order_poi_strings_homes_a_name_in_the_tier_of_its_records_water_kind) {
+    // A pier (tier 3) that is a bay (tier 2) ships in poi/notable as the
+    // bay, whose head of the tier then holds its name.
+    ParsedData d = poi_build({{"zoo", 1}, {"Harbour Bay", 3}, {"bar", 3}});
+    d.poi_records[1].category = static_cast<uint8_t>(PoiCategory::PIER);
+    d.poi_records[1].flags = poi_flags_with_water(0, PoiCategory::BAY);
+    const std::vector<std::string> names = poi_names(d);
+    order_poi_strings_by_record(d);
+    CHECK(tier_bytes(d, STR_TIER_POI) == std::string("zoo\0Harbour Bay\0bar\0", 20));
+    CHECK(d.poi_tier_string_ends == (std::array<uint32_t, POI_MAX_SHIPPED_TIER + 1>{0, 4, 16, 20}));
+    CHECK(poi_names(d) == names);
+}
+
 TEST(order_poi_strings_matches_a_serial_walk_for_any_thread_count) {
     uint64_t seed = 31;
     auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };

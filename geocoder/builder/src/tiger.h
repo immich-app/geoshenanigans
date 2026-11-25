@@ -229,6 +229,7 @@ inline std::vector<std::vector<uint32_t>> intern_tiger_csvs(ParsedData& data, co
             acc.sum_lat_e7 += pc.sum.sum_lat_e7;
             acc.sum_lng_e7 += pc.sum.sum_lng_e7;
             acc.count += pc.sum.count;
+            acc.source = ATTRIBUTION_TIGER;
         }
     }
     return ids;

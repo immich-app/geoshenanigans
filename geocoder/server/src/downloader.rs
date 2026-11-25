@@ -1243,16 +1243,32 @@ mod tests {
 
     // Index::load needs strings_layout.json in every region dir and
     // PoiMeta::load reads poi_meta.json; a selection that resolves without
-    // them downloads GiBs into a dir that can never load.
+    // them downloads GiBs into a dir that can never load. Every selection
+    // takes one mode dir, and with it that dir's attribution.json, the credit
+    // of the data the dataset holds (admin-minimal-poi's beside a POI tier,
+    // the dir that mode takes there); one with a POI tier takes the tier dir's
+    // poi_attribution.json too where the build wrote one (an optional file),
+    // the credit of the sitelinks that rank its POIs, by a name of its own,
+    // as downloads land flat by name.
     #[test]
     fn template_selections_include_load_sidecars() {
         let (v, c) = template();
         for s in template_selections(&v) {
-            let paths = resolve_files(&c, &s).unwrap().paths;
+            let resolved = resolve_files(&c, &s).unwrap();
+            let paths = resolved.paths;
             let has = |name: &str| paths.iter().any(|p| basename(p) == name);
             assert!(has("strings_layout.json"), "{:?} lacks strings_layout.json", s);
             assert!(has("admin_cells.bin"), "{:?} lacks admin_cells.bin", s);
             assert_eq!(has("poi_meta.json"), s.poi_tier != "none", "{:?} poi_meta.json", s);
+            let credits: Vec<&String> = paths.iter().filter(|p| basename(p) == "attribution.json").collect();
+            let mode_dir = if s.mode == "admin-minimal" && s.poi_tier != "none" { "admin-minimal-poi" } else { s.mode.as_str() };
+            let credit = format!("{}/{}/attribution.json", s.region, mode_dir);
+            assert_eq!(credits, [&credit], "{:?}", s);
+            assert!(!resolved.optional.contains(credits[0].as_str()), "{:?}", s);
+            let poi_credits: Vec<&String> = paths.iter().filter(|p| basename(p) == "poi_attribution.json").collect();
+            let poi_credit = format!("{}/poi/{}/poi_attribution.json", s.region, s.poi_tier);
+            assert_eq!(poi_credits, if s.poi_tier == "none" { vec![] } else { vec![&poi_credit] }, "{:?}", s);
+            assert!(poi_credits.iter().all(|p| resolved.optional.contains(p.as_str())), "{:?}", s);
         }
     }
 
@@ -1275,8 +1291,8 @@ mod tests {
     fn template_admin_minimal_takes_its_poi_dir_beside_a_poi_tier() {
         let (v, c) = template();
         let files = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin",
-                     "arc_index.bin", "arc_vertices.bin", "place_cells.bin", "place_hidden.bin", "place_nodes.bin", "strings_core.bin",
-                     "strings_layout.json"];
+                     "arc_index.bin", "arc_vertices.bin", "attribution.json", "place_cells.bin", "place_hidden.bin", "place_nodes.bin",
+                     "strings_core.bin", "strings_layout.json"];
         let minimal: Vec<RegionSelection> = template_selections(&v).into_iter()
             .filter(|s| s.mode == "admin-minimal" && s.region == "europe")
             .collect();
