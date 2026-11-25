@@ -302,6 +302,31 @@ fn a_boundary_the_street_runs_into_is_a_row_of_its_rank() {
 }
 
 #[test]
+fn a_boundary_the_street_runs_into_cells_away_from_the_house_is_a_row_of_its_rank() {
+    // Saw Mill River Road runs 25 km east from Greenburgh into Elmsford, whose boundary no admin
+    // cell of the house's holds; house 9 is in Greenburgh. getNearFeatures takes the street whole,
+    // so Nominatim's street has a row of rank 16 for each: the house's addr:city takes Elmsford.
+    let index = |city: Option<&str>| {
+        let mut index = united_states();
+        index
+            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Elmsford", 8, 0, (-3000.0, 25_000.0, 3000.0, 31_000.0))
+            .street("Saw Mill River Road", &[(0.0, 1500.0), (0.0, 27_000.0)])
+            .address("9", 10.0, 2900.0);
+        if let Some(city) = city {
+            index.addr_city(city);
+        }
+        index.load()
+    };
+    for (city, part) in [(None, "Greenburgh"), (Some("Elmsford"), "Elmsford")] {
+        let (display, address) = answer_at(&index(city), 10.0, 2900.0);
+        assert_eq!(display, format!("9 Saw Mill River Road, {part}, United States"), "{city:?}");
+        assert_eq!(address["city"], part, "{city:?}");
+    }
+}
+
+
+#[test]
 fn a_place_node_a_place_area_of_its_name_and_rank_links_is_no_row() {
     // High Wycombe, a place=town area of rank 16, holds the town node of its name, whose rank is
     // its own: find_linked_place's name match, which runs for ways as well as relations, links the

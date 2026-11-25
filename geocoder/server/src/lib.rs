@@ -836,6 +836,11 @@ pub const MAX_NESTED_RANK: u8 = 25;
 /// rank 25 names nothing, nor does one of rank 0.
 pub const ADDRESS_AREA_RANKS: std::ops::Range<u8> = 1..25;
 
+/// The margin round a street of the admin cells the crosscheck reads areas from
+/// (Index::crosscheck_rows): the street runs through an area only in a cell under it, and
+/// cells_under_line cuts the street into boxes twice this across.
+pub const STREET_CELLS_MARGIN_M: f64 = 50.0;
+
 // --- String pool (tiered) ---
 //
 // Strings are split into 5 files: core/street/addr/postcode/poi.  Record
@@ -3825,19 +3830,35 @@ impl Index {
     /// their own name or by a place node's they link, the farthest from `feature` first
     /// (area_row_distance), then the place nodes of `nodes` (PlaceResult::named_rows), the
     /// farthest first, but those a place area links (links_by_name). The polygons are those of
-    /// `areas`, the address's ranked polygons (found by `scan`), and those of the scan's others
-    /// that are rows of `feature` as getNearFeatures takes them (partition-functions.sql:39-44):
-    /// a polygon holding the point where the feature is one, such as a larger boundary of a level
-    /// `areas` holds it by, else one the street runs through, each at area_row_rank's rank;
-    /// `country` is the point's, upper case.
+    /// `areas`, the address's ranked polygons (found by `scan`), and the others that are rows of
+    /// `feature` as getNearFeatures takes them (partition-functions.sql:39-44): one of the scan
+    /// holding the point where the feature is one, such as a larger boundary of a level `areas`
+    /// holds it by, else one the street runs through, of any admin cell under the street, each at
+    /// area_row_rank's rank; `country` is the point's, upper case.
     fn crosscheck_rows(&self, name: u32, areas: &[RankedPoly], scan: &mut AdminScan, nodes: &[NamedRow],
                        feature: PlaceFeature<'_>, country: &str) -> Vec<CrosscheckRow<'_>> {
         let named = |poly: &AdminPolygon| poly.name_id == name || self.links_name(poly, name);
         let same = |a: &AdminPolygon, b: &AdminPolygon| a.ring_offset == b.ring_offset && a.ring_bytes == b.ring_bytes;
         let mut polygons: Vec<RankedPoly> = areas.iter().filter(|r| named(&r.poly)).copied().collect();
+        // The scan lists the point's admin cell alone, and a street runs through the areas of
+        // every cell under it.
+        let mut candidates = scan.rings.clone();
+        if let PlaceFeature::Line(line) = feature {
+            let (lat, lng) = scan.pip.point.degrees();
+            let here = cell_id_at_level(lat, lng, self.admin_cell_level);
+            let mut listed: std::collections::HashSet<u32> = candidates.iter().map(|&(id, _)| id & ID_MASK).collect();
+            for cell in cells_under_line(line, STREET_CELLS_MARGIN_M, self.admin_cell_level) {
+                if cell == here { continue; }
+                self.admin_index.with_ids(cell, |ids| {
+                    for &id in ids {
+                        if !listed.insert(id & ID_MASK) { continue; }
+                        if let Some(poly) = self.admin_polygon(id & ID_MASK) { candidates.push((id & ID_MASK, poly)); }
+                    }
+                });
+            }
+        }
         let mut seen: Vec<u32> = Vec::new();
-        for k in 0..scan.rings.len() {
-            let (id, poly) = scan.rings[k];
+        for &(id, poly) in &candidates {
             if !is_address_area(&poly) || !named(&poly) || seen.contains(&(id & ID_MASK)) { continue; }
             seen.push(id & ID_MASK);
             if areas.iter().any(|r| same(&r.poly, &poly)) { continue; }
@@ -3863,7 +3884,7 @@ impl Index {
         }
         let place_area = |poly: &AdminPolygon| poly.admin_level == 15 && poly.name_id == name;
         let place_areas: Vec<RankedPoly> = areas.iter().filter(|r| place_area(&r.poly)).copied()
-            .chain(scan.rings.iter().filter(|(_, poly)| place_area(poly) && !areas.iter().any(|r| same(&r.poly, poly)))
+            .chain(candidates.iter().filter(|(_, poly)| place_area(poly) && !areas.iter().any(|r| same(&r.poly, poly)))
                 .map(|&(_, poly)| RankedPoly { poly, rank_address: self.area_row_rank(&poly, areas, country) }))
             .collect();
         let mut nodes: Vec<NamedRow> = nodes.iter().filter(|row| !place_areas.iter().any(|r| self.links_by_name(r, &row.node))).copied().collect();
