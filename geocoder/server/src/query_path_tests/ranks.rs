@@ -204,6 +204,24 @@ fn boundaries_of_levels_11_and_12_are_parts_of_the_address_and_a_postal_area_non
 }
 
 #[test]
+fn a_smaller_country_way_of_rank_0_leaves_the_postcode_to_the_country_of_the_answer() {
+    // A closed level 2 way of another country code, which the builder keeps at rank 0 to name a
+    // country only where no relation of a rank holds the point, lies inside Germany's relation
+    // round the point. The answer's country is the relation's, as Nominatim's country polygons
+    // (location_area_country) are the ranked ones, and the postal area round the point names a
+    // postcode of that country.
+    let mut index = TestIndex::in_country(b"DE");
+    index
+        .boundary("Brandenburg", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Enklave", 2, 0, (-5000.0, -5000.0, 5000.0, 5000.0)).rank(0);
+    index.polygons.last_mut().unwrap().0.country_code = u16::from_be_bytes(*b"AT");
+    index.boundary("14467", POSTCODE_AREA_LEVEL, 0, (-2000.0, -2000.0, 2000.0, 2000.0));
+    let address = address_at(&index.load(), 100.0, 100.0);
+    assert_eq!(address["country_code"], "DE");
+    assert_eq!(address["postcode"], "14467");
+}
+
+#[test]
 fn a_boundary_that_repeats_its_parent_leaves_its_level_to_a_larger_one_round_the_point() {
     // is_same gives a boundary that repeats its parent rank_address 0 (placex_triggers.sql:915-932),
     // as the builder stores it, and a boundary of rank 0 is no address area (:1273): every other

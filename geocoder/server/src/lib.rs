@@ -1968,7 +1968,8 @@ impl Index {
             }
             let address = ADDRESS_AREA_RANKS.contains(&poly.rank_address);
             if level == 2 {
-                country.get_or_insert(poly);
+                // The country of a rank where one holds the point: the answer's.
+                if address || country.is_none() { country = Some(poly); }
                 ranked_country = address;
             }
             if !address { continue; }
