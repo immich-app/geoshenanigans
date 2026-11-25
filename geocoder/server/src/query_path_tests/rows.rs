@@ -402,6 +402,27 @@ fn an_area_the_street_does_not_run_through_is_no_row_of_a_rank_it_shares() {
 }
 
 #[test]
+fn an_area_the_walk_does_not_accept_shows_only_where_it_holds_the_result_s_centroid() {
+    // Two areas of rank 20 hold the point and meet Bend Street: the boundary Lowside round the
+    // street's middle, which the walk accepts (isaddress, score 0), and the suburb area Highside,
+    // which the street enters where it turns north. The street is the answer, its centroid its
+    // point nearest the query (ST_ClosestPoint, reverse.py:46). West of the turn that point lies
+    // outside Highside, which then scores -1 (results.py:611-632), and Lowside is the rank's row;
+    // past the turn Highside holds it, scores 1 and is the row.
+    let mut index = country("Testland", b"XX");
+    index
+        .boundary("Lowside", 10, 0, (-100.0, -300.0, 50.0, 300.0))
+        .boundary("Highside", 15, 4, (20.0, -300.0, 300.0, 300.0))
+        .street("Bend Street", &[(0.0, -200.0), (0.0, 100.0), (100.0, 100.0)]);
+    let index = index.load();
+    for (east, suburb) in [(-100.0, "Lowside"), (150.0, "Highside")] {
+        let (display, address) = answer_at(&index, 30.0, east);
+        assert_eq!(display, format!("Bend Street, {suburb}, Testland"), "{east}");
+        assert_eq!(address["suburb"], suburb, "{east}");
+    }
+}
+
+#[test]
 fn a_place_area_the_walk_accepts_is_the_boundary_of_finer_place_nodes() {
     // The place=city area Metro holds the street, and the walk accepts it at rank 16: it becomes
     // the current boundary (placex_triggers.sql:645-652), so the suburb node Outskirts, outside it

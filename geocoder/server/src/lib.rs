@@ -2060,8 +2060,14 @@ impl Index {
     }
 
     /// `find_admin` over a scan the caller may share with the other admin lookups of the point,
-    /// the rows of the address hanging from `feature` (area_rows).
+    /// the rows of the address hanging from `feature` (area_rows) of a result at the point.
     pub fn find_admin_in(&self, scan: &mut AdminScan, feature: PlaceFeature<'_>) -> AdminResult<'_> {
+        self.find_admin_at(scan, feature, None)
+    }
+
+    /// `find_admin_in` for a result whose centroid is `centroid` (area_rows), the point where
+    /// none is given.
+    fn find_admin_at(&self, scan: &mut AdminScan, feature: PlaceFeature<'_>, centroid: Option<(f64, f64)>) -> AdminResult<'_> {
         // For each admin level, the smallest-area polygon holding the point, the first in
         // visiting order among equals (`ScanPip::holds`: an entry flagged interior holds it
         // without a test). Owned AdminPolygon values so the backing admin_polygons file can be a
@@ -2186,7 +2192,7 @@ impl Index {
         ranked.retain(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address));
         one_boundary_a_rank(&mut ranked, &round_smallest);
 
-        let shown = self.area_rows(&ranked, feature, &country_code_str, true);
+        let shown = self.area_rows(&ranked, feature, &country_code_str, true, centroid);
         result.boundary_ranks = rank_bits(shown.iter().map(|&k| &ranked[k]));
         result.country_code = shown.iter()
             .find(|&&k| polygon_field(&ranked[k]) == Some("country"))
@@ -2286,29 +2292,35 @@ impl Index {
 
     /// The polygon of `ranked` each rank shows, as Nominatim's complete_address_details orders
     /// a rank's rows (results.py:611-632): the address walk accepts one area a rank (area_walk),
-    /// which scores 0, and another area holding the result's centroid scores 1, the one farthest
-    /// from `feature` by plain distance first, then the one of the higher rank_search. A polygon
-    /// of `ranked` stands for one holding the result's centroid, so a rank of two or more shows
-    /// the farthest the walk does not accept: of County Dublin and the postal district Dublin 4
-    /// at rank 12, whose centre is the nearer Mespil Road, County Dublin. Indices into `ranked`;
-    /// `country` is the point's, upper case; `held` where every polygon of `ranked` holds the
-    /// point of a point `feature`. Where no two areas share a rank, each is its rank's row,
-    /// whichever the walk accepts, and the walk is not run.
-    fn area_rows(&self, ranked: &[RankedPoly], feature: PlaceFeature<'_>, country: &str, held: bool) -> Vec<usize> {
+    /// which scores 0, another area holding the result's centroid `centroid` scores 1 and one
+    /// that does not -1, the one farthest from `feature` by plain distance first, then the one of
+    /// the higher rank_search. Of County Dublin and the postal district Dublin 4 at rank 12, both
+    /// round the house, whose centre is the nearer Mespil Road, County Dublin shows. Indices into
+    /// `ranked`; `country` is the point's, upper case; `held` where every polygon of `ranked`
+    /// holds the point of a point `feature`, and `centroid` none where every one holds the
+    /// result's centroid. Where no two areas share a rank, each is its rank's row, whichever the
+    /// walk accepts, and the walk is not run.
+    fn area_rows(&self, ranked: &[RankedPoly], feature: PlaceFeature<'_>, country: &str, held: bool,
+                 centroid: Option<(f64, f64)>) -> Vec<usize> {
         let kept = address_areas(ranked, |a, b| self.admin_geometry.same_outline(a, b));
         let rank = |k: usize| ranked[k].rank_address;
         if kept.iter().enumerate().all(|(i, &k)| kept[..i].iter().all(|&j| rank(j) != rank(k))) {
             return kept;
         }
+        let score = |&(k, accepted, _): &(usize, bool, f64)| match (accepted, centroid) {
+            (true, _) => 0,
+            (false, None) => 1,
+            (false, Some((lat, lng))) => if self.admin_geometry.contains_once(&ranked[k].poly, AdminPoint::new(lat, lng)) { 1 } else { -1 },
+        };
         self.area_walk_of(ranked, kept, feature, country, held)
             .chunk_by(|a, b| ranked[a.0].rank_address == ranked[b.0].rank_address)
             .map(|rank| match rank {
                 [(k, _, _)] => *k,
                 _ => rank.iter()
-                    .filter(|(_, accepted, _)| !accepted)
-                    .max_by(|a, b| a.2.total_cmp(&b.2)
+                    .map(|row| (score(row), row))
+                    .max_by(|(sa, a), (sb, b)| sa.cmp(sb).then_with(|| a.2.total_cmp(&b.2))
                         .then_with(|| self.area_search_rank(&ranked[a.0].poly, country).cmp(&self.area_search_rank(&ranked[b.0].poly, country))))
-                    .map_or(rank[0].0, |(k, _, _)| *k),
+                    .map_or(rank[0].0, |(_, (k, _, _))| *k),
             })
             .collect()
     }
@@ -2777,15 +2789,17 @@ impl Index {
     // in the result, avoiding the false-positive EXTRAs from
     // the pure PIP approach.
     pub fn find_admin_from_chain(&self, start_poly_id: u32, lat: f64, lng: f64) -> AdminResult<'_> {
-        self.find_admin_from_chain_in(start_poly_id, &mut AdminScan::new(self, lat, lng), PlaceFeature::Point(lat, lng))
+        self.find_admin_from_chain_in(start_poly_id, &mut AdminScan::new(self, lat, lng), PlaceFeature::Point(lat, lng), None)
     }
 
     /// `find_admin_from_chain` over a scan the caller may share, the rows of the address hanging
-    /// from `feature` (area_rows).
-    pub fn find_admin_from_chain_in(&self, start_poly_id: u32, scan: &mut AdminScan, feature: PlaceFeature<'_>) -> AdminResult<'_> {
+    /// from `feature` (area_rows) of a result whose centroid is `centroid`, the point where none
+    /// is given.
+    pub fn find_admin_from_chain_in(&self, start_poly_id: u32, scan: &mut AdminScan, feature: PlaceFeature<'_>,
+                                    centroid: Option<(f64, f64)>) -> AdminResult<'_> {
         let admin_parents = match &self.admin_parents {
             Some(m) => m,
-            None => return self.find_admin_in(scan, feature),
+            None => return self.find_admin_at(scan, feature, centroid),
         };
         let parents_count = admin_parents.len() / 4;
         let total_polys = u64::from(self.admin_polygon_count());
@@ -2850,8 +2864,8 @@ impl Index {
         promote_nested_ranks(&mut ranked, place_area_polygons.iter(), &country_code_str, within);
         ranked.retain(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address));
 
-        // The chain's polygons need not hold the point.
-        let shown = self.area_rows(&ranked, feature, &country_code_str, false);
+        // The chain's polygons need not hold the point, nor the result's centroid.
+        let shown = self.area_rows(&ranked, feature, &country_code_str, false, Some(centroid.unwrap_or_else(|| scan.pip.point.degrees())));
         result.boundary_ranks = rank_bits(shown.iter().map(|&k| &ranked[k]));
         result.country_code = shown.iter()
             .find(|&&k| polygon_field(&ranked[k]) == Some("country"))
@@ -3164,8 +3178,10 @@ impl Index {
 
     // --- Combined query ---
 
+    /// The admin rows of the address hanging from `feature` of a result whose centroid is
+    /// `centroid` (area_rows), the point (lat, lng) where none is given.
     fn resolve_admin<'a>(&'a self, scan: &mut AdminScan, lat: f64, lng: f64, street: Option<&(f64, WayRow, u32)>,
-                         feature: PlaceFeature<'_>) -> AdminResult<'a> {
+                         feature: PlaceFeature<'_>, centroid: Option<(f64, f64)>) -> AdminResult<'a> {
         // Hybrid admin resolution: when the primary is a street with a
         // pre-computed parent polygon, walk its admin_parents chain for
         // coarse ranks (country → city) and use PIP for finer ranks
@@ -3177,12 +3193,12 @@ impl Index {
         // street's centroid often sits in a different suburb polygon
         // than the query point — chain walk would then pick the
         // centroid-containing suburb rather than the query's suburb.
-        let admin_pip = self.find_admin_in(scan, feature);
+        let admin_pip = self.find_admin_at(scan, feature, centroid);
         let admin_chain = (|| -> Option<AdminResult<'_>> {
             let wp = self.way_parents.as_ref()?;
             let (_, _, way_idx) = street?;
             let start = Self::sidecar_u32(wp, u64::from(*way_idx))?;
-            Some(self.find_admin_from_chain_in(start, scan, feature))
+            Some(self.find_admin_from_chain_in(start, scan, feature, centroid))
         })();
         // Nominatim's answer puts, at each rank, a boundary holding the
         // result's centroid (for a street its ST_ClosestPoint to the query)
@@ -3579,7 +3595,21 @@ impl Index {
         // One admin cell scan serves every admin lookup at the point. The
         // rows are those of the address hanging from `feature`.
         let mut admin_scan = AdminScan::new(self, lat, lng);
-        let admin = self.resolve_admin(&mut admin_scan, lat, lng, street.as_ref(), feature);
+        // The result's centroid, which an area of a rank the walk does not accept must hold to
+        // show there (area_rows): the answering house or POI's, else the winning street's point
+        // nearest the query (reverse.py:46, ST_ClosestPoint for a line), else the point's own.
+        let centroid: Option<(f64, f64)> = if closest_feature_dist >= max_dist {
+            None
+        } else if poi_won_primary {
+            poi_primary.as_ref().map(|(_, poi)| (f64::from(poi.lat), f64::from(poi.lng)))
+        } else if addr_won_primary {
+            addr.as_ref().map(|(_, point, _)| (f64::from(point.lat), f64::from(point.lng)))
+        } else if let Some((_, point)) = street_house.as_ref() {
+            Some((f64::from(point.lat), f64::from(point.lng)))
+        } else {
+            street.as_ref().and_then(|(_, _, way_idx)| self.closest_point_on_way(*way_idx, lat, lng))
+        };
+        let admin = self.resolve_admin(&mut admin_scan, lat, lng, street.as_ref(), feature, centroid);
         // No address point: Nominatim falls back to TIGER in the US.
         if let Some(refine_max_sq) = tiger_reach_sq {
             if house_number.is_none() && admin.country_code == Some(*b"US") {
@@ -10723,7 +10753,7 @@ mod admin_scan_tests {
         // Valley, not the scan's Kharga, so this is no fallback to find_admin), its place area the
         // scan's interior entry.
         let mut scan = AdminScan::new(&idx, Q.0, Q.1);
-        let c = idx.find_admin_from_chain_in(2, &mut scan, PlaceFeature::Point(Q.0, Q.1));
+        let c = idx.find_admin_from_chain_in(2, &mut scan, PlaceFeature::Point(Q.0, Q.1), None);
         assert_eq!((c.name("country"), c.name("state"), c.name("city"), c.name("neighbourhood")), (Some("Egypt"), Some("New Valley"), Some("Paris"), Some("Bir Tarfawi")));
         assert_eq!(scan.pip.memo.arcs_read(), 0);
         // The same rings listed not interior are tested.
@@ -10879,7 +10909,7 @@ mod admin_scan_tests {
         let a = idx.find_admin_in(&mut scan, PlaceFeature::Point(Q.0, Q.1));
         assert_eq!((a.name("country"), a.name("state"), a.name("neighbourhood")), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
         // No admin_parents: the chain lookup falls back to find_admin over the same scan.
-        let c = idx.find_admin_from_chain_in(0, &mut scan, PlaceFeature::Point(Q.0, Q.1));
+        let c = idx.find_admin_from_chain_in(0, &mut scan, PlaceFeature::Point(Q.0, Q.1), None);
         assert_eq!((c.name("country"), c.name("state"), c.name("neighbourhood")), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
     }
 
