@@ -498,11 +498,11 @@ fn an_address_and_a_street_over_a_pole_are_as_far_as_they_are() {
 }
 
 #[test]
-fn an_interpolation_number_by_a_pole_is_along_its_great_circle() {
+fn an_interpolation_number_by_a_pole_is_where_its_line_is_in_degrees() {
     // By the pole, where the scans measure on the gnomonic projection about the point: a line
     // numbered 1 to 3001 along the meridian from 84° N to the pole, at 89° N, five sixths of the
-    // way along it, is number 2501; though five sixths of the way along its projection,
-    // tan 5° / (tan 5° + tan 1°), would be 2502.
+    // way along it in degrees, where Nominatim locates the number at any latitude, is number 2501;
+    // the fraction of the way along its projection, tan 5° / (tan 5° + tan 1°), would give 2502.
     let q = (89.0, 0.0);
     let line = vec![NodeCoord { lat: 84.0, lng: 0.0 }, NodeCoord { lat: 90.0, lng: 0.0 }];
     let index = TestIndex::around(q).interpolation_through("Pole Road", (1, 3001, 0), line).load();
@@ -549,6 +549,31 @@ fn an_interpolation_number_is_where_its_line_is_nearest_in_degrees() {
     assert_eq!(index.find_interp_on_way(origin.0, origin.1, "Main Street", radians_sq(100.0)), Some(51));
     let interp = &index.debug_primary(origin.0, origin.1)["interp"];
     assert!(interp["number"] == 51 && about(&interp["dist_m"], 0.0006_f64.to_radians() * 6_371_000.0), "{interp}");
+}
+
+#[test]
+fn an_interpolation_number_is_in_plain_degrees_however_far_the_scan_reads() {
+    // Nominatim locates the number on the lon/lat line at any latitude. At 70° N, a line numbered 1
+    // to 301 running 0.0018° east along 70.0009° N from 0.0006° W, then 0.0018° south, is nearest
+    // in degrees a sixth of the way along it, number 51, at a search distance of 130 m and of
+    // 1200 m alike, though at 1200 m the scans measure on the gnomonic projection.
+    let origin = (70.0, 0.0);
+    assert!(geo_origin_is_polar(origin, 1200.0) && !geo_origin_is_polar(origin, DEFAULT_SEARCH_DISTANCE));
+    let node = |lat: f64, lng: f64| NodeCoord { lat: lat as f32, lng: lng as f32 };
+    let line = vec![node(70.0009, -0.0006), node(70.0009, 0.0012), node(69.9991, 0.0012)];
+    let mut dataset = TestIndex::around(origin);
+    dataset.interpolation_through("Main Street", (1, 301, 0), line);
+    for metres in [DEFAULT_SEARCH_DISTANCE, 1200.0] {
+        let index = dataset.load_reaching(metres);
+        assert_eq!(index.find_interp_on_way(origin.0, origin.1, "Main Street", radians_sq(100.0)), Some(51), "{metres} m");
+        assert_eq!(index.debug_primary(origin.0, origin.1)["interp"]["number"], 51, "{metres} m");
+    }
+}
+
+/// Whether the scans round `point` measure on the gnomonic projection at a search distance of
+/// `metres`.
+fn geo_origin_is_polar(point: (f64, f64), metres: f64) -> bool {
+    GeoOrigin::new(point.0, point.1, geo_cover(metres / 6_371_000.0, DEFAULT_STREET_CELL_LEVEL)).polar.is_some()
 }
 
 #[test]

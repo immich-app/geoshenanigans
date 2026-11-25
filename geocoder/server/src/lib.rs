@@ -253,12 +253,6 @@ fn unit_vector(lat: f64, lng: f64) -> [f64; 3] {
     [cos_lat * cos_lng, cos_lat * sin_lng, sin_lat]
 }
 
-/// The angle between the directions of `u` and `v` (of any length), in radians.
-fn angle_between(u: [f64; 3], v: [f64; 3]) -> f64 {
-    let across = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
-    (across[0] * across[0] + across[1] * across[1] + across[2] * across[2]).sqrt().atan2(u[0] * v[0] + u[1] * v[1] + u[2] * v[2])
-}
-
 /// Where a geo lookup measures from, and on what plane, squared distances in radians² as
 /// `max_distance_sq` is: the plane where a degree of longitude is cos(lat) of a degree of latitude
 /// at the point (point_to_segment_distance), each longitude taken the short way round from the
@@ -346,36 +340,18 @@ impl GeoOrigin {
 
     /// The squared distance in plain degrees (as radians², as PostGIS measures a lon/lat line) to
     /// the point of the edge from `a` to `b` nearest in degrees, and the fraction along the edge
-    /// of that point. By a pole, where degrees are no plane, `segment`'s distance and the fraction
-    /// of its great circle's length up to its point nearest the point: the projection keeps the
-    /// edge straight but not its lengths.
+    /// of that point: at any latitude, as Nominatim locates a house number on its lon/lat line.
     fn segment_in_degrees(&self, a: NodeCoord, b: NodeCoord) -> (f64, f64) {
-        let Some(basis) = &self.polar else {
-            return point_to_segment_with_t(self.lat, self.lng, a.lat as f64, self.near_lng(a.lng as f64),
-                                           b.lat as f64, self.near_lng(b.lng as f64), PLANAR);
-        };
-        let (Some(pa), Some(pb)) = (Self::project(basis, a), Self::project(basis, b)) else {
-            return (f64::MAX, 0.0);
-        };
-        let (r, t) = nearest_to_origin(pa, pb);
-        let (x, y) = (pa.0 + t * (pb.0 - pa.0), pa.1 + t * (pb.1 - pa.1));
-        let foot = [0, 1, 2].map(|k| basis[0][k] + x * basis[1][k] + y * basis[2][k]);
-        let (u, v) = (unit_vector(a.lat as f64, a.lng as f64), unit_vector(b.lat as f64, b.lng as f64));
-        let whole = angle_between(u, v);
-        (r.atan().powi(2), if whole > 0.0 { (angle_between(u, foot) / whole).min(1.0) } else { 0.0 })
+        point_to_segment_with_t(self.lat, self.lng, a.lat as f64, self.near_lng(a.lng as f64),
+                                b.lat as f64, self.near_lng(b.lng as f64), PLANAR)
     }
 
     /// The length of the edge from `a` to `b` in plain degrees (as radians), as PostGIS measures
-    /// a lon/lat line; by a pole, along its great circle.
+    /// a lon/lat line.
     fn length(&self, a: NodeCoord, b: NodeCoord) -> f64 {
-        match &self.polar {
-            None => {
-                let dlat = (b.lat as f64 - a.lat as f64).to_radians();
-                let dlng = (self.near_lng(b.lng as f64) - self.near_lng(a.lng as f64)).to_radians();
-                dist_sq(dlat, dlng, PLANAR).sqrt()
-            }
-            Some(_) => angle_between(unit_vector(a.lat as f64, a.lng as f64), unit_vector(b.lat as f64, b.lng as f64)),
-        }
+        let dlat = (b.lat as f64 - a.lat as f64).to_radians();
+        let dlng = (self.near_lng(b.lng as f64) - self.near_lng(a.lng as f64)).to_radians();
+        dist_sq(dlat, dlng, PLANAR).sqrt()
     }
 
     /// The squared distance to the polygon through `vertices`: 0 for the point inside it, as
