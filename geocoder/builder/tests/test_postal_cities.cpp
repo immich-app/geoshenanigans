@@ -318,9 +318,12 @@ TEST(geonames_places_are_read_from_our_tsv_and_from_its_own_files) {
         "PR\t00601\tAdjuntas\tAdjuntas\t001\t\t\t\t\t18.1627\t-66.7221\t4\r\n"
         "US\t09001\tAPO AA\t\t\t\t\t\t\t38.1105\t15.6613\t\n"
         "US\t99553\tAkutan\tAlaska\tAK\tAleutians East\t013\t\t\t54.143\t-165.7854\t1\n"
+        "DE\t10115\tBerlin\tBerlin\tBE\t\t00\t\t\t52.5323\t13.3846\t4\n"
+        "US\t10115\tNew York\tNew York\tNY\tNew York\t061\t\t\t40.8111\t-73.9642\t1\n"
+        "MX\t22030\tTijuana\tBC\n"
         "short line\n");
     const postal_cities::Places places = postal_cities::parse_places(in, postcode_grid::grid_postcode);
-    CHECK_EQ(places.size(), size_t(5));
+    CHECK_EQ(places.size(), size_t(6));
     auto at = [&](const std::string& code) {
         const auto it = places.find({US, code});
         return it == places.end() ? std::string("-") : it->second.name + "/" + it->second.state;
@@ -332,6 +335,9 @@ TEST(geonames_places_are_read_from_our_tsv_and_from_its_own_files) {
     CHECK_EQ(at("99553"), std::string("Akutan/AK"));
     CHECK_EQ(at("19083"), std::string("-"));
     CHECK_EQ(at("19008"), std::string("-"));
+    // A row of a country outside the ZIP space is none of a ZIP's.
+    CHECK_EQ(at("10115"), std::string("New York/NY"));
+    CHECK_EQ(at("22030"), std::string("-"));
 }
 
 TEST(a_builds_table_names_each_code_of_its_votes_in_code_order) {

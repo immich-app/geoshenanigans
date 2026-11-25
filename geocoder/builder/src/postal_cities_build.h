@@ -281,12 +281,16 @@ struct Place {
     std::string name, state;
 };
 
+// The countries whose rows of GeoNames' are of the United States' ZIP space:
+// it and its territories, whose answers give its country.
+inline constexpr std::string_view ZIP_SPACE_COUNTRIES[] = {"US", "PR", "VI", "GU", "AS", "MP"};
+
 // The GeoNames entries by (country, code), of a TSV of country, code, name
 // and state, or of GeoNames' postal code files themselves (12 fields: the
-// state is the admin code, or the country of a territory). Every row is
-// taken as the United States': the territories' ZIPs are of its ZIP space,
-// and the answers there give its country. A row of no code, a name the
-// format can't hold, or a code the grid's pattern doesn't take is skipped.
+// state is the admin code, or the country of a territory). A row of the ZIP
+// space (ZIP_SPACE_COUNTRIES) is taken as the United States'; one of another
+// country, of no code, of a name the format can't hold, or of a code the
+// grid's pattern doesn't take is skipped.
 using Places = std::map<std::pair<uint16_t, std::string>, Place>;
 template <class CodeOf>
 inline Places parse_places(std::istream& in, CodeOf code_of_zip) {
@@ -304,6 +308,8 @@ inline Places parse_places(std::istream& in, CodeOf code_of_zip) {
         }
         if (f.size() < 4) continue;
         const std::string_view country = f[0], name = trim(f[2]);
+        if (std::find(std::begin(ZIP_SPACE_COUNTRIES), std::end(ZIP_SPACE_COUNTRIES), country) == std::end(ZIP_SPACE_COUNTRIES))
+            continue;
         const std::string_view state = f.size() >= 12 ? (country == "US" ? f[4] : country) : f[3];
         const std::optional<std::string> code = code_of_zip(US, f[1]);
         if (!code || name.empty() || name.size() > NAME_BYTES || !name_text(name)) continue;
