@@ -438,3 +438,27 @@ TEST(a_boundary_of_rank_25_answers_where_nothing_nearer_does) {
     CHECK(displays(answers[1], "Telfer Road, Western Australia, Australia"));
     CHECK(displays(answers[2], "Punmu, Western Australia, Australia"));
 }
+
+TEST(a_rank_dump_is_a_new_file_and_a_build_without_boundaries_writes_its_header) {
+    // --rank-dump writes a file of its own: a build naming one that is there fails and leaves it
+    // as it was. A build of place nodes alone, which ranks no boundary, writes the header.
+    Fixture f = winsford();
+    const ScratchDir root("rank-dump");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", dump = root.path() + "/ranks.tsv",
+                      log = root.path() + "/build.log";
+    write_test_pbf(pbf, f.objects(), 1000);
+    std::ofstream(dump) << "kept\n";
+    CHECK(!gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/out", pbf, "--rank-dump", dump}, log));
+    CHECK((file_bytes(dump) == std::vector<char>{'k', 'e', 'p', 't', '\n'}));
+
+    Fixture nodes;
+    nodes.node(53.19, -2.52, {{"place", "town"}, {"name", "Winsford"}});
+    const std::string nodes_pbf = root.path() + "/nodes.osm.pbf", nodes_dump = root.path() + "/nodes.tsv";
+    write_test_pbf(nodes_pbf, nodes.objects(), 1000);
+    const bool built = gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/nodes", nodes_pbf, "--rank-dump", nodes_dump}, log);
+    if (!built) print_failure("build-index", log);
+    REQUIRE(built);
+    const std::vector<char> header = file_bytes(nodes_dump);
+    CHECK(std::string(header.begin(), header.end()).rfind("object\tlevel\t", 0) == 0);
+    CHECK_EQ(std::count(header.begin(), header.end(), '\n'), 1L);
+}

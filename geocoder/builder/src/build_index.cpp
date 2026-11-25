@@ -2,6 +2,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
@@ -24,6 +25,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <unistd.h>
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
@@ -833,11 +835,21 @@ static void hide_linked_place_nodes(ParsedData& data, const AdminRings& countrie
     std::cerr << "Hidden place nodes: " << hidden << " linked (" << claims << " claims)" << std::endl;
 }
 
-// Writes the pass's traces as TSV to `path`: a row a boundary or place area,
-// by osm id (r for a relation, w for a closed way).
+// Makes the --rank-dump file at `path`, which must not be there yet, so that
+// a path naming an input or an earlier output loses nothing; write_rank_dump
+// fills it.
+static void create_rank_dump(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) throw std::runtime_error("--rank-dump: can't make " + path + ": " + std::strerror(errno));
+    ::close(fd);
+}
+
+// Writes the pass's traces as TSV to `path` (create_rank_dump's): a row a
+// boundary or place area, by osm id (r for a relation, w for a closed way),
+// under the header, the header alone where the pass ran on none.
 static void write_rank_dump(const std::string& path, std::vector<RankTrace> trace) {
     std::sort(trace.begin(), trace.end(), [](const RankTrace& a, const RankTrace& b) { return a.id < b.id; });
-    std::ofstream out(path);
+    std::ofstream out(path, std::ios::trunc);
     if (!out) throw std::runtime_error("--rank-dump: can't write " + path);
     auto osm = [](uint64_t id) -> std::string {
         if (id == 0) return "-";
@@ -858,6 +870,8 @@ static void write_rank_dump(const std::string& path, std::vector<RankTrace> trac
             << '\t' << osm(t.container) << '\t' << int(t.container_rank) << '\t' << int(t.before_link) << '\t' << t.step
             << '\t' << int(t.rank) << '\t' << kLinkSteps[static_cast<size_t>(t.link)] << '\t'
             << (t.node ? "n" + std::to_string(t.node) : std::string("-")) << '\n';
+    out.close();
+    if (!out) throw std::runtime_error("--rank-dump: failed writing " + path);
     std::cerr << "Ranks: wrote " << trace.size() << " rows to " << path << std::endl;
 }
 
@@ -1957,6 +1971,7 @@ static int run(int argc, char* argv[]) {
     }
 
     unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency() - 1);
+    if (!rank_dump.empty()) create_rank_dump(rank_dump);
     BuildConfig cfg{num_threads, mode, multi_output, multi_quality, output_dir, prev_output_dir, rank_dump};
     {
         // Parse PBF files (always collect everything)
@@ -4022,6 +4037,8 @@ static int run(int argc, char* argv[]) {
             const AdminRings countries = border_country_rings(data, num_threads);
             hide_linked_place_nodes(data, countries, num_threads);
             rank_admin_polygons(data, countries, num_threads, cfg.rank_dump, _pt, _cpu);
+        } else if (!cfg.rank_dump.empty()) {
+            write_rank_dump(cfg.rank_dump, {});
         }
         std::vector<PackedLocation>().swap(data.place_points);
 
