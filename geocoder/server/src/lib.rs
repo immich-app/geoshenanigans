@@ -3042,15 +3042,16 @@ impl Index {
         // there (get_country_code), for the street and a house of it, which
         // takes its street's country; a street none reaches has no postcode.
         // Then at the house; else at the query point, of its postcode area.
-        // At each, the postcode grid first, where the dir has one of the
-        // point's country.
+        // At each, the postal areas first (ORDER BY osm_id is null), then the
+        // postcode grid in place of the nearest centroid, where the dir has
+        // one of the point's country, then the centroid.
         let mut country_code = country_code;
         if let Some((way_id, _)) = street {
             if let Some((m_lat, m_lng)) = u32::try_from(way_id).ok().and_then(|id| self.street_middle(id)) {
                 let (areas, point, country_there) = self.postal_areas_at(m_lat, m_lng, true);
                 country_code = country_there.or(country_code);
-                let found = self.grid_postcode(m_lat, m_lng, country_code)
-                    .or_else(|| self.postal_area_postcode(&areas, &upper_country(country_code), point))
+                let found = self.postal_area_postcode(&areas, &upper_country(country_code), point)
+                    .or_else(|| self.grid_postcode(m_lat, m_lng, country_code))
                     .or_else(|| self.centroid_postcode(m_lat, m_lng, country_code));
                 if found.is_some() || addr.is_none() {
                     return found.map(|postcode| (postcode, country_code));
@@ -3059,27 +3060,28 @@ impl Index {
         }
         if let Some((_, house)) = addr {
             let (h_lat, h_lng) = (house.lat as f64, house.lng as f64);
-            return self.grid_postcode(h_lat, h_lng, country_code)
-                .or_else(|| self.postal_area_at(h_lat, h_lng, country_code))
+            return self.postal_area_at(h_lat, h_lng, country_code)
+                .or_else(|| self.grid_postcode(h_lat, h_lng, country_code))
                 .or_else(|| self.centroid_postcode(h_lat, h_lng, country_code))
                 .map(|postcode| (postcode, country_code));
         }
-        if let Some(found) = self.grid_postcode(lat, lng, country_code) {
-            return Some((found, country_code));
-        }
         // The postcode area covering the point: get_nearest_postcode takes
         // one before any centroid (ORDER BY osm_id is null).
-        postcode_area.or_else(|| self.centroid_postcode(lat, lng, country_code)).map(|postcode| (postcode, country_code))
+        postcode_area
+            .or_else(|| self.grid_postcode(lat, lng, country_code))
+            .or_else(|| self.centroid_postcode(lat, lng, country_code))
+            .map(|postcode| (postcode, country_code))
     }
 
     /// The postcode grid's at the point (lat, lng), where the cell's run is of the country
     /// `country_code`: the postcode most of the houses round the point carry
-    /// (postcode_grid_build.h). It comes before get_nearest_postcode's postal areas and centroids
-    /// at each point that rule runs at: a US ZIP is an area OSM barely maps, and the centroid of
-    /// a large one lies farther from its edge than a neighbour's, where the houses round the point
-    /// carry their own. A cell of no postcode, past the reach of every house, has none, nor has
-    /// one of a postcode the answer refuses (postcode_looks_valid), which then leaves the point to
-    /// the postal areas and centroids, as such a postal area's does.
+    /// (postcode_grid_build.h). It stands in for get_nearest_postcode's nearest centroid at each
+    /// point that rule runs at, after the postal areas, which the rule takes before any centroid
+    /// (ORDER BY osm_id is null): a US ZIP is an area OSM barely maps, and the centroid of a large
+    /// one lies farther from its edge than a neighbour's, where the houses round the point carry
+    /// their own. A cell of no postcode, past the reach of every house, has none, nor has one of a
+    /// postcode the answer refuses (postcode_looks_valid), which then leaves the point to the
+    /// centroids, as such a postal area's does.
     fn grid_postcode<'a>(&'a self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
         let (grid, cc) = (self.postcode_grid.as_ref()?, country_code?);
         let (country, code) = grid.postcode_at(cell_id_at_level(lat, lng, grid.level()))?;
@@ -3630,8 +3632,8 @@ impl Index {
         // Resolve postcode: mirror Nominatim's stored placex.postcode chain
         // (Tier 0 the house's own / Tier 1 its street's or the primary
         // feature's calculated_postcode / Tier 2 get_nearest_postcode at the
-        // street's centroid, the house or the point: the postcode grid's
-        // cell of it, else the postal area round it, else the nearest
+        // street's centroid, the house or the point: the postal area round
+        // it, else the postcode grid's cell of it, else the nearest
         // centroid). Build-time postal-boundary
         // inheritance feeds Tier 1 (way_postcodes.bin for streets,
         // parent_postcode_id for POIs); at the query point Tier 2 takes the
@@ -3788,7 +3790,7 @@ impl Index {
             neighbourhood,
             city_block: admin.city_block,
             // Postcode from resolve_postcode(): 3-tier chain
-            // (own → inherited → grid, postal area or nearest centroid).
+            // (own → inherited → postal area, grid or nearest centroid).
             // Reject if its country has no postal-code system or if
             // the string doesn't match the country's pattern, then
             // normalise whitespace/separators per country.
