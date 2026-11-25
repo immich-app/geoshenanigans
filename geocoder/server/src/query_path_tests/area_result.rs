@@ -94,6 +94,21 @@ fn a_landmark_round_the_point_that_is_no_rank_30_row_leaves_the_locality_in() {
 }
 
 #[test]
+fn a_poi_whose_point_is_near_but_whose_outline_is_not_leaves_the_locality_in() {
+    // An old mine's outline runs round the point 950 to 1000 m off, open to the east, and its
+    // point is the middle of it: _find_closest_street_or_pois takes an area only where both its
+    // geometry and its centroid lie within reach (ST_DWithin, then the centroid's ST_Distance),
+    // and its outline does not, so Telfer answers. A museum whose outline is within reach keeps
+    // Telfer out (a_street_a_house_or_a_poi_within_nominatims_reach_keeps_the_locality_out).
+    let outline = [(-1000.0, -1000.0), (-1000.0, 1000.0), (-25.0, 1000.0), (-25.0, 950.0), (-950.0, 950.0), (-950.0, -950.0),
+                   (950.0, -950.0), (950.0, 950.0), (25.0, 950.0), (25.0, 1000.0), (1000.0, 1000.0), (1000.0, -1000.0)];
+    let mut dataset = telfer(Some(5000.0));
+    let name_id = dataset.string("Old Mine Works");
+    let index = with_poi_outline(dataset.load(), name_id, NO_DATA, &outline, (0.0, 0.0), 0);
+    assert_eq!(address_at(&index, 0.0, 0.0)["locality"], "Telfer");
+}
+
+#[test]
 fn a_street_past_the_antimeridian_gives_the_answer_none_of_its_rows_or_its_postcode() {
     // On Taveuni the 180th meridian runs across the island: the point lies 42 m west of it, in
     // Testland, the postal area 6000 and the locality Waiyevo, and Lavena Road 5 m east of it, in

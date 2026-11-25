@@ -2228,10 +2228,19 @@ impl Index {
     /// lng): Nominatim answers with the nearest of those (_find_closest_street_or_pois), whose
     /// address leaves an area of rank 25 out, where the street cells next to the point's, which
     /// our own search reads, hold none. A street by its line; a house or a POI by its point, as
-    /// Nominatim takes an area's centroid; a POI of a rank-30 row (poi_is_reverse_feature), with
-    /// a street of its own or not.
+    /// Nominatim takes an area's centroid, and a POI of an outline by that outline too, as it
+    /// takes an area only where its geometry is within reach as well; a POI of a rank-30 row
+    /// (poi_is_reverse_feature), with a street of its own or not.
     fn feature_within_reach(&self, lat: f64, lng: f64) -> bool {
         let near = |plat: f64, plng: f64| (plat - lat).hypot(plng - lng) <= STREET_POI_REACH_DEG;
+        let outline_near = |poi: &PoiRecord| {
+            let Some(verts) = poi.is_polygon().then(|| self.poi_verts(poi)).flatten() else { return true };
+            point_in_polygon(lat as f32, lng as f32, &verts)
+                || verts.iter().zip(verts.iter().cycle().skip(1)).any(|(a, b)| {
+                    planar_segment_distance((lat, lng), (f64::from(a.lat), f64::from(a.lng)), (f64::from(b.lat), f64::from(b.lng)))
+                        <= STREET_POI_REACH_DEG
+                })
+        };
         if let (Some(poi_index), true) = (self.poi_index.as_ref(), self.poi_records.is_some()) {
             let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
             let mut found = false;
@@ -2239,7 +2248,8 @@ impl Index {
                 poi_index.for_each(c, |id| {
                     if found { return; }
                     let Some(poi) = self.poi_record(id & ID_MASK) else { return };
-                    found = poi_is_reverse_feature(poi.category) && poi.name_id != NO_DATA && near(f64::from(poi.lat), f64::from(poi.lng));
+                    found = poi_is_reverse_feature(poi.category) && poi.name_id != NO_DATA && near(f64::from(poi.lat), f64::from(poi.lng))
+                        && outline_near(&poi);
                 });
                 if found { return true; }
             }
@@ -9649,13 +9659,25 @@ mod query_path_tests {
     }
 
     /// `with_polygon_poi` of the POI category `category`.
-    fn with_polygon_poi_of(mut index: Index, name_id: u32, parent_street_id: u32, (s, w, n, e): Span, category: u8) -> Index {
-        let (low, middle) = (at(s, w), at((s + n) / 2.0, (w + e) / 2.0));
+    fn with_polygon_poi_of(index: Index, name_id: u32, parent_street_id: u32, (s, w, n, e): Span, category: u8) -> Index {
+        with_poi_outline(index, name_id, parent_street_id, &[(s, w), (s, e), (n, e), (n, w)], ((s + n) / 2.0, (w + e) / 2.0), category)
+    }
+
+    /// `index` with one POI of category `category`: the polygon through `corners_m`, (north, east)
+    /// metres each, its point at `centre_m`.
+    fn with_poi_outline(mut index: Index, name_id: u32, parent_street_id: u32, corners_m: &[(f64, f64)], centre_m: (f64, f64),
+                        category: u8) -> Index {
+        let corners: Vec<NodeCoord> = corners_m.iter().map(|&(north, east)| at(north, east)).collect();
+        let low = NodeCoord {
+            lat: corners.iter().map(|c| c.lat).fold(f32::MAX, f32::min),
+            lng: corners.iter().map(|c| c.lng).fold(f32::MAX, f32::min),
+        };
+        let middle = at(centre_m.0, centre_m.1);
         // Its corners at 1e-7 degrees (encoding 3) from its low corner.
         let steps = |v: f32, from: f32| ((v as f64 - from as f64) / 1e-7).round() as u32;
         let polygon = poi_files::PoiPolygon {
             encoding: 3, bmin_lat: low.lat, bmin_lng: low.lng,
-            q: [at(s, w), at(s, e), at(n, e), at(n, w)].iter().map(|c| (steps(c.lat, low.lat), steps(c.lng, low.lng))).collect(),
+            q: corners.iter().map(|c| (steps(c.lat, low.lat), steps(c.lng, low.lng))).collect(),
         };
         let record = PoiRecord {
             lat: middle.lat, lng: middle.lng, vertex_offset: 0, name_id, category, tier: 0, flags: 0, importance: 0,
