@@ -433,6 +433,20 @@ fn streets_addresses_and_house_numbers_are_found_across_the_antimeridian() {
     let index = TestIndex::new().address_point("5", node(0.0, 5.0), Some(Footprint::of(&ring))).load();
     let addr = &index.debug_primary(q.0, q.1)["addr"];
     assert!(addr["house_number"] == "5" && about(&addr["dist_m"], metres(10.0)), "{addr}");
+
+    // A street and an interpolation line 16 steps north of the equator, from 24 steps west of the
+    // antimeridian to 24 steps east of it: 16 steps off, the point a third of the way along, so
+    // number 34 of 1 to 99.
+    let lat = 16.0 * step;
+    let seam = vec![NodeCoord { lat: lat as f32, lng: (180.0 - 24.0 * step) as f32 }, node(lat, 24.0)];
+    let index = TestIndex::new()
+        .street_through("Seam Road", seam.clone())
+        .interpolation_through("Seam Road", (1, 99, 0), seam)
+        .load();
+    let found = index.debug_primary(q.0, q.1);
+    assert!(found["street"]["name"] == "Seam Road" && about(&found["street"]["dist_m"], metres(16.0)), "{found}");
+    assert!(found["interp"]["number"] == 34 && about(&found["interp"]["dist_m"], metres(16.0)), "{found}");
+    assert_eq!(index.find_interp_on_way(q.0, q.1, "Seam Road", radians_sq(100.0)), Some(34));
 }
 
 #[test]
