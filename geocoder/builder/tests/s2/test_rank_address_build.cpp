@@ -462,3 +462,20 @@ TEST(a_rank_dump_is_a_new_file_and_a_build_without_boundaries_writes_its_header)
     CHECK(std::string(header.begin(), header.end()).rfind("object\tlevel\t", 0) == 0);
     CHECK_EQ(std::count(header.begin(), header.end(), '\n'), 1L);
 }
+
+TEST(a_locality_area_answers_where_nothing_nearer_does) {
+    // Named place=locality areas are places of rank 25 as any other area (address-levels.json):
+    // a closed way and a multipolygon relation, far from any street. Nominatim answers inside each
+    // with the area (_lookup_area_address), as a locality.
+    Fixture f;
+    f.country(48, 12, 51, 19, "Česko", "CZ");
+    f.boundary(49.0, 13.0, 50.5, 16.0, 4, "Středočeský kraj");
+    f.square(49.80, 14.40, 49.84, 14.46, {{"place", "locality"}, {"name", "Obora"}});
+    f.area(49.70, 14.60, 49.74, 14.66, {{"type", "multipolygon"}, {"place", "locality"}, {"name", "Háj"}});
+    f.line({{49.30, 14.00}, {49.30, 14.01}}, {{"highway", "primary"}, {"name", "Silnice"}});
+    const std::vector<std::string> answers = answers_of(f, "locality-areas", {{49.82, 14.43}, {49.72, 14.63}});
+    REQUIRE(answers.size() == 2);
+    for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+    CHECK(names(answers[0], "locality", "Obora"));
+    CHECK(names(answers[1], "locality", "Háj"));
+}

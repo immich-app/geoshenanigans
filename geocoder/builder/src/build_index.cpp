@@ -91,25 +91,9 @@ static AdminPlaceType classify_place_override(const char* place_tag) {
     // to short-circuit ADMIN_LABELS; `border_type` is kept in extratags
     // but NOT read by the labeller. placex_update drops an OSM
     // `linked_place` tag (placex_triggers.sql:810), and sets its own from
-    // the node a polygon links (place_links.h).
-    const char* val = place_tag;
-    if (val == nullptr || val[0] == '\0') return AdminPlaceType::NONE;
-    AdminPlaceType t = AdminPlaceType::NONE;
-    if (std::strcmp(val, "city") == 0) t = AdminPlaceType::CITY;
-    else if (std::strcmp(val, "town") == 0) t = AdminPlaceType::TOWN;
-    else if (std::strcmp(val, "village") == 0) t = AdminPlaceType::VILLAGE;
-    else if (std::strcmp(val, "hamlet") == 0) t = AdminPlaceType::HAMLET;
-    else if (std::strcmp(val, "borough") == 0) t = AdminPlaceType::BOROUGH;
-    else if (std::strcmp(val, "suburb") == 0) t = AdminPlaceType::SUBURB;
-    else if (std::strcmp(val, "neighbourhood") == 0) t = AdminPlaceType::NEIGHBOURHOOD;
-    else if (std::strcmp(val, "quarter") == 0) t = AdminPlaceType::QUARTER;
-    else if (std::strcmp(val, "state") == 0) t = AdminPlaceType::STATE;
-    else if (std::strcmp(val, "province") == 0) t = AdminPlaceType::PROVINCE;
-    else if (std::strcmp(val, "region") == 0) t = AdminPlaceType::REGION;
-    else if (std::strcmp(val, "county") == 0) t = AdminPlaceType::COUNTY;
-    else if (std::strcmp(val, "district") == 0) t = AdminPlaceType::DISTRICT;
-    else if (std::strcmp(val, "municipality") == 0) t = AdminPlaceType::MUNICIPALITY;
-    return t;
+    // the node a polygon links (place_links.h). The value labels the area
+    // as itself (place_label_of), a locality's too.
+    return place_label_of(place_value_of(place_tag));
 }
 
 // --- TIGER address data loading ---
@@ -3091,14 +3075,16 @@ static int run(int argc, char* argv[]) {
                             && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
                         AdminPlaceType pt = classify_place_override(t.place);
                         // Only the rank-20+ place types (neighbourhood,
-                        // quarter, suburb, borough) — higher-level place
-                        // types on closed ways are rare and adding them
-                        // risks promoting a landuse polygon into the
-                        // city / state chain.
+                        // quarter, suburb, borough) and a locality, of rank
+                        // 25 and in no address — higher-level place types
+                        // on closed ways are rare and adding them risks
+                        // promoting a landuse polygon into the city / state
+                        // chain.
                         bool want = (pt == AdminPlaceType::NEIGHBOURHOOD
                                   || pt == AdminPlaceType::QUARTER
                                   || pt == AdminPlaceType::SUBURB
-                                  || pt == AdminPlaceType::BOROUGH);
+                                  || pt == AdminPlaceType::BOROUGH
+                                  || pt == AdminPlaceType::LOCALITY);
                         if (want && all_valid && resolved_locs.size() >= 3) {
                             std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
                             local.closed_way_admins.push_back({std::move(verts), std::string(t_best_name), uint8_t(15), std::string(),
