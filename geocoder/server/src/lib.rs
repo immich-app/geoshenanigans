@@ -2239,7 +2239,7 @@ impl Index {
     /// The centroid of the area `poly` as Nominatim has it: the place node its boundary links
     /// where that lies inside it (linked_centre), else its point on surface (get_center_point).
     fn area_centre(&self, poly: &AdminPolygon) -> Option<(f64, f64)> {
-        self.linked_centre(poly).or_else(|| self.admin_geometry.point_on_surface_memo(poly).map(|(lat, lng)| (f64::from(lat), f64::from(lng))))
+        self.linked_centre(poly).or_else(|| self.admin_geometry.point_on_surface_memo(poly))
     }
 
     /// The place node the boundary of `poly` links (linked_centres) where it lies inside `poly`,
