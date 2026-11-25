@@ -80,6 +80,36 @@ fn only_a_poi_of_rank_search_30_near_the_point_leaves_the_locality_out() {
 }
 
 #[test]
+fn a_street_past_the_antimeridian_gives_the_answer_none_of_its_rows_or_its_postcode() {
+    // On Taveuni the 180th meridian runs across the island: the point lies 42 m west of it, in
+    // Testland, the postal area 6000 and the locality Waiyevo, and Lavena Road 5 m east of it, in
+    // the street cells round the point, its parent the country Otherland, its postcode 4999.
+    // Planar on lon/lat, as ST_DWithin, the road lies 360 degrees off, beyond lookup_street_poi's
+    // reach: Waiyevo answers, with the areas and the postcode round the point (lookup_area).
+    let taveuni = (-16.8, 179.9996);
+    let mut dataset = TestIndex { origin: taveuni, ..TestIndex::default() };
+    let otherland = 1;
+    dataset
+        .boundary("Testland", 2, 0, (-20_000.0, -20_000.0, 20_000.0, 40.0))
+        .boundary("Otherland", 2, 0, (30_000.0, -30_000.0, 40_000.0, -20_000.0))
+        .boundary("Waiyevo", 9, 15, (-10_000.0, -10_000.0, 10_000.0, 40.0)).rank(25)
+        .boundary("6000", POSTCODE_AREA_LEVEL, 0, (-300.0, -300.0, 300.0, 40.0));
+    dataset.polygons[0].0.country_code = u16::from_be_bytes(*b"AU");
+    dataset.polygons[otherland].0.country_code = u16::from_be_bytes(*b"NZ");
+    dataset.polygons[3].0.country_code = u16::from_be_bytes(*b"AU");
+    dataset
+        .street_through("Lavena Road", vec![NodeCoord { lat: -16.8005, lng: -179.99995 }, NodeCoord { lat: -16.7995, lng: -179.99995 }])
+        .way_parent(otherland as u32)
+        .way_postcode("4999");
+    let mut index = dataset.load();
+    index.admin_parents = Some(FileBytes::Owned([NO_DATA; 4].iter().flat_map(|parent| parent.to_le_bytes()).collect()));
+    let address = address_from(&index, taveuni, 0.0, 0.0);
+    assert_eq!(address["locality"], "Waiyevo");
+    assert_eq!(address["country"], "Testland");
+    assert_eq!(address["postcode"], "6000");
+}
+
+#[test]
 fn a_locality_answers_where_no_country_holds_the_point() {
     // Telfer alone round the point, in no country polygon of the data, and no street near:
     // lookup_area takes it as inside a country, and it answers.

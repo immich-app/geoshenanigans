@@ -3534,8 +3534,10 @@ impl Index {
             street.as_ref().and_then(|(_, _, way_idx)| self.closest_point_on_way(*way_idx, lat, lng))
         };
         // The coarse rows come from the parent chain of the street the address hangs from, as a
-        // house's rows are its parent street's, else of the nearest street.
-        let chain_street = address_street.filter(|&id| id != NO_DATA).or(street.as_ref().map(|(_, _, id)| *id));
+        // house's rows are its parent street's, else of the nearest street; of none where nothing
+        // is near enough to answer, and an area does (lookup_area), with the areas round the point.
+        let feature_answers = closest_feature_dist < max_dist;
+        let chain_street = address_street.filter(|&id| id != NO_DATA).or(street.as_ref().map(|(_, _, id)| *id)).filter(|_| feature_answers);
         let admin = self.resolve_admin(&mut admin_scan, lat, lng, chain_street, feature, centroid);
         // No address point: Nominatim falls back to TIGER in the US.
         if let Some(refine_max_sq) = tiger_reach_sq {
@@ -3569,8 +3571,8 @@ impl Index {
         // the street's inherited ZIP (Mexico City Zócalo 06060 leak).
         // The street the postcode comes from: a house's parent street (placex_update takes the
         // parent's postcode, find_parent_for_poi's street, else the nearest), else the street that
-        // won.
-        let postcode_street: Option<(u32, WayRow)> = if poi_won_primary {
+        // won; none where nothing won.
+        let postcode_street: Option<(u32, WayRow)> = if poi_won_primary || !feature_answers {
             None
         } else if addr_won_primary {
             addr.as_ref()
@@ -3593,7 +3595,7 @@ impl Index {
             // Nominatim consults location_property_tiger only after the
             // street wins and no rank-30 housenumber row was found; a POI
             // or addr-point win routes the postcode through that feature.
-            if poi_won_primary || addr_won_primary || street_house.is_some() { None } else {
+            if poi_won_primary || addr_won_primary || street_house.is_some() || !feature_answers { None } else {
                 interp.as_ref().map(|(d, s, _, idx)| (*idx as usize, *d, &**s))
             },
             admin.postcode_area.clone(),
@@ -7758,6 +7760,20 @@ mod query_path_tests {
         fn street(&mut self, name: &str, points_m: &[(f64, f64)]) -> &mut Self {
             let name_id = self.string(name);
             let nodes = self.way_along(geo_index::STREETS, self.streets.len(), points_m);
+            self.streets.push(Way { name_id, nodes, numbers: (0, 0, 0) });
+            self
+        }
+
+        /// A named street through `nodes` as they are, listed in the street cells along it: one
+        /// whose points at_from would not place, as past the antimeridian.
+        fn street_through(&mut self, name: &str, nodes: Vec<NodeCoord>) -> &mut Self {
+            let name_id = self.string(name);
+            let id = self.streets.len() as u32;
+            for segment in nodes.windows(2) {
+                for cell in cells_meeting(segment, DEFAULT_STREET_CELL_LEVEL) {
+                    self.list(geo_index::STREETS, id, cell);
+                }
+            }
             self.streets.push(Way { name_id, nodes, numbers: (0, 0, 0) });
             self
         }
