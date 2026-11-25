@@ -142,7 +142,7 @@ class NightlyPostalCitiesTest(unittest.TestCase):
     def latest(self, latest, previous):
         self.serve("s3/bucket/geocoder/builds/latest.json", json.dumps({"latest": latest, "previous": previous}))
 
-    def fail(self, path):
+    def fail_read(self, path):
         """A read of the bucket's object `path` that fails."""
         self.serve(f"s3/bucket/geocoder/{path}.fail", "")
 
@@ -263,7 +263,7 @@ class NightlyPostalCitiesTest(unittest.TestCase):
         # latest.json, the named build's configurations.json, and today's (a rerun's) each fail
         # the night when their read fails, and when they hold no JSON object.
         for path in ("builds/latest.json", "builds/2026-11-22/configurations.json", "builds/2026-11-23/configurations.json"):
-            self.fail(path)
+            self.fail_read(path)
             r, outputs = self.run_block(block)
             self.assertEqual(r.returncode, 1, path)
             self.assertIn("::error::[postal] Could not read s3://bucket/geocoder/" + path, r.stdout)
