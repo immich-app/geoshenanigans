@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -15,10 +16,17 @@ struct LinkText {
     static constexpr uint32_t kNone = UINT32_MAX;
     std::string bytes;
 
+    // The offset at `size` of a string of `length` bytes, which its NUL ends.
+    // kNone is no offset, and no string ends past it.
+    static uint32_t offset_at(size_t size, size_t length) {
+        if (size + length + 1 > kNone) throw std::length_error("link text: past 32-bit offsets");
+        return static_cast<uint32_t>(size);
+    }
+
     // The offset of a copy of s; kNone for an empty one.
     uint32_t add(std::string_view s) {
         if (s.empty()) return kNone;
-        const uint32_t at = static_cast<uint32_t>(bytes.size());
+        const uint32_t at = offset_at(bytes.size(), s.size());
         bytes.append(s);
         bytes.push_back('\0');
         return at;
@@ -55,7 +63,8 @@ struct LinkCandidates {
     }
     // Moves `other`'s candidates in after these.
     void append(LinkCandidates&& other) {
-        const uint32_t base = static_cast<uint32_t>(text.bytes.size());
+        const uint32_t base = other.text.bytes.empty() ? static_cast<uint32_t>(text.bytes.size())
+                                                       : LinkText::offset_at(text.bytes.size(), other.text.bytes.size() - 1);
         auto moved = [base](uint32_t offset) { return offset == LinkText::kNone ? offset : base + offset; };
         for (LinkCandidate c : other.nodes) {
             c.name = moved(c.name);

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <initializer_list>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -140,6 +141,19 @@ TEST(lowercase_utf8_lowers_each_letter_as_postgres_lower_does) {
     CHECK_EQ(lowercase_utf8("İstanbul ẞ Ｔｏｋｙｏ 東京"), std::string("istanbul ß ｔｏｋｙｏ 東京"));
     // A byte that is no UTF-8 stays as it is.
     CHECK_EQ(lowercase_utf8(std::string("A\xff" "B")), std::string("a\xff" "b"));
+}
+
+TEST(link_text_takes_no_string_whose_offset_or_end_passes_32_bits) {
+    // Offsets are 32 bits and kNone stands for none: a string that would end past them throws
+    // rather than wrap onto an earlier one.
+    bool threw = false;
+    try {
+        (void)LinkText::offset_at(size_t(LinkText::kNone) - 3, 3);
+    } catch (const std::length_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK_EQ(LinkText::offset_at(size_t(LinkText::kNone) - 5, 3), LinkText::kNone - 5);
 }
 
 TEST(a_label_member_links_whatever_its_value_name_or_link_and_a_boundary_of_rank_0_links_none) {
