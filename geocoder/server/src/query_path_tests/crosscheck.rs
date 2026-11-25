@@ -192,7 +192,6 @@ fn of_two_nodes_of_the_value_s_name_at_one_distance_a_rank_takes_the_one_of_the_
     assert_eq!((&address["city"], &address["town"]), (&serde_json::Value::Null, &serde_json::json!("Springfield")));
 }
 
-
 #[test]
 fn a_field_the_value_s_row_leaves_goes_to_the_finest_part_of_no_field_that_fills_it() {
     // Greenburgh (rank 16) and Hartsdale, a level-9 boundary of rank 18 labelled a city, both fill
@@ -321,6 +320,36 @@ fn a_boundary_the_street_runs_into_is_a_row_of_its_rank() {
 }
 
 #[test]
+fn a_boundary_the_street_runs_along_is_a_row_of_its_rank() {
+    // Saw Mill River Road runs along the border of Greenburgh and Elmsford, on nodes the boundary
+    // shares, which the street's f32 nodes hold 20 cm off: the intersection of the street and
+    // Elmsford is a stretch of the border, more than a point (ST_NPoints > 1), so Nominatim's
+    // street has a row of rank 16 for each, and the house's addr:city takes Elmsford. A street
+    // that ends on the border meets Elmsford at a point, and is no row of it.
+    let index = |city: Option<&str>, street: &[(f64, f64)]| {
+        let mut index = united_states();
+        index
+            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Elmsford", 8, 0, (-3000.0, 3000.0, 3000.0, 9000.0))
+            .street("Saw Mill River Road", street)
+            .address("9", 0.0, 2990.0);
+        if let Some(city) = city {
+            index.addr_city(city);
+        }
+        index.load()
+    };
+    let along = [(-1000.0, 2999.8), (0.0, 2999.8), (1000.0, 2999.8)];
+    for (city, part) in [(None, "Greenburgh"), (Some("Elmsford"), "Elmsford")] {
+        let (display, address) = answer_at(&index(city, &along), 0.0, 2990.0);
+        assert_eq!(display, format!("9 Saw Mill River Road, {part}, United States"), "{city:?}");
+        assert_eq!(address["city"], part, "{city:?}");
+    }
+    let (display, address) = answer_at(&index(Some("Elmsford"), &[(0.0, 1500.0), (0.0, 2999.8)]), 0.0, 2990.0);
+    assert_eq!(display, "9 Saw Mill River Road, Greenburgh, United States");
+    assert_eq!(address["city"], "Greenburgh");
+}
+
+#[test]
 fn a_boundary_the_street_runs_into_cells_away_from_the_house_is_a_row_of_its_rank() {
     // Saw Mill River Road runs 25 km east from Greenburgh into Elmsford, whose boundary no admin
     // cell of the house's holds; house 9 is in Greenburgh. getNearFeatures takes the street whole,
@@ -344,7 +373,6 @@ fn a_boundary_the_street_runs_into_cells_away_from_the_house_is_a_row_of_its_ran
     }
 }
 
-
 #[test]
 fn a_polygon_holding_the_house_that_the_street_misses_is_no_row() {
     // House 4 lies in Springfield, of level 8, and Main Street, a few metres south, does not: a
@@ -365,7 +393,6 @@ fn a_polygon_holding_the_house_that_the_street_misses_is_no_row() {
     assert_eq!(display, "4 Main Street, Springfield, United States");
     assert_eq!((&address["city"], &address["town"]), (&serde_json::Value::Null, &serde_json::json!("Springfield")));
 }
-
 
 #[test]
 fn a_boundary_the_street_runs_into_ranks_by_its_own_place_type() {
@@ -392,7 +419,6 @@ fn a_boundary_the_street_runs_into_ranks_by_its_own_place_type() {
     assert_eq!(display, "9 Saw Mill River Road, Fairview, Greenburgh, United States");
     assert_eq!((&address["city"], &address["suburb"]), (&serde_json::json!("Greenburgh"), &serde_json::json!("Fairview")));
 }
-
 
 #[test]
 fn a_place_node_a_place_area_of_its_name_and_rank_links_is_no_row() {

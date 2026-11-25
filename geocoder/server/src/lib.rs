@@ -4034,18 +4034,26 @@ fn segments_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
     abc * abd < 0.0 && cda * cdb < 0.0
 }
 
-/// Whether `line` runs through the polygon of `rings` (AdminGeometry::rings: [lng, lat] each, the
-/// outer ring then its holes) along a stretch of positive length, as getNearFeatures takes an area
-/// for a line (ST_NPoints(ST_Intersection) > 1, partition-functions.sql:44): a node of the line
-/// inside it (`inside(lat, lng)`), or a segment of the line crossing an edge of a ring.
+/// How far from a ring a street's node may lie and be one the boundary shares: the street's
+/// nodes are f32, 2^-17 degrees apart past 64 degrees, so a shared node lies within half that
+/// of the ring's own vertex.
+pub const SHARED_NODE_DEG: f64 = 4e-6;
+
+/// Whether `line` meets the polygon of `rings` (AdminGeometry::rings: [lng, lat] each, the outer
+/// ring then its holes) in more than a point, as getNearFeatures takes an area for a line
+/// (ST_NPoints(ST_Intersection) > 1, partition-functions.sql:44): a node of the line inside it
+/// (`inside(lat, lng)`), a segment of the line crossing an edge of a ring, or two nodes of the
+/// line on a ring (SHARED_NODE_DEG), a stretch along the boundary or two touches; one alone is a
+/// touch, a point.
 pub fn line_runs_through(line: &[NodeCoord], rings: &[Vec<[f64; 2]>], mut inside: impl FnMut(f64, f64) -> bool) -> bool {
     if line.iter().any(|n| inside(n.lat as f64, n.lng as f64)) {
         return true;
     }
-    line.windows(2).any(|w| {
+    let crosses = line.windows(2).any(|w| {
         let (a, b) = ([w[0].lng as f64, w[0].lat as f64], [w[1].lng as f64, w[1].lat as f64]);
         rings.iter().any(|ring| ring.windows(2).any(|e| segments_cross(a, b, e[0], e[1])))
-    })
+    });
+    crosses || line.iter().filter(|n| rings_distance(rings, n.lat as f64, n.lng as f64) <= SHARED_NODE_DEG).nth(1).is_some()
 }
 
 /// The planar distance in degrees from (lat, lng) to the nearest edge of `rings` ([lng, lat]
