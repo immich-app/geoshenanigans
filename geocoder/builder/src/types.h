@@ -66,9 +66,9 @@ enum class AdminPlaceType : uint8_t {
     HAMLET = 13,
     MUNICIPALITY = 14,  // place=municipality (e.g. Sydney Council L6)
     // place=locality: what labels a boundary of a locality (an Australian one linking its
-    // locality node, an Irish townland tagged so) as get_label_tag does, one of rank 25
-    // (address-levels.json), in no street's or house's address. A place area of it is never
-    // imported.
+    // locality node, an Irish townland tagged so) and a named place=locality area as
+    // get_label_tag does, one of rank 25 (address-levels.json), in no street's or house's
+    // address: it answers a point no street, house or POI is near.
     LOCALITY = 15,
 };
 
@@ -1092,8 +1092,8 @@ struct PoiRecord {
     // NO_DATA if the POI isn't inside any postal
     // boundary.
     uint32_t parent_postcode_id = NO_DATA;
-    // Polygon id of the smallest admin boundary (admin_level <= 12)
-    // containing the POI. The server walks admin_parents from here
+    // Polygon id of the smallest admin boundary (admin_level 2 to
+    // kMaxPoiParentLevel, 10) containing the POI. The server walks admin_parents from here
     // to get the POI's administrative chain — a cheap approximation
     // of Nominatim's parent_place_id walk. Used to demote POIs
     // whose chain doesn't match the query's admin chain (e.g. a

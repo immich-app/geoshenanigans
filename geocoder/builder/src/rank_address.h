@@ -122,7 +122,7 @@ struct RankTrace {
 // (PlaceNode::rank_address, a hidden one's as a place of its own) its
 // rank_address, reading admin_osm_ids, admin_tags, admin_links (each
 // linking polygon's link), place_node_links and place_points (each node's
-// point), the last three of which it frees. With `trace`, a RankTrace for
-// each boundary and place area, by id.
+// point), all of which but admin_osm_ids it frees. With `trace`, a RankTrace
+// for each boundary and place area, by id.
 RankStats compute_rank_addresses(ParsedData& data, const RankLookups& lookups, unsigned threads,
                                  std::vector<RankTrace>* trace = nullptr);

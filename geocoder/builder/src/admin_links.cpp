@@ -501,7 +501,8 @@ void compute_way_parent_polygons(ParsedData& data, unsigned int num_threads) {
 // - parent_postcode_id: the postal boundary's (POSTAL_AREA_LEVEL) postcode,
 //   Nominatim's placex.postcode chain approximation, of one that names a
 //   point of the POI's country (postal_area_names).
-// - parent_poly_id: the admin polygon (levels 2..12; place-area markers 15
+// - parent_poly_id: the admin polygon of levels 2 to kMaxPoiParentLevel (10;
+//   the blocks and neighbourhoods of 11 and 12 and the place-area markers 15
 //   skipped) the server's chain-containment check walks up from.
 // POIs are walked per admin cell, so each cell's candidates are gathered and
 // ranked once for both.
