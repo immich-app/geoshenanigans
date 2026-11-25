@@ -2098,7 +2098,7 @@ impl Index {
             if let Some((_, _, node)) = best {
                 return Some(AreaAnswer::Node(AddressRow {
                     rank: node.rank_address, name: self.get_string(node.name_id), label: Some(PLACE_NODE_FIELDS[node.place_type as usize]),
-                }));
+                }, (f64::from(node.lat), f64::from(node.lng))));
             }
         }
         let label = place_type_to_field(area.place_type_override)
@@ -3583,7 +3583,7 @@ impl Index {
         } else {
             street.as_ref().map(|(_, w, idx)| (*idx, *w))
         };
-        let resolved_postcode = self.resolve_postcode_in(
+        let mut resolved_postcode = self.resolve_postcode_in(
             lat, lng,
             postcode_street.as_ref().map(|(idx, w)| (*idx as usize, w)),
             if addr_won_primary {
@@ -3627,6 +3627,15 @@ impl Index {
         if !anchored && !place_nodes_only {
             return Address::default();
         }
+        // A place node that answers is the result, of its own address (_place_inside_area_query):
+        // the areas round it and the postcode its own row has (get_nearest_postcode round it).
+        let mut node_admin: Option<AdminResult<'_>> = None;
+        if let Some(AreaAnswer::Node(_, (node_lat, node_lng))) = &area_result {
+            let at_node = self.find_admin(*node_lat, *node_lng);
+            resolved_postcode = self.resolve_postcode_in(*node_lat, *node_lng, None, None, None, None, at_node.postcode_area.clone(),
+                                                         at_node.country_code.or(admin.country_code));
+            node_admin = Some(at_node);
+        }
 
         // Note on name-suffix normalisation (previously considered as
         // Option 6): Nominatim does not normalise the localname it
@@ -3650,7 +3659,7 @@ impl Index {
         // finer than the polygon of that label: Brentwood's town node, promoted to 18 in the Town
         // of Islip (a town of rank 16), is the town, the Town of Islip a part of display_name only.
         let (area_rows, node_rows) = (admin.ranked, place.named_rows);
-        let mut rows = admin.rows;
+        let mut rows = node_admin.map_or(admin.rows, |at_node| at_node.rows);
         for row in place.rows {
             if !rows.iter().any(|r| r.rank == row.rank) {
                 rows.push(row);
@@ -3698,7 +3707,7 @@ impl Index {
         // or a place node inside it, whose own address has only the rows of the ranks below its.
         match area_result {
             Some(AreaAnswer::Area(row)) => rows.insert(0, row),
-            Some(AreaAnswer::Node(row)) => {
+            Some(AreaAnswer::Node(row, _)) => {
                 rows.retain(|r| r.rank < row.rank);
                 rows.insert(0, row);
             }
@@ -5988,7 +5997,8 @@ impl<'a> AdminResult<'a> {
 /// AREA_RESULT_RANK (Index::area_result): the area, or a place node inside it, each as its row.
 pub enum AreaAnswer<'a> {
     Area(AddressRow<'a>),
-    Node(AddressRow<'a>),
+    /// The node's row and its point.
+    Node(AddressRow<'a>, (f64, f64)),
 }
 
 /// A row of an address as Nominatim's complete_address_details shows it

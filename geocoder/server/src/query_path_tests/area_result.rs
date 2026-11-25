@@ -92,6 +92,19 @@ fn a_locality_answers_where_no_country_holds_the_point() {
 }
 
 #[test]
+fn a_place_node_that_answers_takes_the_areas_round_it() {
+    // Punmu, a hamlet 1.2 km off inside Telfer, answers the point, of its own address
+    // (_place_inside_area_query returns the node): the point lies in the district Kalamunda and
+    // Punmu across its border in Kiwirrkurra, which the answer names.
+    let index = telfer(Some(5000.0))
+        .boundary("Kalamunda", 5, 0, (-20_000.0, -20_000.0, 20_000.0, 500.0))
+        .boundary("Kiwirrkurra", 5, 0, (-20_000.0, 500.0, 20_000.0, 20_000.0))
+        .place("Punmu", 4, 800.0, 900.0)
+        .load();
+    assert_eq!(display(&index, 0.0, 0.0), "Punmu, Kiwirrkurra, Western Australia, Testland");
+}
+
+#[test]
 fn a_dir_without_streets_answers_as_on_a_street_and_leaves_the_locality_out() {
     // An admin dir has no streets to tell a point no street is near: its answers stand for a
     // street's at the point, whose address takes no area of rank 25.
