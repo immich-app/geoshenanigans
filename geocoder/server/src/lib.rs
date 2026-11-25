@@ -2112,16 +2112,15 @@ impl Index {
     /// getNearFeatures' distance from `feature`) in walk order (CurrentBoundaries::accepted). The
     /// walk takes a rank's areas by that distance (area_row_distance) times their walk_weight, a
     /// quarter for a city-ranked area of rank_search 16 (area_search_rank); a rank of one area
-    /// needs no distance, and has 0. The walk takes only the areas of `ranked` that are rows of
-    /// an address (address_areas), and, at a rank of two or more areas, not one a street `feature`
-    /// does not run through (runs_through), as getNearFeatures takes none such for a street, where
-    /// another of the rank is one it runs through. Every area of `ranked` holds the point of a
-    /// point `feature`.
+    /// needs no distance, and has 0. The walk takes every area of `ranked`, but, at a rank of two
+    /// or more areas, not one a street `feature` does not run through (runs_through), as
+    /// getNearFeatures takes none such for a street, where another of the rank is one it runs
+    /// through. Every area of `ranked` holds the point of a point `feature`.
     fn area_walk(&self, ranked: &[RankedPoly], feature: PlaceFeature<'_>, country: &str) -> Vec<(usize, bool, f64)> {
         self.area_walk_of(ranked, (0..ranked.len()).collect(), feature, country, true)
     }
 
-    /// area_walk over the areas `kept` of `ranked` (address_areas); `held` where every one holds
+    /// area_walk over the areas `kept` of `ranked`; `held` where every one holds
     /// the point of a point `feature`, which then needs no test.
     fn area_walk_of(&self, ranked: &[RankedPoly], mut kept: Vec<usize>, feature: PlaceFeature<'_>, country: &str, held: bool)
         -> Vec<(usize, bool, f64)> {

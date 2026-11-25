@@ -145,7 +145,7 @@ void write_place_files(const std::string& dir, const std::vector<PlaceNode>& nod
 //     neighbourhoods, quarters)
 //   - the admin polygons admin_minimal_keeps leaves out: L9 borough, L10
 //     quarter-area, L11 and L12, the postal areas, and L15 place areas
-//     ranked below 16.
+//     whose label type is outside the retained set in admin_minimal_keeps.
 //   - those boundaries' claims on place nodes: a node one of them
 //     claims answers here as a place, since nothing here stands
 //     for it (an L9 or L10 boundary claims Banja Luka, Mildura and

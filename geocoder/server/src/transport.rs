@@ -8,7 +8,7 @@
 //! checks it decodes to its members; a client checks each member's sha256.
 //!
 //! The kinds and their members, in order:
-//! - places: place_cells.bin, place_nodes.bin (its L3 blocks unpacked), place_hidden.bin;
+//! - places: place_cells.bin, place_nodes.bin (its PNL4 blocks unpacked), place_hidden.bin;
 //! - pois: poi_records.bin (R2's rows), poi_vertices.bin (its V2 blocks unpacked);
 //! - arcs: arc_index.bin and arc_vertices.bin (the arc blocks unpacked, the index computed);
 //! - cols: one fixed-width file (COLS_FILES), its rows split into their fields.
@@ -40,11 +40,12 @@
 //! - P, p: as D and d, but the value before each unit's first is 0 (the POI vertex columns).
 //!
 //! The sections and their columns, each at the encoding the encoder writes it in:
-//! - places: cells, a row a unit: key S, first row D. nodes, an L3 block a unit: lat base D, lng
+//! - places: cells, a row a unit: key S, first row D. nodes, a PNL4 block a unit: lat base D, lng
 //!   base D, wl D, wg D, wn R, then the blocks' rows (BLOCK_ROWS a block, the file's last block
-//!   fewer): lat less the base D, lng less the base D, type R, name S; decode writes each block's
-//!   table entry to a scratch file as it goes, and the table after the blocks, then the tail (the
-//!   footer). hidden, a row a unit: lat D, lng B, word S, parent D.
+//!   fewer): lat less the base D, lng less the base D, type R (the place type in its low three
+//!   bits, bit 3 set for a node promoted inside a relation of its rank), name S; decode writes each
+//!   block's table entry to a scratch file as it goes, and the table after the blocks, then the
+//!   tail (the PNL4 footer). hidden, a row a unit: lat D, lng B, word S, parent D.
 //! - pois: records, an R2 row a unit: lat D, lng B, voff S, name S, street R, the three bytes of
 //!   poly D R R, postcode R, combo B; the tail is the dictionaries and the footer. vertices, a V2
 //!   block a unit: tag R, m B, the bbox varints' values B B (u64), wl R, wg R, then the blocks'
