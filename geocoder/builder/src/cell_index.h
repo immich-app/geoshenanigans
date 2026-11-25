@@ -76,9 +76,16 @@ void normalise_addr_postcodes(ParsedData& data, unsigned threads = 0);
 // only the pairs OSM lacks, of a postcode their country's pattern takes. Run
 // once on the full data before the continent split, so every region writes
 // the same centroids (Nominatim's location_postcode is one table) instead of
-// recomputing them from its own subset of addr points. The last reader of
-// data.admin_exact_rings.
+// recomputing them from its own subset of addr points. With
+// collect_postcode_grid, the last reader of data.admin_exact_rings.
 void collect_postcode_centroids(ParsedData& data);
+
+// The postcode grid's runs (postcode_grid_build.h) of the full data's
+// address points and TIGER lines, each point's country found as the
+// centroids find it, and the planet's postcode_grid.bin, into
+// data.postcode_grid_*. Run once before the continent split, which keeps
+// the runs a query routed to each continent reads (region_rows).
+void collect_postcode_grid(ParsedData& data);
 
 // Strategy-2 persistent dense IDs. Loads the previous build's
 // <prev_dir>/full/<file>.osm_ids sidecars (if present), allocates

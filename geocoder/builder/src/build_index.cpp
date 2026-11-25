@@ -1950,6 +1950,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
     // points and admin polygons they read: their sums are integers, merged
     // in any order, and a point's country rests on area and code, not slot.
     timed_phase("    planet: postcode centroids", [&] { collect_postcode_centroids(data); });
+    // The postcode grid's cells, final before the split as the centroids
+    // are, of each point's country as they find it; nothing in them follows
+    // a record's slot.
+    timed_phase("    planet: postcode grid", [&] { collect_postcode_grid(data); });
     // Gone before the strategy-2 remap takes its budget from what the build
     // holds: the exact rings and the countries' cells never reach the remap,
     // which would have to follow them, nor the write phase.

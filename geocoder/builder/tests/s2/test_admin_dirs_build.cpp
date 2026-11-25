@@ -15,12 +15,14 @@
 // server takes its distance from. A fresh build writes its streets and
 // addresses in cell order, whatever their names, and its postcode centroids
 // in cell order in each mode dir, which a chained build writes as a fresh one
-// does. An address keeps its addr:city beside the full dir's address points
-// where a place or a boundary has that name, which writes no string. Every
-// mode dir credits the sources of the data it holds in attribution.json:
+// does, and its postcode grid of a grid country's addresses in every mode dir
+// alike, which the server answers from before the nearest centroid. An
+// address keeps its addr:city beside the full dir's address points where a
+// place or a boundary has that name, which writes no string. Every mode dir
+// credits the sources of the data it holds in attribution.json:
 // OpenStreetMap, GeoNames and Code-Point Open, which its GB data is derived
 // from, where a postcode centroid there came from it, TIGER where an
-// interpolation or a centroid did.
+// interpolation, a centroid or the postcode grid's votes did.
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -45,6 +47,7 @@
 #include "pbf_test_objects.h"
 #include "poi_files.h"
 #include "postcode_files.h"
+#include "postcode_grid.h"
 #include "scratch_dir.h"
 #include "side_blocks.h"
 #include "string_files.h"
@@ -2282,6 +2285,82 @@ TEST(postcode_centroids_keep_no_slots_and_a_region_of_no_valid_postcode_has_no_f
     }
 }
 
+TEST(a_build_writes_the_postcode_grid_of_its_us_addresses_in_every_mode_dir_and_the_server_answers_from_it) {
+    // Testland as the United States: 19026's houses along 47.05 N from 8.02
+    // to 8.12 E, 19018's from 8.135 to 8.15. At 8.121 E the nearest centroid
+    // is 19018's (8.1425, 1.6 km) rather than 19026's (8.07, 3.9 km); the
+    // house 76 m west of it is 19026's. A house in Testreich (DE) names a US
+    // ZIP no other house names, 19099, and casts no vote: no run names it.
+    const ScratchDir root("postcode-grid-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log", out = root.path() + "/out";
+    std::vector<Postcoded> houses;
+    for (int i = 0; i <= 20; i++) houses.push_back({8100 + i, 470500000, 80200000 + 50000 * i, "19026"});
+    for (int i = 0; i < 4; i++) houses.push_back({8200 + i, 470500000, 81350000 + 50000 * i, "19018-0002"});
+    houses.push_back({8300, 468500000, 80500000, "19099"});
+    std::vector<TestObject> objects = with_postcodes(houses);
+    for (TestObject& o : objects)
+        if (o.type == OsmType::Relation && o.id == 40)
+            for (auto& [key, value] : o.tags)
+                if (key == "ISO3166-1" || key == "ISO3166-1:alpha2") value = "US";
+    write_test_pbf(pbf, objects, 1000);
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output", "--multi-quality"}, log));
+    const auto files = tree(out);
+
+    // Every mode dir of the planet and of Europe holds it, the same bytes;
+    // no other region does.
+    const std::string name = postcode_grid::FILE_NAME;
+    REQUIRE(files.count("planet/admin/" + name));
+    const std::vector<char>& grid = files.at("planet/admin/" + name);
+    for (const char* region : {"planet", "europe"})
+        for (const char* mode : {"admin", "no-addresses", "full", "admin-minimal", "admin-minimal-poi"}) {
+            const std::string at = std::string(region) + "/" + mode + "/" + name;
+            REQUIRE(files.count(at));
+            CHECK(files.at(at) == grid);
+        }
+    for (const std::string& file : names_of(files))
+        if (fs::path(file).filename() == name) CHECK(file.rfind("planet/", 0) == 0 || file.rfind("europe/", 0) == 0);
+
+    // Its runs: 19018 and 19026 of the US, at level 16; each house's cell
+    // has its postcode.
+    std::vector<postcode_grid::LogicalRow> rows;
+    postcode_grid::decode(reinterpret_cast<const uint8_t*>(grid.data()), grid.size(),
+                          [&](const postcode_grid::LogicalRow& r) { rows.push_back(r); });
+    REQUIRE(!rows.empty());
+    std::set<std::string> named;
+    for (const auto& r : rows) {
+        int level = 0;
+        CHECK(postcode_grid::level_of(r.cell, level) && level == 16);
+        CHECK(r.country_code == 0 || r.country_code == pack_country_code('U', 'S'));
+        if (r.country_code) named.insert(std::string(postcode_grid::code_of(r)));
+    }
+    CHECK(named == std::set<std::string>({"19018", "19026"}));
+    auto grid_at = [&](double lat, double lng) {
+        const uint64_t cell = S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(16).id();
+        std::string code = "-";
+        for (const auto& r : rows)
+            if (r.cell <= cell) code = r.country_code ? std::string(postcode_grid::code_of(r)) : "-";
+        return code;
+    };
+    for (const Postcoded& h : houses)
+        if (h.lat == 470500000) CHECK_EQ(grid_at(h.lat * 1e-7, h.lon * 1e-7), std::string(h.postcode).substr(0, 5));
+
+    // The server, from the dir of an admin preset and from admin-minimal,
+    // answers each point from the grid: 19026 beside its last house, where
+    // the nearest centroid is 19018's.
+    const std::vector<std::pair<double, double>> points = {{47.0503, 8.121}, {47.0497, 8.14}, {47.0502, 8.03}};
+    const std::vector<std::string> want = {"19026", "19018", "19026"};
+    for (const std::string& dir : {admin_preset_dir(out, "planet", root.path() + "/preset"), out + "/planet/admin-minimal"}) {
+        const std::vector<std::string> answers = server_answers(dir, points, root.path() + "/q", log);
+        REQUIRE(answers.size() == points.size());
+        for (size_t i = 0; i < points.size(); i++) {
+            CHECK(says(answers[i], "Testland"));
+            const std::optional<std::string> postcode = answer_string(answers[i], {"address", "postcode"});
+            CHECK(postcode == want[i]);
+            if (postcode != want[i]) std::printf("    %s: %s\n", dir.c_str(), answers[i].c_str());
+        }
+    }
+}
+
 namespace {
 
 // The ids of the entries the attribution.json at `path` lists, in order;
@@ -2331,8 +2410,9 @@ TEST(each_mode_dir_credits_the_sources_of_its_data) {
     const Ids osm = {"osm"};
 
     // London's centroid is in the planet and Europe, New York's range and
-    // its ZIP's centroid in the planet and North America; the admin-minimal
-    // dirs hold no postcodes, nor do boundary tiers or POI tiers credit.
+    // its ZIP's centroid in the planet and North America, of no country there
+    // to vote in a postcode grid; the admin-minimal dirs hold no postcode
+    // centroids, nor do boundary tiers or POI tiers credit.
     const auto files = build("multi", {"--continents", "--multi-output", "--multi-quality", "--external-postcodes", london,
                                        "--tiger-data", tiger});
     const std::map<std::string, Ids> want = {
@@ -2399,6 +2479,48 @@ TEST(each_mode_dir_credits_the_sources_of_its_data) {
             if (credited(ranges, at) != want) std::printf("    %s\n", at.c_str());
             CHECK(credited(ranges, at) == want);
         }
+    }
+}
+
+// The postcode grid holds the ZIPs of the TIGER ranges that vote in it, so
+// every mode dir holding a grid of their votes credits TIGER, the
+// admin-minimal dirs too, which hold no centroid; a grid of OSM's houses'
+// votes alone is OpenStreetMap's data. Testland is the United States, with
+// 19026's houses along 47.05 N, and a range of 19026 among them, whose ZIP
+// gives no centroid: OSM's houses have one of it.
+TEST(a_mode_dir_holding_a_postcode_grid_of_tiger_ranges_credits_tiger) {
+    const ScratchDir root("postcode-grid-credit");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log", tiger = root.path() + "/tiger";
+    std::vector<Postcoded> houses;
+    for (int i = 0; i <= 20; i++) houses.push_back({8100 + i, 470500000, 80200000 + 50000 * i, "19026"});
+    std::vector<TestObject> objects = with_postcodes(houses);
+    for (TestObject& o : objects)
+        if (o.type == OsmType::Relation && o.id == 40)
+            for (auto& [key, value] : o.tags)
+                if (key == "ISO3166-1" || key == "ISO3166-1:alpha2") value = "US";
+    write_test_pbf(pbf, objects, 1000);
+    fs::create_directories(tiger);
+    {
+        std::ofstream f(tiger + "/42101.csv", std::ios::binary);
+        f << "from;to;interpolation;street;city;state;postcode;geometry\n"
+             "100;198;even;Teststrasse;Testville;PA;19026;LINESTRING(8.05 47.051,8.06 47.051)\n";
+        REQUIRE(f.good());
+    }
+    using Ids = std::vector<std::string>;
+    for (const bool ranges : {false, true}) {
+        const std::string out = root.path() + (ranges ? "/ranges" : "/houses");
+        std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output", "--multi-quality"};
+        if (ranges) words.insert(words.end(), {"--tiger-data", tiger});
+        REQUIRE(gctest::run(words, log));
+        const auto files = tree(out);
+        const Ids want = ranges ? Ids{"osm", "tiger"} : Ids{"osm"};
+        for (const char* region : {"planet", "europe"})
+            for (const char* mode : {"admin", "no-addresses", "full", "admin-minimal", "admin-minimal-poi"}) {
+                const std::string dir = std::string(region) + "/" + mode + "/";
+                CHECK(files.count(dir + postcode_grid::FILE_NAME));
+                if (credited(files, dir + "attribution.json") != want) std::printf("    %s\n", dir.c_str());
+                CHECK(credited(files, dir + "attribution.json") == want);
+            }
     }
 }
 

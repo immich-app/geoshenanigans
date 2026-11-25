@@ -32,6 +32,7 @@
 #include "place_files.h"
 #include "polygon_rings.h"
 #include "postcode_files.h"
+#include "postcode_grid.h"
 #include "postcode_validation.h"
 #include "ranked_bits.h"
 #include "record_files_io.h"
@@ -754,6 +755,24 @@ void collect_postcode_centroids(ParsedData& data) {
     data.postcode_accum = std::move(osm);
 }
 
+void collect_postcode_grid(ParsedData& data) {
+    using namespace postcode_grid;
+    const AdminRings countries = border_country_rings(data);
+    GridCells grid = grid_cells(
+        data.addr_points, data.addr_postcode_ids, data.interp_ways, data.interp_nodes, data.interp_postcode_ids,
+        [&](uint32_t id) { return std::string_view(data.get_string(id)); },
+        [&](double lat, double lng) { return country_at(data, countries, lat, lng); },
+        [](double lat, double lng) {
+            return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(GRID_LEVEL).id() >> cell_shift(GRID_LEVEL);
+        });
+    data.postcode_grid_rows = grid_rows(grid.cells, grid.codes, GRID_LEVEL);
+    if (!data.postcode_grid_rows.empty()) data.postcode_grid_file = encode_file(data.postcode_grid_rows);
+    data.postcode_grid_sources = (grid.address_votes ? ATTRIBUTION_OSM : 0) | (grid.tiger_votes ? ATTRIBUTION_TIGER : 0);
+    std::cerr << "Postcode grid: " << grid.address_votes << " address votes, " << grid.tiger_votes << " TIGER line votes, "
+              << grid.codes.size() << " postcodes, " << grid.cells.size() << " cells, " << data.postcode_grid_rows.size() << " runs, "
+              << data.postcode_grid_file.size() << " bytes" << std::endl;
+}
+
 // Writes centroids' postcode files into dir (postcode_files.h), the
 // centroids in their logical order; returns the cells they are in.
 static size_t write_postcode_files(const std::string& dir, const std::vector<postcode_files::LogicalCentroid>& centroids) {
@@ -950,6 +969,15 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
         });
     }
 
+    // The postcode grid (postcode_grid.h), an optional file: the same bytes
+    // in every mode dir of a region.
+    if (!data.postcode_grid_file.empty()) {
+        write_futures.push_back(std::async(std::launch::async, [&] {
+            write_binary_file(output_dir + "/" + postcode_grid::FILE_NAME, reinterpret_cast<const char*>(data.postcode_grid_file.data()),
+                              data.postcode_grid_file.size());
+        }));
+    }
+
     // The geo index goes last, beside the files above.
     if (write_streets) {
         GeoTables tables{&data.sorted_way_cells, nullptr, nullptr};
@@ -970,13 +998,15 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     const uint8_t centroid_sources = postcode_sources.valid() ? postcode_sources.get() : 0;
 
     // The credit of the data written here: OpenStreetMap's, its postcode
-    // centroids' sources, and TIGER's where an interpolation written came
-    // from it (a SYNTHETIC identity, tiger.h).
+    // centroids' sources, TIGER's where an interpolation written came from it
+    // (a SYNTHETIC identity, tiger.h), and its postcode grid's votes' sources.
     const bool tiger_interps = write_addresses &&
         std::any_of(data.interp_osm_ids.begin(), data.interp_osm_ids.end(), [](uint64_t id) {
             return id >> 56 == static_cast<uint64_t>(gc::id_alloc::ObjectType::SYNTHETIC);
         });
-    write_attribution(output_dir, ATTRIBUTION_OSM | centroid_sources | (tiger_interps ? ATTRIBUTION_TIGER : 0));
+    const uint8_t grid_sources = data.postcode_grid_file.empty() ? 0 : data.postcode_grid_sources;
+    write_attribution(output_dir,
+                      ATTRIBUTION_OSM | centroid_sources | (tiger_interps ? ATTRIBUTION_TIGER : 0) | grid_sources);
     log_phase((label + "total").c_str(), _total_t, _total_c);
 }
 
@@ -1412,8 +1442,13 @@ void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, con
 
     string_files::write_file(dir + "/" + STR_TIER_FILENAMES[0], strings.core.data(), strings.core.size());
     write_strings_layout(dir, strings.bases);
-    // OpenStreetMap's data alone: admin-minimal holds no postcodes.
-    write_attribution(dir, ATTRIBUTION_OSM);
+    // The postcode grid, which names no string: the mode dirs' bytes.
+    if (!data.postcode_grid_file.empty())
+        write_binary_file(dir + "/" + postcode_grid::FILE_NAME, reinterpret_cast<const char*>(data.postcode_grid_file.data()),
+                          data.postcode_grid_file.size());
+    // OpenStreetMap's data, and the postcode grid's votes' sources:
+    // admin-minimal holds no postcode centroids.
+    write_attribution(dir, ATTRIBUTION_OSM | (data.postcode_grid_file.empty() ? 0 : data.postcode_grid_sources));
 
     size_t kept = 0;
     for (uint32_t p : records.polygon_of) kept += p != NO_DATA;

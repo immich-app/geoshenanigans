@@ -33,6 +33,7 @@
 #include "id_allocator.h"
 #include "place_claims.h"
 #include "parallel.h"
+#include "postcode_grid_build.h"
 #include "ranked_bits.h"
 
 // The records one POI tier's files carry, in record order, and how many of
@@ -522,6 +523,17 @@ struct ParsedData {
         double lng() const { return (sum_lng_e7 / 1e7) / static_cast<double>(count); }
     };
     std::unordered_map<uint64_t, PostcodeAccum> postcode_accum;
+
+    // The postcode grid (postcode_grid_build.h): the planet's runs, found
+    // once on the full data (collect_postcode_grid), which a continent's
+    // file is made of (region_rows) and which it doesn't keep, and the
+    // region's postcode_grid.bin, which every mode dir holds alike: empty for
+    // a region of no run. The sources of the planet's votes (attribution.h):
+    // OSM's addresses, and TIGER's lines, whose ZIPs a region's grid holds
+    // with the runs it takes.
+    std::vector<postcode_grid::LogicalRow> postcode_grid_rows;
+    std::vector<uint8_t> postcode_grid_file;
+    uint8_t postcode_grid_sources = 0;
 
     // The houses whose tag makes a centroid of another postcode than the
     // one they keep (normalise_addr_postcodes), those of a country of no
