@@ -72,6 +72,31 @@ fn a_street_within_the_search_distance_is_found_from_anywhere_in_a_cell_and_none
 }
 
 #[test]
+fn an_interpolation_line_within_the_search_distance_is_found_from_anywhere_in_a_cell_and_none_past_it() {
+    // From each corner of a cell and its middle, in every direction: an interpolation line 125 m
+    // off is the nearest, one 135 m off none, though a cell the scan reads lists it.
+    let cover = geo_cover(DEFAULT_SEARCH_DISTANCE / 6_371_000.0, DEFAULT_STREET_CELL_LEVEL);
+    for from in points_round_cell(ORIGIN) {
+        let scanned = cells_within(from.0, from.1, DEFAULT_STREET_CELL_LEVEL, cover).ids;
+        for bearing in BEARINGS {
+            for (metres, found) in [(125.0, true), (135.0, false)] {
+                let mut dataset = TestIndex::around(from);
+                dataset.interpolation("Main Street", (1, 99, 0), &across(metres, bearing));
+                let at = format!("{metres} m along {bearing}° from {from:?}");
+                assert!(scanned.iter().any(|cell| dataset.geo_cells.get(cell).is_some_and(|lists| lists[geo_index::INTERPOLATIONS].contains(&0))), "{at}");
+                let index = dataset.load();
+                let interp = &index.debug_primary(from.0, from.1)["interp"];
+                if found {
+                    assert!(about(&interp["dist_m"], metres), "{at}: {interp}");
+                } else {
+                    assert!(interp.is_null(), "{at}: {interp}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn the_nearer_of_two_streets_wins_whichever_cell_lists_the_farther() {
     // A street 60 m off one way and another 110 m off another way, from each corner of a cell and
     // its middle: the nearer is the road, though the farther comes first in record order.
