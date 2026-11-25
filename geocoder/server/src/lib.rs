@@ -2744,13 +2744,20 @@ impl Index {
         // Now build the same ranked structure as find_admin, at the builder's ranks.
         let mut result = AdminResult::default();
         let mut ranked: Vec<RankedPoly> = Vec::new();
+        // A closed country way of the chain, which names the country where no country of a rank
+        // does, as in find_admin.
+        let mut country_way: Option<AdminPolygon> = None;
         for &pid in &chain_ids {
             let Some(poly) = self.admin_polygon(pid) else { continue; };
             if poly.admin_level == POSTCODE_AREA_LEVEL { continue; }
             // ISO-less level-2 polygons (maritime boundary closed ways)
             // can never name a country — see find_admin.
             if poly.admin_level == 2 && poly.country_code == 0 { continue; }
-            if ADDRESS_AREA_RANKS.contains(&poly.rank_address) { ranked.push(RankedPoly::of(pid, poly)); }
+            if ADDRESS_AREA_RANKS.contains(&poly.rank_address) {
+                ranked.push(RankedPoly::of(pid, poly));
+            } else if poly.admin_level == 2 {
+                country_way.get_or_insert(poly);
+            }
         }
         // Add place-area polygons
         ranked.extend(place_area_polygons.iter().map(|&(slot, poly)| RankedPoly::of(slot, poly)));
@@ -2768,6 +2775,10 @@ impl Index {
             .find(|&&k| polygon_field(&ranked[k]) == Some("country"))
             .and_then(|&k| country_code_bytes(ranked[k].poly.country_code));
         result.rows = self.polygon_rows(&ranked, shown);
+        if let Some(poly) = country_way.filter(|_| result.country_code.is_none()) {
+            result.country_code = country_code_bytes(poly.country_code);
+            result.rows.push(AddressRow { rank: 4, name: self.get_string(poly.name_id), label: Some("country") });
+        }
         result.ranked = ranked;
 
         result
@@ -3124,8 +3135,10 @@ impl Index {
         });
         let of_street = |row: &AddressRow<'a>| at_street.iter().flatten().flatten().any(|r| r == row);
         let (street_rows, chain_rows): (Vec<_>, Vec<_>) = [state, region, province].into_iter().flatten().partition(of_street);
+        // The chain's country, but a closed country way's where the query point has a country.
+        let chain_country = chain.ranked.iter().any(|r| polygon_field(r) == Some("country")) || admin_pip.country_code.is_none();
         let mut replacing: Vec<AddressRow<'a>> = Vec::with_capacity(4);
-        for row in chain.row("country").cloned().into_iter().chain(street_rows).chain(chain_rows) {
+        for row in chain.row("country").filter(|_| chain_country).cloned().into_iter().chain(street_rows).chain(chain_rows) {
             if !replacing.iter().any(|r| r.rank == row.rank) {
                 replacing.push(row);
             }
@@ -3139,7 +3152,7 @@ impl Index {
             let at = rows.partition_point(|r| r.rank > row.rank);
             rows.insert(at, row);
         }
-        AdminResult { country_code: chain.country_code.or(admin_pip.country_code), rows, ..admin_pip }
+        AdminResult { country_code: chain.country_code.filter(|_| chain_country).or(admin_pip.country_code), rows, ..admin_pip }
     }
 
     /// Street way `id`'s nodes, owned; None for NO_DATA, an id past the last way and a way
@@ -9139,6 +9152,30 @@ mod query_path_tests {
 
         assert_eq!((&address["road"], &address["house_number"]), (&serde_json::json!("High Street"), &serde_json::json!("7")));
         assert_eq!(address["country"], "Farland");
+    }
+
+    #[test]
+    fn query_takes_the_country_way_its_street_s_chain_ends_at_where_no_country_holds_the_point() {
+        // Coast Road runs out of Farland, a closed level 2 way the builder keeps at rank 0 to name
+        // a country where no relation of a rank does, and the point lies past the way, in no
+        // country polygon. The street's chain ends at Farland: Nominatim's street has its country
+        // (placex.country_code), which the answer names (_finalize_entry). Where Testland, a
+        // country of a rank, holds the point, it stays the country.
+        for testland in [false, true] {
+            let mut dataset = if testland { TestIndex::new() } else { TestIndex { origin: ORIGIN, ..TestIndex::default() } };
+            let farland = dataset.polygons.len() as u32;
+            dataset
+                .boundary("Farland", 2, 0, (-1000.0, -1000.0, 1000.0, 1000.0)).rank(0)
+                .street("Coast Road", &[(0.0, 0.0), (0.0, 1500.0)]).way_parent(farland);
+            let mut index = dataset.load();
+            let parents = vec![NO_DATA; farland as usize + 1];
+            index.admin_parents = Some(FileBytes::Owned(parents.iter().flat_map(|parent| parent.to_le_bytes()).collect()));
+
+            let address = address_at(&index, 10.0, 1400.0);
+
+            assert_eq!(address["road"], "Coast Road", "{testland}");
+            assert_eq!(address["country"], if testland { "Testland" } else { "Farland" }, "{testland}");
+        }
     }
 
     #[test]
