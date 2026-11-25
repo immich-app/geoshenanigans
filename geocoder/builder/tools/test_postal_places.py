@@ -119,6 +119,21 @@ class PostalPlacesTest(unittest.TestCase):
         _, _, second, _ = self.run_main(self.zip("US", "".join([rows[1], rows[0]] + rows[2:])))
         self.assertEqual(json.loads(first)["sha256"], json.loads(second)["sha256"])
 
+    def test_a_zip_of_two_files_is_one_row_the_builders_and_counts_once(self):
+        us = self.zip("US", line("US", "19026", "Drexel Hill", "Pennsylvania", "PA") + line("US", "19073", "Newtown Square")
+                      + line("US", "00601", "Adjuntas Station", "Pennsylvania", "PA"))
+        pr = self.zip("PR", line("PR", "00601", "Adjuntas", "Adjuntas", "001"))
+        rc, out, stdout, _ = self.run_main(us, pr)
+        self.assertEqual(rc, 0)
+        with gzip.open(out, "rt", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "PR\t00601\tAdjuntas\tPR\nUS\t19026\tDrexel Hill\tPA\nUS\t19073\tNewtown Square\t\n")
+        self.assertEqual(json.loads(stdout)["rows"], 3)
+        self.assertEqual(json.loads(stdout)["sources"], {"US": 3, "PR": 1})
+        # The copy makes up for no lost ZIP: three of a cache of four are too few.
+        rc, _, _, stderr = self.run_main(us, pr, "--previous-rows", "4")
+        self.assertEqual(rc, 1)
+        self.assertIn("3 rows, fewer than 99% of the cache's 4", stderr)
+
     def test_a_refresh_keeps_99_percent_of_the_caches_rows(self):
         us = self.zip("US", "".join(line("US", f"{19000 + i:05d}", f"Town {i}") for i in range(99)))
         self.assertEqual(self.run_main(us, "--previous-rows", "100")[0], 0)
