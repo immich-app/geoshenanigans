@@ -8,9 +8,18 @@ jq = "1.8.2"
 yq = "4.54.3"
 kustomize = "5.8.3"
 kubeconform = "0.8.0"
-flux2 = "2.9.5"
 # github backend: the aqua backend fails to verify cosign v3's sigstore bundles.
 "github:sigstore/cosign" = "v3.1.4"
+
+# aqua's flux2 recipe names no SLSA signer (and checks checksums.txt with the
+# .sig/.pem that flux 2.10 replaced with a sigstore bundle), so mise needs the
+# signer to verify each archive against provenance.intoto.jsonl at lock time.
+# It is the generator workflow flux's release.yaml calls; a release built with
+# another generator version fails mise lock until the identity is updated.
+[tools.flux2]
+version = "2.10.1"
+slsa_signer_identity = "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.1.0"
+slsa_signer_issuer = "https://token.actions.githubusercontent.com"
 
 [tasks."o11y:render"]
 description = "Render the o11y bundle into build/o11y, check it assembles under kustomize and validate it against the CRD schemas"

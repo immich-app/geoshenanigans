@@ -24,6 +24,7 @@
 
 #include "admin_cover.h"
 #include "admin_rank_config.h"
+#include "attribution.h"
 #include "geometry.h"
 #include "id_allocator.h"
 #include "parallel.h"
@@ -327,9 +328,11 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
         alloc.load_previous(prev_dir + "/poi/all/poi_records.osm_ids");
     }
 
+    // A slot remembers the lowest tier that ships its record, which a
+    // tombstone of it then reaches (select_poi_tier).
     const size_t n_old = data.poi_records.size();
     const std::vector<uint32_t> remap = alloc.allocate_all(n_old, [&](size_t i) {
-        return unpack_identity(data.poi_osm_ids[i], data.poi_records[i].tier);
+        return unpack_identity(data.poi_osm_ids[i], poi_lowest_tier(data.poi_records[i]));
     });
     const bool identity = is_identity(remap);
     const uint32_t n_new = alloc.total_slots();
@@ -348,6 +351,7 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
     tomb_pr.parent_poly_id = NO_DATA;
     reorder_by_remap(data.poi_records, remap, n_new, tomb_pr);
     reorder_by_remap(data.poi_osm_ids, remap, n_new, uint64_t(0));
+    if (!data.poi_water_importance.empty()) reorder_by_remap(data.poi_water_importance, remap, n_new, uint8_t(0));
 
     // sorted_poi_cells item_ids carry the high-bit
     // INTERIOR_FLAG (set during POI cell covering at build_index.cpp). A
@@ -781,6 +785,7 @@ void collect_postcode_grid(ParsedData& data) {
         [&](double lat, double lng) { return country_at(data, countries, lat, lng); }, pos_at);
     data.postcode_grid_rows = grid_rows(grid.cells, grid.codes, GRID_LEVEL);
     if (!data.postcode_grid_rows.empty()) data.postcode_grid_file = encode_file(data.postcode_grid_rows);
+    data.postcode_grid_sources = (grid.address_votes ? ATTRIBUTION_OSM : 0) | (grid.tiger_votes ? ATTRIBUTION_TIGER : 0);
     std::cerr << "Postcode grid: " << grid.address_votes << " address votes, " << grid.tiger_votes << " TIGER line votes, "
               << grid.codes.size() << " postcodes, " << grid.cells.size() << " cells, " << data.postcode_grid_rows.size() << " runs, "
               << data.postcode_grid_file.size() << " bytes" << std::endl;
@@ -828,6 +833,8 @@ void collect_postcode_grid(ParsedData& data) {
     }
     data.postal_city_rows = std::move(table.rows);
     if (!data.postal_city_rows.empty()) data.postal_cities_file = postal_cities::encode_file(data.postal_city_rows);
+    data.postal_cities_sources =
+        data.postal_places.empty() && data.prev_postal_names.empty() ? 0 : ATTRIBUTION_POSTAL_CITIES;
     std::cerr << "Postal cities: " << table.votes << " votes over " << table.zips << " ZIPs, " << data.postal_city_rows.size()
               << " rows (" << table.by_votes << " from votes, " << table.by_geonames << " from GeoNames, "
               << table.by_majority << " by a majority without GeoNames, " << table.by_previous
@@ -993,17 +1000,21 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     // (country, postcode), in cell order. They were summed once on the full
     // data (collect_postcode_centroids), of the postcodes their countries'
     // patterns make; continents carry the ones whose centroid lies inside
-    // them, and a region of none gets no files.
+    // them, and a region of none gets no files. The task gives the sources
+    // of the centroids it writes (attribution.h).
+    std::future<uint8_t> postcode_sources;
     if (!data.postcode_accum.empty()) {
-        write_futures.push_back(std::async(std::launch::async, [&] {
+        postcode_sources = std::async(std::launch::async, [&] {
             auto _pt = std::chrono::steady_clock::now();
             auto _pc = CpuTicks::now();
+            uint8_t sources = 0;
             std::vector<postcode_files::LogicalCentroid> centroids;
             centroids.reserve(data.postcode_accum.size());
             for (const auto& [pk, acc] : data.postcode_accum) {
                 if (acc.count == 0) continue;
                 const uint16_t cc = postcode_key_cc(pk);
                 const uint32_t pc_id = postcode_key_pc(pk);
+                sources |= acc.source;
                 postcode_files::LogicalCentroid c;
                 c.lat = static_cast<float>(acc.lat());
                 c.lng = static_cast<float>(acc.lng());
@@ -1024,7 +1035,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             const size_t cells = write_postcode_files(output_dir, centroids);
             std::cerr << "postcode centroids: " << centroids.size() << " in " << cells << " cells" << std::endl;
             log_phase((label + "postcode centroids").c_str(), _pt, _pc);
-        }));
+            return sources;
+        });
     }
 
     // The postcode grid (postcode_grid.h) and the postal cities
@@ -1060,6 +1072,20 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 
     admin_future.get();
     for (auto& f : write_futures) f.get();
+    const uint8_t centroid_sources = postcode_sources.valid() ? postcode_sources.get() : 0;
+
+    // The credit of the data written here: OpenStreetMap's, its postcode
+    // centroids' sources, TIGER's where an interpolation written came from it
+    // (a SYNTHETIC identity, tiger.h), its postcode grid's votes' sources and
+    // its postal cities' names'.
+    const bool tiger_interps = write_addresses &&
+        std::any_of(data.interp_osm_ids.begin(), data.interp_osm_ids.end(), [](uint64_t id) {
+            return id >> 56 == static_cast<uint64_t>(gc::id_alloc::ObjectType::SYNTHETIC);
+        });
+    const uint8_t grid_sources = data.postcode_grid_file.empty() ? 0 : data.postcode_grid_sources;
+    const uint8_t postal_sources = data.postal_cities_file.empty() ? 0 : data.postal_cities_sources;
+    write_attribution(output_dir, ATTRIBUTION_OSM | centroid_sources | (tiger_interps ? ATTRIBUTION_TIGER : 0) |
+                                      grid_sources | postal_sources);
     log_phase((label + "total").c_str(), _total_t, _total_c);
 }
 
@@ -1503,6 +1529,10 @@ void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, con
     if (!data.postal_cities_file.empty())
         write_binary_file(dir + "/" + postal_cities::FILE_NAME, reinterpret_cast<const char*>(data.postal_cities_file.data()),
                           data.postal_cities_file.size());
+    // OpenStreetMap's data, and the sources of the postcode grid's votes and
+    // of the postal cities' names: admin-minimal holds no postcode centroids.
+    write_attribution(dir, ATTRIBUTION_OSM | (data.postcode_grid_file.empty() ? 0 : data.postcode_grid_sources) |
+                               (data.postal_cities_file.empty() ? 0 : data.postal_cities_sources));
 
     size_t kept = 0;
     for (uint32_t p : records.polygon_of) kept += p != NO_DATA;

@@ -30,15 +30,15 @@
       "notices": [
         "UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.",
         "The Data is provided \"as is\" without warranty or any representation of accuracy, timeliness or completeness.",
-        "Changes: this dataset holds the coordinates of the GB postcodes of GB_full.csv.zip that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the file's other fields.",
+        "Changes: this dataset holds the coordinates of the postcodes of GeoNames's postal code files that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the files' other fields.",
         "Changes: this dataset names a US ZIP code with the place name GeoNames's postal code files give it where the ZIP's OpenStreetMap addresses name too few cities, choose that name, or favour another by fewer votes than the extra ones that name counts, spelt as OpenStreetMap addresses spell it where they do, in its own format; it holds none of the files' other fields."
       ],
       "applies_to": [
-        "dir.admin-minimal",
-        "dir.admin-minimal-poi",
-        "mode.admin",
+        "mode.full",
         "mode.no-addresses",
-        "mode.full"
+        "mode.admin",
+        "dir.admin-minimal",
+        "dir.admin-minimal-poi"
       ]
     },
     {
@@ -70,7 +70,9 @@
       "applies_to": [
         "mode.full",
         "mode.no-addresses",
-        "mode.admin"
+        "mode.admin",
+        "dir.admin-minimal",
+        "dir.admin-minimal-poi"
       ]
     },
     {
@@ -246,7 +248,8 @@
         "{region}/admin-minimal/place_hidden.bin",
         "{region}/admin-minimal/place_nodes.bin",
         "{region}/admin-minimal/strings_core.bin",
-        "{region}/admin-minimal/strings_layout.json"
+        "{region}/admin-minimal/strings_layout.json",
+        "{region}/admin-minimal/attribution.json"
       ],
       "optional_files": [
         "{region}/admin-minimal/postcode_grid.bin",
@@ -272,7 +275,8 @@
         "{region}/admin-minimal-poi/place_hidden.bin",
         "{region}/admin-minimal-poi/place_nodes.bin",
         "{region}/admin-minimal-poi/strings_core.bin",
-        "{region}/admin-minimal-poi/strings_layout.json"
+        "{region}/admin-minimal-poi/strings_layout.json",
+        "{region}/admin-minimal-poi/attribution.json"
       ],
       "optional_files": [
         "{region}/admin-minimal-poi/postcode_grid.bin",
@@ -294,7 +298,8 @@
         "{region}/admin/place_nodes.bin",
         "{region}/admin/strings_core.bin",
         "{region}/admin/strings_layout.json",
-        "{region}/admin/strings_postcode.bin"
+        "{region}/admin/strings_postcode.bin",
+        "{region}/admin/attribution.json"
       ],
       "optional_files": [
         "{region}/admin/postcode_centroids.bin",
@@ -320,7 +325,8 @@
         "{region}/no-addresses/strings_core.bin",
         "{region}/no-addresses/strings_street.bin",
         "{region}/no-addresses/strings_layout.json",
-        "{region}/no-addresses/strings_postcode.bin"
+        "{region}/no-addresses/strings_postcode.bin",
+        "{region}/no-addresses/attribution.json"
       ],
       "optional_files": [
         "{region}/no-addresses/postcode_centroids.bin",
@@ -353,7 +359,8 @@
         "{region}/full/strings_street.bin",
         "{region}/full/strings_addr.bin",
         "{region}/full/strings_layout.json",
-        "{region}/full/strings_postcode.bin"
+        "{region}/full/strings_postcode.bin",
+        "{region}/full/attribution.json"
       ],
       "optional_files": [
         "{region}/full/interp_postcodes.bin",
@@ -391,6 +398,9 @@
         "{region}/poi/major/strings_poi.bin",
         "{region}/poi/major/strings_layout.json",
         "{region}/poi/major/poi_meta.json"
+      ],
+      "optional_files": [
+        "{region}/poi/major/poi_attribution.json"
       ]
     },
     "poi_tier.notable": {
@@ -402,6 +412,9 @@
         "{region}/poi/notable/strings_poi.bin",
         "{region}/poi/notable/strings_layout.json",
         "{region}/poi/notable/poi_meta.json"
+      ],
+      "optional_files": [
+        "{region}/poi/notable/poi_attribution.json"
       ]
     },
     "poi_tier.all": {
@@ -413,6 +426,9 @@
         "{region}/poi/all/strings_poi.bin",
         "{region}/poi/all/strings_layout.json",
         "{region}/poi/all/poi_meta.json"
+      ],
+      "optional_files": [
+        "{region}/poi/all/poi_attribution.json"
       ]
     }
   },

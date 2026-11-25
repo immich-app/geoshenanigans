@@ -285,7 +285,10 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
             [](PoiRecord& p, uint32_t offset, uint32_t) { p.vertex_offset = offset; },
             out.poi_records, out.poi_vertices);
         out.poi_osm_ids = subset_osm_ids(used_poi_ids, poi_remap, out.poi_records.size(), full.poi_osm_ids);
-        drop(full.poi_records, full.poi_vertices, full.poi_osm_ids);
+        if (!full.poi_water_importance.empty())
+            out.poi_water_importance =
+                subset_osm_ids(used_poi_ids, poi_remap, out.poi_records.size(), full.poi_water_importance);
+        drop(full.poi_records, full.poi_vertices, full.poi_osm_ids, full.poi_water_importance);
     };
 
     // Place nodes — parent_poly_id remapped in a second pass below, after
@@ -433,7 +436,10 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
                 return at->second;
             });
         grid_runs = rows.size();
-        if (!rows.empty()) out.postcode_grid_file = postcode_grid::encode_file(rows);
+        if (!rows.empty()) {
+            out.postcode_grid_file = postcode_grid::encode_file(rows);
+            out.postcode_grid_sources = full.postcode_grid_sources;
+        }
         // The postal cities of the postcodes the continent's data answers
         // with, each the planet's row of it (region_rows): its runs', its
         // postal areas', the own postcode of each of its houses in a run of a
@@ -491,7 +497,10 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
                 if (auto code = postcode_grid::grid_postcode(uint16_t(v >> 32), full.get_string(uint32_t(v))))
                     codes.push_back({uint16_t(v >> 32), std::move(*code)});
             out.postal_city_rows = postal_cities::region_rows(full.postal_city_rows, codes);
-            if (!out.postal_city_rows.empty()) out.postal_cities_file = postal_cities::encode_file(out.postal_city_rows);
+            if (!out.postal_city_rows.empty()) {
+                out.postal_cities_file = postal_cities::encode_file(out.postal_city_rows);
+                out.postal_cities_sources = full.postal_cities_sources;
+            }
         }
     }
 

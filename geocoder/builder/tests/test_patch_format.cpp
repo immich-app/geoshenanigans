@@ -491,6 +491,7 @@ TEST(patch_format_client_file_names) {
         {"street_ways.bin", true, false},
         {"strings_layout.json", true, true},
         {"poi_meta.json", true, true},
+        {"attribution.json", true, true},
         {"street_ways.osm_ids", false, false},
         {"patch.gcpatch", false, false},
         {"street_ways.bin.zst", false, false},

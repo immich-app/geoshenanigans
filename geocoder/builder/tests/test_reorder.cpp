@@ -217,6 +217,8 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
         p.category = static_cast<uint8_t>(r.below(3) == 0 ? static_cast<uint8_t>(PoiCategory::PEAK) : r.below(4));
         p.tier = static_cast<uint8_t>(1 + r.below(4));
         p.flags = static_cast<uint8_t>(r.below(4));
+        // Some carry a water kind, which takes an importance of its own.
+        if (r.one_in(6)) p.flags = poi_flags_with_water(p.flags, kPoiWaterKinds[r.below(static_cast<uint32_t>(std::size(kPoiWaterKinds)))]);
         p.parent_street_id = small_id(r, 4);
         p.parent_postcode_id = small_id(r, 4);
         p.parent_poly_id = r.one_in(20) ? n_admin + 4 : small_id(r, n_admin);
@@ -327,6 +329,7 @@ void check_same_records(const ParsedData& a, const ParsedData& b) {
     CHECK(same_pairs(a.admin_country_cells, b.admin_country_cells));
     CHECK(same_bytes(a.poi_records, b.poi_records));
     CHECK(same_bytes(a.poi_osm_ids, b.poi_osm_ids));
+    CHECK(same_bytes(a.poi_water_importance, b.poi_water_importance));
     CHECK(same_bytes(a.poi_vertices, b.poi_vertices));
     CHECK(same_pairs(a.sorted_poi_cells, b.sorted_poi_cells));
     CHECK(same_bytes(a.place_nodes, b.place_nodes));

@@ -4,6 +4,7 @@
   "license": "BSD-3-Clause",
   "scripts": {
     "build": "tsx src/index.ts",
+    "test": "tsx --test src/*.test.ts",
     "watch": "tsx watch src/index.ts",
     "serve": "http-server dist -p 3000 --cors",
     "tunnel": "lt --port 3000 --subdomain immich-map-styles",
@@ -12,12 +13,13 @@
     "dev:tunnel": "concurrently \"npm run watch\" \"npm run serve:tunnel\""
   },
   "devDependencies": {
-    "@maplibre/maplibre-gl-style-spec": "23.3.0",
+    "@maplibre/maplibre-gl-style-spec": "26.9.0",
     "@protomaps/basemaps": "5.7.2",
     "@types/node": "^26.6.6",
     "concurrently": "^10.0.0",
     "http-server": "^14.1.1",
     "localtunnel": "^2.0.2",
+    "maplibre-gl-style-spec-oldest": "npm:@maplibre/maplibre-gl-style-spec@23.3.0",
     "tsx": "^4.7.2"
   }
 }

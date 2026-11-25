@@ -9,8 +9,10 @@ This document traces how Nominatim resolves admin boundaries to address fields, 
 | `settings/address-levels.json` | Country-specific admin_level → address_rank mapping |
 | `lib-sql/functions/ranking.sql` | `compute_place_rank()` — looks up rank from address_levels table |
 | `lib-sql/functions/placex_triggers.sql` | `find_linked_place()` — links boundaries to place nodes. `placex_update()` — rank adjustments for nested boundaries |
-| `src/nominatim_api/v1/classtypes.py` | `get_label_tag()` — determines the output field name (city, state, county, etc.) |
-| `src/nominatim_api/v1/format_json.py` | `_write_typed_address()` — writes the address JSON using labels from get_label_tag |
+| `src/nominatim_api/v1/classtypes.py` | `get_label_tag()` — determines the output field name (city, state, county, etc.); `OSM_ATTRIBUTION`, the `licence` string |
+| `src/nominatim_api/v1/format_json.py` | `_write_typed_address()` — writes the address JSON using labels from get_label_tag; `format_base_json()` puts `licence` in every result |
+| `src/nominatim_api/reverse.py` | `_find_closest_street_or_pois()` — the closest street, address point or rank-30 POI |
+| `lib-lua/themes/nominatim/presets.lua`, `init.lua` | The import's main tags (`MAIN_TAGS_POIS`, `MAIN_TAGS.natural`) and how an object's main tags give its class and categories (`process_tags`) |
 
 ## Step 1: admin_level → address_rank
 
@@ -163,6 +165,172 @@ Where Nominatim's rank adjustment matters:
 - Two admin levels that both map to the same rank range (e.g., level 5 and 6 both → county in some countries)
 - Nominatim bumps the inner one, and so do we. The difference left is that we only see the polygons containing the query point and judge containment between them by admin level, area and the rings' containment test (`polygon_within`, Step 4), where Nominatim tests the geometry with `ST_Contains`.
 
+## The primary POI: Nominatim's rank-30 lane
+
+`_find_closest_street_or_pois()` (`reverse.py:160-240`) takes, besides streets
+and address points, POIs of `rank_search = 30` whose class is not `place` or
+`building` and whose geometry is not a line (`reverse.py:192-195`). The
+closest wins, and an answer whose primary is a POI takes its `road` and
+`postcode` from it (its parent street, its own postcode). The server's
+`find_nearest_poi_with_parent()` is that lane.
+
+**Which objects rank 30.** An object gets one row, of all its main tags'
+categories (`init.lua` `process_tags`, lines 734-878): its class and type are
+its alphabetically first main tag that is no fallback tag, else its first
+fallback tag. Its ranks are those of the category with the lowest positive
+address rank, else the lowest search rank (`ranking.sql`
+`compute_place_rank`, lines 132-233). `address-levels.json` ranks (lines as
+of master 5348a803, 2026-11-21):
+
+| Main tag | rank_search, rank_address | Lines |
+|---|---|---|
+| `place=*` of an address rank: `county` 12, ..., `subdistrict` 14, ..., `locality` and `plot` 25, `square` 26 | as listed | 3-38 |
+| `natural=*` other than peak, volcano and mountain_range (18, 0), sea (4, 0) and tree, spring, cave_entrance, geyser, hot_spring, rock and stone (30, 30) | 22, 0 | 69-82 |
+| `water=*` (with `natural=water`) | 20 to 24, 0 | 83-90 |
+| `waterway=*` other than boatyard, lock_gate and access_point (30, 30) | 19 to 22, 0 | 91-100 |
+| `landuse=*` on an area | 24, 0 (residential and the other admin ones 24, 24) | 53-62 |
+| `landuse=*` on a node or line | 30, 30 (`ranking.sql:178-180`) | |
+| a key it doesn't list: `amenity`, `shop`, `tourism`, `emergency`, most `leisure`, ... | 30, 30 (`ranking.sql:195-198`) | |
+
+So no water kind ever reaches the lane: `natural=water`, `wetland`, `bay` and
+`glacier` rank 22, and `landuse=reservoir` and `basin` 24 on an area. The
+server never lets those categories (`NATURAL_WATER`, `WETLAND`, `BAY`,
+`GLACIER`, and `RESERVOIR` as a polygon) take the primary slot, nor set `road`
+or `postcode` from it (`Index::is_below_poi_rank`); a `RESERVOIR` point, a
+`landuse=reservoir|basin` node, is a rank-30 POI there and stays, but for one
+a main tag of a lower rank ranks, or whose class the lane takes none of
+(below), which the builder links no parent street. A reservoir or basin
+beside a `natural=*` value of rank 30 alone (`spring`, `hot_spring`, ...) is a
+rank-30 POI of it, class `natural`.
+
+**Water streets.** A water area a `highway=*` kind of rank 26 or 27 ranks
+(`area=yes`, `highway=pedestrian`, `natural=water`, ...), where no place or
+landuse kind of a rank below 26 ranks it lower (`place=square` ranks 26), is
+one placex row of class `highway` and `rank_address` 26 or 27 in Nominatim: a
+street, whose street lane takes address ranks 26 to 29 (`reverse.py:187-189`)
+by the distance to its geometry, 0 inside a polygon, and answers its own name
+(`lookup_street_poi`). A street has no parent street (`placex_update` parents
+`rank_search > 27` alone) and is no address point, whatever `addr:*` tags it
+carries (`IsAddressPoint` takes `rank_address = 30` alone). A multipolygon's
+geometry is its polygon; a closed way's is its polygon where `area=yes`
+alone, and its outline as a line else (`init.lua` `process_way`). The builder
+names one by its tags (`poi_classify.h` `poi_water_street`): its POI polygon
+takes the highway flag, but for a closed way of no `area=yes`, which is the
+line the street index holds, and it writes no address point of it. A
+reservoir or basin way of `area=yes` that is a street is a POI polygon of its
+own, with no POI main tag beside it (`way_tags.h` `has_poi_tags`). The
+server lets a water area of that flag compete as streets do, linked to a
+parent street or not, its own name the `road` wherever it wins
+(`Index::is_water_street`): no address node inside it takes its place, as a
+rank-30 one does in an area of `rank_search` above 27 alone
+(`lookup_street_poi`), nor does a tier-1 one take a landmark's head start. It
+reaches as far as a POI does (100 m), about as far as the street scan, of the
+query's street cell and its neighbours. Three differences stay: Nominatim's
+lane takes an area only where its centroid is within 0.007 degrees of the
+point too; its answer for a street of `addr:housenumber` carries that house
+number (`results.py` `_setup_address_details`), which a POI record holds none
+of, and its postcode is the street's own `addr:postcode` first
+(`placex_update`, `token_get_postcode`), where a street or POI here takes its
+postal boundary's, as below.
+Such a street ships in the POI tier of its water kind or in that of the
+category its tags give, whichever is lower: a lake that is an attraction is in
+`poi/notable`, as an attraction is.
+
+**Water with a POI main tag.** A water object that also carries a main tag of
+the import's POI list (`presets.lua` `MAIN_TAGS_POIS`, lines 170-262) with a
+category ranked 30 has a positive address rank, so it ranks 30 and is in the
+lane: `amenity=fountain` and `leisure=swimming_area` (class `amenity`,
+`leisure`, alphabetically before `natural`), `emergency=fire_water_pond`,
+`shop=*`, `man_made=pier`, and so on. A main tag of a lower positive address
+rank beside it ranks the object instead, out of the lane: `place=*` of an
+address rank (`locality` and `plot` 25, `suburb` 20, `subdistrict` 14, ...),
+and on an area `landuse=residential` and the other admin landuse kinds (24)
+and the `highway=*` kinds (26, 27); a landuse or highway node ranks 30. Such
+an object stays water (`poi_classify.h` `has_lower_rank_main_tag`), whatever
+its other tags. The builder classifies a rank-30 one by its rank-30 tags
+(`has_poi_main_tag`): `FOUNTAIN`, `SWIMMING_AREA`, `FIRE_WATER_POND`, `PIER`,
+..., or `GENERIC_RANK30` where they have no category of their own; a tag of a
+lower rank or of no main tag (`boundary=*`, `landuse=*` on an area,
+`leisure=park`, `natural=wood`, `place=island`, `waterway=waterfall`,
+`man_made=dam`, `power=*`) gives it none, though the classifier reads some of
+them before the water kind. Both rules run before any category. A generic
+rank-30 feature ships only with a wiki tag, as every one does; without one, the
+object stays water, so its name stays in `places` and as the `landmark`, out
+of the primary slot. Where its water kind ships in a lower POI tier than its
+category, the tiers between ship it as the water kind (`types.h`
+`poi_record_in_tier`): a bay (notable) that is a pier (all) is a `BAY` in
+`poi/notable` and a `PIER` in `poi/all`. The way pass resolves a named
+`emergency=fire_water_pond` way, and a named `landuse=reservoir|basin` way
+with a POI main tag, though the other `emergency=*` values and `shop=*` make
+no POI way alone (`way_tags.h` `has_poi_tags`). Values the import drops
+(`amenity=parking_space`, `emergency=fire_hydrant`, `tourism=yes`, ...) and
+tags of a rank below 30 and no address rank (`leisure=park`,
+`historic=neighbourhood`, `place=island`, `waterway=*`) leave the water
+category; beside a tag the object yields to, `shop=no` makes no shop.
+`building=*`, a fallback tag, ranks 30 beside `natural=*` (the class stays
+`natural`) but is the class beside `landuse=*`, also a fallback tag, and
+the lane takes no class `building`. So a reservoir or basin whose class the
+lane leaves out stays one, whatever tag ranks it 30
+(`reservoir_leaves_poi_lane`): `building` where it has fallback tags alone
+(`building`, `historic`, `tourism=attraction`), building sorting first
+among them, and `place` where `place=*` sorts before every other main tag of
+no fallback (`place=island` with `tourism=attraction` or `shop=bakery`, not
+with `amenity=fountain`).
+
+**Not matched.**
+- The builder reads no `club`, `military`, `healthcare` or `aerialway` key,
+  nor a node's `highway`: a water object whose only other main tag is one of
+  those keeps its water category, though it ranks 30 in Nominatim. So does
+  one beside `waterway=boatyard`, `lock_gate` or `access_point`, which rank
+  30 (`address-levels.json:96-98`) where the builder takes no `waterway=*`
+  for a POI main tag.
+- Multipolygons: Nominatim imports one as it does a closed way, and the
+  builder classifies a water multipolygon that is a rank-30 POI of another
+  main tag as it does a closed way (a bay or a lake that is a swimming area
+  is a `SWIMMING_AREA`). Otherwise its relation scan takes only some keys,
+  and of the water kinds bays, glaciers and streets alone: a multipolygon bay
+  or glacier the classifier keeps water (a lower rank, or rank-30 tags no
+  tier ships) is the `BAY` or `GLACIER` it is, and a water multipolygon a
+  highway kind ranks a street the water it is, of the highway flag, as the
+  closed way is; a lake, wetland or reservoir of no street is no POI as its
+  water kind, nor in the tiers that don't ship the POI it is, and one the
+  scan's own keys take (`leisure=nature_reserve`, `tourism=attraction`,
+  `place=island`, ...) keeps that category in `places` but never takes the
+  primary slot (the builder links it no parent street). A POI polygon of a
+  multipolygon is its outer rings, without its holes, so a water
+  multipolygon with an `inner` member the classifier makes one that could
+  take the slot (a rank-30 POI, or a street) takes the scan's own categories
+  instead, and never the slot: one the scan takes none of (a lake that is a
+  swimming area) is no POI, so a point on its island finds neither its name
+  nor its road, nor the address its `addr:*` tags give; the one it takes is
+  no street either. No water multipolygon of holes is an address point,
+  whatever its `addr:*` tags. A plain bay or glacier of holes keeps its
+  parent street.
+- Where no boundary and no street anchors the address (a coast no boundary
+  covers), Nominatim finds nothing; a water POI that would have won the slot
+  but for the lane still gives the answer its `landmark` and `places`,
+  without a `road` or `postcode` (`Index::query`). A bay or glacier would
+  have won it as an area label (below), only where no other POI is near.
+- A water object of a generic rank-30 tag without a wiki tag stays water,
+  out of the primary slot, where Nominatim's lane holds it as a POI.
+- The lower rank leaves out `boundary=administrative`, which ranks by an
+  admin_level the classifier doesn't read, and the country tables of
+  `address-levels.json` (`place=county` in ca and de, ...).
+- The area-label lane: peaks, volcanoes, beaches, capes, islands, parks,
+  nature reserves, stadiums, gardens, water parks, golf courses, national
+  parks, protected areas, campuses (university, college, hospital),
+  marketplaces, cemeteries, prisons, theme parks, zoos, camp sites, resorts,
+  battlefields, aerodromes and power plants (`Index::is_area_label_category`)
+  take the primary slot only where no other POI is near. Nominatim ranks many
+  of them below 30 (peak and volcano 18, beach and cape 22, island 17 or 22,
+  park and nature_reserve 24, garden 25, protected areas 25) and holds the
+  others in the lane like any POI. Bays and glaciers are not in it: as water
+  kinds, they never take the slot.
+- River and canal areas (`natural=water` with `water=river`, `canal`, ...)
+  are POIs here, though Nominatim imports none (`presets.lua:157-163` gives
+  them no category). As water they never take the primary slot; they can be
+  the `landmark` and are in `places`.
+
 ## How our implementation maps to Nominatim
 
 | Nominatim concept | Our implementation | Status |
@@ -179,8 +347,11 @@ Where Nominatim's rank adjustment matters:
 | Postcodes from addr:postcode | addr_postcodes.bin (an address point's own addr:postcode) and postcode_centroids.bin (centroids of every addr:postcode, plus external ones) | ✅ Implemented — see "Postcode handling" section below |
 | border_type tag | Not used: Nominatim never reads this tag | ✅ Ignored, as in Nominatim |
 | Wikidata-based place linking | Part of find_linked_place() above: a boundary's wikidata matched against the wikidata of the place nodes it holds (`_st_covers`) | ✅ Implemented |
+| `licence` in every result (`format_base_json`) | `licence` first in every answer, `OSM_ATTRIBUTION`'s words (`Address::licence`); `{}` where no loaded region covers the point, as Nominatim's error carries none | ✅ Implemented |
+| The rank-30 POI lane of `_find_closest_street_or_pois` | `find_nearest_poi_with_parent()`: water kinds never in it, water with a POI main tag classified by that tag (The primary POI, above) | ✅ Implemented — the area-label lane is a divergence |
 | Display name formatting (`display_name` in results.py) | `format_address`: the landmark, the house number with the road, the place parts finest first by the rank_address of the polygon or place node behind each field, with the polygons that lost their field to one of another rank or to a place node, then the postcode (rank 5) and the country (4); a part is left out only where it repeats the part just before it, and every answer with a part has one | ✅ Implemented — the house number joined to the road as the country writes it |
 | Street/road resolution | Minor differences in closest street selection | ℹ️ Our point-to-segment distance vs Nominatim's pre-computed parent streets. Causes occasional one-off differences at intersections. |
+| How far the closest street or address is looked for (`lookup_street_poi` runs `_find_closest_street_or_poi` within 0.006°) | `DEFAULT_SEARCH_DISTANCE`, 130 m: how far the street and address lookups reach, wherever the point lies in its street cell, and none farther: the nearest street way (measured to its segments) and address point that compete to be the answer's feature, and the interpolation lines that give a street that wins its house number | ℹ️ Divergence — Nominatim reaches 0.006° (about 660 m), but a road that far off is no longer the road the point is on: no street way past 130 m names the road. An address or POI that wins still gives the road it names, and a street that wins still takes its house number from within 100 m, as `_find_housenumber_for_street` does within 0.001° |
 | Suburb/neighbourhood rank adjustment | Covered by the query-time rank adjustment above | ✅ Implemented |
 | TIGER address interpolation | `--tiger-data` loads Nominatim's TIGER export (address ranges, one CSV per county) as interpolation lines, with each line's ZIP in interp_postcodes.bin | ✅ Implemented — a US street that wins without an address point takes its house number from the nearest interpolation line of that street, as Nominatim's `_find_tiger_number_for_street` does |
 | Postal city names | `address.postal_city` (US): the ZIP's postal city, from postal_cities.bin: from five votes, the `addr:city` most of its addresses carry, GeoNames' USPS place name and yesterday's name counting max(2, 10 %) more; below five, GeoNames' name; spelt as the ZIP's or its state's addresses spell it (`builder/src/postal_cities_build.h`) | ➕ An addition, not a Nominatim field — USPS assigns city names to ZIP codes that may differ from the municipal jurisdiction (e.g., "Cumming, GA" for unincorporated Forsyth County). Nominatim's own address rows reach some of these names (Pittsburgh, Miami) as place parts, from the houses' `addr:city`; `postal_city` changes no field Nominatim has, nor `display_name`. |
