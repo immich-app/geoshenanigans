@@ -298,10 +298,11 @@ class NightlyPostalCitiesTest(unittest.TestCase):
         # One that lists no files, or lists the table without its sha256: what yesterday held is
         # unknown, which fails the night as a table it can't read does. An empty list is a build
         # that published no table.
+        no_sha = "lists planet/admin/postal_cities.bin without its sha256"
         for manifest, why in (({}, "lists no files"), ({"files": []}, "lists no files"),
-                              ({"files": {"planet/admin/postal_cities.bin": {}}}, "without its sha256"),
-                              ({"files": {"planet/admin/postal_cities.bin": "x"}}, "without its sha256"),
-                              ({"files": {"planet/admin/postal_cities.bin": {"sha256": "ABC"}}}, "without its sha256")):
+                              ({"files": {"planet/admin/postal_cities.bin": {}}}, no_sha),
+                              ({"files": {"planet/admin/postal_cities.bin": "x"}}, no_sha),
+                              ({"files": {"planet/admin/postal_cities.bin": {"sha256": "ABC"}}}, no_sha)):
             self.serve("s3/bucket/geocoder/builds/2026-11-22/configurations.json", json.dumps(manifest))
             r, outputs = self.run_block(block)
             self.assertEqual(r.returncode, 1, manifest)
