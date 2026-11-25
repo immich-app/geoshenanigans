@@ -663,7 +663,8 @@ Old file hash: marker 0xFFFFFFF8 (u32) + file_id (u32) + lane_hash of the
   `poi_vertices.bin` (15), in that order right before the POI records'
   section of a dir with POI files, and `addr_points.bin` (3) and
   `addr_vertices.bin` (28), in that order right before the address points'
-  section of a dir with address points. The patcher
+  section of a dir with address points, and (v20) `postcode_grid.bin` (36)
+  right before the postcode grid's section where the old grid has rows. The patcher
   refuses a second hash of a file, a hash of any other file, and a replay
   without the hashes it checks by. A family both of whose sections are
   unchanged is copied as its files sit, and POI records sent unchanged over
