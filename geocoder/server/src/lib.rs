@@ -5901,7 +5901,7 @@ pub fn unlabelled_rows(ranked: &[RankedPoly], slots: &[Option<usize>], winners: 
 
 /// Where an answer's postcode came from (resolve_postcode's tiers): the house's own, its
 /// street's stored one, the POI's, the TIGER line's, and get_nearest_postcode's at a point, which
-/// takes the postcode grid's cell, else the postal area holding it, else the nearest centroid.
+/// takes the postal area holding it, else the postcode grid's cell, else the nearest centroid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PostcodeSource {
     Address,
