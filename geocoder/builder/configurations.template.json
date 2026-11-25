@@ -4,6 +4,88 @@
     "version": 24,
     "patch_version": 19
   },
+  "attribution": [
+    {
+      "id": "osm",
+      "text": "© OpenStreetMap contributors",
+      "url": "https://www.openstreetmap.org/copyright",
+      "licence": "ODbL 1.0",
+      "licence_url": "https://opendatacommons.org/licenses/odbl/1-0/",
+      "notices": [
+        "This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0."
+      ],
+      "applies_to": [
+        "mode.*",
+        "dir.*",
+        "quality.*",
+        "poi_tier.*"
+      ]
+    },
+    {
+      "id": "geonames",
+      "text": "GeoNames",
+      "url": "https://www.geonames.org/",
+      "licence": "CC BY 4.0",
+      "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+      "notices": [
+        "UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.",
+        "The Data is provided \"as is\" without warranty or any representation of accuracy, timeliness or completeness.",
+        "Changes: this dataset holds the coordinates of the postcodes of GeoNames's postal code files that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the files' other fields."
+      ],
+      "applies_to": [
+        "mode.full",
+        "mode.no-addresses",
+        "mode.admin"
+      ]
+    },
+    {
+      "id": "codepoint-open",
+      "text": "Ordnance Survey Code-Point Open",
+      "url": "https://www.ordnancesurvey.co.uk/products/code-point-open",
+      "licence": "OGL v3.0",
+      "licence_url": "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",
+      "notices": [
+        "GeoNames's GB_full.csv.zip is derived from Code-Point Open.",
+        "Contains Ordnance Survey data © Crown copyright and database right 2022.",
+        "Contains Royal Mail data © Royal Mail copyright and database right 2022.",
+        "Contains National Statistics data © Crown copyright and database right 2022."
+      ],
+      "applies_to": [
+        "mode.full",
+        "mode.no-addresses",
+        "mode.admin"
+      ]
+    },
+    {
+      "id": "tiger",
+      "text": "US Census Bureau TIGER/Line",
+      "url": "https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html",
+      "licence": "Public domain",
+      "notices": [
+        "Address ranges and ZIP codes in the United States from the US Census Bureau's TIGER/Line files, which are in the public domain."
+      ],
+      "applies_to": [
+        "mode.full",
+        "mode.no-addresses",
+        "mode.admin"
+      ]
+    },
+    {
+      "id": "wikidata",
+      "text": "Wikidata",
+      "url": "https://www.wikidata.org/",
+      "licence": "CC0 1.0",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "notices": [
+        "POI importance from the sitelink counts of the POIs' Wikidata items; Wikidata's structured data is available under CC0 1.0."
+      ],
+      "applies_to": [
+        "poi_tier.major",
+        "poi_tier.notable",
+        "poi_tier.all"
+      ]
+    }
+  ],
   "axes": {
     "region": {
       "label": "Region",
@@ -161,7 +243,8 @@
         "{region}/admin-minimal/place_hidden.bin",
         "{region}/admin-minimal/place_nodes.bin",
         "{region}/admin-minimal/strings_core.bin",
-        "{region}/admin-minimal/strings_layout.json"
+        "{region}/admin-minimal/strings_layout.json",
+        "{region}/admin-minimal/attribution.json"
       ],
       "replaces": [
         "{region}/quality/{quality}/admin_polygons.bin",
@@ -183,7 +266,8 @@
         "{region}/admin-minimal-poi/place_hidden.bin",
         "{region}/admin-minimal-poi/place_nodes.bin",
         "{region}/admin-minimal-poi/strings_core.bin",
-        "{region}/admin-minimal-poi/strings_layout.json"
+        "{region}/admin-minimal-poi/strings_layout.json",
+        "{region}/admin-minimal-poi/attribution.json"
       ],
       "replaces": [
         "{region}/quality/{quality}/admin_polygons.bin",
@@ -201,7 +285,8 @@
         "{region}/admin/place_nodes.bin",
         "{region}/admin/strings_core.bin",
         "{region}/admin/strings_layout.json",
-        "{region}/admin/strings_postcode.bin"
+        "{region}/admin/strings_postcode.bin",
+        "{region}/admin/attribution.json"
       ],
       "optional_files": [
         "{region}/admin/postcode_centroids.bin",
@@ -225,7 +310,8 @@
         "{region}/no-addresses/strings_core.bin",
         "{region}/no-addresses/strings_street.bin",
         "{region}/no-addresses/strings_layout.json",
-        "{region}/no-addresses/strings_postcode.bin"
+        "{region}/no-addresses/strings_postcode.bin",
+        "{region}/no-addresses/attribution.json"
       ],
       "optional_files": [
         "{region}/no-addresses/postcode_centroids.bin",
@@ -256,7 +342,8 @@
         "{region}/full/strings_street.bin",
         "{region}/full/strings_addr.bin",
         "{region}/full/strings_layout.json",
-        "{region}/full/strings_postcode.bin"
+        "{region}/full/strings_postcode.bin",
+        "{region}/full/attribution.json"
       ],
       "optional_files": [
         "{region}/full/interp_postcodes.bin",
@@ -292,6 +379,9 @@
         "{region}/poi/major/strings_poi.bin",
         "{region}/poi/major/strings_layout.json",
         "{region}/poi/major/poi_meta.json"
+      ],
+      "optional_files": [
+        "{region}/poi/major/poi_attribution.json"
       ]
     },
     "poi_tier.notable": {
@@ -303,6 +393,9 @@
         "{region}/poi/notable/strings_poi.bin",
         "{region}/poi/notable/strings_layout.json",
         "{region}/poi/notable/poi_meta.json"
+      ],
+      "optional_files": [
+        "{region}/poi/notable/poi_attribution.json"
       ]
     },
     "poi_tier.all": {
@@ -314,6 +407,9 @@
         "{region}/poi/all/strings_poi.bin",
         "{region}/poi/all/strings_layout.json",
         "{region}/poi/all/poi_meta.json"
+      ],
+      "optional_files": [
+        "{region}/poi/all/poi_attribution.json"
       ]
     }
   },
