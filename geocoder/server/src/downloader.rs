@@ -1303,12 +1303,24 @@ mod tests {
     fn template_selections_take_each_admin_geometry_file_once_from_their_dir() {
         let (v, c) = template();
         for s in template_selections(&v) {
-            let paths = resolve_files(&c, &s).unwrap().paths;
+            let resolved = resolve_files(&c, &s).unwrap();
+            let paths = resolved.paths;
             let dir = match (s.mode.as_str(), s.poi_tier.as_str()) {
                 ("admin-minimal", "none") => format!("{}/admin-minimal/", s.region),
                 ("admin-minimal", _) => format!("{}/admin-minimal-poi/", s.region),
                 _ => format!("{}/quality/{}/", s.region, s.quality),
             };
+            // The postal cities, once, from the mode's own dir, and optional: a region of no US
+            // ZIP has none.
+            let mode_dir = match (s.mode.as_str(), s.poi_tier.as_str()) {
+                ("admin-minimal", "none") => format!("{}/admin-minimal/", s.region),
+                ("admin-minimal", _) => format!("{}/admin-minimal-poi/", s.region),
+                (mode, _) => format!("{}/{mode}/", s.region),
+            };
+            let postal = format!("{mode_dir}postal_cities.bin");
+            let tables: Vec<&String> = paths.iter().filter(|p| basename(p) == "postal_cities.bin").collect();
+            assert_eq!(tables, [&postal], "{:?}", s);
+            assert!(resolved.optional.contains(&postal), "{:?}", s);
             for name in std::iter::once("admin_polygons.bin").chain(query_server::ADMIN_GEOMETRY_FILES) {
                 let copies: Vec<&String> = paths.iter().filter(|p| basename(p) == name).collect();
                 assert_eq!(copies, [&format!("{dir}{name}")], "{:?}", s);

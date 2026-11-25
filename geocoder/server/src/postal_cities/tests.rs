@@ -148,12 +148,11 @@ fn a_name_its_block_does_not_end_and_a_block_past_its_rows_room_read_as_no_name(
     let t = PostalCities::open(FileBytes::Owned(long)).unwrap();
     assert_eq!(t.name(*b"US", "19026"), None);
     assert!(!t.for_rows(|_| {}));
-    // As long as its rows can hold: it reads.
-    let mut most = file[..table_at].to_vec();
-    let room = 2 + CODE_BYTES + NAME_BYTES + 1;
-    most.extend(std::iter::repeat(b'x').take(room - table_at - 1));
-    most.push(0);
-    most.extend_from_slice(&file[table_at..]);
+    // As long as its rows can hold, as a row of the longest code and name is: it reads.
+    let (code, name) = ("1".repeat(CODE_BYTES), "M".repeat(NAME_BYTES));
+    let most = encode(&[row(US, &code, &name)]);
+    assert_eq!(most.len() - FOOTER_BYTES - ENTRY_BYTES, max_block_bytes(1));
     let t = PostalCities::open(FileBytes::Owned(most)).unwrap();
-    assert_eq!(t.name(*b"US", "19026"), Some("Media"));
+    assert_eq!(t.name(*b"US", &code), Some(name.as_str()));
+    assert!(t.for_rows(|_| {}));
 }
