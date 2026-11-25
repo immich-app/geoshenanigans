@@ -413,6 +413,7 @@ jobs:
           TODAY_SEQ: ${{ steps.setup.outputs.today_seq }}
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
           PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}
+          SEED_PREVIOUS: ${{ inputs.seed_previous }}
         run: |
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
@@ -602,7 +603,10 @@ jobs:
           # the sha256 it gives (build.postal_cities_previous_sha256), so the
           # same inputs give the same names, whatever latest.json names
           # since, or the night fails where that day was rebuilt with other
-          # names since. It goes to prev-state/, apart from old-output/, which
+          # names since. A scratch prefix's patch night (seed_previous)
+          # takes the table of the live build Setup seeded it with, as the
+          # live night after it would. It goes to prev-state/, apart from
+          # old-output/, which
           # fetch_previous_index.sh fills beside the build. A build that
           # published none (the first night) leaves none; one that did and
           # can't be read fails the night, as does a latest.json or
@@ -634,6 +638,9 @@ jobs:
             RERUN=1
             PINNED_SHA=$(jq -r '.build.postal_cities_previous_sha256 // "" | tostring' "$WORKDIR/prev-state/today.json")
             echo "[postal] A rerun of $TODAY, which took the postal cities of ${PREV_TABLE_DATE:-no day}: taking them again"
+          elif [ "${SEED_PREVIOUS:-}" = true ]; then
+            PREV_TABLE_DATE=$YESTERDAY
+            echo "[postal] A patch night seeded with the live build of $YESTERDAY: taking its postal cities"
           elif s3_json "$BUILDS/latest.json" "$WORKDIR/prev-state/latest.json"; then
             # A pointer names a build: latest a day, previous a day or null.
             if ! jq -e --arg day "$DAY_RE" '(.latest | type == "string" and test($day))

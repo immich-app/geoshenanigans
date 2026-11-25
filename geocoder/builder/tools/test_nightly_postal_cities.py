@@ -154,12 +154,12 @@ class NightlyPostalCitiesTest(unittest.TestCase):
         with open(outputs["prev_postal_cities"], "rb") as f:
             return f.read()
 
-    def run_block(self, script):
+    def run_block(self, script, **extra):
         out = os.path.join(self.root, "github_output")
         open(out, "w").close()
         env = {"PATH": self.bin + os.pathsep + os.environ["PATH"], "SERVED": self.served, "WORKDIR": self.work,
                "GITHUB_OUTPUT": out, "S3_PUBLIC_URL": "https://cache.example", "S3_BUCKET": "bucket",
-               "S3_PREFIX": "geocoder", "S5": "s5cmd", "TODAY": "2026-11-23"}
+               "S3_PREFIX": "geocoder", "S5": "s5cmd", "TODAY": "2026-11-23", "YESTERDAY": "2026-11-22", **extra}
         r = subprocess.run(["bash", "-eo", "pipefail", "-c", script], env=env, capture_output=True, text=True)
         with open(out) as f:
             outputs = dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
@@ -275,6 +275,31 @@ class NightlyPostalCitiesTest(unittest.TestCase):
             r, _ = self.run_block(block)
             self.assertEqual(r.returncode, 1, bad)
             self.assertIn("is no day before 2026-11-23", r.stdout)
+
+    def test_a_seeded_patch_night_takes_the_postal_cities_of_the_build_it_was_seeded_with(self):
+        block = postal_block()
+        text = workflow("geocoder-build.yml")
+        download = re.search(rf"(?ms)^      - name: {re.escape(DOWNLOAD)}\n.*?^        run: \|", text).group(0)
+        self.assertIn("SEED_PREVIOUS: ${{ inputs.seed_previous }}", download)
+        self.cache()
+        # A scratch prefix of no latest.json, Setup's seed of day 22 in it.
+        self.build("2026-11-22", b"day 22")
+        r, outputs = self.run_block(block)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("prev_postal_cities", outputs)
+        r, outputs = self.run_block(block, SEED_PREVIOUS="true")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.table_of(outputs), b"day 22")
+        self.assertEqual(outputs["prev_postal_cities_date"], "2026-11-22")
+        # Its latest.json of an earlier test run names an older build: the seed's still.
+        self.build("2026-11-20", b"day 20")
+        self.latest("2026-11-20", None)
+        r, outputs = self.run_block(block, SEED_PREVIOUS="true")
+        self.assertEqual(self.table_of(outputs), b"day 22")
+        # A rerun of the day takes what its first run took.
+        self.build("2026-11-23", b"day 23", built_from="2026-11-20", built_from_sha=b"day 20")
+        r, outputs = self.run_block(block, SEED_PREVIOUS="true")
+        self.assertEqual(self.table_of(outputs), b"day 20")
 
     def test_a_pointer_or_manifest_that_cant_be_read_fails_the_night(self):
         block = postal_block()
