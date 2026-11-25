@@ -4995,6 +4995,71 @@ mod query_tests {
         (got, STRING_READS.with(|n| n.get()) - before)
     }
 
+    /// An index of polygon POIs of POI_META's categories in `origin()`'s cell, each (its corners
+    /// as metres north of `origin()` and east, its name, category, importance), its vertices to
+    /// 1e-7°, with a parent street of its own name.
+    fn polygon_pois(pois: &[(&[(f64, f64)], &str, u8, u8)]) -> Index {
+        let own = cell_id_at_level(origin().0, origin().1, DEFAULT_ADMIN_CELL_LEVEL);
+        let mut strings = Vec::new();
+        let (mut records, mut pairs) = (Vec::new(), Vec::new());
+        for (id, &(corners, name, category, importance)) in pois.iter().enumerate() {
+            let name_id = strings.len() as u32;
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            let corners: Vec<(f64, f64)> = corners.iter().map(|&(north, east)| at(north, east)).collect();
+            for &(lat, lng) in &corners {
+                assert_eq!(cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL), own, "({lat}, {lng})");
+            }
+            let (bmin_lat, bmin_lng) = corners.iter().fold((f32::MAX, f32::MAX), |(a, b), &(lat, lng)| (a.min(lat as f32), b.min(lng as f32)));
+            let q = corners.iter()
+                .map(|&(lat, lng)| (((lat - bmin_lat as f64) / 1e-7).round() as u32, ((lng - bmin_lng as f64) / 1e-7).round() as u32))
+                .collect();
+            let record = PoiRecord {
+                lat: corners[0].0 as f32, lng: corners[0].1 as f32, vertex_offset: 0, name_id, category, tier: 2, flags: 0, importance,
+                parent_street_id: name_id, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
+            };
+            records.push((record, Some(poi_files::PoiPolygon { encoding: 3, bmin_lat, bmin_lng, q })));
+            pairs.push((own, id as u32));
+        }
+        let (records, vertices) = poi_files::encode(&records);
+        let end = strings.len() as u32;
+        Index {
+            poi_index: Some(cell_pairs::from_pairs(pairs, cell_pairs::POI)),
+            poi_records: Some(PoiRecords::open(FileBytes::Owned(records)).unwrap()),
+            poi_vertices: Some(FileBytes::Owned(vertices)),
+            poi_meta: PoiMeta::from_json(POI_META),
+            strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, end, end, end, end, end]),
+            ..index(&[], &[])
+        }
+    }
+
+    /// A triangle whose side nearest `origin()` runs north-east, `metres` south-east of it at its
+    /// point nearest in metres, and 400 m long.
+    fn north_east_side(metres: f64) -> [(f64, f64); 3] {
+        let (foot, half) = ((-metres / 2f64.sqrt(), metres / 2f64.sqrt()), 200.0 / 2f64.sqrt());
+        [(foot.0 - half, foot.1 - half), (foot.0 + half, foot.1 + half), (foot.0 - 40.0, foot.1 + 40.0)]
+    }
+
+    #[test]
+    fn a_poi_polygon_is_as_far_as_its_point_nearest_in_metres() {
+        // In Paris, a polygon whose side nearest the point runs north-east is as far as that
+        // side's point nearest in metres, not its point nearest in degrees, 7.5 % farther: one
+        // 290 m off scores 5 / (1 + 2.9²), over the 0.5 a cafe (importance 5) is listed at, where
+        // 312 m would not; and one 100 m off is nearer than a square 104 m off, so it is the first
+        // listed and the nearest POI, where 107.5 m would put the square first.
+        let idx = polygon_pois(&[(&north_east_side(290.0), "Far Cafe", 0, 0)]);
+        let listed = idx.find_pois(origin().0, origin().1);
+        assert!(listed.len() == 1 && (listed[0].distance_m - 290.0).abs() < 0.1, "{:?}", listed.iter().map(|p| p.distance_m).collect::<Vec<_>>());
+
+        let square = [(104.0, -50.0), (104.0, 50.0), (154.0, 50.0), (154.0, -50.0)];
+        let idx = polygon_pois(&[(&square, "Square", 1, 0), (&north_east_side(100.0), "Diagonal", 1, 0)]);
+        let listed: Vec<_> = idx.find_pois(origin().0, origin().1).iter().map(|p| (p.name.to_string(), p.distance_m)).collect();
+        assert!(listed.len() == 2 && listed[0].0 == "Diagonal" && (listed[0].1 - 100.0).abs() < 0.1 && listed[1].0 == "Square", "{listed:?}");
+        let (d, nearest) = idx.find_nearest_poi_with_parent(origin().0, origin().1).unwrap();
+        assert_eq!(idx.get_string(nearest.name_id), "Diagonal");
+        assert!((d.sqrt() * 6_371_000.0 - 100.0).abs() < 0.1, "{}", d.sqrt() * 6_371_000.0);
+    }
+
     #[test]
     fn a_poi_name_is_read_only_once_the_poi_passes_every_filter() {
         // Cafes (category 0) and a museum (1), with POI_META's distances and importance.
