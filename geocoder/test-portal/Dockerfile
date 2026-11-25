@@ -1,6 +1,6 @@
 # Build the test portal's server, query-portal (includes the test page's
 # HTML), which fetches and decodes the build itself
-FROM rust:trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS builder
+FROM rust:trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
