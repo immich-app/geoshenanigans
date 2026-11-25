@@ -285,6 +285,16 @@ class NightlyPostalCitiesTest(unittest.TestCase):
             else:
                 os.remove(os.path.join(self.served, f"s3/bucket/geocoder/{path}"))
         self.assertEqual(self.run_block(block)[0].returncode, 0)
+        # A latest.json that names no build: no latest day, or a previous that is no day.
+        for text in ('{}', '{"latest": ""}', '{"latest": null}', '{"latest": 20261122}', '{"latest": "yesterday"}',
+                     '{"latest": "2026-11-22", "previous": ""}', '{"latest": "2026-11-22", "previous": "2026-11"}'):
+            self.serve("s3/bucket/geocoder/builds/latest.json", text)
+            r, outputs = self.run_block(block)
+            self.assertEqual(r.returncode, 1, text)
+            self.assertIn("::error::[postal] s3://bucket/geocoder/builds/latest.json names no build", r.stdout, text)
+            self.assertNotIn("prev_postal_cities", outputs)
+        self.latest("2026-11-22", None)
+        self.assertEqual(self.run_block(block)[0].returncode, 0)
         # One that lists no files, or lists the table without its sha256: what yesterday held is
         # unknown, which fails the night as a table it can't read does. An empty list is a build
         # that published no table.
