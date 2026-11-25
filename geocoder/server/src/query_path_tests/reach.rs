@@ -407,20 +407,33 @@ fn the_street_found_is_the_nearest_of_every_way_within_the_search_distance() {
 }
 
 #[test]
-fn a_long_edge_is_found_where_the_builder_lists_its_great_circle() {
-    // The builder lists a long edge in the cells its great circle crosses, but the scans measure to
-    // its line in degrees: at 60° N, a way along the parallel from 0.55° W to 0.55° E bows 127 m
-    // north of it in the cells. On the parallel it is the road at no distance, though a street 1 m
-    // off is listed in the point's own cell and the long way is not.
+fn a_long_edge_is_as_far_as_its_great_circle_where_the_builder_lists_it() {
+    // The builder lists a long edge in the cells its great circle crosses, which can stray from its
+    // line in degrees past what the scan reads beyond the search distance: at 60° N, a way along
+    // the parallel from 0.55° W to 0.55° E bows 127.1 m north of it in the cells, one from 1° W to
+    // 1° E 420 m. From the parallel, where the cells of the point don't list the way, the first is
+    // 127.1 m off and the second past the search distance, though their lines in degrees run
+    // through the point; from their great circle each is the road at no distance.
     let origin = (60.0, 0.0);
-    let mut dataset = TestIndex::around(origin);
-    dataset.street_through("Long Road", vec![NodeCoord { lat: 60.0, lng: -0.55 }, NodeCoord { lat: 60.0, lng: 0.55 }])
-        .street("Short Street", &across(1.0, 0.0));
-    let own = cell_id_at_level(origin.0, origin.1, DEFAULT_STREET_CELL_LEVEL);
-    assert!(!dataset.geo_cells[&own][geo_index::STREETS].contains(&0));
-    let index = dataset.load();
-    let street = &index.debug_primary(origin.0, origin.1)["street"];
-    assert!(street["name"] == "Long Road" && about(&street["dist_m"], 0.0), "{street}");
+    for (half, bow) in [(0.55_f64, 127.1), (1.0, 420.2)] {
+        let ends = vec![NodeCoord { lat: 60.0, lng: -half as f32 }, NodeCoord { lat: 60.0, lng: half as f32 }];
+        let mut dataset = TestIndex::around(origin);
+        dataset.street_through("Long Road", ends);
+        let own = cell_id_at_level(origin.0, origin.1, DEFAULT_STREET_CELL_LEVEL);
+        assert!(!dataset.geo_cells.get(&own).is_some_and(|lists| lists[geo_index::STREETS].contains(&0)), "{half}°");
+        let index = dataset.load();
+        // The northmost point of the great circle, at 0°: tan(lat) = tan(60°) / cos(half).
+        let arc = (60f64.to_radians().tan() / half.to_radians().cos()).atan().to_degrees();
+        assert!(((arc - 60.0).to_radians() * 6_371_000.0 - bow).abs() < 0.1, "{half}°: {arc}");
+        let street = &index.debug_primary(origin.0, origin.1)["street"];
+        if bow < DEFAULT_SEARCH_DISTANCE {
+            assert!(street["name"] == "Long Road" && about(&street["dist_m"], bow), "{half}°: {street}");
+        } else {
+            assert!(street.is_null(), "{half}°: {street}");
+        }
+        let street = &index.debug_primary(arc, 0.0)["street"];
+        assert!(street["name"] == "Long Road" && about(&street["dist_m"], 0.0), "{half}° on the arc: {street}");
+    }
 }
 
 #[test]

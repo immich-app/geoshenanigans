@@ -265,7 +265,8 @@ fn angle_between(u: [f64; 3], v: [f64; 3]) -> f64 {
 /// point's, so across the antimeridian too. Near a pole, where that plane would stray from the
 /// sphere by more than half CELL_REACH_SLACK within the cover round the point, the gnomonic
 /// projection about the point instead, where a point is as far as it is and an edge is its great
-/// circle, as the builder lists it.
+/// circle, as the builder lists it (cover_edge); and there too an edge whose line in degrees can
+/// stray from its great circle by more than half CELL_REACH_SLACK of the cover.
 #[derive(Clone, Copy)]
 struct GeoOrigin {
     lat: f64,
@@ -273,18 +274,29 @@ struct GeoOrigin {
     cos_lat: f64,
     /// Near a pole, the point and its directions east and north, as unit vectors.
     polar: Option<[[f64; 3]; 3]>,
+    /// The point and its directions east and north, as unit vectors.
+    basis: [[f64; 3]; 3],
+    /// How far an edge measured on the plane may stray from its great circle, in radians.
+    stray: f64,
 }
 
 impl GeoOrigin {
     /// The point (lat, lng), whose lookups read the cells within `cover` radians of it.
     fn new(lat: f64, lng: f64, cover: f64) -> Self {
+        let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
+        let (sin_lng, cos_lng) = lng.to_radians().sin_cos();
+        let basis = [unit_vector(lat, lng), [-sin_lng, cos_lng, 0.0], [-sin_lat * cos_lng, -sin_lat * sin_lng, cos_lat]];
         // The plane's scale strays by up to the cover times tan(lat) within the cover.
-        let polar = (cover * lat.abs().to_radians().tan() > CELL_REACH_SLACK / 2.0).then(|| {
-            let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
-            let (sin_lng, cos_lng) = lng.to_radians().sin_cos();
-            [unit_vector(lat, lng), [-sin_lng, cos_lng, 0.0], [-sin_lat * cos_lng, -sin_lat * sin_lng, cos_lat]]
-        });
-        GeoOrigin { lat, lng, cos_lat: lat.to_radians().cos(), polar }
+        let polar = (cover * lat.abs().to_radians().tan() > CELL_REACH_SLACK / 2.0).then_some(basis);
+        GeoOrigin { lat, lng, cos_lat: lat.to_radians().cos(), polar, basis, stray: cover * CELL_REACH_SLACK / 2.0 }
+    }
+
+    /// Whether the line in degrees of the edge from `a` to `b` can stray from its great circle by
+    /// more than `stray`: by up to Δλ (Δλ + 2 |Δφ|) / 8 radians, to second order, at any latitude.
+    fn strays(&self, a: NodeCoord, b: NodeCoord) -> bool {
+        let dlng = (self.near_lng(b.lng as f64) - self.near_lng(a.lng as f64)).to_radians().abs();
+        let dlat = (b.lat as f64 - a.lat as f64).to_radians().abs();
+        dlng * (dlng + 2.0 * dlat) > 8.0 * self.stray
     }
 
     /// `lng` the short way round from the point's: within 180° of it.
@@ -318,19 +330,17 @@ impl GeoOrigin {
     /// The squared distance to the edge from `a` to `b`, and the fraction along it of its point
     /// nearest the point.
     fn segment(&self, a: NodeCoord, b: NodeCoord) -> (f64, f64) {
-        match &self.polar {
-            None => {
-                let c = self.cos_lat;
-                point_to_segment_with_t(self.lat, self.lng * c, a.lat as f64, self.near_lng(a.lng as f64) * c,
-                                        b.lat as f64, self.near_lng(b.lng as f64) * c, PLANAR)
+        if self.polar.is_none() && !self.strays(a, b) {
+            let c = self.cos_lat;
+            return point_to_segment_with_t(self.lat, self.lng * c, a.lat as f64, self.near_lng(a.lng as f64) * c,
+                                           b.lat as f64, self.near_lng(b.lng as f64) * c, PLANAR);
+        }
+        match (Self::project(&self.basis, a), Self::project(&self.basis, b)) {
+            (Some(a), Some(b)) => {
+                let (r, t) = nearest_to_origin(a, b);
+                (r.atan().powi(2), t)
             }
-            Some(basis) => match (Self::project(basis, a), Self::project(basis, b)) {
-                (Some(a), Some(b)) => {
-                    let (r, t) = nearest_to_origin(a, b);
-                    (r.atan().powi(2), t)
-                }
-                _ => (f64::MAX, 0.0),
-            },
+            _ => (f64::MAX, 0.0),
         }
     }
 
