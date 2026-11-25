@@ -58,6 +58,10 @@ pub const PREFIX_TABLE_TOP: usize = 40;
 /// A lookup stops streaming keys after this many (bounds the worst case and the per-query
 /// memory; the most any evaluation query matched is 13,424).
 pub const MAX_KEYS_STREAMED: usize = 50_000;
+/// A lookup's walk of the keys stops after taking this many transitions (bounds the walk of a
+/// damaged file, whose paths can share nodes in ways no build writes; the most any evaluation
+/// query took is 593,669).
+pub const MAX_KEY_STEPS: usize = 1 << 24;
 /// Extra names of one entity a posting can point at (more get ordinal 15: shown by the base name).
 pub const MAX_NAME_ORD: u8 = 15;
 pub const MAX_EXTRA_ORD: u8 = 13;

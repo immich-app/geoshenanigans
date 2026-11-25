@@ -158,7 +158,7 @@ impl<'a> PlacesSource<'a> {
         let mut n_linked = 0u32;
         for p in 0..n_poly {
             let node = link[p as usize];
-            if node == NO_DATA || polygon_raw(geo, p).name_id == NO_DATA {
+            if node == NO_DATA || polygon_raw(geo, p).is_none_or(|ap| ap.name_id == NO_DATA) {
                 continue;
             }
             label_used.set(node);
@@ -172,7 +172,7 @@ impl<'a> PlacesSource<'a> {
             if link[p as usize] != NO_DATA {
                 continue;
             }
-            let ap = polygon_raw(geo, p);
+            let Some(ap) = polygon_raw(geo, p) else { continue };
             let searchable = ap.name_id != NO_DATA && (BOUNDARY_MIN_LEVEL..=BOUNDARY_MAX_LEVEL).contains(&ap.admin_level) && ap.area > 0.0;
             if !searchable {
                 continue;
@@ -213,9 +213,8 @@ impl<'a> PlacesSource<'a> {
         e.names.clear();
         let geo = self.geo;
         let (rrefs, base_id) = {
-            let Some(s) = self.bnd.at(geo, pos) else { return false };
-            let ap = polygon_raw(geo, s.poly);
-            let node = s.linked().then(|| place_node_raw(geo, s.node));
+            let Some((s, ap)) = self.bnd.at(geo, pos).and_then(|s| Some((s, polygon_raw(geo, s.poly)?))) else { return false };
+            let node = s.linked().then(|| place_node_raw(geo, s.node)).flatten();
             let kind = if s.linked() { Kind::Linked } else { Kind::Area };
             let typ = boundary_type(&ap, node.as_ref());
             e.id = self.n_place_nodes + s.poly;
@@ -303,16 +302,20 @@ impl<'a> PoiSource<'a> {
         Ok(PoiSource { geo, n, max_tier: opts.poi_max_tier, imp_poi, extras })
     }
 
-    fn fill(&self, pos: u32, e: &mut EntityBuf) -> bool {
+    /// The entity of POI record `pos` (below `n`); false when it is not one (a tombstone, a
+    /// secondary ring, a tier left out) or has no name, an error for a row that does not read,
+    /// which would leave the POI out of every index built over the file.
+    fn fill(&self, pos: u32, e: &mut EntityBuf) -> Result<bool, String> {
         e.names.clear();
-        let r = poi_raw(self.geo, pos);
+        let r = poi_raw(self.geo, pos)
+            .ok_or_else(|| format!("poi_records.bin: row {pos} names a combo or a postcode its dictionaries do not hold"))?;
         if r.name_id == NO_DATA || r.flags & POI_FLAG_SECONDARY_RING != 0 || r.tier > self.max_tier {
-            return false;
+            return Ok(false);
         }
         e.id = pos;
         e.imp = poi_importance(r.importance, byte_at(&self.imp_poi, pos));
         e.cc_poly = r.parent_poly_id;
-        fill_names(self.geo, self.extras, &[record_ref(KIND_POI, pos)], r.name_id, e)
+        Ok(fill_names(self.geo, self.extras, &[record_ref(KIND_POI, pos)], r.name_id, e))
     }
 }
 
@@ -344,13 +347,14 @@ impl Source<'_> {
             Source::Poi(s) => s.n,
         }
     }
-    /// Calls `f` with the entity of each position of [lo, hi) that is one, each once.
-    fn for_each_entity<E>(&self, lo: u32, hi: u32, e: &mut EntityBuf, f: &mut impl FnMut(&EntityBuf) -> Result<(), E>) -> Result<(), E> {
+    /// Calls `f` with the entity of each position of [lo, hi) that is one, each once; an error
+    /// of `f`'s, or for a record that does not read (`PoiSource::fill`).
+    fn for_each_entity(&self, lo: u32, hi: u32, e: &mut EntityBuf, f: &mut impl FnMut(&EntityBuf) -> Result<(), String>) -> Result<(), String> {
         match self {
             Source::Places(s) => s.for_each_entity(lo, hi, e, f),
             Source::Poi(s) => {
                 for pos in lo..hi {
-                    if s.fill(pos, e) {
+                    if s.fill(pos, e)? {
                         f(e)?;
                     }
                 }
@@ -470,10 +474,48 @@ struct Item {
     imp: u8,
 }
 
+/// Sort run files, removed when dropped. A run is held from its file's creation until the merge
+/// that reads it is done with it, through the worker that spilled it and the sub-index's
+/// `KeyRuns`, so a build that fails anywhere leaves none behind.
+#[derive(Default)]
+struct RunFiles(Vec<PathBuf>);
+
+impl RunFiles {
+    fn push(&mut self, path: PathBuf) {
+        self.0.push(path);
+    }
+
+    /// Takes over `other`'s runs, after this one's.
+    fn append(&mut self, mut other: RunFiles) {
+        self.0.append(&mut other.0);
+    }
+
+    /// The first `n` runs, no longer held here.
+    fn take_first(&mut self, n: usize) -> RunFiles {
+        RunFiles(self.0.drain(..n).collect())
+    }
+}
+
+impl std::ops::Deref for RunFiles {
+    type Target = [PathBuf];
+
+    fn deref(&self) -> &[PathBuf] {
+        &self.0
+    }
+}
+
+impl Drop for RunFiles {
+    fn drop(&mut self) {
+        for f in &self.0 {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+}
+
 struct Runs {
     arena: MapVec<u8>,
     items: MapVec<Item>,
-    files: Vec<PathBuf>,
+    files: RunFiles,
     dir: PathBuf,
     tag: String,
     spilled_bytes: u64,
@@ -491,7 +533,7 @@ impl Runs {
         Ok(Runs {
             arena: MapVec::with_capacity(arena_cap)?,
             items: MapVec::with_capacity(items_cap.max(1024))?,
-            files: Vec::new(),
+            files: RunFiles::default(),
             dir: dir.to_path_buf(),
             tag,
             spilled_bytes: 0,
@@ -517,7 +559,7 @@ impl Runs {
     }
 
     /// Spills the last run and frees the buffers: the run files and the bytes spilled.
-    fn finish(mut self) -> std::io::Result<(Vec<PathBuf>, u64)> {
+    fn finish(mut self) -> std::io::Result<(RunFiles, u64)> {
         self.spill()?;
         Ok((self.files, self.spilled_bytes))
     }
@@ -530,12 +572,14 @@ impl Runs {
         let key = |it: &Item| &arena[it.off as usize..it.off as usize + it.len as usize];
         self.items.as_mut_slice().sort_unstable_by(|a, b| key(a).cmp(key(b)).then(a.entity.cmp(&b.entity)));
         let path = self.dir.join(format!("{}-{}.run", self.tag, self.files.len()));
-        let mut w = BufWriter::with_capacity(WRITE_BUFFER, File::create(&path)?);
+        let file = File::create(&path)?;
+        // Held from here: a run whose write fails goes with the others.
+        self.files.push(path);
+        let mut w = BufWriter::with_capacity(WRITE_BUFFER, file);
         for it in self.items.as_slice() {
             self.spilled_bytes += write_entry(&mut w, key(it), it.entity, it.imp, it.flags, it.ord)?;
         }
         w.flush()?;
-        self.files.push(path);
         self.items.clear();
         self.arena.clear();
         Ok(())
@@ -621,22 +665,28 @@ fn run_error(path: &Path, e: std::io::Error) -> std::io::Error {
 /// MERGE_FAN_IN are left (consecutive, so entries that compare equal keep their run order).
 /// Each pass merges every run while more than MERGE_FAN_IN² are left, then only as many of the
 /// last runs as it takes to leave MERGE_FAN_IN. Returns the runs left and the bytes rewritten.
-fn reduce_runs(mut files: Vec<PathBuf>, dir: &Path, tag: &str) -> std::io::Result<(Vec<PathBuf>, u64)> {
+fn reduce_runs(mut files: RunFiles, dir: &Path, tag: &str) -> std::io::Result<(RunFiles, u64)> {
     let mut rewritten = 0u64;
     let mut pass = 0;
     while files.len() > MERGE_FAN_IN {
         let n = files.len();
         let excess = n - MERGE_FAN_IN;
         let merged = if n > MERGE_FAN_IN * MERGE_FAN_IN { n } else { excess + excess.div_ceil(MERGE_FAN_IN - 1) };
-        let mut next = files[..n - merged].to_vec();
-        for (i, group) in files[n - merged..].chunks(MERGE_FAN_IN).enumerate() {
+        // The runs left as they are, then each group's merged run; `files` holds those not merged
+        // yet, so every run has one holder until its group's merge has removed it.
+        let mut next = files.take_first(n - merged);
+        let mut i = 0;
+        while !files.is_empty() {
+            let group = files.take_first(MERGE_FAN_IN.min(files.len()));
             if group.len() == 1 {
-                next.push(group[0].clone());
+                next.append(group);
                 continue;
             }
             let path = dir.join(format!("{tag}-m{pass}-{i}.run"));
-            let mut w = BufWriter::with_capacity(WRITE_BUFFER, File::create(&path)?);
-            let mut m = Merge::open(group)?;
+            let file = File::create(&path)?;
+            next.push(path);
+            let mut w = BufWriter::with_capacity(WRITE_BUFFER, file);
+            let mut m = Merge::open(&group)?;
             let mut key = Vec::new();
             let mut p = Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 };
             while m.next(&mut key, &mut p)? {
@@ -644,10 +694,8 @@ fn reduce_runs(mut files: Vec<PathBuf>, dir: &Path, tag: &str) -> std::io::Resul
             }
             w.flush()?;
             drop(m);
-            for f in group {
-                let _ = std::fs::remove_file(f);
-            }
-            next.push(path);
+            drop(group);
+            i += 1;
         }
         files = next;
         pass += 1;
@@ -952,25 +1000,17 @@ pub fn build(geo: &Index, names: &[&str], out: &Path, opts: &BuildOpts) -> Resul
     Ok(stats)
 }
 
-/// One sub-index between its two phases: its sorted runs on disk.
+/// One sub-index between its two phases: its sorted runs on disk, removed with it unless a
+/// merge takes them (a failed build leaves none of a sub-index it never merged).
 pub struct KeyRuns {
     name: String,
-    files: Vec<PathBuf>,
+    files: RunFiles,
     st: Stats,
     ents: u64,
     entries: u64,
     spilled: u64,
     t_src: Duration,
     t_keys: Duration,
-}
-
-impl Drop for KeyRuns {
-    /// Removes the runs no merge took: a failed build leaves none of a sub-index it never merged.
-    fn drop(&mut self) {
-        for f in &self.files {
-            let _ = std::fs::remove_file(f);
-        }
-    }
 }
 
 /// Key phase of one sub-index: its entities' normalized keys, sorted in bounded runs spilled to
@@ -1001,7 +1041,7 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
 
     // ---- keys -> sorted runs, one worker per contiguous range of entities
     let n = src.len();
-    type RunsOut = (Vec<PathBuf>, u64, u64, u64);
+    type RunsOut = (RunFiles, u64, u64, u64);
     let results: Vec<Result<RunsOut, String>> = std::thread::scope(|sc| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
@@ -1039,14 +1079,15 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let mut files = Vec::new();
+    // Every worker's runs are held until the merge takes them, a failed worker's siblings' too.
+    let mut files = RunFiles::default();
     let (mut ents, mut entries, mut spilled) = (0u64, 0u64, 0u64);
     for r in results {
         let (f, s, e, k) = r?;
         ents += e;
         entries += k;
         spilled += s;
-        files.extend(f);
+        files.append(f);
     }
     drop(src);
     let t_keys = t0.elapsed() - t_src;
@@ -1054,11 +1095,10 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
 }
 
 /// Merge phase of one sub-index: its runs -> `<name>.fst`, `.post`, `.pfx.fst` and `.pfx` in `out`.
-pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, String> {
+pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, String> {
     let t0 = Instant::now();
-    let (files, mut st) = (std::mem::take(&mut runs.files), std::mem::take(&mut runs.st));
-    let (ents, entries, spilled, t_src, t_keys) = (runs.ents, runs.entries, runs.spilled, runs.t_src, runs.t_keys);
-    let name = runs.name.as_str();
+    let KeyRuns { name, files, mut st, ents, entries, spilled, t_src, t_keys } = runs;
+    let name = name.as_str();
     let n_runs = files.len();
     let (files, rewritten) = reduce_runs(files, &opts.tmp, name).map_err(|e| e.to_string())?;
     let [keys_path, post_path, pfx_keys_path, pfx_path] = sub_index_files(name).map(|f| out.join(f));
@@ -1097,9 +1137,7 @@ pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, S
         group.take(|list| w.add(&cur, list))?;
     }
     drop(m);
-    for f in &files {
-        let _ = std::fs::remove_file(f);
-    }
+    drop(files);
     let Writer { fst, mut post, mut slots, keys, postings, longest, .. } = w;
     fst.finish().map_err(|e| e.to_string())?;
     post.flush().map_err(|e| e.to_string())?;
@@ -1535,7 +1573,7 @@ mod tests {
         let dir = tmp_dir("reduce-excess");
         let (files, all) = random_runs(&dir, MERGE_FAN_IN + 1, &mut Rng(11));
         let last_two: u64 = files[MERGE_FAN_IN - 1..].iter().map(|f| std::fs::metadata(f).unwrap().len()).sum();
-        let (left, rewritten) = reduce_runs(files.clone(), &dir, "t").unwrap();
+        let (left, rewritten) = reduce_runs(RunFiles(files.clone()), &dir, "t").unwrap();
         assert_eq!(left.len(), MERGE_FAN_IN);
         assert_eq!(left[..MERGE_FAN_IN - 1], files[..MERGE_FAN_IN - 1]);
         assert_eq!(rewritten, last_two);
@@ -1549,7 +1587,7 @@ mod tests {
         for n in [MERGE_FAN_IN, 3 * MERGE_FAN_IN + 5, MERGE_FAN_IN * MERGE_FAN_IN + 3] {
             let dir = tmp_dir(&format!("reduce-{n}"));
             let (files, all) = random_runs(&dir, n, &mut Rng(n as u64));
-            let (left, rewritten) = reduce_runs(files, &dir, "t").unwrap();
+            let (left, rewritten) = reduce_runs(RunFiles(files), &dir, "t").unwrap();
             assert!(left.len() <= MERGE_FAN_IN);
             assert_eq!(rewritten == 0, n <= MERGE_FAN_IN);
             assert_eq!(read_all(&left), all);
@@ -1679,7 +1717,7 @@ mod tests {
         let dir = tmp_dir(&format!("merge-heap-{n}"));
         let mut run: Vec<(Vec<u8>, Posting)> =
             (0..n).map(|entity| (b"church".to_vec(), Posting { entity, imp_q: 100, partial: false, class: 0, ord: 0 })).collect();
-        let files = vec![write_run(&dir, "k.run", &mut run)];
+        let files = RunFiles(vec![write_run(&dir, "k.run", &mut run)]);
         let runs = KeyRuns {
             name: "poi".into(),
             files,
@@ -1753,6 +1791,54 @@ mod tests {
         let err = build(&geo, &["places"], &dir.0.join("idx"), &opts).err();
 
         assert!(err.as_deref().is_some_and(|e| e.contains("65536 bytes")), "{err:?}");
+    }
+
+    #[test]
+    fn a_build_fails_on_a_poi_row_that_does_not_read_and_leaves_no_sort_runs() {
+        use crate::fixture::{Geo, TempDir};
+        use query_server::{DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
+        // 27 POIs of one 50,000-byte key each. A sort budget of 1 MiB holds 12 such keys a run on
+        // one thread and 4 on each of three, so every worker spills runs, and the one that reaches
+        // row 14 (on three threads the second, of rows 9 to 17) has spilled one before it does.
+        let (n, bad_row) = (27, 14);
+        let mut g = Geo::default();
+        g.place("Testburg", 1, 10.1, 20.1);
+        let name = "a".repeat(50_000);
+        for k in 0..n {
+            g.poi(&name, 10.0 + k as f32 * 0.01, 20.0, 0);
+        }
+        let dir = TempDir::new("poi-row");
+        let set = dir.0.join("geo");
+        g.write(&set);
+        let records = std::fs::read(set.join("poi_records.bin")).unwrap();
+        let load = || Index::load(set.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+        let opts = |threads| BuildOpts { threads, mem_mb: 1, ..BuildOpts::new(dir.0.join("tmp")) };
+        let left = |tmp: &Path| std::fs::read_dir(tmp).into_iter().flatten().map(|e| e.unwrap().file_name()).collect::<Vec<_>>();
+        for threads in [1, 3] {
+            let stats = build(&load(), &["poi"], &dir.0.join("idx"), &opts(threads)).unwrap();
+            let runs = stats[0].1.lines.iter().find(|(k, _)| k == "sort runs").map(|(_, v)| v.clone());
+            assert_eq!(runs, Some((3 * threads).to_string()), "{threads} threads");
+        }
+
+        // Row 14 (27 bytes a row) naming a combo, then a postcode, past its dictionary.
+        for (case, at) in [("a combo", 25), ("a postcode", 23)] {
+            let at = bad_row * 27 + at;
+            let mut bad = records.clone();
+            bad[at..at + 2].copy_from_slice(&0xFFFEu16.to_le_bytes());
+            std::fs::write(set.join("poi_records.bin"), bad).unwrap();
+            let geo = load();
+            assert!(geo.poi_records.as_ref().unwrap().record(bad_row as u32).is_none(), "{case}");
+
+            for threads in [1, 3] {
+                let opts = opts(threads);
+
+                let err = build(&geo, &["poi"], &dir.0.join("idx"), &opts).err();
+
+                assert!(err.as_deref().is_some_and(|e| e.contains("poi_records.bin") && e.contains("row 14")), "{case}, {threads} threads: {err:?}");
+                let left = left(&opts.tmp);
+                assert!(left.is_empty(), "{case}, {threads} threads: left in the temp directory: {left:?}");
+            }
+        }
     }
 
     #[test]
@@ -2030,7 +2116,7 @@ mod tests {
             let f = &found[0];
             assert_eq!(f.hit.entity, poly, "{q}");
             let label = AdminPoint::new(f.lat as f64, f.lng as f64);
-            assert!(geo.admin_geometry.contains_once(&polygon_raw(&geo, poly), label), "{q} at {} {}", f.lat, f.lng);
+            assert!(geo.admin_geometry.contains_once(&polygon_raw(&geo, poly).unwrap(), label), "{q} at {} {}", f.lat, f.lng);
             assert_eq!(f.ctx.county, q);
         }
     }

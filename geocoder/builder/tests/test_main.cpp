@@ -1,11 +1,18 @@
 // Entry point for the geocoder-tests target. Runs every TEST() registered
 // across the other test*.cpp translation units and reports pass/fail.
+//
+// GEOCODER_TEST_SHARD=i/n runs only the tests whose index in the registry is
+// i modulo n (tests/test_shard.h): the nightly runs the n shards at once.
+// --count prints the registry's size, which the shards' counts must add up to.
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
 #include "sanitizer_report.h"
 #include "test_framework.h"
+#include "test_shard.h"
 
 // LeakSanitizer (the sanitizer build): a test's forked child that ends
 // through exit() checks for leaks without the threads the ThreadCache
@@ -29,27 +36,26 @@ static void pass_sanitizer_options_to_tools() {
     }
 }
 
-int main() {
-    pass_sanitizer_options_to_tools();
-    int passed = 0;
+int main(int argc, char** argv) {
     auto& reg = gctest::registry();
-    for (auto& t : reg) {
-        int before = gctest::failures();
-        try {
-            t.fn();
-        } catch (const gctest::RequireFailed&) {
-            // failure already recorded by REQUIRE
-        } catch (const std::exception& e) {
-            std::printf("    FAIL %s: uncaught exception: %s\n", t.name, e.what());
-            gctest::failures()++;
-        }
-        if (gctest::failures() == before) {
-            passed++;
-        } else {
-            std::printf("FAILED  %s\n", t.name);
-        }
+    if (argc == 2 && std::strcmp(argv[1], "--count") == 0) {
+        std::printf("%zu\n", reg.size());
+        return 0;
     }
-    std::printf("\n%d/%zu tests passed  (%d checks, %d failures)\n", passed,
-                reg.size(), gctest::checks(), gctest::failures());
+    if (argc > 1) {
+        std::fprintf(stderr, "Usage: %s [--count]\n", argv[0]);
+        return 2;
+    }
+    gctest::Shard shard;
+    try {
+        shard = gctest::parse_shard(std::getenv("GEOCODER_TEST_SHARD"));
+    } catch (const std::invalid_argument& e) {
+        std::fprintf(stderr, "%s\n", e.what());
+        return 2;
+    }
+    pass_sanitizer_options_to_tools();
+    const gctest::ShardRun run = gctest::run_shard(reg, shard);
+    std::printf("\n%d/%zu tests passed  (%d checks, %d failures)\n", run.passed, run.ran, gctest::checks(),
+                gctest::failures());
     return gctest::failures() == 0 ? 0 : 1;
 }

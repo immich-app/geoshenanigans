@@ -259,7 +259,7 @@ TEST(child_ops_refuse_a_section_that_is_not_the_childs) {
         {"records", merge_section(file, 12, 72, 72, seq), kind},
         {"sparse delta", merge_section(file, SPARSE_DELTA_STRIDE, 72, 72, seq), kind},
         {"parallel delta", merge_section(file, PARALLEL_DELTA_STRIDE, 72, 72, seq), kind},
-        {"cell list delta", merge_section(file, CELL_LIST_DELTA_STRIDE, 72, 72, seq), kind},
+        {"a stride of no section kind", merge_section(file, 0xFB, 72, 72, seq), kind},
         {"offset fixup runs", merge_section(file, 8, 72, 72, seq, {1, 0, 0, 0, 0, 0}), offset_fixups},
         {"offset fixup values", merge_section(file, 8, 72, 72, seq, {0, 1, 0, 0, 0, 0}), offset_fixups},
         {"offset fixup run bytes", merge_section(file, 8, 72, 72, seq, {0, 0, 4, 0, 0, 0}), offset_fixups},

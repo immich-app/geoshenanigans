@@ -1,5 +1,15 @@
 mod auth;
 mod downloader;
+mod handlers;
+// The test portal (the query-portal binary, portal_main.rs), whose tests run
+// here beside the routes its answers are compared with: on Unix alone, as
+// the portal does.
+#[cfg(all(test, unix))]
+#[allow(dead_code)]
+mod portal;
+#[cfg(all(test, unix))]
+#[path = "portal/tests.rs"]
+mod portal_tests;
 mod region_state;
 #[cfg(test)]
 mod scratch_dir;
@@ -27,36 +37,6 @@ struct QueryParams {
     debug: Option<String>,
 }
 
-// Shared key-validation preamble for authenticated endpoints. Returns the
-// validated token tuple `(login, rps, rpd, by_ip)` on success, or the
-// appropriate error `Response` (401 "Missing API key" / 401 "Invalid API
-// key") on failure. Callers decide whether to use the returned rate-limit
-// fields: `/reverse` rate-limits with them; `/polygons` discards them,
-// preserving its existing validate-only (no rate-limit) behaviour.
-fn require_valid_key(
-    db: &RwLock<auth::Db>,
-    key: Option<&str>,
-) -> Result<(String, u32, u32, bool), Response> {
-    // Sidecar mode: when the server runs on a private container network
-    // (e.g. as an Immich companion service) there is no key to manage.
-    // GEOCODER_ALLOW_ANONYMOUS=true accepts keyless requests with rate
-    // limiting effectively disabled. Never set this on an internet-facing
-    // deployment.
-    if anonymous_allowed() && key.is_none() {
-        return Ok(("anonymous".to_string(), u32::MAX, u32::MAX, false));
-    }
-
-    let key = match key {
-        Some(k) => k,
-        None => return Err((StatusCode::UNAUTHORIZED, "Missing API key").into_response()),
-    };
-
-    match db.read().unwrap().validate_token(key) {
-        Some(info) => Ok(info),
-        None => Err((StatusCode::UNAUTHORIZED, "Invalid API key").into_response()),
-    }
-}
-
 // Configuration changes repoint where datasets are downloaded from, so
 // they need an admin (dashboard session or an admin's API key). Sidecar
 // mode trusts the private network for this as it does for queries.
@@ -66,7 +46,7 @@ fn require_admin(
     key: Option<&str>,
 ) -> Result<(), Response> {
     let session_id = auth::get_session_cookie(headers);
-    if anonymous_allowed() && key.is_none() && session_id.is_none() {
+    if handlers::anonymous_allowed() && key.is_none() && session_id.is_none() {
         return Ok(());
     }
 
@@ -83,23 +63,6 @@ struct KeyParam {
     key: Option<String>,
 }
 
-fn require_coords(params: &QueryParams) -> Result<(), Response> {
-    if coords_in_range(params.lat, params.lon) {
-        Ok(())
-    } else {
-        Err((StatusCode::BAD_REQUEST, "lat must be within ±90 and lon within ±180").into_response())
-    }
-}
-
-fn anonymous_allowed() -> bool {
-    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ALLOWED.get_or_init(|| {
-        std::env::var("GEOCODER_ALLOW_ANONYMOUS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
 async fn reverse_geocode(
     Query(params): Query<QueryParams>,
     state: axum::extract::State<Arc<RwLock<auth::Db>>>,
@@ -108,22 +71,8 @@ async fn reverse_geocode(
     limiter: axum::extract::Extension<Arc<auth::RateLimiter>>,
     connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
-    let (login, rps, rpd, by_ip) = match require_valid_key(&state, params.key.as_deref()) {
-        Ok(info) => info,
-        Err(resp) => return resp,
-    };
-    if let Err(resp) = require_coords(&params) {
+    if let Err(resp) = handlers::check_reverse(&state, &limiter, params.key.as_deref(), params.lat, params.lon, connect_info.0.ip()) {
         return resp;
-    }
-
-    let rate_key = if by_ip {
-        format!("{}:{}", login, connect_info.0.ip())
-    } else {
-        login
-    };
-
-    if let Err(msg) = auth::check_rate(&limiter, &rate_key, rps, rpd) {
-        return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
     }
 
     // On-demand region download: if the point bbox-matches one or
@@ -141,43 +90,7 @@ async fn reverse_geocode(
         }
     }
 
-    if let Some(ref mode) = params.debug {
-        // Debug endpoints route to the first loaded continent that
-        // bbox-matches the point. In single-region (legacy flat) deploys
-        // that's the world Index; in per-continent setups it's whichever
-        // continent the query lands in. No cross-continent merging on
-        // debug paths — they're for inspecting a single Index's internals.
-        let arcs = index.loaded_matches(params.lat, params.lon);
-        let Some(idx) = arcs.first() else {
-            return ([(axum::http::header::CONTENT_TYPE, "application/json")], "{}").into_response();
-        };
-        if mode == "all" {
-            let address = idx.query(params.lat, params.lon);
-            let admin_debug = idx.debug_admin(params.lat, params.lon);
-            let primary_debug = idx.debug_primary(params.lat, params.lon);
-            let places_debug = idx.debug_places(params.lat, params.lon);
-            let combined = serde_json::json!({
-                "result": serde_json::to_value(&address).unwrap_or_default(),
-                "admin_polygons": admin_debug,
-                "primary_features": primary_debug,
-                "place_nodes": places_debug,
-            });
-            let json = serde_json::to_string_pretty(&combined).unwrap_or_default();
-            return ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response();
-        }
-        let debug = if mode == "primary" {
-            idx.debug_primary(params.lat, params.lon)
-        } else if mode == "places" {
-            idx.debug_places(params.lat, params.lon)
-        } else {
-            idx.debug_admin(params.lat, params.lon)
-        };
-        let json = serde_json::to_string_pretty(&debug).unwrap_or_default();
-        return ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response();
-    }
-
-    let json = index.query_json(params.lat, params.lon);
-    ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response()
+    handlers::reverse_answer(&index, params.lat, params.lon, params.debug.as_deref())
 }
 
 async fn health(
@@ -188,13 +101,6 @@ async fn health(
     // poll this; keep it allocation-light and unauthenticated.
     let body = format!("{{\"status\":\"ok\",\"regions\":{}}}", index.loaded_count());
     ([(axum::http::header::CONTENT_TYPE, "application/json")], body)
-}
-
-async fn test_portal() -> impl IntoResponse {
-    (
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("../../test-portal/index.html"),
-    )
 }
 
 async fn get_configuration(
@@ -231,53 +137,15 @@ async fn put_configuration(
     (StatusCode::ACCEPTED, "configuration updated, downloads scheduled").into_response()
 }
 
-// Permissive CORS for the test portal. The full-dataset server embeds
-// the test page; the page also fetches from a second minimal-dataset
-// server on a different port for side-by-side comparison. Browsers
-// treat that as cross-origin so we tag every response with `*`.
-async fn cors_middleware(
-    req: axum::http::Request<axum::body::Body>,
-    next: axum::middleware::Next,
-) -> Response {
-    if req.method() == axum::http::Method::OPTIONS {
-        let mut resp = Response::default();
-        let h = resp.headers_mut();
-        h.insert("access-control-allow-origin", "*".parse().unwrap());
-        h.insert("access-control-allow-methods", "GET, OPTIONS".parse().unwrap());
-        h.insert("access-control-allow-headers", "*".parse().unwrap());
-        return resp;
-    }
-    let mut resp = next.run(req).await;
-    resp.headers_mut().insert("access-control-allow-origin", "*".parse().unwrap());
-    resp
-}
-
 async fn polygons_geojson(
     Query(params): Query<QueryParams>,
     state: axum::extract::State<Arc<RwLock<auth::Db>>>,
     index: axum::extract::Extension<Arc<MultiIndex>>,
 ) -> Response {
-    if let Err(resp) = require_valid_key(&state, params.key.as_deref()) {
+    if let Err(resp) = handlers::check_polygons(&state, params.key.as_deref(), params.lat, params.lon) {
         return resp;
     }
-    if let Err(resp) = require_coords(&params) {
-        return resp;
-    }
-
-    // Every loaded continent whose bbox covers the query: at a border
-    // (Russia/Türkiye/Egypt) two may, each listing its own polygons.
-    let features: Vec<serde_json::Value> = index
-        .loaded_matches(params.lat, params.lon)
-        .iter()
-        .flat_map(|idx| idx.polygon_features(params.lat, params.lon))
-        .collect();
-
-    let fc = serde_json::json!({
-        "type": "FeatureCollection",
-        "features": features,
-    });
-    let body = serde_json::to_string(&fc).unwrap_or_default();
-    ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response()
+    handlers::polygons_answer(&index, params.lat, params.lon)
 }
 
 // Worker pool sized for a lightweight sidecar: reverse geocoding is
@@ -367,13 +235,13 @@ async fn async_main() {
         .route("/health", get(health))
         .route("/reverse", get(reverse_geocode))
         .route("/polygons", get(polygons_geojson))
-        .route("/test", get(test_portal))
+        .route("/test", get(handlers::test_portal))
         .route("/admin/configuration", get(get_configuration).put(put_configuration))
         .merge(auth::router())
         .layer(axum::Extension(index))
         .layer(axum::Extension(region_state))
         .layer(axum::Extension(limiter))
-        .layer(axum::middleware::from_fn(cors_middleware))
+        .layer(axum::middleware::from_fn(handlers::cors_middleware))
         .with_state(db);
 
     // ACME mode: --domain <domain> [--cache <dir>]

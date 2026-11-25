@@ -13,8 +13,11 @@
 // three footers without a record; with it, a build without --multi-quality is
 // refused. A building's address is written with its footprint, which the
 // server takes its distance from. A fresh build writes its streets and
-// addresses in cell order, whatever their names.
+// addresses in cell order, whatever their names, and its postcode centroids
+// in cell order in each mode dir, which a chained build writes as a fresh one
+// does.
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -23,15 +26,19 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
 
 #include <s2/s2cell_id.h>
+#include <s2/s2latlng.h>
 
 #include "addr_files.h"
+#include "country_code.h"
 #include "id_allocator.h"
 #include "pbf_test_objects.h"
+#include "postcode_files.h"
 #include "scratch_dir.h"
 #include "side_blocks.h"
 #include "string_files.h"
@@ -47,6 +54,7 @@ namespace fs = std::filesystem;
 // the tool headers here).
 void cover_edge(S2CellId c1, S2CellId c2, double lat1, double lng1, double lat2, double lng2, std::vector<S2CellId>& out);
 S2CellId point_to_cell(double lat, double lng);
+extern int kAdminCellLevel;
 
 namespace {
 
@@ -280,6 +288,84 @@ bool says(const std::string& answer, const std::string& name) {
     return answer.find("\"" + name + "\"") != std::string::npos;
 }
 
+// A JSON value's text from i on, the JSON of an answer: its strings with
+// their escapes, its objects by key.
+struct JsonAt {
+    const std::string& s;
+    size_t i;
+    void space() {
+        while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) i++;
+    }
+    // The string at i, unescaped (a \u escape as written), and i past it.
+    std::string string() {
+        std::string out;
+        for (i++; i < s.size() && s[i] != '"'; i++) {
+            if (s[i] != '\\') {
+                out += s[i];
+                continue;
+            }
+            const char e = s[++i];
+            out += e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e == 'b' ? '\b' : e == 'f' ? '\f' : e;
+            if (e == 'u') out.insert(out.size() - 1, "\\");
+        }
+        i++;
+        return out;
+    }
+    // i past the value at i.
+    void skip() {
+        space();
+        if (i >= s.size()) return;
+        if (s[i] == '"') {
+            string();
+        } else if (s[i] == '{' || s[i] == '[') {
+            int depth = 0;
+            do {
+                if (s[i] == '"') {
+                    string();
+                    continue;
+                }
+                depth += s[i] == '{' || s[i] == '[';
+                depth -= s[i] == '}' || s[i] == ']';
+                i++;
+            } while (i < s.size() && depth > 0);
+        } else {
+            while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ']') i++;
+        }
+    }
+    // With an object at i: whether it has `key`, and i at its value.
+    bool member(const std::string& key) {
+        space();
+        if (i >= s.size() || s[i] != '{') return false;
+        i++;
+        for (;;) {
+            space();
+            if (i >= s.size() || s[i] != '"') return false;
+            const std::string k = string();
+            space();
+            i++;  // ':'
+            space();
+            if (k == key) return true;
+            skip();
+            space();
+            if (i < s.size() && s[i] == ',') i++;
+        }
+    }
+};
+
+// The string at `path` (keys from the top object down) in an answer, the
+// JSON after grid_query's point; none where a key of the path is missing or
+// the value is no string.
+std::optional<std::string> answer_string(const std::string& answer, const std::vector<std::string>& path) {
+    const size_t start = answer.find('{');
+    if (start == std::string::npos) return std::nullopt;
+    JsonAt j{answer, start};
+    for (const std::string& key : path)
+        if (!j.member(key)) return std::nullopt;
+    j.space();
+    if (j.i >= answer.size() || answer[j.i] != '"') return std::nullopt;
+    return j.string();
+}
+
 // The ways of a kind `dir` of a tree holds, as its two way files decode: each
 // way's logical record, a WayHeader or an InterpWay, and the ways' nodes back
 // to back. A dir without either file holds none.
@@ -399,6 +485,78 @@ uint64_t least_way_cell(const NodeCoord* nodes, size_t count) {
 }
 
 bool close_to(double a, double b) { return std::fabs(a - b) < 1e-4; }
+
+// The postcode centroids `dir` of a tree holds, as its two postcode files
+// decode (strictly: the files are the encoder's for these rows); none in a
+// dir without them, which has neither.
+std::vector<postcode_files::LogicalCentroid> centroids_of(const std::map<std::string, std::vector<char>>& files,
+                                                          const std::string& dir) {
+    const auto centroids = files.find(dir + postcode_files::CENTROIDS_FILE);
+    const auto cells = files.find(dir + postcode_files::CELLS_FILE);
+    REQUIRE((centroids == files.end()) == (cells == files.end()));
+    std::vector<postcode_files::LogicalCentroid> out;
+    if (centroids == files.end()) return out;
+    postcode_files::decode(reinterpret_cast<const uint8_t*>(centroids->second.data()), centroids->second.size(),
+                           reinterpret_cast<const uint8_t*>(cells->second.data()), cells->second.size(),
+                           [&](const postcode_files::LogicalCentroid& c) { out.push_back(c); });
+    return out;
+}
+
+constexpr uint16_t CH = pack_country_code('C', 'H'), DE = pack_country_code('D', 'E');
+
+// A postcode's address: a node of a house number with the postcode tag.
+struct Postcoded {
+    int64_t id;
+    int32_t lat, lon;
+    const char* postcode;
+};
+
+// Addresses of postcodes: in Testland CH 8001 twice (its centroid halfway
+// between them), 8004 beside that, 8002 in the far corner and 80A1, which no
+// Swiss postcode is like (no centroid); in Testreich DE 78462 and 78464 side
+// by side.
+std::vector<Postcoded> postcoded_addresses() {
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    return {{7001, lat0 + 210000, lng0 + 230000, "8001"}, {7002, lat0 + 410000, lng0 + 430000, "8001"},
+            {7003, lat0 + 313000, lng0 + 333000, "8004"}, {7004, lat0 + 1700000, lng0 + 1700000, "8002"},
+            {7005, lat0 + 1700000, lng0 + 300000, "80A1"}, {7006, 468500000, 80500000, "78462"},
+            {7007, 468500000, 80520000, "78464"}};
+}
+
+// The fixture with Testland's country code, CH, a second country, Testreich
+// (DE), a square of 0.1 degrees 0.1 degrees south of it, and the addresses.
+std::vector<TestObject> with_postcodes(const std::vector<Postcoded>& addresses) {
+    std::vector<TestObject> objects = fixture();
+    const int32_t s = 468000000, n = 469000000, w = 80000000, e = 81000000;
+    objects.push_back(node(6001, s, w));
+    objects.push_back(node(6002, s, e));
+    objects.push_back(node(6003, n, e));
+    objects.push_back(node(6004, n, w));
+    objects.push_back(way(6000, {6001, 6002, 6003, 6004, 6001}));
+    objects.push_back(boundary(50, 2, "Testreich", {6000}));
+    // The countries' codes, which the builder reads from ISO3166-1:alpha2.
+    for (TestObject& o : objects)
+        if (o.type == OsmType::Relation && (o.id == 40 || o.id == 50)) o.tags.push_back({"ISO3166-1:alpha2", o.id == 40 ? "CH" : "DE"});
+    for (const Postcoded& a : addresses)
+        objects.push_back(node(a.id, a.lat, a.lon,
+                               {{"addr:housenumber", std::to_string(a.id)}, {"addr:postcode", a.postcode},
+                                {"addr:street", "Teststrasse"}}));
+    std::stable_sort(objects.begin(), objects.end(), [](const TestObject& a, const TestObject& b) {
+        return a.type != b.type ? a.type < b.type : a.id < b.id;
+    });
+    return objects;
+}
+
+// The dir a client of an admin preset holds: the mode dir's files and the
+// exact tier's admin geometry beside them.
+std::string admin_preset_dir(const std::string& out, const std::string& region, const std::string& into) {
+    fs::create_directories(into);
+    for (const auto& e : fs::directory_iterator(out + "/" + region + "/admin"))
+        if (e.is_regular_file()) fs::copy_file(e.path(), into + "/" + e.path().filename().string());
+    for (const char* f : {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin"})
+        fs::copy_file(out + "/" + region + "/quality/exact/" + f, into + "/" + f, fs::copy_options::overwrite_existing);
+    return into;
+}
 
 }  // namespace
 
@@ -1023,4 +1181,156 @@ TEST(a_fresh_build_writes_streets_and_addresses_in_cell_order_whatever_their_nam
     const std::string again = root.path() + "/again";
     REQUIRE(build(again, {"--prev-output", first}));
     CHECK(tree(again) == files);
+}
+
+TEST(a_build_writes_its_postcode_centroids_in_cell_order_and_the_server_answers_from_them) {
+    const ScratchDir root("postcode-centroids-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log", out = root.path() + "/out";
+    write_test_pbf(pbf, with_postcodes(postcoded_addresses()), 1000);
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output", "--multi-quality"}, log));
+    const auto files = tree(out);
+
+    // Each mode dir of the planet and of Europe holds the two files, the same
+    // bytes, and nothing else of the centroids: no entries file, no slots.
+    const auto planet = files.at("planet/admin/" + std::string(postcode_files::CENTROIDS_FILE));
+    for (const std::string& name : names_of(files)) {
+        const std::string file = fs::path(name).filename().string();
+        CHECK(file != "postcode_centroid_entries.bin" && file != "postcode_centroids.osm_ids");
+    }
+    for (const char* region : {"planet", "europe"})
+        for (const char* mode : {"admin", "no-addresses", "full"})
+            for (const char* f : {postcode_files::CENTROIDS_FILE, postcode_files::CELLS_FILE}) {
+                const std::string at = std::string(region) + "/" + mode + "/" + f;
+                REQUIRE(files.count(at));
+                CHECK(files.at(at) == files.at(std::string("planet/admin/") + f));
+            }
+    // A region without postcodes has neither file.
+    CHECK(!files.count("asia/admin/" + std::string(postcode_files::CENTROIDS_FILE)));
+    CHECK(!files.count("asia/admin/" + std::string(postcode_files::CELLS_FILE)));
+
+    // The centroids of the five postcodes that pass their country's pattern,
+    // each the mean of its addresses, in cell order with the admin cell of its
+    // point; a cell holds two of them.
+    const std::vector<postcode_files::LogicalCentroid> rows = centroids_of(files, "planet/admin/");
+    struct Want {
+        double lat, lng;
+        uint16_t cc;
+    };
+    const std::vector<Want> want = {{47.031, 8.033, CH}, {47.0313, 8.0333, CH}, {47.17, 8.17, CH},
+                                    {46.85, 8.05, DE},   {46.85, 8.052, DE}};
+    REQUIRE(rows.size() == want.size());
+    std::set<uint32_t> keys;
+    for (const Want& w : want) {
+        size_t found = 0;
+        for (const auto& r : rows)
+            found += std::fabs(r.lat - w.lat) < 1e-5 && std::fabs(r.lng - w.lng) < 1e-5 && r.country_code == w.cc;
+        CHECK_EQ(found, size_t(1));
+    }
+    for (size_t i = 0; i < rows.size(); i++) {
+        const auto& r = rows[i];
+        const S2CellId cell = S2CellId(S2LatLng::FromDegrees(r.lat, r.lng)).parent(kAdminCellLevel);
+        CHECK_EQ(uint64_t(r.cell_key) << 32, cell.id());
+        CHECK(i == 0 || rows[i - 1].cell_key <= r.cell_key);
+        keys.insert(r.cell_key);
+    }
+    CHECK(keys.size() < rows.size());
+
+    // The server, from the dir of an admin preset, answers each point by the
+    // nearest centroid of its country within 0.05 degrees: none for the two
+    // points with none that near.
+    const std::string dir = admin_preset_dir(out, "planet", root.path() + "/preset");
+    const std::vector<std::pair<double, double>> points = {
+        {47.0312, 8.0332}, {47.169, 8.169}, {46.851, 8.0505}, {46.8505, 8.0516}, {47.1, 8.1}, {47.19, 8.01}};
+    const std::vector<const char*> postcodes = {"8004", "8002", "78462", "78464", nullptr, nullptr};
+    const std::vector<std::string> answers = server_answers(dir, points, root.path() + "/q", log);
+    REQUIRE(answers.size() == points.size());
+    const int failures_before = gctest::failures();
+    for (size_t i = 0; i < points.size(); i++) {
+        CHECK(says(answers[i], "Testland") || says(answers[i], "Testreich"));
+        const std::optional<std::string> postcode = answer_string(answers[i], {"address", "postcode"});
+        if (postcodes[i]) CHECK(postcode == std::string(postcodes[i]));
+        else CHECK(!postcode);
+    }
+    if (gctest::failures() != failures_before)
+        for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(a_house_whose_postcode_its_country_rejects_answers_its_streets) {
+    // Two houses of Teststrasse in Testland (CH) beside its middle, one tagged 8003 and one 80A1,
+    // which no Swiss postcode is like: the clean-postcodes sanitizer makes that tag an address
+    // term, so its house takes the street's postcode (placex_update), the centroid nearest the
+    // street's middle, 8003. The other house answers its own.
+    const ScratchDir root("rejected-house-postcode");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log", out = root.path() + "/out";
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    write_test_pbf(pbf, with_postcodes({{7010, lat0 + 1405000, lng0 + 1505000, "8003"}, {7011, lat0 + 1395000, lng0 + 1495000, "80A1"}}),
+                   1000);
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
+    const std::vector<std::pair<double, double>> points = {{47.1395, 8.1495}, {47.1405, 8.1505}};
+    const std::vector<std::string> answers = server_answers(out + "/planet", points, root.path() + "/q", log);
+    REQUIRE(answers.size() == points.size());
+    const int failures_before = gctest::failures();
+    for (const std::string& answer : answers) {
+        CHECK(answer_string(answer, {"address", "postcode"}) == std::string("8003"));
+        CHECK(answer_string(answer, {"address", "road"}) == std::string("Teststrasse"));
+    }
+    CHECK(answer_string(answers[0], {"address", "house_number"}) == std::string("7011"));
+    if (gctest::failures() != failures_before)
+        for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
+}
+
+TEST(postcode_centroids_keep_no_slots_and_a_region_of_no_valid_postcode_has_no_files) {
+    // The next day 8002's address is gone and 8007's is new. A build of that
+    // day on the day before writes the files a fresh build of it does: a
+    // centroid that is gone leaves nothing, and one that is new takes no
+    // slot of its own.
+    const ScratchDir root("postcode-centroids-chained");
+    const std::string log = root.path() + "/build.log";
+    std::vector<Postcoded> next = postcoded_addresses();
+    next.erase(std::remove_if(next.begin(), next.end(), [](const Postcoded& a) { return std::strcmp(a.postcode, "8002") == 0; }),
+               next.end());
+    next.push_back({7008, 470000000 + 900000, 80000000 + 1200000, "8007"});
+    auto build = [&](const std::string& name, const std::vector<Postcoded>& addresses, std::vector<std::string> extra) {
+        const std::string pbf = root.path() + "/" + name + ".osm.pbf", out = root.path() + "/" + name;
+        write_test_pbf(pbf, with_postcodes(addresses), 1000);
+        std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf, "--multi-output", "--multi-quality"};
+        words.insert(words.end(), extra.begin(), extra.end());
+        REQUIRE(gctest::run(words, log));
+        return tree(out);
+    };
+    const auto one = build("one", postcoded_addresses(), {});
+    const auto fresh = build("fresh", next, {});
+    const auto chained = build("chained", next, {"--prev-output", root.path() + "/one"});
+    for (const char* mode : {"admin", "no-addresses", "full"})
+        for (const char* f : {postcode_files::CENTROIDS_FILE, postcode_files::CELLS_FILE}) {
+            const std::string at = std::string("planet/") + mode + "/" + f;
+            REQUIRE(fresh.count(at) && chained.count(at) && one.count(at));
+            CHECK(chained.at(at) == fresh.at(at));
+        }
+    // Day one holds 8002's centroid and not 8007's, the chained day 8007's and
+    // not 8002's: each the one address of its postcode, at its point.
+    const std::vector<postcode_files::LogicalCentroid> day_one = centroids_of(one, "planet/full/"),
+                                                       day_two = centroids_of(chained, "planet/full/");
+    CHECK_EQ(day_one.size(), size_t(5));
+    CHECK_EQ(day_two.size(), size_t(5));
+    auto at = [](const std::vector<postcode_files::LogicalCentroid>& rows, double lat, double lng) {
+        size_t found = 0;
+        for (const auto& r : rows) found += std::fabs(r.lat - lat) < 1e-5 && std::fabs(r.lng - lng) < 1e-5 && r.country_code == CH;
+        return found;
+    };
+    const double p8002[2] = {47.17, 8.17}, p8007[2] = {47.09, 8.12};
+    CHECK_EQ(at(day_one, p8002[0], p8002[1]), size_t(1));
+    CHECK_EQ(at(day_one, p8007[0], p8007[1]), size_t(0));
+    CHECK_EQ(at(day_two, p8007[0], p8007[1]), size_t(1));
+    CHECK_EQ(at(day_two, p8002[0], p8002[1]), size_t(0));
+    for (const auto& tree_files : {one, fresh, chained})
+        for (const std::string& name : names_of(tree_files)) CHECK(fs::path(name).filename() != "postcode_centroids.osm_ids");
+
+    // Addresses whose only postcode no Swiss postcode is like keep none, so
+    // their region has no centroid files, as one without postcodes.
+    const auto none = build("none", {{7005, 470000000 + 1700000, 80000000 + 300000, "80A1"}}, {});
+    for (const char* mode : {"admin", "no-addresses", "full"}) {
+        const std::string at = std::string("planet/") + mode + "/";
+        CHECK(!none.count(at + postcode_files::CENTROIDS_FILE) && !none.count(at + postcode_files::CELLS_FILE));
+    }
 }

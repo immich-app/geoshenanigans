@@ -63,5 +63,10 @@ int main() {
         // The globe's corners: deltas past 30 bits at a wider base width.
         row(k, {{on_grid(-900000000), on_grid(-1800000000)}, {on_grid(900000000), on_grid(1800000000)}, {on_grid(-900000000), on_grid(-1800000000)}}, "across the globe");
     }
+    // Across the globe and back, then a straight line east: second-order deltas, the turn's of 34
+    // bits.
+    std::vector<PackedLocation> turn{{100000000, -1800000000}, {100000000, 1800000000}};
+    for (int32_t lng = -1800000000; lng <= 1700000000; lng += 50000000) turn.push_back({100000000, lng});
+    row(0, turn, "across the globe and back, then a straight line");
     return 0;
 }

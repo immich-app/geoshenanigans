@@ -341,7 +341,10 @@ TEST(patch_format_stride_sentinel_values) {
     // Concrete values locked in (diff/patch wire contract), distinct.
     CHECK_EQ(SPARSE_DELTA_STRIDE, uint32_t(0xFC));
     CHECK_EQ(COPY_OLD_STRIDE, uint32_t(0xFD));
-    CHECK_EQ(CELL_LIST_DELTA_STRIDE, uint32_t(0xFB));
+    CHECK_EQ(PARALLEL_DELTA_STRIDE, uint32_t(0xFA));
+    // From 0xFA up a stride is a section kind's or refused (0xFB was the cell
+    // list delta's to v18): no merge section has one.
+    CHECK_EQ(MAX_RECORD_STRIDE, uint32_t(0xF9));
 }
 
 TEST(patch_format_stride_sentinels_no_collision_with_real_strides) {
@@ -355,8 +358,8 @@ TEST(patch_format_stride_sentinels_no_collision_with_real_strides) {
         4,   // u32 id arrays (entries, parents, postcodes)
         8,   // NodeCoord, cell_id
         12,  // WayHeader / admin_cells / poi_cells
-        16,  // postcode_centroid value_stride, empty addr_points, AdminPolygonRecord
-        20,  // geo_cell
+        16,  // empty addr_points, AdminPolygonRecord
+        20,  // geo_cell, logical postcode centroid
         24,  // InterpWay / logical place node
         28,  // AddrPoint
         36,  // PoiRecord
@@ -364,7 +367,7 @@ TEST(patch_format_stride_sentinels_no_collision_with_real_strides) {
     for (uint32_t s : real_strides) {
         CHECK(s != SPARSE_DELTA_STRIDE);
         CHECK(s != COPY_OLD_STRIDE);
-        CHECK(s != CELL_LIST_DELTA_STRIDE);
+        CHECK(s != PARALLEL_DELTA_STRIDE);
         CHECK(s <= MAX_RECORD_STRIDE);
     }
 }
@@ -410,10 +413,10 @@ TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread_or_copies
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v18 = the address footprints' stream in 2-byte units
-    // (v17: an old file's hash names its file). The patcher accepts this
-    // version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(18));
+    // diff/patch tools. v19 = the postcode centroids' logical stream (v18:
+    // the address footprints' stream in 2-byte units). The patcher accepts
+    // this version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(19));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
@@ -786,22 +789,52 @@ TEST(patch_format_string_fields_match_the_record_layouts) {
     CHECK(string_field_offsets(PatchFileId::ADMIN_POLYGONS) == V({4}));
     CHECK(string_field_offsets(PatchFileId::POI_RECORDS) == V({16, 24, 28}));  // not parent_poly_id at 32
     CHECK(string_field_offsets(PatchFileId::PLACE_NODES) == V({8}));  // not parent_poly_id at 16
+    CHECK(string_field_offsets(PatchFileId::POSTCODE_CENTROIDS) == V({8}));  // a logical row's postcode_id
+    CHECK_EQ(POSTCODE_CENTROID_STRIDE, size_t(20));
+    bool centroids_scanned = false;
+    for (const auto& f : STRING_RECORD_FILES)
+        if (f.fid == PatchFileId::POSTCODE_CENTROIDS) centroids_scanned = f.stride == POSTCODE_CENTROID_STRIDE;
+    CHECK(centroids_scanned);
     CHECK(string_field_offsets(PatchFileId::STREET_NODES).empty());
     CHECK(string_field_offsets(PatchFileId::POI_VERTICES).empty());
 
-    // Sparse files: string offsets are kind 2 (the u32 itself) and kind 3
-    // (byte 8 of a postcode centroid); kind 0 holds admin slots, raw.
+    // Sparse files: string offsets are kind 2 (the u32 itself); kind 0 holds
+    // admin slots, raw. No other kind names a file (kind 3 was the 16-byte
+    // postcode centroids', which merge as logical rows from v19).
     std::vector<std::string> strings, raw;
     for (const auto& f : SPARSE_DELTA_FILES) {
         const std::string name = patch_file_names[(uint32_t)f.fid];
-        if (f.remap_kind == 2) { CHECK_EQ(f.value_stride, 4u); strings.push_back(name); }
-        if (f.remap_kind == 3) { CHECK_EQ(f.value_stride, 16u); strings.push_back(name); }
-        if (f.remap_kind == 0) raw.push_back(name);
+        CHECK_EQ(f.value_stride, 4u);
+        CHECK(f.remap_kind == 0 || f.remap_kind == 2);
+        (f.remap_kind == 2 ? strings : raw).push_back(name);
     }
-    CHECK(strings == std::vector<std::string>({"addr_postcodes.bin", "way_postcodes.bin",
-                                               "interp_postcodes.bin", "postcode_centroids.bin"}));
+    CHECK(strings == std::vector<std::string>({"addr_postcodes.bin", "way_postcodes.bin", "interp_postcodes.bin"}));
     CHECK(raw == std::vector<std::string>({"admin_parents.bin", "way_parents.bin"}));
-    CHECK_EQ(POSTCODE_CENTROID_POSTCODE_ID_OFF, size_t(8));
+}
+
+// v19: the postcode centroids merge under file id 23 as their logical rows,
+// and the patcher writes their cells file beside them, as it writes the
+// place files': file ids 24 and 25 name no file, the old file sizes list no
+// entries file, and the client files of a dir may be the two files.
+TEST(patch_format_v19_names_no_file_for_ids_24_and_25) {
+    CHECK_EQ(std::string(patch_file_names[23]), std::string("postcode_centroids.bin"));
+    CHECK(uint32_t(PatchFileId::POSTCODE_CENTROIDS) == 23);
+    for (const uint32_t id : {24u, 25u}) {
+        CHECK(names_no_file(id));
+        const std::string name = patch_file_names[id];
+        CHECK(name.find(".bin") == std::string::npos);
+        CHECK(sparse_delta_file(static_cast<PatchFileId>(id)) == nullptr);
+        CHECK(string_field_offsets(static_cast<PatchFileId>(id)).empty());
+        for (const PatchFileId f : UNSECTIONED_OLD_FILES) CHECK(uint32_t(f) != id);
+    }
+    for (const uint32_t id : {0u, 9u, 10u, 11u}) CHECK(names_no_file(id));
+    for (const uint32_t id : {1u, 8u, 18u, 23u, 26u, 35u}) CHECK(!names_no_file(id));
+    CHECK(!names_no_file(uint32_t(PatchFileId::COUNT)));
+    CHECK(std::vector<std::string>(std::begin(POSTCODE_SIDE_FILES), std::end(POSTCODE_SIDE_FILES)) ==
+          std::vector<std::string>({"postcode_centroid_cells.bin"}));
+    CHECK(sparse_delta_file(PatchFileId::POSTCODE_CENTROIDS) == nullptr);
+    CHECK(!cell_pairs::format_named("postcode_centroid"));
+    CHECK(cell_pairs::format_named("admin") && cell_pairs::format_named("poi"));
 }
 
 // v14: file ids 7, 26 and 27 name the arc files, of no string field, which
@@ -847,6 +880,8 @@ TEST(patch_format_sparse_delta_header_is_a_row_of_its_table) {
     CHECK_EQ(refusal(PatchFileId::ADMIN_PARENTS, 4, 2), malformed);
     CHECK_EQ(refusal(PatchFileId::ADDR_POSTCODES, 4, 0), malformed);
     CHECK_EQ(refusal(PatchFileId::POSTCODE_CENTROIDS, 4, 3), malformed);
+    CHECK_EQ(refusal(PatchFileId::POSTCODE_CENTROIDS, 16, 3), malformed);
+    CHECK_EQ(refusal(PatchFileId::POSTCODE_CENTROIDS, 20, 2), malformed);
     CHECK_EQ(refusal(PatchFileId::ADDR_POSTCODES, 16, 2), malformed);
     CHECK_EQ(refusal(PatchFileId::ARC_INDEX, 4, 0), malformed);
     CHECK_EQ(refusal_of([] { check_sparse_delta_header(uint32_t(PatchFileId::COUNT), 4, 0); }), malformed);
@@ -1896,7 +1931,7 @@ static CellLists at10(const CellLists& lists) {
 TEST(patch_format_empty_cell_lists_round_trip) {
     // An emptied cell keeps an empty list; parsing and rebuilding it copy
     // no ids (its vector's data() is null).
-    for (cell_pairs::Format format : {cell_pairs::ADMIN, cell_pairs::POI, cell_pairs::POSTCODE_CENTROID}) {
+    for (cell_pairs::Format format : {cell_pairs::ADMIN, cell_pairs::POI}) {
         auto [cells, entries] = write_cell_lists(at10({{7, {}}, {9, {4}}}), format);
         CHECK(parse_cell_lists(cells, entries, format) == at10({{7, {}}, {9, {4}}}));
     }
@@ -1946,17 +1981,17 @@ TEST(patch_format_cell_lists_write_the_cell_pair_files) {
              std::string("Malformed cell index: a cells file of another kind of index"));
 }
 
-// The index stream_cell_list_delta writes for the old index plus the delta
-// from old_lists to new_lists.
+// The index stream_cell_index writes for the old index, its ids kept, plus
+// the delta from old_lists to new_lists, as it writes the admin index (whose
+// polygons keep their slots).
 static std::pair<std::vector<char>, std::vector<char>> apply_delta(
         const std::pair<std::vector<char>, std::vector<char>>& old_index, const std::vector<char>& delta, size_t delta_size,
-        cell_pairs::Format format = cell_pairs::POSTCODE_CENTROID) {
+        cell_pairs::Format format = cell_pairs::POI) {
     std::pair<std::vector<char>, std::vector<char>> out;
-    stream_cell_list_delta(ByteSpan{old_index.first.data(), old_index.first.size()},
-                           ByteSpan{old_index.second.data(), old_index.second.size()}, format,
-                           delta.data(), delta_size,
-                           [&](const char* p, size_t n) { out.first.insert(out.first.end(), p, p + n); },
-                           [&](const char* p, size_t n) { out.second.insert(out.second.end(), p, p + n); });
+    stream_cell_index(ByteSpan{old_index.first.data(), old_index.first.size()},
+                      ByteSpan{old_index.second.data(), old_index.second.size()}, format, {}, {}, [](uint32_t id) { return id; },
+                      delta.data(), delta_size, [&](const char* p, size_t n) { out.first.insert(out.first.end(), p, p + n); },
+                      [&](const char* p, size_t n) { out.second.insert(out.second.end(), p, p + n); });
     return out;
 }
 
@@ -1965,7 +2000,7 @@ static bool delta_applies(const CellLists& old_lists, const CellLists& new_lists
     std::vector<char> delta;
     append_cell_list_delta(delta, old_lists, new_lists);
     bool ok = true;
-    for (cell_pairs::Format format : {cell_pairs::POSTCODE_CENTROID, cell_pairs::ADMIN, cell_pairs::POI})
+    for (cell_pairs::Format format : {cell_pairs::ADMIN, cell_pairs::POI})
         ok &= apply_delta(write_cell_lists(old_lists, format), delta, delta.size(), format) ==
               write_cell_lists(new_lists, format);
     return ok;
@@ -2191,7 +2226,7 @@ TEST(patch_format_cell_list_delta_bounds_ranks_in_64_bits) {
     CHECK_EQ(refusal_applying(old_lists, {}, {}, {}, {{1, 0, 5 << 1}, {~0ull, 0, 6 << 1}}), past);
     CHECK_EQ(refusal_applying(old_lists, {}, {}, {}, {{1, ~0ull, 5 << 1}}), past);
     CHECK_EQ(refusal_applying(old_lists, {two32}, {}, {}, {}), std::string("Malformed cell list delta: a gone rank past the last source cell"));
-    const auto old_index = write_cell_lists(at10(old_lists), cell_pairs::POSTCODE_CENTROID);
+    const auto old_index = write_cell_lists(at10(old_lists), cell_pairs::POI);
     // A new cell past 2^64: cell 5, then a gap past what is left.
     std::vector<char> beyond = {0, 2};
     write_varint64(beyond, c10(5));
@@ -2328,8 +2363,8 @@ TEST(patch_format_cell_list_delta_drops_an_emptied_cell) {
     const CellLists old_lists = at10({{7, {1}}, {9, {}}}), new_lists = at10({{7, {1}}});
     std::vector<char> delta;
     append_cell_list_delta(delta, old_lists, new_lists);
-    CHECK(apply_delta(write_cell_lists(old_lists, cell_pairs::POSTCODE_CENTROID), delta, delta.size()) ==
-          write_cell_lists(new_lists, cell_pairs::POSTCODE_CENTROID));
+    CHECK(apply_delta(write_cell_lists(old_lists, cell_pairs::POI), delta, delta.size()) ==
+          write_cell_lists(new_lists, cell_pairs::POI));
 }
 
 TEST(patch_format_stream_cell_index_refuses_cell_changes_out_of_order) {
@@ -2378,7 +2413,7 @@ TEST(patch_format_stream_cell_index_refuses_a_malformed_old_index_or_new_cell) {
 TEST(patch_format_cell_list_delta_rejects_truncation) {
     std::vector<char> delta;
     append_cell_list_delta(delta, at10({{1, {10}}}), at10({{1, {11}}, {2, {5}}}));
-    auto old_index = write_cell_lists(at10({{1, {10}}}), cell_pairs::POSTCODE_CENTROID);
+    auto old_index = write_cell_lists(at10({{1, {10}}}), cell_pairs::POI);
     for (size_t cut = 0; cut < delta.size(); cut++)
         CHECK_EQ(refusal_of([&] { apply_delta(old_index, delta, cut); }), std::string("Malformed cell list delta"));
 }

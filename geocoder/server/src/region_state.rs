@@ -14,7 +14,9 @@
 //    until the download finishes.
 //
 // Per-region mutex serialises concurrent ensure_loaded calls so each
-// region is downloaded at most once even under request fan-in.
+// region is downloaded at most once even under request fan-in. A download
+// runs in a task of its own, which holds the mutex to its end: a request
+// that gives up leaves it to run on.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::downloader::{
-    check_selection, download_region, Configurations, DownloadError, DownloadProgress, RegionSelection,
+    check_selection, client_error, download_region, Configurations, DownloadError, DownloadProgress, RegionSelection,
 };
 use query_server::MultiIndex;
 
@@ -34,13 +36,21 @@ use query_server::MultiIndex;
 /// never re-resolved would 404 on every new download from day 4.
 const CONFIGURATIONS_TTL: Duration = Duration::from_secs(3600);
 
+#[cfg(test)]
+thread_local! {
+    /// Set by a test: run by the next ensure_loaded on this thread once its
+    /// download is in, before it loads the region dir, which it is given.
+    static ONCE_DOWNLOADED: std::cell::Cell<Option<Box<dyn FnOnce(&std::path::Path)>>> = const { std::cell::Cell::new(None) };
+}
+
 /// The selection a server downloads. A mode, quality or poi_tier its build
 /// has no component for fails each download, naming the values the build
 /// offers; a PUT naming one is refused when the build's manifest is at hand.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Configuration {
     /// Base URL for the geocoder build artifacts. Latest.json + each
-    /// build's configurations.json + .bin.zst files all hang off this.
+    /// build's configurations.json + its files' .zst and transport units
+    /// all hang off this.
     pub base_url: String,
     /// Address detail level — must match a `mode.*` component.
     pub mode: String,
@@ -96,7 +106,8 @@ pub struct RegionState {
     /// share one inner Mutex; only the leader actually downloads, the
     /// rest wait on the lock and find the region already loaded.
     pub region_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    pub http: reqwest::Client,
+    /// The client of downloads, built by the first (`http`).
+    http: tokio::sync::OnceCell<reqwest::Client>,
 }
 
 impl RegionState {
@@ -116,11 +127,21 @@ impl RegionState {
             configurations: Mutex::new(None),
             configurations_ttl: CONFIGURATIONS_TTL,
             region_locks: Mutex::new(HashMap::new()),
-            http: reqwest::Client::builder()
-                .user_agent("geocoder-server/0.1")
-                .build()
-                .expect("failed to build reqwest client"),
+            http: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// The client of downloads. Building one loads the system's CA
+    /// certificates, which a host may lack, so the first download builds
+    /// it and a server without them still serves the regions on its disk.
+    /// A client that can't be built fails the download, naming why, and
+    /// the next download tries again.
+    async fn http(&self) -> Result<&reqwest::Client, DownloadError> {
+        self.http
+            .get_or_try_init(|| async {
+                reqwest::Client::builder().user_agent("geocoder-server/0.1").build().map_err(client_error)
+            })
+            .await
     }
 
     /// Replace the active configuration. Persists to disk and kicks
@@ -179,9 +200,10 @@ impl RegionState {
         }
 
         let cfg = self.config.lock().await.clone();
+        let http = self.http().await?;
         // Resolve latest build date via latest.json.
         let latest_url = format!("{}/builds/latest.json", cfg.base_url.trim_end_matches('/'));
-        let latest: serde_json::Value = self.http.get(&latest_url).send().await
+        let latest: serde_json::Value = http.get(&latest_url).send().await
             .map_err(|e| DownloadError::Http(format!("{}: {}", latest_url, e)))?
             .error_for_status().map_err(|e| DownloadError::Http(format!("{}: {}", latest_url, e)))?
             .json().await
@@ -190,7 +212,7 @@ impl RegionState {
             .ok_or_else(|| DownloadError::Http(format!("{}: missing 'latest' field", latest_url)))?;
 
         let cfg_url = format!("{}/builds/{}/configurations.json", cfg.base_url.trim_end_matches('/'), date);
-        let configurations: Configurations = self.http.get(&cfg_url).send().await
+        let configurations: Configurations = http.get(&cfg_url).send().await
             .map_err(|e| DownloadError::Http(format!("{}: {}", cfg_url, e)))?
             .error_for_status().map_err(|e| DownloadError::Http(format!("{}: {}", cfg_url, e)))?
             .json().await
@@ -204,7 +226,14 @@ impl RegionState {
     /// isn't already, downloads its files (single-flighted), then
     /// installs the new Index. Subsequent calls for the same region
     /// after a successful download return immediately.
-    pub async fn ensure_loaded(&self, region: &str) -> Result<(), DownloadError> {
+    ///
+    /// The download and the install run in a task of their own, which
+    /// holds the region's mutex until they end: a caller that gives up (a
+    /// request whose client went, its future dropped) leaves them to run
+    /// on. Dropped part way, a download would let go of the dir's lock
+    /// while what it started on threads of their own (a unit's decode, a
+    /// file's writer) went on writing the dir.
+    pub async fn ensure_loaded(self: &Arc<Self>, region: &str) -> Result<(), DownloadError> {
         // Per-region serialisation. Acquire the inner mutex so only
         // one concurrent request runs the download below; the rest
         // wait, find the region already installed, and return.
@@ -214,7 +243,7 @@ impl RegionState {
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
-        let _guard = inner.lock().await;
+        let guard = inner.lock_owned().await;
 
         // Re-check after acquiring the lock: an earlier waiter may
         // have just finished the download.
@@ -228,13 +257,24 @@ impl RegionState {
             return Err(DownloadError::UnknownRegion(region.to_string()));
         }
 
+        let (state, region) = (self.clone(), region.to_string());
+        tokio::spawn(async move {
+            let _guard = guard;
+            state.download_and_install(&region).await
+        })
+        .await
+        .map_err(|e| DownloadError::Io(format!("download task: {}", e)))?
+    }
+
+    /// Downloads `region` and installs it: the task of ensure_loaded.
+    async fn download_and_install(&self, region: &str) -> Result<(), DownloadError> {
         let configurations = self.ensure_configurations().await?;
         let cfg = self.config.lock().await.clone();
         let sel = cfg.selection(region);
 
         let region_owned = region.to_string();
         download_region(
-            &self.http,
+            self.http().await?,
             &cfg.base_url,
             &configurations,
             &sel,
@@ -247,7 +287,18 @@ impl RegionState {
             },
         ).await?;
 
-        self.multi_index.install_region(region)
+        #[cfg(test)]
+        if let Some(meanwhile) = ONCE_DOWNLOADED.take() {
+            meanwhile(&self.root_dir.join(region));
+        }
+        // Another server's download into the dir may begin once this one let
+        // go of it: the dir loads once that one ended, where it finished. The
+        // load waits for it on a thread of its own, not on one of the
+        // runtime's, which answer the queries meanwhile.
+        let (multi_index, name) = (self.multi_index.clone(), region.to_string());
+        tokio::task::spawn_blocking(move || multi_index.install_region(&name))
+            .await
+            .map_err(|e| DownloadError::Io(format!("load task: {}", e)))?
             .map_err(DownloadError::UnknownRegion)?;
         Ok(())
     }
@@ -258,6 +309,7 @@ mod tests {
     use super::*;
     use crate::scratch_dir::ScratchDir;
     use crate::test_bucket;
+    use query_server::DOWNLOAD_LOCK;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FakeBucket {
@@ -330,13 +382,49 @@ mod tests {
         let persisted = Configuration { base_url: bucket.url.clone(), quality: "q2.5".into(), ..Configuration::default() };
         std::fs::write(root.path().join("configuration.json"), serde_json::to_string(&persisted).unwrap()).unwrap();
         let mi = MultiIndex::load(root.path().to_str().unwrap(), 17, 10, 660.0).unwrap();
-        let state = RegionState::new(Arc::new(mi), root.path().to_path_buf());
+        let state = Arc::new(RegionState::new(Arc::new(mi), root.path().to_path_buf()));
 
         let got = state.ensure_loaded("europe").await.map_err(|e| e.to_string());
 
         assert_eq!(got, Err("this build has no quality \"q2.5\"; it offers quality: exact, simplified".to_string()));
         assert_eq!(bucket.files_served(), 0);
         assert!(!root.path().join("europe").exists());
+    }
+
+    // A host without CA certificates (an image without a CA bundle) builds
+    // no HTTP client. A server there still starts and serves the regions on
+    // its disk; each download fails naming why, fetching nothing, and the
+    // first once the certificates are there builds it. The case runs in a
+    // process of its own (test_bucket::without_ca_store).
+    #[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+    #[test]
+    fn a_host_without_ca_certificates_starts_and_its_downloads_fail_naming_why() {
+        test_bucket::without_ca_store("region_state::tests::without_ca_certificates");
+    }
+
+    #[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+    #[tokio::test]
+    #[ignore = "run by a_host_without_ca_certificates_starts_and_its_downloads_fail_naming_why"]
+    async fn without_ca_certificates() {
+        if std::env::var_os(test_bucket::NO_CA_STORE).is_none() {
+            return;
+        }
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (root, state) = state_for(bucket.url.clone(), Duration::from_secs(3600)).await;
+        let state = Arc::new(state);
+
+        let got = state.ensure_loaded("europe").await.map_err(|e| e.to_string());
+
+        assert_eq!(
+            got,
+            Err("HTTP error: building the client: builder error: unexpected error: No CA certificates were loaded from the system".to_string())
+        );
+        assert_eq!(bucket.files_served(), 0);
+        assert!(!root.path().join("europe").exists());
+
+        let certificates = ScratchDir::new();
+        test_bucket::with_test_ca(certificates.path());
+        state.ensure_configurations().await.unwrap();
     }
 
     // With the build's manifest at hand, a configuration naming a value it
@@ -393,5 +481,93 @@ mod tests {
         let fine = Configuration { quality: "fine".into(), ..state.get_configuration().await };
         state.set_configuration(fine).await.unwrap();
         assert_eq!(state.get_configuration().await.quality, "fine");
+    }
+
+    // Once its download is in, a server loads the region dir under a shared
+    // lock on its DOWNLOAD_LOCK, which waits while a download of another
+    // server on the data dir holds the lock. It waits on a thread of its
+    // own, and the runtime's threads go on with other tasks meanwhile. Here
+    // another open takes the lock as the download let go of it and keeps it
+    // a second, on a runtime of one thread: a task due in 100 ms runs while
+    // the lock is held, and the load returns once it was let go of.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_load_waiting_for_another_servers_download_leaves_the_runtime_free() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (_root, state) = state_for(bucket.url.clone(), Duration::from_secs(3600)).await;
+        let state = Arc::new(state);
+        let meanwhile = Arc::new(std::sync::Mutex::new(None));
+        let started = meanwhile.clone();
+        ONCE_DOWNLOADED.set(Some(Box::new(move |dir: &std::path::Path| {
+            let other = std::fs::File::open(dir.join(DOWNLOAD_LOCK)).unwrap();
+            other.lock().unwrap();
+            let let_go = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(1));
+                let at = Instant::now();
+                drop(other);
+                at
+            });
+            let ticked = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Instant::now()
+            });
+            *started.lock().unwrap() = Some((let_go, ticked));
+        })));
+
+        let got = state.ensure_loaded("europe").await.map_err(|e| e.to_string());
+        let returned = Instant::now();
+
+        let (let_go, ticked) = meanwhile.lock().unwrap().take().expect("the download is in");
+        let (let_go, ticked) = (let_go.join().unwrap(), ticked.await.unwrap());
+        assert_eq!((ticked < let_go, let_go < returned), (true, true), "{got:?}");
+    }
+
+    /// The names in a dir and their bytes.
+    fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir).unwrap()
+            .map(|e| e.unwrap())
+            .map(|e| (e.file_name().into_string().unwrap(), std::fs::read(e.path()).unwrap()))
+            .collect()
+    }
+
+    // A request that gives up, its future dropped (as the server drops a
+    // handler's once its client went), leaves the download it started to
+    // run to its end. Dropped part way, a download lets go of the dir's
+    // lock and the region's mutex while what it started on threads of their
+    // own (a unit's decode, a file's writer) goes on writing the dir, and a
+    // download after it may mix their files with its own. Here the bucket
+    // holds a unit's body back half way and the request gives up meanwhile:
+    // the lock and the mutex stay held; once the bucket sends the rest, the
+    // download ends, the dir as a download of the selection leaves it, each
+    // object fetched once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_request_that_gives_up_leaves_its_download_to_run_to_its_end() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (root, state) = state_for(bucket.url.clone(), Duration::from_secs(3600)).await;
+        let state = Arc::new(state);
+        let sel = state.get_configuration().await.selection("europe");
+        let whole = ScratchDir::new();
+        download_region(state.http().await.unwrap(), &bucket.url, &bucket.manifest, &sel, whole.path(), |_| {}).await.unwrap();
+        let (want, all) = (tree(&whole.path().join("europe")), bucket.files_served());
+        let unit = crate::downloader::resolve_files(&bucket.manifest, &sel).unwrap().paths.iter()
+            .find_map(|p| bucket.manifest.files.get(p)?.unit.clone())
+            .expect("the selection takes a unit");
+        let holding = bucket.hold(&unit);
+
+        tokio::select! {
+            got = state.ensure_loaded("europe") => panic!("done while the bucket held {unit} back: {got:?}"),
+            () = holding.reached() => {}
+        }
+        let dir = root.path().join("europe");
+        let lock_free = std::fs::File::open(dir.join(DOWNLOAD_LOCK)).unwrap().try_lock().is_ok();
+        let mutex = state.region_locks.lock().await["europe"].clone();
+        let mutex_free = mutex.try_lock().is_ok();
+        drop(holding);
+        let ended = tokio::time::timeout(Duration::from_secs(60), mutex.lock()).await.is_ok();
+
+        assert_eq!((lock_free, mutex_free, ended), (false, false, true));
+        assert!(tree(&dir) == want, "{:?}", tree(&dir).keys().collect::<Vec<_>>());
+        assert_eq!(bucket.files_served(), 2 * all);
     }
 }

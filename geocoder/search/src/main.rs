@@ -159,22 +159,7 @@ fn cmd_query(args: &[String]) {
     answer_lines(std::io::stdin().lock(), &mut out, |q| {
         let t = Instant::now();
         let (found, st) = s.search(q, limit);
-        let us = t.elapsed().as_secs_f64() * 1e6;
-        let results: Vec<_> = found
-            .iter()
-            .map(|f| {
-                let mut r = f.to_json();
-                r["kind"] = json!(f.kind.letter().to_string());
-                r["score"] = json!(f.hit.score);
-                r["text"] = json!(f.hit.text);
-                r["context"] = json!(f.hit.context);
-                r["class"] = json!(f.hit.class);
-                r["entity"] = json!(f.hit.entity);
-                r
-            })
-            .collect();
-        json!({"q": q, "us": us, "reverse_lookups": st.reverse_lookups, "context_checks": st.context_checks,
-               "keys": st.keys_matched, "postings": st.postings_read, "results": results})
+        place_search::query::debug_line(q, t.elapsed().as_secs_f64() * 1e6, &found, &st)
     }).expect("query input/output");
     eprintln!("after queries: memory {}", mem_json());
 }
@@ -216,13 +201,19 @@ fn cmd_ctxbench(args: &[String]) {
 /// Key-level churn between two builds of one sub-index: keys only in A, only in B, in both with
 /// the same / a different posting list.
 fn cmd_diff(args: &[String]) {
-    use fst::{IntoStreamer, Streamer};
+    use fst::Streamer;
     let (a, b, name) = (Path::new(&args[2]), Path::new(&args[3]), &args[4]);
-    // Every posting of each list, whatever its entity.
-    let sa = place_search::reader::SubIndex::open(a, name, u32::MAX).expect("A");
-    let sb = place_search::reader::SubIndex::open(b, name, u32::MAX).expect("B");
+    // Every posting of each list, whatever its entity; the keys of each verified first, as a
+    // walk of a damaged fst may not end.
+    let open = |dir: &Path| {
+        place_search::reader::SubIndex::open_verified(dir, name, u32::MAX).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1)
+        })
+    };
+    let (sa, sb) = (open(a), open(b));
     let mut ia = sa.map.stream();
-    let mut ib = sb.map.into_stream();
+    let mut ib = sb.map.stream();
     let (mut only_a, mut only_b, mut same, mut changed) = (0u64, 0u64, 0u64, 0u64);
     let (mut pa, mut pb) = (Vec::new(), Vec::new());
     let mut na = ia.next().map(|(k, v)| (k.to_vec(), v));
