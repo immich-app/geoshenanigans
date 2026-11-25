@@ -66,6 +66,7 @@
 #include "place_files.h"
 #include "poi_files.h"
 #include "postcode_files.h"
+#include "postcode_grid.h"
 #include "scratch_dir.h"
 #include "record_match.h"
 #include "side_blocks.h"
@@ -538,7 +539,8 @@ struct FileMergeResult {
 // (addr_files.h, the address points and their footprints' logical blobs), POI
 // files (R2 and V2, poi_files.h), place files (place_files.h, their logical
 // stream as place_nodes.bin), postcode centroid files (postcode_files.h,
-// their logical stream as postcode_centroids.bin) and side files
+// their logical stream as postcode_centroids.bin), the postcode grid
+// (postcode_grid.h, its runs as postcode_grid.bin) and side files
 // (side_blocks.h, each its u32 values) are decoded at the start into a
 // scratch dir of their own, which merge_path reads them from.
 static std::map<std::string, std::string>& logical_dirs() {
@@ -761,6 +763,33 @@ static uint64_t postcode_logical_size(const LogicalFamily&, const std::string& d
     unmap_file(m);
     return postcode_files::logical_size(f);
 }
+// Decodes dir's postcode grid into to's postcode_grid.bin, its logical
+// stream; false: dir has none.
+static bool decode_grid_file(const LogicalFamily&, const std::string& dir, const std::string& to) {
+    const std::string path = dir + "/" + postcode_grid::FILE_NAME;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return false;
+    const std::vector<char> file = read_file(path);
+    if (file.size() != static_cast<uint64_t>(st.st_size)) throw std::runtime_error("Cannot read " + path);
+    logical_decode::ScratchFile o(to + "/" + postcode_grid::FILE_NAME);
+    postcode_grid::decode(reinterpret_cast<const uint8_t*>(file.data()), file.size(),
+                          [&](const postcode_grid::LogicalRow& r) { o.write(&r, postcode_grid::LOGICAL_STRIDE); });
+    if (!o.flush()) throw std::runtime_error("Cannot write the decoded postcode grid of " + dir);
+    return true;
+}
+// The bytes decode_grid_file writes for dir, from postcode_grid.bin's footer
+// alone; 0 without the file.
+static uint64_t grid_logical_size(const LogicalFamily&, const std::string& dir) {
+    const std::string path = dir + "/" + postcode_grid::FILE_NAME;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return 0;
+    MappedFile m = mmap_file(path);
+    if (static_cast<uint64_t>(st.st_size) != m.size) throw std::runtime_error("Cannot read " + path);
+    const postcode_grid::Footer f = postcode_grid::read_footer(
+        reinterpret_cast<const uint8_t*>(m.data) + m.size - std::min<size_t>(m.size, postcode_grid::FOOTER_BYTES), m.size);
+    unmap_file(m);
+    return postcode_grid::logical_size(f);
+}
 // Decodes dir's side file, the family's one file, into its values in to;
 // false: dir has no such file.
 static bool decode_side_file(const LogicalFamily& family, const std::string& dir, const std::string& to) {
@@ -811,6 +840,7 @@ static const std::vector<LogicalFamily>& logical_families() {
          {postcode_files::CENTROIDS_FILE, postcode_files::CELLS_FILE},
          decode_postcode_files,
          postcode_logical_size},
+        {"grid", {postcode_grid::FILE_NAME}, {postcode_grid::FILE_NAME}, decode_grid_file, grid_logical_size},
         {"way_parents", {"way_parents.bin"}, {"way_parents.bin"}, decode_side_file, side_logical_size},
         {"way_postcodes", {"way_postcodes.bin"}, {"way_postcodes.bin"}, decode_side_file, side_logical_size},
         {"interp_postcodes", {"interp_postcodes.bin"}, {"interp_postcodes.bin"}, decode_side_file, side_logical_size},
@@ -1238,6 +1268,7 @@ static constexpr MergedFile MERGED_FILES[] = {
     {PatchFileId::POI_VERTICES, 1},
     {PatchFileId::PLACE_NODES, PLACE_NODE_STRIDE},
     {PatchFileId::POSTCODE_CENTROIDS, POSTCODE_CENTROID_STRIDE},
+    {PatchFileId::POSTCODE_GRID, POSTCODE_GRID_STRIDE},
     {PatchFileId::ARC_INDEX, ARC_INDEX_STRIDE},
     {PatchFileId::ARC_VERTICES, 1},
     {PatchFileId::ADMIN_POLYGONS, ADMIN_POLYGON_STRIDE},
@@ -1514,7 +1545,7 @@ static int run(int argc, char* argv[]) {
     // Group 2: street_ways → street_nodes (sequential within group)
     // Group 3: interp_ways → interp_nodes (sequential within group)
     FileMergeResult res_addr, res_addr_v, res_ways, res_nodes, res_interp_w, res_interp_n, res_poi_r, res_poi_v, res_place_n,
-        res_postcodes;
+        res_postcodes, res_grid;
 
     // Byte-block merge for the v15 variable-stride vertex stream
     // (poi_vertices / addr_vertices). The vertex bytes for polygon i live
@@ -2037,6 +2068,35 @@ static int run(int argc, char* argv[]) {
         log_rss("postcode");
     });
 
+    // Group 6c: the postcode grid (no child files, a fixed-stride merge, no
+    // string field)
+    std::thread t_grid([&]() {
+        double gs = now_ms();
+        const size_t grid_stride = POSTCODE_GRID_STRIDE;
+        // The grid's logical streams (decode_grid_file).
+        auto old_data = mmap_file(merge_path(old_dir, postcode_grid::FILE_NAME));
+        auto new_data = mmap_file(merge_path(new_dir, postcode_grid::FILE_NAME));
+        if (new_data.size == 0 && old_data.size == 0) {
+            res_grid = {PatchFileId::POSTCODE_GRID, postcode_grid::FILE_NAME, grid_stride, 0, 0, MergeSequence{}, {}};
+            log_time("  group:grid (empty)", gs);
+            return;
+        }
+        // A merge of the runs walked by their first cells, which ascend on
+        // both days (build_keyed_merge_seq): a day's new run is an INSERT
+        // among MATCH runs, one whose postcode or first cell moved a DELETE
+        // and an INSERT, however many new runs come before a kept one. No id
+        // remap: no file the patch rebuilds holds a run's row.
+        const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
+        auto seq = unchanged ? match_all(old_data.size / grid_stride)
+                             : build_keyed_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, grid_stride);
+        res_grid = {PatchFileId::POSTCODE_GRID, postcode_grid::FILE_NAME, grid_stride, old_data.size, new_data.size, seq, {}};
+        log_merge(res_grid);
+        if (old_data.data) unmap_file(old_data);
+        if (new_data.data) unmap_file(new_data);
+        log_time("  group:grid", gs);
+        log_rss("grid");
+    });
+
     // Group 7: the admin geometry by slot, each family's slots (arc_index,
     // admin_polygons) and then its blocks (arc_vertices, admin_rings) along
     // them. A slot on both days is its old record (slot_family), its block
@@ -2092,7 +2152,7 @@ static int run(int argc, char* argv[]) {
         log_rss("admin");
     });
 
-    t_addr.join(); t_street.join(); t_interp.join(); t_poi.join(); t_place.join(); t_postcode.join(); t_cells.join(); t_admin.join();
+    t_addr.join(); t_street.join(); t_interp.join(); t_poi.join(); t_place.join(); t_postcode.join(); t_grid.join(); t_cells.join(); t_admin.join();
     log_time("All merge sequences + cell changes built", merge_start);
     // str_remap is kept alive for emit_sparse_delta below — it consumes
     // the map directly to decide which addr_postcodes / way_postcodes
@@ -2167,6 +2227,11 @@ static int run(int argc, char* argv[]) {
     { std::vector<char>().swap(res_poi_v.seq.data); }
     serialize_merge(patch, res_place_n, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     serialize_merge(patch, res_postcodes, old_dir, new_dir, patcher_strings, offset_fixup_limits);
+    // The hash of the old postcode_grid.bin, before its section: a day that
+    // changes no run sends the grid unchanged, and the patcher copies the old
+    // file as it sits, held to the hash.
+    if (res_grid.old_size) append_old_file_hash(patch, old_dir, PatchFileId::POSTCODE_GRID);
+    serialize_merge(patch, res_grid, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     // The admin geometry, ahead of the admin cells: arc_index, arc_vertices,
     // admin_polygons, admin_rings. A file the new dir lacks gets no section,
     // as it got no full replacement (emit_raw): the patch lists no such
@@ -2266,7 +2331,8 @@ static int run(int argc, char* argv[]) {
     // Free merge sequences (already serialized to patch)
     { std::vector<char>().swap(res_nodes.seq.data); std::vector<char>().swap(res_interp_n.seq.data);
       std::vector<char>().swap(res_poi_r.seq.data); std::vector<char>().swap(res_poi_v.seq.data);
-      std::vector<char>().swap(res_place_n.seq.data); std::vector<char>().swap(res_postcodes.seq.data); }
+      std::vector<char>().swap(res_place_n.seq.data); std::vector<char>().swap(res_postcodes.seq.data);
+      std::vector<char>().swap(res_grid.seq.data); }
 
     {
         const GeoIndexMap old_geo(old_dir), new_geo(new_dir);

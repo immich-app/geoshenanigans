@@ -2,7 +2,7 @@
   "schema_version": 1,
   "build": {
     "version": 24,
-    "patch_version": 19
+    "patch_version": 20
   },
   "attribution": [
     {
@@ -68,7 +68,9 @@
       "applies_to": [
         "mode.full",
         "mode.no-addresses",
-        "mode.admin"
+        "mode.admin",
+        "dir.admin-minimal",
+        "dir.admin-minimal-poi"
       ]
     },
     {
@@ -168,7 +170,7 @@
         },
         "admin-minimal": {
           "label": "Admin minimal",
-          "description": "Admin boundaries (within 37.5 m, on an 11 m grid) + place nodes only — no postcodes, no postcode areas. Smallest possible deployable. Country/state/city + cities500-equivalent place names.",
+          "description": "Admin boundaries (within 37.5 m, on an 11 m grid) + place nodes + US postcodes from the postcode grid — no other postcodes, no postcode areas. Smallest possible deployable. Country/state/city + cities500-equivalent place names.",
           "order": 4
         }
       }
@@ -292,6 +294,9 @@
         "{region}/admin-minimal/strings_layout.json",
         "{region}/admin-minimal/attribution.json"
       ],
+      "optional_files": [
+        "{region}/admin-minimal/postcode_grid.bin"
+      ],
       "replaces": [
         "{region}/quality/{quality}/admin_polygons.bin",
         "{region}/quality/{quality}/admin_rings.bin",
@@ -315,6 +320,9 @@
         "{region}/admin-minimal-poi/strings_layout.json",
         "{region}/admin-minimal-poi/attribution.json"
       ],
+      "optional_files": [
+        "{region}/admin-minimal-poi/postcode_grid.bin"
+      ],
       "replaces": [
         "{region}/quality/{quality}/admin_polygons.bin",
         "{region}/quality/{quality}/admin_rings.bin",
@@ -336,7 +344,8 @@
       ],
       "optional_files": [
         "{region}/admin/postcode_centroids.bin",
-        "{region}/admin/postcode_centroid_cells.bin"
+        "{region}/admin/postcode_centroid_cells.bin",
+        "{region}/admin/postcode_grid.bin"
       ]
     },
     "mode.no-addresses": {
@@ -361,7 +370,8 @@
       ],
       "optional_files": [
         "{region}/no-addresses/postcode_centroids.bin",
-        "{region}/no-addresses/postcode_centroid_cells.bin"
+        "{region}/no-addresses/postcode_centroid_cells.bin",
+        "{region}/no-addresses/postcode_grid.bin"
       ]
     },
     "mode.full": {
@@ -394,7 +404,8 @@
       "optional_files": [
         "{region}/full/interp_postcodes.bin",
         "{region}/full/postcode_centroids.bin",
-        "{region}/full/postcode_centroid_cells.bin"
+        "{region}/full/postcode_centroid_cells.bin",
+        "{region}/full/postcode_grid.bin"
       ]
     },
     "quality.simplified": {

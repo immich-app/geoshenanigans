@@ -3,7 +3,8 @@
 // output (open_out hands back a FILE* whose bytes go to the family's encoder). A family (the
 // street and the interpolation ways, way_files.h; the address files, addr_files.h; the POI
 // files, R2 and V2: poi_files.h; the place files, place_files.h; the postcode centroid files,
-// postcode_files.h; each of the four side files, side_blocks.h) is encoded in every dir under
+// postcode_files.h; the postcode grid, postcode_grid.h; each of the four side files,
+// side_blocks.h) is encoded in every dir under
 // today's names, the place files' logical stream as place_nodes.bin and the postcode
 // centroids' as postcode_centroids.bin. No today's-format file of an encoded family touches the
 // disk. A family a patch leaves unchanged goes through neither: the patcher copies its files
@@ -82,6 +83,10 @@ static const std::vector<FamilyDesc>& families() {
          [](const std::string& dir) -> Decoder* { return new postcodes::Dec(dir); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new postcodes::Enc(dir); },
          [](const std::string& dir, int) { return postcodes::decoded_size(dir); }},
+        {"grid", {postcode_grid::FILE_NAME}, {},
+         [](const std::string& dir) -> Decoder* { return new grid::Dec(dir); },
+         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new grid::Enc(dir); },
+         [](const std::string& dir, int) { return grid::decoded_size(dir); }},
     };
     return f;
 }

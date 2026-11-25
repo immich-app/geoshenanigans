@@ -136,9 +136,10 @@ fn every_row_reads_back_one_cell_at_a_time() {
     }
 }
 
-/// Nine cells at a time, in any order, as a query asks for its cell and its neighbours: some in
-/// one block, some in blocks apart, some twice, some without rows. Each gets what a lookup of it
-/// alone gets.
+/// One to 128 cells at a time, in any order, as a query asks for the cells round its point (some
+/// 30 at the street level): some in one block, some in blocks apart, some twice, some without
+/// rows, a batch longer or shorter than the one before into the same lists. Each gets what a
+/// lookup of it alone gets.
 #[test]
 fn the_batched_lookup_gets_what_one_cell_at_a_time_gets() {
     let mut rng = Rng::new(7);
@@ -149,8 +150,9 @@ fn the_batched_lookup_gets_what_one_cell_at_a_time_gets() {
         let all = probes(&mut rng, &rows, level);
         for _ in 0..3000 {
             let start = (rng.next() % all.len() as u64) as usize;
-            let mut cells: Vec<u64> = (0..9).map(|k| all[(start + k * (1 + (rng.next() % 3) as usize)) % all.len()]).collect();
-            if rng.next() % 4 == 0 {
+            let length = [1, 9, 32, 128][(rng.next() % 4) as usize];
+            let mut cells: Vec<u64> = (0..length).map(|k| all[(start + k * (1 + (rng.next() % 3) as usize)) % all.len()]).collect();
+            if length > 3 && rng.next() % 4 == 0 {
                 cells[3] = cells[0];
             }
             if rng.next() % 4 == 0 {

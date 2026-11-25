@@ -21,8 +21,8 @@ enum AttributionSource : uint8_t {
     // Postcode centroids where OSM has none (--external-postcodes), of
     // GeoNames's postal code files.
     ATTRIBUTION_GEONAMES = 1 << 1,
-    // US address ranges, their ZIPs, and postcode centroids where OSM has
-    // none (--tiger-data).
+    // US address ranges, their ZIPs, postcode centroids where OSM has none,
+    // and the postcode grid's votes of the ranges' ZIPs (--tiger-data).
     ATTRIBUTION_TIGER = 1 << 2,
     // The sitelink counts of the POIs' Wikidata items, which their
     // importance takes (--wikidata-sitelinks).
