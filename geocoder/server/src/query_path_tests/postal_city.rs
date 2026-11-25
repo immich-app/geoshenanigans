@@ -126,6 +126,50 @@ fn a_tiger_lines_zip_names_its_postal_city() {
     assert_eq!(address["postal_city"], "Newtown Square");
 }
 
+/// `index` with one POI, a rectangle (`s`, `w`, `n`, `e` in metres from `origin`) named `name_id`
+/// of the parent street named `street_id`, whose stored postcode (parent_postcode_id, its postal
+/// boundary's at build time) is `postcode_id`, strings of the index's; the admin cell of its
+/// middle lists it.
+fn with_postcoded_poi(mut index: Index, origin: (f64, f64), name_id: u32, street_id: u32, postcode_id: u32,
+                      (s, w, n, e): Span) -> Index {
+    let (low, middle) = (at_from(origin, s, w), at_from(origin, (s + n) / 2.0, (w + e) / 2.0));
+    let steps = |v: f32, from: f32| ((v as f64 - from as f64) / 1e-7).round() as u32;
+    let corners = [at_from(origin, s, w), at_from(origin, s, e), at_from(origin, n, e), at_from(origin, n, w)];
+    let polygon = poi_files::PoiPolygon {
+        encoding: 3, bmin_lat: low.lat, bmin_lng: low.lng,
+        q: corners.iter().map(|c| (steps(c.lat, low.lat), steps(c.lng, low.lng))).collect(),
+    };
+    let record = PoiRecord {
+        lat: middle.lat, lng: middle.lng, vertex_offset: 0, name_id, category: 1, tier: 0, flags: 0, importance: 0,
+        parent_street_id: street_id, parent_postcode_id: postcode_id, parent_poly_id: NO_DATA,
+    };
+    let (records, vertices) = poi_files::encode(&[(record, Some(polygon))]);
+    let cell = cell_id_at_level(middle.lat as f64, middle.lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
+    index.poi_index = Some(cell_pairs::from_pairs([(cell, 0)], cell_pairs::POI));
+    index.poi_records = Some(PoiRecords::open(FileBytes::Owned(records)).unwrap());
+    index.poi_vertices = Some(FileBytes::Owned(vertices));
+    index
+}
+
+#[test]
+fn a_pois_stored_zip_names_its_postal_city() {
+    // A town hall round the point, of Mill Lane, where the grid's cell of the point is 19026's.
+    // With its stored postcode, 19073, the answer is the POI's, of that ZIP and its postal city;
+    // without one it takes the grid's, and that ZIP's postal city.
+    for (stored, postcode, city) in [(true, "19073", "Newtown Square"), (false, "19026", "Drexel Hill")] {
+        let mut dataset = country_at(DREXEL_HILL, b"US");
+        delaware_county(&mut dataset);
+        grid_over(&mut dataset, DREXEL_HILL, 0.0, 0.0, "19026");
+        let (hall, lane, zip) = (dataset.string("Town Hall"), dataset.string("Mill Lane"), dataset.string("19073"));
+        let index = with_postcoded_poi(dataset.load(), DREXEL_HILL, hall, lane, if stored { zip } else { NO_DATA },
+                                       (-20.0, -30.0, 20.0, 30.0));
+        let address = address_from(&index, DREXEL_HILL, 0.0, 0.0);
+        assert_eq!(address["road"], "Mill Lane", "{address}");
+        assert_eq!(address["postcode"], postcode, "{address}");
+        assert_eq!(address["postal_city"], city, "{address}");
+    }
+}
+
 #[test]
 fn a_zip_of_no_row_and_a_postcode_of_no_zip_name_no_postal_city() {
     // 19099 has no row.
