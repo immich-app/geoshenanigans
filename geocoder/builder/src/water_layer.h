@@ -388,7 +388,7 @@ void write_water_exact(const Layer& layer, const std::string& dir);
 
 // attribution.json of a water dir, with Marine Regions' entry when it holds
 // a marine area: a JSON array of the entries as configurations.template.json's
-// attribution list gives them, without their applies_to.
+// attribution list gives them, without their applies_to (attribution.h).
 std::string attribution_json(bool marine);
 
 }  // namespace water

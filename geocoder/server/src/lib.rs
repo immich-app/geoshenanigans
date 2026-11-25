@@ -550,6 +550,9 @@ pub fn poi_category_to_osm_class(cat: u8) -> Option<&'static str> {
         142..=152 => Some("landuse"),
         // office=government
         160 => Some("office"),
+        // leisure=swimming_area, emergency=fire_water_pond
+        161 => Some("leisure"),
+        162 => Some("emergency"),
         // Small-amenity sub-categories (171..=179) — toilets, clock…
         171..=179 => Some("amenity"),
         // Food / civic / health / finance / mail / transport extras
@@ -1137,6 +1140,9 @@ pub struct Index {
     pub street_cell_level: u64,
     pub admin_cell_level: u64,
     pub max_distance_sq: f64,
+    /// The credit of the data in the dir as it loaded (dir_credits): a download may replace the
+    /// dir's files later, while this index answers from those it mapped.
+    pub credits: Vec<serde_json::Value>,
 }
 
 /// Normalised street-name token overlap, mirroring the builder's
@@ -1474,6 +1480,7 @@ impl Index {
             street_cell_level,
             admin_cell_level,
             max_distance_sq,
+            credits: dir_credits(dir),
         })
     }
 
@@ -2403,7 +2410,7 @@ impl Index {
     pub fn is_area_label_category(cat: u8) -> bool {
         matches!(cat,
             // natural: large polygons
-            80 | 81 | 82 | 86 | 91 | 92 | 93 | // peak, volcano, beach, glacier, bay, cape, island
+            80 | 81 | 82 | 92 | 93 | // peak, volcano, beach, cape, island
             // boundary/leisure: parks, reserves
             60 | 61 | 62 | 63 | 64 | 65 | // park, nature_reserve, stadium, garden, water_park, golf_course
             130 | 131 | // national_park, protected_area
@@ -2417,6 +2424,44 @@ impl Index {
             100 | // aerodrome
             150   // power_plant
         )
+    }
+
+    // Water kinds, which never take the primary slot, so never set `road`
+    // or `postcode`. Nominatim's POI lane takes rank_search 30 alone
+    // (reverse.py _find_closest_street_or_pois), and it ranks
+    // natural=water, wetland, bay and glacier 22 ("natural": {"": [22, 0]})
+    // and landuse=reservoir|basin on an area 24 ("landuse": {"": [24, 0]},
+    // settings/address-levels.json), while a landuse node ranks 30
+    // (lib-sql/functions/ranking.sql compute_place_rank): a point RESERVOIR
+    // stays in the lane. A water object that also carries a POI main tag is
+    // a rank-30 POI there, and the builder classifies it by that tag
+    // (poi_classify.h), so it stays too.
+    pub fn is_below_poi_rank(cat: u8, polygon: bool) -> bool {
+        match cat {
+            86 | 91 | 97 | 99 => true, // glacier, bay, wetland, natural_water
+            148 => polygon,            // reservoir
+            _ => false,
+        }
+    }
+
+    // Whether `poi` is a water street: a water area of the highway flag, which
+    // a highway kind of rank 26 or 27 ranks (the builder flags it only there,
+    // poi_classify.h poi_water_street). Nominatim imports it as one placex row
+    // of class highway, its polygon the geometry and rank_address 26 or 27
+    // (init.lua process_tags, ranking.sql compute_place_rank), which its
+    // street lane, of address ranks 26 to 29, finds by the distance to that
+    // polygon, 0 inside (reverse.py _find_closest_street_or_pois), and which
+    // answers by its own name as a street does, of no parent street
+    // (placex_update parents rank_search > 27 alone): it competes as one,
+    // wherever it wins, linked to a parent street or not.
+    pub fn is_water_street(poi: &PoiRecord) -> bool {
+        poi.is_polygon() && poi.flags & POI_FLAG_HIGHWAY != 0 && Self::is_below_poi_rank(poi.category, true)
+    }
+
+    // Whether `poi` stays out of the primary slot: a water kind below the
+    // POI rank, but a water street (is_water_street).
+    pub fn is_out_of_the_primary_lanes(poi: &PoiRecord) -> bool {
+        Self::is_below_poi_rank(poi.category, poi.is_polygon()) && !Self::is_water_street(poi)
     }
 
     // Chain-containment check for a POI primary candidate.
@@ -2440,8 +2485,9 @@ impl Index {
 
     // --- POI primary-feature lookup ---
     //
-    // Returns the nearest POI with a valid parent_street_id to the
-    // query point. Used by query() as an additional primary-feature
+    // Returns the nearest POI with a valid parent_street_id, or water
+    // street (is_water_street), to the query point. Used by query() as an
+    // additional primary-feature
     // candidate alongside the raw address / interpolation / street
     // lookups — mirrors Nominatim's _find_closest_street_or_pois
     // which returns the closest rank-26+ feature regardless of
@@ -2451,6 +2497,17 @@ impl Index {
     // the polygon, otherwise the distance to the nearest edge. None for
     // a point off the globe (see find_pois).
     pub fn find_nearest_poi_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, PoiRecord)> {
+        self.nearest_linked_poi(lat, lng, false)
+    }
+
+    /// The POI find_nearest_poi_with_parent would find if the primary lanes took the water they
+    /// leave out (is_out_of_the_primary_lanes) too. A glacier or bay labels an area there, as an
+    /// island does: it wins only where no specific POI is found, however far.
+    pub fn find_nearest_poi_or_water_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, PoiRecord)> {
+        self.nearest_linked_poi(lat, lng, true)
+    }
+
+    fn nearest_linked_poi(&self, lat: f64, lng: f64, water: bool) -> Option<(f64, PoiRecord)> {
         let poi_index = self.poi_index.as_ref()?;
         if self.poi_records.is_none() || !coords_in_range(lat, lng) { return None; }
 
@@ -2461,7 +2518,7 @@ impl Index {
         let mut best_dist_sq = f64::MAX;
         let mut best_idx: Option<u32> = None;
         // Fallback tier: the closest area-label POI (national park,
-        // island, bay, campus). Only wins primary if no specific
+        // island, cape, campus). Only wins primary if no specific
         // POI qualifies — so "middle of Yosemite with no roads" can
         // surface the park, while urban queries never get "Manhattan
         // Island" as the primary feature.
@@ -2483,8 +2540,10 @@ impl Index {
                 let Some(poi) = self.poi_record(poi_id) else { return; };
                 // Need a linked parent street (for the `road` field)
                 // when this POI wins — without it we have nothing to
-                // surface as the road name.
-                if poi.parent_street_id == NO_DATA {
+                // surface as the road name; a water street's own name is
+                // its road.
+                if (poi.parent_street_id == NO_DATA && !Self::is_water_street(&poi))
+                    || (!water && Self::is_out_of_the_primary_lanes(&poi)) {
                     return;
                 }
 
@@ -2517,8 +2576,10 @@ impl Index {
                     dist_sq_val = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
                 }
 
-                if Self::is_area_label_category(poi.category) {
-                    // Split lane: area labels (islands, parks, bays,
+                // Glaciers and bays (86, 91) label an area too where
+                // the lanes take water.
+                if Self::is_area_label_category(poi.category) || (water && matches!(poi.category, 86 | 91)) {
+                    // Split lane: area labels (islands, parks, capes,
                     // campuses) only win primary when nothing more
                     // specific competes. Track them separately so a
                     // "middle-of-nowhere in Yosemite" query still has
@@ -3418,7 +3479,10 @@ impl Index {
         // We implement the real containment check: if the nearest
         // containing POI has a polygon and the nearest addr_point is a
         // node (no footprint) that point_in_polygon reports as
-        // inside, demote the POI so the node wins.
+        // inside, demote the POI so the node wins. A water street
+        // (is_water_street), of rank_search 26 or 27, takes no such node
+        // in its place: a street that wins refines to a house number it is
+        // the parent of alone (reverse.py lookup_street_poi).
         let mut effective_poi_dist = poi_dist;
         if poi_dist == 0.0 {
             if let (Some((_, addr_pt, _)), Some((_, poi))) = (addr.as_ref(), poi_primary.as_ref()) {
@@ -3429,7 +3493,7 @@ impl Index {
                 // (housenumber, street) drive the result.
                 if addr_dist == 0.0 {
                     effective_poi_dist = f64::MAX;
-                } else if !addr_pt.is_building() && poi.is_polygon() {
+                } else if !addr_pt.is_building() && poi.is_polygon() && !Self::is_water_street(poi) {
                     let mut inside = false;
                     if let Some(verts) = self.poi_verts(&poi) {
                         inside = point_in_polygon(addr_pt.lat, addr_pt.lng, &verts);
@@ -3479,6 +3543,8 @@ impl Index {
         // they typically lack parent_postcode and would drop the
         // address' postcode when they win — Moscow 109012 regressed
         // to '—' when the tier-1 boost applied to a point attraction.
+        // A water street is a street, which competes by its distance
+        // alone.
         let tier1_bonus_sq: f64 = {
             let r = 50.0_f64 / 6_371_000.0_f64;
             r * r
@@ -3486,6 +3552,7 @@ impl Index {
         let compare_poi_dist = match poi_primary.as_ref() {
             Some((_, poi)) if poi.tier == 1
                 && poi.is_polygon()
+                && !Self::is_water_street(poi)
                 && effective_poi_dist < max_dist => {
                 if effective_poi_dist > tier1_bonus_sq {
                     effective_poi_dist - tier1_bonus_sq
@@ -3522,10 +3589,11 @@ impl Index {
                 // POI_FLAG_HIGHWAY is set by the builder for highway-
                 // class polygons; without the flag we default to
                 // parent_street even when the polygon contains the
-                // query, matching nominatim's rank-30 chain walk.
+                // query, matching nominatim's rank-30 chain walk. A
+                // water street is a street wherever it wins.
                 let (_, poi) = poi_primary.unwrap();
                 let is_highway_poi = (poi.flags & POI_FLAG_HIGHWAY) != 0;
-                let use_poi_name = is_highway_poi && poi.is_polygon() && poi_dist == 0.0;
+                let use_poi_name = Self::is_water_street(&poi) || (is_highway_poi && poi.is_polygon() && poi_dist == 0.0);
                 if use_poi_name {
                     road = Some(self.get_string(poi.name_id));
                 } else if poi.parent_street_id != NO_DATA {
@@ -3584,13 +3652,14 @@ impl Index {
         // (results.py _get_address_lookup_id). That is the street that won,
         // the address point's parent way, or for a POI the nearest street
         // when it carries the POI's parent street name (POIs keep only the
-        // name). Without one, the query point stands in.
+        // name). Without one, the query point stands in, as it does for a
+        // water street, whose address is its own (rank_search <= 27).
         let address_street: Option<u32> = if closest_feature_dist >= max_dist {
             None
         } else if poi_won_primary {
             let (_, poi) = poi_primary.unwrap();
             street.as_ref().filter(|(_, w, _)| {
-                poi.parent_street_id != NO_DATA && w.name != NO_DATA
+                !Self::is_water_street(&poi) && poi.parent_street_id != NO_DATA && w.name != NO_DATA
                     && self.get_string(w.name) == self.get_string(poi.parent_street_id)
             }).map(|(_, _, id)| *id)
         } else if addr_won_primary {
@@ -3658,9 +3727,25 @@ impl Index {
         // country polygon misses.
         let anchored = road.is_some() || admin.country.is_some() || admin.city.is_some() || admin.state.is_some();
         let place_nodes_only = admin.is_empty() && !place.is_empty();
-        if !anchored && !place_nodes_only {
+        // Water the primary lanes leave out gives no road nor postcode, but a
+        // point where it would win the slot keeps its landmark and `places`
+        // where nothing else anchors the address (a glacier on a coast no
+        // boundary holds): where it is the POI the lanes would find if they
+        // took it too, within reach of the slot as poi_primary is. A glacier
+        // or bay is an area label there: a specific POI found near takes the
+        // lane from it, and one too far for the slot leaves the point nothing.
+        let water_holds = || {
+            self.find_nearest_poi_or_water_with_parent(lat, lng)
+                .filter(|(d, p)| {
+                    Self::is_out_of_the_primary_lanes(p) && *d <= poi_max_sq && self.poi_chain_contains_query(p, lat, lng)
+                })
+                .is_some()
+        };
+        if !anchored && !place_nodes_only && !water_holds() {
             return Address::default();
         }
+        // Nor does the nearest postcode centroid give one where water alone holds the point.
+        let resolved_postcode = resolved_postcode.filter(|_| anchored || place_nodes_only);
 
         let (landmark_name, places) = self.collect_landmark_and_places(lat, lng);
 
@@ -3791,7 +3876,7 @@ impl Index {
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
         };
         let display_name = format_address(&address);
-        Address { display_name, address, places }
+        Address { licence: Licence, display_name, address, places }
     }
 }
 
@@ -4127,6 +4212,29 @@ impl MultiIndex {
         self.continents.iter().filter(|c| c.index.load().is_some()).count()
     }
 
+    /// The credit of the data the loaded datasets hold (Index::credits, as each loaded), each
+    /// source once, in the order the datasets list them, of every notice any of them gives it
+    /// (a dataset of GB centroids owes GeoNames a notice others don't); none where none is
+    /// loaded.
+    pub fn credits(&self) -> Vec<serde_json::Value> {
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for index in self.continents.iter().filter_map(|c| c.index.load_full()) {
+            for entry in &index.credits {
+                let Some(seen) = out.iter_mut().find(|e| e["id"] == entry["id"]) else {
+                    out.push(entry.clone());
+                    continue;
+                };
+                let Some(have) = seen.get_mut("notices").and_then(serde_json::Value::as_array_mut) else { continue };
+                for notice in entry["notices"].as_array().into_iter().flatten() {
+                    if !have.contains(notice) {
+                        have.push(notice.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// A point off the globe is in no slot: S2 would wrap it onto a cell of the globe.
     fn covers(&self, slot: &ContinentSlot, lat: f64, lng: f64) -> bool {
         coords_in_range(lat, lng) && slot.continent.map_or(true, |c| c.covers_query(lat, lng, self.admin_cell_level))
@@ -4395,6 +4503,7 @@ mod query_tests {
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
             admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
             max_distance_sq: (DEFAULT_SEARCH_DISTANCE / 6_371_000.0).powi(2),
+            credits: Vec::new(),
         }
     }
 
@@ -4432,7 +4541,7 @@ mod query_tests {
     fn a_boundary_without_a_country_city_or_state_has_no_answer() {
         let idx = index(&[SHOALS], &[SHOALS_VILLAGE]);
 
-        assert_eq!(answer(&idx, 5.05, 112.65), serde_json::json!({"address": {}}));
+        assert_eq!(answer(&idx, 5.05, 112.65), serde_json::json!({"licence": OSM_LICENCE, "address": {}}));
     }
 
     #[test]
@@ -4440,7 +4549,7 @@ mod query_tests {
         let idx = index(&[SHOALS], &[MCMURDO]);
 
         for (lat, lng) in [(-82.0, 60.0), (5.2, 112.65)] {
-            assert_eq!(answer(&idx, lat, lng), serde_json::json!({"address": {}}), "({}, {})", lat, lng);
+            assert_eq!(answer(&idx, lat, lng), serde_json::json!({"licence": OSM_LICENCE, "address": {}}), "({}, {})", lat, lng);
         }
     }
 
@@ -5920,8 +6029,99 @@ pub struct PoiDetail {
     pub distance_m: f64,
 }
 
+/// The licence of every answer, Nominatim's (src/nominatim_api/v1/
+/// classtypes.py OSM_ATTRIBUTION): its json and jsonv2 results carry it
+/// first after their place_id (v1/format_json.py format_base_json), and
+/// these answers have no place_id.
+pub const OSM_LICENCE: &str = "Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright";
+
+/// An answer's `licence`, OSM_LICENCE.
+#[derive(Clone, Copy, Default)]
+pub struct Licence;
+
+impl Serialize for Licence {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(OSM_LICENCE)
+    }
+}
+
+/// OpenStreetMap's entry of the builder's credits (builder/src/attribution.h kAttribution), the
+/// credit of a dataset whose dir holds no attribution.json.
+pub fn osm_credit() -> serde_json::Value {
+    serde_json::json!({
+        "id": "osm",
+        "text": "© OpenStreetMap contributors",
+        "url": "https://www.openstreetmap.org/copyright",
+        "licence": "ODbL 1.0",
+        "licence_url": "https://opendatacommons.org/licenses/odbl/1-0/",
+        "notices": ["This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0."],
+    })
+}
+
+/// The credit of the data in dataset dir `dir`: the entries of its attribution.json and
+/// poi_attribution.json, as the builder writes them; OpenStreetMap's alone in place of an
+/// attribution.json the dir holds none of, or one that is no list.
+pub fn dir_credits(dir: &str) -> Vec<serde_json::Value> {
+    let read = |name: &str| -> Option<Vec<serde_json::Value>> {
+        serde_json::from_str(&std::fs::read_to_string(format!("{dir}/{name}")).ok()?).ok()
+    };
+    let mut credits = read("attribution.json").unwrap_or_else(|| vec![osm_credit()]);
+    credits.extend(read("poi_attribution.json").unwrap_or_default());
+    credits
+}
+
+/// `credits` as query-server's /test/credits gives them (main.rs): a disclosure whose summary
+/// names each source, and a paragraph of each, its text linked to its URL and its licence to the
+/// licence's, then its notices, all as text. A URL of no http(s) scheme links nothing. No
+/// credits, no disclosure.
+pub fn credits_html(credits: &[serde_json::Value]) -> String {
+    fn escape(s: &str) -> String {
+        s.chars().fold(String::with_capacity(s.len()), |mut out, c| {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&#39;"),
+                _ => out.push(c),
+            }
+            out
+        })
+    }
+    fn link(url: &str, label: &str) -> String {
+        if url.starts_with("https://") || url.starts_with("http://") {
+            format!(r#"<a href="{}" target="_blank" rel="noopener">{}</a>"#, escape(url), escape(label))
+        } else {
+            escape(label)
+        }
+    }
+    if credits.is_empty() {
+        return String::new();
+    }
+    let field = |e: &serde_json::Value, key: &str| e[key].as_str().unwrap_or("").to_owned();
+    let names: Vec<String> = credits.iter().map(|e| escape(&field(e, "text"))).collect();
+    let mut out = format!("<details><summary>Data: {}</summary>\n", names.join(", "));
+    for e in credits {
+        out += "<p>";
+        out += &link(&field(e, "url"), &field(e, "text"));
+        let licence = field(e, "licence");
+        if !licence.is_empty() {
+            out += ", ";
+            out += &link(&field(e, "licence_url"), &licence);
+        }
+        out += ".";
+        for notice in e["notices"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) {
+            out += " ";
+            out += &escape(notice);
+        }
+        out += "</p>\n";
+    }
+    out + "</details>\n"
+}
+
 #[derive(Serialize, Default)]
 pub struct Address<'a> {
+    pub licence: Licence,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub address: AddressDetails<'a>,
@@ -6418,6 +6618,8 @@ mod pure_helper_tests {
         // arm precedes the 142..=152 landuse band.
         assert_eq!(poi_category_to_osm_class(150), None);
         assert_eq!(poi_category_to_osm_class(160), Some("office"));
+        assert_eq!(poi_category_to_osm_class(161), Some("leisure"));
+        assert_eq!(poi_category_to_osm_class(162), Some("emergency"));
         // NOTE: GENERIC_RANK30=170 -> None (generic filler).
         assert_eq!(poi_category_to_osm_class(170), None);
         assert_eq!(poi_category_to_osm_class(171), Some("amenity"));
@@ -6435,12 +6637,13 @@ mod pure_helper_tests {
     #[test]
     fn is_area_label_category_snapshot() {
         // A representative sample of the matched set.
-        for cat in [80u8, 81, 82, 86, 91, 92, 93, 60, 61, 62, 63, 64, 65,
+        for cat in [80u8, 81, 82, 92, 93, 60, 61, 62, 63, 64, 65,
                     130, 131, 41, 42, 43, 47, 51, 54, 3, 4, 9, 11, 25, 100, 150] {
             assert!(Index::is_area_label_category(cat), "expected {cat} to be an area label");
         }
-        // A representative sample of non-matches.
-        for cat in [0u8, 1, 2, 5, 40, 44, 50, 66, 70, 90, 120, 170, 200, 255] {
+        // A representative sample of non-matches. Bays (91) and glaciers (86) never take the
+        // primary slot at all.
+        for cat in [0u8, 1, 2, 5, 40, 44, 50, 66, 70, 86, 90, 91, 120, 170, 200, 255] {
             assert!(!Index::is_area_label_category(cat), "expected {cat} to NOT be an area label");
         }
     }
@@ -7815,6 +8018,182 @@ mod query_path_tests {
         mi.continents.iter().filter(|c| c.index.load().is_some()).map(|c| c.name).collect()
     }
 
+    /// The template's credits (configurations.template.json `attribution`), each without its
+    /// `applies_to`: what the builder writes for each source.
+    fn template_credits() -> Vec<serde_json::Value> {
+        let template: serde_json::Value = serde_json::from_str(include_str!("../../builder/configurations.template.json")).unwrap();
+        template["attribution"].as_array().unwrap().iter()
+            .map(|e| {
+                let mut e = e.clone();
+                e.as_object_mut().unwrap().remove("applies_to");
+                e
+            })
+            .collect()
+    }
+
+    /// The ids of `credits`, in order.
+    fn ids(credits: &[serde_json::Value]) -> Vec<&str> {
+        credits.iter().map(|e| e["id"].as_str().unwrap()).collect()
+    }
+
+    /// The template's entry `id` (template_credits).
+    fn template_entry(id: &str) -> serde_json::Value {
+        template_credits().into_iter().find(|e| e["id"] == id).unwrap()
+    }
+
+    /// Writes `name` in `dir`: the template's entries of `ids`, as the builder writes a credit file.
+    fn write_credits(dir: &std::path::Path, name: &str, ids: &[&str]) {
+        let entries: Vec<serde_json::Value> = ids.iter().map(|&id| template_entry(id)).collect();
+        std::fs::write(dir.join(name), serde_json::to_string(&entries).unwrap()).unwrap();
+    }
+
+    // A server credits the data of the datasets it loaded, as their dirs credit it: each
+    // source once. Europe's dataset holds OpenStreetMap's data and GeoNames's, and Wikidata
+    // ranked its POIs; Asia's of a build before attribution.json, OpenStreetMap's alone. A
+    // dataset whose credit names no GeoNames gives none; one of a minimal selection, of
+    // OpenStreetMap alone, OpenStreetMap's.
+    #[test]
+    fn a_server_credits_the_sources_of_the_datasets_it_loaded() {
+        let load = |root: &std::path::Path| {
+            MultiIndex::load(root.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap()
+        };
+
+        let root = two_continents();
+        write_credits(&root.path().join("europe"), "attribution.json", &["osm", "geonames", "codepoint-open"]);
+        write_credits(&root.path().join("europe"), "poi_attribution.json", &["wikidata"]);
+        let credits = load(root.path()).credits();
+        assert_eq!(ids(&credits), ["osm", "geonames", "codepoint-open", "wikidata"]);
+        // Asia's, first, of no file.
+        assert_eq!(credits[0], osm_credit());
+        assert_eq!(credits[1], template_entry("geonames"));
+
+        for (written, want) in [(vec!["osm", "tiger"], vec!["osm", "tiger"]), (vec!["osm"], vec!["osm"]), (vec![], vec!["osm"])] {
+            let flat = ScratchDir::new();
+            oldtown().write(flat.path());
+            if !written.is_empty() {
+                write_credits(flat.path(), "attribution.json", &written);
+            }
+            let credits = load(flat.path()).credits();
+            assert_eq!(ids(&credits), want, "{written:?}");
+            assert_eq!(credits[0], template_entry("osm"));
+        }
+    }
+
+    // A source two datasets credit is credited once, of the notices of both: Asia's GeoNames
+    // centroids, of no GB postcode, owe no GB_full notice, which Europe's, of GB's, do.
+    #[test]
+    fn a_server_credits_a_source_of_two_datasets_once_of_both_their_notices() {
+        let root = two_continents();
+        let geonames = template_entry("geonames");
+        let notices = geonames["notices"].as_array().unwrap().clone();
+        assert!(notices[0].as_str().unwrap().starts_with("UK (GB_full.csv.zip)"));
+        let mut without_gb = geonames.clone();
+        without_gb["notices"] = serde_json::Value::Array(notices[1..].to_vec());
+        let asia = serde_json::json!([template_entry("osm"), without_gb]);
+        std::fs::write(root.path().join("asia").join("attribution.json"), asia.to_string()).unwrap();
+        write_credits(&root.path().join("europe"), "attribution.json", &["osm", "geonames", "codepoint-open"]);
+
+        let mi = MultiIndex::load(root.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+        let credits = mi.credits();
+        assert_eq!(ids(&credits), ["osm", "geonames", "codepoint-open"]);
+        let mut merged = credits[1].clone();
+        let mut given: Vec<String> = merged["notices"].as_array().unwrap().iter().map(|n| n.as_str().unwrap().to_owned()).collect();
+        let mut owed: Vec<String> = notices.iter().map(|n| n.as_str().unwrap().to_owned()).collect();
+        given.sort();
+        owed.sort();
+        assert_eq!(given, owed, "{merged}");
+        merged["notices"] = geonames["notices"].clone();
+        assert_eq!(merged, geonames);
+        assert_eq!(credits[2], template_entry("codepoint-open"));
+    }
+
+    // A server credits the datasets it loaded, not those their dirs hold now: a server sharing
+    // the data dir may have replaced Europe's selection with a minimal one since, while this one
+    // still answers from the files it mapped. Once it loads Europe's dir again it credits what
+    // that holds, in a flat dir as in a continent's.
+    #[test]
+    fn a_server_credits_the_datasets_it_loaded_until_it_loads_their_dirs_again() {
+        let root = two_continents();
+        let europe = root.path().join("europe");
+        write_credits(&europe, "attribution.json", &["osm", "geonames"]);
+        write_credits(&europe, "poi_attribution.json", &["wikidata"]);
+        let mi = MultiIndex::load(root.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+        write_credits(&europe, "attribution.json", &["osm"]);
+        std::fs::remove_file(europe.join("poi_attribution.json")).unwrap();
+
+        assert_eq!(ids(&mi.credits()), ["osm", "geonames", "wikidata"]);
+        mi.install_region("europe").unwrap();
+        assert_eq!(ids(&mi.credits()), ["osm"]);
+
+        let flat = ScratchDir::new();
+        oldtown().write(flat.path());
+        write_credits(flat.path(), "attribution.json", &["osm", "tiger"]);
+        let mi = MultiIndex::load(flat.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+        std::fs::remove_file(flat.path().join("attribution.json")).unwrap();
+        assert_eq!(ids(&mi.credits()), ["osm", "tiger"]);
+    }
+
+    // A dataset of no attribution.json is OpenStreetMap's data: its credit is the builder's
+    // OpenStreetMap entry, the template's.
+    #[test]
+    fn the_credit_of_a_dataset_of_no_attribution_file_is_the_templates_osm_entry() {
+        assert_eq!(osm_credit(), template_credits()[0]);
+    }
+
+    /// Each paragraph of `html`: the hrefs of its links, and its text, tags left out and
+    /// entities decoded.
+    fn paragraphs(html: &str) -> Vec<(Vec<String>, String)> {
+        let decode = |s: &str| s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&amp;", "&");
+        html.split("<p>").skip(1).map(|p| {
+            let p = &p[..p.find("</p>").unwrap()];
+            let hrefs = p.split("href=\"").skip(1).map(|h| decode(&h[..h.find('"').unwrap()])).collect();
+            let mut text = String::new();
+            let mut in_tag = false;
+            for c in p.chars() {
+                match c {
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    _ if !in_tag => text.push(c),
+                    _ => {}
+                }
+            }
+            (hrefs, decode(&text))
+        }).collect()
+    }
+
+    // The test page's credits: a paragraph a source, its URL and its licence's the hrefs of
+    // its links, its text, licence and notices its text. Text is text, whatever it holds, and
+    // a URL of another scheme than http(s) links nothing.
+    #[test]
+    fn the_test_pages_credits_link_each_source_and_its_licence_and_give_its_notices() {
+        let credits = template_credits();
+        let html = credits_html(&credits);
+        let names: Vec<&str> = credits.iter().map(|e| e["text"].as_str().unwrap()).collect();
+        assert!(html.starts_with(&format!("<details><summary>Data: {}</summary>", names.join(", ").replace('&', "&amp;"))), "{html}");
+        let found = paragraphs(&html);
+        assert_eq!(found.len(), credits.len());
+        for (entry, (hrefs, text)) in credits.iter().zip(&found) {
+            let mut links = vec![entry["url"].as_str().unwrap()];
+            links.extend(entry["licence_url"].as_str());
+            assert_eq!(hrefs, &links, "{}", entry["id"]);
+            for field in ["text", "licence"] {
+                assert!(text.contains(entry[field].as_str().unwrap()), "{} {field}: {text}", entry["id"]);
+            }
+            for notice in entry["notices"].as_array().unwrap() {
+                assert!(text.contains(notice.as_str().unwrap()), "{}: {text}", entry["id"]);
+            }
+        }
+
+        let hostile = serde_json::json!([{"id": "x", "text": "<b>X</b> & Co", "url": "javascript:alert(1)",
+                                          "licence": "L", "licence_url": "https://l.example/?a=1&b=\"2\"",
+                                          "notices": ["<script>alert(1)</script> 'q'"]}]);
+        let html = credits_html(hostile.as_array().unwrap());
+        assert!(!html.contains("<script>") && !html.contains("<b>") && !html.contains("javascript:"), "{html}");
+        assert_eq!(paragraphs(&html), [(vec![r#"https://l.example/?a=1&b="2""#.to_owned()],
+                                         "<b>X</b> & Co, L. <script>alert(1)</script> 'q'".to_owned())]);
+        assert_eq!(credits_html(&[]), "");
+    }
+
     // A dir holding the downloader's ledger but no stamp is one whose
     // download did not finish, and it may mix two builds' or selections'
     // files that load as one. Its slot stays empty, for the downloader to
@@ -8296,10 +8675,29 @@ mod query_path_tests {
         };
         let (lat, lng) = ORIGIN;
         assert!(world.query_json(lat, lng).contains("Testland"));
+        assert!(world.query_json(lat, lng).starts_with(r#"{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","#));
         // The first two are the origin's own point once S2 wraps them onto the globe.
         for (lat, lng) in [(lat, lng + 360.0), (180.0 - lat, lng - 180.0), (f64::NAN, lng), (lat, f64::INFINITY), (90.5, lng), (lat, -180.5)] {
             assert_eq!(world.query_json(lat, lng), "{}", "({}, {})", lat, lng);
         }
+    }
+
+    /// What a lookup that finds nothing answers: Nominatim's licence, and no address.
+    const NOTHING_FOUND: &str = r#"{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","address":{}}"#;
+
+    #[test]
+    fn every_answer_carries_nominatims_licence_at_its_head() {
+        // Nominatim's json and jsonv2 write "licence" first in every result but for its
+        // place_id, which these answers have none of (v1/format_json.py format_base_json),
+        // worded as its v1/classtypes.py OSM_ATTRIBUTION. An answer of nothing found carries
+        // it too.
+        let index = TestIndex::new().street("Main Street", &parallel(0.0, 200.0)).load();
+        let (lat, lng) = query_point(1.0, 0.0);
+        let answer = serde_json::to_string(&index.query(lat, lng)).unwrap();
+        assert!(answer.starts_with(r#"{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","display_name":"Main Street"#), "{answer}");
+        // 60 km north: outside Testland.
+        let (lat, lng) = query_point(60_000.0, 0.0);
+        assert_eq!(serde_json::to_string(&index.query(lat, lng)).unwrap(), NOTHING_FOUND);
     }
 
     #[test]
@@ -8318,10 +8716,10 @@ mod query_path_tests {
         // Each is p once S2 wraps it onto the globe.
         for (wlat, wlng) in [(lat, lng + 360.0), (lat, lng - 360.0), (180.0 - lat, lng - 180.0), (-180.0 - lat, lng + 180.0)] {
             assert_eq!(cell(wlat, wlng), cell(lat, lng), "({wlat}, {wlng})");
-            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), r#"{"address":{}}"#, "({wlat}, {wlng})");
+            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), NOTHING_FOUND, "({wlat}, {wlng})");
         }
         for (wlat, wlng) in [(f64::NAN, lng), (lat, f64::NAN), (lat, f64::INFINITY), (f64::NEG_INFINITY, lng)] {
-            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), r#"{"address":{}}"#, "({wlat}, {wlng})");
+            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), NOTHING_FOUND, "({wlat}, {wlng})");
         }
     }
 
@@ -9159,21 +9557,43 @@ mod query_path_tests {
 
     /// `index` with one polygon POI, the rectangle: `name_id` its name and `parent_street_id`
     /// its parent street's, strings of the index's. The admin cell of its middle lists it.
-    fn with_polygon_poi(mut index: Index, name_id: u32, parent_street_id: u32, (s, w, n, e): Span) -> Index {
-        let (low, middle) = (at(s, w), at((s + n) / 2.0, (w + e) / 2.0));
-        // Its corners at 1e-7 degrees (encoding 3) from its low corner.
-        let steps = |v: f32, from: f32| ((v as f64 - from as f64) / 1e-7).round() as u32;
-        let polygon = poi_files::PoiPolygon {
-            encoding: 3, bmin_lat: low.lat, bmin_lng: low.lng,
-            q: [at(s, w), at(s, e), at(n, e), at(n, w)].iter().map(|c| (steps(c.lat, low.lat), steps(c.lng, low.lng))).collect(),
-        };
-        let record = PoiRecord {
-            lat: middle.lat, lng: middle.lng, vertex_offset: 0, name_id, category: 1, tier: 0, flags: 0, importance: 0,
-            parent_street_id, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
-        };
-        let (records, vertices) = poi_files::encode(&[(record, Some(polygon))]);
-        let cell = cell_id_at_level(middle.lat as f64, middle.lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
-        index.poi_index = Some(cell_pairs::from_pairs([(cell, 0)], cell_pairs::POI));
+    fn with_polygon_poi(index: Index, name_id: u32, parent_street_id: u32, span: Span) -> Index {
+        with_poi(index, (1, 0), name_id, (parent_street_id, NO_DATA), span, true)
+    }
+
+    /// `index` with one POI of `category` and `flags`: the rectangle, or a point at its middle
+    /// where `polygon` is false. `name_id` its name and `parents` its parent street's and
+    /// postcode's, strings of the index's. The admin cell of its middle lists it.
+    fn with_poi(index: Index, kind: (u8, u8), name_id: u32, parents: (u32, u32), span: Span, polygon: bool) -> Index {
+        with_pois(index, &[(kind, name_id, parents, span, polygon)])
+    }
+
+    /// `index` with `pois`, each as with_poi takes one, record i the i-th.
+    fn with_pois(index: Index, pois: &[((u8, u8), u32, (u32, u32), Span, bool)]) -> Index {
+        with_pois_of_tier(index, pois, 0)
+    }
+
+    /// with_pois, every record of `tier`.
+    fn with_pois_of_tier(mut index: Index, pois: &[((u8, u8), u32, (u32, u32), Span, bool)], tier: u8) -> Index {
+        let mut records = Vec::new();
+        let mut cells = Vec::new();
+        for (i, &((category, flags), name_id, (parent_street_id, parent_postcode_id), (s, w, n, e), polygon)) in pois.iter().enumerate() {
+            let (low, middle) = (at(s, w), at((s + n) / 2.0, (w + e) / 2.0));
+            // Its corners at 1e-7 degrees (encoding 3) from its low corner.
+            let steps = |v: f32, from: f32| ((v as f64 - from as f64) / 1e-7).round() as u32;
+            let outline = polygon.then(|| poi_files::PoiPolygon {
+                encoding: 3, bmin_lat: low.lat, bmin_lng: low.lng,
+                q: [at(s, w), at(s, e), at(n, e), at(n, w)].iter().map(|c| (steps(c.lat, low.lat), steps(c.lng, low.lng))).collect(),
+            });
+            let record = PoiRecord {
+                lat: middle.lat, lng: middle.lng, vertex_offset: if polygon { 0 } else { NO_DATA }, name_id, category, tier, flags,
+                importance: 0, parent_street_id, parent_postcode_id, parent_poly_id: NO_DATA,
+            };
+            records.push((record, outline));
+            cells.push((cell_id_at_level(middle.lat as f64, middle.lng as f64, DEFAULT_ADMIN_CELL_LEVEL), i as u32));
+        }
+        let (records, vertices) = poi_files::encode(&records);
+        index.poi_index = Some(cell_pairs::from_pairs(cells, cell_pairs::POI));
         index.poi_records = Some(PoiRecords::open(FileBytes::Owned(records)).unwrap());
         index.poi_vertices = Some(FileBytes::Owned(vertices));
         index
@@ -9204,6 +9624,223 @@ mod query_path_tests {
         // The building's nearest wall is 21 m from the query: the town hall answers, on its
         // parent street.
         assert_eq!(answer(true), (None, Some("Mill Lane".to_owned())));
+    }
+
+    #[test]
+    fn a_water_poi_never_takes_the_primary_slot_nor_gives_its_road_or_postcode() {
+        // A POI 40 m by 60 m holds the query, its parent street Mill Lane and its postcode 4510;
+        // Main Street, of postcode 2020, runs 70 m south of the query. Nominatim's POI lane
+        // takes rank 30 alone (reverse.py _find_closest_street_or_pois), and it ranks
+        // natural=water, wetland, bay and glacier 22, and landuse=reservoir|basin on an area 24
+        // (address-levels.json): the street answers there, with its postcode. A landuse node
+        // ranks 30 (ranking.sql compute_place_rank), and so do a swimming area, a fire pond
+        // and a fountain: the POI answers, on its parent street with its postcode.
+        let answer = |category: u8, polygon: bool| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Main Street", &parallel(-40.0, 200.0)).way_postcode("2020");
+            let (name, lane, postcode) = (dataset.string("Water"), dataset.string("Mill Lane"), dataset.string("4510"));
+            let index = with_poi(dataset.load(), (category, 0), name, (lane, postcode), (0.0, 0.0, 40.0, 60.0), polygon);
+            let primary = primary_at(&index, 30.0, 10.0);
+            let address = address_at(&index, 30.0, 10.0);
+            (primary["poi"]["category"].as_u64(), address["road"].as_str().map(str::to_owned), address["postcode"].as_str().map(str::to_owned))
+        };
+        let street = (None, Some("Main Street".to_owned()), Some("2020".to_owned()));
+        let poi = |category: u8| (Some(category as u64), Some("Mill Lane".to_owned()), Some("4510".to_owned()));
+
+        // NATURAL_WATER, WETLAND, BAY, GLACIER and RESERVOIR, areas.
+        for category in [99, 97, 91, 86, 148] {
+            assert_eq!(answer(category, true), street, "category {category}");
+        }
+        // NATURAL_WATER, WETLAND, BAY and GLACIER nodes rank 22 too.
+        for category in [99, 97, 91, 86] {
+            assert_eq!(answer(category, false), street, "category {category}, a point");
+        }
+        // A RESERVOIR node, SWIMMING_AREA, FIRE_WATER_POND and FOUNTAIN.
+        assert_eq!(answer(148, false), poi(148));
+        for category in [161, 162, 49] {
+            assert_eq!(answer(category, true), poi(category), "category {category}");
+        }
+    }
+
+    #[test]
+    fn a_water_area_of_the_highway_flag_answers_its_own_name_as_a_street_does() {
+        // A water area a highway kind of rank 26 or 27 ranks (area=yes, highway=pedestrian,
+        // natural=water, tourism=attraction: the builder's NATURAL_WATER of the highway flag)
+        // is a street in Nominatim, whose street lane takes address ranks 26 to 29 (reverse.py
+        // _find_closest_street_or_pois): inside it, its own name answers, though Main Street,
+        // 5 m south of the query, is nearer than its outline, 10 m west, and its parent street
+        // is Mill Lane. Of no flag, the water stays out of both lanes and Main Street answers;
+        // a node of the flag stays out too.
+        let answer = |flags: u8, polygon: bool| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Main Street", &parallel(25.0, 200.0));
+            let (name, lane) = (dataset.string("Seeplatz"), dataset.string("Mill Lane"));
+            let index = with_poi(dataset.load(), (99, flags), name, (lane, NO_DATA), (0.0, 0.0, 40.0, 60.0), polygon);
+            address_at(&index, 30.0, 10.0)["road"].as_str().map(str::to_owned)
+        };
+        assert_eq!(answer(POI_FLAG_HIGHWAY, true).as_deref(), Some("Seeplatz"));
+        assert_eq!(answer(0, true).as_deref(), Some("Main Street"));
+        assert_eq!(answer(POI_FLAG_HIGHWAY, false).as_deref(), Some("Main Street"));
+        for category in [86, 91, 97, 148] {
+            let record = PoiRecord {
+                lat: 0.0, lng: 0.0, vertex_offset: 0, name_id: 0, category, tier: 0, flags: POI_FLAG_HIGHWAY,
+                importance: 0, parent_street_id: 0, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
+            };
+            assert!(!Index::is_out_of_the_primary_lanes(&record), "category {category}");
+            assert!(Index::is_out_of_the_primary_lanes(&PoiRecord { flags: 0, ..record }), "category {category}");
+        }
+    }
+
+    #[test]
+    fn a_water_street_answers_its_own_name_wherever_it_wins_and_needs_no_parent_street() {
+        // A water street, a water area of the highway flag, is one placex row of class highway
+        // in Nominatim, its polygon the geometry and rank_address 26 or 27 (init.lua
+        // process_tags, ranking.sql compute_place_rank): the street lane finds it by its
+        // distance to the polygon, 0 inside, and answers its own name (reverse.py
+        // lookup_street_poi), and a street has no parent street (placex_update parents
+        // rank_search > 27 alone). Main Street runs 10 m south of a point 3 m west of the
+        // outline, 40 m by 60 m, and of one inside it 10 m from the outline: the water street
+        // wins at both, and answers its own name, not that of its parent street, Mill Lane, nor
+        // Main Street where it links none. A polygon of the flag that is no water keeps its
+        // parent street outside it, and takes no slot without one.
+        let answer = |category: u8, linked: bool, (north, east): (f64, f64)| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Main Street", &parallel(20.0, 200.0));
+            let (name, lane) = (dataset.string("Seeplatz"), dataset.string("Mill Lane"));
+            let parents = (if linked { lane } else { NO_DATA }, NO_DATA);
+            let index = with_poi(dataset.load(), (category, POI_FLAG_HIGHWAY), name, parents, (0.0, 0.0, 40.0, 60.0), true);
+            address_at(&index, north, east)["road"].as_str().map(str::to_owned)
+        };
+        let (outside, inside) = ((30.0, -3.0), (30.0, 10.0));
+        // NATURAL_WATER, WETLAND, BAY, GLACIER and RESERVOIR.
+        for category in [99, 97, 91, 86, 148] {
+            for linked in [true, false] {
+                for point in [outside, inside] {
+                    assert_eq!(answer(category, linked, point).as_deref(), Some("Seeplatz"), "category {category}, linked {linked}, {point:?}");
+                }
+            }
+        }
+        // An ATTRACTION.
+        assert_eq!(answer(1, true, inside).as_deref(), Some("Seeplatz"));
+        assert_eq!(answer(1, true, outside).as_deref(), Some("Mill Lane"));
+        assert_eq!(answer(1, false, inside).as_deref(), Some("Main Street"));
+    }
+
+    #[test]
+    fn a_water_street_competes_by_the_rules_of_a_street_not_those_of_a_poi() {
+        // A water street is a street in Nominatim, of rank_address 26 or 27: a street that wins
+        // its street lane refines to a house number it is the parent of alone, and a rank-30 node
+        // inside the closest feature takes its place where that is an area of rank_search above
+        // 27 alone (reverse.py lookup_street_poi), nor does a street take a head start. The lake,
+        // 40 m by 60 m, of the highway flag, its parent street Mill Lane, holds the point asked
+        // and an address node on Main Street 28 m off, Main Street 70 m south: the lake answers,
+        // with no house number. Of tier 1, which gives a landmark polygon its head start of 50 m,
+        // and 30 m east of the point asked, with Main Street 10 m north, it leaves the answer to
+        // Main Street. An ATTRACTION of the flag keeps the POIs' rules: the node answers inside
+        // it, on its street, and of tier 1 it wins beside it, on its parent street.
+        let answer = |category: u8, tier: u8, address: bool, street_north: f64, (north, east): (f64, f64)| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Main Street", &parallel(street_north, 200.0));
+            if address {
+                dataset.address("1", 10.0, 30.0);
+            }
+            let (name, lane) = (dataset.string("Seeplatz"), dataset.string("Mill Lane"));
+            let pois = [((category, POI_FLAG_HIGHWAY), name, (lane, NO_DATA), (0.0, 0.0, 40.0, 60.0), true)];
+            let address = address_at(&with_pois_of_tier(dataset.load(), &pois, tier), north, east);
+            (address["road"].as_str().map(str::to_owned), address["house_number"].as_str().map(str::to_owned))
+        };
+        let road = |name: &str, house_number: Option<&str>| (Some(name.to_owned()), house_number.map(str::to_owned));
+        let (inside, beside) = ((30.0, 10.0), (20.0, -30.0));
+        // NATURAL_WATER, WETLAND, BAY, GLACIER and RESERVOIR.
+        for category in [99, 97, 91, 86, 148] {
+            assert_eq!(answer(category, 0, true, -40.0, inside), road("Seeplatz", None), "category {category}");
+            assert_eq!(answer(category, 1, false, 30.0, beside), road("Main Street", None), "category {category}");
+        }
+        // An ATTRACTION.
+        assert_eq!(answer(1, 0, true, -40.0, inside), road("Main Street", Some("1")));
+        assert_eq!(answer(1, 1, false, 30.0, beside), road("Mill Lane", None));
+    }
+
+    #[test]
+    fn a_water_street_matches_place_nodes_against_the_point_not_its_parent_street() {
+        // Nominatim takes a street's address from the street itself, a rank-30 answer's from its
+        // parent street (results.py _get_address_lookup_id). The lake, 40 m by 60 m, of the
+        // highway flag, holds the point asked, 40 m east of Long Road, its parent street and the
+        // nearest street, whose line the hamlet's 1000 m square crosses 3 km north of the point,
+        // which it leaves out: the lake answers, and no hamlet. An ATTRACTION there answers on
+        // Long Road, in the hamlet.
+        let answer = |(category, flags): (u8, u8)| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Long Road", &[(-1000.0, 0.0), (5000.0, 0.0)]).place("Justice", 4, 3000.0, 200.0);
+            let (name, lane) = (dataset.string("Seeplatz"), dataset.string("Long Road"));
+            let index = with_poi(dataset.load(), (category, flags), name, (lane, NO_DATA), (-20.0, 20.0, 20.0, 80.0), true);
+            let address = address_at(&index, 0.0, 40.0);
+            (address["road"].as_str().map(str::to_owned), address["hamlet"].as_str().map(str::to_owned))
+        };
+        // NATURAL_WATER, WETLAND, BAY, GLACIER and RESERVOIR.
+        for category in [99, 97, 91, 86, 148] {
+            assert_eq!(answer((category, POI_FLAG_HIGHWAY)), (Some("Seeplatz".to_owned()), None), "category {category}");
+        }
+        assert_eq!(answer((1, 0)), (Some("Long Road".to_owned()), Some("Justice".to_owned())));
+    }
+
+    #[test]
+    fn water_no_address_anchors_keeps_its_landmark_and_places_but_gives_no_road_nor_postcode() {
+        // A glacier 60 km north, outside Testland, holds the query, its parent street Coast
+        // Road and its postcode 4510; no boundary holds the point and no street is near, and a
+        // postcode centroid, 4520, is 10 m off. Water never takes the primary slot, so its road
+        // and postcode don't answer, nor the centroid's, but where it would have taken the slot
+        // its name answers as the landmark and in `places`. One of no linked parent street
+        // never could, and the point finds nothing, as one in no POI.
+        let answer = |linked: bool| {
+            let mut dataset = TestIndex::new();
+            dataset.centroid("4520", 60_030.0, 20.0);
+            let (name, road, postcode) = (dataset.string("Coast Glacier"), dataset.string("Coast Road"), dataset.string("4510"));
+            let parents = if linked { (road, postcode) } else { (NO_DATA, NO_DATA) };
+            let index = with_poi(dataset.load(), (86, 0), name, parents, (60_000.0, 0.0, 60_040.0, 60.0), true);
+            let (lat, lng) = query_point(60_030.0, 10.0);
+            serde_json::to_string(&index.query(lat, lng)).unwrap()
+        };
+        let linked: serde_json::Value = serde_json::from_str(&answer(true)).unwrap();
+        assert_eq!(linked["address"], serde_json::json!({"landmark": "Coast Glacier"}), "{linked}");
+        assert_eq!(linked["places"][0]["name"], "Coast Glacier", "{linked}");
+        assert_eq!(linked["licence"], OSM_LICENCE);
+        assert_eq!(answer(false), NOTHING_FOUND);
+    }
+
+    #[test]
+    fn a_bay_or_glacier_no_address_anchors_answers_nothing_where_a_specific_poi_is_found() {
+        // A bay or glacier 60 km north, outside Testland, holds the query, its parent street
+        // Coast Road; no boundary holds the point and no street is near. 150 m east of the
+        // query, past the 100 m a POI takes the primary slot within, is a POI of Hill Road.
+        // Were water in the lanes, a bay or glacier would be an area label there, as an island
+        // is, and win the slot only where no specific POI is found: a school or a lake takes
+        // the lane from it, too far to take the slot, and the point finds nothing, as one in
+        // no water. An area label (a protected area) or a school of no linked parent street
+        // leaves it the lane, and a lake, itself specific, keeps the lane from the farther
+        // school: the water's name answers as the landmark.
+        let answer = |water: u8, (category, linked): (u8, bool)| {
+            let mut dataset = TestIndex::new();
+            let (name, road) = (dataset.string("Coast Water"), dataset.string("Coast Road"));
+            let (other, hill_road) = (dataset.string("Hilltop"), dataset.string("Hill Road"));
+            let pois = [
+                ((water, 0), name, (road, NO_DATA), (60_000.0, 0.0, 60_040.0, 60.0), true),
+                ((category, 0), other, (if linked { hill_road } else { NO_DATA }, NO_DATA), (60_030.0, 160.0, 60_030.0, 160.0), false),
+            ];
+            let index = with_pois(dataset.load(), &pois);
+            let (lat, lng) = query_point(60_030.0, 10.0);
+            serde_json::to_value(index.query(lat, lng)).unwrap()
+        };
+        let nothing: serde_json::Value = serde_json::from_str(NOTHING_FOUND).unwrap();
+        let (bay, glacier, lake, school, protected_area) = (91, 86, 99, 56, 131);
+        for water in [bay, glacier] {
+            assert_eq!(answer(water, (school, true)), nothing, "category {water}, a school");
+            assert_eq!(answer(water, (lake, true)), nothing, "category {water}, a lake");
+        }
+        for (water, other) in [(glacier, (protected_area, true)), (glacier, (school, false)), (lake, (school, true))] {
+            let held = answer(water, other);
+            assert_eq!(held["address"], serde_json::json!({"landmark": "Coast Water"}), "category {water}, {other:?}: {held}");
+        }
     }
 
     #[test]
@@ -10029,6 +10666,7 @@ mod admin_scan_tests {
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
             admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
             max_distance_sq: 1.0,
+            credits: Vec::new(),
         }
     }
 
@@ -10373,6 +11011,9 @@ mod admin_scan_tests {
         idx
     }
 
+    /// What a lookup that finds nothing answers: Nominatim's licence, and no address.
+    const NOTHING_FOUND: &str = r#"{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","address":{}}"#;
+
     #[test]
     fn a_point_off_the_globe_is_in_no_poi_though_its_wrapped_cell_lists_one_interior() {
         let around_q = (21.99, 27.5, 22.05, 27.6);
@@ -10388,7 +11029,7 @@ mod admin_scan_tests {
                 assert_eq!(cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL), cells()[0], "({lat}, {lng})");
                 assert_eq!(pois(lat, lng), [], "({lat}, {lng}) interior {interior}");
                 assert!(idx.find_nearest_poi_with_parent(lat, lng).is_none(), "({lat}, {lng}) interior {interior}");
-                assert_eq!(serde_json::to_string(&idx.query(lat, lng)).unwrap(), r#"{"address":{}}"#, "({lat}, {lng}) interior {interior}");
+                assert_eq!(serde_json::to_string(&idx.query(lat, lng)).unwrap(), NOTHING_FOUND, "({lat}, {lng}) interior {interior}");
             }
             for (lat, lng) in [(f64::NAN, Q.1), (Q.0, f64::NAN), (Q.0, f64::INFINITY), (f64::NEG_INFINITY, Q.1)] {
                 assert_eq!(pois(lat, lng), [], "({lat}, {lng})");

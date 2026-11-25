@@ -562,15 +562,19 @@ inline bool is_included_highway(const char* value) {
     }
 }
 
+// Whether footway=`footway` makes highway=footway no main tag in Nominatim:
+// sidewalk, crossing, link and traffic_aisle (presets.lua:23-33
+// EXCLUDED_FOOTWAYS, filter_footways), the adjuncts of a road.
+inline bool is_excluded_footway(const char* footway) {
+    return footway && (std::strcmp(footway, "sidewalk") == 0 || std::strcmp(footway, "crossing") == 0 ||
+                       std::strcmp(footway, "link") == 0 || std::strcmp(footway, "traffic_aisle") == 0);
+}
+
 // Full filter including the footway subtype check.
-// Excludes footway=sidewalk/crossing (unnamed adjuncts).
+// Excludes highway=footway of an excluded footway=* (is_excluded_footway).
 inline bool is_included_highway_full(const char* highway, const char* footway) {
     if (!is_included_highway(highway)) return false;
-    // Exclude footway subtypes that are road adjuncts
-    if (highway[0] == 'f' && std::strcmp(highway, "footway") == 0 && footway) {
-        if (std::strcmp(footway, "sidewalk") == 0) return false;
-        if (std::strcmp(footway, "crossing") == 0) return false;
-    }
+    if (highway[0] == 'f' && std::strcmp(highway, "footway") == 0 && is_excluded_footway(footway)) return false;
     // No access/tunnel filtering — Nominatim indexes all highways
     // unconditionally. The Treasury Annex Tunnel case is handled by
     // the addr_point area→node preference rule (the 1600 Penn Ave

@@ -295,7 +295,10 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
             [](PoiRecord& p, uint32_t offset, uint32_t) { p.vertex_offset = offset; },
             out.poi_records, out.poi_vertices);
         out.poi_osm_ids = subset_osm_ids(used_poi_ids, poi_remap, out.poi_records.size(), full.poi_osm_ids);
-        drop(full.poi_records, full.poi_vertices, full.poi_osm_ids);
+        if (!full.poi_water_importance.empty())
+            out.poi_water_importance =
+                subset_osm_ids(used_poi_ids, poi_remap, out.poi_records.size(), full.poi_water_importance);
+        drop(full.poi_records, full.poi_vertices, full.poi_osm_ids, full.poi_water_importance);
     };
 
     // Place nodes — parent_poly_id remapped in a second pass below, after

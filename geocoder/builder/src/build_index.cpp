@@ -339,6 +339,9 @@ static void load_external_postcodes(ParsedData& data, const std::string& path,
         auto [it, added] = data.postcode_accum.try_emplace(postcode_key(rows[i].cc, ids[i]));
         if (added) {
             it->second.add(rows[i].lat, rows[i].lng);
+            // A GB row is GB_full's, whose credit takes Code-Point Open's.
+            it->second.source = static_cast<uint8_t>(
+                ATTRIBUTION_GEONAMES | (rows[i].cc == pack_country_code('G', 'B') ? ATTRIBUTION_CODEPOINT : 0));
             loaded++;
         }
     }
@@ -1441,6 +1444,8 @@ static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
             [&](uint32_t i, NearbyStreets& nearby) {
                 auto& pr = data.poi_records[i];
                 pr.parent_street_id = 0xFFFFFFFFu;
+                // One that never takes the primary slot links none.
+                if (pr.flags & POI_FLAG_PLACES_ONLY) return;
 
                 double best_d2 = 1e18;
                 uint32_t best_name = 0xFFFFFFFFu;
@@ -1782,7 +1787,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                     // VertexEncoding tag, byte_offset into vertex stream).
                     // A tombstone keeps its bytes but only goes to the tiers
                     // that held its record, so a death never touches the
-                    // files that never carried it.
+                    // files that never carried it. A record goes as the tier
+                    // ships it: a water object of a category the tier
+                    // doesn't ship as its water kind (poi_record_in_tier).
                     const PoiTierSelection selection =
                         select_poi_tier(d.poi_records, d.poi_sidecar_blob, tier_var.max_tier);
                     const auto& selected = selection.indices;
@@ -1801,7 +1808,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                         [&](size_t total) { parallel_resize(filtered_vertex_bytes, total); },
                         [&](size_t k, size_t offset) -> size_t {
                             id_remap[selected[k]] = static_cast<uint32_t>(k);
-                            auto pr = d.poi_records[selected[k]];
+                            auto pr = poi_record_in_tier(d.poi_records[selected[k]], tier_var.max_tier,
+                                                         d.poi_water_importance.empty() ? 0 : d.poi_water_importance[selected[k]]);
                             size_t bytes = 0;
                             if (is_polygon(pr)) {
                                 bytes = pack_polygon_at(filtered_vertex_bytes.data() + offset,
@@ -1868,6 +1876,13 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                                                  names.size());
                     }
                     write_strings_layout(poi_dir, d.strings_tier_bases);
+                    // Wikidata's credit, where its sitelinks ranked a live POI
+                    // of the tier; the mode dir credits the rest.
+                    // A tombstone carries no flags.
+                    const bool sitelinked = parallel_count(selected.size(), [&](size_t k) {
+                        return (d.poi_records[selected[k]].flags & POI_FLAG_SITELINKS) != 0;
+                    }) > 0;
+                    if (sitelinked) write_attribution(poi_dir, ATTRIBUTION_WIKIDATA, POI_ATTRIBUTION_FILE);
 
                     // Write poi_meta.json (category metadata for the server)
                     {
@@ -2868,8 +2883,69 @@ static int run(int argc, char* argv[]) {
                         const char* r_office   = rel.tag("office");
 
                         PoiCategory poi_cat = PoiCategory::UNKNOWN;
+                        // A water multipolygon (poi_water_kind), which
+                        // Nominatim imports as it does a closed way, is
+                        // classified as a closed way is (classify_poi), but
+                        // of the water kinds the scan takes bays, glaciers and
+                        // streets alone: a lake, a wetland or a reservoir that
+                        // is no street is no POI as its water kind in any
+                        // tier. One that is a rank-30 POI of another main tag
+                        // is that POI. One that is the water it is (a main tag
+                        // of a lower rank ranks it, it is a reservoir of a
+                        // class the POI lane leaves out, or no tier ships what
+                        // its rank-30 tags make of it) is a bay or a glacier,
+                        // or a street where a highway kind ranks it one, as it
+                        // ranks the closed way, or else takes the scan's own
+                        // categories below, as before, but never the primary
+                        // slot (POI_FLAG_PLACES_ONLY). One the classifier
+                        // makes one that could take it (a rank-30 POI, or a
+                        // street) but that has holes, which its polygon of the
+                        // outer rings alone would fill, takes the scan's own
+                        // categories instead, and never the slot: one of none
+                        // is no POI, whose name, or address, a point in a hole
+                        // would find. Nor is any water multipolygon an
+                        // address point that is a street (poi_water_street)
+                        // or has holes, which the address's polygon of the
+                        // outer rings would fill: its addr:* tags give none.
+                        std::optional<PoiClassification> water_poi;
+                        bool places_only = false;
+                        const char* r_landuse = rel.tag("landuse");
+                        const PoiCategory r_water = area_type ? poi_water_kind(r_natural, r_landuse) : PoiCategory::UNKNOWN;
+                        bool no_address = false;
+                        if (r_water != PoiCategory::UNKNOWN) {
+                            for (size_t mi = 0; mi < rel.members.size(); mi++)
+                                if (rel.member_role(mi) == "inner") no_address = true;
+                            if (poi_water_street(r_natural, r_landuse, rel.tag("highway"), rel.tag("footway"), r_place))
+                                no_address = true;
+                            auto cls = classify_poi(r_tourism, rel.tag("historic"), r_boundary, rel.tag("amenity"),
+                                                    r_leisure, r_natural, rel.tag("railway"), r_aeroway,
+                                                    rel.tag("man_made"), rel.tag("building"), rel.tag("craft"),
+                                                    rel.tag("power"), r_place, rel.tag("waterway"), r_office,
+                                                    rel.tag("wikipedia"), rel.tag("wikidata"), rel.tag("highway"),
+                                                    rel.tag("shop"), r_landuse, rel.tag("emergency"), rel.tag("footway"),
+                                                    /*area=*/true);
+                            auto taken = [](PoiCategory c) {
+                                return c == PoiCategory::BAY || c == PoiCategory::GLACIER;
+                            };
+                            if (cls && cls->water != PoiCategory::UNKNOWN && cls->category != cls->water) {
+                                if (!taken(poi_water_of(cls->flags)))
+                                    cls->flags &= static_cast<uint8_t>(~POI_FLAG_WATER_MASK);
+                                water_poi = cls;
+                            } else if (cls && cls->category == r_water) {
+                                if (taken(r_water) || (cls->flags & POI_FLAG_HIGHWAY)) water_poi = cls;
+                                else places_only = true;
+                            }
+                            if (water_poi) {
+                                const bool could_lead =
+                                    water_poi->category != r_water || (water_poi->flags & POI_FLAG_HIGHWAY);
+                                for (size_t mi = 0; could_lead && mi < rel.members.size(); mi++)
+                                    if (rel.member_role(mi) == "inner") places_only = true;
+                                if (places_only) water_poi.reset();
+                                else poi_cat = water_poi->category;
+                            }
+                        }
                         // boundary
-                        if (r_boundary) {
+                        if (poi_cat == PoiCategory::UNKNOWN && r_boundary) {
                             if (std::strcmp(r_boundary, "national_park") == 0) poi_cat = PoiCategory::NATIONAL_PARK;
                             else if (std::strcmp(r_boundary, "protected_area") == 0) poi_cat = PoiCategory::PROTECTED_AREA;
                         }
@@ -2945,6 +3021,14 @@ static int run(int argc, char* argv[]) {
                                 }
                                 uint8_t tier = poi_get_default_tier(poi_cat);
                                 if ((flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) && tier > 1) tier--;
+                                if (water_poi) {
+                                    tier = water_poi->tier;
+                                    flags = water_poi->flags;
+                                }
+                                // One that never takes the slot is no street
+                                // either, though its highway tag is one.
+                                if (places_only)
+                                    flags = static_cast<uint8_t>((flags & ~POI_FLAG_HIGHWAY) | POI_FLAG_PLACES_ONLY);
 
                                 CollectedPoiRelation cpr;
                                 cpr.id = rel.id;
@@ -2961,7 +3045,7 @@ static int run(int argc, char* argv[]) {
                                 // header for rationale — rank-30 rows with
                                 // addr:housenumber become AddrPoints too).
                                 const char* r_hn = rel.tag("addr:housenumber");
-                                if (r_hn) {
+                                if (r_hn && !no_address) {
                                     cpr.addr_housenumber = r_hn;
                                     const char* r_st = rel.tag("addr:street");
                                     if (r_st) cpr.addr_street = r_st;
@@ -3201,6 +3285,7 @@ static int run(int argc, char* argv[]) {
                         const char* n_highway = nullptr;
                         const char* n_shop = nullptr;
                         const char* n_landuse = nullptr;
+                        const char* n_emergency = nullptr;
                         for (size_t i = 0; i < ntags; i++) {
                             if (tag_keys[i] >= st.size()) continue;
                             const auto& k = st[tag_keys[i]];
@@ -3218,7 +3303,10 @@ static int run(int argc, char* argv[]) {
                                     else if (k == "boundary") n_boundary = v;
                                     break;
                                 case 'c': if (k == "craft") n_craft = v; break;
-                                case 'e': if (k == "ele") n_ele = v; break;
+                                case 'e':
+                                    if (k == "ele") n_ele = v;
+                                    else if (k == "emergency") n_emergency = v;
+                                    break;
                                 case 'h':
                                     if (k == "historic") n_historic = v;
                                     else if (k == "highway") n_highway = v;
@@ -3283,7 +3371,7 @@ static int run(int argc, char* argv[]) {
                                 n_man_made, n_building, n_craft, n_power, n_place, n_waterway,
                                 n_office,
                                 n_wikipedia, n_wikidata,
-                                n_highway, n_shop, n_landuse);
+                                n_highway, n_shop, n_landuse, n_emergency, /*footway=*/nullptr, /*area=*/false);
                             const char* name = poi_name(n_name_en, n_name);
                             if (cls && name) {
                                 PoiRecord pr{};
@@ -3728,9 +3816,24 @@ static int run(int argc, char* argv[]) {
                     // addr:street is present. Missing streets are
                     // backfilled via the nearest-named-street sweep
                     // after way indexing, matching Nominatim's
-                    // parent_place_id resolution behaviour.
+                    // parent_place_id resolution behaviour. A named water
+                    // street is no address point, whatever its addr:* tags
+                    // (poi_water_street), and is a polygon in Nominatim of
+                    // area=yes alone (init.lua process_way): of none it is
+                    // the line the street index holds, which its POI's
+                    // polygon takes no highway flag beside. One whose street
+                    // the build holds nowhere, as that polygon or as a line
+                    // of the street index, which takes no
+                    // highway=construction (is_included_highway), keeps its
+                    // address.
                     const char* housenumber = t.housenumber;
-                    if (housenumber && refs_size > 0) {
+                    const bool street_line = t.highway && is_included_highway_full(t.highway, t.footway) &&
+                                             t_best_name && refs_size >= 2 && all_valid;
+                    const bool water_street = t_best_name && refs_size >= 4 && refs_data[0] == refs_data[refs_size - 1] &&
+                                              poi_water_street(t.natural, t.landuse, t.highway, t.footway, t.place);
+                    const bool water_street_line = water_street && !(t.area && std::strcmp(t.area, "yes") == 0);
+                    const bool water_street_held = water_street && all_valid && (!water_street_line || street_line);
+                    if (housenumber && refs_size > 0 && !water_street_held) {
                         const char* street = t.street;
                         double sum_lat = 0, sum_lng = 0; int valid = 0;
                         for (const auto& loc : resolved_locs) {
@@ -3776,22 +3879,20 @@ static int run(int argc, char* argv[]) {
                     }
 
                     // Highway ways
-                    if (t.highway && is_included_highway_full(t.highway, t.footway)) {
-                        if (t_best_name && refs_size >= 2 && all_valid) {
-                            uint32_t wid = static_cast<uint32_t>(local.ways.size());
-                            uint32_t noff = static_cast<uint32_t>(local.street_nodes.size());
-                            for (const auto& loc : resolved_locs)
-                                local.street_nodes.push_back({static_cast<float>(loc.lat()), static_cast<float>(loc.lon())});
-                            WayHeader header{}; header.node_offset = noff;
-                            header.node_count = static_cast<uint16_t>(std::min(refs_size, size_t(MAX_NODE_COUNT)));
-                            local.ways.push_back(header);
-                            local.way_osm_ids.push_back(way_id);
-                            const char* orig_name = t.name ? t.name : (t_best_name ? t_best_name : "");
-                            local.way_strings.push_back(local.strings.add(t_best_name));
-                            local.way_orig_names.push_back(orig_name[0] ? local.strings.add(orig_name) : StringDict::kNone);
-                            local.deferred_ways.push_back({wid, noff, header.node_count});
-                            local.way_count++;
-                        }
+                    if (street_line) {
+                        uint32_t wid = static_cast<uint32_t>(local.ways.size());
+                        uint32_t noff = static_cast<uint32_t>(local.street_nodes.size());
+                        for (const auto& loc : resolved_locs)
+                            local.street_nodes.push_back({static_cast<float>(loc.lat()), static_cast<float>(loc.lon())});
+                        WayHeader header{}; header.node_offset = noff;
+                        header.node_count = static_cast<uint16_t>(std::min(refs_size, size_t(MAX_NODE_COUNT)));
+                        local.ways.push_back(header);
+                        local.way_osm_ids.push_back(way_id);
+                        const char* orig_name = t.name ? t.name : (t_best_name ? t_best_name : "");
+                        local.way_strings.push_back(local.strings.add(t_best_name));
+                        local.way_orig_names.push_back(orig_name[0] ? local.strings.add(orig_name) : StringDict::kNone);
+                        local.deferred_ways.push_back({wid, noff, header.node_count});
+                        local.way_count++;
                     }
 
                     auto valid_locs = [&] {
@@ -3823,7 +3924,7 @@ static int run(int argc, char* argv[]) {
                             t.man_made, t.building, t.craft, t.power, t.place, t.waterway,
                             t.office,
                             t.wikipedia, t.wikidata,
-                            t.highway, t.shop, t.landuse);
+                            t.highway, t.shop, t.landuse, t.emergency, t.footway, /*area=*/true);
                         if (cls) {
                             // Compute centroid
                             double sum_lat = 0, sum_lng = 0;
@@ -3860,6 +3961,7 @@ static int run(int argc, char* argv[]) {
                             pr.category = static_cast<uint8_t>(cls->category);
                             pr.tier = cls->tier;
                             pr.flags = cls->flags;
+                            if (water_street_line) pr.flags &= static_cast<uint8_t>(~POI_FLAG_HIGHWAY);
 
                             float way_ele = 0;
                             if (t.ele) { char* end; way_ele = std::strtof(t.ele, &end); if (end == t.ele) way_ele = 0; }

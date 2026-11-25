@@ -368,6 +368,7 @@ Response follows [Nominatim](https://nominatim.org/release-docs/latest/api/Rever
 
 ```json
 {
+  "licence": "Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright",
   "display_name": "Avenue de la Costa 42, 98000 Monaco, Monaco",
   "address": {
     "house_number": "42",
@@ -382,7 +383,12 @@ Response follows [Nominatim](https://nominatim.org/release-docs/latest/api/Rever
 }
 ```
 
-Fields are omitted when not available.
+Fields are omitted when not available, but `licence`, which every answer
+carries first, as Nominatim's results do, worded as Nominatim words it
+(`OSM_ATTRIBUTION` in its `src/nominatim_api/v1/classtypes.py`); an answer
+that found nothing carries it too (`{"licence": "...", "address": {}}`).
+Where no loaded region covers the point the answer is `{}`, without it, as
+Nominatim's `{"error":"Unable to geocode"}` is.
 
 Status codes:
 - `200` - success
@@ -429,6 +435,8 @@ to the same files ([builder/PATCHING.md](builder/PATCHING.md#transport-units)).
 | `strings_core.bin`, `strings_street.bin`, `strings_addr.bin`, `strings_postcode.bin`, `strings_poi.bin` | Deduplicated string pool, in five tiers so each variant ships only the strings it uses; each tier front-coded in buckets cut by content (FCC2, `builder/src/string_files.h`), a string's id still its offset in the tier's pool |
 | `strings_layout.json` | Start and end of each string tier, which place every string offset |
 | `poi_meta.json` | POI category names and scoring parameters |
+| `attribution.json` | In each mode dir: the credit of the data it holds, one entry per source ([PATCHING.md](PATCHING.md#attribution)) |
+| `poi_attribution.json` | In a POI tier dir: Wikidata's credit, where its sitelinks ranked a POI of it ([PATCHING.md](PATCHING.md#attribution)) |
 
 ## Building from Source
 
@@ -526,6 +534,21 @@ The server is designed to run inside memory-constrained deployments
 |----------|-------------|---------|
 | `GEOCODER_WORKER_THREADS` | Async worker pool size | `min(cores, 8)` |
 | `GEOCODER_ALLOW_ANONYMOUS` | `true` accepts requests without an API key, configuration changes included, with no rate limit: only for a server on a private container network | (disabled) |
+
+## Data and licences
+
+The indexes are a derivative database of [OpenStreetMap](https://www.openstreetmap.org/copyright)
+(© OpenStreetMap contributors, ODbL 1.0), with GB postcode centroids from
+[GeoNames](https://www.geonames.org/) (CC BY 4.0), derived from Ordnance
+Survey's Code-Point Open (OGL v3.0; contains OS, Royal Mail and National
+Statistics data), US address ranges and ZIP codes from the US Census
+Bureau's TIGER/Line files (public domain), and POI importance from
+[Wikidata](https://www.wikidata.org/)'s sitelink counts (CC0). The
+`attribution` list of each build's configurations.json gives every source's
+credit and licence, and each mode dir's `attribution.json` and POI tier dir's
+`poi_attribution.json` the ones of the data it holds
+([PATCHING.md](PATCHING.md#attribution));
+show those wherever the data is shown. The licence below is the code's.
 
 ## License
 

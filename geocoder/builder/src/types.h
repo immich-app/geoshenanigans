@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <stdexcept>
 #include <vector>
 #include <string>
@@ -597,6 +598,10 @@ enum class PoiCategory : uint8_t {
     POWER_PLANT = 150,
     // office
     GOVERNMENT = 160,
+    // leisure=swimming_area and emergency=fire_water_pond, most often on
+    // named water, which Nominatim imports as rank-30 POIs of these tags
+    // (poi_classify.h has_poi_main_tag).
+    SWIMMING_AREA = 161, FIRE_WATER_POND = 162,
 
     // Generic rank-30 node (amenity/shop/tourism/historic/leisure/man_made/
     // craft/office/waterway/natural/aeroway/railway/power) that didn't
@@ -706,6 +711,7 @@ inline uint8_t poi_get_default_tier(PoiCategory cat) {
         case PoiCategory::VEHICLE_INSPECTION:
         case PoiCategory::SAUNA: case PoiCategory::HORSE_RIDING:
         case PoiCategory::BIRD_HIDE: case PoiCategory::MINIATURE_GOLF:
+        case PoiCategory::SWIMMING_AREA: case PoiCategory::FIRE_WATER_POND:
         case PoiCategory::SHOP_SUPERMARKET: case PoiCategory::SHOP_CONVENIENCE:
         case PoiCategory::SHOP_CLOTHES: case PoiCategory::SHOP_MALL:
         case PoiCategory::SHOP_DEPARTMENT_STORE: case PoiCategory::SHOP_BAKERY:
@@ -746,6 +752,48 @@ static constexpr uint8_t POI_FLAG_WIKIDATA  = 0x02;
 // tourism=attraction, rank 30 in nominatim) — both land in our POI index
 // as PoiCategory::ATTRACTION.
 static constexpr uint8_t POI_FLAG_HIGHWAY   = 0x04;
+// While the build runs, a water object that takes its category from a
+// rank-30 tag (poi_classify.h classify_poi) carries its water kind in these
+// bits where the kind ships in a lower tier than the category: the dirs of
+// the tiers in between ship it as that kind (poi_record_in_tier), which
+// strips the bits, so no file holds them. 0 is none, else 1 + the kind's
+// index in kPoiWaterKinds.
+static constexpr uint8_t POI_FLAG_WATER_SHIFT = 3;
+static constexpr uint8_t POI_FLAG_WATER_MASK  = 0x7 << POI_FLAG_WATER_SHIFT;
+inline constexpr PoiCategory kPoiWaterKinds[] = {PoiCategory::NATURAL_WATER, PoiCategory::WETLAND, PoiCategory::BAY,
+                                                 PoiCategory::GLACIER, PoiCategory::RESERVOIR};
+// While the build runs, too: a POI that never takes the primary slot, a
+// water multipolygon the relation scan takes by its own categories, or one
+// that could whose holes its polygon leaves out (build_index.cpp), which
+// the build links no parent street, so that the server's primary lane,
+// which needs one, takes none of it (compute_poi_parent_streets).
+static constexpr uint8_t POI_FLAG_PLACES_ONLY = 0x40;
+// A POI whose importance took the sitelink count of its Wikidata item
+// (reorder_pois), which the tier dirs holding one credit.
+static constexpr uint8_t POI_FLAG_SITELINKS = 0x80;
+// The flags no file holds.
+static constexpr uint8_t POI_FLAG_BUILD_MASK = POI_FLAG_WATER_MASK | POI_FLAG_PLACES_ONLY | POI_FLAG_SITELINKS;
+
+// The tier of a POI of `cat`: its category's, one more important (lower)
+// with a wiki tag, but for tier 1.
+inline uint8_t poi_tier_of(PoiCategory cat, uint8_t flags) {
+    const uint8_t tier = poi_get_default_tier(cat);
+    return (flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) && tier > 1 ? tier - 1 : tier;
+}
+
+// The water kind `flags` carry, UNKNOWN for none.
+inline PoiCategory poi_water_of(uint8_t flags) {
+    const unsigned at = (flags & POI_FLAG_WATER_MASK) >> POI_FLAG_WATER_SHIFT;
+    return at == 0 || at > std::size(kPoiWaterKinds) ? PoiCategory::UNKNOWN : kPoiWaterKinds[at - 1];
+}
+
+// `flags` carrying the water kind `water`, one of kPoiWaterKinds.
+inline uint8_t poi_flags_with_water(uint8_t flags, PoiCategory water) {
+    for (size_t k = 0; k < std::size(kPoiWaterKinds); k++)
+        if (kPoiWaterKinds[k] == water)
+            return static_cast<uint8_t>((flags & ~POI_FLAG_WATER_MASK) | ((k + 1) << POI_FLAG_WATER_SHIFT));
+    throw std::logic_error("poi_flags_with_water: no water kind");
+}
 
 inline const char* poi_category_label(PoiCategory cat) {
     switch (cat) {
@@ -824,6 +872,8 @@ inline const char* poi_category_label(PoiCategory cat) {
         case PoiCategory::WINERY: return "winery"; case PoiCategory::BREWERY: return "brewery";
         case PoiCategory::POWER_PLANT: return "power_plant";
         case PoiCategory::GOVERNMENT: return "government";
+        case PoiCategory::SWIMMING_AREA: return "swimming_area";
+        case PoiCategory::FIRE_WATER_POND: return "fire_water_pond";
         case PoiCategory::HOTEL: return "hotel";
         case PoiCategory::MOTEL: return "motel";
         case PoiCategory::GUEST_HOUSE: return "guest_house";
@@ -1087,6 +1137,10 @@ struct PoiClassification {
     PoiCategory category;
     uint8_t tier;
     uint8_t flags;
+    // The water kind of a water object that takes its category from a
+    // rank-30 tag instead (poi_classify.h classify_poi), UNKNOWN for any
+    // other.
+    PoiCategory water = PoiCategory::UNKNOWN;
 };
 
 struct PoiRecord {
@@ -1130,6 +1184,36 @@ struct PoiRecord {
     // vertex_offset = NO_DATA; no header is written for them.
 };
 static_assert(sizeof(PoiRecord) == 36, "PoiRecord must be 36 bytes");
+
+// The lowest tier whose dir ships `pr`: its own, or its water kind's where
+// it carries one (POI_FLAG_WATER_MASK).
+inline uint8_t poi_lowest_tier(const PoiRecord& pr) {
+    const PoiCategory water = poi_water_of(pr.flags);
+    if (water == PoiCategory::UNKNOWN) return pr.tier;
+
+    const uint8_t tier = poi_tier_of(water, pr.flags);
+    return tier < pr.tier ? tier : pr.tier;
+}
+
+// `pr` as the dir of the POIs of tier <= max_tier writes it: as its water
+// kind, of that kind's tier and of `water_importance`, its importance as
+// that kind (ParsedData::poi_water_importance), where the dir ships the kind
+// but not its own category, with the rest of it as it is; without the flags
+// of the build alone (POI_FLAG_BUILD_MASK) in any dir. A reservoir point
+// there, which stands in for a POI the dir doesn't ship, links no parent
+// street, so that it never takes the primary slot, which the server lets a
+// RESERVOIR point take where it has one.
+inline PoiRecord poi_record_in_tier(PoiRecord pr, uint8_t max_tier, uint8_t water_importance = 0) {
+    const PoiCategory water = poi_water_of(pr.flags);
+    pr.flags &= static_cast<uint8_t>(~POI_FLAG_BUILD_MASK);
+    if (water != PoiCategory::UNKNOWN && pr.tier > max_tier) {
+        pr.category = static_cast<uint8_t>(water);
+        pr.tier = poi_tier_of(water, pr.flags);
+        if (water_importance) pr.importance = water_importance;
+        if (water == PoiCategory::RESERVOIR && pr.vertex_count == 0) pr.parent_street_id = NO_DATA;
+    }
+    return pr;
+}
 
 // Collected POI relation data for parallel polygon assembly
 struct CollectedPoiRelation {
