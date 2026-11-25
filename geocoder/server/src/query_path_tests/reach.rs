@@ -527,17 +527,24 @@ fn a_building_round_the_point_is_found_at_any_search_distance() {
 fn a_search_distance_past_what_a_query_may_read_is_refused() {
     // At the street cells' level, a query reads every cell within the search distance: 660 m
     // (Nominatim's 0.006°) reads a few hundred, 100 km millions, which the server refuses to load
-    // with, as it does a distance that is no distance.
+    // with, as it does a distance that is no distance: a flat layout, and one of continents,
+    // whose continents that can't load it would otherwise leave empty.
     let dir = ScratchDir::new();
     TestIndex::new().street("Main Street", &across(20.0, 0.0)).write(dir.path());
     let path = dir.path().to_str().unwrap();
     let load = |metres: f64| Index::load(path, DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, metres);
+    let continents = two_continents();
+    let root = continents.path().to_str().unwrap();
+    let load_all = |metres: f64| MultiIndex::load(root, DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, metres);
     assert!(load(660.0).is_ok());
+    assert_eq!(load_all(660.0).map(|all| all.loaded_count()), Ok(2));
     for metres in [100_000.0, f64::INFINITY, f64::NAN, 0.0, -5.0] {
         let refused = load(metres).err().unwrap_or_default();
         assert!(refused.contains("search distance"), "{metres}: {refused}");
         let refused = MultiIndex::load(path, DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, metres).err().unwrap_or_default();
         assert!(refused.contains("search distance"), "{metres}: {refused}");
+        let refused = load_all(metres).err().unwrap_or_default();
+        assert!(refused.contains("search distance"), "continents, {metres}: {refused}");
     }
 }
 
