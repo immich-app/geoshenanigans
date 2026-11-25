@@ -407,10 +407,19 @@ class NightlyPostalCitiesTest(unittest.TestCase):
         with open(pointer) as f:
             self.assertEqual(json.load(f)["rows"], 41706)
         self.assertEqual(len(uploads), 3)
-        # The next one checks against its rows.
-        r, args, _ = refresh()
+        first = [u for u in uploads if u.endswith("/postal_places.tsv.gz")]
+        self.assertEqual(len(first), 1)
+        # The next one, another attempt, checks against its rows and writes keys of its own:
+        # the first's data stays, and latest.json names the second's.
+        r, args, again = refresh(GITHUB_RUN_ATTEMPT="2")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(args[args.index("--previous-rows") + 1], "41706")
+        second = [u for u in again if u.endswith("/postal_places.tsv.gz")]
+        self.assertEqual(len(second), 1)
+        self.assertNotEqual(first, second)
+        self.assertTrue(os.path.exists(os.path.join(self.served, "s3", first[0][len("s3://"):])))
+        with open(pointer) as f:
+            self.assertEqual("s3://bucket/geocoder/" + json.load(f)["path"], second[0])
         # A refused refresh, a failed read and a latest.json of no row count leave it as it was.
         with open(pointer, "rb") as f:
             before = f.read()
