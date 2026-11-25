@@ -1589,6 +1589,21 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
     CHECK(!gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/bad", pbf, "--postal-places", places, "--prev-postal-cities",
                         yesterday},
                        log));
+    // So does a file of GeoNames' places of no row it can take: empty, or of
+    // another country's alone.
+    for (const std::string text : {"", "DE\t10115\tBerlin\tBE\n"}) {
+        const std::string none = root.path() + "/none" + std::to_string(text.size()) + ".tsv",
+                          none_log = root.path() + "/none" + std::to_string(text.size()) + ".log";
+        {
+            std::ofstream f(none, std::ios::trunc);
+            f << text;
+        }
+        std::remove(none_log.c_str());
+        CHECK(!gctest::run({GEOCODER_BUILD_INDEX_BIN, none + ".out", pbf, "--postal-places", none}, none_log));
+        std::ifstream l(none_log);
+        const std::string got((std::istreambuf_iterator<char>(l)), std::istreambuf_iterator<char>());
+        CHECK(got.find("--postal-places: no row of a ZIP in " + none) != std::string::npos);
+    }
 }
 
 namespace {

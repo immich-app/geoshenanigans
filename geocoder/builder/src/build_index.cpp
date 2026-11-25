@@ -333,7 +333,11 @@ static postal_cities::Places read_postal_places(const std::string& path) {
         }
     }
     std::istringstream in(std::move(text));
-    return postal_cities::parse_places(in, postcode_grid::grid_postcode);
+    postal_cities::Places places = postal_cities::parse_places(in, postcode_grid::grid_postcode);
+    // A file given that names no ZIP is none of GeoNames': a build of it
+    // would name a ZIP of few votes as one without --postal-places does.
+    if (places.empty()) throw std::runtime_error("--postal-places: no row of a ZIP in " + path);
+    return places;
 }
 
 // Yesterday's postal cities (--prev-postal-cities): any mode dir's
