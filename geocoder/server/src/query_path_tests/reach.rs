@@ -114,6 +114,31 @@ fn an_interpolation_line_several_cells_list_is_read_once_a_scan() {
 }
 
 #[test]
+fn two_interpolation_lines_whose_ids_differ_by_64_are_read_once_each_a_scan() {
+    // Lines 0 and 64 through the point, 10 m apart and 300 m long, listed together in many of the
+    // cells the scan reads: the house number lookup reads each name once, though one read after
+    // the other in each cell.
+    let mut dataset = TestIndex::new();
+    dataset.interpolation("Main Street", (1, 99, 0), &[(0.0, -150.0), (0.0, 150.0)]);
+    for _ in 1..64 {
+        dataset.dead_interpolation();
+    }
+    dataset.interpolation("Main Street", (2, 100, 1), &[(10.0, -150.0), (10.0, 150.0)]);
+    let cover = geo_cover(DEFAULT_SEARCH_DISTANCE / 6_371_000.0, DEFAULT_STREET_CELL_LEVEL);
+    let listing = cells_within(ORIGIN.0, ORIGIN.1, DEFAULT_STREET_CELL_LEVEL, cover).ids.iter()
+        .filter(|cell| dataset.geo_cells.get(cell).is_some_and(|lists| {
+            let lines = &lists[geo_index::INTERPOLATIONS];
+            lines.contains(&0) && lines.contains(&64)
+        }))
+        .count();
+    assert!(listing > 3, "{listing}");
+    let index = dataset.load();
+    let before = STRING_READS.with(|n| n.get());
+    assert_eq!(index.find_interp_on_way(ORIGIN.0, ORIGIN.1, "Main Street", radians_sq(100.0)), Some(50));
+    assert_eq!(STRING_READS.with(|n| n.get()) - before, 2);
+}
+
+#[test]
 fn the_nearer_of_two_streets_wins_whichever_cell_lists_the_farther() {
     // A street 60 m off one way and another 110 m off another way, from each corner of a cell and
     // its middle: the nearer is the road, though the farther comes first in record order.

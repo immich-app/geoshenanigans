@@ -409,17 +409,13 @@ fn origin_in_ring(points: &[(f64, f64)]) -> bool {
     inside
 }
 
-/// The interpolation ways in a lookup's lists of `cells`, in the order read, each once a scan, as
-/// a street is in nearest_street: a line several cells list is measured once, unless another
-/// read between takes its slot of a table of 64.
+/// The interpolation ways in a lookup's lists of `cells`, in the order read, each once a scan: a
+/// line several cells list is measured once.
 fn interps_once<'a>(lists: &'a GeoLists, cells: &NearCells) -> impl Iterator<Item = u32> + 'a {
-    let mut seen = [u32::MAX; 64];
-    (0..cells.ids.len()).flat_map(move |i| lists.list(i, geo_index::INTERPOLATIONS).iter().copied()).filter(move |&id| {
-        let slot = (id as usize) & 0x3F;
-        let first = seen[slot] != id;
-        seen[slot] = id;
-        first
-    })
+    let mut seen = std::collections::HashSet::new();
+    (0..cells.ids.len())
+        .flat_map(move |i| lists.list(i, geo_index::INTERPOLATIONS).iter().copied())
+        .filter(move |&id| seen.insert(id))
 }
 
 /// The cells a lookup round a point reads (cells_within), nearest first: their ids, and the
