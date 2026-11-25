@@ -256,8 +256,8 @@ TEST(a_boundary_links_one_node_of_its_wikidata_its_namesake_first) {
     f.country(30, -100, 45, -70, "United States", "US");
     f.boundary(38, -91, 42, -87, 4, "Illinois");
     f.boundary(39.6, -89.8, 39.9, -89.5, 8, "Springfield", {{"wikidata", "Q28515"}});
-    f.node(39.78, -89.65, {{"place", "city"}, {"name", "Springfield"}, {"wikidata", "Q28515"}});
     f.node(39.70, -89.60, {{"place", "suburb"}, {"name", "Springfield Centre"}, {"wikidata", "Q28515"}});
+    f.node(39.78, -89.65, {{"place", "city"}, {"name", "Springfield"}, {"wikidata", "Q28515"}});
     const std::vector<std::string> answers = answers_of(f, "wikidata-one", {{39.701, -89.601}});
     REQUIRE(answers.size() == 1);
     CHECK(names(answers[0], "suburb", "Springfield Centre"));

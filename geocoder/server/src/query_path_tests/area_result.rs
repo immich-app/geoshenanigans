@@ -42,12 +42,12 @@ fn a_locality_of_rank_25_answers_a_point_no_street_is_near() {
 }
 
 #[test]
-fn a_street_or_a_house_within_nominatims_reach_answers_instead() {
+fn a_street_a_house_or_a_poi_within_nominatims_reach_keeps_the_locality_out() {
     // lookup_street_poi reaches 0.007 degrees (0.006 and 0.001 of fuzziness), planar as ST_DWithin
     // on lon/lat, much farther than the street cells round the point that our own search reads: a
-    // street 500 m north (0.0045 degrees) answers, its address leaving Telfer out, and one 900 m
-    // north (0.0081 degrees) is out of reach, where Telfer answers.
-    for (north_m, locality) in [(500.0, None), (900.0, Some("Telfer"))] {
+    // street 750 m north (0.0067 degrees) is in reach, and Telfer is no answer, and one 800 m
+    // north (0.0072 degrees) is out of it, where Telfer answers.
+    for (north_m, locality) in [(750.0, None), (800.0, Some("Telfer"))] {
         let index = telfer(Some(north_m)).load();
         let address = address_at(&index, 0.0, 0.0);
         assert_eq!(address.get("locality").and_then(|v| v.as_str()), locality, "{north_m}");
@@ -56,7 +56,8 @@ fn a_street_or_a_house_within_nominatims_reach_answers_instead() {
     let index = telfer(Some(5000.0)).address("12", 0.0, 600.0).load();
     assert_eq!(address_at(&index, 0.0, 0.0).get("locality"), None);
     // And a named POI whose centre is 500 m north, which no street parents: a rank-30 row of
-    // placex, as near as the reach, whatever its street.
+    // placex, as near as the reach, whatever its street, keeps Telfer out, though our own primary
+    // lookup takes only a POI with a street.
     let mut dataset = telfer(Some(5000.0));
     let name_id = dataset.string("Old Mine Museum");
     let index = with_polygon_poi(dataset.load(), name_id, NO_DATA, (450.0, -50.0, 550.0, 50.0));
@@ -131,9 +132,10 @@ fn a_place_node_inside_the_locality_and_near_enough_answers_instead() {
     assert_eq!(address.get("locality"), None);
     assert_eq!(address["hamlet"], "Punmu");
     assert_eq!(display(&index, 0.0, 0.0), "Punmu, Western Australia, Testland");
-    // Of two nodes in reach, the one of the higher rank_search: a neighbourhood (24) 1.5 km off over
-    // a village (19) 2.5 km off, neither of whose fuzzy areas holds the point.
-    let index = telfer(Some(5000.0)).place("Punmu", 2, 2500.0, 0.0).place("Camp Seven", 5, -1500.0, 0.0).load();
+    // Of two nodes in reach, the one of the higher rank_search, then the nearer: a neighbourhood
+    // (24) 2.15 km off over a village (19) 2.05 km off, neither of whose fuzzy areas holds the
+    // point.
+    let index = telfer(Some(5000.0)).place("Punmu", 2, 2050.0, 0.0).place("Camp Seven", 5, -2150.0, 0.0).load();
     assert_eq!(display(&index, 0.0, 0.0), "Camp Seven, Western Australia, Testland");
     let index = telfer(Some(5000.0)).place("Punmu", 4, 2000.0, 2200.0).load();
     assert_eq!(address_at(&index, 0.0, 0.0)["locality"], "Telfer");
@@ -149,10 +151,11 @@ fn a_place_node_inside_the_locality_and_near_enough_answers_instead() {
 
 #[test]
 fn an_area_of_a_higher_rank_search_round_the_point_answers_and_the_locality_stays_out() {
-    // A suburb boundary (admin_level 10, rank_search 20) inside Telfer round the point is the
-    // area _lookup_area_address takes: its address, of the ranks below its own, has no Telfer.
+    // A suburb boundary (admin_level 10, rank_search 20) round the point, larger than Telfer, is
+    // the area _lookup_area_address takes, of the higher rank_search whatever its size: its
+    // address, of the ranks below its own, has no Telfer.
     let index = telfer(Some(5000.0))
-        .boundary("Telfer Village", 10, 0, (-2000.0, -2000.0, 2000.0, 2000.0)).rank(20)
+        .boundary("Telfer Village", 10, 0, (-30_000.0, -30_000.0, 2000.0, 30_000.0)).rank(20)
         .load();
     let address = address_at(&index, 0.0, 0.0);
     assert_eq!(address.get("locality"), None);

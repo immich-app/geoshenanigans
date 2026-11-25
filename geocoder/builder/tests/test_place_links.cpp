@@ -204,6 +204,21 @@ TEST(a_relation_links_the_first_of_its_label_members_that_is_a_place_node) {
     CHECK_EQ(w.link_of(kilbeg).node, int64_t(2));
 }
 
+TEST(two_relations_of_one_label_member_both_link_it_and_the_later_runner_claims_it) {
+    // Den Haag's city node is the label member of its level 8 relation (rank_search 14) and of
+    // its level 10 one (16), a later runner: each links it by its label (:291-312, which reads no
+    // link), and the level 10 one, indexed after, holds the claim.
+    World w("NL");
+    w.node(1, PlaceValue::CITY, 52.08, 4.31, "Den Haag");
+    const Box city{52.0, 4.2, 52.15, 4.4};
+    const uint32_t gemeente = w.relation(192736, 8, city, {PlaceValue::NONE, "Den Haag", "", 1});
+    const uint32_t woonplaats = w.relation(192737, 10, city, {PlaceValue::NONE, "Den Haag", "", 1});
+    w.link();
+    CHECK(w.link_of(gemeente).step == LinkStep::LABEL);
+    CHECK(w.link_of(woonplaats).step == LinkStep::LABEL);
+    CHECK_EQ(w.claimant(1), w.boundary(woonplaats));
+}
+
 TEST(a_label_member_is_left_to_its_relation_by_every_other_step) {
     // Den Haag (R192736, NL admin_level 8, 14) shares its wikidata (Q36600) with the city node, the
     // label member of the level 10 relation of its outline (R192737), a later runner. On a fresh
@@ -211,12 +226,13 @@ TEST(a_label_member_is_left_to_its_relation_by_every_other_step) {
     // label (:291-312, which reads no link); the public server, which indexes each polygon again
     // after its import, finds the node linked then. So the level 8 one links nothing, by its
     // wikidata or by name, and keeps its 14; so does Grad Sarajevo (R2567380, BA level 6),
-    // whose wikidata node is Sarajevo's label member (level 9). A label member of a relation of
-    // rank 0, which links nothing, is any step's.
+    // whose wikidata node is Sarajevo's label member (level 9). The level 8 one tagged place=city
+    // takes no type step to it either. A label member of a relation of rank 0, which links
+    // nothing, is any step's.
     World w("NL");
     w.node(1, PlaceValue::CITY, 52.08, 4.31, "Den Haag", "Q36600");
     const Box city{52.0, 4.2, 52.15, 4.4};
-    const uint32_t gemeente = w.relation(192736, 8, city, {PlaceValue::NONE, "Den Haag", "Q36600"});
+    const uint32_t gemeente = w.relation(192736, 8, city, {PlaceValue::CITY, "Den Haag", "Q36600"});
     const uint32_t woonplaats = w.relation(192737, 10, city, {PlaceValue::NONE, "Den Haag", "Q36600", 1});
     w.node(2, PlaceValue::TOWN, 52.5, 4.6, "Velsen", "Q9");
     const uint32_t velsen = w.relation(3, 8, Box{52.4, 4.5, 52.6, 4.7}, {PlaceValue::NONE, "Velsen", "Q9"});

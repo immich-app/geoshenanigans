@@ -26,11 +26,13 @@ fn a_place_area_keeps_its_place_rank_round_smaller_boundaries() {
 }
 
 #[test]
-fn a_place_area_lifts_a_boundary_only_from_rank_23_down_and_round_its_surface_point() {
-    // Prairie Township (R7238290, admin_level 7, rank 14) and Westland, a place=neighbourhood area
-    // (rank 24) a little larger, round the point but not round the township's middle. Nominatim
-    // lifts a boundary only into a place area of rank 1 to 23 that contains it (:912-929), so the
-    // township keeps 14 under either. A place=quarter area (22) round it lifts it to 24.
+fn a_boundary_is_labelled_by_the_rank_the_builder_stored_whatever_place_area_holds_the_point() {
+    // Prairie Township (R7238290, admin_level 7) and a place area round the point. The builder
+    // lifts a boundary only into a place area of rank 1 to 23 that contains it whole (:912-929),
+    // and the server reads the rank it stores: Westland, a place=neighbourhood area (rank 24)
+    // round the township, lifts nothing, as its rank is 24, nor does the place=quarter area
+    // Lincoln Village (22) round the point but not round the township, so the township keeps 14;
+    // a place=quarter area (22) round the whole township lifts it to 24, a city block.
     let township = |area: (&str, u8, Span), rank: u8| {
         TestIndex::in_country(b"US")
             .boundary("Ohio", 4, 7, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
@@ -196,7 +198,8 @@ fn boundaries_of_levels_11_and_12_are_parts_of_the_address_and_a_postal_area_non
     assert_eq!(address["suburb"], "Ortsteil Mitte");
     assert_eq!(address["neighbourhood"], "Ortslage Nord");
     assert_eq!(address["city_block"], "Block Sieben");
-    assert!(!address.as_object().unwrap().values().any(|v| v == "14467") || address["postcode"] == "14467");
+    assert_eq!(address["postcode"], "14467");
+    assert!(!address.as_object().unwrap().iter().any(|(key, value)| key != "postcode" && value == "14467"));
     let point = at(100.0, 100.0);
     let seen = &index.debug_admin(point.lat as f64, point.lng as f64)["seen_per_level"];
     assert_eq!(seen[12][0]["name"], "Block Sieben");

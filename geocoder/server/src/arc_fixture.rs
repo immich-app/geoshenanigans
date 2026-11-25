@@ -255,6 +255,7 @@ pub fn default_rank(admin_level: u8, place_type_override: u8) -> u8 {
         (15, 10 | 11) => 12,
         (15, 12) => 18,
         (15, 14) => 14,
+        (15, 15) => 25,
         _ => 0,
     }
 }

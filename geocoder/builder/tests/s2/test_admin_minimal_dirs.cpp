@@ -233,7 +233,7 @@ struct Region {
         add_polygon("Harbour", 8, 13, 12.0, "Hafen");      // 2, kept
         add_polygon("Quay", 10, 14, 13.0);           // 4, a quarter: dropped
         add_polygon("Northern State", 4, 15, 14.0);  // 5, kept
-        add_polygon("1234", 11, 16, 15.0);           // 6, a postcode area: dropped
+        add_polygon("1234", POSTAL_AREA_LEVEL, 16, 15.0);  // 6, a postcode area: dropped
         std::vector<bool> in_minimal;
         for (const AdminPolygon& p : data.admin_polygons)
             in_minimal.push_back(admin_minimal_keeps(p.admin_level, p.place_type_override));
@@ -404,8 +404,8 @@ TEST(the_boundary_tiers_share_their_records_and_rings_and_postcode_areas_are_rec
         CHECK(shared[slot].area == r.data.admin_polygons[slot].area);
         CHECK(shared[slot].name_id == r.data.admin_polygons[slot].name_id);
     }
-    // The postcode area is a level-11 record there; no dir has postal files.
-    CHECK_EQ(level_of(shared[6]), uint8_t(11));
+    // The postcode area is a record of its level there; no dir has postal files.
+    CHECK_EQ(level_of(shared[6]), POSTAL_AREA_LEVEL);
     for (const auto& entry : std::filesystem::recursive_directory_iterator(r.tmp.path))
         CHECK(entry.path().filename().string().rfind("postal_", 0) != 0);
     // The slots' sidecars beside the exact tier only.

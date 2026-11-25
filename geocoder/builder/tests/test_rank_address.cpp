@@ -416,7 +416,8 @@ TEST(a_country_ranks_its_levels_by_its_own_table_at_one_rank_search) {
 TEST(a_place_node_in_a_relation_of_its_rank_ranks_2_more_wherever_the_query_is) {
     // A village node (16) in a neighbouring township's level 8 relation (16) ranks 18; a suburb
     // node in a closed-way suburb area ranks 20, as ways promote nothing; a hidden node and a
-    // neighbourhood (24) keep their type's rank.
+    // neighbourhood (24) keep their type's rank, the neighbourhood inside a relation of its own
+    // rank too (level 12, 24), above the ranks a promotion takes.
     World w("US");
     w.relation(1, 4, Box{40, -80, 42, -76});
     w.relation(2, 8, Box{40.5, -79.5, 40.6, -79.4});
@@ -425,6 +426,7 @@ TEST(a_place_node_in_a_relation_of_its_rank_ranks_2_more_wherever_the_query_is) 
     w.place_way(3, AdminPlaceType::SUBURB, Box{41.0, -78.0, 41.1, -77.9});
     const uint32_t suburb = w.node(PlaceType::SUBURB, 41.05, -77.95);
     w.relation(4, 10, Box{41.2, -78.0, 41.3, -77.9});
+    w.relation(5, 12, Box{41.245, -77.955, 41.255, -77.945});
     const uint32_t neighbourhood = w.node(PlaceType::NEIGHBOURHOOD, 41.25, -77.95);
     const uint32_t hamlet = w.node(PlaceType::HAMLET, 41.26, -77.95);
     const RankStats stats = w.rank();

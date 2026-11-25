@@ -402,7 +402,7 @@ fn fixture_datasets_come_back_and_the_readers_read_them_as_before() {
     let places = crate::PlaceFiles::open(back.next().unwrap(), back.next().unwrap(), back.next().unwrap()).unwrap();
     for (n, &id) in nodes.iter().zip(&ids) {
         let got = places.node(id).unwrap();
-        let fields = |p: &PlaceNode| (p.lat.to_bits(), p.lng.to_bits(), p.name_id, p.place_type, p._pad1, p.parent_poly_id);
+        let fields = |p: &PlaceNode| (p.lat.to_bits(), p.lng.to_bits(), p.name_id, p.place_type, p._pad1, p.rank_address, p.parent_poly_id);
         assert_eq!(fields(&got), fields(n), "node {id}");
     }
     // POIs: points and polygons of every encoding, open and closed.
@@ -645,6 +645,9 @@ fn a_unit_with_bytes_past_its_end_or_another_version_or_kind_is_refused() {
     let mut v3 = unit.clone();
     v3[4] = 3;
     assert_eq!(refusal(&v3), "transport: a unit of transport version 3: this build reads version 2 only");
+    let mut v1 = unit.clone();
+    v1[4] = 1;
+    assert_eq!(refusal(&v1), "transport: a unit of transport version 1: this build reads version 2 only");
     let mut k9 = unit.clone();
     k9[8] = 9;
     assert_eq!(refusal(&k9), "transport: a unit of kind 9, which this build doesn't know");
