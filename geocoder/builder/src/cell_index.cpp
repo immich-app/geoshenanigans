@@ -760,12 +760,10 @@ void collect_postcode_grid(ParsedData& data) {
         [](double lat, double lng) {
             return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(GRID_LEVEL).id() >> cell_shift(GRID_LEVEL);
         });
-    data.postcode_grid_codes = std::move(grid.codes);
-    data.postcode_grid_cells = std::move(grid.cells);
-    if (!data.postcode_grid_cells.empty())
-        data.postcode_grid_file = encode_file(grid_rows(data.postcode_grid_cells, data.postcode_grid_codes, GRID_LEVEL));
+    data.postcode_grid_rows = grid_rows(grid.cells, grid.codes, GRID_LEVEL);
+    if (!data.postcode_grid_rows.empty()) data.postcode_grid_file = encode_file(data.postcode_grid_rows);
     std::cerr << "Postcode grid: " << grid.address_votes << " address votes, " << grid.tiger_votes << " TIGER line votes, "
-              << data.postcode_grid_codes.size() << " postcodes, " << data.postcode_grid_cells.size() << " cells, "
+              << grid.codes.size() << " postcodes, " << grid.cells.size() << " cells, " << data.postcode_grid_rows.size() << " runs, "
               << data.postcode_grid_file.size() << " bytes" << std::endl;
 }
 

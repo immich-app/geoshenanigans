@@ -504,13 +504,12 @@ struct ParsedData {
     };
     std::unordered_map<uint64_t, PostcodeAccum> postcode_accum;
 
-    // The postcode grid (postcode_grid_build.h): the postcodes its cells
-    // name and the cells holding votes, found once on the full data
-    // (collect_postcode_grid; a continent keeps the cells whose centre lies
-    // in it), and the region's postcode_grid.bin, which every mode dir holds
-    // alike: empty for a region of no such cell.
-    std::vector<postcode_grid::GridCode> postcode_grid_codes;
-    std::vector<uint64_t> postcode_grid_cells;
+    // The postcode grid (postcode_grid_build.h): the planet's runs, found
+    // once on the full data (collect_postcode_grid), which a continent's
+    // file is made of (region_rows) and which it doesn't keep, and the
+    // region's postcode_grid.bin, which every mode dir holds alike: empty for
+    // a region of no run.
+    std::vector<postcode_grid::LogicalRow> postcode_grid_rows;
     std::vector<uint8_t> postcode_grid_file;
 
     // The houses whose tag makes a centroid of another postcode than the

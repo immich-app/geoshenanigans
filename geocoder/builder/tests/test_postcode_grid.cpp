@@ -200,6 +200,47 @@ TEST(a_gap_takes_the_nearer_cell_within_reach_and_none_past_it) {
     CHECK(rows({}).empty());
 }
 
+// A region's grid is the planet's runs a query routed to it reads: the
+// region serves the level-10 cells 5 to 8. A house of 19026 10 cells before
+// cell 5 names the first cells of cell 5, where the region's own votes (one
+// house of 19073 in cell 7) would name none; the run of 19008 in cells 19 and
+// 20, which no query routed to the region reads, goes, and every cell the
+// region serves has the planet's postcode.
+TEST(a_regions_grid_is_the_planets_runs_a_query_routed_there_reads) {
+    using postcode_grid::vote;
+    const std::vector<GridCode> codes = {{US, "19008"}, {US, "19026"}, {US, "19073"}};
+    const uint64_t K = uint64_t(1) << 12;  // level-16 cells a level-10 cell
+    const uint64_t a = 5 * K - 10, d = 7 * K + 50, c = 20 * K + 100;
+    const std::vector<LogicalRow> planet = postcode_grid::grid_rows({vote(a, 1), vote(d, 2), vote(c, 0)}, codes, L);
+    auto served = [&](uint64_t id) {
+        int level = 0;
+        REQUIRE(postcode_grid::level_of(id, level) && level == 10);
+        const uint64_t at = id >> postcode_grid::cell_shift(10);
+        return at >= 5 && at < 9;
+    };
+    const std::vector<LogicalRow> region = postcode_grid::region_rows(planet, L, 10, served);
+    auto code_at = [](const std::vector<LogicalRow>& rows, uint64_t pos) {
+        std::string code = "-";
+        for (const LogicalRow& r : rows)
+            if (r.cell <= cell(pos)) code = r.country_code ? std::string(postcode_grid::code_of(r)) : "-";
+        return code;
+    };
+    CHECK_EQ(code_at(planet, 5 * K + 5), std::string("19026"));
+    CHECK_EQ(code_at(postcode_grid::grid_rows({vote(d, 2)}, codes, L), 5 * K + 5), std::string("-"));
+    CHECK_EQ(code_at(region, 5 * K + 5), std::string("19026"));
+    CHECK(same(region, {row(a - 150, US, "19026"), none(a + 151), row(d - 150, US, "19073"), none(d + 151)}));
+    size_t differ = 0;
+    for (uint64_t pos = 5 * K; pos < 9 * K; pos++) differ += code_at(planet, pos) != code_at(region, pos);
+    CHECK_EQ(differ, size_t(0));
+    CHECK_EQ(code_at(planet, c), std::string("19008"));
+    CHECK_EQ(code_at(region, c), std::string("-"));
+    // A region that serves none of the runs has no rows; one that serves
+    // every cell has the planet's.
+    CHECK(postcode_grid::region_rows(planet, L, 10, [](uint64_t) { return false; }).empty());
+    CHECK(same(postcode_grid::region_rows(planet, L, 10, [](uint64_t) { return true; }), planet));
+    CHECK_EQ(refusal(region), std::string());
+}
+
 TEST(the_grid_file_is_run_coded_as_the_format_lays_it_out) {
     // A run of 19026 from cell 1000 and none from 1003, at level 16.
     const std::vector<uint8_t> file = postcode_grid::encode_file({row(1000, US, "19026"), none(1003)});
