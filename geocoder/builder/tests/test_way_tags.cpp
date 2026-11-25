@@ -109,3 +109,15 @@ TEST(way_needs_nodes_matches_the_way_pass_rule) {
     CHECK(!needs({{"shop", "bakery"}, {"name", "X"}}));
     CHECK(!needs({{"amenity", "school"}}));
 }
+
+TEST(a_place_area_way_named_by_name_en_alone_needs_its_nodes) {
+    // The way pass makes a place area of a closed way of a neighbourhood, quarter, suburb,
+    // borough or locality named by best_name(), name:en as much as name: its nodes are resolved.
+    for (const char* place : {"locality", "neighbourhood", "quarter", "suburb", "borough"}) {
+        CHECK(needs({{"place", place}, {"name:en", "Obora"}}));
+        CHECK(!needs({{"place", place}, {"name:en", ""}}));
+    }
+    // Other place ways are POI ways, which qualify on `name`.
+    CHECK(!needs({{"place", "island"}, {"name:en", "Long Island"}}));
+    CHECK(!needs({{"place", "village"}, {"name:en", "Lhota"}}));
+}

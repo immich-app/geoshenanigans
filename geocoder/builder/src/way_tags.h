@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "admin_rank_config.h"
 #include "geometry.h"
 
 struct WayTags {
@@ -122,15 +123,33 @@ inline WayTags parse_way_tags(const uint32_t* tag_keys, const uint32_t* tag_vals
     return t;
 }
 
+// Whether a closed way of this place tag is a place area of its own: the
+// rank-20+ place types (neighbourhood, quarter, suburb, borough) and a
+// locality, of rank 25 and in no address. Higher-level place types on closed
+// ways are rare, and taking them risks promoting a landuse polygon into the
+// city or state chain.
+inline bool is_place_area_way(const char* place) {
+    switch (place_label_of(place_value_of(place))) {
+        case AdminPlaceType::NEIGHBOURHOOD:
+        case AdminPlaceType::QUARTER:
+        case AdminPlaceType::SUBURB:
+        case AdminPlaceType::BOROUGH:
+        case AdminPlaceType::LOCALITY: return true;
+        default: return false;
+    }
+}
+
 // Whether the way pass resolves this way's node coordinates; every other
 // way is skipped before any lookup. `relation_member`: the way has refs and
 // belongs to a pass-1 admin/postal/place or POI relation. Highways and POI
 // ways qualify on `name`, not best_name(), and ways tagged only
-// landuse/shop never do.
+// landuse/shop never do; a place area's way (is_place_area_way) on
+// best_name(), as the way pass names the area.
 inline bool way_needs_nodes(const WayTags& t, bool relation_member) {
     return t.interpolation || t.housenumber ||
         (t.highway && is_included_highway_full(t.highway, t.footway) && t.name) ||
         t.boundary ||
         relation_member ||
-        (t.has_poi_tags() && t.name);
+        (t.has_poi_tags() && t.name) ||
+        (t.place && t.best_name() && is_place_area_way(t.place));
 }

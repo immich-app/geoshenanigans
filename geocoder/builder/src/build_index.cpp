@@ -3040,19 +3040,7 @@ static int run(int argc, char* argv[]) {
                     // the polygon.
                     if (!boundary && t.place && t_best_name
                             && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
-                        AdminPlaceType pt = classify_place_override(t.place);
-                        // Only the rank-20+ place types (neighbourhood,
-                        // quarter, suburb, borough) and a locality, of rank
-                        // 25 and in no address — higher-level place types
-                        // on closed ways are rare and adding them risks
-                        // promoting a landuse polygon into the city / state
-                        // chain.
-                        bool want = (pt == AdminPlaceType::NEIGHBOURHOOD
-                                  || pt == AdminPlaceType::QUARTER
-                                  || pt == AdminPlaceType::SUBURB
-                                  || pt == AdminPlaceType::BOROUGH
-                                  || pt == AdminPlaceType::LOCALITY);
-                        if (want && all_valid && resolved_locs.size() >= 3) {
+                        if (is_place_area_way(t.place) && all_valid && resolved_locs.size() >= 3) {
                             std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
                             local.closed_way_admins.push_back({std::move(verts), std::string(t_best_name), uint8_t(15), std::string(),
                                                                way_id, static_cast<uint8_t>(place_value_of(t.place)),
