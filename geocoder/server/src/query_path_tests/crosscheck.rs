@@ -327,6 +327,28 @@ fn a_boundary_the_street_runs_into_cells_away_from_the_house_is_a_row_of_its_ran
 
 
 #[test]
+fn a_polygon_holding_the_house_that_the_street_misses_is_no_row() {
+    // House 4 lies in Springfield, of level 8, and Main Street, a few metres south, does not: a
+    // house's address rows are its street's (results.py _get_address_lookup_id), the areas the
+    // street runs through, so Springfield is none of them. The town node Springfield, in both
+    // Springfield and Greenburgh round the street (closed ways, which raise no node), is a row of
+    // rank 16: the house's addr:city makes it the rank's part, which leaves no city.
+    let places = |index: &mut TestIndex| {
+        index
+            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0)).of_way()
+            .boundary("Springfield", 8, 0, (5.0, -100.0, 4000.0, 100.0)).of_way()
+            .place("Springfield", 1, 100.0, 50.0);
+    };
+    let (display, address) = answer_at(&main_street(None, places), 10.0, 0.0);
+    assert_eq!(display, "4 Main Street, Springfield, United States");
+    assert_eq!((&address["city"], &address["town"]), (&serde_json::json!("Springfield"), &serde_json::Value::Null));
+    let (display, address) = answer_at(&main_street(Some("Springfield"), places), 10.0, 0.0);
+    assert_eq!(display, "4 Main Street, Springfield, United States");
+    assert_eq!((&address["city"], &address["town"]), (&serde_json::Value::Null, &serde_json::json!("Springfield")));
+}
+
+
+#[test]
 fn a_place_node_a_place_area_of_its_name_and_rank_links_is_no_row() {
     // High Wycombe, a place=town area of rank 16, holds the town node of its name, whose rank is
     // its own: find_linked_place's name match, which runs for ways as well as relations, links the

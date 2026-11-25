@@ -3829,17 +3829,27 @@ impl Index {
     /// rank (results.py:617-621: fromarea, then distance, descending): the polygons named so, by
     /// their own name or by a place node's they link, the farthest from `feature` first
     /// (area_row_distance), then the place nodes of `nodes` (PlaceResult::named_rows), the
-    /// farthest first, but those a place area links (links_by_name). The polygons are those of
-    /// `areas`, the address's ranked polygons (found by `scan`), and the others that are rows of
-    /// `feature` as getNearFeatures takes them (partition-functions.sql:39-44): one of the scan
-    /// holding the point where the feature is one, such as a larger boundary of a level `areas`
-    /// holds it by, else one the street runs through, of any admin cell under the street, each at
+    /// farthest first, but those a place area links (links_by_name). The polygons are those that
+    /// are rows of `feature` as getNearFeatures takes them (partition-functions.sql:39-44): of a
+    /// point, the polygons holding it, of a street (a house's rows are its street's), those the
+    /// street runs through. They are those of `areas`, the address's ranked polygons (found by
+    /// `scan`), and the others: of the scan where the feature is a point, such as a larger
+    /// boundary of a level `areas` holds it by, else of any admin cell under the street, each at
     /// area_row_rank's rank; `country` is the point's, upper case.
     fn crosscheck_rows(&self, name: u32, areas: &[RankedPoly], scan: &mut AdminScan, nodes: &[NamedRow],
                        feature: PlaceFeature<'_>, country: &str) -> Vec<CrosscheckRow<'_>> {
         let named = |poly: &AdminPolygon| poly.name_id == name || self.links_name(poly, name);
         let same = |a: &AdminPolygon, b: &AdminPolygon| a.ring_offset == b.ring_offset && a.ring_bytes == b.ring_bytes;
-        let mut polygons: Vec<RankedPoly> = areas.iter().filter(|r| named(&r.poly)).copied().collect();
+        let geometry = &self.admin_geometry;
+        let runs_through = |line: &[NodeCoord], poly: &AdminPolygon| geometry.has_rings(poly)
+            && line_runs_through(line, &geometry.rings(poly), |lat, lng| geometry.contains_once(poly, AdminPoint::new(lat, lng)));
+        // A polygon holding the point is a row of a street only where the street runs through it.
+        let mut polygons: Vec<RankedPoly> = areas.iter()
+            .filter(|r| named(&r.poly) && match feature {
+                PlaceFeature::Point(..) => true,
+                PlaceFeature::Line(line) => runs_through(line, &r.poly),
+            })
+            .copied().collect();
         // The scan lists the point's admin cell alone, and a street runs through the areas of
         // every cell under it.
         let mut candidates = scan.rings.clone();
@@ -3866,11 +3876,7 @@ impl Index {
             if !ADDRESS_AREA_RANKS.contains(&rank) { continue; }
             let row = match feature {
                 PlaceFeature::Point(..) => scan.pip.holds(self, id, &poly),
-                PlaceFeature::Line(line) => {
-                    let geometry = &self.admin_geometry;
-                    geometry.has_rings(&poly)
-                        && line_runs_through(line, &geometry.rings(&poly), |lat, lng| geometry.contains_once(&poly, AdminPoint::new(lat, lng)))
-                }
+                PlaceFeature::Line(line) => runs_through(line, &poly),
             };
             if row {
                 polygons.push(RankedPoly { poly, rank_address: rank });
