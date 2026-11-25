@@ -381,6 +381,20 @@ fn an_address_and_a_street_over_a_pole_are_as_far_as_they_are() {
 }
 
 #[test]
+fn an_interpolation_number_by_a_pole_is_along_its_great_circle() {
+    // By the pole, where the scans measure on the gnomonic projection about the point: a line
+    // numbered 1 to 3001 along the meridian from 84° N to the pole, at 89° N, five sixths of the
+    // way along it, is number 2501; though five sixths of the way along its projection,
+    // tan 5° / (tan 5° + tan 1°), would be 2502.
+    let q = (89.0, 0.0);
+    let line = vec![NodeCoord { lat: 84.0, lng: 0.0 }, NodeCoord { lat: 90.0, lng: 0.0 }];
+    let index = TestIndex::around(q).interpolation_through("Pole Road", (1, 3001, 0), line).load();
+    assert_eq!(index.find_interp_on_way(q.0, q.1, "Pole Road", radians_sq(100.0)), Some(2501));
+    let interp = &index.debug_primary(q.0, q.1)["interp"];
+    assert!(interp["number"] == 2501 && about(&interp["dist_m"], 0.0), "{interp}");
+}
+
+#[test]
 fn an_interpolation_line_is_as_far_as_its_point_nearest_in_metres() {
     // At 60° N, a line running north-east whose nearest point lies 95 m south-east of the point,
     // numbered 1 to 301 along its 300 m: a street of its name takes its number from it, within
