@@ -3179,8 +3179,9 @@ impl Index {
     // --- Combined query ---
 
     /// The admin rows of the address hanging from `feature` of a result whose centroid is
-    /// `centroid` (area_rows), the point (lat, lng) where none is given.
-    fn resolve_admin<'a>(&'a self, scan: &mut AdminScan, lat: f64, lng: f64, street: Option<&(f64, WayRow, u32)>,
+    /// `centroid` (area_rows), the point (lat, lng) where none is given; `street` is the way whose
+    /// parent chain the coarse rows come from.
+    fn resolve_admin<'a>(&'a self, scan: &mut AdminScan, lat: f64, lng: f64, street: Option<u32>,
                          feature: PlaceFeature<'_>, centroid: Option<(f64, f64)>) -> AdminResult<'a> {
         // Hybrid admin resolution: when the primary is a street with a
         // pre-computed parent polygon, walk its admin_parents chain for
@@ -3196,8 +3197,7 @@ impl Index {
         let admin_pip = self.find_admin_at(scan, feature, centroid);
         let admin_chain = (|| -> Option<AdminResult<'_>> {
             let wp = self.way_parents.as_ref()?;
-            let (_, _, way_idx) = street?;
-            let start = Self::sidecar_u32(wp, u64::from(*way_idx))?;
+            let start = Self::sidecar_u32(wp, u64::from(street?))?;
             Some(self.find_admin_from_chain_in(start, scan, feature, centroid))
         })();
         // Nominatim's answer puts, at each rank, a boundary holding the
@@ -3221,8 +3221,7 @@ impl Index {
         let coarse = |admin: &AdminResult<'a>| COARSE.map(|label| admin.row(label).cloned());
         let mut at_street: Option<[Option<AddressRow<'a>>; 3]> = None;
         let [state, region, province] = coarse_fields(coarse(&chain), coarse(&admin_pip), |row| row.name.clone(), || {
-            let (_, _, way_idx) = street?;
-            let (plat, plng) = self.closest_point_on_way(*way_idx, lat, lng)?;
+            let (plat, plng) = self.closest_point_on_way(street?, lat, lng)?;
             at_street = Some(coarse(&self.find_admin(plat, plng)));
             at_street.clone()
         });
@@ -3609,7 +3608,10 @@ impl Index {
         } else {
             street.as_ref().and_then(|(_, _, way_idx)| self.closest_point_on_way(*way_idx, lat, lng))
         };
-        let admin = self.resolve_admin(&mut admin_scan, lat, lng, street.as_ref(), feature, centroid);
+        // The coarse rows come from the parent chain of the street the address hangs from, as a
+        // house's rows are its parent street's, else of the nearest street.
+        let chain_street = address_street.filter(|&id| id != NO_DATA).or(street.as_ref().map(|(_, _, id)| *id));
+        let admin = self.resolve_admin(&mut admin_scan, lat, lng, chain_street, feature, centroid);
         // No address point: Nominatim falls back to TIGER in the US.
         if let Some(refine_max_sq) = tiger_reach_sq {
             if house_number.is_none() && admin.country_code == Some(*b"US") {
@@ -9399,6 +9401,27 @@ mod query_path_tests {
         assert_eq!(address_at(&index, 1010.0, 0.0)["country"], "Farland");
         // Mill Lane has no parent: the boundaries at the point answer.
         assert_eq!(address_at(&index, 2010.0, 0.0)["country"], "Testland");
+    }
+
+    #[test]
+    fn query_walks_the_parent_chain_of_the_answering_house_s_street() {
+        // The house on High Street answers, the nearest feature, and Main Street is the nearest
+        // street. Nominatim takes a house's address from its parent street's rows (results.py
+        // _get_address_lookup_id): High Street's chain, Farland, not Main Street's.
+        let mut dataset = TestIndex::new();
+        dataset
+            .boundary("Farland", 2, 0, (60_000.0, 60_000.0, 70_000.0, 70_000.0))
+            .boundary("Otherland", 2, 0, (-70_000.0, -70_000.0, -60_000.0, -60_000.0))
+            .street("Main Street", &parallel(0.0, 200.0)).way_parent(2)
+            .street("High Street", &parallel(60.0, 200.0)).way_parent(1)
+            .address("7", 25.0, 0.0);
+        let mut index = dataset.load();
+        index.admin_parents = Some(FileBytes::Owned([NO_DATA; 3].iter().flat_map(|parent| parent.to_le_bytes()).collect()));
+
+        let address = address_at(&index, 22.0, 0.0);
+
+        assert_eq!((&address["road"], &address["house_number"]), (&serde_json::json!("High Street"), &serde_json::json!("7")));
+        assert_eq!(address["country"], "Farland");
     }
 
     #[test]
