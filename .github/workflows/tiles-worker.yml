@@ -50,6 +50,38 @@ jobs:
         run: deployment/scripts/tiles-cleanup.test.sh
         if: ${{ !cancelled() }}
 
+  map-styles:
+    name: Map Styles
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ./map-styles
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: './map-styles/.nvmrc'
+
+      - name: Run npm install
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test
+        if: ${{ !cancelled() }}
+
+      # Generates and validates every theme, as tiles-deploy does before publishing them.
+      - name: Build styles
+        run: npm run build
+        if: ${{ !cancelled() }}
+
   build:
     name: Build
     runs-on: ubuntu-latest
