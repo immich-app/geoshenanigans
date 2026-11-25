@@ -79,6 +79,19 @@ fn only_a_poi_of_rank_search_30_near_the_point_leaves_the_locality_out() {
 }
 
 #[test]
+fn a_locality_answers_where_no_country_holds_the_point() {
+    // Telfer alone round the point, in no country polygon of the data, and no street near:
+    // lookup_area takes it as inside a country, and it answers.
+    let mut index = TestIndex { origin: ORIGIN, ..TestIndex::default() };
+    index
+        .boundary("Telfer", 9, 15, (-20_000.0, -20_000.0, 20_000.0, 20_000.0)).rank(25)
+        .street("Telfer Road", &[(5000.0, -500.0), (5000.0, 500.0)]);
+    let index = index.load();
+    assert_eq!(address_at(&index, 0.0, 0.0)["locality"], "Telfer");
+    assert_eq!(display(&index, 0.0, 0.0), "Telfer");
+}
+
+#[test]
 fn a_dir_without_streets_answers_as_on_a_street_and_leaves_the_locality_out() {
     // An admin dir has no streets to tell a point no street is near: its answers stand for a
     // street's at the point, whose address takes no area of rank 25.

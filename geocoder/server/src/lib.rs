@@ -3603,18 +3603,6 @@ impl Index {
             admin.country_code,
         );
 
-        // Where no boundary holds the point, its place nodes are the whole
-        // address: Nominatim has no country in Antarctica (no `aq` in
-        // settings/country_settings.yaml) and answers a station with its
-        // place nodes alone. Boundaries without a country, city or state
-        // still give no answer: they are mostly a coast or border our
-        // country polygon misses.
-        let anchored = road.is_some() || ["country", "city", "state"].iter().any(|label| admin.row(label).is_some());
-        let place_nodes_only = admin.is_empty() && !place.rows.is_empty();
-        if !anchored && !place_nodes_only {
-            return Address::default();
-        }
-
         let (landmark_name, places) = self.collect_landmark_and_places(lat, lng);
         // Where no street, house or POI is near, Nominatim answers with an area round the point,
         // and one of AREA_RESULT_RANK leads the answer (area_result). A dir without streets knows
@@ -3626,6 +3614,19 @@ impl Index {
         } else {
             None
         };
+        // Where no boundary holds the point, its place nodes are the whole
+        // address: Nominatim has no country in Antarctica (no `aq` in
+        // settings/country_settings.yaml) and answers a station with its
+        // place nodes alone. Boundaries without a country, city or state
+        // still give no answer: they are mostly a coast or border our
+        // country polygon misses. An area that answers (area_result) is
+        // an answer of its own, with a country or not.
+        let anchored = road.is_some() || area_result.is_some()
+            || ["country", "city", "state"].iter().any(|label| admin.row(label).is_some());
+        let place_nodes_only = admin.is_empty() && !place.rows.is_empty();
+        if !anchored && !place_nodes_only {
+            return Address::default();
+        }
 
         // Note on name-suffix normalisation (previously considered as
         // Option 6): Nominatim does not normalise the localname it
