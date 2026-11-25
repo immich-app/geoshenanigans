@@ -879,6 +879,63 @@ TEST(a_build_keeps_an_addresss_addr_city_where_a_place_has_its_name) {
     // The same data again on top of the first build.
     REQUIRE(build(with_pbf, again, {"--prev-output", with}));
     CHECK(tree(again) == files);
+
+    // Changed data on top of the first build: the house of Gemeinde 3 gone,
+    // a new one of Testville further along. The houses kept keep their slots,
+    // so the slots are not a fresh build's order, and each value follows its
+    // house; a slot no house holds is NO_DATA.
+    std::vector<TestObject> changed = with_cities(true);
+    changed.erase(std::remove_if(changed.begin(), changed.end(),
+                                 [](const TestObject& o) { return o.type == OsmType::Node && o.id == 953; }),
+                  changed.end());
+    changed.push_back(node(961, 471420000, 81510000,
+                           {{"addr:housenumber", "15"}, {"addr:street", "Teststrasse"}, {"addr:city", "Testville"}}));
+    std::stable_sort(changed.begin(), changed.end(), [](const TestObject& a, const TestObject& b) {
+        return a.type != b.type ? a.type < b.type : a.id < b.id;
+    });
+    const std::string changed_pbf = root.path() + "/changed.osm.pbf", chained = root.path() + "/chained",
+                      fresh = root.path() + "/fresh";
+    write_test_pbf(changed_pbf, changed, 1000);
+    REQUIRE(build(changed_pbf, chained, {"--prev-output", with}));
+    REQUIRE(build(changed_pbf, fresh, {}));
+    std::vector<CityAt> moved = cities_at();
+    moved.erase(moved.begin() + 1);
+    moved.push_back({47.142, 8.151, "Testville"});
+    const auto chained_files = tree(chained), fresh_files = tree(fresh);
+    auto points_of = [](const Addresses& addresses) {
+        std::vector<std::pair<float, float>> out;
+        for (const AddrPoint& a : addresses.points) out.push_back({a.lat, a.lng});
+        return out;
+    };
+    for (const char* region : {"planet", "europe"}) {
+        const std::string dir = std::string(region) + "/full/";
+        const Addresses addresses = addresses_of(chained_files, dir);
+        const std::vector<uint32_t> cities = side_files(chained_files, dir).at("addr_cities.bin");
+        const std::string core = core_strings(chained_files, dir);
+        REQUIRE(cities.size() == addresses.points.size());
+        CHECK(points_of(addresses) != points_of(addresses_of(fresh_files, dir)));
+        size_t found = 0;
+        for (size_t i = 0; i < addresses.points.size(); i++) {
+            const AddrPoint& a = addresses.points[i];
+            if (a.lat == 0 && a.lng == 0) {
+                CHECK_EQ(cities[i], NO_DATA);
+                continue;
+            }
+            for (const CityAt& w : moved) {
+                if (std::fabs(a.lat - w.lat) > 5e-5 || std::fabs(a.lng - w.lng) > 5e-5) continue;
+                found++;
+                const int failures_before = gctest::failures();
+                if (w.city.empty()) {
+                    CHECK_EQ(cities[i], NO_DATA);
+                } else {
+                    REQUIRE(cities[i] < core.size());
+                    CHECK(std::string(core.c_str() + cities[i]) == w.city);
+                }
+                if (gctest::failures() > failures_before) std::printf("    chained %s at %.4f %.4f\n", dir.c_str(), w.lat, w.lng);
+            }
+        }
+        CHECK_EQ(found, moved.size());
+    }
 }
 
 TEST(an_admin_polygon_is_built_whatever_simplifying_would_leave_of_its_ring) {

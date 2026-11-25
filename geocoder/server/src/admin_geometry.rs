@@ -293,9 +293,10 @@ impl AdminGeometry {
         self.point_on_surface_with(poly, &mut Vec::new())
     }
 
-    /// `point_on_surface` memoised, as point_on_surface_in keeps it.
-    pub fn point_on_surface_memo(&self, poly: &AdminPolygon) -> Option<(f32, f32)> {
-        self.memo_surface_point(poly, self.ring_block(poly)?).map(|(lat, lng)| (lat as f32, lng as f32))
+    /// `point_on_surface` memoised, as point_on_surface_in keeps it, in full: a rank's areas are
+    /// taken by their centres' distances, which f32 would tie.
+    pub fn point_on_surface_memo(&self, poly: &AdminPolygon) -> Option<(f64, f64)> {
+        self.memo_surface_point(poly, self.ring_block(poly)?)
     }
 
     /// `point_on_surface`, its scan line's crossings gathered in `crossings`, which a caller

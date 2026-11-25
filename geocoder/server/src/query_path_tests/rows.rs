@@ -319,19 +319,41 @@ fn a_node_outside_its_boundary_or_its_fuzzy_area_s_reach_or_at_a_rank_an_area_ho
     assert_eq!(address["neighbourhood"], serde_json::Value::Null);
 
     // South Van Ness Avenue, San Francisco (N10555180060): the place=neighbourhood area South of
-    // Market holds rank 24, so Hayes Valley, a neighbourhood node outside it, is no row.
-    let mut index = country("United States", b"US");
-    index
-        .boundary("California", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
-        .boundary("San Francisco", 6, 1, (-10_000.0, -10_000.0, 10_000.0, 10_000.0)).rank(16)
-        .boundary("South of Market", 15, 5, (-300.0, -300.0, 2000.0, 2000.0))
-        .place("Mission", 3, 1500.0, 0.0)
-        .place("Civic Center", 6, -400.0, 300.0)
-        .place("Hayes Valley", 5, 300.0, -400.0)
-        .street("South Van Ness Avenue", &[(0.0, -200.0), (0.0, 200.0)]);
-    let (display, address) = answer_at(&index.load(), 0.0, 0.0);
-    assert_eq!(display, "South Van Ness Avenue, South of Market, Civic Center, Mission, San Francisco, California, United States");
-    assert_eq!(address["neighbourhood"], "South of Market");
+    // Market holds rank 24, so Hayes Valley, a neighbourhood node inside it whose fuzzy area holds
+    // the street, is no row the address shows; without the area it is the neighbourhood. The area
+    // is a closed way here, inside which a node keeps its rank (placex_triggers.sql:984-1004).
+    let index = |south_of_market: bool| {
+        let mut index = country("United States", b"US");
+        index
+            .boundary("California", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+            .boundary("San Francisco", 6, 1, (-10_000.0, -10_000.0, 10_000.0, 10_000.0)).rank(16);
+        if south_of_market {
+            index.boundary("South of Market", 15, 5, (-300.0, -300.0, 2000.0, 2000.0));
+        }
+        index
+            .place("Mission", 3, 1500.0, 0.0)
+            .place("Civic Center", 6, -400.0, 300.0)
+            .place("Hayes Valley", 5, 300.0, -200.0)
+            .street("South Van Ness Avenue", &[(0.0, -200.0), (0.0, 200.0)]);
+        index.load()
+    };
+    for (south_of_market, neighbourhood) in [(true, "South of Market"), (false, "Hayes Valley")] {
+        let index = index(south_of_market);
+        let (display, address) = answer_at(&index, 0.0, 0.0);
+        assert_eq!(display, format!("South Van Ness Avenue, {neighbourhood}, Civic Center, Mission, San Francisco, California, United States"));
+        assert_eq!(address["neighbourhood"], neighbourhood);
+        // The place nodes' rows themselves, before the address merges them: none at 24 where the
+        // area holds the rank.
+        let p = at(0.0, 0.0);
+        let (lat, lng) = (f64::from(p.lat), f64::from(p.lng));
+        let line = index.way_nodes(0).unwrap();
+        let mut scan = AdminScan::new(&index, lat, lng);
+        let admin = index.find_admin_in(&mut scan, PlaceFeature::Line(&line));
+        let gates = index.find_current_boundaries(&mut scan, admin.country_code, PlaceFeature::Line(&line));
+        let rows = index.find_places(PlaceFeature::Line(&line), &gates, admin.boundary_ranks, None).rows;
+        let at_24: Vec<&str> = rows.iter().filter(|row| row.rank == 24).map(|row| &*row.name).collect();
+        assert_eq!(at_24, if south_of_market { vec![] } else { vec!["Hayes Valley"] }, "{rows:?}");
+    }
 
     // Kartavya Path, New Delhi (W1307222666): Nominatim answers the suburb Raisina Hill.
     let mut index = country("India", b"IN");
@@ -386,19 +408,41 @@ fn the_walk_weighs_the_distance_of_a_rank_16_area_by_its_search_rank() {
 
 #[test]
 fn an_area_the_street_does_not_run_through_is_no_row_of_a_rank_it_shares() {
-    // Two areas of rank 20 hold the point, 30 m off the street: the boundary Westend, which the
-    // street runs through, and the suburb area Eastend, which ends 10 m short of it.
-    // getNearFeatures takes an area for a street only where the two share a stretch
-    // (partition-functions.sql:39-44), so Eastend is no row of the street, and Westend is the
-    // rank's.
+    // Two areas of rank 20 hold the house, 30 m off the street: the boundary Westend, which the
+    // street runs through between its two nodes, both outside it, and the suburb area Eastend,
+    // which ends 10 m short of it. getNearFeatures takes an area for a street only where the two
+    // share a stretch (partition-functions.sql:39-44), so Eastend, though it holds the house's
+    // centroid and the walk accepts Westend, is no row of the street, and Westend is the rank's.
     let mut index = country("Testland", b"XX");
     index
         .boundary("Westend", 10, 0, (-1000.0, -1000.0, 1000.0, 1000.0))
         .boundary("Eastend", 15, 4, (10.0, -500.0, 1500.0, 1500.0))
-        .street("Border Street", &[(0.0, -200.0), (0.0, 200.0)]);
+        .street("Border Street", &[(0.0, -1200.0), (0.0, 1200.0)])
+        .address("5", 30.0, 0.0);
     let (display, address) = answer_at(&index.load(), 30.0, 0.0);
-    assert_eq!(display, "Border Street, Westend, Testland");
+    assert_eq!(display, "Border Street 5, Westend, Testland");
     assert_eq!(address["suburb"], "Westend");
+}
+
+#[test]
+fn an_area_the_walk_does_not_accept_shows_only_where_it_holds_the_result_s_centroid() {
+    // Two areas of rank 20 hold the point and meet Bend Street: the boundary Lowside round the
+    // street's middle, which the walk accepts (isaddress, score 0), and the suburb area Highside,
+    // which the street enters where it turns north. The street is the answer, its centroid its
+    // point nearest the query (ST_ClosestPoint, reverse.py:46). West of the turn that point lies
+    // outside Highside, which then scores -1 (results.py:611-632), and Lowside is the rank's row;
+    // past the turn Highside holds it, scores 1 and is the row.
+    let mut index = country("Testland", b"XX");
+    index
+        .boundary("Lowside", 10, 0, (-100.0, -300.0, 50.0, 300.0))
+        .boundary("Highside", 15, 4, (20.0, -300.0, 300.0, 300.0))
+        .street("Bend Street", &[(0.0, -200.0), (0.0, 100.0), (100.0, 100.0)]);
+    let index = index.load();
+    for (east, suburb) in [(-100.0, "Lowside"), (150.0, "Highside")] {
+        let (display, address) = answer_at(&index, 30.0, east);
+        assert_eq!(display, format!("Bend Street, {suburb}, Testland"), "{east}");
+        assert_eq!(address["suburb"], suburb, "{east}");
+    }
 }
 
 #[test]

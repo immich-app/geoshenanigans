@@ -509,7 +509,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     parallel_each(out.addr_postcode_ids, add_used);
     for (const auto& [key, _acc] : out.postcode_accum) add_used(postcode_key_pc(key));
     // An addr:city keeps a string only another record of the region keeps,
-    // which the partition below then holds to being a core one.
+    // which the partition below then holds to a place's or a boundary's.
 
     // The kept strings, ascending by planet offset, back to back.
     StringSubset kept(old_sp, used_bits);

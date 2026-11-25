@@ -496,8 +496,8 @@ struct ParsedData {
     std::vector<uint32_t> addr_postcode_ids; // per-addr_point postcode (optional separate file)
     // Per addr_point: its addr:city (addr_cities.bin). Interned but marking
     // no tier, so it writes no string: partition_strings_into_tiers keeps it
-    // where its string is a core one (a place's or a boundary's name), and
-    // makes it NO_DATA where not.
+    // where a place node or a boundary has its string, a core one, and makes
+    // it NO_DATA where not.
     std::vector<uint32_t> addr_city_ids;
 
     // External postcode centroids (TIGER segments, GeoNames rows) keyed by
@@ -722,6 +722,13 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
         parallel_for(n, [&](size_t b, size_t e, unsigned) {
             for (size_t s = b; s < e; s++) tier[s] = string_home_tier(mask[s].load(std::memory_order_relaxed));
         }, threads);
+        // An addr:city is none where no place node or boundary has its
+        // string, though a POI sharing it with a street puts it in core.
+        mark_each(data.addr_city_ids.size(), [&](size_t i) {
+            uint32_t& city = data.addr_city_ids[i];
+            const size_t s = city == NO_DATA ? RankedBits::npos : starts.index(city);
+            if (s == RankedBits::npos || !(mask[s].load(std::memory_order_relaxed) & STR_TIER_BIT_CORE)) city = NO_DATA;
+        });
     }
 
     // Each tier's string offsets in alphabetical order. Strings no shipped
@@ -857,8 +864,8 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
     remap_vec(data.way_postcode_ids);
     remap_vec(data.addr_postcode_ids);
     remap_vec(data.interp_postcode_ids);
-    // An addr:city marks no tier: it keeps its string where that is a core
-    // one, a place's or a boundary's name, and is none where not.
+    // An addr:city marks no tier: one a place node or a boundary names (none
+    // else is left above) keeps its string, a core one.
     remap_each(data.addr_city_ids.size(), [&](size_t i) {
         uint32_t& city = data.addr_city_ids[i];
         const size_t s = city == NO_DATA ? RankedBits::npos : starts.index(city);
