@@ -1419,7 +1419,7 @@ namespace {
 
 // The postal cities' fixture: Testland as the United States, the grid test's
 // 19026 and 19018 houses, each with its addr:city (19026: Drexel Hill but two
-// of Upper Darby and one of none; 19018: Clifton Heights, 4 votes), a house of
+// of Upper Darby, a building of Upper Darby too, and one of none; 19018: Clifton Heights, 4 votes), a house of
 // 19099 among 19026's, 11 houses of 19050 at 47.1 N from 8.03 E (Lansdowne
 // 6, Yeadon 5),
 // Testreich (DE) houses of 19026 in Drexel Hill and of 19600, which cast no
@@ -1446,6 +1446,15 @@ std::vector<TestObject> postal_city_fixture() {
     area.tags = {{"boundary", "postal_code"}, {"postal_code", "19400"}, {"type", "boundary"}};
     area.members.emplace_back(OsmType::Way, 8710, "outer");
     objects.push_back(area);
+    // A house of 19026 mapped as a building, of Upper Darby, between the
+    // first two houses.
+    objects.push_back(node(8800, 470499800, 80224800));
+    objects.push_back(node(8801, 470499800, 80225200));
+    objects.push_back(node(8802, 470500200, 80225200));
+    objects.push_back(node(8803, 470500200, 80224800));
+    objects.push_back(way(8810, {8800, 8801, 8802, 8803, 8800},
+                          {{"building", "house"}, {"addr:housenumber", "8810"}, {"addr:postcode", "19026"},
+                           {"addr:street", "Teststrasse"}, {"addr:city", "Upper Darby"}}));
     std::stable_sort(objects.begin(), objects.end(), [](const TestObject& a, const TestObject& b) {
         return a.type != b.type ? a.type < b.type : a.id < b.id;
     });
@@ -1525,7 +1534,8 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
     std::ifstream votes(dump);
     const std::string text((std::istreambuf_iterator<char>(votes)), std::istreambuf_iterator<char>());
     CHECK(text.find("US\t19026\tDrexel Hill\t\tvotes\tDrexel Hill\tvote\tDREXEL HILL\tDrexel Hill\t18\n") != std::string::npos);
-    CHECK(text.find("US\t19026\tDrexel Hill\t\tvotes\tDrexel Hill\tvote\tUPPER DARBY\tUpper Darby\t2\n") != std::string::npos);
+    // Upper Darby's two houses and its building.
+    CHECK(text.find("US\t19026\tDrexel Hill\t\tvotes\tDrexel Hill\tvote\tUPPER DARBY\tUpper Darby\t3\n") != std::string::npos);
     CHECK(text.find("US\t19018\tClifton Heights\t\tgeonames\tClifton Heights\tvote\tCLIFTON HEIGHTS\tClifton Heights\t4\n") !=
           std::string::npos);
     CHECK(text.find("19500") == std::string::npos);
@@ -1547,7 +1557,9 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
             const std::optional<std::string> city = answer_string(answers[i], {"address", "postal_city"});
             CHECK(city == want_city[i]);
             if (city != want_city[i]) std::printf("    %s: %s\n", dir.c_str(), answers[i].c_str());
-            CHECK(answer_string(answers[i], {"display_name"}).value_or("").find(want_city[i]) == std::string::npos);
+            const std::optional<std::string> display_name = answer_string(answers[i], {"display_name"});
+            REQUIRE(display_name.has_value());
+            CHECK(display_name->find(want_city[i]) == std::string::npos);
         }
     }
 
@@ -1567,6 +1579,11 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
                                                                                "US 19400 Postalton"}));
     const auto chained = tree(build("chained", {"--prev-output", out, "--prev-postal-cities", out + "/planet/admin/" + name}));
     CHECK(chained.at("planet/admin/" + name) == table);
+    // One on top of the held build keeps its Yeadon, which loses without it.
+    const std::string held_out = root.path() + "/held";
+    const auto held_again =
+        tree(build("held-chained", {"--prev-output", held_out, "--prev-postal-cities", held_out + "/planet/admin/" + name}));
+    CHECK(held_again.at("planet/admin/" + name) == held.at("planet/admin/" + name));
     // The same names gzipped, at a path a shell would read otherwise.
     const std::string gz = root.path() + "/geonames' places $(false).tsv.gz";
     {
@@ -1586,9 +1603,13 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
         std::ofstream f(yesterday, std::ios::binary | std::ios::trunc);
         f << "not a table";
     }
+    const std::string bad_log = root.path() + "/bad.log";
     CHECK(!gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/bad", pbf, "--postal-places", places, "--prev-postal-cities",
                         yesterday},
-                       log));
+                       bad_log));
+    std::ifstream bad(bad_log);
+    const std::string bad_text((std::istreambuf_iterator<char>(bad)), std::istreambuf_iterator<char>());
+    CHECK(bad_text.find("Malformed postal cities") != std::string::npos);
     // So does a file of GeoNames' places of no row it can take: empty, or of
     // another country's alone.
     for (const std::string text : {"", "DE\t10115\tBerlin\tBE\n"}) {

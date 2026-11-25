@@ -195,8 +195,17 @@ TEST(geonames_key_counts_max_of_two_and_a_tenth_of_the_votes_more) {
     // 3 to 2 against GeoNames' key: a tie with its margin, which GeoNames wins.
     CHECK_EQ(name({{"Kirkwood", 3}, {"Saint Louis", 1}, {"Webster Groves", 1}}, "Saint Louis"), std::string("Saint Louis"));
     CHECK_EQ(name({{"Kirkwood", 4}, {"Saint Louis", 1}}, "Saint Louis"), std::string("Kirkwood"));
-    // A key of no vote at all: GeoNames' wins over scattered ones.
-    CHECK_EQ(name({{"A", 1}, {"B", 1}, {"C", 1}, {"D", 1}, {"E", 1}}, "Zed"), std::string("Zed"));
+    // A key of no vote at all: GeoNames' wins over scattered ones, by its
+    // two votes over five of one each.
+    const Choice scattered = choice({{"Alder", 1}, {"Birch", 1}, {"Cedar", 1}, {"Dogwood", 1}, {"Elm", 1}}, "Zed");
+    CHECK(scattered.step == Step::VOTES);
+    CHECK_EQ(scattered.name, std::string("Zed"));
+    // A tenth of 50 votes, 5, over two: 27 to 23 against GeoNames' key is 27
+    // to 28 with its margin.
+    const Choice tenth = choice({{"Kirkwood", 27}, {"Saint Louis", 23}}, "Saint Louis");
+    CHECK(tenth.step == Step::VOTES);
+    CHECK_EQ(tenth.name, std::string("Saint Louis"));
+    CHECK_EQ(name({{"Kirkwood", 30}, {"Saint Louis", 23}}, "Saint Louis"), std::string("Kirkwood"));
     // 63122: 14,503 of 19,317 votes name Kirkwood, far past the margin.
     CHECK_EQ(name({{"Kirkwood", 14503}, {"Saint Louis", 4814}}, "Saint Louis"), std::string("Kirkwood"));
     // A tie without GeoNames: the least key.
@@ -553,7 +562,9 @@ TEST(the_decoder_refuses_a_file_the_encoder_would_not_write) {
             CHECK(why.find("Malformed postal cities") == 0);
             refused++;
         } else {
+            // Other rows, of which the bytes are the one encoding.
             CHECK(!same(got, rows));
+            CHECK(postal_cities::encode_file(got) == f);
             other++;
         }
     }

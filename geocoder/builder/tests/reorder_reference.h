@@ -371,7 +371,7 @@ inline void reorder_addr_points(ParsedData& data) {
             std::vector<uint32_t> deduped_city(write_pos, NO_DATA);
             for (size_t i = 0; i < n; i++) {
                 uint32_t new_idx = dedup_remap[i];
-                const uint32_t pc = data.addr_postcode_ids.size() == write_pos ? data.addr_postcode_ids[new_idx] : NO_DATA;
+                const uint32_t pc = cell_order_postcodes ? data.addr_postcode_ids[new_idx] : NO_DATA;
                 if (deduped_city[new_idx] == NO_DATA && pc != NO_DATA && pc == pc_before[order[i]])
                     deduped_city[new_idx] = data.addr_city_ids[order[i]];
             }
