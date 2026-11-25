@@ -154,15 +154,20 @@ class BuildSearchIndexesTest(unittest.TestCase):
 
         self.assertEqual(self.run_main(), 1)
 
-    def test_a_full_selection_builds_without_the_addresses_cities(self):
-        # The builder writes addr_cities.bin beside a region's address points, so a region
-        # without them has none; the server reads the file where it is.
+    def test_a_full_selection_holds_the_addresses_cities_where_the_region_has_them(self):
+        # The builder writes addr_cities.bin beside a region's address points, an optional file
+        # of the full mode, which every shipped selection is.
         self.write_output(["planet"])
         cities = os.path.join(self.out, "planet", "full", "addr_cities.bin")
-        if os.path.exists(cities):
-            os.remove(cities)
+        with open(cities, "w") as f:
+            f.write(cities)
 
         self.assertEqual(self.run_main(), 0)
+        shipped = self.cfg["search_index"]["shipped"]
+        self.assertTrue(shipped)
+        for sel in shipped:
+            self.assertEqual(sel["mode"], "full")
+            self.assertEqual(self.call("planet", sel)["held"]["addr_cities.bin"], cities)
 
 
 class PlaceSearchJobTest(unittest.TestCase):
