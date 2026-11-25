@@ -433,6 +433,12 @@ public:
         std::vector<uint32_t> next(user_at_.begin(), user_at_.end() - 1);
         for (uint32_t r : rings_)
             for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) users_[next[set_.refs()[k].arc]++] = r;
+        if (tier.crossings_within_polygons) {
+            ring_polygon_.assign(store.rings.size(), UINT32_MAX);
+            for (uint32_t p = 0; p < store.polygons.size(); p++)
+                for (uint32_t r = 0; r < store.polygons[p].ring_count; r++)
+                    ring_polygon_[store.polygons[p].first_ring + r] = p;
+        }
     }
 
     // Douglas-Peucker on every arc at its tolerance.
@@ -463,12 +469,54 @@ public:
         }, threads_);
     }
 
+    // Puts the arcs of every ring of the set valid as OSM has it that the
+    // tier's grid collapses with every vertex kept (collapses_whole) on the
+    // e7 grid, with their junctions (keep_collapsing_on_e7_grid). Returns how
+    // many rings.
+    size_t keep_collapsing_rings_on_e7_grid() {
+        std::vector<uint32_t> changed;
+        return keep_collapsing_on_e7_grid(rings_, changed);
+    }
+
+    // Puts the arcs of those of `suspects` (rings, ascending) valid as OSM
+    // has it that the tier's grid collapses with every vertex kept
+    // (collapses_whole) on the e7 grid, with their junctions
+    // (keep_arcs_on_e7_grid); then the same for the rings of the arcs that
+    // changed, which a junction on the e7 grid can collapse in turn, round
+    // after round until none does. Adds the arcs it changed to `changed`
+    // (ascending, each once) and returns how many rings.
+    size_t keep_collapsing_on_e7_grid(std::vector<uint32_t> suspects, std::vector<uint32_t>& changed) {
+        size_t rings = 0;
+        while (!suspects.empty()) {
+            const std::vector<uint32_t> collapsing = collect_in_order<uint32_t, Scratch>(suspects.size(),
+                [&](size_t k, std::vector<uint32_t>& out, Scratch& s) {
+                    if (collapses_whole(suspects[k], s)) out.push_back(suspects[k]);
+                }, threads_);
+            if (collapsing.empty()) break;
+
+            rings += collapsing.size();
+            std::vector<uint32_t> whole;
+            for (uint32_t r : collapsing)
+                for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) whole.push_back(set_.refs()[k].arc);
+            const std::vector<uint32_t> round = keep_arcs_on_e7_grid(std::move(whole));
+            changed.insert(changed.end(), round.begin(), round.end());
+            suspects = round.empty() ? std::vector<uint32_t>() : rings_of(round);
+        }
+        sort_unique(changed, threads_);
+        return rings;
+    }
+
     // Gives a ring that is degenerate once snapped (under 3 vertices, or no
     // area) the farthest dropped vertex of its arc that strays most, round
     // after round, every ring checked first and then those a round touched.
     // Returns the arcs it changed.
     std::vector<uint32_t> restore_degenerate_rings(ArcTierCounts& counts) {
-        std::vector<uint32_t> suspects = rings_, changed;
+        return restore_degenerate_rings(rings_, counts);
+    }
+
+    // The same from `suspects` (rings, ascending) instead of every ring.
+    std::vector<uint32_t> restore_degenerate_rings(std::vector<uint32_t> suspects, ArcTierCounts& counts) {
+        std::vector<uint32_t> changed;
         for (int round = 0;; round++) {
             std::vector<uint32_t> bad = collect_in_order<uint32_t, Scratch>(suspects.size(),
                 [&](size_t k, std::vector<uint32_t>& out, Scratch& s) {
@@ -620,14 +668,25 @@ public:
     // (keep_on_e7_grid), round after round while that changes an arc: the
     // snap alone moved a ring onto another, with no dropped vertex to give
     // back. Once coarsened, each round keeps the rings of the arcs it
-    // changed fine where they collapse.
+    // changed fine where they collapse; on a tier that takes collapsing
+    // rings to the e7 grid, it puts those the junctions it moved collapse
+    // with every vertex kept there (keep_collapsing_on_e7_grid), then gives
+    // the rings of the arcs that changed that are degenerate as stored
+    // their dropped vertices back (restore_degenerate_rings).
     void keep_unnested_on_e7_grid(ArcTierCounts& counts) {
         std::vector<uint32_t> unnested = not_nesting(candidates_);
         while (!unnested.empty()) {
             std::vector<uint32_t> changed = keep_on_e7_grid(unnested);
             if (changed.empty()) break;
             counts.e7_grid_rounds++;
-            if (coarse_) with_collapsing_rings_kept_fine(changed, counts);
+            if (coarse_) {
+                with_collapsing_rings_kept_fine(changed, counts);
+            } else if (tier_.collapsing_rings_on_e7) {
+                counts.e7_collapsing_rings += keep_collapsing_on_e7_grid(rings_of(changed), changed);
+                const std::vector<uint32_t> back = restore_degenerate_rings(rings_of(changed), counts);
+                changed.insert(changed.end(), back.begin(), back.end());
+                sort_unique(changed, threads_);
+            }
             add_conflicts(meetings_of(update(changed)));
             std::vector<uint32_t> suspects = unnested;
             for (uint32_t a : changed)
@@ -900,6 +959,13 @@ private:
             for (uint32_t r = poly.first_ring; r < poly.first_ring + poly.ring_count; r++)
                 for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) whole.push_back(set_.refs()[k].arc);
         }
+        return keep_arcs_on_e7_grid(std::move(whole));
+    }
+
+    // Puts `whole` (arcs) wholly on the e7 grid, and the end of every other
+    // arc of the set at one of their junctions; returns the arcs it changed,
+    // ascending.
+    std::vector<uint32_t> keep_arcs_on_e7_grid(std::vector<uint32_t> whole) {
         sort_unique(whole, threads_);
         std::vector<uint64_t> junctions;
         for (uint32_t a : whole) {
@@ -1060,6 +1126,29 @@ private:
         stored_ring(r, s);
         return valid(s.ring);
     }
+    // Whether ring r is valid as OSM has it, under 3 vertices or of no area
+    // with every vertex kept, each on the grid its arc's marks put it on (the
+    // tier's for an arc of none), each once where its neighbour repeats it.
+    bool collapses_whole(uint32_t r, Scratch& s) const {
+        const RingSpan& span = store_.rings[r];
+        const PackedLocation* v = store_.vertices.data() + span.begin;
+        s.ring.assign(v, v + span.count);
+        if (s.ring.size() >= 2 && s.ring.front() == s.ring.back()) s.ring.pop_back();
+        if (!valid(s.ring)) return false;
+        s.ring.clear();
+        for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) {
+            const ArcRef ref = set_.refs()[k];
+            set_.read(ref.arc, s.raw);
+            const uint32_t n = static_cast<uint32_t>(s.raw.size());
+            for (uint32_t j = 0; j < n; j++) {
+                const uint32_t i = ref.reversed ? n - 1 - j : j;
+                const PackedLocation p = snapped(s.raw[i], vertex_grid_e7(tier_, grid_[ref.arc], i, n));
+                if (s.ring.empty() || s.ring.back() != p) s.ring.push_back(p);
+            }
+        }
+        if (s.ring.size() >= 2 && s.ring.front() == s.ring.back()) s.ring.pop_back();
+        return !valid(s.ring);
+    }
     // Whether ring r, as s.ring holds it on the tier's grid (stored_ring),
     // folds where the fine build's doesn't: it winds the other way, or
     // folds over itself (folds_over).
@@ -1113,7 +1202,7 @@ private:
                 });
                 for (size_t i = 0; i < items.size(); i++)
                     for (size_t j = i + 1; j < items.size() && items[j].lng_lo <= items[i].lng_hi; j++)
-                        if (segments_conflict(segs_[items[i].s], segs_[items[j].s]))
+                        if (conflict(segs_[items[i].s], segs_[items[j].s]))
                             found[worker].push_back(std::minmax(items[i].s, items[j].s));
             }
         }, threads_);
@@ -1133,7 +1222,7 @@ private:
                         for (; it != cells->end() && entry_cell(*it) == cell; ++it) {
                             const uint32_t t = entry_segment(*it);
                             if (t == s || !alive_[t] || (t >= first && t < s)) continue;
-                            if (segments_conflict(segs_[s], segs_[t])) found[worker].push_back(std::minmax(s, t));
+                            if (conflict(segs_[s], segs_[t])) found[worker].push_back(std::minmax(s, t));
                         }
                     }
                 });
@@ -1150,6 +1239,19 @@ private:
         }
         sort_unique(all, threads_);
         return all;
+    }
+
+    // Two segments the repair counts a crossing between (segments_conflict):
+    // with crossings_within_polygons, only of arcs one polygon's rings use.
+    bool conflict(const Segment& p, const Segment& q) const {
+        if (!segments_conflict(p, q)) return false;
+        return !tier_.crossings_within_polygons || p.arc == q.arc || share_polygon(p.arc, q.arc);
+    }
+    bool share_polygon(uint32_t a, uint32_t b) const {
+        for (uint32_t u = user_at_[a]; u < user_at_[a + 1]; u++)
+            for (uint32_t v = user_at_[b]; v < user_at_[b + 1]; v++)
+                if (ring_polygon_[users_[u]] == ring_polygon_[users_[v]]) return true;
+        return false;
     }
 
     // Whether two segments' raw spans already meet: the crossing is in the
@@ -1314,6 +1416,7 @@ private:
     std::vector<uint32_t> user_at_, users_;  // arc a's rings: users_[user_at_[a], user_at_[a + 1])
     std::vector<uint32_t> candidates_;  // nesting_candidates
     std::vector<uint32_t> polygon_of_;  // a candidate's rings' polygon, by ring
+    std::vector<uint32_t> ring_polygon_;  // every ring's polygon, by ring (crossings_within_polygons)
 
     std::vector<Segment> segs_;
     std::vector<uint8_t> alive_;
@@ -1378,6 +1481,10 @@ ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store,
     TierBuilder builder(arcs, store, tier, threads);
     builder.simplify();
     done("simplify");
+    if (tier.collapsing_rings_on_e7) {
+        state.counts.e7_collapsing_rings = builder.keep_collapsing_rings_on_e7_grid();
+        done("collapsing rings on the e7 grid");
+    }
     builder.restore_degenerate_rings(state.counts);
     done("validity");
     builder.build_grid();
@@ -1386,6 +1493,8 @@ ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store,
     done("repair");
     builder.keep_unnested_on_e7_grid(state.counts);
     done("e7 grid");
+    // The e7 grid rounds give rings vertices back on such a tier.
+    if (tier.collapsing_rings_on_e7) builder.count_degenerate(state.counts);
     if (tier.coarsens()) {
         ArcTierCounts fine;
         builder.count_left(fine);

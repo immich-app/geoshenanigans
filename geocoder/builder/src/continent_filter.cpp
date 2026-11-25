@@ -7,6 +7,7 @@
 #include "s2_helpers.h"
 #include "string_subset.h"
 #include "subset_copy.h"
+#include "water_layer.h"
 
 #include <algorithm>
 #include <atomic>
@@ -52,7 +53,7 @@ static bool cell_in_bbox(uint64_t cell_id, const ContinentBBox& bbox) {
 // record classes), hand-written bbox fallback otherwise. The bbox-only test
 // dropped admin data for zones the bboxes miss but the Geofabrik polygons
 // cover (Guam, Adak, the Azores, island territories).
-static bool cell_in_continent(uint64_t cell_id, const ContinentBBox& bbox, const PolygonIndex* polygon) {
+bool cell_in_continent(uint64_t cell_id, const ContinentBBox& bbox, const PolygonIndex* polygon) {
     if (!polygon) return cell_in_bbox(cell_id, bbox);
     S2CellId cell(cell_id);
     S2LatLng center = cell.ToLatLng();
@@ -78,6 +79,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     const std::vector<uint8_t>& interp_masks,
     const std::vector<uint8_t>& poi_masks,
     const std::vector<uint8_t>& place_masks,
+    const std::vector<uint8_t>& water_masks,
     const std::vector<std::pair<double,double>>* boundary,
     PlanetRecords records) {
 
@@ -268,6 +270,16 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         drop(full.admin_polygons, full.admin_osm_ids);
     };
 
+    // Water: the polygons the continent's cells of the water cell index list,
+    // or the ring of cells around them (its bit of water_masks), whole, with
+    // their arcs.
+    auto copy_water = [&]() {
+        if (water_masks.size() != full.water.cells.size())
+            throw std::logic_error("water continent masks out of step with the water cells");
+        out.water = water::subset_layer(full.water, water_masks, continent_bit);
+        if (consume) full.water = water::Layer();
+    };
+
     // POIs — coord polygon refinement, preserve vertex arrays for polygon POIs
     // A point POI's vertex_offset also moves to the current end of the
     // vertex array, as it always has.
@@ -314,6 +326,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         // copies grow.
         copy_interps();
         copy_admins();
+        copy_water();
         copy_places();
         copy_ways();
         copy_pois();
@@ -322,7 +335,8 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         std::future<void> copies[] = {
             std::async(std::launch::async, copy_ways), std::async(std::launch::async, copy_addrs),
             std::async(std::launch::async, copy_interps), std::async(std::launch::async, copy_admins),
-            std::async(std::launch::async, copy_pois), std::async(std::launch::async, copy_places)};
+            std::async(std::launch::async, copy_pois), std::async(std::launch::async, copy_places),
+            std::async(std::launch::async, copy_water)};
         for (auto& f : copies) f.get();
     }
     log_phase(("      " + std::string(bbox.name) + " filter: data remap (masked)").c_str(), _ft, _fc);
@@ -574,6 +588,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
               << " pois=" << out.poi_records.size()
               << " places=" << out.place_nodes.size()
               << " admins=" << out.admin_polygons.size()
+              << " waters=" << out.water.size()
               << " postcodes=" << out.postcode_accum.size()
               << " postcode_grid_runs=" << grid_runs
               << std::endl;

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKFLOWS = os.path.join(HERE, "..", "..", "..", ".github", "workflows")
@@ -540,6 +541,154 @@ class GeneratePatchesTest(unittest.TestCase):
         self.assertEqual(night.events, {})
 
 
+# A water dir on three days (geocoder/testdata/water_dir, which the builder's
+# s2 tests check is what the water layer writes): admin geometry, admin cells
+# and a core of its own, no place files and no other string tier, slots of its
+# own; day 2 moves one vertex of one of its four polygons, day 3 adds a pond of
+# a water=* value of its own and a sea, so its water_meta.json and
+# attribution.json change.
+WATER_DIR_FIXTURE = os.path.join(HERE, "..", "..", "testdata", "water_dir")
+
+
+BUILD_DIR = os.path.join(HERE, "..", "build")
+
+
+def real_tool(name, env, build_dir=BUILD_DIR):
+    """The tool generate_patches.sh would run: $env (a path, or a name on PATH, as the script runs it), else the one
+    in the builder's build dir, else the one on PATH; None for none. The build dir's comes before PATH's, so a fresh
+    build is what the tests run rather than a tool installed before it."""
+    given = os.environ.get(env)
+    if given:
+        return shutil.which(given)
+    built = os.path.join(build_dir, name)
+    if os.path.isfile(built) and os.access(built, os.X_OK):
+        return built
+    return shutil.which(name)
+
+
+HAS_REAL_TOOLS = real_tool("geocoder-diff", "GEOCODER_DIFF") and real_tool("geocoder-patch", "GEOCODER_PATCH")
+NEEDS_REAL_TOOLS = ("needs geocoder-diff and geocoder-patch (GEOCODER_DIFF / GEOCODER_PATCH, builder/build, "
+                    "or on PATH)")
+
+
+class RealToolTest(unittest.TestCase):
+    """Where the water dir tests find the tools generate_patches.sh runs."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root)
+        self.bin, self.build = os.path.join(self.root, "bin"), os.path.join(self.root, "build")
+        os.makedirs(self.bin)
+        os.makedirs(self.build)
+
+    def tool(self, directory):
+        path = os.path.join(directory, "geocoder-diff")
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def found(self, given=None):
+        env = {"PATH": self.bin}
+        if given is not None:
+            env["GEOCODER_DIFF"] = given
+        with mock.patch.dict(os.environ, env):
+            if given is None:
+                os.environ.pop("GEOCODER_DIFF", None)
+            return real_tool("geocoder-diff", "GEOCODER_DIFF", self.build)
+
+    def test_a_tool_is_the_one_given_else_the_build_dirs_else_the_one_on_path(self):
+        self.assertIsNone(self.found())
+        on_path = self.tool(self.bin)
+        self.assertEqual(self.found(), on_path)
+        built = self.tool(self.build)
+        self.assertEqual(self.found(), built)
+        # Given by name, it is the one on PATH, as the script runs it; by path, that one; one not there, none.
+        self.assertEqual(self.found("geocoder-diff"), on_path)
+        self.assertEqual(self.found(built), built)
+        self.assertIsNone(self.found(os.path.join(self.root, "gone")))
+        self.assertIsNone(self.found("geocoder-gone"))
+
+
+def patch_water_days(test, old_day, new_day):
+    """Runs generate_patches.sh with the real tools from the fixture's old_day to its new_day, each at
+    <root>/{old,new}/r/water/all/exact, beside a mode dir's street tier."""
+    test.root = tempfile.mkdtemp()
+    test.addCleanup(shutil.rmtree, test.root)
+    test.old, test.new = os.path.join(test.root, "old"), os.path.join(test.root, "new")
+    for day, src in ((test.old, old_day), (test.new, new_day)):
+        shutil.copytree(os.path.join(WATER_DIR_FIXTURE, src), os.path.join(day, "r", "water", "all", "exact"))
+        # A mode dir's street tier, which a variant one or two dirs down would borrow as its own (a dir of
+        # one .bin file is no variant).
+        write_file(os.path.join(day, "r", "full", "strings_street.bin"), 4 << 20)
+    test.results, test.logs = os.path.join(test.root, "results"), os.path.join(test.root, "logs")
+    os.makedirs(os.path.join(test.root, "scratch"))
+    # Scratch space the scheduler takes as ample, whatever the volume holds and the environment reserves.
+    env = dict(os.environ, GEOCODER_DIFF=real_tool("geocoder-diff", "GEOCODER_DIFF"),
+               GEOCODER_PATCH=real_tool("geocoder-patch", "GEOCODER_PATCH"), TMPDIR=os.path.join(test.root, "scratch"),
+               GEOCODER_PATCH_SCRATCH_FREE_KIB=str(AMPLE_SCRATCH_KIB), GEOCODER_PATCH_SCRATCH_RESERVE_KIB="0")
+    test.run_ = subprocess.run(["bash", os.path.join(HERE, "generate_patches.sh"), test.old, test.new, test.results,
+                                test.logs], env=env, capture_output=True, text=True, timeout=300)
+
+
+@unittest.skipUnless(HAS_REAL_TOOLS, NEEDS_REAL_TOOLS)
+class WaterDirPatchTest(unittest.TestCase):
+    """The real diff and patcher on a water dir at <region>/water/all/exact: it patches on its own."""
+
+    def setUp(self):
+        patch_water_days(self, "day1", "day2")
+
+    def test_a_water_dir_diffs_patches_and_verifies_on_its_own(self):
+        self.assertEqual(self.run_.returncode, 0, self.run_.stdout + self.run_.stderr)
+        result = read(os.path.join(self.results, "r_water_all_exact")).split()
+        # All ten client files, the JSON ones among them, as the new day's.
+        self.assertEqual(result[:2], ["PASS", "10"], result)
+        self.assertTrue(os.path.getsize(os.path.join(self.new, "r", "water", "all", "exact", "patch.gcpatch")) > 0)
+        self.assertEqual(read(os.path.join(self.results, "r_full")).split(), ["SKIP"])
+        # Its strings are its core alone, three dirs down from the mode dirs: its estimate holds no street tier.
+        weight = int(re.search(r"^r/water/all/exact: diff (\d+) KiB of memory", self.run_.stdout, re.M).group(1))
+        self.assertLess(weight, 2 * DIFF_DAY_KIB + MIB)
+
+    def test_a_moved_polygon_sends_its_own_slots_alone(self):
+        log = read(os.path.join(self.logs, "r_water_all_exact.log"))
+        # The pond keeps its slot (its way's) and its arc's: its record is replaced there and its arc's block
+        # edited, a few bytes, the same length; the other three polygons, every ring block and the arc slots
+        # stay as they were.
+        self.assertRegex(log, r"admin_polygons\.bin by slot: match=3 replace=1 insert=0 delete=0")
+        self.assertIn("admin_rings.bin: unchanged", log)
+        self.assertIn("arc_index.bin: unchanged", log)
+        arcs = re.search(r"arc_vertices\.bin: .* recs m/i/d/r=(\d+)/(\d+)/(\d+)/(\d+)", log)
+        self.assertIsNotNone(arcs, log)
+        kept, inserted, deleted, replaced = map(int, arcs.groups())
+        self.assertEqual(inserted, deleted)
+        self.assertTrue(0 < inserted <= 8, log)
+        self.assertEqual(replaced, 0, log)
+        self.assertGreater(kept, 100)
+
+
+@unittest.skipUnless(HAS_REAL_TOOLS, NEEDS_REAL_TOOLS)
+class WaterDirKindsPatchTest(unittest.TestCase):
+    """The real diff and patcher on a day whose water dir lists another kind and another credit."""
+
+    def setUp(self):
+        patch_water_days(self, "day2", "day3")
+
+    def test_new_kinds_and_credits_come_through_the_patch(self):
+        exact = os.path.join("r", "water", "all", "exact")
+        for name in ("water_meta.json", "attribution.json"):
+            with open(os.path.join(self.old, exact, name), "rb") as f:
+                before = f.read()
+            with open(os.path.join(self.new, exact, name), "rb") as f:
+                after = f.read()
+            self.assertNotEqual(before, after, name)
+        self.assertEqual(self.run_.returncode, 0, self.run_.stdout + self.run_.stderr)
+        result = read(os.path.join(self.results, "r_water_all_exact")).split()
+        # All ten client files as the new day's, the changed JSON ones among them.
+        self.assertEqual(result[:2], ["PASS", "10"], result)
+        log = read(os.path.join(self.logs, "r_water_all_exact.log"))
+        self.assertRegex(log, r"admin_polygons\.bin by slot: match=\d+ replace=\d+ insert=[1-9]")
+
+
 def sizing_loop():
     """generate_patches.sh's lines that start the estimates and wait for them, as bash: from the one after the
     estimates dir is made to the wait."""
@@ -613,14 +762,16 @@ def reserves(workdir, path=None, compressing=True):
 class NightlyReserveTest(unittest.TestCase):
     # The compressor runs beside the patch jobs and writes a .zst beside each
     # file it compresses: at most those files' bytes, which the patch jobs
-    # must leave free.
+    # must leave free. Each kind of file it takes holds a KiB or more, so the
+    # reserve in KiB changes without any one of them.
     def test_the_nightly_passes_the_new_trees_bytes_as_the_reserve(self):
         reserve, assignments = nightly_patch_step()
         with tempfile.TemporaryDirectory() as workdir:
             out = os.path.join(workdir, "output")
-            sizes = {"planet/full/street_ways.bin": 300 * 1024, "planet/full/strings_layout.json": 700,
-                     "planet/full/poi_meta.json": 900, "planet/full/attribution.json": 600,
+            sizes = {"planet/full/street_ways.bin": 300 * 1024, "planet/full/strings_layout.json": 1700,
+                     "planet/full/poi_meta.json": 1900, "planet/full/attribution.json": 1500,
                      "planet/poi/all/poi_records.bin": 5000, "planet/poi/all/poi_attribution.json": 2048,
+                     "planet/water/all/exact/water_meta.json": 1800, "planet/water/all/exact/attribution.json": 1600,
                      "planet/search/places.fst": 40 * 1024 + 1, "planet/search/packs/europe.pack": 3000,
                      # What the compressor leaves alone, or has written already.
                      "planet/full/street_ways.bin.osm_ids": 64 * 1024, "planet/full/street_ways.bin.zst": 100 * 1024,
@@ -633,7 +784,7 @@ class NightlyReserveTest(unittest.TestCase):
             printed = subprocess.run(["bash", "-c", reserve + '\necho "$RESERVE_KIB"'], env=dict(os.environ, WORKDIR=workdir),
                                      check=True, capture_output=True, text=True).stdout
 
-        self.assertEqual(compressed, 300 * 1024 + 700 + 900 + 600 + 5000 + 2048 + 40 * 1024 + 1 + 3000)
+        self.assertEqual(compressed, 300 * 1024 + 1700 + 1900 + 1500 + 5000 + 2048 + 1800 + 1600 + 40 * 1024 + 1 + 3000)
         self.assertEqual(printed, "%d\n" % -(-compressed // 1024))
         self.assertEqual(assignments, ['GEOCODER_PATCH_SCRATCH_RESERVE_KIB="$RESERVE_KIB"',
                                        'GEOCODER_PATCH_MEM_RESERVE_KIB="$MEM_RESERVE_KIB"'])

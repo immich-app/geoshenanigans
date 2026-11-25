@@ -35,6 +35,7 @@
 #include "parallel.h"
 #include "postcode_grid_build.h"
 #include "ranked_bits.h"
+#include "water_layer_data.h"
 
 // The records one POI tier's files carry, in record order, and how many of
 // them are tombstones. A record goes to the tiers from its lowest on
@@ -430,6 +431,8 @@ struct ParsedData {
     // The arc stage's encoded arcs of those rings, which outlive them (empty
     // without admin polygons).
     AdminArcBlocks admin_arcs;
+    // The water layer (water_layer.h): the planet's, or a region's share.
+    water::Layer water;
     // The admin cell index the reader reads (admin_cells.bin), in canonical
     // order: (cell, poly_id | INTERIOR_FLAG) for every cell from which a
     // polygon's rings in any of the full set's tiers contain a point,

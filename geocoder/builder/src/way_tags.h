@@ -38,6 +38,7 @@ struct WayTags {
     const char* power = nullptr;
     const char* place = nullptr;
     const char* waterway = nullptr;
+    const char* water = nullptr;
     const char* office = nullptr;
     const char* wikipedia = nullptr;
     const char* wikidata = nullptr;
@@ -134,6 +135,7 @@ inline WayTags parse_way_tags(const uint32_t* tag_keys, const uint32_t* tag_vals
             case 'I': if (k == "ISO3166-1:alpha2") t.iso = v; break;
             case 'w':
                 if (k == "waterway") t.waterway = v;
+                else if (k == "water") t.water = v;
                 else if (k == "wikipedia") t.wikipedia = v;
                 else if (k == "wikidata") t.wikidata = v;
                 break;

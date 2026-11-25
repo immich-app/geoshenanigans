@@ -455,6 +455,21 @@ jobs:
             (
               START=$(date +%s)
               $S5 cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*.osm_ids" "$WORKDIR/old-output/" > /dev/null
+              # The water kinds' codes (the water=* values outside the fixed
+              # table keep yesterday's): the build reads them early, so they
+              # can't wait for the fetch beside it. A build that wrote water
+              # dirs (its sidecars hold theirs) has the file, and the step
+              # fails if it doesn't come down, as the codes could move; a
+              # build before the water layer has none, and they start afresh.
+              WATER_META=planet/water/all/exact/water_meta.json
+              if [ -f "$WORKDIR/old-output/planet/water/all/exact/admin_polygons.osm_ids" ]; then
+                if ! $S5 cp "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/$WATER_META" "$WORKDIR/old-output/$WATER_META" > /dev/null; then
+                  echo "::error::[sidecars] $YESTERDAY wrote water dirs, but its $WATER_META did not come down"
+                  exit 1
+                fi
+              else
+                echo "[sidecars] $YESTERDAY wrote no water dirs: the water kinds take new codes"
+              fi
               COUNT=$(find "$WORKDIR/old-output" -name "*.osm_ids" | wc -l)
               SIZE=$(du -sb "$WORKDIR/old-output" | cut -f1)
               echo "[sidecars] Done: $COUNT files ($((SIZE/1024/1024)) MiB) in $(($(date +%s) - START))s"
@@ -569,6 +584,54 @@ jobs:
           ) &
           EXTRAS_PID=$!
 
+          # ── Background: the pinned marine areas ──
+          # The seas and oceans of the water dirs: the run of Update Marine
+          # Areas the repo pins (geocoder/builder/data/marine.json), checked
+          # against its sha256, so that every night builds them from the same
+          # file. With none pinned (the pin's three fields all null) the water
+          # dirs hold OSM's water alone; a pin of anything else that names no
+          # file, or a pinned file that doesn't come down whole, fails the
+          # step, as the water dirs would lose their seas.
+          (
+          MARINE_PIN="$GITHUB_WORKSPACE/geocoder/builder/data/marine.json"
+          MARINE_PINNED=$(jq -r -s 'if length == 1 and (.[0] | type) == "object" and (.[0] | has("version") and has("path") and has("sha256")) then .[0] | [.version, .path, .sha256] | if all(. == null) then "none" elif all(type == "string") then "file" else "neither" end else "neither" end' "$MARINE_PIN" 2> /dev/null) || MARINE_PINNED=neither
+          if [ "$MARINE_PINNED" != none ] && [ "$MARINE_PINNED" != file ]; then
+            echo "::error::[marine] $MARINE_PIN is no pin: one JSON object whose version, path and sha256 name a file, or are all null for none"
+            exit 1
+          fi
+          if [ "$MARINE_PINNED" = none ]; then
+            echo "[marine] No marine areas pinned: the water dirs hold OSM's water alone"
+            exit 0
+          fi
+          MARINE_VERSION=$(jq -r .version "$MARINE_PIN")
+          MARINE_PATH=$(jq -r .path "$MARINE_PIN")
+          MARINE_SHA=$(jq -r .sha256 "$MARINE_PIN")
+          if ! [[ "$MARINE_VERSION" =~ ^[0-9]{8}$ && "$MARINE_PATH" == "marine/$MARINE_VERSION/marine_areas.bin.zst" && "$MARINE_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::[marine] $MARINE_PIN pins no file the build can check (version '$MARINE_VERSION', path '$MARINE_PATH', sha256 '$MARINE_SHA')"
+            exit 1
+          fi
+          echo "[marine] Downloading marine areas $MARINE_VERSION..."
+          # curl retries a timed-out attempt too: --retry-max-time starts no
+          # retry after 30 minutes, so a stalled bucket fails the step before
+          # its timeout cancels it, which the watchdog doesn't retry.
+          if ! curl -sL --fail --connect-timeout 30 --max-time 900 --retry 3 --retry-delay 10 --retry-max-time 1800 \
+              -o "$WORKDIR/marine_areas.bin.zst" "$S3_PUBLIC_URL/geocoder/$MARINE_PATH"; then
+            echo "::error::[marine] $S3_PUBLIC_URL/geocoder/$MARINE_PATH did not download — publish it (Update Marine Areas) or pin another"
+            rm -f "$WORKDIR/marine_areas.bin.zst"
+            exit 1
+          fi
+          MARINE_GOT=$(sha256sum "$WORKDIR/marine_areas.bin.zst" | cut -c1-64)
+          if [ "$MARINE_GOT" != "$MARINE_SHA" ]; then
+            echo "::error::[marine] Marine areas $MARINE_VERSION came down with sha256 $MARINE_GOT; the pin says $MARINE_SHA"
+            rm -f "$WORKDIR/marine_areas.bin.zst"
+            exit 1
+          fi
+          zstd -d -q -f --rm "$WORKDIR/marine_areas.bin.zst" -o "$WORKDIR/marine_areas.bin"
+          echo "[marine] Downloaded $MARINE_VERSION: $(( $(stat -c%s "$WORKDIR/marine_areas.bin") / 1024 / 1024 )) MiB"
+          echo "marine_areas=$WORKDIR/marine_areas.bin" >> "$GITHUB_OUTPUT"
+          ) &
+          MARINE_PID=$!
+
           # ── Foreground: download PBF ──
           download_pbf_from_cache() {
             local SRC="$1" DEST="$2" LABEL="$3"
@@ -648,13 +711,14 @@ jobs:
             fi
           fi
 
-          # Wait for the sidecars and the small downloads (wikidata or TIGER
-          # fails the step), then the diff.
+          # Wait for the sidecars and the small downloads (wikidata, TIGER or
+          # the marine areas fail the step), then the diff.
           if [ "$HAS_PREVIOUS" = "true" ]; then
             echo "Waiting for the sidecar download..."
             wait $IDX_PID
           fi
           wait $EXTRAS_PID
+          wait $MARINE_PID
           if [ -n "${DIFF_PID:-}" ]; then
             wait "$DIFF_PID" || true
             cat "$WORKDIR/diff-today.log"
@@ -821,6 +885,7 @@ jobs:
           WIKIDATA_DATE: ${{ steps.download.outputs.wikidata_date }}
           TIGER_FILE: ${{ steps.download.outputs.tiger_data }}
           GEONAMES_FILE: ${{ steps.download.outputs.postcode_centroids_external }}
+          MARINE_FILE: ${{ steps.download.outputs.marine_areas }}
           PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
@@ -869,6 +934,10 @@ jobs:
           if [ -n "$GEONAMES_FILE" ] && [ -f "$GEONAMES_FILE" ]; then
             BUILD_ARGS="$BUILD_ARGS --external-postcodes $GEONAMES_FILE"
             echo "Using GeoNames postcode data"
+          fi
+          if [ -n "$MARINE_FILE" ] && [ -f "$MARINE_FILE" ]; then
+            BUILD_ARGS="$BUILD_ARGS --marine $MARINE_FILE"
+            echo "Using the pinned marine areas"
           fi
           # Strategy-2: pass the previous build's output root so the
           # IdAllocator can stabilize dense IDs against yesterday's
@@ -1102,8 +1171,8 @@ jobs:
           RESERVE_KIB=0
           if compressing; then
             RESERVE_KIB=$(find "$WORKDIR/output" -type f \
-              \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -name attribution.json \
-              -o -name poi_attribution.json -o -path '*/search/*' \) \
+              \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -name water_meta.json \
+              -o -name attribution.json -o -name poi_attribution.json -o -path '*/search/*' \) \
               ! -name '*.zst' -printf '%s\n' | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}')
           fi
           RESERVE_KIB=$((RESERVE_KIB + SEARCH_RESERVE_KIB))

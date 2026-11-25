@@ -171,6 +171,30 @@ std::vector<uint64_t> find_junctions(const AdminExactRings& store, unsigned thre
     return junctions;
 }
 
+// The vertices where a member way of a ring ends and another begins: the
+// first vertex of each way run of a ring of more than one whose run before
+// it (round the ring) is of another way, ascending, each once.
+std::vector<uint64_t> way_end_vertices(const AdminExactRings& store, unsigned threads) {
+    if (store.first_run.empty()) return {};
+    if (store.first_run.size() != store.rings.size())
+        throw std::logic_error("admin exact rings' way runs out of step with the rings");
+    std::vector<uint64_t> ends = parallel_collect<uint64_t>(store.rings.size(), [&](size_t r, std::vector<uint64_t>& out) {
+        const auto [first, last] = store.runs_of_ring(static_cast<uint32_t>(r));
+        const size_t n = static_cast<size_t>(last - first);
+        if (n < 2) return;
+        const RingSpan& ring = store.rings[r];
+        uint64_t place = 0;
+        for (size_t k = 0; k < n; k++) {
+            const int64_t way = first[k].way, before = first[(k + n - 1) % n].way;
+            if (way != before && place + 1 < ring.count) out.push_back(vertex_key(store.vertices[ring.begin + place]));
+            place += first[k].edges;
+        }
+    }, threads);
+    parallel_sort(ends.begin(), ends.end(), std::less<uint64_t>(), threads);
+    ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
+    return ends;
+}
+
 // Membership in a set of vertex keys, by open addressing.
 class VertexSet {
 public:
@@ -423,7 +447,7 @@ size_t duplicates_among(size_t n, Key key, unsigned threads) {
 }  // namespace
 
 AdminArcs build_arc_topology(const AdminExactRings& store, unsigned threads,
-                             const std::function<void(const char*)>& phase_done) {
+                             const std::function<void(const char*)>& phase_done, ArcCuts cut_rule) {
     auto done = [&](const char* step) {
         if (phase_done) phase_done(step);
     };
@@ -432,7 +456,14 @@ AdminArcs build_arc_topology(const AdminExactRings& store, unsigned threads,
     const size_t ring_count = store.rings.size();
     AdminArcs out;
 
-    const std::vector<uint64_t> junctions = find_junctions(store, threads, out.counts.largest_partition);
+    std::vector<uint64_t> junctions = find_junctions(store, threads, out.counts.largest_partition);
+    if (cut_rule == ArcCuts::JunctionsAndWayEnds) {
+        std::vector<uint64_t> ends = way_end_vertices(store, threads);
+        out.counts.way_ends = ends.size();
+        junctions.insert(junctions.end(), ends.begin(), ends.end());
+        parallel_sort(junctions.begin(), junctions.end(), std::less<uint64_t>(), threads);
+        junctions.erase(std::unique(junctions.begin(), junctions.end()), junctions.end());
+    }
     out.counts.junctions = junctions.size();
     done("      Admin arcs: junctions");
 
@@ -918,16 +949,10 @@ MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& sto
     return out;
 }
 
-namespace {
-
-// Whether a lookup finds nothing at `path`; one it can't make (ec set) says
-// nothing, and the read that follows refuses it.
-bool absent(const std::string& path) {
+bool path_absent(const std::string& path) {
     std::error_code ec;
     return !std::filesystem::exists(path, ec) && !ec;
 }
-
-}  // namespace
 
 ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar,
                             const std::vector<ArcFallbackKeys>& fallback, const std::string& prev_fallback_sidecar) {
@@ -935,7 +960,7 @@ ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string
     if (!fallback.empty() && fallback.size() != keys.size()) throw std::logic_error("arc fallback keys out of step with the keys");
     IdAllocator alloc;
     // Only a sidecar the lookup finds absent starts cold.
-    const bool missing = !prev_sidecar.empty() && absent(prev_sidecar);
+    const bool missing = !prev_sidecar.empty() && path_absent(prev_sidecar);
     if (!prev_sidecar.empty() && !missing && !alloc.load_previous(prev_sidecar))
         throw std::runtime_error("unreadable arc sidecar " + prev_sidecar);
     // The key each previous slot can be claimed by, none for its tombstones.
@@ -947,7 +972,7 @@ ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string
     }
     // The previous slots' fallback keys, and a pass for each: the way set, then the ends.
     const bool fallback_missing =
-        prev_slots > 0 && !fallback.empty() && (prev_fallback_sidecar.empty() || absent(prev_fallback_sidecar));
+        prev_slots > 0 && !fallback.empty() && (prev_fallback_sidecar.empty() || path_absent(prev_fallback_sidecar));
     std::vector<ArcFallbackKeys> prev_fallback;
     if (prev_slots > 0 && !fallback.empty() && !fallback_missing)
         prev_fallback = read_arc_fallback_sidecar(prev_fallback_sidecar, prev_slots);
@@ -989,8 +1014,12 @@ ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string
 
 std::string arc_slot_start_lines(const std::string& region, ArcSet set, const std::string& prev_sidecar,
                                  const AdminArcSlotCounts& counts) {
+    return arc_slot_start_lines(region, set == ArcSet::Full ? "full" : "minimal", prev_sidecar, counts);
+}
+
+std::string arc_slot_start_lines(const std::string& region, const char* set_name, const std::string& prev_sidecar,
+                                 const AdminArcSlotCounts& counts) {
     if (prev_sidecar.empty()) return "";
-    const char* set_name = set == ArcSet::Full ? "full" : "minimal";
     std::ostringstream line;
     if (counts.previous_sidecar_missing)
         line << "  " << region << " arcs: no previous " << set_name << " arc slots at " << prev_sidecar
@@ -1009,18 +1038,18 @@ std::string arc_slot_start_lines(const std::string& region, ArcSet set, const st
 
 namespace {
 
-std::string arc_sidecar_dir(const std::string& region_dir, ArcSet set) {
-    return region_dir + (set == ArcSet::Full ? "/quality/exact" : "/admin-minimal");
+std::string arc_sidecar_dir(const std::string& region_dir, ArcSet set, const ArcStage& stage) {
+    return region_dir + "/" + (set == ArcSet::Full ? stage.sidecar_dir : "admin-minimal");
 }
 
 }  // namespace
 
-std::string arc_sidecar_path(const std::string& region_dir, ArcSet set) {
-    return arc_sidecar_dir(region_dir, set) + "/arc_index.osm_ids";
+std::string arc_sidecar_path(const std::string& region_dir, ArcSet set, const ArcStage& stage) {
+    return arc_sidecar_dir(region_dir, set, stage) + "/arc_index.osm_ids";
 }
 
-std::string arc_fallback_sidecar_path(const std::string& region_dir, ArcSet set) {
-    return arc_sidecar_dir(region_dir, set) + "/arc_index.fallback.osm_ids";
+std::string arc_fallback_sidecar_path(const std::string& region_dir, ArcSet set, const ArcStage& stage) {
+    return arc_sidecar_dir(region_dir, set, stage) + "/arc_index.fallback.osm_ids";
 }
 
 void write_arc_fallback_sidecar(const std::string& path, const ArcSetBlocks& set) {
@@ -1060,17 +1089,19 @@ namespace {
 // Slots for a set's arcs in presentation order (key(a), fallback(a))
 // against the previous planet build's sidecars of that set.
 template <class Key, class Fallback>
-ArcSlots planet_slots(size_t n, Key key, Fallback fallback, const std::string& prev_planet_dir, ArcSet set) {
+ArcSlots planet_slots(size_t n, Key key, Fallback fallback, const std::string& prev_planet_dir, ArcSet set,
+                      const ArcStage& stage) {
     std::vector<uint64_t> keys(n);
     std::vector<ArcFallbackKeys> fallbacks(n);
     for (size_t a = 0; a < n; a++) {
         keys[a] = key(a);
         fallbacks[a] = fallback(a);
     }
-    const std::string prev = prev_planet_dir.empty() ? "" : arc_sidecar_path(prev_planet_dir, set);
-    const std::string prev_fallback = prev_planet_dir.empty() ? "" : arc_fallback_sidecar_path(prev_planet_dir, set);
+    const std::string prev = prev_planet_dir.empty() ? "" : arc_sidecar_path(prev_planet_dir, set, stage);
+    const std::string prev_fallback =
+        prev_planet_dir.empty() ? "" : arc_fallback_sidecar_path(prev_planet_dir, set, stage);
     ArcSlots slots = allocate_arc_slots(keys, prev, fallbacks, prev_fallback);
-    std::cerr << arc_slot_start_lines("planet", set, prev, slots.counts);
+    std::cerr << arc_slot_start_lines("planet", set == ArcSet::Full ? stage.set_word : "minimal", prev, slots.counts);
     return slots;
 }
 
@@ -1082,9 +1113,10 @@ std::string slot_summary(const AdminArcSlotCounts& s, size_t slots) {
     return line.str();
 }
 
-std::string tier_summary(const ArcTier& tier, const ArcTierCounts& c) {
+std::string tier_summary(const ArcStage& stage, const ArcTier& tier, const ArcTierCounts& c) {
     std::ostringstream line;
-    line << "  Admin arc tier " << tier.dir << " (" << (tier.set == ArcSet::Full ? "full" : "minimal") << " set): ";
+    line << "  " << stage.name << " arc tier " << tier.dir << " (" << (tier.set == ArcSet::Full ? stage.set_word : "minimal")
+         << " set): ";
     if (!tier.simplifies()) {
         line << c.stored_vertices << " vertices, every raw one; " << c.single_point_arcs << " arcs of one point\n";
         return line.str();
@@ -1097,6 +1129,8 @@ std::string tier_summary(const ArcTier& tier, const ArcTierCounts& c) {
          << " to polygons not nesting, " << c.crossings_left << " crossings left, "
          << c.unrepairable_segments << " unrepairable segments, " << c.raw_crossings
          << " raw crossings; rings_nest: " << c.rings_nest_introduced << " polygons introduced";
+    if (tier.collapsing_rings_on_e7)
+        line << "; " << c.e7_collapsing_rings << " rings the tier's grid would collapse, kept on the e7 grid";
     if (tier.coarsens())
         line << "; coarsened from the " << tier.fine_grid_e7 << " to the " << tier.grid_e7 << " e7 grid: "
              << c.fine_degenerate_rings << " rings degenerate and " << c.fine_crossings_left
@@ -1115,56 +1149,76 @@ std::string tier_summary(const ArcTier& tier, const ArcTierCounts& c) {
 
 AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>& in_minimal,
                            const std::string& prev_planet_dir, unsigned threads) {
+    return build_arc_stage(kAdminArcStage, store, in_minimal, prev_planet_dir, threads);
+}
+
+AdminArcs build_arc_stage(const ArcStage& stage, const AdminExactRings& store, const std::vector<bool>& in_minimal,
+                          const std::string& prev_planet_dir, unsigned threads) {
     threads = std::min(threads ? threads : parallel_threads(), kArcTopologyMaxThreads);
     auto t = std::chrono::steady_clock::now();
     auto cpu = CpuTicks::now();
-    AdminArcs arcs = build_arc_topology(store, threads, [&](const char* step) { log_phase(step, t, cpu); });
+    const std::string arcs_name = std::string(stage.name) + " arcs";
+    auto step_name = [&](const std::string& step) { return "      " + arcs_name + ": " + step; };
+    AdminArcs arcs = build_arc_topology(store, threads, [&](const char* step) {
+        // The topology names its steps "      Admin arcs: ...".
+        const std::string named = step;
+        const std::string prefix = "      Admin arcs: ";
+        log_phase((named.rfind(prefix, 0) == 0 ? step_name(named.substr(prefix.size())) : named).c_str(), t, cpu);
+    }, stage.cuts);
+    arcs.stage = &stage;
 
     ArcSlots slots = planet_slots(arcs.arcs.size(), [&](size_t a) { return arcs.arcs[a].key; },
-                                  [&](size_t a) { return arcs.arcs[a].fallback; }, prev_planet_dir, ArcSet::Full);
+                                  [&](size_t a) { return arcs.arcs[a].fallback; }, prev_planet_dir, ArcSet::Full, stage);
     for (size_t a = 0; a < arcs.arcs.size(); a++) arcs.arcs[a].planet_slot = slots.slots[a];
     arcs.planet_sidecar = std::move(slots.sidecar);
     arcs.slot_counts = slots.counts;
-    log_phase("      Admin arcs: planet slots", t, cpu);
+    log_phase(step_name("planet slots").c_str(), t, cpu);
 
-    arcs.minimal = build_minimal_arcs(arcs, store, in_minimal, threads);
-    free_storage(arcs.way_at);
-    free_storage(arcs.ways);
     MinimalArcs& minimal = arcs.minimal;
-    slots = planet_slots(minimal.arcs.size(), [&](size_t a) { return minimal.arcs[a].key; },
-                         [&](size_t a) { return minimal.arcs[a].fallback; }, prev_planet_dir, ArcSet::Minimal);
-    for (size_t a = 0; a < minimal.arcs.size(); a++) minimal.arcs[a].planet_slot = slots.slots[a];
-    minimal.planet_sidecar = std::move(slots.sidecar);
-    minimal.slot_counts = slots.counts;
-    log_phase("      Admin arcs: minimal set", t, cpu);
+    if (stage.has_minimal()) {
+        minimal = build_minimal_arcs(arcs, store, in_minimal, threads);
+        free_storage(arcs.way_at);
+        free_storage(arcs.ways);
+        slots = planet_slots(minimal.arcs.size(), [&](size_t a) { return minimal.arcs[a].key; },
+                             [&](size_t a) { return minimal.arcs[a].fallback; }, prev_planet_dir, ArcSet::Minimal, stage);
+        for (size_t a = 0; a < minimal.arcs.size(); a++) minimal.arcs[a].planet_slot = slots.slots[a];
+        minimal.planet_sidecar = std::move(slots.sidecar);
+        minimal.slot_counts = slots.counts;
+        log_phase(step_name("minimal set").c_str(), t, cpu);
+    } else {
+        free_storage(arcs.way_at);
+        free_storage(arcs.ways);
+    }
 
     const std::vector<bool> nests_exact = exact_rings_nest(store, threads);
     arcs.rings_nest_raw = static_cast<size_t>(std::count(nests_exact.begin(), nests_exact.end(), false));
-    log_phase("      Admin arcs: exact nesting", t, cpu);
-    for (const ArcTier& tier : kArcTiers) {
+    log_phase(step_name("exact nesting").c_str(), t, cpu);
+    for (size_t k = 0; k < stage.tier_count; k++) {
+        const ArcTier& tier = stage.tiers[k];
         arcs.tiers.push_back(build_arc_tier(arcs, store, tier, nests_exact, threads, [&](const char* step) {
-            log_phase((std::string("      Admin arcs: ") + tier.dir + " " + step).c_str(), t, cpu);
+            log_phase(step_name(std::string(tier.dir) + " " + step).c_str(), t, cpu);
         }));
-        log_phase((std::string("      Admin arcs: ") + tier.dir).c_str(), t, cpu);
+        log_phase(step_name(tier.dir).c_str(), t, cpu);
     }
 
     const AdminArcCounts& c = arcs.counts;
     const MinimalArcCounts& m = minimal.counts;
     std::ostringstream line;
-    line << "  Admin arcs: " << c.junctions << " junctions, " << c.arcs << " arcs (" << c.closed_arcs << " closed, "
+    line << "  " << arcs_name << ": " << c.junctions << " junctions, " << c.arcs << " arcs (" << c.closed_arcs << " closed, "
          << c.arc_vertices << " vertices), " << c.refs << " refs over " << store.rings.size() << " rings; largest partition "
          << c.largest_partition << " occurrences, " << c.hash_collisions << " hash collisions, " << c.duplicate_keys
          << " duplicate keys, " << c.arcs_without_ways << " arcs without way runs, " << c.shared_way_sets
          << " shared way sets, " << c.shared_ends << " shared ends; "
          << slot_summary(arcs.slot_counts, arcs.planet_sidecar.size()) << " on " << threads << " threads\n";
-    line << "  Admin arcs minimal set: " << m.arcs << " arcs (" << m.closed_arcs << " closed, " << m.arc_vertices
-         << " vertices), " << m.refs << " refs over " << m.rings << " rings of " << m.polygons << " polygons; "
-         << m.core_arcs << " full arcs in " << m.joined_junctions << " full junctions joined ("
-         << m.turnback_junctions << " kept where a ring turns back), " << m.duplicate_keys << " duplicate keys, "
-         << m.shared_way_sets << " shared way sets, " << m.shared_ends << " shared ends; "
-         << slot_summary(minimal.slot_counts, minimal.planet_sidecar.size()) << "\n";
-    line << "  Admin arcs rings_nest raw: " << arcs.rings_nest_raw << " polygons whose exact rings don't nest\n";
-    for (size_t k = 0; k < kArcTierCount; k++) line << tier_summary(kArcTiers[k], arcs.tiers[k].counts);
+    if (stage.has_minimal())
+        line << "  " << arcs_name << " minimal set: " << m.arcs << " arcs (" << m.closed_arcs << " closed, " << m.arc_vertices
+             << " vertices), " << m.refs << " refs over " << m.rings << " rings of " << m.polygons << " polygons; "
+             << m.core_arcs << " full arcs in " << m.joined_junctions << " full junctions joined ("
+             << m.turnback_junctions << " kept where a ring turns back), " << m.duplicate_keys << " duplicate keys, "
+             << m.shared_way_sets << " shared way sets, " << m.shared_ends << " shared ends; "
+             << slot_summary(minimal.slot_counts, minimal.planet_sidecar.size()) << "\n";
+    line << "  " << arcs_name << " rings_nest raw: " << arcs.rings_nest_raw << " polygons whose exact rings don't nest\n";
+    for (size_t k = 0; k < stage.tier_count; k++) line << tier_summary(stage, stage.tiers[k], arcs.tiers[k].counts);
     std::cerr << line.str();
     return arcs;
 }
@@ -1180,7 +1234,9 @@ std::vector<PackedLocation> rebuild_ring(const AdminArcs& arcs, const AdminExact
         for (uint32_t k = arcs.ring_refs[ring]; k < arcs.ring_refs[ring + 1]; k++)
             chain(arc_vertices(store, arcs.arcs[arcs.refs[k].arc].view), arcs.refs[k].reversed);
     } else {
+        // A stage with no minimal set has no minimal refs at all.
         const MinimalArcs& m = arcs.minimal;
+        if (m.ring_refs.empty()) return out;
         for (uint32_t k = m.ring_refs[ring]; k < m.ring_refs[ring + 1]; k++)
             chain(MinimalArcVertices(store, arcs, m.refs[k].arc), m.refs[k].reversed);
     }

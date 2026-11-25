@@ -203,10 +203,13 @@ std::set<std::string> admin_dir_layout() {
     return out;
 }
 
+// An admin dir's geometry file: not the water layer's, which has files of
+// the same names (water_layer.h).
 bool admin_geometry(const std::string& name) {
     const std::string file = fs::path(name).filename().string();
-    return file == "admin_polygons.bin" || file == "admin_rings.bin" || file == "arc_index.bin" ||
-           file == "arc_vertices.bin";
+    return name.find("/water/") == std::string::npos &&
+           (file == "admin_polygons.bin" || file == "admin_rings.bin" || file == "arc_index.bin" ||
+            file == "arc_vertices.bin");
 }
 
 // An arc sidecar's slots: each live one's arc key, UINT64_MAX for a
@@ -261,7 +264,8 @@ std::map<std::string, std::vector<char>> arc_files(const std::string& out) {
     std::map<std::string, std::vector<char>> files = tree(out);
     for (auto it = files.begin(); it != files.end();) {
         const std::string file = fs::path(it->first).filename().string();
-        it = admin_geometry(it->first) || file == "arc_index.osm_ids" ? std::next(it) : files.erase(it);
+        const bool admin_sidecar = file == "arc_index.osm_ids" && it->first.find("/water/") == std::string::npos;
+        it = admin_geometry(it->first) || admin_sidecar ? std::next(it) : files.erase(it);
     }
     return files;
 }
@@ -966,7 +970,9 @@ TEST(a_chained_build_on_a_previous_build_without_arc_fallback_sidecars_takes_slo
     fs::copy(out1, prev, fs::copy_options::recursive);
     std::vector<fs::path> fallbacks;
     for (const auto& e : fs::recursive_directory_iterator(prev))
-        if (e.path().filename() == "arc_index.fallback.osm_ids") fallbacks.push_back(e.path());
+        if (e.path().filename() == "arc_index.fallback.osm_ids" &&
+            fs::relative(e.path(), prev).string().find("/water/") == std::string::npos)
+            fallbacks.push_back(e.path());
     REQUIRE(fallbacks.size() == kRegions.size() + kRegionsHeld.size());
     for (const fs::path& p : fallbacks) fs::remove(p);
     REQUIRE(build(day_two, out2, {"--prev-output", prev}));
@@ -2231,13 +2237,22 @@ TEST(each_mode_dir_credits_the_sources_of_its_data) {
         for (const char* dir : {"admin-minimal", "admin-minimal-poi"})
             if (kRegionsHeld.count(region)) CHECK(credited(files, region + "/" + dir + "/attribution.json") == osm);
     }
-    size_t credits = 0;
+    // Each region's three water dirs credit the data of their own
+    // (water_layer.h): OSM's alone in a build without --marine.
+    size_t credits = 0, water_credits = 0;
     for (const std::string& name : names_of(files)) {
         if (fs::path(name).filename() != "attribution.json") continue;
+        if (name.find("/water/") != std::string::npos) {
+            water_credits++;
+            if (credited(files, name) != osm) std::printf("    %s\n", name.c_str());
+            CHECK(credited(files, name) == osm);
+            continue;
+        }
         credits++;
         CHECK(name.find("/quality/") == std::string::npos && name.find("/poi/") == std::string::npos);
     }
     CHECK_EQ(credits, kRegions.size() * 3 + kRegionsHeld.size() * 2);
+    CHECK_EQ(water_credits, kRegions.size() * 3);
 
     // A GeoNames row whose pair OSM holds gives no centroid, so no credit.
     const auto taken = build("taken", {"--continents", "--multi-output", "--multi-quality", "--external-postcodes", zurich});

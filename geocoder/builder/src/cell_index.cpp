@@ -1017,7 +1017,7 @@ struct ArcCells {
 };
 
 ArcCells tier_arc_cells(const AdminArcs& arcs, const AdminExactRings& store, size_t t, unsigned threads) {
-    const ArcTier& tier = kArcTiers[t];
+    const ArcTier& tier = arcs.stage->tiers[t];
     const size_t n = tier.set == ArcSet::Full ? arcs.arcs.size() : arcs.minimal.arcs.size();
     // Longest first, a few at a time: started last, a long arc would leave
     // one core working alone.
@@ -1069,7 +1069,7 @@ ArcCells tier_arc_cells(const AdminArcs& arcs, const AdminExactRings& store, siz
 AdminTierCells admin_tier_cells(const AdminArcs& arcs, const AdminExactRings& store, size_t t, unsigned threads,
                                 const std::function<void(const char*)>& phase_done) {
     if (threads == 0) threads = parallel_threads();
-    const ArcTier& tier = kArcTiers[t];
+    const ArcTier& tier = arcs.stage->tiers[t];
     // The exact tier's rings are the store's own: the same cycles its arcs chain.
     const bool exact = tier.set == ArcSet::Full && !tier.simplifies();
     const std::vector<uint32_t>& ring_refs = tier.set == ArcSet::Full ? arcs.ring_refs : arcs.minimal.ring_refs;
@@ -1224,6 +1224,32 @@ void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned
               << " interior) over the full set's tiers; admin-minimal " << count_cells(data.admin_minimal_index_cells)
               << " cells, " << data.admin_minimal_index_cells.size() << " entries ("
               << interior(data.admin_minimal_index_cells) << " interior)" << std::endl;
+}
+
+std::vector<CellItemPair> compute_water_index_cells(const AdminArcs& arcs, const AdminExactRings& store,
+                                                    unsigned threads) {
+    if (threads == 0) threads = parallel_threads();
+    auto clock = std::chrono::steady_clock::now();
+    auto cpu = CpuTicks::now();
+    std::ostringstream counts;
+    std::vector<std::vector<CellItemPair>> tiers;
+    for (size_t t = 0; t < arcs.stage->tier_count; t++) {
+        const ArcTier& tier = arcs.stage->tiers[t];
+        AdminTierCells covered = admin_tier_cells(arcs, store, t, threads, [&](const char* step) {
+            log_phase((std::string("      Water cells: ") + tier.dir + " " + step).c_str(), clock, cpu);
+        });
+        counts << "  Water cells " << tier.dir << ": " << arcs.arcs.size() << " arcs with " << covered.arc_cells
+               << " boundary cells, merged into " << covered.boundary_cells << " over the polygons' boundaries; "
+               << covered.cells.size() << " entries\n";
+        tiers.push_back(std::move(covered.cells));
+    }
+    std::vector<CellItemPair> cells = union_of_tiers(std::move(tiers), threads);
+    log_phase("      Water cells: union", clock, cpu);
+    const size_t interior =
+        parallel_count(cells.size(), [&](size_t k) { return (cells[k].item_id & INTERIOR_FLAG) != 0; }, threads);
+    std::cerr << counts.str() << "Water index cells: " << count_cells(cells) << " cells, " << cells.size()
+              << " entries (" << interior << " interior) over both tiers" << std::endl;
+    return cells;
 }
 
 // --- The admin dirs ---
