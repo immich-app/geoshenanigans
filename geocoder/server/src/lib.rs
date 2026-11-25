@@ -2255,7 +2255,7 @@ impl Index {
             }
         }
         let Some(streets) = self.streets.as_ref() else { return false };
-        let cells = cells_near_point(lat, lng, STREET_POI_REACH_DEG * METRES_PER_DEGREE, self.street_cell_level);
+        let cells = reach_cells(lat, lng, self.street_cell_level);
         let mut lists = GeoLists::default();
         self.geo_index.lookup_many(&cells, 1 << geo_index::STREETS | 1 << geo_index::ADDRESSES, &mut lists);
         let mut found = false;
@@ -5553,6 +5553,14 @@ pub fn cells_near_point(lat: f64, lng: f64, margin_m: f64, level: u64) -> Vec<u6
     cells_under_rects(vec![grown_rect(LatLngBox::at((lat, lng)), margin_m)], level)
 }
 
+/// The cells of `level` that can hold a feature within STREET_POI_REACH_DEG of (lat, lng): those
+/// under the box that reach spans in degrees either way, as the reach is planar on lon/lat.
+pub fn reach_cells(lat: f64, lng: f64, level: u64) -> Vec<u64> {
+    let r = STREET_POI_REACH_DEG;
+    let reach = s2::rect::Rect::from_degrees((lat - r).max(-90.0), (lng - r).max(-180.0), (lat + r).min(90.0), (lng + r).min(180.0));
+    cells_under_rects(vec![reach], level)
+}
+
 /// The line's points as (lat, lng) degrees, with points added along every
 /// segment whose box spans more than `span_m` either way, evenly in degrees:
 /// the fuzzy-area tests map degrees linearly to metres, so the pieces cover
@@ -7032,6 +7040,22 @@ mod pure_helper_tests {
                 assert!(fuzzy_area_holds(lat as f32, lng as f32, MAX_PLACE_FUZZY_HALF_SIDE_M, lat0, lng0));
                 assert!(cells.contains(&cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL)), "({lat}, {lng})");
             }
+        }
+    }
+
+    #[test]
+    fn the_reach_cells_are_those_of_the_reach_box_in_degrees() {
+        // The reach is planar on lon/lat, 0.007 degrees either way in latitude and longitude at
+        // every latitude: the cells hold each corner of that box, and no more of the globe than
+        // it needs, up to a pole, where the box is a sliver.
+        let r = STREET_POI_REACH_DEG * 0.999;
+        for (lat0, lng0, most) in [(10.0, 20.0, 800), (60.0, 10.0, 350), (80.0, -40.0, 200), (89.999, 10.0, 40)] {
+            let cells = reach_cells(lat0, lng0, DEFAULT_STREET_CELL_LEVEL);
+            for (north, east) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
+                let (lat, lng) = ((lat0 + north * r).min(90.0), lng0 + east * r);
+                assert!(cells.contains(&cell_id_at_level(lat, lng, DEFAULT_STREET_CELL_LEVEL)), "({lat}, {lng})");
+            }
+            assert!(cells.len() <= most, "{lat0}: {} cells", cells.len());
         }
     }
 
