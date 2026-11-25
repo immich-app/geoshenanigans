@@ -1134,11 +1134,11 @@ pub struct Index {
     pub street_cell_level: u64,
     pub admin_cell_level: u64,
     pub max_distance_sq: f64,
-    /// (boundary_key, name_id) of the place nodes each boundary links where the node's name is
-    /// not the boundary's, ascending: Nominatim merges a linked node's names into its boundary's
-    /// as `_place_*` (placex_indexing_prepare), which the crosscheck reads. A node labels one
-    /// polygon of its boundary, the largest outer ring, and the key holds for every ring. From
-    /// place_hidden.bin's labels, on first use.
+    /// (boundary_key, name_id) of the place nodes each boundary links, ascending: Nominatim
+    /// merges a linked node's names into its boundary's as `_place_*` (placex_indexing_prepare),
+    /// which the crosscheck reads, and a boundary links one node at most (find_linked_place). A
+    /// node labels one polygon of its boundary, the largest outer ring, and the key holds for
+    /// every ring. From place_hidden.bin's labels, on first use.
     pub linked_names: std::sync::OnceLock<Vec<(u64, u32)>>,
 }
 
@@ -3919,8 +3919,7 @@ impl Index {
         to_area + 0.00001 * to_centre
     }
 
-    /// Whether the boundary of polygon `poly` links a place node named `name` other than its own
-    /// name (linked_names).
+    /// Whether the boundary of polygon `poly` links a place node named `name` (linked_names).
     fn links_name(&self, poly: &AdminPolygon, name: u32) -> bool {
         self.linked_names.get_or_init(|| self.read_linked_names()).binary_search(&(boundary_key(poly), name)).is_ok()
     }
@@ -3930,7 +3929,8 @@ impl Index {
     /// builder runs for boundaries only (placex_triggers.sql:359-385): the area has the node's
     /// name, its rank_address is the one the node's type has (compute_place_rank), which an area
     /// lifted by one round it no longer has, and it holds the node, where it links no node by its
-    /// label or wikidata, one of another type or name.
+    /// label or wikidata: find_linked_place links one node, which may have the area's name and
+    /// type too.
     fn links_by_name(&self, area: &RankedPoly, node: &PlaceNode) -> bool {
         let (poly, geometry) = (&area.poly, &self.admin_geometry);
         poly.admin_level == 15 && poly.name_id == node.name_id && poly.own_place_type == 0
@@ -3939,20 +3939,20 @@ impl Index {
             && !self.links_any(poly)
     }
 
-    /// Whether the boundary of polygon `poly` links a place node of another name (linked_names).
+    /// Whether the boundary of polygon `poly` links a place node (linked_names), of its own name
+    /// or another.
     fn links_any(&self, poly: &AdminPolygon) -> bool {
         let key = boundary_key(poly);
         let linked = self.linked_names.get_or_init(|| self.read_linked_names());
         linked.get(linked.partition_point(|&(k, _)| k < key)).is_some_and(|&(k, _)| k == key)
     }
 
-    /// linked_names from place_hidden.bin: each label's boundary and name where the boundary has
-    /// another name.
+    /// linked_names from place_hidden.bin: each label's boundary and name.
     fn read_linked_names(&self) -> Vec<(u64, u32)> {
         let mut linked = Vec::new();
         if let Some(places) = &self.places {
             places.for_each_label(|polygon, name| {
-                if let Some(poly) = self.admin_polygon(polygon).filter(|p| p.name_id != name) {
+                if let Some(poly) = self.admin_polygon(polygon) {
                     linked.push((boundary_key(&poly), name));
                 }
             });

@@ -308,12 +308,12 @@ fn a_place_node_a_place_area_of_its_name_and_rank_links_is_no_row() {
     // node to the area, and Nominatim's street has no row of it. The house's addr:city names the
     // area, the rank's part already, and the community board of rank 18 stays. Where the area
     // links another node, by its label, the town node is a row of rank 18, in the area's rank 16
-    // boundary, and takes the rank.
-    let index = |city: Option<&str>, label: bool| {
+    // boundary, and takes the rank; a label of the area's name and type is that one link too.
+    let index = |city: Option<&str>, label: Option<&str>| {
         let mut index = united_states();
         index.boundary("High Wycombe", 15, 2, (-3000.0, -3000.0, 3000.0, 3000.0));
-        if label {
-            index.linked_place("Wycombe", 1, 1500.0, 1500.0);
+        if let Some(label) = label {
+            index.linked_place(label, 1, 1500.0, 1500.0);
         }
         index
             .boundary("High Wycombe Community Board", 9, 0, (-2000.0, -2000.0, 2000.0, 2000.0))
@@ -327,15 +327,17 @@ fn a_place_node_a_place_area_of_its_name_and_rank_links_is_no_row() {
     };
     let board = "81 Oakridge Road, High Wycombe Community Board, High Wycombe, United States";
     for city in [None, Some("High Wycombe")] {
-        let (display, address) = answer_at(&index(city, false), 10.0, 0.0);
+        let (display, address) = answer_at(&index(city, None), 10.0, 0.0);
         assert_eq!(display, board, "{city:?}");
         assert_eq!(address["town"], "High Wycombe", "{city:?}");
     }
-    let (display, _) = answer_at(&index(None, true), 10.0, 0.0);
-    assert_eq!(display, board);
-    let (display, address) = answer_at(&index(Some("High Wycombe"), true), 10.0, 0.0);
-    assert_eq!(display, "81 Oakridge Road, High Wycombe, United States");
-    assert_eq!(address["town"], "High Wycombe");
+    for label in ["Wycombe", "High Wycombe"] {
+        let (display, _) = answer_at(&index(None, Some(label)), 10.0, 0.0);
+        assert_eq!(display, board, "{label}");
+        let (display, address) = answer_at(&index(Some("High Wycombe"), Some(label)), 10.0, 0.0);
+        assert_eq!(display, "81 Oakridge Road, High Wycombe, United States", "{label}");
+        assert_eq!(address["town"], "High Wycombe", "{label}");
+    }
 }
 
 #[test]
