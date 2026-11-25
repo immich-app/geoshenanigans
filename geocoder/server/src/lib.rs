@@ -3077,11 +3077,13 @@ impl Index {
     /// (postcode_grid_build.h). It comes before get_nearest_postcode's postal areas and centroids
     /// at each point that rule runs at: a US ZIP is an area OSM barely maps, and the centroid of
     /// a large one lies farther from its edge than a neighbour's, where the houses round the point
-    /// carry their own. A cell of no postcode, past the reach of every house, has none.
+    /// carry their own. A cell of no postcode, past the reach of every house, has none, nor has
+    /// one of a postcode the answer refuses (postcode_looks_valid), which then leaves the point to
+    /// the postal areas and centroids, as such a postal area's does.
     fn grid_postcode<'a>(&'a self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
         let (grid, cc) = (self.postcode_grid.as_ref()?, country_code?);
         let (country, code) = grid.postcode_at(cell_id_at_level(lat, lng, grid.level()))?;
-        (country == cc).then_some(Cow::Borrowed(code))
+        (country == cc && postcode_looks_valid(&cc, code)).then_some(Cow::Borrowed(code))
     }
 
     /// The postcode of the postcode centroid nearest the point (lat, lng) whose box holds it,

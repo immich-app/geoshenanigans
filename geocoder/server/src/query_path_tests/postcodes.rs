@@ -493,6 +493,17 @@ fn a_cell_of_no_postcode_in_the_grid_leaves_the_point_to_the_nearest_centroid() 
 }
 
 #[test]
+fn a_grid_postcode_the_answer_refuses_leaves_the_point_to_the_nearest_centroid() {
+    // A run of 44444, which Nominatim's pattern takes but the answer refuses as a placeholder (all
+    // one digit, postcode_looks_valid): the grid names the point no postcode, as a postal area of
+    // one names none, and the nearest centroid does.
+    let point = (39.93538, -75.29800);
+    let mut dataset = country_at(point, b"US");
+    dataset.centroid("19018", 1242.0, 0.0).grid_run("44444", grid_cell(point, 0.0, 0.0, -1));
+    assert_eq!(postcode_from(&dataset.load(), point, 0.0, 0.0), "19018");
+}
+
+#[test]
 fn the_grid_names_a_point_of_its_runs_country_only() {
     // Beyond the US border the grid's US runs name no point: a Canadian one takes its own
     // country's centroid.
