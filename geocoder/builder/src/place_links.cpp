@@ -278,10 +278,14 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
     });
 
     auto label_of = [&](const AdminObject& o) -> uint32_t {
-        if (!o.relation || !o.tags || o.tags->label < 0) return NO_DATA;
-        const auto it = std::lower_bound(nodes.begin(), nodes.end(), o.tags->label,
-                                         [](const LinkCandidate& c, int64_t id) { return c.node < id; });
-        return it != nodes.end() && it->node == o.tags->label ? static_cast<uint32_t>(it - nodes.begin()) : NO_DATA;
+        // The first label member that is a place node (:297-312).
+        if (!o.relation || !o.tags) return NO_DATA;
+        for (const int64_t label : o.tags->labels) {
+            const auto it = std::lower_bound(nodes.begin(), nodes.end(), label,
+                                             [](const LinkCandidate& c, int64_t id) { return c.node < id; });
+            if (it != nodes.end() && it->node == label) return static_cast<uint32_t>(it - nodes.begin());
+        }
+        return NO_DATA;
     };
     // The nodes a relation links as its label member: the public server's index, which takes
     // every polygon again after its import, holds each with its label relation (a label link

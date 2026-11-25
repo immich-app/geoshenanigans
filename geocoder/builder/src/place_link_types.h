@@ -79,11 +79,11 @@ struct LinkCandidates {
 };
 
 // What find_linked_place reads of a boundary or place area beyond its rings
-// and ranks: a relation's first label member, its name tag lower-cased and
-// its wikidata tag; and whether a name:en tag of its own names it.
+// and ranks: a relation's label members, its name tag lower-cased and its
+// wikidata tag; and whether a name:en tag of its own names it.
 struct AdminTags {
-    uint64_t boundary = 0;  // admin_boundary_id of its polygons
-    int64_t label = -1;     // the node of its first label member, -1 for none
+    uint64_t boundary = 0;        // admin_boundary_id of its polygons
+    std::vector<int64_t> labels;  // the nodes of its label members, in relation order
     std::string name;       // empty for none
     std::string wikidata;   // empty for none
     bool name_en = false;   // its polygons are named by a name:en tag of its own

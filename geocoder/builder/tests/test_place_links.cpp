@@ -41,6 +41,7 @@ struct Tags {
     std::string wikidata;
     int64_t label = -1;
     bool name_en = false;  // a name:en of its own names it
+    std::vector<int64_t> more_labels;  // its label members after `label`
 };
 
 // Boundaries, place areas and place nodes, every point in `country`.
@@ -63,7 +64,8 @@ struct World {
         data.admin_osm_ids.push_back(osm_id);
         AdminTags t;
         t.boundary = admin_boundary_id(osm_id);
-        t.label = tags.label;
+        if (tags.label >= 0) t.labels.push_back(tags.label);
+        t.labels.insert(t.labels.end(), tags.more_labels.begin(), tags.more_labels.end());
         t.name = lowercase_utf8(tags.name);
         t.wikidata = tags.wikidata;
         t.name_en = tags.name_en;
@@ -186,6 +188,20 @@ TEST(a_label_member_links_whatever_its_value_name_or_link_and_a_boundary_of_rank
     au.link();
     CHECK(au.link_of(gold_coast).step == LinkStep::NONE);
     CHECK_EQ(au.claimant(1), uint64_t(0));
+}
+
+TEST(a_relation_links_the_first_of_its_label_members_that_is_a_place_node) {
+    // Kilbeg's first label member, node 9, is no place node; its second, the hamlet Ballyboy of
+    // another name and no wikidata, is: find_linked_place takes the label members in turn until
+    // one is a place (placex_triggers.sql:297-312), so Kilbeg links Ballyboy by its label.
+    World w("IE");
+    w.node(2, PlaceValue::HAMLET, 53.5, -6.5, "Ballyboy");
+    Tags tags{PlaceValue::NONE, "Kilbeg", "", 9};
+    tags.more_labels = {2};
+    const uint32_t kilbeg = w.relation(10, 10, Box{53.4, -6.6, 53.6, -6.4}, tags);
+    w.link();
+    CHECK(w.link_of(kilbeg).step == LinkStep::LABEL);
+    CHECK_EQ(w.link_of(kilbeg).node, int64_t(2));
 }
 
 TEST(a_label_member_is_left_to_its_relation_by_every_other_step) {

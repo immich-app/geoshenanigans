@@ -2027,14 +2027,11 @@ static int run(int argc, char* argv[]) {
                         bool is_postal = kind == RelationKind::POSTAL;
                         bool is_place_area = kind == RelationKind::PLACE;
 
-                        // Capture label member node (Nominatim's primary place-link lookup)
-                        int64_t label_node_id = -1;
-                        for (size_t mi = 0; mi < rel.members.size(); mi++) {
-                            if (rel.members[mi].type == 'n' && rel.member_role(mi) == "label") {
-                                label_node_id = rel.members[mi].ref;
-                                break;
-                            }
-                        }
+                        // Its label member nodes (Nominatim's primary place-link lookup).
+                        std::vector<int64_t> label_node_ids;
+                        for (size_t mi = 0; mi < rel.members.size(); mi++)
+                            if (rel.members[mi].type == 'n' && rel.member_role(mi) == "label")
+                                label_node_ids.push_back(rel.members[mi].ref);
 
                         // Place areas: boundary=place (e.g., Washington DC) and
                         // multipolygons with place=* (e.g., Moscow R2555133).
@@ -2051,7 +2048,7 @@ static int run(int argc, char* argv[]) {
                                         CollectedRelation cr;
                                         cr.id = rel.id;
                                         cr.name_en = own_name_en;
-                                        cr.label_node_id = label_node_id;
+                                        cr.label_node_ids = label_node_ids;
                                         cr.admin_level = 15;  // special marker for boundary=place / place multipolygon
                                         cr.name = name;
                                         cr.is_postal = false;
@@ -2066,7 +2063,8 @@ static int run(int argc, char* argv[]) {
                                         }
                                         if (!cr.members.empty()) {
                                             mine.relations.push_back(std::move(cr));
-                                            if (label_node_id >= 0) mine.label_nodes.push_back(label_node_id);
+                                            mine.label_nodes.insert(mine.label_nodes.end(), label_node_ids.begin(),
+                                                                    label_node_ids.end());
                                         }
                                     }
                                 }
@@ -2120,7 +2118,7 @@ static int run(int argc, char* argv[]) {
 
                         CollectedRelation cr;
                         cr.id = rel.id;
-                        cr.label_node_id = is_postal ? -1 : label_node_id;
+                        if (!is_postal) cr.label_node_ids = std::move(label_node_ids);
                         cr.admin_level = admin_level;
                         cr.name = std::move(name_str);
                         cr.country_code = std::move(country_code);
@@ -2139,7 +2137,8 @@ static int run(int argc, char* argv[]) {
                         }
 
                         if (!cr.members.empty()) {
-                            if (cr.label_node_id >= 0) mine.label_nodes.push_back(cr.label_node_id);
+                            mine.label_nodes.insert(mine.label_nodes.end(), cr.label_node_ids.begin(),
+                                                    cr.label_node_ids.end());
                             mine.relations.push_back(std::move(cr));
                         }
                     }
@@ -3599,7 +3598,7 @@ static int run(int argc, char* argv[]) {
                         if (rel.is_postal) continue;
                         AdminTags tags;
                         tags.boundary = relation_boundary_id(rel.id);
-                        tags.label = rel.label_node_id;
+                        tags.labels = std::move(rel.label_node_ids);
                         tags.name = lowercase_utf8(rel.name_tag);
                         tags.wikidata = std::move(rel.wikidata);
                         tags.name_en = rel.name_en;
