@@ -77,6 +77,10 @@ enum class AdminPlaceType : uint8_t {
 // import dropping one of level 4 or less (placex_insert,
 // placex_triggers.sql:687-690).
 constexpr uint8_t kMaxBoundaryLevel = 12;
+// The highest admin level of a POI's parent polygon, the jurisdiction a query
+// must lie in for the POI to answer it (the server's poi_chain_contains_query):
+// a city's district at most, not the blocks and neighbourhoods of 11 and 12.
+constexpr uint8_t kMaxPoiParentLevel = 10;
 constexpr uint8_t kMinBoundaryWayLevel = 5;
 
 // The admin_level of a postal area's polygon (boundary=postal_code), above

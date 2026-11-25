@@ -468,21 +468,23 @@ TEST(admin_candidates_are_the_same_for_any_rotation_or_direction_of_the_rings) {
     CHECK(cells > 1000);
 }
 
-TEST(a_poi_and_a_street_link_to_a_level_11_or_12_polygon_round_them) {
-    // Nominatim's administrative levels run to 12: a POI inside a level 12 polygon has it as its
-    // parent, and a street inside a level 11 one that; a postal area round both is neither's.
+TEST(a_street_links_to_a_level_11_or_12_polygon_round_it_and_a_poi_to_one_of_level_10_or_less) {
+    // Nominatim's administrative levels run to 12: a street inside a level 11 polygon has it as
+    // its parent, the first of its address chain. A POI's parent is the jurisdiction a query must
+    // lie in for the POI to answer it (poi_chain_contains_query), of levels 2 to 10: one inside a
+    // level 12 polygon has the level 10 one round it. A postal area round both is neither's.
     Admins a;
     a.add(2, closed({at(45, 5), at(45, 11), at(48, 11), at(48, 5)}));
-    a.add(10, closed({at(46.0, 7.0), at(46.0, 7.4), at(46.4, 7.4), at(46.4, 7.0)}));
+    const uint32_t l10 = a.add(10, closed({at(46.0, 7.0), at(46.0, 7.4), at(46.4, 7.4), at(46.4, 7.0)}));
     const uint32_t l11 = a.add(11, closed({at(46.1, 7.1), at(46.1, 7.3), at(46.3, 7.3), at(46.3, 7.1)}));
-    const uint32_t l12 = a.add(12, closed({at(46.15, 7.15), at(46.15, 7.2), at(46.2, 7.2), at(46.2, 7.15)}));
+    a.add(12, closed({at(46.15, 7.15), at(46.15, 7.2), at(46.2, 7.2), at(46.2, 7.15)}));
     const uint32_t postal = a.add(POSTAL_AREA_LEVEL, closed({at(46.05, 7.05), at(46.05, 7.35), at(46.35, 7.35), at(46.35, 7.05)}));
     a.add_poi(46.17f, 7.17f);
     a.add_way({at(46.25, 7.22), at(46.26, 7.24)});
     a.map();
     a.link_pois();
     compute_way_parent_polygons(a.data, 1);
-    CHECK_EQ(a.data.poi_records[0].parent_poly_id, l12);
+    CHECK_EQ(a.data.poi_records[0].parent_poly_id, l10);
     CHECK_EQ(a.data.poi_records[0].parent_postcode_id, a.data.admin_polygons[postal].name_id);
     CHECK_EQ(a.data.way_parent_ids[0], l11);
 }

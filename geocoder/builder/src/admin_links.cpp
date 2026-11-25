@@ -533,7 +533,7 @@ void compute_poi_parent_polygons(ParsedData& data, unsigned int num_threads, std
                     if (p.admin_level == POSTAL_AREA_LEVEL) {
                         if (p.place_type_override != POSTAL_AREA_INVALID && p.name_id != NO_DATA) c.postal.push_back(id);
                     }
-                    else if (p.admin_level >= 2 && p.admin_level <= kMaxBoundaryLevel) c.admin.push_back(id);
+                    else if (p.admin_level >= 2 && p.admin_level <= kMaxPoiParentLevel) c.admin.push_back(id);
                 });
                 rank_candidates(c.postal, smaller, c.scratch);
                 rank_candidates(c.admin, smaller, c.scratch);
