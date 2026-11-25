@@ -10,7 +10,8 @@
 // which Roy City is Roy, Barre Town is Barre and Mayagüez is Mayaguez.
 // Values that name no postal place (a digit, a state's name, one or two
 // letters, a Township, Twp, County or Borough last word) don't vote unless
-// GeoNames' name of the ZIP is theirs.
+// GeoNames' name of the ZIP is theirs, nor do values of punctuation and
+// symbols alone (`???`).
 //
 // The choice (choose): a ZIP of 5 votes or more takes the key of the most
 // votes, GeoNames' key counting max(2, 10% of the votes) more, and
@@ -251,7 +252,8 @@ enum class Kind : uint8_t {
     VOTE,
     // Names no postal place (names_no_postal_place) and is not GeoNames'.
     FILTERED,
-    // Longer than a name can be, or no text a name can hold.
+    // Longer than a name can be, or no text a name can hold (of
+    // punctuation and symbols alone, as `???` or `*`).
     UNFIT,
 };
 inline const char* kind_name(Kind k) { return k == Kind::VOTE ? "vote" : k == Kind::FILTERED ? "filtered" : "unfit"; }
@@ -269,9 +271,19 @@ struct Classified {
     uint64_t n = 0;
     Kind kind = Kind::VOTE;
 };
+// Whether a strict key holds more than punctuation and symbols: an ASCII
+// letter or digit, or any byte of a character past ASCII, as a script
+// without case spells names in.
+inline bool has_word_character(std::string_view strict) {
+    return std::any_of(strict.begin(), strict.end(), [](char ch) {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c >= 0x80;
+    });
+}
 inline Classified classify(const Value& v, std::string_view geonames_key) {
     Classified c{v.text, strict_key(v.text), lenient_key(v.text), v.n, Kind::VOTE};
-    if (v.text.empty() || v.text.size() > NAME_BYTES || !name_text(v.text) || c.strict.empty()) c.kind = Kind::UNFIT;
+    if (v.text.empty() || v.text.size() > NAME_BYTES || !name_text(v.text) || !has_word_character(c.strict))
+        c.kind = Kind::UNFIT;
     else if (names_no_postal_place(v.text, c.strict) && c.lenient != geonames_key) c.kind = Kind::FILTERED;
     return c;
 }

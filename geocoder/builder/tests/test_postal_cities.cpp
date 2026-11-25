@@ -163,6 +163,11 @@ TEST(a_value_that_names_no_postal_place_votes_only_where_geonames_names_it) {
     CHECK(kind("Bad\xC3") == Kind::UNFIT);
     CHECK(kind(";") == Kind::UNFIT);
     CHECK(kind("...") == Kind::UNFIT);
+    // Nor is a text of punctuation and symbols alone, a placeholder; letters
+    // of other scripts are.
+    for (const char* none : {"???", "*", "-?-", "#!"}) CHECK(kind(none, "Saint Louis") == Kind::UNFIT);
+    CHECK(kind("\xC3\x91" "and\xC3\xBA") == Kind::VOTE);
+    CHECK(kind("\xE6\x9D\xB1\xE4\xBA\xAC") == Kind::VOTE);
 }
 
 TEST(a_zip_of_five_votes_or_more_takes_its_votes_key_and_below_that_geonames_name) {
@@ -181,6 +186,10 @@ TEST(a_zip_of_five_votes_or_more_takes_its_votes_key_and_below_that_geonames_nam
     CHECK_EQ(name({}, "Saint Louis"), std::string("Saint Louis"));
     // Filtered votes count towards no threshold: GeoNames stands.
     CHECK_EQ(name({{"Kirkwood", 4}, {"Loudoun County", 20}}, "Saint Louis"), std::string("Saint Louis"));
+    // Nor do votes of no letter, which name nothing.
+    CHECK(choice({{"???", 5}}, "Saint Louis").step == Step::GEONAMES);
+    CHECK_EQ(name({{"???", 5}}, "Saint Louis"), std::string("Saint Louis"));
+    CHECK_EQ(name({{"Kirkwood", 4}, {"*", 3}}, "Saint Louis"), std::string("Saint Louis"));
     // Spellings of one key vote together; a tie of spellings goes to the
     // least text.
     CHECK_EQ(name({{"St. Louis", 3}, {"Saint Louis", 3}, {"Kirkwood", 4}}), std::string("Saint Louis"));
