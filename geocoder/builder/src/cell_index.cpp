@@ -751,6 +751,24 @@ void collect_postcode_centroids(ParsedData& data) {
     data.postcode_accum = std::move(osm);
 }
 
+// The ids of `ids` but NO_DATA, each once, ascending.
+static std::vector<uint32_t> distinct_ids(const std::vector<uint32_t>& ids) {
+    const unsigned workers = parallel_threads();
+    std::vector<std::vector<uint32_t>> parts(workers);
+    parallel_for(ids.size(), [&](size_t begin, size_t end, unsigned w) {
+        std::vector<uint32_t>& part = parts[w];
+        for (size_t i = begin; i < end; i++)
+            if (ids[i] != NO_DATA) part.push_back(ids[i]);
+        std::sort(part.begin(), part.end());
+        part.erase(std::unique(part.begin(), part.end()), part.end());
+    }, workers);
+    std::vector<uint32_t> out;
+    for (auto& part : parts) out.insert(out.end(), part.begin(), part.end()), std::vector<uint32_t>().swap(part);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
 void collect_postcode_grid(ParsedData& data) {
     using namespace postcode_grid;
     const AdminRings countries = border_country_rings(data);
@@ -768,10 +786,12 @@ void collect_postcode_grid(ParsedData& data) {
               << data.postcode_grid_file.size() << " bytes" << std::endl;
 
     // The postal cities, of the codes an answer in a grid country can give
-    // (the grid's, and its postal areas', which assign_postal_area_countries
-    // gave their centroid's country) and the votes of its addresses with a
-    // city; then the cities go, before the strategy-2 remap.
-    std::vector<GridCode> areas;
+    // (the grid's, its postal areas', which assign_postal_area_countries
+    // gave their centroid's country, and its TIGER lines' own ZIPs, which a
+    // US street's answer takes wherever the line runs, its middle in the
+    // country or not) and the votes of its addresses with a city; then the
+    // cities go, before the strategy-2 remap.
+    std::vector<GridCode> answered;
     const auto& rings = data.admin_exact_rings;
     for (size_t i = 0; i < data.admin_polygons.size() && i < rings.polygons.size(); i++) {
         const AdminPolygon& area = data.admin_polygons[i];
@@ -779,11 +799,14 @@ void collect_postcode_grid(ParsedData& data) {
             !grid_country(area.country_code) || rings.polygons[i].ring_count == 0)
             continue;
         std::optional<std::string> code = grid_postcode(area.country_code, data.get_string(area.name_id));
-        if (code) areas.push_back(GridCode{area.country_code, std::move(*code)});
+        if (code) answered.push_back(GridCode{area.country_code, std::move(*code)});
     }
-    const size_t postal_areas = areas.size();
+    const size_t postal_areas = answered.size();
+    for (uint32_t id : distinct_ids(data.interp_postcode_ids))
+        if (auto code = grid_postcode(pack_country_code('U', 'S'), data.get_string(id)))
+            answered.push_back(GridCode{pack_country_code('U', 'S'), std::move(*code)});
     postal_cities::TableCodes codes =
-        postal_cities::table_codes(grid.codes, grid.cells, grid.other_votes, std::move(areas));
+        postal_cities::table_codes(grid.codes, grid.cells, grid.other_votes, std::move(answered));
     std::vector<uint64_t>().swap(grid.other_votes);
     // The city votes of the table's codes: the merge keeps their order.
     if (codes.codes.size() != grid.codes.size())

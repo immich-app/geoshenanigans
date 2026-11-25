@@ -505,29 +505,29 @@ inline Choice choose(const std::vector<Classified>& values, const Place* geoname
 }
 
 // The codes a build's postal cities are chosen for: the grid's codes
-// (postcode_grid_build.h) and its postal areas' merged, (country, code)
-// ascending; each grid code's index among them; and whether an answer can
-// give each: a code a cell holds votes for (the cell's own, of `cells`, or
-// another, of `other_votes`) or a postal area's is, and one that only a
-// foreign address names is not.
+// (postcode_grid_build.h) and `answered` merged, (country, code) ascending;
+// each grid code's index among them; and whether an answer can give each: a
+// code a cell holds votes for (the cell's own, of `cells`, or another, of
+// `other_votes`) or one of `answered` (a postal area's, a TIGER line's) is,
+// and one that only a foreign address names is not.
 struct TableCodes {
     std::vector<postcode_grid::GridCode> codes;
     std::vector<uint32_t> of_grid;
     std::vector<bool> reachable;
 };
 inline TableCodes table_codes(const std::vector<postcode_grid::GridCode>& grid_codes, const std::vector<uint64_t>& cells,
-                              const std::vector<uint64_t>& other_votes, std::vector<postcode_grid::GridCode> areas) {
+                              const std::vector<uint64_t>& other_votes, std::vector<postcode_grid::GridCode> answered) {
     using postcode_grid::code_index;
     auto less = [](const postcode_grid::GridCode& a, const postcode_grid::GridCode& b) {
         return postcode_grid::postcode_less(a.country, a.code, b.country, b.code);
     };
-    std::sort(areas.begin(), areas.end(), less);
+    std::sort(answered.begin(), answered.end(), less);
     TableCodes t;
     t.of_grid.resize(grid_codes.size());
-    std::vector<uint32_t> of_area(areas.size());
-    for (size_t g = 0, a = 0; g < grid_codes.size() || a < areas.size();) {
-        const bool area_first = a < areas.size() && (g == grid_codes.size() || less(areas[a], grid_codes[g]));
-        const postcode_grid::GridCode& code = area_first ? areas[a] : grid_codes[g];
+    std::vector<uint32_t> of_area(answered.size());
+    for (size_t g = 0, a = 0; g < grid_codes.size() || a < answered.size();) {
+        const bool area_first = a < answered.size() && (g == grid_codes.size() || less(answered[a], grid_codes[g]));
+        const postcode_grid::GridCode& code = area_first ? answered[a] : grid_codes[g];
         if (t.codes.empty() || less(t.codes.back(), code)) {
             if (t.codes.size() == postcode_grid::MAX_CODES) throw std::runtime_error("postal cities: more than 2^20 postcodes");
             t.codes.push_back(code);

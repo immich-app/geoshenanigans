@@ -1,7 +1,6 @@
 #include "continent_filter.h"
 #include "admin_cover.h"
 #include "continent_boundaries.h"
-#include "line_middle.h"
 #include "parsed_data.h"
 #include "parallel.h"
 #include "ranked_bits.h"
@@ -437,10 +436,12 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         if (!rows.empty()) out.postcode_grid_file = postcode_grid::encode_file(rows);
         // The postal cities of the postcodes the continent's data answers
         // with, each the planet's row of it (region_rows): its runs', its
-        // postal areas', and the own postcode of each of its houses and TIGER
-        // lines (at the point halfway along it) in a run of a grid country,
-        // whose answers give that country's postcodes. Its runs hold every
-        // cell a query routed here reads, so each of its records lies in one.
+        // postal areas', the own postcode of each of its houses in a run of a
+        // grid country, whose answers give that country's postcodes, and the
+        // ZIP of each of its TIGER lines, the United States' wherever the line
+        // runs (a line it keeps by a cell at its end may have its middle
+        // outside). Its runs hold every cell a query routed here reads, so
+        // each of its houses lies in one.
         if (!full.postal_city_rows.empty()) {
             using postcode_grid::GridCode;
             std::vector<GridCode> codes;
@@ -474,12 +475,8 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
                         id = out.addr_postcode_ids[i];
                         if (id != NO_DATA) country = run_country(out.addr_points[i].lat, out.addr_points[i].lng);
                     } else {
-                        const InterpWay& line = out.interp_ways[i - n_addrs];
                         id = out.interp_postcode_ids[i - n_addrs];
-                        if (id == NO_DATA || !line.node_count || size_t(line.node_offset) + line.node_count > out.interp_nodes.size())
-                            continue;
-                        const PackedLocation mid = line_middle(out.interp_nodes.data() + line.node_offset, line.node_count);
-                        country = run_country(mid.lat(), mid.lon());
+                        country = pack_country_code('U', 'S');
                     }
                     if (country && id != NO_DATA) part.push_back(uint64_t(country) << 32 | id);
                 }

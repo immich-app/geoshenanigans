@@ -25,6 +25,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <map>
 #include <optional>
@@ -1663,7 +1664,7 @@ StraddlingCell straddling_cell() {
 
 int32_t e7(double degrees) { return int32_t(std::lround(degrees * 1e7)); }
 
-// Testland, the United States, a square across Europe's edge from 11.3 to
+// Testland, the United States, a square across Europe's edge from 10.9 to
 // 11.9 E round the straddling cell; north of the cell a postal area of 19700
 // from 11.40 to 11.62 E, its centroid west of the edge; and in the cell two
 // houses of 19800 west of the edge and one of 19810 east of it, which Europe
@@ -1678,7 +1679,7 @@ std::vector<TestObject> straddling_fixture(const StraddlingCell& cell) {
         objects.push_back(node(first + 3, e7(n), e7(w)));
         objects.push_back(way(way_id, {first, first + 1, first + 2, first + 3, first}));
     };
-    square(9001, 9000, lat0 - 0.2, lat0 + 0.3, 11.30, 11.90);
+    square(9001, 9000, lat0 - 0.2, lat0 + 0.3, 10.90, 11.90);
     square(9101, 9100, lat0 + 0.07, lat0 + 0.17, 11.40, 11.62);
     TestObject country;
     country.type = OsmType::Relation;
@@ -1724,11 +1725,27 @@ TEST(a_regions_postal_cities_hold_the_planets_row_of_each_us_postcode_its_data_a
     const std::string places = root.path() + "/postal_places.tsv";
     {
         std::ofstream f(places);
-        f << "US\t19700\tPostalton\tPA\nUS\t19800\tMajorville\tPA\nUS\t19810\tMinorville\tPA\n";
+        f << "US\t19700\tPostalton\tPA\nUS\t19800\tMajorville\tPA\nUS\t19810\tMinorville\tPA\n"
+             "US\t19820\tLineville\tPA\nUS\t19830\tBorderline\tPA\n";
+    }
+    // Two TIGER lines a kilometre south of the cell, of ZIPs no house or
+    // area has: one of 19820 from 11.0 E to just east of the edge, which
+    // Europe keeps by its east end, its middle 27 km west of the edge, and
+    // one of 19830 from 11.86 to 12.6 E, its middle 30 km east of Testland,
+    // in no country, so it casts no vote.
+    const std::string tiger = root.path() + "/tiger";
+    fs::create_directories(tiger);
+    {
+        const S2LatLng c = cell.east.parent(16).ToLatLng();
+        const double lat = c.lat().degrees() - 0.01, edge = europe_edge_lng(lat);
+        std::ofstream f(tiger + "/99001.csv");
+        f << std::fixed << std::setprecision(6) << "from;to;interpolation;street;city;state;postcode;geometry\n"
+          << "100;198;even;Tigerweg;Testville;PA;19820;LINESTRING(11.0 " << lat << "," << edge + 0.004 << " " << lat << ")\n"
+          << "101;199;odd;Tigerweg;Testville;PA;19830;LINESTRING(11.86 " << lat << ",12.6 " << lat << ")\n";
     }
     const std::string out = root.path() + "/out";
     REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output", "--multi-quality",
-                         "--postal-places", places},
+                         "--postal-places", places, "--tiger-data", tiger},
                         log));
     const auto files = tree(out);
     auto rows_of = [&](const std::string& at) {
@@ -1741,11 +1758,18 @@ TEST(a_regions_postal_cities_hold_the_planets_row_of_each_us_postcode_its_data_a
         return rows;
     };
     const std::string name = postal_cities::FILE_NAME;
-    const std::vector<std::string> all = {"19700 Postalton", "19800 Majorville", "19810 Minorville"};
+    const std::vector<std::string> all = {"19700 Postalton", "19800 Majorville", "19810 Minorville", "19820 Lineville",
+                                          "19830 Borderline"};
+    // The planet answers with each, 19830 too, whose line's middle has no
+    // country.
     CHECK(rows_of("planet/admin/" + name) == all);
+    for (const char* region : {"planet", "europe"})
+        if (rows_of(std::string(region) + "/admin/" + name) != all)
+            for (const std::string& r : rows_of(std::string(region) + "/admin/" + name)) std::printf("    %s: %s\n", region, r.c_str());
     // Europe answers with each: the postal area it keeps, whose centroid lies
-    // west of its edge, the grid's 19800 of the cell, and the house of 19810
-    // it keeps, whose cell's centre lies west of the edge too.
+    // west of its edge, the grid's 19800 of the cell, the house of 19810 it
+    // keeps, whose cell's centre lies west of the edge too, and the TIGER
+    // lines it keeps, 19820's by a cell east of the edge, far from its middle.
     REQUIRE(files.count(std::string("europe/admin/") + postcode_grid::FILE_NAME));
     CHECK(rows_of("europe/admin/" + name) == all);
     // Europe's dir of the full mode, as a client of a preset with addresses
