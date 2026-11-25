@@ -224,7 +224,8 @@ impl PostcodeGrid {
     }
 
     /// The postcode of `cell`, an S2 cell id at the grid's level: its run's country and code, None
-    /// in a run of no postcode or before the first.
+    /// in a run of no postcode or before the first, and in a block that reads as malformed before
+    /// the row after the cell's.
     pub fn postcode_at(&self, cell: u64) -> Option<([u8; 2], &str)> {
         let blocks = self.blocks();
         if blocks == 0 {
@@ -240,14 +241,15 @@ impl PostcodeGrid {
         }
         let b = lo.checked_sub(1)?;
         let mut found = None;
-        self.walk(b, |c, entry| {
+        // A block that reads as malformed before the walk passes the cell gives no run of it.
+        let read = self.walk(b, |c, entry| {
             if c > cell {
                 return false;
             }
             found = Some(entry);
             true
         });
-        let (country, code) = found?;
+        let (country, code) = found.filter(|_| read)?;
         (country != 0 && !code.is_empty()).then(|| (country.to_be_bytes(), code))
     }
 

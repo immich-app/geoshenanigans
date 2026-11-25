@@ -172,6 +172,22 @@ fn a_block_whose_parameter_is_past_63_reads_as_malformed() {
 }
 
 #[test]
+fn a_block_that_breaks_off_after_its_first_row_reads_as_no_postcode() {
+    // Two runs a cell apart, 19026 and 19073, the block's bits all 0: row 0 reads as 19026, and
+    // the step's Rice code runs past the block, so where the next run starts is not known. No cell
+    // of the block reads a postcode, past row 0 neither.
+    let file = encode(&[run(100, "19026"), run(101, "19073")]);
+    let mut block = file[..file.len() - ENTRY_BYTES - FOOTER_BYTES].to_vec();
+    assert_eq!((block.len(), block[17]), (19, 0));
+    block[18] = 0;
+    let g = PostcodeGrid::open(FileBytes::Owned(one_block(&block, cell(100), 2))).unwrap();
+    for pos in [100, 101, 200] {
+        assert_eq!(at(&g, pos), None, "cell {pos}");
+    }
+    assert!(!g.for_rows(|_| {}));
+}
+
+#[test]
 fn a_block_past_the_blocks_or_longer_than_its_rows_take_reads_as_malformed() {
     let rows: Vec<LogicalRow> = (0..2 * BLOCK_ROWS as u64).map(|i| run(100 + 2 * i, ["19026", "19073"][(i % 2) as usize])).collect();
     let file = encode(&rows);
