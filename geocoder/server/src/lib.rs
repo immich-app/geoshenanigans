@@ -7434,12 +7434,8 @@ mod pure_helper_tests {
         let (accepted, rows) = place_node_walk(&nodes, 1 << 20, |_| true, true);
         assert_eq!(accepted, [None; 7]);
         assert_eq!(rows, [0, 1, 2]);
-        // Without rows the walk accepts the same nodes and lists none.
-        assert_eq!(place_node_walk(&nodes, 0, |_| true, false), (accepted_of(&nodes, 0), Vec::new()));
-    }
-
-    fn accepted_of(nodes: &[(usize, u8, f64, f32, f32)], held_ranks: u32) -> [Option<usize>; 7] {
-        accept_place_nodes(nodes, held_ranks, |_| true)
+        // Without rows the walk accepts the same nodes, Addingham alone, and lists none.
+        assert_eq!(place_node_walk(&nodes, 0, |_| true, false), ([None, None, None, None, Some(0), None, None], Vec::new()));
     }
 
     #[test]
