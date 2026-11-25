@@ -176,6 +176,24 @@ fn a_rank_takes_the_farther_of_two_nodes_of_the_value_s_name_whatever_field_the_
 }
 
 #[test]
+fn of_two_nodes_of_the_value_s_name_at_one_distance_a_rank_takes_the_one_of_the_higher_search_rank() {
+    // A city node and a town node Springfield at one point 100 m north of the street: the walk
+    // accepts the city, and both are rows of rank 16 at the same distance. Nominatim's last order
+    // within a rank is rank_search, descending (results.py:622), the town's 18 before the city's
+    // 16: the house's town is Springfield, and it has no city.
+    let places = |index: &mut TestIndex| {
+        index.place("Springfield", 0, 100.0, 0.0).place("Springfield", 1, 100.0, 0.0);
+    };
+    let (display, address) = answer_at(&main_street(None, places), 10.0, 0.0);
+    assert_eq!(display, "4 Main Street, Springfield, United States");
+    assert_eq!((&address["city"], &address["town"]), (&serde_json::json!("Springfield"), &serde_json::Value::Null));
+
+    let (display, address) = answer_at(&main_street(Some("Springfield"), places), 10.0, 0.0);
+    assert_eq!(display, "4 Main Street, Springfield, United States");
+    assert_eq!((&address["city"], &address["town"]), (&serde_json::Value::Null, &serde_json::json!("Springfield")));
+}
+
+#[test]
 fn a_field_the_value_s_row_leaves_goes_to_the_finest_part_of_no_field_that_fills_it() {
     // Greenburgh (rank 16) and Hartsdale, a level-9 boundary of rank 18 labelled a city, both fill
     // `city`, which the smaller takes; Greenburgh is a part of no field. The village Elmsford in
@@ -305,18 +323,119 @@ fn a_boundary_the_street_runs_into_is_a_row_of_its_rank() {
 }
 
 #[test]
+fn a_boundary_the_street_runs_along_is_a_row_of_its_rank() {
+    // Saw Mill River Road runs along the border of Greenburgh and Elmsford, on nodes the boundary
+    // shares, which the street's f32 nodes hold 20 cm off: the intersection of the street and
+    // Elmsford is a stretch of the border, more than a point (ST_NPoints > 1), so Nominatim's
+    // street has a row of rank 16 for each, and the house's addr:city takes Elmsford. A street
+    // that ends on the border meets Elmsford at a point, and is no row of it.
+    let index = |city: Option<&str>, street: &[(f64, f64)]| {
+        let mut index = united_states();
+        index
+            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Elmsford", 8, 0, (-3000.0, 3000.0, 3000.0, 9000.0))
+            .street("Saw Mill River Road", street)
+            .address("9", 0.0, 2990.0);
+        if let Some(city) = city {
+            index.addr_city(city);
+        }
+        index.load()
+    };
+    let along = [(-1000.0, 2999.8), (0.0, 2999.8), (1000.0, 2999.8)];
+    for (city, part) in [(None, "Greenburgh"), (Some("Elmsford"), "Elmsford")] {
+        let (display, address) = answer_at(&index(city, &along), 0.0, 2990.0);
+        assert_eq!(display, format!("9 Saw Mill River Road, {part}, United States"), "{city:?}");
+        assert_eq!(address["city"], part, "{city:?}");
+    }
+    let (display, address) = answer_at(&index(Some("Elmsford"), &[(0.0, 1500.0), (0.0, 2999.8)]), 0.0, 2990.0);
+    assert_eq!(display, "9 Saw Mill River Road, Greenburgh, United States");
+    assert_eq!(address["city"], "Greenburgh");
+}
+
+#[test]
+fn a_boundary_the_street_runs_into_cells_away_from_the_house_is_a_row_of_its_rank() {
+    // Saw Mill River Road runs 25 km east from Greenburgh into Elmsford, whose boundary no admin
+    // cell of the house's holds; house 9 is in Greenburgh. getNearFeatures takes the street whole,
+    // so Nominatim's street has a row of rank 16 for each: the house's addr:city takes Elmsford.
+    let index = |city: Option<&str>| {
+        let mut index = united_states();
+        index
+            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Elmsford", 8, 0, (-3000.0, 25_000.0, 3000.0, 31_000.0))
+            .street("Saw Mill River Road", &[(0.0, 1500.0), (0.0, 27_000.0)])
+            .address("9", 10.0, 2900.0);
+        if let Some(city) = city {
+            index.addr_city(city);
+        }
+        index.load()
+    };
+    for (city, part) in [(None, "Greenburgh"), (Some("Elmsford"), "Elmsford")] {
+        let (display, address) = answer_at(&index(city), 10.0, 2900.0);
+        assert_eq!(display, format!("9 Saw Mill River Road, {part}, United States"), "{city:?}");
+        assert_eq!(address["city"], part, "{city:?}");
+    }
+}
+
+#[test]
+fn a_polygon_holding_the_house_that_the_street_misses_is_no_row() {
+    // House 4 lies in Springfield, of level 8, and Main Street, a few metres south, does not: a
+    // house's address rows are its street's (results.py _get_address_lookup_id), the areas the
+    // street runs through, so Springfield is none of them. The town node Springfield, in both
+    // Springfield and Greenburgh round the street (closed ways, which raise no node), is a row of
+    // rank 16: the house's addr:city makes it the rank's part, which leaves no city.
+    let places = |index: &mut TestIndex| {
+        index
+            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0)).of_way()
+            .boundary("Springfield", 8, 0, (5.0, -100.0, 4000.0, 100.0)).of_way()
+            .place("Springfield", 1, 100.0, 50.0);
+    };
+    let (display, address) = answer_at(&main_street(None, places), 10.0, 0.0);
+    assert_eq!(display, "4 Main Street, Springfield, United States");
+    assert_eq!((&address["city"], &address["town"]), (&serde_json::json!("Springfield"), &serde_json::Value::Null));
+    let (display, address) = answer_at(&main_street(Some("Springfield"), places), 10.0, 0.0);
+    assert_eq!(display, "4 Main Street, Springfield, United States");
+    assert_eq!((&address["city"], &address["town"]), (&serde_json::Value::Null, &serde_json::json!("Springfield")));
+}
+
+#[test]
+fn a_boundary_the_street_runs_into_ranks_by_its_own_place_type() {
+    // Saw Mill River Road runs east from Greenburgh, of level 8 and rank 16, into Fairview, of
+    // level 8 too and tagged place=suburb: placex_update gives a boundary that links no node its
+    // place tag's rank where that is above its parent's (placex_triggers.sql:1189-1199), 20, not
+    // Greenburgh's. The house's addr:city makes Fairview the suburb, and Greenburgh stays.
+    let index = |city: Option<&str>| {
+        let mut index = united_states();
+        index
+            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Fairview", 8, 4, (-3000.0, 3000.0, 3000.0, 9000.0))
+            .street("Saw Mill River Road", &[(0.0, 1500.0), (0.0, 4000.0)])
+            .address("9", 10.0, 2900.0);
+        if let Some(city) = city {
+            index.addr_city(city);
+        }
+        index.load()
+    };
+    let (display, address) = answer_at(&index(None), 10.0, 2900.0);
+    assert_eq!(display, "9 Saw Mill River Road, Greenburgh, United States");
+    assert_eq!(address["suburb"], serde_json::Value::Null);
+    let (display, address) = answer_at(&index(Some("Fairview")), 10.0, 2900.0);
+    assert_eq!(display, "9 Saw Mill River Road, Fairview, Greenburgh, United States");
+    assert_eq!((&address["city"], &address["suburb"]), (&serde_json::json!("Greenburgh"), &serde_json::json!("Fairview")));
+}
+
+#[test]
 fn a_place_node_a_place_area_of_its_name_and_rank_links_is_no_row() {
     // High Wycombe, a place=town area of rank 16, holds the town node of its name, whose rank is
     // its own: find_linked_place's name match, which runs for ways as well as relations, links the
     // node to the area, and Nominatim's street has no row of it. The house's addr:city names the
     // area, the rank's part already, and the community board of rank 18 stays. Where the area
     // links another node, by its label, the town node is a row of rank 18, in the area's rank 16
-    // boundary, and takes the rank.
-    let index = |city: Option<&str>, label: bool| {
+    // boundary, and takes the rank; a label of the area's name and type is that one link too.
+    let index = |city: Option<&str>, label: Option<&str>| {
         let mut index = united_states();
         index.boundary("High Wycombe", 15, 2, (-3000.0, -3000.0, 3000.0, 3000.0));
-        if label {
-            index.linked_place("Wycombe", 1, 1500.0, 1500.0);
+        if let Some(label) = label {
+            index.linked_place(label, 1, 1500.0, 1500.0);
         }
         index
             .boundary("High Wycombe Community Board", 9, 0, (-2000.0, -2000.0, 2000.0, 2000.0))
@@ -330,15 +449,17 @@ fn a_place_node_a_place_area_of_its_name_and_rank_links_is_no_row() {
     };
     let board = "81 Oakridge Road, High Wycombe Community Board, High Wycombe, United States";
     for city in [None, Some("High Wycombe")] {
-        let (display, address) = answer_at(&index(city, false), 10.0, 0.0);
+        let (display, address) = answer_at(&index(city, None), 10.0, 0.0);
         assert_eq!(display, board, "{city:?}");
         assert_eq!(address["town"], "High Wycombe", "{city:?}");
     }
-    let (display, _) = answer_at(&index(None, true), 10.0, 0.0);
-    assert_eq!(display, board);
-    let (display, address) = answer_at(&index(Some("High Wycombe"), true), 10.0, 0.0);
-    assert_eq!(display, "81 Oakridge Road, High Wycombe, United States");
-    assert_eq!(address["town"], "High Wycombe");
+    for label in ["Wycombe", "High Wycombe"] {
+        let (display, _) = answer_at(&index(None, Some(label)), 10.0, 0.0);
+        assert_eq!(display, board, "{label}");
+        let (display, address) = answer_at(&index(Some("High Wycombe"), Some(label)), 10.0, 0.0);
+        assert_eq!(display, "81 Oakridge Road, High Wycombe, United States", "{label}");
+        assert_eq!(address["town"], "High Wycombe", "{label}");
+    }
 }
 
 #[test]

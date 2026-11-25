@@ -413,3 +413,33 @@ TEST(partition_keeps_an_addr_city_only_where_its_string_is_a_core_one_and_writes
     for (size_t i = 2; i < 5; i++) CHECK_EQ(with.addr_city_ids[i], NO_DATA);
     CHECK(without.addr_city_ids.empty());
 }
+
+TEST(partition_keeps_no_addr_city_a_place_or_boundary_does_not_name_though_its_string_is_core) {
+    // Kingsway names a street and a POI, which puts it in core though no
+    // place node or boundary has it; Drexel Hill names a place node. An
+    // addr:city of Kingsway is none.
+    ParsedData d;
+    PlaceNode pn{};
+    pn.name_id = d.string_pool.intern("Drexel Hill");
+    d.place_nodes.push_back(pn);
+    WayHeader way{};
+    way.name_id = d.string_pool.intern("Kingsway");
+    d.ways.push_back(way);
+    PoiRecord pr{};
+    pr.name_id = way.name_id;
+    pr.vertex_offset = NO_DATA;
+    pr.tier = 1;
+    d.poi_records.push_back(pr);
+    for (const char* number : {"1", "2"}) {
+        AddrPoint a{};
+        a.street_id = way.name_id;
+        a.housenumber_id = d.string_pool.intern(number);
+        a.vertex_offset = NO_DATA;
+        d.addr_points.push_back(a);
+    }
+    d.addr_city_ids = {way.name_id, pn.name_id};
+    partition_strings_into_tiers(d);
+    REQUIRE(tier_bytes(d, 0) == std::string("Drexel Hill\0Kingsway\0", 21));
+    CHECK_EQ(d.addr_city_ids[0], NO_DATA);
+    CHECK_EQ(d.addr_city_ids[1], d.place_nodes[0].name_id);
+}

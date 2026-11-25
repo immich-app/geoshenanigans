@@ -831,6 +831,11 @@ pub const MAX_NESTED_RANK: u8 = 25;
 /// rank 25 names nothing, nor does one of rank 0.
 pub const ADDRESS_AREA_RANKS: std::ops::Range<u8> = 1..25;
 
+/// The margin round a street of the admin cells the crosscheck reads areas from
+/// (Index::crosscheck_rows): the street runs through an area only in a cell under it, and
+/// cells_under_line cuts the street into boxes twice this across.
+pub const STREET_CELLS_MARGIN_M: f64 = 50.0;
+
 // --- String pool (tiered) ---
 //
 // Strings are split into 5 files: core/street/addr/postcode/poi.  Record
@@ -1129,11 +1134,11 @@ pub struct Index {
     pub street_cell_level: u64,
     pub admin_cell_level: u64,
     pub max_distance_sq: f64,
-    /// (boundary_key, name_id) of the place nodes each boundary links where the node's name is
-    /// not the boundary's, ascending: Nominatim merges a linked node's names into its boundary's
-    /// as `_place_*` (placex_indexing_prepare), which the crosscheck reads. A node labels one
-    /// polygon of its boundary, the largest outer ring, and the key holds for every ring. From
-    /// place_hidden.bin's labels, on first use.
+    /// (boundary_key, name_id) of the place nodes each boundary links, ascending: Nominatim
+    /// merges a linked node's names into its boundary's as `_place_*` (placex_indexing_prepare),
+    /// which the crosscheck reads, and a boundary links one node at most (find_linked_place). A
+    /// node labels one polygon of its boundary, the largest outer ring, and the key holds for
+    /// every ring. From place_hidden.bin's labels, on first use.
     pub linked_names: std::sync::OnceLock<Vec<(u64, u32)>>,
     /// (boundary_key, lat, lng) of the place node each boundary links, ascending: Nominatim
     /// takes the node for the boundary's centroid where it lies inside the boundary
@@ -3734,23 +3739,47 @@ impl Index {
     }
 
     /// The rows of an address that are named `name` (a string id), in Nominatim's order within a
-    /// rank (results.py:617-621: fromarea, then distance, descending): the polygons named so, by
-    /// their own name or by a place node's they link, the farthest from `feature` first
-    /// (area_row_distance), then the place nodes of `nodes` (PlaceResult::named_rows), the
-    /// farthest first, but those a place area links (links_by_name). The polygons are those of
-    /// `areas`, the address's ranked polygons (found by `scan`), and those of the scan's others
-    /// that are rows of `feature` as getNearFeatures takes them (partition-functions.sql:39-44):
-    /// a polygon holding the point where the feature is one, such as a larger boundary of a level
-    /// `areas` holds it by, else one the street runs through, each at area_row_rank's rank;
-    /// `country` is the point's, upper case.
+    /// rank (results.py:617-622: fromarea, then distance, descending, then rank_search): the
+    /// polygons named so, by their own name or by a place node's they link, the farthest from
+    /// `feature` first (area_row_distance), then the place nodes of `nodes`
+    /// (PlaceResult::named_rows), the farthest first, equals by rank_search, but those a place
+    /// area links (links_by_name). The polygons are those that
+    /// are rows of `feature` as getNearFeatures takes them (partition-functions.sql:39-44): of a
+    /// point, the polygons holding it, of a street (a house's rows are its street's), those the
+    /// street runs through. They are those of `areas`, the address's ranked polygons (found by
+    /// `scan`), and the others: of the scan where the feature is a point, such as a larger
+    /// boundary of a level `areas` holds it by, else of any admin cell under the street, each at
+    /// area_row_rank's rank; `country` is the point's, upper case.
     fn crosscheck_rows(&self, name: u32, areas: &[RankedPoly], scan: &mut AdminScan, nodes: &[NamedRow],
                        feature: PlaceFeature<'_>, country: &str) -> Vec<AddressRow<'_>> {
         let named = |poly: &AdminPolygon| poly.name_id == name || self.links_name(poly, name);
         let same = |a: &AdminPolygon, b: &AdminPolygon| a.ring_offset == b.ring_offset && a.ring_bytes == b.ring_bytes;
-        let mut polygons: Vec<RankedPoly> = areas.iter().filter(|r| named(&r.poly)).copied().collect();
+        // A polygon holding the point is a row of a street only where the street runs through it.
+        let mut polygons: Vec<RankedPoly> = areas.iter()
+            .filter(|r| named(&r.poly) && match feature {
+                PlaceFeature::Point(..) => true,
+                PlaceFeature::Line(line) => self.runs_through(&r.poly, line),
+            })
+            .copied().collect();
+        // The scan lists the point's admin cell alone, and a street runs through the areas of
+        // every cell under it.
+        let mut candidates = scan.rings.clone();
+        if let PlaceFeature::Line(line) = feature {
+            let (lat, lng) = scan.pip.point.degrees();
+            let here = cell_id_at_level(lat, lng, self.admin_cell_level);
+            let mut listed: std::collections::HashSet<u32> = candidates.iter().map(|&(id, _)| id & ID_MASK).collect();
+            for cell in cells_under_line(line, STREET_CELLS_MARGIN_M, self.admin_cell_level) {
+                if cell == here { continue; }
+                self.admin_index.with_ids(cell, |ids| {
+                    for &id in ids {
+                        if !listed.insert(id & ID_MASK) { continue; }
+                        if let Some(poly) = self.admin_polygon(id & ID_MASK) { candidates.push((id & ID_MASK, poly)); }
+                    }
+                });
+            }
+        }
         let mut seen: Vec<u32> = Vec::new();
-        for k in 0..scan.rings.len() {
-            let (id, poly) = scan.rings[k];
+        for &(id, poly) in &candidates {
             if !is_address_area(&poly) || !named(&poly) || seen.contains(&(id & ID_MASK)) { continue; }
             seen.push(id & ID_MASK);
             if areas.iter().any(|r| same(&r.poly, &poly)) { continue; }
@@ -3772,11 +3801,13 @@ impl Index {
         }
         let place_area = |poly: &AdminPolygon| poly.admin_level == 15 && poly.name_id == name;
         let place_areas: Vec<RankedPoly> = areas.iter().filter(|r| place_area(&r.poly)).copied()
-            .chain(scan.rings.iter().filter(|(_, poly)| place_area(poly) && !areas.iter().any(|r| same(&r.poly, poly)))
+            .chain(candidates.iter().filter(|(_, poly)| place_area(poly) && !areas.iter().any(|r| same(&r.poly, poly)))
                 .map(|&(_, poly)| RankedPoly { poly, rank_address: self.area_row_rank(&poly, areas, country) }))
             .collect();
         let mut nodes: Vec<NamedRow> = nodes.iter().filter(|row| !place_areas.iter().any(|r| self.links_by_name(r, &row.node))).copied().collect();
-        nodes.sort_by(|a, b| b.distance.total_cmp(&a.distance));
+        // Equals by rank_search, the higher first (results.py:622).
+        let search_rank = |row: &NamedRow| PLACE_NODE_SEARCH_RANK.get(usize::from(row.node.place_type)).copied().unwrap_or(0);
+        nodes.sort_by(|a, b| b.distance.total_cmp(&a.distance).then_with(|| search_rank(b).cmp(&search_rank(a))));
         let mut rows: Vec<AddressRow> = polygons.iter()
             .map(|r| self.area_row(r))
             .chain(nodes.iter().map(|row| AddressRow { rank: row.rank, name: self.get_string(name), label: Some(row.field) }))
@@ -3792,22 +3823,35 @@ impl Index {
     }
 
     /// The rank_address of `poly`, a row of an address that is none of the address's ranked
-    /// polygons `areas`: that of the polygon of `areas` of its level (and of its place types, for
-    /// a place area), else its own before any lift, its level's in `country` or a place area's
-    /// (place_area_ranks). A boundary that repeats its parent and links a place node ranks as
-    /// promote_nested_ranks ranks it: its node's rank, above 3 and below 26, else 0.
+    /// polygons `areas`: that of the polygon of `areas` of its level and place types, else for a
+    /// place area its own before any lift (place_area_ranks), and for a boundary the one
+    /// promote_nested_ranks gives it from its level's rank in `country` under the coarser
+    /// polygons of `areas`: a place tag's rank where that is above its parent's
+    /// (placex_triggers.sql:1189-1199). A boundary that repeats its parent and links a place node
+    /// ranks as promote_nested_ranks ranks it: its node's rank, above 3 and below 26, else 0.
     fn area_row_rank(&self, poly: &AdminPolygon, areas: &[RankedPoly], country: &str) -> u8 {
         if poly.admin_level != 15 && poly.own_place_type == BOUNDARY_REPEATS_PARENT {
             let linked = place_type_to_rank(poly.place_type_override, country);
             return if (4..26).contains(&linked) { linked } else { 0 };
         }
         let kin = |r: &&RankedPoly| r.poly.admin_level == poly.admin_level
-            && (poly.admin_level != 15 || (r.poly.place_type_override, r.poly.own_place_type) == (poly.place_type_override, poly.own_place_type));
-        match areas.iter().find(kin) {
-            Some(r) => r.rank_address,
-            None if poly.admin_level == 15 => place_area_ranks(poly, country).1,
-            None => self.admin_config.to_rank(country, poly.admin_level),
+            && (r.poly.place_type_override, r.poly.own_place_type) == (poly.place_type_override, poly.own_place_type);
+        if let Some(r) = areas.iter().find(kin) {
+            return r.rank_address;
         }
+        if poly.admin_level == 15 {
+            return place_area_ranks(poly, country).1;
+        }
+        let initial = self.admin_config.to_rank(country, poly.admin_level);
+        if initial == 0 {
+            return 0;
+        }
+        let mut ranked: Vec<RankedPoly> = areas.iter().filter(|r| r.poly.admin_level < poly.admin_level).copied().collect();
+        ranked.push(RankedPoly { poly: *poly, rank_address: initial });
+        let place_areas: Vec<AdminPolygon> = areas.iter().filter(|r| r.poly.admin_level == 15).map(|r| r.poly).collect();
+        promote_nested_ranks(&mut ranked, place_areas.iter(), country, |a, b| self.admin_geometry.polygon_within(a, b));
+        let same = |r: &&RankedPoly| r.poly.ring_offset == poly.ring_offset && r.poly.ring_bytes == poly.ring_bytes;
+        ranked.iter().find(same).map_or(initial, |r| r.rank_address)
     }
 
     /// getNearFeatures' distance of the area `poly` from `feature` (partition-functions.sql:32-36),
@@ -3828,8 +3872,7 @@ impl Index {
         to_area + 0.00001 * to_centre
     }
 
-    /// Whether the boundary of polygon `poly` links a place node named `name` other than its own
-    /// name (linked_names).
+    /// Whether the boundary of polygon `poly` links a place node named `name` (linked_names).
     fn links_name(&self, poly: &AdminPolygon, name: u32) -> bool {
         self.linked_names.get_or_init(|| self.read_linked_names()).binary_search(&(boundary_key(poly), name)).is_ok()
     }
@@ -3839,7 +3882,8 @@ impl Index {
     /// builder runs for boundaries only (placex_triggers.sql:359-385): the area has the node's
     /// name, its rank_address is the one the node's type has (compute_place_rank), which an area
     /// lifted by one round it no longer has, and it holds the node, where it links no node by its
-    /// label or wikidata, one of another type or name.
+    /// label or wikidata: find_linked_place links one node, which may have the area's name and
+    /// type too.
     fn links_by_name(&self, area: &RankedPoly, node: &PlaceNode) -> bool {
         let (poly, geometry) = (&area.poly, &self.admin_geometry);
         poly.admin_level == 15 && poly.name_id == node.name_id && poly.own_place_type == 0
@@ -3848,20 +3892,20 @@ impl Index {
             && !self.links_any(poly)
     }
 
-    /// Whether the boundary of polygon `poly` links a place node of another name (linked_names).
+    /// Whether the boundary of polygon `poly` links a place node (linked_names), of its own name
+    /// or another.
     fn links_any(&self, poly: &AdminPolygon) -> bool {
         let key = boundary_key(poly);
         let linked = self.linked_names.get_or_init(|| self.read_linked_names());
         linked.get(linked.partition_point(|&(k, _)| k < key)).is_some_and(|&(k, _)| k == key)
     }
 
-    /// linked_names from place_hidden.bin: each label's boundary and name where the boundary has
-    /// another name.
+    /// linked_names from place_hidden.bin: each label's boundary and name.
     fn read_linked_names(&self) -> Vec<(u64, u32)> {
         let mut linked = Vec::new();
         if let Some(places) = &self.places {
             places.for_each_label(|polygon, node| {
-                if let Some(poly) = self.admin_polygon(polygon).filter(|p| p.name_id != node.name_id) {
+                if let Some(poly) = self.admin_polygon(polygon) {
                     linked.push((boundary_key(&poly), node.name_id));
                 }
             });
@@ -3953,18 +3997,26 @@ fn segments_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
     abc * abd < 0.0 && cda * cdb < 0.0
 }
 
-/// Whether `line` runs through the polygon of `rings` (AdminGeometry::rings: [lng, lat] each, the
-/// outer ring then its holes) along a stretch of positive length, as getNearFeatures takes an area
-/// for a line (ST_NPoints(ST_Intersection) > 1, partition-functions.sql:44): a node of the line
-/// inside it (`inside(lat, lng)`), or a segment of the line crossing an edge of a ring.
+/// How far from a ring a street's node may lie and be one the boundary shares: the street's
+/// nodes are f32, 2^-17 degrees apart past 64 degrees, so a shared node lies within half that
+/// of the ring's own vertex.
+pub const SHARED_NODE_DEG: f64 = 4e-6;
+
+/// Whether `line` meets the polygon of `rings` (AdminGeometry::rings: [lng, lat] each, the outer
+/// ring then its holes) in more than a point, as getNearFeatures takes an area for a line
+/// (ST_NPoints(ST_Intersection) > 1, partition-functions.sql:44): a node of the line inside it
+/// (`inside(lat, lng)`), a segment of the line crossing an edge of a ring, or two nodes of the
+/// line on a ring (SHARED_NODE_DEG), a stretch along the boundary or two touches; one alone is a
+/// touch, a point.
 pub fn line_runs_through(line: &[NodeCoord], rings: &[Vec<[f64; 2]>], mut inside: impl FnMut(f64, f64) -> bool) -> bool {
     if line.iter().any(|n| inside(n.lat as f64, n.lng as f64)) {
         return true;
     }
-    line.windows(2).any(|w| {
+    let crosses = line.windows(2).any(|w| {
         let (a, b) = ([w[0].lng as f64, w[0].lat as f64], [w[1].lng as f64, w[1].lat as f64]);
         rings.iter().any(|ring| ring.windows(2).any(|e| segments_cross(a, b, e[0], e[1])))
-    })
+    });
+    crosses || line.iter().filter(|n| rings_distance(rings, n.lat as f64, n.lng as f64) <= SHARED_NODE_DEG).nth(1).is_some()
 }
 
 /// The planar distance in degrees from (lat, lng) to the nearest edge of `rings` ([lng, lat]
@@ -5686,8 +5738,8 @@ pub fn coarse_fields<T, N: PartialEq>(chain: [Option<T>; 3], query: [Option<T>; 
 /// (22) and neighbourhood (24) are ranks of their own.
 pub const PLACE_NODE_RANK: [u8; 7] = [16, 16, 16, 20, 20, 24, 22];
 
-/// rank_search of each PlaceNode type, from address-levels.json: a town's 18, a village's and a
-/// suburb's 19, a hamlet's and a quarter's 20.
+/// rank_search of each PlaceNode type, from address-levels.json (no country there sets one of
+/// these types): a town's 18, a village's and a suburb's 19, a hamlet's and a quarter's 20.
 pub const PLACE_NODE_SEARCH_RANK: [u8; 7] = [16, 18, 19, 19, 20, 24, 20];
 
 /// insert_addresslines' weight on the distance of a candidate of rank_address
@@ -7389,8 +7441,8 @@ mod pure_helper_tests {
         let (shown, rows) = place_node_walk(&nodes, 1 << 20, 1 << 20, |_| true, true);
         assert_eq!(shown, []);
         assert_eq!(rows, [0, 1, 2]);
-        // Without rows the walk shows the same nodes and lists none.
-        assert_eq!(place_node_walk(&nodes, 0, 0, |_| true, false), (accept_place_nodes(&nodes, 0, |_| true), Vec::new()));
+        // Without rows the walk shows the same nodes, Addingham alone, and lists none.
+        assert_eq!(place_node_walk(&nodes, 0, 0, |_| true, false), (vec![(20, 0, true)], Vec::new()));
     }
 
     #[test]
