@@ -1,4 +1,5 @@
-// The postcode centroid files (postcode_files.h) of a patch test's dir.
+// The postcode centroid files (postcode_files.h) and the postcode grid
+// (postcode_grid.h) of a patch test's dir.
 #pragma once
 
 #include <cstdint>
@@ -6,6 +7,7 @@
 
 #include "cell_pairs.h"
 #include "postcode_files.h"
+#include "postcode_grid.h"
 #include "tool_runs.h"
 
 // A country code as a centroid holds it: two letters, the first high.
@@ -42,4 +44,10 @@ inline void put_centroids(gctest::BuildDir& d, const std::vector<postcode_files:
 inline std::vector<char> logical_bytes(const std::vector<postcode_files::LogicalCentroid>& rows) {
     const char* p = reinterpret_cast<const char*>(rows.data());
     return std::vector<char>(p, p + rows.size() * postcode_files::LOGICAL_STRIDE);
+}
+
+// The postcode grid of rows into d, as the builder writes it.
+inline void put_grid(gctest::BuildDir& d, const std::vector<postcode_grid::LogicalRow>& rows) {
+    const std::vector<uint8_t> file = postcode_grid::encode_file(rows);
+    d[postcode_grid::FILE_NAME].assign(file.begin(), file.end());
 }

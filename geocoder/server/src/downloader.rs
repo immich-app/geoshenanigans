@@ -1292,13 +1292,13 @@ mod tests {
         let (v, c) = template();
         let files = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin",
                      "arc_index.bin", "arc_vertices.bin", "attribution.json", "place_cells.bin", "place_hidden.bin", "place_nodes.bin",
-                     "strings_core.bin", "strings_layout.json"];
+                     "postcode_grid.bin", "strings_core.bin", "strings_layout.json"];
         let minimal: Vec<RegionSelection> = template_selections(&v).into_iter()
             .filter(|s| s.mode == "admin-minimal" && s.region == "europe")
             .collect();
         assert_eq!(minimal.len(), axis_values(&v, "poi_tier").len());
         for s in minimal {
-            let paths = resolve_files(&c, &s).unwrap().paths;
+            let ResolvedFiles { paths, optional } = resolve_files(&c, &s).unwrap();
             let (dir, other) = if s.poi_tier == "none" {
                 ("europe/admin-minimal/", "europe/admin-minimal-poi/")
             } else {
@@ -1306,6 +1306,8 @@ mod tests {
             };
             let in_dir: Vec<&str> = paths.iter().filter_map(|p| p.strip_prefix(dir)).collect();
             assert_eq!(in_dir, files, "{:?}", s);
+            // A region of no grid has no postcode_grid.bin in its manifest: the dir's is optional.
+            assert!(optional.contains(&format!("{dir}postcode_grid.bin")), "{:?}", s);
             let stray: Vec<&String> = paths.iter()
                 .filter(|p| p.starts_with(other) || p.starts_with("europe/quality/"))
                 .collect();

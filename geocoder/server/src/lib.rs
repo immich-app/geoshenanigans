@@ -31,6 +31,7 @@ pub mod place_files;
 pub mod poi_files;
 pub mod geography_box;
 pub mod postcode_files;
+pub mod postcode_grid;
 pub mod side_blocks;
 pub mod strings;
 pub mod transport;
@@ -1129,6 +1130,8 @@ pub struct Index {
     /// The postcode centroids: postcode_centroids.bin and postcode_centroid_cells.bin
     /// (postcode_files.rs).
     pub postcode_centroids: Option<PostcodeFiles>,
+    /// The postcode grid (postcode_grid.bin): each cell's postcode in the countries it covers
+    pub postcode_grid: Option<postcode_grid::PostcodeGrid>,
     pub admin_config: AdminLevelConfig,
     pub strings: StringPool,
     pub street_cell_level: u64,
@@ -1427,6 +1430,9 @@ impl Index {
             }
             _ => None,
         };
+        let postcode_grid = file(postcode_grid::FILE)
+            .map(|f| postcode_grid::PostcodeGrid::open(f).map_err(|e| format!("{dir}: {e}")))
+            .transpose()?;
         // A cell pair index (cell_pairs.rs) of the dir, an error naming its cells file.
         let pairs = |prefix: &str, cells: FileBytes, entries: FileBytes, format: cell_pairs::Format| {
             CellPairs::open(cells, entries, format, admin_cell_level).map_err(|e| format!("{dir}/{prefix}_cells.bin: {e}"))
@@ -1469,6 +1475,7 @@ impl Index {
             addr_postcodes,
             way_postcodes,
             postcode_centroids,
+            postcode_grid,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::load(dir)?,
             street_cell_level,
@@ -3096,12 +3103,16 @@ impl Index {
         // there (get_country_code), for the street and a house of it, which
         // takes its street's country; a street none reaches has no postcode.
         // Then at the house; else at the query point, of its postcode area.
+        // At each, the postal areas first (ORDER BY osm_id is null), then the
+        // postcode grid in place of the nearest centroid, where the dir has
+        // one of the point's country, then the centroid.
         let mut country_code = country_code;
         if let Some((way_id, _)) = street {
             if let Some((m_lat, m_lng)) = u32::try_from(way_id).ok().and_then(|id| self.street_middle(id)) {
                 let (areas, point, country_there) = self.postal_areas_at(m_lat, m_lng, true);
                 country_code = country_there.or(country_code);
                 let found = self.postal_area_postcode(&areas, &upper_country(country_code), point)
+                    .or_else(|| self.grid_postcode(m_lat, m_lng, country_code))
                     .or_else(|| self.centroid_postcode(m_lat, m_lng, country_code));
                 if found.is_some() || addr.is_none() {
                     return found.map(|postcode| (postcode, country_code));
@@ -3111,12 +3122,31 @@ impl Index {
         if let Some((_, house)) = addr {
             let (h_lat, h_lng) = (house.lat as f64, house.lng as f64);
             return self.postal_area_at(h_lat, h_lng, country_code)
+                .or_else(|| self.grid_postcode(h_lat, h_lng, country_code))
                 .or_else(|| self.centroid_postcode(h_lat, h_lng, country_code))
                 .map(|postcode| (postcode, country_code));
         }
         // The postcode area covering the point: get_nearest_postcode takes
         // one before any centroid (ORDER BY osm_id is null).
-        postcode_area.or_else(|| self.centroid_postcode(lat, lng, country_code)).map(|postcode| (postcode, country_code))
+        postcode_area
+            .or_else(|| self.grid_postcode(lat, lng, country_code))
+            .or_else(|| self.centroid_postcode(lat, lng, country_code))
+            .map(|postcode| (postcode, country_code))
+    }
+
+    /// The postcode grid's at the point (lat, lng), where the cell's run is of the country
+    /// `country_code`: the postcode most of the houses round the point carry
+    /// (postcode_grid_build.h). It stands in for get_nearest_postcode's nearest centroid at each
+    /// point that rule runs at, after the postal areas, which the rule takes before any centroid
+    /// (ORDER BY osm_id is null): a US ZIP is an area OSM barely maps, and the centroid of a large
+    /// one lies farther from its edge than a neighbour's, where the houses round the point carry
+    /// their own. A cell of no postcode, past the reach of every house, has none, nor has one of a
+    /// postcode the answer refuses (postcode_looks_valid), which then leaves the point to the
+    /// centroids, as such a postal area's does.
+    fn grid_postcode<'a>(&'a self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
+        let (grid, cc) = (self.postcode_grid.as_ref()?, country_code?);
+        let (country, code) = grid.postcode_at(cell_id_at_level(lat, lng, grid.level()))?;
+        (country == cc && postcode_looks_valid(&cc, code)).then_some(Cow::Borrowed(code))
     }
 
     /// The postcode of the postcode centroid nearest the point (lat, lng) whose box holds it,
@@ -3672,7 +3702,8 @@ impl Index {
         // (Tier 0 the house's own / Tier 1 its street's or the primary
         // feature's calculated_postcode / Tier 2 get_nearest_postcode at the
         // street's centroid, the house or the point: the postal area round
-        // it, else the nearest centroid). Build-time postal-boundary
+        // it, else the postcode grid's cell of it, else the nearest
+        // centroid). Build-time postal-boundary
         // inheritance feeds Tier 1 (way_postcodes.bin for streets,
         // parent_postcode_id for POIs); at the query point Tier 2 takes the
         // postal area find_admin found there. Tier 0 and Tier 1 are
@@ -3844,7 +3875,7 @@ impl Index {
             neighbourhood,
             city_block: admin.city_block,
             // Postcode from resolve_postcode(): 3-tier chain
-            // (own → inherited → postal area or nearest centroid).
+            // (own → inherited → postal area, grid or nearest centroid).
             // Reject if its country has no postal-code system or if
             // the string doesn't match the country's pattern, then
             // normalise whitespace/separators per country.
@@ -4492,6 +4523,7 @@ mod query_tests {
             addr_postcodes: None,
             way_postcodes: None,
             postcode_centroids: None,
+            postcode_grid: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, end, end, end, end, end]),
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
@@ -7524,6 +7556,8 @@ mod query_path_tests {
         interp_postcodes: Vec<(u32, u32)>,
         /// The postcode centroids, each one's point, postcode and country.
         centroids: Vec<postcode_files::Centroid>,
+        /// The postcode grid's runs, in cell order.
+        grid: Vec<postcode_grid::LogicalRow>,
     }
 
     impl TestIndex {
@@ -7721,6 +7755,14 @@ mod query_path_tests {
             self
         }
 
+        /// A run of the postcode grid from `cell`, a level-16 cell, of Testland's country and
+        /// `postcode`, or of no postcode for "": runs go in cell order.
+        fn grid_run(&mut self, postcode: &str, cell: u64) -> &mut Self {
+            let country_code = if postcode.is_empty() { 0 } else { self.polygons[0].0.country_code };
+            self.grid.push(postcode_grid::LogicalRow { cell, country_code, code: postcode.to_string() });
+            self
+        }
+
         /// The side files with a value set, each with its values: NO_DATA for every other record
         /// of the file it sits beside.
         fn side_values(&self) -> Vec<(&'static str, Vec<u32>)> {
@@ -7777,6 +7819,10 @@ mod query_path_tests {
             if !self.centroids.is_empty() {
                 let (centroids, cells) = postcode_files::encode_points(&self.centroids, DEFAULT_ADMIN_CELL_LEVEL);
                 files.extend([(postcode_files::CENTROIDS_FILE, centroids), (postcode_files::CELLS_FILE, cells)]);
+            }
+
+            if !self.grid.is_empty() {
+                files.push((postcode_grid::FILE, postcode_grid::encode(&self.grid)));
             }
 
             if !(self.streets.is_empty() && self.addrs.is_empty() && self.interps.is_empty()) {
@@ -10655,6 +10701,7 @@ mod admin_scan_tests {
             places: None,
             way_parents: None, admin_parents: None, addr_postcodes: None, way_postcodes: None,
             postcode_centroids: None,
+            postcode_grid: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, len, len, len, len, len]),
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,

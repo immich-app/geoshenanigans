@@ -97,6 +97,10 @@ static constexpr size_t POSTCODE_CENTROID_STRIDE = 20;
 static constexpr size_t POSTCODE_CENTROID_POSTCODE_ID_OFF = 8;
 // The client file postcode_centroids.bin's section writes beside it.
 static constexpr const char* POSTCODE_SIDE_FILES[] = {"postcode_centroid_cells.bin"};
+// postcode_grid.bin's logical rows (postcode_grid.h LogicalRow): its section
+// replays the grid's runs, which its codec (gcs_codec.h grid) writes as
+// postcode_grid.bin. No string field: the grid holds its postcodes as text.
+static constexpr size_t POSTCODE_GRID_STRIDE = 24;
 // The client file addr_points.bin's and addr_vertices.bin's sections write
 // besides them (addr_files.h).
 static constexpr const char* ADDR_SIDE_FILES[] = {"addr_index.bin"};
@@ -271,7 +275,13 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // postcode_centroids.bin and postcode_centroid_cells.bin. No sparse delta
 // carries them (remap kind 3 is gone), no cell list delta (stride 0xFB)
 // carries any index, and file ids 24 and 25 name no file.
-static constexpr uint32_t GCPATCH_VERSION = 19;
+// v20: the postcode grid (postcode_grid.h) merges as one logical stream of
+// 24-byte rows in cell order under file id 36, postcode_grid.bin, which the
+// patcher encodes again; a section of it right after the postcode
+// centroids', in every patch (an empty merge where neither day has it), with
+// the old file's hash before it where the old grid has rows
+// (HASHED_OLD_FILES).
+static constexpr uint32_t GCPATCH_VERSION = 20;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -328,7 +338,9 @@ enum class PatchFileId : uint32_t {
     INTERP_POSTCODES = 34,
     // The geo index's blocks, beside its top file (GEO_CELLS).
     GEO_ENTRIES = 35,
-    COUNT = 36
+    // The postcode grid's logical rows (v20).
+    POSTCODE_GRID = 36,
+    COUNT = 37
 };
 
 static const char* patch_file_names[] = {
@@ -345,7 +357,8 @@ static const char* patch_file_names[] = {
     "strings_core.bin", "strings_street.bin", "strings_addr.bin",
     "strings_postcode.bin", "strings_poi.bin",
     "interp_postcodes.bin",
-    "geo_entries.bin"
+    "geo_entries.bin",
+    "postcode_grid.bin"
 };
 
 // The string offset fields of a record file the patch merges, as byte
@@ -794,15 +807,19 @@ static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 // (way_replay.h) the node blocks of the groups a day leaves whole and their
 // rows' anchors, counts and codes (both files of each way pair), the address
 // replay (addr_replay.h) the old footprint blobs and the records whose
-// points they sit under (addr_vertices.bin and addr_points.bin). The diff
-// sends one for each file of HASHED_OLD_FILES the old dir holds and whose
-// family has a section. The patcher refuses a second hash of a file, a hash
-// of any other file, and a replay without the hashes it checks by. A family
-// both of whose sections are unchanged is copied as its files sit, and POI
-// records sent unchanged over blocks that change go through the codecs: the
-// patcher holds each hashed file of such a family to its hash before it
-// reads it. The hash of an old file without records is read and checks
-// nothing.
+// points they sit under (addr_vertices.bin and addr_points.bin). The
+// postcode grid's is checked before its runs are replayed and before the
+// copy below: its postcodes are text, which no string tier's hash covers,
+// and a grid of other postcodes, as many runs, decodes as well as the old
+// one. The diff sends one for each file of
+// HASHED_OLD_FILES the old dir holds and whose family has a section, the
+// grid's where the old grid has rows. The patcher refuses a second hash of a
+// file, a hash of any other file, and a replay without the hashes it checks
+// by. A family both of whose sections are unchanged is copied as its files
+// sit, and POI records sent unchanged over blocks that change go through the
+// codecs: the patcher holds each hashed file of such a family to its hash
+// before it reads it. The hash of an old file without records is read and
+// checks nothing.
 static constexpr uint32_t OLD_FILE_HASH_MARKER = 0xFFFFFFF8;
 static constexpr PatchFileId HASHED_OLD_FILES[] = {
     PatchFileId::POI_RECORDS,
@@ -813,6 +830,7 @@ static constexpr PatchFileId HASHED_OLD_FILES[] = {
     PatchFileId::INTERP_NODES,
     PatchFileId::ADDR_POINTS,
     PatchFileId::ADDR_VERTICES,
+    PatchFileId::POSTCODE_GRID,
 };
 inline bool is_hashed_old_file(uint32_t fid) {
     return std::find(std::begin(HASHED_OLD_FILES), std::end(HASHED_OLD_FILES), static_cast<PatchFileId>(fid)) !=
