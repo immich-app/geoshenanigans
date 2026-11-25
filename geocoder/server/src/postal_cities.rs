@@ -96,8 +96,10 @@ impl PostalCities {
         if rows == u32::MAX || blocks > rows || (blocks as u64) * (BLOCK_ROWS as u64) < rows as u64 {
             return Err(format!("{FILE}'s footer is not one the builder writes"));
         }
-        let table_at = (b.len() - FOOTER_BYTES)
-            .checked_sub(blocks as usize * ENTRY_BYTES)
+        // The table's bytes may pass a 32-bit usize: checked as the subtraction is.
+        let table_at = (blocks as usize)
+            .checked_mul(ENTRY_BYTES)
+            .and_then(|table_bytes| (b.len() - FOOTER_BYTES).checked_sub(table_bytes))
             .ok_or_else(|| format!("{FILE} is shorter than its block table"))?;
         let (mut held, mut last_offset, mut last_country) = (0u64, 0usize, 0u16);
         for k in 0..blocks as usize {
