@@ -8077,10 +8077,9 @@ mod query_path_tests {
     /// The street cells the builder lists an edge from `a` to `b` in (cover_edge,
     /// builder/src/s2_helpers.cpp): the cell of both ends where they share one; the cells of its
     /// two ends alone where its middle in degrees lies in one of them, though it may cross a third
-    /// by their corner; else the cells its great circle crosses. Those are here the cells meeting
-    /// the edge's box, which hold its great circle as well as its line for an edge under a
-    /// kilometre away from the poles and the antimeridian; for any other, the cells of points of
-    /// its great circle 25 cm apart.
+    /// by their corner; else the cells its great circle crosses. Those are here the cells of
+    /// points of its great circle 25 cm apart, which may leave out a cell it clips by less, never
+    /// list one it misses.
     fn edge_cells(a: NodeCoord, b: NodeCoord) -> Vec<u64> {
         let cell = |lat: f64, lng: f64| cell_id_at_level(lat, lng, DEFAULT_STREET_CELL_LEVEL);
         let (alat, alng, blat, blng) = (a.lat as f64, a.lng as f64, b.lat as f64, b.lng as f64);
@@ -8096,9 +8095,6 @@ mod query_path_tests {
         let cross = [pa[1] * pb[2] - pa[2] * pb[1], pa[2] * pb[0] - pa[0] * pb[2], pa[0] * pb[1] - pa[1] * pb[0]];
         let angle = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt()
             .atan2(pa[0] * pb[0] + pa[1] * pb[1] + pa[2] * pb[2]);
-        if angle * 6_371_000.0 < 1_000.0 && (blng - alng).abs() < 90.0 && alat.abs().max(blat.abs()) < 80.0 {
-            return cells_meeting(&[a, b], DEFAULT_STREET_CELL_LEVEL);
-        }
         let steps = (angle * 6_371_000.0 / 0.25).ceil() as usize;
         let mut cells: Vec<u64> = (0..=steps)
             .map(|k| {
