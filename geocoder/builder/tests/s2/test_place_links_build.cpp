@@ -282,8 +282,8 @@ TEST(a_boundary_links_only_a_node_it_covers_by_name) {
 
 TEST(a_place_tagged_boundary_links_a_node_of_its_value_by_part_of_its_name) {
     // Stadt Kreuzberg (admin_level 8, place=city) links the city node Kreuzberg, whose name lies
-    // in its own (:339-361), and hides it; a town node of the name, of another value, stays a
-    // place of its own.
+    // in its own (:339-361), and hides it, its row naming the boundary; a town node of the name,
+    // of another value, stays a place of its own.
     Fixture f;
     f.country(47, 6, 55, 15, "Germany", "DE");
     f.boundary(52, 12, 53, 14, 4, "Brandenburg");
@@ -295,14 +295,26 @@ TEST(a_place_tagged_boundary_links_a_node_of_its_value_by_part_of_its_name) {
     write_test_pbf(pbf, f.objects(), 1000);
     REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/out", pbf}, log));
     std::map<uint8_t, size_t> visible;
+    std::vector<PlaceNode> cities;
     const std::string dir = root.path() + "/out/planet/";
     const std::vector<char> cells = file_bytes(dir + place_files::CELLS_FILE), nodes = file_bytes(dir + place_files::NODES_FILE),
                             hidden = file_bytes(dir + place_files::HIDDEN_FILE);
     auto u8 = [](const std::vector<char>& v) { return reinterpret_cast<const uint8_t*>(v.data()); };
-    place_files::decode(u8(cells), cells.size(), u8(nodes), nodes.size(), u8(hidden), hidden.size(),
-                        [&](const place_files::LogicalPlace& p) { visible[p.node.place_type] += place_files::is_visible(p.node); });
+    place_files::decode(u8(cells), cells.size(), u8(nodes), nodes.size(), u8(hidden), hidden.size(), [&](const place_files::LogicalPlace& p) {
+        visible[p.node.place_type] += place_files::is_visible(p.node);
+        if (p.node.place_type == uint8_t(PlaceType::CITY)) cities.push_back(p.node);
+    });
     CHECK_EQ(visible[uint8_t(PlaceType::CITY)], size_t(0));
     CHECK_EQ(visible[uint8_t(PlaceType::TOWN)], size_t(1));
+    REQUIRE(cities.size() == 1);
+    CHECK(cities[0]._pad1 & PLACE_FLAG_HIDDEN);
+    CHECK(cities[0]._pad1 & PLACE_FLAG_LABEL_OF);
+    const std::vector<char> polygons = file_bytes(dir + "admin_polygons.bin");
+    REQUIRE(cities[0].parent_poly_id != NO_DATA);
+    REQUIRE((size_t(cities[0].parent_poly_id) + 1) * sizeof(AdminPolygonRecord) <= polygons.size());
+    AdminPolygonRecord claimant;
+    std::memcpy(&claimant, polygons.data() + size_t(cities[0].parent_poly_id) * sizeof claimant, sizeof claimant);
+    CHECK_EQ(claimant.level_override, uint8_t(8 << 4 | uint8_t(AdminPlaceType::CITY)));
     const std::vector<std::string> answers = server_answers(dir, {{52.501, 13.401}}, root.path() + "/answers", log);
     REQUIRE(answers.size() == 1);
     CHECK(names(answers[0], "city", "Stadt Kreuzberg"));

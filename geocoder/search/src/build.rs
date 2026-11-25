@@ -2091,7 +2091,9 @@ mod tests {
         use crate::reader::SearchIndex;
         // Sosnovka's boundary goes by its town node's English name and keeps its own name,
         // Сосновка (admin_own_names.bin); Kirsanovka's too, Кирсановка, which no node labels.
-        // Each is found by either name, shown by the name the search matched.
+        // Each is found by either name, shown by the name the search matched. A city named Mill
+        // in neither outranks the mills in each, so only a context the boundary's name matches
+        // places a mill in it.
         let mut g = Geo::default();
         let sosnovka = g.boundary("Sosnovka", 8, [10.0, 20.0, 10.2, 20.2]);
         g.own_name(sosnovka, "Сосновка");
@@ -2101,6 +2103,7 @@ mod tests {
         g.claim(sosnovka, node);
         g.place("Mill", 2, 10.05, 20.05);
         g.place("Mill", 1, 11.1, 21.1);
+        g.place("Mill", 0, 12.1, 22.1);
         let dir = TempDir::new("own-names");
         let geo = g.load(&dir.0.join("geo"));
         let out = dir.0.join("idx");
@@ -2108,15 +2111,17 @@ mod tests {
         let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
         let s = Searcher::new(&idx);
 
-        // The boundaries are entities n_place_nodes (3) + their polygons.
-        for (q, entity) in [("Sosnovka", 3), ("Сосновка", 3), ("Kirsanovka", 4), ("Кирсановка", 4)] {
+        // The boundaries are entities n_place_nodes (4) + their polygons.
+        for (q, entity) in [("Sosnovka", 4), ("Сосновка", 4), ("Kirsanovka", 5), ("Кирсановка", 5)] {
             let (found, _) = s.search(q, 5);
 
             assert!(!found.is_empty(), "{q}");
             assert_eq!((found[0].hit.entity, found[0].name.as_str()), (entity, q), "{q}");
         }
-        // Either name places a mill in its boundary: the village in Sosnovka before the town in
-        // Kirsanovka.
+        // Either name places a mill in its boundary, before the city and the other boundary's
+        // mill; without a context the city comes first.
+        let (found, _) = s.search("Mill", 5);
+        assert_eq!(found.first().map(|f| f.lat), Some(12.1));
         for (q, lat) in [("Mill, Sosnovka", 10.05), ("Mill, Сосновка", 10.05), ("Mill, Kirsanovka", 11.1), ("Mill, Кирсановка", 11.1)] {
             let (found, _) = s.search(q, 5);
 

@@ -192,12 +192,14 @@ TEST(a_label_member_links_whatever_its_value_name_or_link_and_a_boundary_of_rank
 
 TEST(a_relation_links_the_first_of_its_label_members_that_is_a_place_node) {
     // Kilbeg's first label member, node 9, is no place node; its second, the hamlet Ballyboy of
-    // another name and no wikidata, is: find_linked_place takes the label members in turn until
-    // one is a place (placex_triggers.sql:297-312), so Kilbeg links Ballyboy by its label.
+    // another name and no wikidata, is, and so is its third, the hamlet Ballyduff, of a lower id:
+    // find_linked_place takes the label members in turn until one is a place
+    // (placex_triggers.sql:297-312), so Kilbeg links Ballyboy by its label.
     World w("IE");
     w.node(2, PlaceValue::HAMLET, 53.5, -6.5, "Ballyboy");
+    w.node(1, PlaceValue::HAMLET, 53.52, -6.48, "Ballyduff");
     Tags tags{PlaceValue::NONE, "Kilbeg", "", 9};
-    tags.more_labels.push_back(2);
+    tags.more_labels = {2, 1};
     const uint32_t kilbeg = w.relation(10, 10, Box{53.4, -6.6, 53.6, -6.4}, tags);
     w.link();
     CHECK(w.link_of(kilbeg).step == LinkStep::LABEL);

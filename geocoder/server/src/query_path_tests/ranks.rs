@@ -41,7 +41,8 @@ fn a_boundary_is_labelled_by_the_rank_the_builder_stored_whatever_place_area_hol
             .boundary(area.0, 15, area.1, area.2)
             .load()
     };
-    // Round the township's middle, rank 24.
+    // Round the whole township, 500 m past it each way: it contains it, but of rank 24 lifts
+    // nothing.
     let index = township(("Westland", 5, (-3500.0, -3500.0, 3500.0, 3500.0)), 14);
     let address = address_at(&index, 1000.0, 1000.0);
     assert_eq!(address["municipality"], "Prairie Township");
@@ -130,19 +131,21 @@ fn a_country_ranks_place_types_of_its_own() {
 }
 
 #[test]
-fn the_admin_nested_step_stops_at_rank_25_which_no_address_shows() {
-    // A boundary inside one of rank 24 or more takes rank 25 (placex_triggers.sql:903-904), and an
-    // area of rank 25 is in no street's or house's address (getNearFeatures, rank_address below
-    // 25): the neighbourhood-linked level 10 boundary inside the level 9 one names nothing, the
-    // level 9 one does.
+fn a_street_address_shows_the_stored_rank_of_24_and_leaves_one_of_25_out() {
+    // A boundary inside one of rank 24 or more takes rank 25 (placex_triggers.sql:903-904), as the
+    // builder stores it, and an area of rank 25 is in no street's or house's address
+    // (getNearFeatures, rank_address below 25): of the neighbourhood-linked level 9 and 10
+    // boundaries Ward Street runs through, the level 9 one (24) names the street's address, the
+    // level 10 one inside it (25) nothing.
     let index = TestIndex::new()
         .boundary("Town", 8, 0, (-10_000.0, -10_000.0, 10_000.0, 10_000.0))
         .boundary("Upper Ward", 9, 5, (-3000.0, -3000.0, 3000.0, 3000.0)).rank(24)
         .boundary("Lower Ward", 10, 5, (-1000.0, -1000.0, 1000.0, 1000.0)).rank(25)
+        .street("Ward Street", &[(0.0, -2000.0), (0.0, 2000.0)])
         .load();
-    let address = address_at(&index, 0.0, 0.0);
-    assert_eq!(address["neighbourhood"], "Upper Ward");
-    assert_eq!(address["city"], "Town");
+    let answer = serde_json::to_value(index.query(at(10.0, 0.0).lat as f64, at(10.0, 0.0).lng as f64)).unwrap();
+    assert_eq!(answer["display_name"], "Ward Street, Upper Ward, Town, Testland");
+    assert_eq!(answer["address"]["neighbourhood"], "Upper Ward");
 }
 
 #[test]
@@ -359,25 +362,26 @@ fn a_place_area_in_the_address_holds_the_place_nodes_of_finer_ranks_to_itself() 
 }
 
 #[test]
-fn a_place_area_of_a_closed_way_promotes_no_place_node_of_its_rank() {
+fn a_place_node_of_its_suburb_areas_rank_is_the_suburb_only_promoted() {
     // Bat Yam (32.012156, 34.756722): the place=suburb way בת ים (W1219784953, rank 20) holds the
     // place=suburb node Ramat HaNasi (rank 20). placex_update raises a place node to a subpart,
     // two ranks up, only inside a relation of its rank (osm_type = 'R',
     // placex_triggers.sql:984-1004), so the node stays at 20, where the area's row comes first
     // (isguess asc, :576): the area is the suburb. Inside a place=suburb relation the node ranks
     // 22 and, the finer row, is the suburb.
-    let bat_yam = |way: bool| {
+    // The builder promotes the node inside the relation alone (test_place_links_build.cpp
+    // tells the way and the relation apart): here the node's stored rank is 20, or 22 promoted.
+    let bat_yam = |promoted: bool| {
         let mut index = TestIndex::in_country(b"IL");
         index.boundary("Tel-Aviv District", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
             .boundary("Bat Yam", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
             .boundary("Bat Yam West", 15, 4, (-1000.0, -1000.0, 1000.0, 1000.0));
-        // The builder promotes the node inside the relation alone.
         index.place("Ramat HaNasi", 3, 300.0, 200.0);
-        if !way { index.promoted(); }
+        if promoted { index.promoted(); }
         index.load()
     };
-    let address = address_at(&bat_yam(true), 0.0, 0.0);
-    assert_eq!(address["suburb"], "Bat Yam West");
     let address = address_at(&bat_yam(false), 0.0, 0.0);
+    assert_eq!(address["suburb"], "Bat Yam West");
+    let address = address_at(&bat_yam(true), 0.0, 0.0);
     assert_eq!(address["suburb"], "Ramat HaNasi");
 }
