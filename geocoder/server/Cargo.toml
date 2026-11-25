@@ -29,8 +29,11 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 memmap2 = "0.9"
 libc = "0.2"
-rustls-acme = { version = "0.15", features = ["axum"] }
+# The --domain mode's certificates. Its acceptor for axum-server is src/acme.rs, as
+# rustls-acme's own (its feature axum) is for axum-server 0.8.
+rustls-acme = "0.15"
 axum-server = "0.9"
+tokio-util = { version = "0.7", features = ["compat"] }
 bcrypt = "0.19"
 getrandom = "0.4"
 arc-swap = "1"
@@ -50,6 +53,8 @@ http-body = "1"
 [dev-dependencies]
 query-server = { path = ".", features = ["fixtures"] }
 place-search = { path = "../search" }
+# The self-signed certificate of the acceptor's tests (src/acme.rs).
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 
 [profile.release]
 opt-level = 3
