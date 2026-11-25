@@ -411,6 +411,28 @@ test('the field table marks the fields the answers disagree on or lack', () => {
   assert.deepEqual(plain(fieldRows([{ city: 'Paris' }, { city: 'Paris' }])), [{ field: 'city', values: ['Paris', 'Paris'], differs: false, missing: false }]);
 });
 
+// Nominatim's column lacks an extension field by its contract: no mark,
+// and n/a in its cell; another column lacking one is marked.
+test('the field table marks no extension field missing in the Nominatim column', () => {
+  const { fieldRows, detailHtml } = core();
+  const ours = { postcode: '19026', postal_city: 'Drexel Hill' };
+  const theirs = { postcode: '19026' };
+  const row = (rows) => plain(rows).find((r) => r.field === 'postal_city');
+  assert.deepEqual(row(fieldRows([ours, theirs], [false, true])), { field: 'postal_city', values: ['Drexel Hill', ''], differs: false, missing: false });
+  assert.equal(row(fieldRows([ours, theirs])).missing, true);
+  assert.equal(row(fieldRows([ours, theirs], [false, true])).missing, false);
+  const views = [
+    { label: 'ours', color: '#fff', dataset: null, answer: { data: { display_name: 'x', address: ours } } },
+    { label: 'Nominatim', color: '#000', dataset: null, nominatim: true, answer: { data: { display_name: 'x', address: theirs } } },
+  ];
+  const detail = detailHtml(views, '2026-11-20');
+  const postal = detail.slice(detail.indexOf('>postal_city<') - 40, detail.indexOf('</tr>', detail.indexOf('>postal_city<')));
+  assert.ok(!postal.includes('missing'), postal);
+  assert.ok(postal.includes('<td class="empty" title="Not a Nominatim field">n/a</td>'), postal);
+  const other = detailHtml([views[0], { ...views[1], nominatim: false, label: 'other' }], '2026-11-20');
+  assert.ok(other.slice(other.indexOf('>postal_city<') - 40, other.indexOf('>postal_city<')).includes('missing'));
+});
+
 test('answers differ by display name, a field, or the places and their distances', () => {
   const { answersDiffer } = core();
   const paris = { display_name: 'Paris', address: { city: 'Paris' }, places: [{ name: 'Louvre', category: 'museum', distance_m: 12 }] };
