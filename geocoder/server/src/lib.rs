@@ -3826,10 +3826,11 @@ impl Index {
     }
 
     /// The rows of an address that are named `name` (a string id), in Nominatim's order within a
-    /// rank (results.py:617-621: fromarea, then distance, descending): the polygons named so, by
-    /// their own name or by a place node's they link, the farthest from `feature` first
-    /// (area_row_distance), then the place nodes of `nodes` (PlaceResult::named_rows), the
-    /// farthest first, but those a place area links (links_by_name). The polygons are those that
+    /// rank (results.py:617-622: fromarea, then distance, descending, then rank_search): the
+    /// polygons named so, by their own name or by a place node's they link, the farthest from
+    /// `feature` first (area_row_distance), then the place nodes of `nodes`
+    /// (PlaceResult::named_rows), the farthest first, equals by rank_search, but those a place
+    /// area links (links_by_name). The polygons are those that
     /// are rows of `feature` as getNearFeatures takes them (partition-functions.sql:39-44): of a
     /// point, the polygons holding it, of a street (a house's rows are its street's), those the
     /// street runs through. They are those of `areas`, the address's ranked polygons (found by
@@ -3894,7 +3895,9 @@ impl Index {
                 .map(|&(_, poly)| RankedPoly { poly, rank_address: self.area_row_rank(&poly, areas, country) }))
             .collect();
         let mut nodes: Vec<NamedRow> = nodes.iter().filter(|row| !place_areas.iter().any(|r| self.links_by_name(r, &row.node))).copied().collect();
-        nodes.sort_by(|a, b| b.distance.total_cmp(&a.distance));
+        // Equals by rank_search, the higher first (results.py:622).
+        let search_rank = |row: &NamedRow| PLACE_NODE_SEARCH_RANK.get(usize::from(row.node.place_type)).copied().unwrap_or(0);
+        nodes.sort_by(|a, b| b.distance.total_cmp(&a.distance).then_with(|| search_rank(b).cmp(&search_rank(a))));
         let mut rows: Vec<CrosscheckRow> = polygons.iter()
             .map(|r| self.area_row(r))
             .chain(nodes.iter().map(|row| CrosscheckRow { rank: row.rank, name: self.get_string(name), field: Some(row.field) }))
@@ -5759,6 +5762,10 @@ pub fn coarse_fields<T: PartialEq>(chain: [Option<T>; 3], query: [Option<T>; 3],
 /// 4 hamlet, 5 neighbourhood, 6 quarter), from address-levels.json: quarter
 /// (22) and neighbourhood (24) are ranks of their own.
 pub const PLACE_NODE_RANK: [u8; 7] = [16, 16, 16, 20, 20, 24, 22];
+
+/// rank_search of each PlaceNode type, from address-levels.json (no country there sets one of
+/// these types): a town 18, a village and a suburb 19, a quarter 20.
+pub const PLACE_NODE_SEARCH_RANK: [u8; 7] = [16, 18, 19, 19, 20, 24, 20];
 
 /// insert_addresslines' weight on a place node's distance by its
 /// rank_search (placex_triggers.sql:597-605): city (16) 0.25, town (18) 0.5,

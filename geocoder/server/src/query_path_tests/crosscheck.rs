@@ -175,6 +175,25 @@ fn a_rank_takes_the_farther_of_two_nodes_of_the_value_s_name_whatever_field_the_
 }
 
 #[test]
+fn of_two_nodes_of_the_value_s_name_at_one_distance_a_rank_takes_the_one_of_the_higher_search_rank() {
+    // A city node and a town node Springfield at one point 100 m north of the street: the walk
+    // accepts the city, and both are rows of rank 16 at the same distance. Nominatim's last order
+    // within a rank is rank_search, descending (results.py:622), the town's 18 before the city's
+    // 16: the house's town is Springfield, and it has no city.
+    let places = |index: &mut TestIndex| {
+        index.place("Springfield", 0, 100.0, 0.0).place("Springfield", 1, 100.0, 0.0);
+    };
+    let (display, address) = answer_at(&main_street(None, places), 10.0, 0.0);
+    assert_eq!(display, "4 Main Street, Springfield, United States");
+    assert_eq!((&address["city"], &address["town"]), (&serde_json::json!("Springfield"), &serde_json::Value::Null));
+
+    let (display, address) = answer_at(&main_street(Some("Springfield"), places), 10.0, 0.0);
+    assert_eq!(display, "4 Main Street, Springfield, United States");
+    assert_eq!((&address["city"], &address["town"]), (&serde_json::Value::Null, &serde_json::json!("Springfield")));
+}
+
+
+#[test]
 fn a_field_the_value_s_row_leaves_goes_to_the_finest_part_of_no_field_that_fills_it() {
     // Greenburgh (rank 16) and Hartsdale, a level-9 boundary of rank 18 labelled a city, both fill
     // `city`, which the smaller takes; Greenburgh is a part of no field. The village Elmsford in
