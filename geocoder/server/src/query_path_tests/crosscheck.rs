@@ -467,8 +467,10 @@ fn a_place_area_an_area_round_it_lifts_links_no_place_node_of_its_name() {
     // Newton Aycliffe, a place=town area, lies in the parish of Great Aycliffe (rank 20), which
     // lifts it to rank 22. find_linked_place reads the area's rank_address, no longer the town
     // node's, so the name match links no node, and the town node of its name, in Durham's rank 16
-    // boundary, is a row of rank 18, the rank's part, after the parish: Nominatim repeats Newton
-    // Aycliffe, and the house's addr:city names that row. The town is the area, the finer row.
+    // boundary, is a row of rank 18 after the parish, within twice the distance of the nearer
+    // town node Aycliffe Village, the rank's part. The house's addr:city names the Newton Aycliffe
+    // row, which then takes the rank: Nominatim repeats Newton Aycliffe. The town is the area, the
+    // finer row.
     let index = |city: Option<&str>| {
         let mut index = united_states();
         index
@@ -476,6 +478,7 @@ fn a_place_area_an_area_round_it_lifts_links_no_place_node_of_its_name() {
             .boundary("Great Aycliffe", 10, 0, (-4000.0, -4000.0, 4000.0, 4000.0))
             .boundary("Newton Aycliffe", 15, 2, (-3000.0, -3000.0, 3000.0, 3000.0))
             .place("Newton Aycliffe", 1, 500.0, 800.0)
+            .place("Aycliffe Village", 1, 475.0, 0.0)
             .street("Stanfield Road", &[(0.0, -200.0), (0.0, 200.0)])
             .address("20", 10.0, 0.0);
         if let Some(city) = city {
@@ -483,9 +486,9 @@ fn a_place_area_an_area_round_it_lifts_links_no_place_node_of_its_name() {
         }
         index.load()
     };
-    for city in [None, Some("Newton Aycliffe")] {
+    for (city, rank_18) in [(None, "Aycliffe Village"), (Some("Newton Aycliffe"), "Newton Aycliffe")] {
         let (display, address) = answer_at(&index(city), 10.0, 0.0);
-        assert_eq!(display, "20 Stanfield Road, Newton Aycliffe, Great Aycliffe, Newton Aycliffe, Durham, United States", "{city:?}");
+        assert_eq!(display, format!("20 Stanfield Road, Newton Aycliffe, Great Aycliffe, {rank_18}, Durham, United States"), "{city:?}");
         assert_eq!(address["town"], "Newton Aycliffe", "{city:?}");
     }
 }
