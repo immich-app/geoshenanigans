@@ -784,10 +784,12 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   LogicalRow out) under `postcode_grid.bin`'s id, right after the postcode
   centroids' section, in every patch (an empty merge where neither day has
   the file). It has no string field: the grid holds its postcodes as text.
-  The patcher decodes the old file strictly and encodes the new rows as
-  `postcode_grid.bin`, whose size the client list gives; a grid sent
-  unchanged is copied as it sits. A dir that gets its first grid or loses
-  its last merges as any other day. A run whose postcode or first cell
+  When it replays a merge of the grid, the patcher decodes the old file
+  strictly and encodes the new rows as `postcode_grid.bin`, whose size the
+  client list gives; a grid sent unchanged is copied as it sits, without
+  decoding it, and held to the old file's hash (`HASHED_OLD_FILES`), which
+  the patch gives before the section where the old grid has rows. A dir that
+  gets its first grid or loses its last merges as any other day. A run whose postcode or first cell
   moved goes as a DELETE and an INSERT.
   A child stream (street_nodes, interp_nodes, addr_vertices, poi_vertices,
   in the section right after its parent's) replays along its parent by

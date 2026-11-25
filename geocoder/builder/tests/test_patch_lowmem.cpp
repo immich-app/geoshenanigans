@@ -1262,10 +1262,21 @@ std::vector<postcode_files::LogicalCentroid> some_centroids(uint32_t n) {
     return rows;
 }
 
+// A postcode grid of 40 runs, each of three US postcodes from `first` in
+// turn but every fourth, of none: of any first of five digits, as many bytes.
+std::vector<postcode_grid::LogicalRow> some_grid(uint32_t first) {
+    std::vector<postcode_grid::LogicalRow> rows;
+    for (uint64_t i = 0; i < 40; i++) {
+        const std::string code = i % 4 == 3 ? "" : std::to_string(first + i % 3);
+        rows.push_back(postcode_grid::row_of(postcode_grid::cell_at(1000 + 7 * i, 16), code.empty() ? 0 : uint16_t('U' << 8 | 'S'), code));
+    }
+    return rows;
+}
+
 // A dir of every encoded family: 40 street ways of two nodes in a geo cell,
 // with a parent each; 30 interpolations of three nodes; 60 address points,
 // two in three with a footprint, with a postcode each; 50 POIs, two in three
-// polygons; 20 place nodes; 30 postcode centroids.
+// polygons; 20 place nodes; 30 postcode centroids; a postcode grid of 40 runs.
 BuildDir every_family(std::mt19937& rng) {
     BuildDir d, meta;
     std::vector<uint32_t> names;
@@ -1293,6 +1304,7 @@ BuildDir every_family(std::mt19937& rng) {
     put_pois(d, pois_of(rng, 50, 0, true));
     put_places(d, some_places(20));
     put_centroids(d, some_centroids(30));
+    put_grid(d, some_grid(19000));
     return d;
 }
 
@@ -1404,7 +1416,8 @@ TEST(patch_copies_a_family_both_of_whose_sections_are_unchanged) {
 
 // A family a day leaves unchanged is copied as its files sit, and each of its
 // files the patch gives a hash of is held to it first: with one byte of such
-// a file changed, its size kept, no mode applies the patch.
+// a file changed, its size kept, or a postcode grid of other postcodes in
+// place of the old one, no mode applies the patch.
 TEST(patch_holds_the_files_of_a_family_it_copies_to_their_hashes) {
     ScratchDir dir("lowmem-copied-hashes");
     std::mt19937 rng(20261116);
@@ -1423,6 +1436,17 @@ TEST(patch_holds_the_files_of_a_family_it_copies_to_their_hashes) {
         CHECK(not_refused(c, ALL_MODES, c.patch(), name, "Old " + name + " is not the one the patch was made from").empty());
         REQUIRE(write_file(path, written));
     }
+    // The grid holds its postcodes as text, which no string tier's hash
+    // covers: an old grid of other postcodes, as many bytes and runs, which
+    // the patch would copy as it sits, is refused too.
+    const std::string grid = c.dir("old") + "/" + postcode_grid::FILE_NAME;
+    const std::vector<char> written = read_file(grid);
+    BuildDir other;
+    put_grid(other, some_grid(19003));
+    REQUIRE(other[postcode_grid::FILE_NAME].size() == written.size() && other[postcode_grid::FILE_NAME] != written);
+    REQUIRE(write_file(grid, other[postcode_grid::FILE_NAME]));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "other-grid", "Old postcode_grid.bin is not the one the patch was made from").empty());
+    REQUIRE(write_file(grid, written));
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
