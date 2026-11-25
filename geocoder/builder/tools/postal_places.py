@@ -10,7 +10,7 @@ its file's, of a ZIP of other than five ASCII digits or of no name, a country of
 MIN_ROWS and, given the rows the cache holds now, fewer than 99% of them. A row the builder skips (a
 ZIP of 00000, a name of more than NAME_BYTES bytes of UTF-8 or of a control character) is left out
 and not counted. A ZIP of two rows (a Navy ZIP is an FPO's and its base's) keeps the one of a state,
-else the least name.
+else the least name, then the least state.
 
 Usage: postal_places.py OUT.tsv.gz ZIP... [--previous-rows N]
 Prints a JSON summary: {"rows": n, "size": bytes, "sha256": hex, "sources": {"US": n, ...}}."""
@@ -82,7 +82,7 @@ def table(paths):
         sources[rows[0][0]] = len(rows)
         for r in rows:
             key = (r[0], r[1])
-            if key not in best or (not best[key][3], best[key][2]) > (not r[3], r[2]):
+            if key not in best or (not best[key][3], best[key][2], best[key][3]) > (not r[3], r[2], r[3]):
                 best[key] = r
     return [best[k] for k in sorted(best)], sources
 

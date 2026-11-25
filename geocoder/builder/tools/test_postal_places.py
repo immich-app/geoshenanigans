@@ -110,6 +110,15 @@ class PostalPlacesTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("not five digits", stderr)
 
+    def test_a_zips_rows_of_one_name_keep_the_least_state_whatever_their_order(self):
+        rows = [line("US", "19026", "Drexel Hill", "Pennsylvania", "PA"), line("US", "19026", "Drexel Hill", "Delaware", "DE"),
+                line("US", "19073", "Newtown Square", "Pennsylvania", "PA"), line("US", "19083", "Havertown")]
+        _, out, first, _ = self.run_main(self.zip("US", "".join(rows)))
+        with gzip.open(out, "rt", encoding="utf-8") as f:
+            self.assertIn("US\t19026\tDrexel Hill\tDE\n", f.read())
+        _, _, second, _ = self.run_main(self.zip("US", "".join([rows[1], rows[0]] + rows[2:])))
+        self.assertEqual(json.loads(first)["sha256"], json.loads(second)["sha256"])
+
     def test_a_refresh_keeps_99_percent_of_the_caches_rows(self):
         us = self.zip("US", "".join(line("US", f"{19000 + i:05d}", f"Town {i}") for i in range(99)))
         self.assertEqual(self.run_main(us, "--previous-rows", "100")[0], 0)
