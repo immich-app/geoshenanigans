@@ -6,9 +6,11 @@ country, ZIP, place name and state (GeoNames' admin code of a US row, a territor
 gzipped without a timestamp, so that the file's bytes are its rows'.
 
 It refuses files GeoNames would not publish: a row of other than 12 fields, of another country than
-its file's, of a ZIP of other than five digits or of no name, a country of fewer rows than MIN_ROWS
-and, given the rows the cache holds now, fewer than 99% of them. A ZIP of two rows (a Navy ZIP is
-an FPO's and its base's) keeps the one of a state, else the least name.
+its file's, of a ZIP of other than five ASCII digits or of no name, a country of fewer rows than
+MIN_ROWS and, given the rows the cache holds now, fewer than 99% of them. A row the builder skips (a
+ZIP of 00000, a name of more than NAME_BYTES bytes of UTF-8 or of a control character) is left out
+and not counted. A ZIP of two rows (a Navy ZIP is an FPO's and its base's) keeps the one of a state,
+else the least name.
 
 Usage: postal_places.py OUT.tsv.gz ZIP... [--previous-rows N]
 Prints a JSON summary: {"rows": n, "size": bytes, "sha256": hex, "sources": {"US": n, ...}}."""
@@ -26,7 +28,17 @@ import zipfile
 MIN_ROWS = {"US": 40000, "PR": 150, "VI": 1, "GU": 1, "AS": 1, "MP": 1}
 # The share of the cache's rows a refresh must keep.
 KEEP = 0.99
-ZIP = re.compile(r"\d{5}")
+ZIP = re.compile(r"[0-9]{5}")
+# The longest name the builder takes, in bytes of UTF-8 (postal_cities.h NAME_BYTES).
+NAME_BYTES = 48
+
+
+def builder_takes(zip_, name):
+    """Whether the builder takes a row (postal_cities_build.h parse_places): a ZIP the grid's pattern
+    takes, not 00000, and a name of at most NAME_BYTES bytes with no control character (U+0000 to
+    U+001F, U+007F)."""
+    return zip_ != "00000" and len(name.encode("utf-8")) <= NAME_BYTES and not any(
+        ord(c) < 0x20 or ord(c) == 0x7F for c in name)
 
 
 class Refused(Exception):
@@ -55,7 +67,8 @@ def rows_of(path):
         name = f[2].strip()
         if not name or "\t" in name:
             raise Refused(f"{path}:{n}: a row of no name")
-        out.append((country, f[1], name, f[4].strip() if country == "US" else country))
+        if builder_takes(f[1], name):
+            out.append((country, f[1], name, f[4].strip() if country == "US" else country))
     if len(out) < MIN_ROWS[country]:
         raise Refused(f"{path}: {len(out)} rows, fewer than {country}'s {MIN_ROWS[country]}")
     return out

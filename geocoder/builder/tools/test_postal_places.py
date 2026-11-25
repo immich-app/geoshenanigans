@@ -87,6 +87,29 @@ class PostalPlacesTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("not a file of", stderr)
 
+    def test_a_row_the_builder_cant_take_is_neither_counted_nor_published(self):
+        good = line("US", "19026", "Drexel Hill", "Pennsylvania", "PA") + line("US", "19073", "Newtown Square") \
+            + line("US", "19083", "Havertown")
+        for bad in (line("US", "00000", "Nowhere"), line("US", "19008", "B" * 49), line("US", "19008", "Broom\x01all"),
+                    line("US", "19008", "Broom\x7fall")):
+            rc, out, stdout, _ = self.run_main(self.zip("US", good + bad))
+            self.assertEqual(rc, 0, bad)
+            self.assertEqual(json.loads(stdout)["rows"], 3, bad)
+            self.assertEqual(json.loads(stdout)["sources"], {"US": 3}, bad)
+            with gzip.open(out, "rt", encoding="utf-8") as f:
+                text = f.read()
+            self.assertNotIn("19008", text)
+            self.assertNotIn("00000", text)
+        # A name of 48 bytes the builder takes, accents counted as their bytes.
+        rc, out, stdout, _ = self.run_main(self.zip("US", good + line("US", "19008", "é" * 24)))
+        self.assertEqual(json.loads(stdout)["rows"], 4)
+        rc, out, stdout, _ = self.run_main(self.zip("US", good + line("US", "19008", "é" * 24 + "B")))
+        self.assertEqual(json.loads(stdout)["rows"], 3)
+        # Digits of another script are no ZIP's.
+        rc, _, _, stderr = self.run_main(self.zip("US", good + line("US", "\uff11\uff19\uff10\uff10\uff18", "Broomall")))
+        self.assertEqual(rc, 1)
+        self.assertIn("not five digits", stderr)
+
     def test_a_refresh_keeps_99_percent_of_the_caches_rows(self):
         us = self.zip("US", "".join(line("US", f"{19000 + i:05d}", f"Town {i}") for i in range(99)))
         self.assertEqual(self.run_main(us, "--previous-rows", "100")[0], 0)
