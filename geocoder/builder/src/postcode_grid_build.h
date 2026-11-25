@@ -214,24 +214,26 @@ inline std::vector<LogicalRow> grid_rows(const std::vector<uint64_t>& cells, con
 // The rows a region's grid holds of the planet's (grid_rows, at `level`):
 // each of the planet's runs that holds a cell a query routed to the region
 // reads, whole, and none in place of the others. served(id) says whether the
-// region serves the cell of id, a cell at served_level (at most level): the
-// server routes the queries in it there. A run's cells come from votes on
+// region serves the cell of id, a cell at served_level (0 to 30, coarser or
+// finer than the grid's): the server routes the queries in it there. A run's cells come from votes on
 // either side of the region's edge, so the region answers as the planet does
 // at every point routed to it, which a grid of the region's votes alone
 // would not. served may be called more than once for a cell.
 template <class Served>
 std::vector<LogicalRow> region_rows(const std::vector<LogicalRow>& rows, int level, int served_level, Served served) {
     std::vector<LogicalRow> out;
-    if (level < 0 || level > MAX_LEVEL || served_level < 0 || served_level > level)
-        throw std::logic_error("postcode_grid::region_rows: levels past the grid's");
-    const int shift = 2 * (level - served_level);
+    if (level < 0 || level > MAX_LEVEL || served_level < 0 || served_level > 30)
+        throw std::logic_error("postcode_grid::region_rows: levels past the grid's or S2's");
+    const bool coarser = served_level <= level;
+    const int shift = 2 * (coarser ? level - served_level : served_level - level);
     const uint64_t end = cells_at(level);
     for (size_t i = 0; i < rows.size(); i++) {
+        // The run's cells [from, to), and the served cells over them [lo, hi).
         const uint64_t from = rows[i].cell >> cell_shift(level);
         const uint64_t to = i + 1 < rows.size() ? rows[i + 1].cell >> cell_shift(level) : end;
+        const uint64_t lo = coarser ? from >> shift : from << shift, hi = coarser ? ((to - 1) >> shift) + 1 : to << shift;
         bool keep = false;
-        for (uint64_t up = from >> shift; rows[i].country_code && !keep && (up << shift) < to; up++)
-            keep = served(cell_at(up, served_level));
+        for (uint64_t up = lo; rows[i].country_code && !keep && up < hi; up++) keep = served(cell_at(up, served_level));
         const LogicalRow r = keep ? rows[i] : row_of(rows[i].cell, 0, {});
         if (out.empty() ? !keep : same_postcode(out.back(), r)) continue;
         out.push_back(r);

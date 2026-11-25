@@ -239,6 +239,18 @@ TEST(a_regions_grid_is_the_planets_runs_a_query_routed_there_reads) {
     CHECK(postcode_grid::region_rows(planet, L, 10, [](uint64_t) { return false; }).empty());
     CHECK(same(postcode_grid::region_rows(planet, L, 10, [](uint64_t) { return true; }), planet));
     CHECK_EQ(refusal(region), std::string());
+    // Served cells finer than the grid's: a level-17 cell in the first
+    // cell of 19026's run keeps it; one past the run's last keeps none.
+    auto served_17 = [&](uint64_t at) {
+        return [at](uint64_t id) {
+            int level = 0;
+            REQUIRE(postcode_grid::level_of(id, level) && level == 17);
+            return (id >> postcode_grid::cell_shift(17)) == at;
+        };
+    };
+    CHECK(same(postcode_grid::region_rows(planet, L, 17, served_17(4 * (a - 150))), {row(a - 150, US, "19026"), none(a + 151)}));
+    CHECK(postcode_grid::region_rows(planet, L, 17, served_17(4 * (a + 151))).empty());
+    CHECK(postcode_grid::region_rows({}, L, 17, served_17(0)).empty());
 }
 
 TEST(the_grid_file_is_run_coded_as_the_format_lays_it_out) {
