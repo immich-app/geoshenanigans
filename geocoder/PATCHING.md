@@ -298,7 +298,9 @@ the `.bin` files, because the server can't load a region without them.
      above) and each checked against its sha256; a selection takes every
      file of each unit it needs
    - any other: as <path>.zst, decompressed and checked against its sha256
-   - builds/{date}/europe/full/…                (23 files + up to 5 optional)
+   - builds/{date}/europe/full/…                (23 files + 2 optional: the
+     postcode centroids; the TIGER, grid and postal city files are only in
+     a region holding the United States)
    - builds/{date}/europe/quality/simplified/…  (4 files)
    - builds/{date}/europe/poi/notable/…         (7 files, optional)
    The JSON files (strings_layout.json, poi_meta.json) are part of the set:

@@ -390,10 +390,12 @@ addressed with, which may differ from the city or town the point lies in
 (19026 is Drexel Hill, in Upper Darby). It is the `addr:city` most of the
 ZIP's OpenStreetMap addresses carry, else GeoNames' USPS place name
 (`postal_cities.bin`). It is not a Nominatim field and never part of
-`display_name`, and an answer whose postcode came from the nearest postcode
-centroid has none. Every preset carries it where the answer has a ZIP: in
-with-addresses and max-quality the house's, the street's or the postcode
-grid's; in immich-recommended and smallest, mostly the grid's.
+`display_name`. An answer has none whose postcode came from the nearest
+postcode centroid, nor one of a ZIP the dir's table has no row of (one too
+few addresses name, without GeoNames' name) or from a dir of no table. Every
+preset carries it where the answer has a ZIP of a row: in with-addresses and
+max-quality the house's, the street's, a TIGER line's, a postal area's or
+the postcode grid's; in immich-recommended and smallest, mostly the grid's.
 
 Status codes:
 - `200` - success
