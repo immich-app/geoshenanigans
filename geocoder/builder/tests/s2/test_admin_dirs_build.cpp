@@ -1424,8 +1424,9 @@ namespace {
 // 19099 among 19026's, 11 houses of 19050 at 47.1 N from 8.03 E (Lansdowne
 // 6, Yeadon 5),
 // Testreich (DE) houses of 19026 in Drexel Hill and of 19600, which cast no
-// vote, and a postal area of 19400 in Testland's north-west corner, clear of
-// every house and street.
+// vote, and a postal area of 19000 in Testland's north-west corner, clear of
+// every house and street: a ZIP that sorts before every ZIP of a vote, so
+// each vote's code moves up one among the table's.
 std::vector<TestObject> postal_city_fixture() {
     std::vector<Postcoded> houses;
     for (int i = 0; i <= 20; i++) houses.push_back({8100 + i, 470500000, 80200000 + 50000 * i, "19026"});
@@ -1444,7 +1445,7 @@ std::vector<TestObject> postal_city_fixture() {
     TestObject area;
     area.type = OsmType::Relation;
     area.id = 8720;
-    area.tags = {{"boundary", "postal_code"}, {"postal_code", "19400"}, {"type", "boundary"}};
+    area.tags = {{"boundary", "postal_code"}, {"postal_code", "19000"}, {"type", "boundary"}};
     area.members.emplace_back(OsmType::Way, 8710, "outer");
     objects.push_back(area);
     // A house of 19026 mapped as a building, of Upper Darby, between the
@@ -1482,13 +1483,13 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
     write_test_pbf(pbf, postal_city_fixture(), 1000);
     // GeoNames' names of 19026, 19018 and 19099, of 19500, which no address
-    // names, of 19600, which only the foreign house does, and of 19400, the
+    // names, of 19600, which only the foreign house does, and of 19000, the
     // postal area's.
     const std::string places = root.path() + "/postal_places.tsv";
     {
         std::ofstream f(places);
         f << "US\t19026\tDrexel Hill\tPA\nUS\t19018\tClifton Heights\tPA\nUS\t19099\tMinorityville\tPA\n"
-             "US\t19500\tNowhere\tPA\nUS\t19600\tForeignville\tPA\nUS\t19400\tPostalton\tPA\n";
+             "US\t19500\tNowhere\tPA\nUS\t19600\tForeignville\tPA\nUS\t19000\tPostalton\tPA\n";
     }
     auto build = [&](const std::string& name, std::vector<std::string> extra) {
         const std::string out = root.path() + "/" + name;
@@ -1529,8 +1530,8 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
         });
         return rows;
     };
-    CHECK(rows_of(table) == std::vector<std::string>({"US 19018 Clifton Heights", "US 19026 Drexel Hill",
-                                                      "US 19050 Lansdowne", "US 19099 Minorityville", "US 19400 Postalton"}));
+    CHECK(rows_of(table) == std::vector<std::string>({"US 19000 Postalton", "US 19018 Clifton Heights", "US 19026 Drexel Hill",
+                                                      "US 19050 Lansdowne", "US 19099 Minorityville"}));
     // The votes, a line per value.
     std::ifstream votes(dump);
     const std::string text((std::istreambuf_iterator<char>(votes)), std::istreambuf_iterator<char>());
@@ -1541,7 +1542,7 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
           std::string::npos);
     CHECK(text.find("19500") == std::string::npos);
     CHECK(text.find("19600") == std::string::npos);
-    CHECK(text.find("US\t19400\tPostalton\t\tgeonames\tPostalton\t\t\t\t0\n") != std::string::npos);
+    CHECK(text.find("US\t19000\tPostalton\t\tgeonames\tPostalton\t\t\t\t0\n") != std::string::npos);
 
     // The server, from the dir of an admin preset and from admin-minimal,
     // answers each point with the postal city of the grid's ZIP there,
@@ -1575,9 +1576,9 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
         f.write(reinterpret_cast<const char*>(prev.data()), std::streamsize(prev.size()));
     }
     const auto held = tree(build("held", {"--prev-postal-cities", yesterday}));
-    CHECK(rows_of(held.at("planet/full/" + name)) == std::vector<std::string>({"US 19018 Clifton Heights", "US 19026 Drexel Hill",
-                                                                               "US 19050 Yeadon", "US 19099 Minorityville",
-                                                                               "US 19400 Postalton"}));
+    CHECK(rows_of(held.at("planet/full/" + name)) == std::vector<std::string>({"US 19000 Postalton", "US 19018 Clifton Heights",
+                                                                               "US 19026 Drexel Hill", "US 19050 Yeadon",
+                                                                               "US 19099 Minorityville"}));
     const auto chained = tree(build("chained", {"--prev-output", out, "--prev-postal-cities", out + "/planet/admin/" + name}));
     CHECK(chained.at("planet/admin/" + name) == table);
     // One on top of the held build keeps its Yeadon, which loses without it.
