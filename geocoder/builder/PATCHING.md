@@ -796,10 +796,12 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   postcode's country, its code and its name, as `src/postal_cities.h` lays
   a LogicalRow out) under `postal_cities.bin`'s id, right after the postcode
   grid's section, in every patch (an empty merge where neither day has the
-  file). It has no string field: the table holds its names as text. The
-  patcher decodes the old file strictly and encodes the new rows as
-  `postal_cities.bin`, whose size the client list gives; a table sent
-  unchanged is copied as it sits. A dir that gets its first table or loses
+  file). It has no string field: the table holds its names as text. As for
+  the grid, the patch gives the old file's hash (`HASHED_OLD_FILES`) before
+  the section where the old table has rows, and the patcher holds the old
+  file to it first. It then decodes the old file strictly and encodes the
+  new rows as `postal_cities.bin`, whose size the client list gives; a table
+  sent unchanged is copied as it sits. A dir that gets its first table or loses
   its last merges as any other day. A postcode whose name changed goes as a
   DELETE and an INSERT.
   A child stream (street_nodes, interp_nodes, addr_vertices, poi_vertices,

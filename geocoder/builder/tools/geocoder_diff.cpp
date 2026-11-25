@@ -2289,6 +2289,8 @@ static int run(int argc, char* argv[]) {
     // file as it sits, held to the hash.
     if (res_grid.old_size) append_old_file_hash(patch, old_dir, PatchFileId::POSTCODE_GRID);
     serialize_merge(patch, res_grid, old_dir, new_dir, patcher_strings, offset_fixup_limits);
+    // The postal cities' hash likewise: their names are text too.
+    if (res_postal.old_size) append_old_file_hash(patch, old_dir, PatchFileId::POSTAL_CITIES);
     serialize_merge(patch, res_postal, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     // The admin geometry, ahead of the admin cells: arc_index, arc_vertices,
     // admin_polygons, admin_rings. A file the new dir lacks gets no section,

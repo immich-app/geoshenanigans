@@ -1352,13 +1352,6 @@ TEST(patch_round_trip_merges_the_postcode_grid_as_logical_rows) {
     CHECK(round_trip(without, without).mismatches.empty());
 }
 
-// The postal cities (postal_cities.h) of rows into d, as the builder writes
-// them.
-static void put_postal(BuildDir& d, const std::vector<postal_cities::LogicalRow>& rows) {
-    const std::vector<uint8_t> file = postal_cities::encode_file(rows);
-    d[postal_cities::FILE_NAME].assign(file.begin(), file.end());
-}
-
 // --decode-logical writes a dir's postal cities as their 64-byte rows, and
 // none for a dir without them; a table the encoder would not write is
 // refused.
