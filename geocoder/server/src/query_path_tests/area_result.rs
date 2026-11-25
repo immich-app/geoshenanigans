@@ -80,6 +80,20 @@ fn only_a_poi_of_rank_search_30_near_the_point_leaves_the_locality_out() {
 }
 
 #[test]
+fn a_landmark_round_the_point_that_is_no_rank_30_row_leaves_the_locality_in() {
+    // Karlamilyi National Park (boundary=national_park, rank_search 25 and rank_address 0) holds
+    // the point, and no street, house or rank-30 POI is near: Nominatim's features near the point
+    // have none of it, nor has the area lookup (rank_address 4 to 25), and Telfer answers. The
+    // park stays the answer's landmark.
+    let mut dataset = telfer(Some(5000.0));
+    let name_id = dataset.string("Karlamilyi National Park");
+    let index = with_polygon_poi_of(dataset.load(), name_id, NO_DATA, (-3000.0, -3000.0, 3000.0, 3000.0), 130);
+    let address = address_at(&index, 0.0, 0.0);
+    assert_eq!(address["locality"], "Telfer");
+    assert_eq!(address["landmark"], "Karlamilyi National Park");
+}
+
+#[test]
 fn a_street_past_the_antimeridian_gives_the_answer_none_of_its_rows_or_its_postcode() {
     // On Taveuni the 180th meridian runs across the island: the point lies 42 m west of it, in
     // Testland, the postal area 6000 and the locality Waiyevo, and Lavena Road 5 m east of it, in

@@ -3607,7 +3607,7 @@ impl Index {
         // and one of AREA_RESULT_RANK leads the answer (area_result). A dir without streets knows
         // of none: its answers stand for those of a street at the point, which leave such an area
         // out.
-        let area_result = if self.streets.is_some() && closest_feature_dist >= max_dist && landmark_name.is_none() {
+        let area_result = if self.streets.is_some() && closest_feature_dist >= max_dist {
             let country = admin.country_code.map(|c| String::from_utf8_lossy(&c).to_uppercase()).unwrap_or_default();
             self.area_result(&mut admin_scan, &country).filter(|_| !self.feature_within_reach(lat, lng))
         } else {
