@@ -2025,7 +2025,7 @@ test('the address shown whole is escaped', () => {
 
 // -- Credits --
 // The sources of the data the answers come from, their licences and their
-// notices: configurations.template.json's attribution as PR 530 adds it
+// notices: configurations.template.json's attribution
 // (builder/src/attribution.h writes each dataset's attribution.json from
 // it), but for the datasets each applies to.
 const OSM = {
@@ -2036,7 +2036,7 @@ const OSM = {
 const NOTICES = {
   geonames: ['UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.',
     'The Data is provided "as is" without warranty or any representation of accuracy, timeliness or completeness.',
-    "Changes: this dataset holds the coordinates of the GB postcodes of GB_full.csv.zip that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the file's other fields."],
+    "Changes: this dataset holds the coordinates of the postcodes of GeoNames's postal code files that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the files' other fields."],
   'codepoint-open': ["GeoNames's GB_full.csv.zip is derived from Code-Point Open.",
     'Contains Ordnance Survey data © Crown copyright and database right 2022.',
     'Contains Royal Mail data © Royal Mail copyright and database right 2022.',
@@ -2134,9 +2134,9 @@ test("a build's own credit, as /datasets passes it on, is the one shown, escaped
   }
 });
 
-// Once the template lists the sources (PR 530), the page's credit is that
-// list but for the datasets each applies to.
-test("the page's credit is the template's attribution", { skip: !template.attribution && 'the template has no attribution yet' }, () => {
+// The page's credit is the template's list but for the datasets each
+// applies to.
+test("the page's credit is the template's attribution", () => {
   const { DATA_CREDITS } = core();
   assert.deepEqual(plain(DATA_CREDITS), template.attribution.map(({ applies_to, ...entry }) => entry));
 });
