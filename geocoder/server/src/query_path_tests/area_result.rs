@@ -64,6 +64,21 @@ fn a_street_or_a_house_within_nominatims_reach_answers_instead() {
 }
 
 #[test]
+fn only_a_poi_of_rank_search_30_near_the_point_leaves_the_locality_out() {
+    // The features lookup_street_poi takes are rank-30 rows of placex (_find_closest_street_or_pois:
+    // rank_search 30, a class other than place and building). A named peak whose centre is 500 m
+    // north, natural=peak of rank_search 18 (address-levels.json), is none of them, and Telfer
+    // answers; a museum there is one, as is a named office of none of our categories
+    // (GENERIC_RANK30), and Telfer stays out.
+    for (category, locality) in [(80u8, Some("Telfer")), (0, None), (170, None)] {
+        let mut dataset = telfer(Some(5000.0));
+        let name_id = dataset.string("Mount Telfer");
+        let index = with_polygon_poi_of(dataset.load(), name_id, NO_DATA, (450.0, -50.0, 550.0, 50.0), category);
+        assert_eq!(address_at(&index, 0.0, 0.0).get("locality").and_then(|v| v.as_str()), locality, "{category}");
+    }
+}
+
+#[test]
 fn a_dir_without_streets_answers_as_on_a_street_and_leaves_the_locality_out() {
     // An admin dir has no streets to tell a point no street is near: its answers stand for a
     // street's at the point, whose address takes no area of rank 25.
