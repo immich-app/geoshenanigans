@@ -1450,6 +1450,32 @@ TEST(patch_holds_the_files_of_a_family_it_copies_to_their_hashes) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
+// A day that changes runs of the grid replays them over the old file's: an
+// old grid of other postcodes, as many bytes and runs, decodes as well as the
+// one the patch was made from, so the patcher holds it to the old file's
+// hash first, and refuses it in every mode.
+TEST(patch_holds_the_old_postcode_grid_it_replays_to_its_hash) {
+    ScratchDir dir("lowmem-grid-replay-hash");
+    std::mt19937 rng(20261125);
+    const BuildDir base = every_family(rng);
+    BuildDir day = base;
+    std::vector<postcode_grid::LogicalRow> rows = some_grid(19000);
+    rows[5] = postcode_grid::row_of(rows[5].cell, uint16_t('U' << 8 | 'S'), "19099");
+    put_grid(day, rows);
+    const LowMemCase c{dir.path(), "grid-day"};
+    REQUIRE(prepare(c, base, day).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    const std::string grid = c.dir("old") + "/" + postcode_grid::FILE_NAME;
+    const std::vector<char> written = read_file(grid);
+    BuildDir other;
+    put_grid(other, some_grid(19003));
+    REQUIRE(other[postcode_grid::FILE_NAME].size() == written.size() && other[postcode_grid::FILE_NAME] != written);
+    REQUIRE(write_file(grid, other[postcode_grid::FILE_NAME]));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "other-grid", "Old postcode_grid.bin is not the one the patch was made from").empty());
+    REQUIRE(write_file(grid, written));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
 // What the patcher checks of an old family it copies as its files sit,
 // refused in every mode: old files whose footers give the child stream
 // another size than the patch (a street way of three nodes for one of two:

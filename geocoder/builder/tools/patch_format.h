@@ -808,8 +808,10 @@ static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 // rows' anchors, counts and codes (both files of each way pair), the address
 // replay (addr_replay.h) the old footprint blobs and the records whose
 // points they sit under (addr_vertices.bin and addr_points.bin). The
-// postcode grid's is for the copy below: its postcodes are text, which no
-// string tier's hash covers. The diff sends one for each file of
+// postcode grid's is checked before its runs are replayed and before the
+// copy below: its postcodes are text, which no string tier's hash covers,
+// and a grid of other postcodes, as many runs, decodes as well as the old
+// one. The diff sends one for each file of
 // HASHED_OLD_FILES the old dir holds and whose family has a section, the
 // grid's where the old grid has rows. The patcher refuses a second hash of a
 // file, a hash of any other file, and a replay without the hashes it checks
