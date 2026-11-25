@@ -139,6 +139,38 @@ fn a_street_past_the_antimeridian_gives_the_answer_none_of_its_rows_or_its_postc
 }
 
 #[test]
+fn a_place_node_that_answers_takes_its_country_and_its_place_rows_at_its_own_point() {
+    // Punmu, a hamlet inside the locality Telfer, which runs across a border, answers the point
+    // of its own address: the point lies in Testland (AU) and Punmu in Otherland (NZ), and the
+    // town node Newman 3.5 km west of the point covers the point (its fuzzy area reaches 4 km)
+    // but not Punmu, 4.4 km east of it. Punmu's answer is of Otherland, without Newman.
+    let mut dataset = TestIndex { origin: ORIGIN, ..TestIndex::default() };
+    dataset
+        .boundary("Testland", 2, 0, (-40_000.0, -40_000.0, 40_000.0, 500.0))
+        .boundary("Otherland", 2, 0, (-40_000.0, 500.0, 40_000.0, 40_000.0))
+        .boundary("Telfer", 9, 15, (-20_000.0, -20_000.0, 20_000.0, 20_000.0)).rank(25)
+        .street("Telfer Road", &[(5000.0, -500.0), (5000.0, 500.0)])
+        .place("Punmu", 4, 800.0, 900.0)
+        .place("Newman", 1, 0.0, -3500.0);
+    dataset.polygons[0].0.country_code = u16::from_be_bytes(*b"AU");
+    dataset.polygons[1].0.country_code = u16::from_be_bytes(*b"NZ");
+    let index = dataset.load();
+    let address = address_at(&index, 0.0, 0.0);
+    assert_eq!(address["hamlet"], "Punmu");
+    assert_eq!((&address["country"], &address["country_code"]), (&serde_json::json!("Otherland"), &serde_json::json!("NZ")));
+    assert_eq!(address.get("town"), None);
+    assert_eq!(display(&index, 0.0, 0.0), "Punmu, Otherland");
+    // Without Punmu the town covers the point, and Telfer's answer has it.
+    let index = TestIndex { origin: ORIGIN, ..TestIndex::default() }
+        .boundary("Testland", 2, 0, (-40_000.0, -40_000.0, 40_000.0, 500.0))
+        .boundary("Telfer", 9, 15, (-20_000.0, -20_000.0, 20_000.0, 20_000.0)).rank(25)
+        .street("Telfer Road", &[(5000.0, -500.0), (5000.0, 500.0)])
+        .place("Newman", 1, 0.0, -3500.0)
+        .load();
+    assert_eq!(address_at(&index, 0.0, 0.0)["town"], "Newman");
+}
+
+#[test]
 fn a_locality_answers_where_no_country_holds_the_point() {
     // Telfer alone round the point, in no country polygon of the data, and no street near:
     // lookup_area takes it as inside a country, and it answers.

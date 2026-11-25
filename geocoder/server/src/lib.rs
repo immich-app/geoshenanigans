@@ -3637,14 +3637,20 @@ impl Index {
             return Address::default();
         }
         // A place node that answers is the result, of its own address (_place_inside_area_query):
-        // the areas round it and the postcode its own row has (get_nearest_postcode round it).
-        let mut node_admin: Option<AdminResult<'_>> = None;
+        // the areas and the place nodes round it, its country and the postcode its own row has
+        // (get_nearest_postcode round it).
+        let mut node_admin: Option<(AdminResult<'_>, PlaceResult<'_>)> = None;
         if let Some(AreaAnswer::Node(_, (node_lat, node_lng))) = &area_result {
-            let at_node = self.find_admin(*node_lat, *node_lng);
+            let at = PlaceFeature::Point(*node_lat, *node_lng);
+            let mut node_scan = AdminScan::new(self, *node_lat, *node_lng);
+            let at_node = self.find_admin_in(&mut node_scan, at);
+            let node_boundaries = self.find_current_boundaries(&mut node_scan, at_node.country_code, at);
+            let node_places = self.find_places(at, &node_boundaries, at_node.boundary_ranks, None);
             resolved_postcode = self.resolve_postcode_in(*node_lat, *node_lng, None, None, None, None, at_node.postcode_area.clone(),
                                                          at_node.country_code.or(admin.country_code));
-            node_admin = Some(at_node);
+            node_admin = Some((at_node, node_places));
         }
+        let answer_country = node_admin.as_ref().and_then(|(at_node, _)| at_node.country_code).or(admin.country_code);
 
         // Note on name-suffix normalisation (previously considered as
         // Option 6): Nominatim does not normalise the localname it
@@ -3668,14 +3674,17 @@ impl Index {
         // finer than the polygon of that label: Brentwood's town node, promoted to 18 in the Town
         // of Islip (a town of rank 16), is the town, the Town of Islip a part of display_name only.
         let (area_rows, node_rows) = (admin.ranked, place.named_rows);
-        let mut rows = node_admin.map_or(admin.rows, |at_node| at_node.rows);
-        for row in place.rows {
+        let (mut rows, place_rows) = match node_admin {
+            Some((at_node, node_places)) => (at_node.rows, node_places.rows),
+            None => (admin.rows, place.rows),
+        };
+        for row in place_rows {
             if !rows.iter().any(|r| r.rank == row.rank) {
                 rows.push(row);
             }
         }
         rows.sort_by(|a, b| b.rank.cmp(&a.rank));
-        let country_code = admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned());
+        let country_code = answer_country.map(|c| String::from_utf8_lossy(&c).into_owned());
         if let Some(addr_city) = addr_city {
             let named = self.crosscheck_rows(addr_city, &area_rows, &mut admin_scan, &node_rows, feature);
             crosscheck(&mut rows, &named);
