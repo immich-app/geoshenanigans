@@ -636,6 +636,18 @@ fn one_outline_is_the_same_whichever_vertex_and_way_round_its_ring_starts() {
 }
 
 #[test]
+fn the_memoised_point_on_surface_is_the_builder_s_at_full_precision() {
+    // A rank's areas are taken by their centres' distances: a box 3e-7 degrees wide at lng 100
+    // has its middle between two f32 values, which two such boxes side by side would share.
+    let mut s = Shapes::default();
+    let narrow = ring_polygon(&mut s, vec![box_deg(10.0, 100.000_000_1, 10.2, 100.000_000_4)]);
+    let (geom, polys) = s.geometry();
+    let exact = interior_point(&s.rings[narrow as usize]);
+    assert_ne!(f64::from(exact.1 as f32), exact.1);
+    assert_eq!(geom.point_on_surface_memo(&polys[narrow as usize]), Some(exact));
+}
+
+#[test]
 fn point_on_surface_streams_what_the_builder_finds_over_the_rings() {
     // Wiggling edges cross a scan line many times, and in a lattice of mixed grids arcs of
     // different grids meet at their shared junctions.
@@ -956,7 +968,7 @@ fn index_load_reads_the_arc_files_and_names_a_missing_one() {
     let (fx, cells, names) = testland();
     let dir = ScratchDir::new();
     write_index(dir.path(), &fx, &cells, &names);
-    assert_eq!(load(dir.path()).unwrap().find_admin(10.0, 20.0).country.as_deref(), Some("Testland"));
+    assert_eq!(load(dir.path()).unwrap().find_admin(10.0, 20.0).row("country").map(|row| row.name.to_string()).as_deref(), Some("Testland"));
     for name in ADMIN_GEOMETRY_FILES {
         let dir = ScratchDir::new();
         write_index(dir.path(), &fx, &cells, &names);

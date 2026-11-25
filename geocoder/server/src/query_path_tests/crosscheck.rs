@@ -92,15 +92,16 @@ fn an_addr_city_no_row_of_its_rank_has_changes_nothing() {
 
 #[test]
 fn a_polygon_takes_its_rank_by_its_own_name_or_by_a_place_node_it_links() {
-    // Greenburgh, a boundary of rank 16, is the city; the city area across its north-east corner
-    // is a row of rank 16 too, which links the city node Yonkers: Nominatim's names of the area
-    // hold the node's as `_place_name`. A house named Yonkers, or the area's own name, takes the
-    // area; one named after a node it does not link, nothing.
+    // Greenburgh, a boundary of rank 16, is the city; the city area east of the house, which the
+    // street runs into across Greenburgh's north-east corner, is a row of rank 16 too, which links
+    // the city node Yonkers: Nominatim's names of the area hold the node's as `_place_name`. A
+    // house named Yonkers, or the area's own name, takes the area; one named after a node it does
+    // not link, nothing.
     let index = |city: Option<&str>| {
         let mut index = united_states();
         index
             .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
-            .boundary("City of Yonkers", 15, 1, (-1000.0, -1000.0, 8000.0, 8000.0))
+            .boundary("City of Yonkers", 15, 1, (-1000.0, 100.0, 8000.0, 8000.0))
             .linked_place("Yonkers", 0, 4000.0, 4000.0)
             .boundary("Scarsdale", 15, 1, (20_000.0, 20_000.0, 24_000.0, 24_000.0))
             .linked_place("Edgemont", 0, 22_000.0, 22_000.0)
@@ -216,14 +217,15 @@ fn a_field_the_value_s_row_leaves_goes_to_the_finest_part_of_no_field_that_fills
 #[test]
 fn a_boundary_s_every_outer_ring_has_the_names_of_the_node_it_links() {
     // The City of Yonkers is two rings, a place area of rank 16 each: the node Yonkers labels the
-    // larger, 25 km north-east, and the house is in the smaller. Nominatim's boundary is one
-    // relation, whose names hold Yonkers whichever ring the house is in.
+    // larger, 25 km north-east, and the street runs into the smaller, east of the house.
+    // Nominatim's boundary is one relation, whose names hold Yonkers whichever ring the street
+    // runs into.
     let places = |index: &mut TestIndex| {
         index
             .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
             .boundary("City of Yonkers", 15, 1, (20_000.0, 20_000.0, 30_000.0, 30_000.0))
             .linked_place("Yonkers", 0, 25_000.0, 25_000.0)
-            .boundary_ring((-1000.0, -1000.0, 1000.0, 4000.0));
+            .boundary_ring((-1000.0, 100.0, 1000.0, 4000.0));
     };
     for (city, part) in [(None, "Greenburgh"), (Some("Yonkers"), "City of Yonkers"), (Some("Edgemont"), "Greenburgh")] {
         let (display, address) = answer_at(&main_street(city, places), 10.0, 0.0);
@@ -234,11 +236,12 @@ fn a_boundary_s_every_outer_ring_has_the_names_of_the_node_it_links() {
 
 #[test]
 fn of_two_polygons_of_the_value_s_name_a_rank_takes_the_one_farther_from_the_street_s_middle() {
-    // The City of Yonkers, a boundary of rank 16 round Main Street's middle that links the node
-    // Yonkers, and Yonkers, a larger place area of rank 16 east of the middle, both hold house 4.
-    // getNearFeatures' distance of an area is the street middle's to it: none for the boundary,
-    // the street's city, and 100 m for the place area. Both match the house's addr:city, and
-    // Nominatim takes the farther, Yonkers.
+    // The City of Yonkers, a boundary of rank 16 round Main Street's middle and house 4 that links
+    // the node Yonkers, and Yonkers, a larger place area of rank 16 east of the middle and of the
+    // house, which the street runs into, are both rows of the street. getNearFeatures' distance
+    // of an area is the street middle's to it: none for the boundary, the street's city, and
+    // 100 m for the place area. Both match the house's addr:city, and Nominatim takes the
+    // farther, Yonkers.
     let index = |city: Option<&str>| {
         let mut index = united_states();
         index
@@ -246,14 +249,14 @@ fn of_two_polygons_of_the_value_s_name_a_rank_takes_the_one_farther_from_the_str
             .boundary("City of Yonkers", 8, 0, (-500.0, -500.0, 500.0, 500.0))
             .linked_place("Yonkers", 0, 300.0, -300.0)
             .street("Main Street", &[(0.0, -200.0), (0.0, 200.0)])
-            .address("4", 10.0, 150.0);
+            .address("4", 10.0, 50.0);
         if let Some(city) = city {
             index.addr_city(city);
         }
         index.load()
     };
     for (city, part) in [(None, "City of Yonkers"), (Some("Yonkers"), "Yonkers")] {
-        let (display, address) = answer_at(&index(city), 10.0, 150.0);
+        let (display, address) = answer_at(&index(city), 10.0, 50.0);
         assert_eq!(display, format!("4 Main Street, {part}, United States"), "{city:?}");
         assert_eq!(address["city"], part, "{city:?}");
     }
@@ -526,8 +529,10 @@ fn a_place_area_an_area_round_it_lifts_links_no_place_node_of_its_name() {
     // Newton Aycliffe, a place=town area, lies in the parish of Great Aycliffe (rank 20), which
     // lifts it to rank 22. find_linked_place reads the area's rank_address, no longer the town
     // node's, so the name match links no node, and the town node of its name, in Durham's rank 16
-    // boundary, is a row of rank 18. The house's addr:city makes the node the rank's part, after
-    // the parish: Nominatim repeats Newton Aycliffe.
+    // boundary, is a row of rank 18 after the parish, within twice the distance of the nearer
+    // town node Aycliffe Village, the rank's part. The house's addr:city names the Newton Aycliffe
+    // row, which then takes the rank: Nominatim repeats Newton Aycliffe. The town is the area, the
+    // finer row.
     let index = |city: Option<&str>| {
         let mut index = united_states();
         index
@@ -535,6 +540,7 @@ fn a_place_area_an_area_round_it_lifts_links_no_place_node_of_its_name() {
             .boundary("Great Aycliffe", 10, 0, (-4000.0, -4000.0, 4000.0, 4000.0))
             .boundary("Newton Aycliffe", 15, 2, (-3000.0, -3000.0, 3000.0, 3000.0))
             .place("Newton Aycliffe", 1, 500.0, 800.0)
+            .place("Aycliffe Village", 1, 475.0, 0.0)
             .street("Stanfield Road", &[(0.0, -200.0), (0.0, 200.0)])
             .address("20", 10.0, 0.0);
         if let Some(city) = city {
@@ -542,9 +548,9 @@ fn a_place_area_an_area_round_it_lifts_links_no_place_node_of_its_name() {
         }
         index.load()
     };
-    let (display, _) = answer_at(&index(None), 10.0, 0.0);
-    assert_eq!(display, "20 Stanfield Road, Newton Aycliffe, Great Aycliffe, Durham, United States");
-    let (display, address) = answer_at(&index(Some("Newton Aycliffe")), 10.0, 0.0);
-    assert_eq!(display, "20 Stanfield Road, Newton Aycliffe, Great Aycliffe, Newton Aycliffe, Durham, United States");
-    assert_eq!(address["town"], "Newton Aycliffe");
+    for (city, rank_18) in [(None, "Aycliffe Village"), (Some("Newton Aycliffe"), "Newton Aycliffe")] {
+        let (display, address) = answer_at(&index(city), 10.0, 0.0);
+        assert_eq!(display, format!("20 Stanfield Road, Newton Aycliffe, Great Aycliffe, {rank_18}, Durham, United States"), "{city:?}");
+        assert_eq!(address["town"], "Newton Aycliffe", "{city:?}");
+    }
 }

@@ -8,7 +8,7 @@ use crate::model::*;
 use crate::normalize::{is_ideographic, join, normalize, tokens, Token};
 use crate::entities::{cc_of, polygon_raw, Entities};
 use crate::reader::{SearchIndex, SubIndex};
-use query_server::{cell_id_at_level, AdminPoint, AdminPolygon, Index, ID_MASK, INTERIOR_FLAG, NO_DATA};
+use query_server::{cell_id_at_level, polygon_field, AdminPoint, AdminPolygon, Index, ID_MASK, INTERIOR_FLAG, NO_DATA};
 use fst::{Automaton, Streamer};
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA, SINK_STATE};
 use std::borrow::Cow;
@@ -417,15 +417,22 @@ impl<'a, 'g> Searcher<'a, 'g> {
         Searcher { idx, lev: [LevenshteinAutomatonBuilder::new(1, true), LevenshteinAutomatonBuilder::new(2, true)], limits: Limits::default() }
     }
 
-    /// Display context of a point: the geocoder's admin lookup (country, state, county).
+    /// Display context of a point: the geocoder's admin lookup (country, state, county). A label
+    /// no address row has is that of the first polygon of the address it labels: a rank shows one
+    /// polygon, and a county sharing its rank with a place=district area the address shows is
+    /// still the county.
     pub fn context_at(&self, lat: f32, lng: f32) -> Ctx<'g> {
-        let admin = self.idx.geo.find_admin(lat as f64, lng as f64);
+        let geo: &'g Index = self.idx.geo;
+        let admin = geo.find_admin(lat as f64, lng as f64);
+        let field = |label: &str| admin.row(label).map(|row| row.name.clone()).or_else(|| {
+            admin.ranked.iter().find(|r| polygon_field(r) == Some(label)).map(|r| geo.get_string(r.poly.name_id))
+        });
         Ctx {
             cc: admin.country_code.map(|c| [c[0].to_ascii_uppercase(), c[1].to_ascii_uppercase()]).unwrap_or([0, 0]),
-            country: admin.country.unwrap_or_default(),
-            state: admin.state.or(admin.province).unwrap_or_default(),
-            county: admin.county.unwrap_or_default(),
-            district: admin.state_district.or(admin.district).unwrap_or_default(),
+            country: field("country").unwrap_or_default(),
+            state: field("state").or_else(|| field("province")).unwrap_or_default(),
+            county: field("county").unwrap_or_default(),
+            district: field("state_district").or_else(|| field("district")).unwrap_or_default(),
         }
     }
 
@@ -1030,6 +1037,29 @@ mod tests {
 
             assert_eq!(found.iter().map(|f| f.hit.entity).collect::<Vec<_>>(), want, "{q}");
         }
+    }
+
+    #[test]
+    fn a_county_is_the_context_where_a_place_area_of_its_rank_is_the_address_row() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        let mut g = Geo::default();
+        // A county (rank 12) and a place=district area (rank 12) both hold the town. The county's
+        // centre is the nearer, so the address walk accepts it and the district is the rank's
+        // address row; the context's county is still the county's.
+        g.boundary("Southcounty", 6, [10.0, 20.0, 11.0, 21.0]);
+        g.place_area("Northdistrict", 11, [10.2, 20.2, 12.0, 22.0]);
+        g.place("Testville", 1, 10.3, 20.3);
+        let dir = TempDir::new("county-context");
+        let geo = g.load(&dir.0.join("geo"));
+        build_search(&geo, &dir.0.join("idx"), None);
+        let idx = SearchIndex::open(&geo, &dir.0.join("idx"), None, None).unwrap();
+        assert_eq!(geo.find_admin(10.3, 20.3).name("district"), Some("Northdistrict"));
+
+        let (found, _) = Searcher::new(&idx).search("testville", 5);
+
+        assert_eq!(found[0].name, "Testville");
+        assert_eq!((&*found[0].ctx.county, &*found[0].ctx.district), ("Southcounty", "Northdistrict"));
+        assert!(results_json(&found).contains(r#""admin2name":"Southcounty""#), "{}", results_json(&found));
     }
 
     // The answers as the node binding's searchPlaces (results_json) and `place-search query`
