@@ -966,8 +966,13 @@ class TemplateAttributionTest(unittest.TestCase):
         centroids = sorted(c for c, comp in self.components.items()
                            if any(f.endswith("/postcode_centroids.bin") for f in comp.get("files", []) + comp.get("optional_files", [])))
         self.assertEqual(centroids, ["mode.admin", "mode.full", "mode.no-addresses"])
-        for e in self.entries[1:4]:
+        for e in self.entries[1:3]:
             self.assertEqual(self.applies(e), centroids, e["id"])
+        # TIGER's ZIPs vote in the postcode grid, which the admin-minimal dirs hold too.
+        grids = sorted(c for c, comp in self.components.items()
+                       if any(f.endswith("/postcode_grid.bin") for f in comp.get("files", []) + comp.get("optional_files", [])))
+        self.assertEqual(grids, ["dir.admin-minimal", "dir.admin-minimal-poi", "mode.admin", "mode.full", "mode.no-addresses"])
+        self.assertEqual(self.applies(self.entries[3]), grids)
         # Wikidata's sitelinks rank the POIs of the tiers that hold any.
         self.assertEqual(self.applies(self.entries[4]), ["poi_tier.all", "poi_tier.major", "poi_tier.notable"])
 

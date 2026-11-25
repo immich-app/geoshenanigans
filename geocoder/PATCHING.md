@@ -301,7 +301,7 @@ The data is owed credit, and the dataset carries it in two places:
   | `osm` | OpenStreetMap: the dataset is a derivative database of it | ODbL 1.0 | every dir |
   | `geonames` | GeoNames: postcode centroids where OSM has none (`--external-postcodes`; GB_full, which the nightly loads), with the notices of its readme (the Royal Mail one GB_full's, where a GB centroid is there) and the changes the dataset made (CC BY 4.0 section 3(a)(1)(B)) | CC BY 4.0 | the dirs of `full`, `no-addresses` and `admin`, the ones holding postcode centroids |
   | `codepoint-open` | Ordnance Survey Code-Point Open, which GB_full is derived from, with the Ordnance Survey, Royal Mail and National Statistics statements of its licence | OGL v3.0 | the same, beside `geonames` where a GB centroid is there |
-  | `tiger` | US Census Bureau TIGER/Line: US address ranges and ZIPs, and postcode centroids where OSM has none | Public domain, credited as a courtesy | the same |
+  | `tiger` | US Census Bureau TIGER/Line: US address ranges and ZIPs, postcode centroids where OSM has none, and the postcode grid's votes of the ranges' ZIPs | Public domain, credited as a courtesy | the same, and the admin-minimal dirs, which hold the postcode grid |
   | `wikidata` | Wikidata: the sitelink counts of the POIs' items, which their importance takes (`--wikidata-sitelinks`, which the nightly passes) | CC0 1.0 | the POI tier dirs holding a POI whose importance took one |
 
 - **`attribution.json`** in every mode dir (`full/`, `no-addresses/`,
@@ -310,11 +310,13 @@ The data is owed credit, and the dataset carries it in two places:
   holds, in the list's order. OSM's is always there; GeoNames's where the
   dir holds a postcode centroid that came from GeoNames, Code-Point Open's
   and GeoNames's notice of GB_full where one of them is a GB postcode's,
-  TIGER's where it holds an interpolation or a centroid that did
+  TIGER's where it holds an interpolation or a centroid that did, or a
+  postcode grid of a build whose TIGER ranges voted in it
   (so `europe/admin/` credits GeoNames and Code-Point Open,
   `north-america/full/` TIGER, and the admin-minimal dirs, which hold no
-  postcodes, OSM alone). The quality dirs hold OpenStreetMap data only,
-  which the mode dir's OSM entry covers.
+  postcode centroids, OSM alone, and TIGER beside it where they hold the
+  grid). The quality dirs hold OpenStreetMap data only, which the mode dir's
+  OSM entry covers.
 - **`poi_attribution.json`** in each POI tier dir (`poi/major/`,
   `poi/notable/`, `poi/all/`) holding a POI whose importance took the
   sitelink count of its Wikidata item: Wikidata's entry alone, in the same

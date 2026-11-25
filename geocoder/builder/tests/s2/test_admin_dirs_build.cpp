@@ -20,7 +20,7 @@
 // mode dir credits the sources of the data it holds in attribution.json:
 // OpenStreetMap, GeoNames and Code-Point Open, which its GB data is derived
 // from, where a postcode centroid there came from it, TIGER where an
-// interpolation or a centroid did.
+// interpolation, a centroid or the postcode grid's votes did.
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -2211,8 +2211,9 @@ TEST(each_mode_dir_credits_the_sources_of_its_data) {
     const Ids osm = {"osm"};
 
     // London's centroid is in the planet and Europe, New York's range and
-    // its ZIP's centroid in the planet and North America; the admin-minimal
-    // dirs hold no postcodes, nor do boundary tiers or POI tiers credit.
+    // its ZIP's centroid in the planet and North America, of no country there
+    // to vote in a postcode grid; the admin-minimal dirs hold no postcode
+    // centroids, nor do boundary tiers or POI tiers credit.
     const auto files = build("multi", {"--continents", "--multi-output", "--multi-quality", "--external-postcodes", london,
                                        "--tiger-data", tiger});
     const std::map<std::string, Ids> want = {
@@ -2279,6 +2280,48 @@ TEST(each_mode_dir_credits_the_sources_of_its_data) {
             if (credited(ranges, at) != want) std::printf("    %s\n", at.c_str());
             CHECK(credited(ranges, at) == want);
         }
+    }
+}
+
+// The postcode grid holds the ZIPs of the TIGER ranges that vote in it, so
+// every mode dir holding a grid of their votes credits TIGER, the
+// admin-minimal dirs too, which hold no centroid; a grid of OSM's houses'
+// votes alone is OpenStreetMap's data. Testland is the United States, with
+// 19026's houses along 47.05 N, and a range of 19026 among them, whose ZIP
+// gives no centroid: OSM's houses have one of it.
+TEST(a_mode_dir_holding_a_postcode_grid_of_tiger_ranges_credits_tiger) {
+    const ScratchDir root("postcode-grid-credit");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log", tiger = root.path() + "/tiger";
+    std::vector<Postcoded> houses;
+    for (int i = 0; i <= 20; i++) houses.push_back({8100 + i, 470500000, 80200000 + 50000 * i, "19026"});
+    std::vector<TestObject> objects = with_postcodes(houses);
+    for (TestObject& o : objects)
+        if (o.type == OsmType::Relation && o.id == 40)
+            for (auto& [key, value] : o.tags)
+                if (key == "ISO3166-1" || key == "ISO3166-1:alpha2") value = "US";
+    write_test_pbf(pbf, objects, 1000);
+    fs::create_directories(tiger);
+    {
+        std::ofstream f(tiger + "/42101.csv", std::ios::binary);
+        f << "from;to;interpolation;street;city;state;postcode;geometry\n"
+             "100;198;even;Teststrasse;Testville;PA;19026;LINESTRING(8.05 47.051,8.06 47.051)\n";
+        REQUIRE(f.good());
+    }
+    using Ids = std::vector<std::string>;
+    for (const bool ranges : {false, true}) {
+        const std::string out = root.path() + (ranges ? "/ranges" : "/houses");
+        std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output", "--multi-quality"};
+        if (ranges) words.insert(words.end(), {"--tiger-data", tiger});
+        REQUIRE(gctest::run(words, log));
+        const auto files = tree(out);
+        const Ids want = ranges ? Ids{"osm", "tiger"} : Ids{"osm"};
+        for (const char* region : {"planet", "europe"})
+            for (const char* mode : {"admin", "no-addresses", "full", "admin-minimal", "admin-minimal-poi"}) {
+                const std::string dir = std::string(region) + "/" + mode + "/";
+                CHECK(files.count(dir + postcode_grid::FILE_NAME));
+                if (credited(files, dir + "attribution.json") != want) std::printf("    %s\n", dir.c_str());
+                CHECK(credited(files, dir + "attribution.json") == want);
+            }
     }
 }
 

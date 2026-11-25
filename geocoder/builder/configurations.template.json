@@ -67,7 +67,9 @@
       "applies_to": [
         "mode.full",
         "mode.no-addresses",
-        "mode.admin"
+        "mode.admin",
+        "dir.admin-minimal",
+        "dir.admin-minimal-poi"
       ]
     },
     {

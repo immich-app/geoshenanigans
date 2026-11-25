@@ -436,7 +436,10 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
                 return at->second;
             });
         grid_runs = rows.size();
-        if (!rows.empty()) out.postcode_grid_file = postcode_grid::encode_file(rows);
+        if (!rows.empty()) {
+            out.postcode_grid_file = postcode_grid::encode_file(rows);
+            out.postcode_grid_sources = full.postcode_grid_sources;
+        }
     }
 
     drop(full.way_parent_ids, full.admin_parent_ids, full.way_postcode_ids, full.interp_postcode_ids,

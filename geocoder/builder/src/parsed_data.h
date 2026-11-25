@@ -522,9 +522,12 @@ struct ParsedData {
     // once on the full data (collect_postcode_grid), which a continent's
     // file is made of (region_rows) and which it doesn't keep, and the
     // region's postcode_grid.bin, which every mode dir holds alike: empty for
-    // a region of no run.
+    // a region of no run. The sources of the planet's votes (attribution.h):
+    // OSM's addresses, and TIGER's lines, whose ZIPs a region's grid holds
+    // with the runs it takes.
     std::vector<postcode_grid::LogicalRow> postcode_grid_rows;
     std::vector<uint8_t> postcode_grid_file;
+    uint8_t postcode_grid_sources = 0;
 
     // The houses whose tag makes a centroid of another postcode than the
     // one they keep (normalise_addr_postcodes), those of a country of no
