@@ -697,8 +697,8 @@ TEST(a_boundary_that_repeats_its_parent_and_labels_a_locality_is_in_no_address) 
     // tagged place=city along its gmina's ways, of its wikidata, whose label member is a
     // place=locality node, takes the locality's rank, 25, back (:1161): no street or house has an
     // address area of that rank (getNearFeatures' rank_address < maxrank), so the street at the
-    // point names no city. (Far from any street the area of rank 25 answers itself, as
-    // reverse.py's _lookup_area_address finds it.)
+    // point names no city. Far from any street the area of rank 25 answers itself, as
+    // reverse.py's _lookup_area_address finds it, labelled a locality by its link.
     Fixture f;
     f.country(49, 14, 55, 24, "Polska", "PL");
     f.boundary(51, 19, 53.5, 23.5, 4, "województwo mazowieckie");
@@ -710,10 +710,12 @@ TEST(a_boundary_that_repeats_its_parent_and_labels_a_locality_is_in_no_address) 
     f.relation(gmina, {ways});
     f.relation(town, {ways}, {{OsmType::Node, locality, "label"}});
     f.line({{52.0511, 20.099}, {52.0511, 20.103}}, {{"highway", "residential"}, {"name", "Rynkowa"}});
-    const std::vector<std::string> answers = answers_of(f, "repeated-locality", {{52.051, 20.101}});
-    REQUIRE(answers.size() == 1);
+    const std::vector<std::string> answers = answers_of(f, "repeated-locality", {{52.051, 20.101}, {52.09, 20.19}});
+    REQUIRE(answers.size() == 2);
+    CHECK(names(answers[0], "road", "Rynkowa"));
     CHECK(names(answers[0], "neighbourhood", "Nowe Miasto"));
     CHECK(answers[0].find("Stare Miasto") == std::string::npos);
+    CHECK(names(answers[1], "locality", "Stare Miasto"));
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
 }
 

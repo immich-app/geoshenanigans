@@ -251,7 +251,8 @@ TEST(levels_11_and_12_are_boundaries_and_so_are_closed_ways_from_level_5) {
     // administrative way as a boundary, its place tag in its extratags, and drops one of level 4
     // or less (placex_insert): a level 6 way with place=town is a boundary its tag ranks 16 and
     // labels town, one of level 6 without a place tag a county of 12, as Iferouane (W1333677402)
-    // is in Niger, and one of level 4 with place=town names nothing.
+    // is in Niger, and one of level 4 with place=town names nothing. In France a level 5 way, the
+    // lowest level taken, is a state district of 10.
     Fixture f;
     f.country(47, 6, 55, 15, "Germany", "DE");
     f.boundary(52, 12, 53, 14, 4, "Brandenburg");
@@ -271,9 +272,11 @@ TEST(levels_11_and_12_are_boundaries_and_so_are_closed_ways_from_level_5) {
     f.square(52.10, 12.10, 52.30, 12.40, {{"boundary", "administrative"}, {"admin_level", "6"}, {"name", "Kreisweg"}});
     f.square(52.05, 13.60, 52.30, 13.90,
              {{"boundary", "administrative"}, {"admin_level", "4"}, {"place", "town"}, {"name", "Landweg"}});
-    const std::vector<std::string> answers =
-        answers_of(f, "rank-levels-11-12", {{52.5002, 13.4001}, {52.75, 12.55}, {52.2, 12.2}, {52.2, 13.7}});
-    REQUIRE(answers.size() == 4);
+    f.country(42, -4, 46, 5, "France", "FR");
+    f.square(45.00, 1.00, 45.20, 1.30, {{"boundary", "administrative"}, {"admin_level", "5"}, {"name", "Corrèze"}});
+    const std::vector<std::string> answers = answers_of(
+        f, "rank-levels-11-12", {{52.5002, 13.4001}, {52.75, 12.55}, {52.2, 12.2}, {52.2, 13.7}, {45.1, 1.15}});
+    REQUIRE(answers.size() == 5);
     for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
     CHECK(answers[0].find("Hauptstraße") != std::string::npos);
     CHECK(answers[0].find("Block Sieben, Ortslage Nord, Ortsteil Mitte, Brandenburg, Germany\"") != std::string::npos);
@@ -282,6 +285,7 @@ TEST(levels_11_and_12_are_boundaries_and_so_are_closed_ways_from_level_5) {
     CHECK(displays(answers[2], "Kreisweg, Brandenburg, Germany"));
     CHECK(answers[3].find("Landweg") == std::string::npos);
     CHECK(displays(answers[3], "Brandenburg, Germany"));
+    CHECK(names(answers[4], "state_district", "Corrèze"));
 }
 
 TEST(an_admin_level_that_is_no_whole_number_of_1_to_15_makes_no_boundary) {
