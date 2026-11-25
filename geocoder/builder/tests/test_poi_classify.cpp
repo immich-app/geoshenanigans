@@ -106,6 +106,30 @@ TEST(poi_classify_keeps_a_generic_feature_only_with_a_wiki_tag) {
     }
 }
 
+TEST(poi_classify_marks_a_generic_feature_of_no_rank_30_row) {
+    // A generic feature of a natural or waterway tag address-levels.json ranks below 30 (a
+    // stream [22, 0], a dam [20, 0], a hill [22, 0]), or of leisure=common or
+    // historic=neighbourhood, is no rank-30 row of placex: it carries POI_FLAG_BELOW_RANK30. One
+    // of a rank-30 tag, natural=tree or amenity=car_sharing beside the stream, does not.
+    auto flags = [](Tags t) {
+        t.wikidata = "Q1";
+        auto c = classify(t);
+        REQUIRE(c.has_value());
+        CHECK_EQ(uint8_t(c->category), uint8_t(PoiCategory::GENERIC_RANK30));
+        return c->flags & POI_FLAG_BELOW_RANK30;
+    };
+    Tags stream; stream.waterway = "stream";
+    Tags dam; dam.waterway = "dam";
+    Tags hill; hill.natural = "hill";
+    Tags common; common.leisure = "common";
+    Tags neighbourhood; neighbourhood.historic = "neighbourhood";
+    for (const Tags& t : {stream, dam, hill, common, neighbourhood}) CHECK(flags(t) != 0);
+    Tags tree; tree.natural = "tree";
+    Tags shared = stream; shared.amenity = "car_sharing";
+    Tags office; office.office = "company";
+    for (const Tags& t : {tree, shared, office}) CHECK(flags(t) == 0);
+}
+
 TEST(poi_name_of_an_unnamed_node_is_none) {
     // OSM carries empty values: a shop=bakery node tagged name= is no POI,
     // whatever its category.

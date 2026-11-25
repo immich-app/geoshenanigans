@@ -716,6 +716,13 @@ static constexpr uint8_t POI_FLAG_WIKIDATA  = 0x02;
 // tourism=attraction, rank 30 in nominatim) — both land in our POI index
 // as PoiCategory::ATTRACTION.
 static constexpr uint8_t POI_FLAG_HIGHWAY   = 0x04;
+// A generic rank-30 feature (PoiCategory::GENERIC_RANK30) of a tag
+// address-levels.json ranks below 30 alone: a natural=* other than tree,
+// spring, cave_entrance, geyser, hot_spring, rock and stone, a waterway=*,
+// leisure=common or historic=neighbourhood. Nominatim makes no rank-30 row
+// of it, so it is no feature near a point (the server's
+// poi_is_reverse_feature), though it stays a POI near one.
+static constexpr uint8_t POI_FLAG_BELOW_RANK30 = 0x08;
 
 inline const char* poi_category_label(PoiCategory cat) {
     switch (cat) {

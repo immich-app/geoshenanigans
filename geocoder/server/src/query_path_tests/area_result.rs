@@ -70,12 +70,14 @@ fn only_a_poi_of_rank_search_30_near_the_point_leaves_the_locality_out() {
     // rank_search 30, a class other than place and building). A named peak whose centre is 500 m
     // north, natural=peak of rank_search 18 (address-levels.json), is none of them, and Telfer
     // answers; a museum there is one, as is a named office of none of our categories
-    // (GENERIC_RANK30), and Telfer stays out.
-    for (category, locality) in [(80u8, Some("Telfer")), (0, None), (170, None)] {
+    // (GENERIC_RANK30), and Telfer stays out. A generic feature of a tag ranked below 30, a
+    // waterway=stream (POI_FLAG_BELOW_RANK30), is none, and Telfer answers.
+    for (category, flags, locality) in [(80u8, 0, Some("Telfer")), (0, 0, None), (170, 0, None), (170, POI_FLAG_BELOW_RANK30, Some("Telfer"))] {
         let mut dataset = telfer(Some(5000.0));
         let name_id = dataset.string("Mount Telfer");
-        let index = with_polygon_poi_of(dataset.load(), name_id, NO_DATA, (450.0, -50.0, 550.0, 50.0), category);
-        assert_eq!(address_at(&index, 0.0, 0.0).get("locality").and_then(|v| v.as_str()), locality, "{category}");
+        let corners = [(450.0, -50.0), (450.0, 50.0), (550.0, 50.0), (550.0, -50.0)];
+        let index = with_poi_outline(dataset.load(), name_id, NO_DATA, &corners, (500.0, 0.0), category, flags);
+        assert_eq!(address_at(&index, 0.0, 0.0).get("locality").and_then(|v| v.as_str()), locality, "{category} {flags}");
     }
 }
 
@@ -104,7 +106,7 @@ fn a_poi_whose_point_is_near_but_whose_outline_is_not_leaves_the_locality_in() {
                    (950.0, -950.0), (950.0, 950.0), (25.0, 950.0), (25.0, 1000.0), (1000.0, 1000.0), (1000.0, -1000.0)];
     let mut dataset = telfer(Some(5000.0));
     let name_id = dataset.string("Old Mine Works");
-    let index = with_poi_outline(dataset.load(), name_id, NO_DATA, &outline, (0.0, 0.0), 0);
+    let index = with_poi_outline(dataset.load(), name_id, NO_DATA, &outline, (0.0, 0.0), 0, 0);
     assert_eq!(address_at(&index, 0.0, 0.0)["locality"], "Telfer");
 }
 

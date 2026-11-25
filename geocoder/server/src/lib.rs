@@ -153,6 +153,11 @@ pub const DEFAULT_SEARCH_DISTANCE: f64 = 660.0;
 // than falling through to `parent_street`.
 pub const POI_FLAG_HIGHWAY: u8 = 0x04;
 
+/// Matches POI_FLAG_BELOW_RANK30 in builder/src/types.h: a generic feature (GENERIC_RANK30) of a
+/// tag address-levels.json ranks below 30 alone, a waterway=* or most natural=* ones, which is
+/// no rank-30 row of placex.
+pub const POI_FLAG_BELOW_RANK30: u8 = 0x08;
+
 /// Whether (lat, lng) is a point on the globe: lat within ±90 and lng within ±180, so neither is NaN.
 pub fn coords_in_range(lat: f64, lng: f64) -> bool {
     (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lng)
@@ -511,10 +516,10 @@ pub fn poi_category_to_osm_class(cat: u8) -> Option<&'static str> {
 /// trees, springs, cave entrances, geysers, hot springs, rocks and stones; landuse=*;
 /// leisure=park, nature_reserve and garden; boundary=*; place=island; waterway=*), nor
 /// power=plant, no placex row. A cemetery is taken as landuse=cemetery, its usual tag. A generic
-/// one (GENERIC_RANK30) is taken as of a rank-30 tag, which it is but for a natural=* or
-/// waterway=* one.
-pub fn poi_is_reverse_feature(category: u8) -> bool {
-    !matches!(category,
+/// one (GENERIC_RANK30) is taken as of a rank-30 tag, but one the builder flags
+/// POI_FLAG_BELOW_RANK30 (`flags`): a waterway=* or natural=* one, of a lower rank.
+pub fn poi_is_reverse_feature(category: u8, flags: u8) -> bool {
+    flags & POI_FLAG_BELOW_RANK30 == 0 && !matches!(category,
         51 | 60 | 61 | 63 // cemetery (landuse, [24, 0]), park, nature_reserve [24, 0], garden [25, 0]
         | 80 | 81 // peak, volcano [18, 0]
         | 82 | 85..=88 | 91..=99 // beach, waterfall, glacier, cliff, arch, bay, cape, island, wood .. water
@@ -2248,7 +2253,7 @@ impl Index {
                 poi_index.for_each(c, |id| {
                     if found { return; }
                     let Some(poi) = self.poi_record(id & ID_MASK) else { return };
-                    found = poi_is_reverse_feature(poi.category) && poi.name_id != NO_DATA && near(f64::from(poi.lat), f64::from(poi.lng))
+                    found = poi_is_reverse_feature(poi.category, poi.flags) && poi.name_id != NO_DATA && near(f64::from(poi.lat), f64::from(poi.lng))
                         && outline_near(&poi);
                 });
                 if found { return true; }
@@ -9693,13 +9698,13 @@ mod query_path_tests {
 
     /// `with_polygon_poi` of the POI category `category`.
     fn with_polygon_poi_of(index: Index, name_id: u32, parent_street_id: u32, (s, w, n, e): Span, category: u8) -> Index {
-        with_poi_outline(index, name_id, parent_street_id, &[(s, w), (s, e), (n, e), (n, w)], ((s + n) / 2.0, (w + e) / 2.0), category)
+        with_poi_outline(index, name_id, parent_street_id, &[(s, w), (s, e), (n, e), (n, w)], ((s + n) / 2.0, (w + e) / 2.0), category, 0)
     }
 
-    /// `index` with one POI of category `category`: the polygon through `corners_m`, (north, east)
-    /// metres each, its point at `centre_m`.
+    /// `index` with one POI of category `category` and POI flags `flags`: the polygon through
+    /// `corners_m`, (north, east) metres each, its point at `centre_m`.
     fn with_poi_outline(mut index: Index, name_id: u32, parent_street_id: u32, corners_m: &[(f64, f64)], centre_m: (f64, f64),
-                        category: u8) -> Index {
+                        category: u8, flags: u8) -> Index {
         let corners: Vec<NodeCoord> = corners_m.iter().map(|&(north, east)| at(north, east)).collect();
         let low = NodeCoord {
             lat: corners.iter().map(|c| c.lat).fold(f32::MAX, f32::min),
@@ -9713,7 +9718,7 @@ mod query_path_tests {
             q: corners.iter().map(|c| (steps(c.lat, low.lat), steps(c.lng, low.lng))).collect(),
         };
         let record = PoiRecord {
-            lat: middle.lat, lng: middle.lng, vertex_offset: 0, name_id, category, tier: 0, flags: 0, importance: 0,
+            lat: middle.lat, lng: middle.lng, vertex_offset: 0, name_id, category, tier: 0, flags, importance: 0,
             parent_street_id, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
         };
         let (records, vertices) = poi_files::encode(&[(record, Some(polygon))]);
