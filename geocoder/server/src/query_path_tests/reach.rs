@@ -134,46 +134,77 @@ fn s2_distance(p: &s2::point::Point, cell: &Cell) -> f64 {
     (0..4).map(|k| s2::edgeutil::distance_from_segment(p, &cell.vertex(k), &cell.vertex((k + 1) % 4)).rad()).fold(f64::MAX, f64::min)
 }
 
+/// Checks cells_within(lat, lng, level, reach) against S2's own distances over the cells round
+/// the point, out to twice the reach: every cell within the reach listed, nearest first, each at
+/// its distance, and none past twice the reach.
+fn assert_cells_within_as_s2_has_them(lat: f64, lng: f64, level: u64, reach: f64) {
+    // A point on a cell's side is as far from the cell as rounding leaves it, up to 6 µm.
+    const HAIR: f64 = 1e-12;
+    let cells = cells_within(lat, lng, level, reach);
+    let at = format!("{} m of ({lat}, {lng}) at level {level}", reach * 6_371_000.0);
+    assert!(cells.near.windows(2).all(|w| w[0] <= w[1]), "{at}: not nearest first");
+    // The point's own cell, at no distance: on a corner or an edge, beside the others there.
+    let own = cells.ids.iter().position(|&id| id == cell_id_at_level(lat, lng, level));
+    assert!(own.is_some_and(|i| cells.near[i] <= HAIR * HAIR), "{at}");
+
+    // The cells round the point, each with S2's distance to it.
+    let p = s2::point::Point::from(LatLng::from_degrees(lat, lng));
+    let mut round = BTreeMap::new();
+    let mut todo = vec![CellID(cells.ids[0])];
+    while let Some(id) = todo.pop() {
+        if round.contains_key(&id.0) { continue; }
+        let d = s2_distance(&p, &Cell::from(id));
+        round.insert(id.0, d);
+        if d <= 2.0 * reach { todo.extend(id.edge_neighbors()); }
+    }
+    for (&id, &d) in &round {
+        let listed = cells.ids.iter().position(|&c| c == id);
+        if d <= reach {
+            assert!(listed.is_some(), "{at}: cell {id:x} at {} m", d * 6_371_000.0);
+        }
+        if let Some(i) = listed {
+            assert!(d <= reach * 1.002, "{at}: cell {id:x} at {} m", d * 6_371_000.0);
+            assert!(cells.near[i] <= (d + HAIR).powi(2) && cells.near[i] >= (d * 0.998).powi(2), "{at}: cell {id:x}");
+        }
+    }
+    assert!(cells.ids.iter().all(|id| round.contains_key(id)), "{at}: a cell past twice the reach");
+}
+
+/// Points on a face, by an edge and a corner of the cube, by a pole, on the antimeridian.
+const SCAN_POINTS: [(f64, f64); 10] = [ORIGIN, CUBE_CORNER, (35.264_389_682_754_654, 45.0), (0.0, 45.0), (45.0, 0.0),
+                                       (45.0002, -0.0003), (89.9995, 10.0), (90.0, 0.0), (-33.9, 179.9999), (-33.9, -180.0)];
+
 #[test]
 fn cells_within_lists_every_cell_the_reach_meets_nearest_first() {
-    // Against S2's own distances over the cells round the point, out to twice the reach: on a
-    // face, by an edge and a corner of the cube, by a pole, on the antimeridian.
-    let points = [ORIGIN, CUBE_CORNER, (35.264_389_682_754_654, 45.0), (0.0, 45.0), (45.0, 0.0), (45.0002, -0.0003),
-                  (89.9995, 10.0), (90.0, 0.0), (-33.9, 179.9999), (-33.9, -180.0)];
-    for (lat, lng) in points {
+    for (lat, lng) in SCAN_POINTS {
         for metres in [100.0, 130.0, 660.0] {
-            // A point on a cell's side is as far from the cell as rounding leaves it, up to 6 µm.
-            const HAIR: f64 = 1e-12;
-            let reach = metres / 6_371_000.0;
-            let cells = cells_within(lat, lng, DEFAULT_STREET_CELL_LEVEL, reach);
-            let at = format!("{metres} m of ({lat}, {lng})");
-            assert!(cells.near.windows(2).all(|w| w[0] <= w[1]), "{at}: not nearest first");
-            // The point's own cell, at no distance: on a corner or an edge, beside the others there.
-            let own = cells.ids.iter().position(|&id| id == cell_id_at_level(lat, lng, DEFAULT_STREET_CELL_LEVEL));
-            assert!(own.is_some_and(|i| cells.near[i] <= HAIR * HAIR), "{at}");
-
-            // The cells round the point, each with S2's distance to it.
-            let p = s2::point::Point::from(LatLng::from_degrees(lat, lng));
-            let mut round = BTreeMap::new();
-            let mut todo = vec![CellID(cells.ids[0])];
-            while let Some(id) = todo.pop() {
-                if round.contains_key(&id.0) { continue; }
-                let d = s2_distance(&p, &Cell::from(id));
-                round.insert(id.0, d);
-                if d <= 2.0 * reach { todo.extend(id.edge_neighbors()); }
-            }
-            for (&id, &d) in &round {
-                let listed = cells.ids.iter().position(|&c| c == id);
-                if d <= reach {
-                    assert!(listed.is_some(), "{at}: cell {id:x} at {} m", d * 6_371_000.0);
-                }
-                if let Some(i) = listed {
-                    assert!(d <= reach * 1.002, "{at}: cell {id:x} at {} m", d * 6_371_000.0);
-                    assert!(cells.near[i] <= (d + HAIR).powi(2) && cells.near[i] >= (d * 0.998).powi(2), "{at}: cell {id:x}");
-                }
-            }
-            assert!(cells.ids.iter().all(|id| round.contains_key(id)), "{at}: a cell past twice the reach");
+            assert_cells_within_as_s2_has_them(lat, lng, DEFAULT_STREET_CELL_LEVEL, metres / 6_371_000.0);
         }
+    }
+}
+
+#[test]
+fn a_street_level_too_coarse_for_the_scan_of_a_point_s_cells_is_refused() {
+    // The scan of the cells round a point holds within 5° of it, as far as the cells next to the
+    // point's own come at street level 5 and finer, where it lists the cells S2 has round the
+    // point. Coarser, from (35°, 44°) by the corner of three faces at level 1, it would miss the
+    // point's own cell, and the server refuses to load.
+    for level in 5..=8 {
+        assert_eq!(geo_reach_refused(DEFAULT_SEARCH_DISTANCE, level), None, "level {level}");
+        for (lat, lng) in SCAN_POINTS.into_iter().chain([(35.0, 44.0)]) {
+            assert_cells_within_as_s2_has_them(lat, lng, level, geo_cover(DEFAULT_SEARCH_DISTANCE / 6_371_000.0, level));
+        }
+    }
+    let dir = ScratchDir::new();
+    TestIndex::new().street("Main Street", &across(20.0, 0.0)).write(dir.path());
+    let path = dir.path().to_str().unwrap();
+    for level in 0..=4 {
+        let refused = geo_reach_refused(DEFAULT_SEARCH_DISTANCE, level).unwrap_or_default();
+        assert!(refused.contains(&format!("level {level}")), "{level}: {refused}");
+        let refused = Index::load(path, level, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).err().unwrap_or_default();
+        assert!(refused.contains("search distance") && refused.contains(&format!("level {level}")), "{level}: {refused}");
+        let refused = MultiIndex::load(path, level, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).err().unwrap_or_default();
+        assert!(refused.contains("search distance") && refused.contains(&format!("level {level}")), "{level}: {refused}");
     }
 }
 

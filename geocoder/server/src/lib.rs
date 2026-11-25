@@ -187,6 +187,11 @@ const S2_MIN_AREA: f64 = 1.257_078_722_109_418;
 /// query's work, and the lists GEO_LISTS keeps, whatever the search distance.
 const MAX_GEO_CELLS: f64 = 4096.0;
 
+/// The widest cover, in radians, cells_within reads the cells of: every point of a face of S2's
+/// cube lies within 54.74° of its middle, so the faces it reads, those whose middle the point lies
+/// within 60° of, hold every point within 5.26° of it.
+const MAX_GEO_COVER: f64 = 5.0 * std::f64::consts::PI / 180.0;
+
 /// How far across a street cell of `level` is at the most, in radians.
 fn cell_diameter(level: u64) -> f64 {
     S2_MAX_DIAG * (-(level as f64)).exp2()
@@ -221,13 +226,20 @@ fn address_cover(reach: f64, level: u64) -> f64 {
 }
 
 /// Why the geo lookups can't reach `search_distance` metres at street level `level`: no
-/// distance, or more street cells round a point than MAX_GEO_CELLS; none where they can.
+/// distance, a cover wider than MAX_GEO_COVER, or more street cells round a point than
+/// MAX_GEO_CELLS; none where they can.
 fn geo_reach_refused(search_distance: f64, level: u64) -> Option<String> {
     if !(search_distance > 0.0 && search_distance.is_finite()) {
         return Some(format!("search distance {search_distance} m is no distance"));
     }
+    let cover = geo_cover(search_distance / 6_371_000.0, level);
+    if cover > MAX_GEO_COVER {
+        return Some(format!(
+            "search distance {search_distance} m reads street cells {:.2}° round a point at level {level}, \
+             past the {:.0}° a query's scan of them holds within", cover.to_degrees(), MAX_GEO_COVER.to_degrees()));
+    }
     // The cells within the cover lie within a cell's diameter past it, none smaller than kMinArea.
-    let disc = (geo_cover(search_distance / 6_371_000.0, level) + cell_diameter(level)).min(std::f64::consts::PI);
+    let disc = (cover + cell_diameter(level)).min(std::f64::consts::PI);
     let cells = 4.0 * std::f64::consts::PI * (disc / 2.0).sin().powi(2) / (S2_MIN_AREA * (-2.0 * level as f64).exp2());
     (cells > MAX_GEO_CELLS).then(|| format!(
         "search distance {search_distance} m reads up to {cells:.0} street cells round a point at level {level}, \
@@ -448,7 +460,7 @@ fn cells_within(lat: f64, lng: f64, level: u64, reach: f64) -> NearCells {
     let (mut us, mut vs, mut corners) = (Vec::new(), Vec::new(), Vec::new());
     for face in 0..6u8 {
         // Every point of a face lies within 55° of its middle, so p lies within 60° of the middle
-        // of a face that holds a point within a reach of a few degrees.
+        // of a face that holds a point within a reach of MAX_GEO_COVER.
         let toward = p[usize::from(face % 3)] * if face < 3 { 1.0 } else { -1.0 };
         if toward <= 0.5 {
             continue;
