@@ -213,10 +213,12 @@ inline void partition_strings_into_tiers(ParsedData& data) {
     remap_pc_vec(data.way_postcode_ids);
     remap_pc_vec(data.addr_postcode_ids);
     remap_pc_vec(data.interp_postcode_ids);
-    // An addr:city keeps its string where that is a core one.
+    // An addr:city keeps its string where a place node or a boundary has it.
     for (auto& city : data.addr_city_ids) {
         auto it = city == NO_DATA ? rm.end() : rm.find(city);
-        city = it != rm.end() && home_tier(city) == STR_TIER_CORE ? it->second : NO_DATA;
+        auto bits = city == NO_DATA ? tier_mask.end() : tier_mask.find(city);
+        const bool named = bits != tier_mask.end() && (bits->second & STR_TIER_BIT_CORE);
+        city = it != rm.end() && named ? it->second : NO_DATA;
     }
     {
         std::unordered_map<uint64_t, ParsedData::PostcodeAccum> remapped;
