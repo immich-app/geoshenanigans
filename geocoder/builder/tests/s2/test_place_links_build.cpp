@@ -1081,3 +1081,23 @@ TEST(a_country_code_of_lower_case_letters_ranks_as_its_upper_case_one) {
     CHECK(names(answers[0], "state", "Queensland"));
     CHECK(answers[0].find("Gold Coast City") == std::string::npos);
 }
+
+TEST(a_build_of_two_extracts_sharing_a_boundary_and_its_place_node_links_the_node) {
+    // Two extracts that overlap, each holding the town node of Sosnovka and the boundary that
+    // links it by its label: build-index reads both, and the link pass takes the node once.
+    Fixture f;
+    f.country(41, 19, 82, 180, "Россия", "RU");
+    const int64_t town = f.node(53.24, 41.37, {{"place", "town"}, {"name", "Сосновка"}, {"name:en", "Sosnovka"}});
+    f.boundary(53.20, 41.30, 53.30, 41.45, 8, "Сосновка", {}, {{OsmType::Node, town, "label"}});
+    const ScratchDir root("two-extracts");
+    const std::string a = root.path() + "/a.osm.pbf", b = root.path() + "/b.osm.pbf", log = root.path() + "/build.log";
+    write_test_pbf(a, f.objects(), 1000);
+    write_test_pbf(b, f.objects(), 1000);
+    const bool built = gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/out", a, b}, log);
+    if (!built) print_failure("build-index", log);
+    REQUIRE(built);
+    const std::vector<std::string> answers = server_answers(root.path() + "/out/planet", {{53.245, 41.375}}, root.path() + "/answers", log);
+    REQUIRE(answers.size() == 1);
+    std::printf("    %s\n", answers[0].c_str());
+    CHECK(names(answers[0], "town", "Sosnovka"));
+}

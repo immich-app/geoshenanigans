@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -206,10 +207,17 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
     LinkCandidates& candidates = data.link_candidates;
     std::vector<LinkCandidate>& nodes = candidates.nodes;
     const LinkText& text = candidates.text;
-    parallel_sort(nodes.begin(), nodes.end(), [](const LinkCandidate& a, const LinkCandidate& b) { return a.node < b.node; },
-                  threads);
-    for (size_t i = 1; i < nodes.size(); i++)
-        if (nodes[i].node == nodes[i - 1].node) throw std::logic_error("a place node listed twice for the links");
+    // A build of extracts that overlap lists a node they share once an extract: of its copies the
+    // first by their fields stays, the same one whatever order the extracts came in.
+    auto fields = [&](const LinkCandidate& c) {
+        return std::make_tuple(c.at.lat_e7, c.at.lon_e7, c.value, text.at(c.name), text.at(c.wikidata), text.at(c.name_en),
+                               text.at(c.name_tag));
+    };
+    parallel_sort(nodes.begin(), nodes.end(), [&](const LinkCandidate& a, const LinkCandidate& b) {
+        return a.node != b.node ? a.node < b.node : fields(a) < fields(b);
+    }, threads);
+    nodes.erase(std::unique(nodes.begin(), nodes.end(), [](const LinkCandidate& a, const LinkCandidate& b) { return a.node == b.node; }),
+                nodes.end());
     stats.candidates = nodes.size();
     stats.polygons = objects.size();
 
