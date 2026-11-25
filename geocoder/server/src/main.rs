@@ -1,3 +1,4 @@
+mod acme;
 mod auth;
 mod downloader;
 mod handlers;
@@ -271,7 +272,7 @@ async fn async_main() {
             .cache(DirCache::new(cache_dir.clone()))
             .directory_lets_encrypt(true)
             .state();
-        let acceptor = state.axum_acceptor(state.default_rustls_config());
+        let acceptor = acme::AxumAcceptor::new(&state, state.default_rustls_config());
 
         tokio::spawn(async move {
             loop {
