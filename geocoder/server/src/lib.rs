@@ -316,24 +316,25 @@ impl GeoOrigin {
         }
     }
 
-    /// The squared distance to the point of the edge from `a` to `b` nearest in degrees (planar
-    /// in degrees, as PostGIS measures a lon/lat line), and the fraction along the edge of that
-    /// point. By a pole, where degrees are no plane, `segment`'s.
+    /// The squared distance in plain degrees (as radians², as PostGIS measures a lon/lat line) to
+    /// the point of the edge from `a` to `b` nearest in degrees, and the fraction along the edge
+    /// of that point. By a pole, where degrees are no plane, `segment`'s.
     fn segment_in_degrees(&self, a: NodeCoord, b: NodeCoord) -> (f64, f64) {
         match &self.polar {
             None => point_to_segment_with_t(self.lat, self.lng, a.lat as f64, self.near_lng(a.lng as f64),
-                                            b.lat as f64, self.near_lng(b.lng as f64), self.cos_lat),
+                                            b.lat as f64, self.near_lng(b.lng as f64), PLANAR),
             Some(_) => self.segment(a, b),
         }
     }
 
-    /// The length of the edge from `a` to `b`, in radians.
+    /// The length of the edge from `a` to `b` in plain degrees (as radians), as PostGIS measures
+    /// a lon/lat line; by a pole, along its great circle.
     fn length(&self, a: NodeCoord, b: NodeCoord) -> f64 {
         match &self.polar {
             None => {
                 let dlat = (b.lat as f64 - a.lat as f64).to_radians();
                 let dlng = (self.near_lng(b.lng as f64) - self.near_lng(a.lng as f64)).to_radians();
-                dist_sq(dlat, dlng, self.cos_lat).sqrt()
+                dist_sq(dlat, dlng, PLANAR).sqrt()
             }
             Some(_) => {
                 let (u, v) = (unit_vector(a.lat as f64, a.lng as f64), unit_vector(b.lat as f64, b.lng as f64));
@@ -1540,9 +1541,10 @@ fn street_tokens_overlap(a: &str, b: &str) -> bool {
 /// so descending ranges (start > end) saturated the negative offset to 0.
 /// Squared distance (radians²) from `origin` to an interpolation line, as far
 /// as its point nearest in metres, as a street is (GeoOrigin::segment); and
-/// the fraction along it, by length, of its point nearest in degrees, where
-/// Nominatim takes the house number (_locate_interpolation in reverse.py:
-/// ST_LineLocatePoint on the lon/lat line). None for a line without length.
+/// the fraction along it, by its length in degrees, of its point nearest in
+/// degrees, where Nominatim takes the house number (_locate_interpolation in
+/// reverse.py: ST_LineLocatePoint on the lon/lat line, its first segment of
+/// the least distance in degrees). None for a line without length.
 fn interp_position(nodes: &[NodeCoord], origin: &GeoOrigin) -> Option<(f64, f64)> {
     if nodes.len() < 2 { return None; }
     // Lengths, not their squares: accumulating squares skews the along-way

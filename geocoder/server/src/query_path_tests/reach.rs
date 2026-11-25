@@ -404,6 +404,23 @@ fn an_interpolation_line_is_as_far_as_its_point_nearest_in_metres() {
 }
 
 #[test]
+fn an_interpolation_number_is_where_its_line_is_nearest_in_degrees() {
+    // At 60° N, a line numbered 1 to 301 running 0.0018° east along 60.0009° N from 0.0006° W,
+    // then 0.0018° south. Nominatim's ST_LineLocatePoint on the lon/lat line takes the point
+    // nearest in degrees, 0.0009° north on the first leg (the second passes 0.0012° east), a
+    // sixth of the way along the line in degrees, so number 51; though in metres the second leg
+    // is the nearer, 67 m east against 100 m north, and the first leg a third as long as the
+    // second.
+    let origin = (60.0, 0.0);
+    let node = |lat: f64, lng: f64| NodeCoord { lat: lat as f32, lng: lng as f32 };
+    let line = vec![node(60.0009, -0.0006), node(60.0009, 0.0012), node(59.9991, 0.0012)];
+    let index = TestIndex::around(origin).interpolation_through("Main Street", (1, 301, 0), line).load();
+    assert_eq!(index.find_interp_on_way(origin.0, origin.1, "Main Street", radians_sq(100.0)), Some(51));
+    let interp = &index.debug_primary(origin.0, origin.1)["interp"];
+    assert!(interp["number"] == 51 && about(&interp["dist_m"], 0.0006_f64.to_radians() * 6_371_000.0), "{interp}");
+}
+
+#[test]
 fn a_building_round_the_point_is_found_at_any_search_distance() {
     // With a 30 m search distance, a building the point lies in whose own point lies 80 m east, in
     // a cell past 30 m of the point: the address at no distance, as the cells round the point's
