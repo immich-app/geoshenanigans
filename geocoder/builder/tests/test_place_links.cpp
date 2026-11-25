@@ -197,7 +197,7 @@ TEST(a_relation_links_the_first_of_its_label_members_that_is_a_place_node) {
     World w("IE");
     w.node(2, PlaceValue::HAMLET, 53.5, -6.5, "Ballyboy");
     Tags tags{PlaceValue::NONE, "Kilbeg", "", 9};
-    tags.more_labels = {2};
+    tags.more_labels.push_back(2);
     const uint32_t kilbeg = w.relation(10, 10, Box{53.4, -6.6, 53.6, -6.4}, tags);
     w.link();
     CHECK(w.link_of(kilbeg).step == LinkStep::LABEL);
