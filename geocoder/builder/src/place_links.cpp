@@ -185,6 +185,9 @@ std::string lowercase_utf8(std::string_view s) {
             valid = (cc & 0xC0) == 0x80;
             cp = cp << 6 | (cc & 0x3F);
         }
+        // UTF-8 only where the scalar needs all its bytes, and is no surrogate nor past U+10FFFF.
+        static constexpr char32_t kLeast[] = {0, 0, 0x80, 0x800, 0x10000};
+        if (valid && (cp < kLeast[n] || (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF)) valid = false;
         if (!valid) {
             out.push_back(s[i]);
             i++;

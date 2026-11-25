@@ -156,6 +156,14 @@ TEST(link_text_takes_no_string_whose_offset_or_end_passes_32_bits) {
     CHECK_EQ(LinkText::offset_at(size_t(LinkText::kNone) - 5, 3), LinkText::kNone - 5);
 }
 
+TEST(lowercase_utf8_keeps_the_bytes_of_a_sequence_that_is_no_utf_8) {
+    // An overlong A, of two bytes and of three, a surrogate and a code point past U+10FFFF decode
+    // to no scalar UTF-8 allows: each byte stays as it is, and the letters round them lower.
+    for (const std::string bad : {std::string("\xc1\x81"), std::string("\xe0\x81\x81"), std::string("\xed\xa0\x80"),
+                                  std::string("\xf4\x90\x80\x80")})
+        CHECK_EQ(lowercase_utf8("X" + bad + "Y"), "x" + bad + "y");
+}
+
 TEST(a_label_member_links_whatever_its_value_name_or_link_and_a_boundary_of_rank_0_links_none) {
     // Town Parks' label member, a place=locality node, links it (the node ranks 25) and labels it
     // a locality; an unnamed village node is a label member too. Gold Coast City (AU admin_level
