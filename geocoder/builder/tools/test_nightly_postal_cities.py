@@ -515,6 +515,8 @@ class NightlyPostalCitiesTest(unittest.TestCase):
     def test_a_change_to_the_cache_workflow_runs_these_tests(self):
         paths = re.search(r"(?ms)^  pull_request:\n    paths:\n(.*?)^\S", workflow("geocoder-tests.yml")).group(1)
         self.assertIn('".github/workflows/geocoder-geonames.yml"', paths)
+        # So does one to the shared vectors alone (postal_cities.tsv), which both suites read.
+        self.assertIn('"geocoder/testdata/**"', paths)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,8 @@ on:
       - "geocoder/search/**"
       - "geocoder/server/**"
       - "geocoder/test-portal/**"
+      # The vectors the builder's and the server's tests both read.
+      - "geocoder/testdata/**"
       - ".github/workflows/geocoder-tests.yml"
       # The tool tests read the nightly's package list and its postal
       # inputs, run the nightly's steps and its watchdog's scripts, and read
