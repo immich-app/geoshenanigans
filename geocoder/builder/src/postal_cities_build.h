@@ -25,8 +25,9 @@
 // The name is the winning key's spelling most of the ZIP's votes use
 // (pick_spelling): a mixed-case one over one all in capitals, and that over
 // one all in lower case, yesterday's where it is within the same margin of
-// the top, and, for GeoNames' key, none ending in a municipal word GeoNames'
-// name lacks. A key the ZIP spells nowhere, or in one case only, takes the
+// the top, and, for GeoNames' key, only one ending in GeoNames' own municipal
+// word, or in none where it has none. A key the ZIP spells nowhere, or in one
+// case only, takes the
 // spelling most votes of its GeoNames state use, else GeoNames' text, where
 // that is cased better.
 #pragma once
@@ -382,14 +383,14 @@ inline std::optional<std::string> pick_spelling(const Spellings& spellings, uint
     return top->first;
 }
 
-// Drops the spellings ending in a municipal word GeoNames' name lacks, for
-// the key of GeoNames' name: Roy City where GeoNames says Roy.
+// Drops the spellings ending in another municipal word than GeoNames' name,
+// or in none where it has one, for the key of GeoNames' name: Roy City where
+// GeoNames says Roy, and Union where it says Union City.
 inline Spellings without_municipal_forms(Spellings spellings, std::string_view geonames_strict) {
+    const std::string_view want = municipal_word(geonames_strict);
     for (auto it = spellings.begin(); it != spellings.end();) {
         const std::string strict = strict_key(it->first);
-        const std::string_view word = municipal_word(strict);
-        const bool lacks = !word.empty() && municipal_word(geonames_strict) != word;
-        it = lacks ? spellings.erase(it) : std::next(it);
+        it = municipal_word(strict) != want ? spellings.erase(it) : std::next(it);
     }
     return spellings;
 }

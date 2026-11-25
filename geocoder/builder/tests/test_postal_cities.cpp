@@ -266,8 +266,13 @@ TEST(the_name_is_spelt_as_the_zips_votes_spell_its_key) {
     CHECK_EQ(name({{"Roy City", 30}, {"Roy", 5}}, "Roy"), std::string("Roy"));
     CHECK_EQ(name({{"Salt Lake City", 300}, {"Salt Lake", 2}}, "Salt Lake City"), std::string("Salt Lake City"));
     CHECK_EQ(name({{"Charles Town", 30}}, "Charles Town"), std::string("Charles Town"));
-    // A short form of GeoNames' name renames nothing: 07087 stays Union City.
+    // A short form of GeoNames' name renames nothing: 07087 stays Union City,
+    // as do 45390 and 71910 Hot Springs Village, where most votes drop the
+    // word.
     CHECK_EQ(name({{"Union City", 90}, {"Union", 10}}, "Union City"), std::string("Union City"));
+    CHECK_EQ(name({{"Union", 12}, {"Union City", 3}}, "Union City"), std::string("Union City"));
+    CHECK_EQ(name({{"Hot Springs", 6}}, "Hot Springs Village"), std::string("Hot Springs Village"));
+    CHECK_EQ(name({{"Charlton", 2}}, "Charlton City"), std::string("Charlton City"));
     // All the ZIP's spellings dropped: GeoNames' text.
     CHECK_EQ(name({{"Roy City", 30}}, "Roy"), std::string("Roy"));
     // Another key than GeoNames' keeps its municipal word.
