@@ -1516,9 +1516,31 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
         }
     for (const std::string& file : names_of(files))
         if (fs::path(file).filename() == name) CHECK(file.rfind("planet/", 0) == 0 || file.rfind("europe/", 0) == 0);
+    // The cities reach no other file: the same fixture without its addr:city
+    // tags builds every file but the postal cities to the same bytes.
+    {
+        std::vector<TestObject> objects = postal_city_fixture();
+        for (TestObject& o : objects)
+            o.tags.erase(std::remove_if(o.tags.begin(), o.tags.end(), [](const auto& t) { return t.first == "addr:city"; }),
+                         o.tags.end());
+        const std::string bare_pbf = root.path() + "/no-cities.osm.pbf", bare = root.path() + "/no-cities";
+        write_test_pbf(bare_pbf, objects, 1000);
+        REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, bare, bare_pbf, "--continents", "--multi-output", "--multi-quality",
+                             "--postal-places", places},
+                            log));
+        auto others = [&](std::map<std::string, std::vector<char>> t) {
+            for (auto it = t.begin(); it != t.end();) it = fs::path(it->first).filename() == name ? t.erase(it) : std::next(it);
+            return t;
+        };
+        const auto with = others(files), without = others(tree(bare));
+        CHECK(names_of(with) == names_of(without));
+        for (const auto& [file, bytes] : with)
+            if (!without.count(file) || without.at(file) != bytes) std::printf("    %s differs without the cities\n", file.c_str());
+        CHECK(with == without);
+    }
 
     // Its rows: 19026 by its votes, 19018 and 19099 (whose one house votes
-    // among 19026's) by GeoNames, 19050 by its votes, 19400 by GeoNames, its
+    // among 19026's) by GeoNames, 19050 by its votes, 19000 by GeoNames, its
     // postal area an answer's postcode; 19500 has no vote, and no answer
     // gives 19600.
     auto rows_of = [](const std::vector<char>& file) {
