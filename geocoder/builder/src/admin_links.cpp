@@ -18,6 +18,7 @@
 #include "cell_index.h"
 #include "cell_index_io.h"
 #include "cell_walk.h"
+#include "line_middle.h"
 #include "parallel.h"
 #include "parent_linking.h"
 #include "polygon_rings.h"
@@ -115,33 +116,6 @@ bool postcode_taken(const char* postcode) {
 bool postal_area_names(const AdminPolygon& area, uint16_t cc, const char* postcode) {
     if (area.place_type_override == POSTAL_AREA_INVALID || !postcode_taken(postcode)) return false;
     return cc == 0 || area.country_code == cc;
-}
-
-// The point halfway along a street's nodes, Nominatim's centroid of a line
-// (get_center_point: ST_LineInterpolatePoint(geom, 0.5)), as the server's
-// line_middle finds it on the same f32 nodes: along their lengths in plain
-// degrees, rounded to 1e-7.
-PackedLocation street_middle(const NodeCoord* nodes, uint16_t count) {
-    auto length = [&](uint16_t k) {
-        return std::hypot(double(nodes[k].lat) - nodes[k - 1].lat, double(nodes[k].lng) - nodes[k - 1].lng);
-    };
-    double total = 0;
-    for (uint16_t k = 1; k < count; k++) total += length(k);
-    double left = total / 2, lat = nodes[0].lat, lng = nodes[0].lng;
-    for (uint16_t k = 1; k < count; k++) {
-        const double step = length(k);
-        if (step > 0 && left <= step) {
-            const double t = left / step;
-            lat = nodes[k - 1].lat + t * (double(nodes[k].lat) - nodes[k - 1].lat);
-            lng = nodes[k - 1].lng + t * (double(nodes[k].lng) - nodes[k - 1].lng);
-            break;
-        }
-        left -= step;
-        lat = nodes[k].lat;
-        lng = nodes[k].lng;
-    }
-    auto reduce = [](double v) { return std::round(v * 1e7) / 1e7; };
-    return point_e7(reduce(lat), reduce(lng));
 }
 
 // get_nearest_postcode's distance from a point to a postal area's centroid,
@@ -590,7 +564,7 @@ void compute_way_parent_polygons(ParsedData& data, unsigned int num_threads) {
                 data.way_parent_ids[i] = rings.first_containing(c.admins, centroid(w));
                 if (w.node_count == 0) return;
 
-                const PackedLocation middle = street_middle(data.street_nodes.data() + w.node_offset, w.node_count);
+                const PackedLocation middle = line_middle(data.street_nodes.data() + w.node_offset, w.node_count);
                 const uint64_t middle_cell = admin_link_cell(middle).id();
                 const std::vector<uint32_t>* postals = &c.postals;
                 if (middle_cell != c.cell) {

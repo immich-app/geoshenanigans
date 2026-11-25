@@ -11,7 +11,8 @@ builds/
     planet/
       full/            *.bin.zst + places.tt.zst + street_ways.tt.zst
                        + interp_ways.tt.zst + addr_index.tt.zst
-                       + strings_layout.json(.zst) + patch.gcpatch
+                       + strings_layout.json(.zst) + attribution.json(.zst)
+                       + patch.gcpatch
       no-addresses/    ... (places, street_ways units)
       admin/           ... (places unit)
       admin-minimal/   ... (places, arcs, admin_polygons units)
@@ -23,9 +24,18 @@ builds/
       poi/
         major/         poi_cells.bin.zst + poi_entries.bin.zst + strings_poi.bin.zst
                        + pois.tt.zst + strings_layout.json(.zst) + poi_meta.json(.zst)
-                       + patch.gcpatch
+                       + poi_attribution.json(.zst) + patch.gcpatch
         notable/       ...
         all/           ...
+      water/
+        all/
+          simplified/  admin_rings.bin.zst + admin_cells.bin.zst + admin_entries.bin.zst
+                       + strings_core.bin.zst + arcs.tt.zst + admin_polygons.tt.zst
+                       + strings_layout.json(.zst) + water_meta.json(.zst)
+                       + attribution.json(.zst) + patch.gcpatch
+          exact/       ...
+        major/
+          simplified/  ...
     europe/
       full/            ...
       no-addresses/    ...
@@ -40,17 +50,17 @@ A file is published either as its own `<path>.zst` or inside a transport unit
 
 ## Files Overview
 
-A complete geocoder index for a given region and configuration consists of files from **up to three directories**:
+A complete geocoder index for a given region and configuration consists of files from **up to four directories**:
 
 ### Mode directory (pick one)
 
 | Mode | Files | Description |
 |------|-------|-------------|
-| `full/` | 23 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
-| `no-addresses/` | 16 files (+2 optional) | Streets + admin + postcodes (no address points) |
-| `admin/` | 8 files (+2 optional) | Admin cell indexes + place nodes + postcodes |
-| `admin-minimal/` | 11 files | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified to within 37.5 m on an 11 m grid (a ring that grid would collapse keeps the 1.1 m one; takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
-| `admin-minimal-poi/` | 11 files | The same, on the shared polygon slots and core strings that a POI tier's parent polygons and names point into (a dropped polygon's slot holds a tombstone), with the same arc files. The admin-minimal mode's dir beside a POI tier |
+| `full/` | 24 files (+5 optional) | Streets + addresses + interpolation + admin + postcodes |
+| `no-addresses/` | 17 files (+3 optional) | Streets + admin + postcodes (no address points) |
+| `admin/` | 9 files (+3 optional) | Admin cell indexes + place nodes + postcodes |
+| `admin-minimal/` | 12 files (+1 optional) | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified to within 37.5 m on an 11 m grid (a ring that grid would collapse keeps the 1.1 m one; takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
+| `admin-minimal-poi/` | 12 files (+1 optional) | The same, on the shared polygon slots and core strings that a POI tier's parent polygons and names point into (a dropped polygon's slot holds a tombstone), with the same arc files. The admin-minimal mode's dir beside a POI tier |
 
 Optional files are written only when the data has them; see `optional_files`
 under configurations.json below. The admin-minimal mode picks its dir by the
@@ -62,6 +72,11 @@ The place nodes come as three files: `place_cells.bin` (each admin cell's
 first row), `place_nodes.bin` (the visible nodes in cell order, bit-packed)
 and `place_hidden.bin` (the ones a boundary hides), which the server reads
 as they are.
+
+Every mode dir holds `attribution.json`, the credit of the data it holds
+(Attribution, below). A selection takes one mode dir, so every dataset holds
+its credit at `<dataset>/attribution.json`, and a dataset with a POI tier
+the tier's `poi_attribution.json` beside it where the build has one.
 
 ### Quality directory (pick one)
 
@@ -84,7 +99,27 @@ stored once; those two files are what the tiers differ in.
 | `poi/notable/` | 7 files | Major + notable POIs (museums, castles, stadiums, beaches, etc.) |
 | `poi/all/` | 7 files | All POIs including minor ones (picnic sites, small galleries, etc.) |
 
-POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin`, `strings_poi.bin`, `strings_layout.json`, `poi_meta.json`. POIs with Wikipedia/Wikidata tags are promoted one tier.
+POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin`, `strings_poi.bin`, `strings_layout.json`, `poi_meta.json`, and `poi_attribution.json` (optional: Wikidata's credit, where its sitelinks ranked a POI of the tier; Attribution, below). POIs with Wikipedia/Wikidata tags are promoted one tier.
+
+### Water directory (optional, pick one)
+
+| Water | Files | Description |
+|-------|-------|-------------|
+| `water/major/simplified/` | 10 files | The seas and oceans, in builds that pin the marine areas; every named water area of 100 km² or more, whatever its kind (lakes, reservoirs, bays, straits, wetlands, glaciers and the rest); whole rivers and canals whose areas sum to 100 km² (5 km² with a Wikidata item). Those are the thresholds to enter: one in the previous build's tier stays down to 90 km² (4.5 km²). Shores simplified with a tolerance of 37.5 m |
+| `water/all/simplified/` | 10 files | Every named water area, every river or canal area its waterway names, and the seas and oceans in builds that pin the marine areas. Shores simplified with a tolerance of 37.5 m |
+| `water/all/exact/` | 10 files | The same with every OSM point of every shore |
+
+Water files: `admin_polygons.bin`, `admin_rings.bin`, `arc_index.bin`,
+`arc_vertices.bin`, `admin_cells.bin`, `admin_entries.bin`,
+`strings_core.bin`, `strings_layout.json`, `water_meta.json` (each type
+code's class, type and Nominatim rank) and `attribution.json`. The names of
+the admin geometry, but a set of their own: their records, slots, arcs,
+cells and strings point into nothing else, and nothing points into them. A
+client puts them in `<dataset>/water/` (their component's `dir`, below), not
+beside the other dirs' files, and patches that dir on its own. Any boundary
+precision takes any water value. The seas and oceans (Marine Regions'
+sea areas, cut to OpenStreetMap's land) are in a continent's dirs where its
+region takes in the coastal sea; only the planet's reach the open ocean.
 
 ## Transport units
 
@@ -98,8 +133,8 @@ has the format). Every dir holding all of a unit's files publishes the unit as
 |------|-------|------|
 | `places.tt.zst` | `place_cells.bin`, `place_nodes.bin`, `place_hidden.bin` | `full/`, `no-addresses/`, `admin/`, `admin-minimal/`, `admin-minimal-poi/` |
 | `pois.tt.zst` | `poi_records.bin`, `poi_vertices.bin` | `poi/*/` |
-| `arcs.tt.zst` | `arc_index.bin`, `arc_vertices.bin` | `quality/*/`, `admin-minimal/`, `admin-minimal-poi/` |
-| `admin_polygons.tt.zst` | `admin_polygons.bin` | `quality/*/`, `admin-minimal/`, `admin-minimal-poi/` |
+| `arcs.tt.zst` | `arc_index.bin`, `arc_vertices.bin` | `quality/*/`, `admin-minimal/`, `admin-minimal-poi/`, `water/*/*/` |
+| `admin_polygons.tt.zst` | `admin_polygons.bin` | `quality/*/`, `admin-minimal/`, `admin-minimal-poi/`, `water/*/*/` |
 | `street_ways.tt.zst` | `street_ways.bin` | `full/`, `no-addresses/` |
 | `interp_ways.tt.zst` | `interp_ways.bin` | `full/` |
 | `addr_index.tt.zst` | `addr_index.bin` | `full/` |
@@ -218,11 +253,12 @@ The entry point for all clients:
 
 Each build date has a `configurations.json` covering both the per-build
 metadata (formerly in `manifest.json`) and the schema that drives the
-client UI — axes (region/mode/quality/poi_tier), components (which
-files belong to each axis value), constraints, presets, the flat
-`files` map keyed by relative path with `size_raw`/`sha256` and either
-`size_zst` (the file's own `.zst`) or `unit` (the transport unit that holds
-it), and the `units` map of the build's transport units:
+client UI — the credit of the data (`attribution`, below), axes
+(region/mode/quality/poi_tier), components (which files belong to each
+axis value), constraints, presets, the flat `files` map keyed by relative
+path with `size_raw`/`sha256` and either `size_zst` (the file's own `.zst`)
+or `unit` (the transport unit that holds it), and the `units` map of the
+build's transport units:
 
 ```json
 {
@@ -235,6 +271,7 @@ it), and the `units` map of the build's transport units:
     "built_at": "2026-04-10T09:00:14Z",
     "wikidata_date": "2026-04-08"
   },
+  "attribution": [ { "id": "osm", "text": "© OpenStreetMap contributors", "licence": "ODbL 1.0", ... }, ... ],
   "axes":        { "region": { ... }, "mode": { ... }, ... },
   "components":  { "mode.full": { "files": ["{region}/full/...", ... ] }, ... },
   "constraints": [ { "when": { "mode": "admin-minimal" }, "requires": { "quality": "simplified" } } ],
@@ -255,17 +292,18 @@ it), and the `units` map of the build's transport units:
 }
 ```
 
-The static portions (axes/components/constraints/presets/transport) come
-from `geocoder/builder/configurations.template.json` and are stable across
-builds. CI splices in `build.*` and the `files` and `units` tables during
-the build's compress step. `transport` lists the units a dir publishes when
+The static portions (attribution/axes/components/constraints/presets/
+transport) come from `geocoder/builder/configurations.template.json` and are
+stable across builds. CI splices in `build.*` and the `files` and `units`
+tables during the build's compress step. `transport` lists the units a dir publishes when
 it holds all of their files; `units` the ones this build has, each with its
 kind, the transport version it was written in, its bytes on the wire and its
 files. A client refuses a unit of a `transport_version` it doesn't read.
 
 A component's `optional_files` are written only when the data has them
 (`addr_cities.bin` where a region has address points, `interp_postcodes.bin`
-in TIGER regions, the postcode centroids where a region has postcodes); a
+in TIGER regions, the postcode centroids where a region has postcodes,
+`postcode_grid.bin` in the mode dirs of a region holding the United States); a
 client skips any that are absent from `files`.
 
 A component's `variants` add one more component, picked by the whole
@@ -273,8 +311,73 @@ selection: the first variant whose `when` names the selection's value on
 every axis it lists (a variant without `when` takes any selection). Its
 `component` is resolved like an axis component, `files`, `optional_files`,
 `replaces` and all.
-`strings_layout.json` and `poi_meta.json` are listed and compressed like
-the `.bin` files, because the server can't load a region without them.
+`strings_layout.json`, `poi_meta.json`, `water_meta.json`,
+`attribution.json` and `poi_attribution.json` are listed and compressed like
+the `.bin` files: the server can't load a region without the first two,
+`water_meta.json` gives a water dir's kinds, and the last two are the credit
+the data is owed.
+
+A component's `dir` names the sub-dir of the dataset its files go in: the
+`water.*` components' `"dir": "water"` puts their files in
+`<dataset>/water/<name>`. A component without one puts its files in the
+dataset dir by their names, as before.
+
+`component_sizes` gives, per region, each component's bytes: `raw` its files
+on disk, `wire` what downloading them costs (a unit's size once, or its share
+by its files' raw bytes when the component holds only some of them; every
+other file as its `.zst`). A component counts its own files, not its
+variants', and only those the region has.
+
+## Attribution
+
+The data is owed credit, and the dataset carries it in two places:
+
+- **`attribution`** in configurations.json: a list of every source, each with
+  an `id`, the `text` to show, the source's `url`, its `licence` (and
+  `licence_url`, but for public domain), the `notices` it must travel with,
+  verbatim, and the components whose files can hold its data
+  (`applies_to`, shell patterns over the component names):
+
+  | `id` | Source | Licence | In |
+  |---|---|---|---|
+  | `osm` | OpenStreetMap: the dataset is a derivative database of it | ODbL 1.0 | every dir |
+  | `geonames` | GeoNames: postcode centroids where OSM has none (`--external-postcodes`; GB_full, which the nightly loads), with the notices of its readme (the Royal Mail one GB_full's, where a GB centroid is there) and the changes the dataset made (CC BY 4.0 section 3(a)(1)(B)) | CC BY 4.0 | the dirs of `full`, `no-addresses` and `admin`, the ones holding postcode centroids |
+  | `codepoint-open` | Ordnance Survey Code-Point Open, which GB_full is derived from, with the Ordnance Survey, Royal Mail and National Statistics statements of its licence | OGL v3.0 | the same, beside `geonames` where a GB centroid is there |
+  | `tiger` | US Census Bureau TIGER/Line: US address ranges and ZIPs, postcode centroids where OSM has none, and the postcode grid's votes of the ranges' ZIPs | Public domain, credited as a courtesy | the same, and the admin-minimal dirs, which hold the postcode grid |
+  | `wikidata` | Wikidata: the sitelink counts of the POIs' items, which their importance takes (`--wikidata-sitelinks`, which the nightly passes) | CC0 1.0 | the POI tier dirs holding a POI whose importance took one |
+  | `marine-regions` | Marine Regions (Flanders Marine Institute): the seas and oceans, its intersect of the EEZs and IHO sea areas, with the changes the dataset made (cut to OpenStreetMap's land, which makes them part of its ODbL derivative database) | CC BY 4.0 | the water dirs holding a sea or ocean (`--marine`, in builds that pin the marine areas) |
+
+- **`attribution.json`** in every mode dir (`full/`, `no-addresses/`,
+  `admin/`, `admin-minimal/`, `admin-minimal-poi/`) and every water dir
+  (`water/<value>/<tier>/`): a JSON array of the entries above, without
+  `applies_to`, of the sources of the data that dir holds, in the list's
+  order. OSM's is always there; GeoNames's where the
+  dir holds a postcode centroid that came from GeoNames, Code-Point Open's
+  and GeoNames's notice of GB_full where one of them is a GB postcode's,
+  TIGER's where it holds an interpolation or a centroid that did, or a
+  postcode grid of a build whose TIGER ranges voted in it
+  (so `europe/admin/` credits GeoNames and Code-Point Open,
+  `north-america/full/` TIGER, and the admin-minimal dirs, which hold no
+  postcode centroids, OSM alone, and TIGER beside it where they hold the
+  grid); Marine Regions' where a water dir holds a sea or ocean
+  (OpenStreetMap's alone in a build without the marine areas). The quality
+  dirs hold OpenStreetMap data only, which the mode dir's OSM entry covers.
+- **`poi_attribution.json`** in each POI tier dir (`poi/major/`,
+  `poi/notable/`, `poi/all/`) holding a POI whose importance took the
+  sitelink count of its Wikidata item: Wikidata's entry alone, in the same
+  form. Their other data is
+  OpenStreetMap's, which the mode dir's OSM entry covers, so a dataset with a
+  POI tier credits the union of the two files. It has a name of its own as a
+  dataset's files land in one dir by name. The template lists it among the
+  tier's `optional_files`.
+
+A client shows the entries of the `attribution.json` and
+`poi_attribution.json` it holds wherever it credits map data, a water dir's
+beside its dataset's; the test portal's page shows the build's `attribution`
+list but the sources of the water alone, as the portal serves no water,
+which query-portal's `/datasets` passes on, and query-server's
+`/test/credits` gives those of the datasets it loaded. Every reverse answer
+also carries Nominatim's `licence` string (README.md).
 
 ## Client Decision Tree
 
@@ -284,7 +387,8 @@ the `.bin` files, because the server can't load a region without them.
 1. GET builds/latest.json
 2. Choose a date >= oldest_indexes (typically use latest)
 3. GET builds/{date}/configurations.json
-4. Choose region (e.g. europe), mode (e.g. full), quality (e.g. simplified), and POI tier (e.g. notable)
+4. Choose region (e.g. europe), mode (e.g. full), quality (e.g. simplified), POI tier (e.g. notable)
+   and water (e.g. none)
 5. Download every file the selected components and the variants they pick
    list (their `files`, the `optional_files` that appear in `files`, minus
    any `replaces`):
@@ -293,11 +397,15 @@ the `.bin` files, because the server can't load a region without them.
      above) and each checked against its sha256; a selection takes every
      file of each unit it needs
    - any other: as <path>.zst, decompressed and checked against its sha256
-   - builds/{date}/europe/full/…                (23 files + up to 4 optional)
+   - builds/{date}/europe/full/…                (24 files + up to 4 optional)
    - builds/{date}/europe/quality/simplified/…  (4 files)
-   - builds/{date}/europe/poi/notable/…         (7 files, optional)
-   The JSON files (strings_layout.json, poi_meta.json) are part of the set:
-   the server can't load a region without them.
+   - builds/{date}/europe/poi/notable/…         (7 files + 1 optional, with a POI tier)
+   - builds/{date}/europe/water/all/simplified/… (10 files, optional), into <dataset>/water/
+   The JSON files (strings_layout.json, poi_meta.json, water_meta.json,
+   attribution.json, poi_attribution.json) are part of the set: the server
+   can't load a region without the first two, water_meta.json gives a water
+   dir's kinds, and the last two are the dataset's credit (Attribution,
+   above).
 6. Store build_version, patch_version, and date locally
 ```
 
@@ -318,6 +426,12 @@ the `.bin` files, because the server can't load a region without them.
    - Download builds/{date}/europe/full/patch.gcpatch → apply to mode files
    - Download builds/{date}/europe/quality/simplified/patch.gcpatch → apply to quality files
    - Download builds/{date}/europe/poi/notable/patch.gcpatch → apply to POI files (if using POIs)
+   - Download builds/{date}/europe/water/all/simplified/patch.gcpatch → apply to <dataset>/water/ (if using water)
+   The water patch applies only to a water dir the client holds. A client
+   with no water dir for its selection (it switched to water after its local
+   date, or no water patch exists for that date) downloads the value's files
+   fresh at the target date, as Switching Water does, and patches the other
+   dirs as usual.
 7. Update local date to latest
 ```
 
@@ -355,9 +469,17 @@ Quality changes don't require patching — just download the new quality files:
    admin_rings.bin, arc_index.bin and arc_vertices.bin
 ```
 
+### Switching Water
+
+The water dir is a set of its own, so a switch downloads the new value's
+files into `<dataset>/water/` (or removes that dir, for `none`), as a fresh
+install does, with no patch.
+
 ### Switching Region
 
-Regions are independent. Download the new region's mode + quality directories.
+Regions are independent. Download the new region's mode + quality directories,
+and its dirs of the selected POI tier and water value (none for `none`); its
+water dir goes into `<dataset>/water/`, replacing the old region's.
 
 ## Retention Policy
 

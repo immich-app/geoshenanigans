@@ -437,6 +437,159 @@ Dirs patched on different days don't fit together: the server combines a
 mode dir with a quality or poi dir by global string offsets, so the selected
 dirs must all be patched to the same date and swapped in together.
 
+### The water dirs
+
+With `--multi-output`, the water layer (`src/water_layer.h`) writes three
+dirs under each region: `water/all/simplified/`, `water/all/exact/` and
+`water/major/simplified/`. A build without it writes one, `water/` beside
+the region's mode files: the `all` set's exact tier, its polygons in their
+own order as slots, with none of the sidecars (`*.osm_ids`) the patches'
+slots come from. Each is made of file names the patch format already has a
+section for, so no file id, GCPATCH or transport version changes:
+
+- `admin_polygons.bin` and `admin_rings.bin`: one 16-byte record per polygon
+  (an outer ring of an OSM object, with the holes inside it), its name in the
+  dir's own `strings_core.bin`, its type code in the `country_code` field
+  (`water_meta.json` gives each code's class, type and Nominatim rank) and
+  the object's area, its polygons' exact areas less their holes, summed, in
+  the `area` field. Merged by slot (`ADMIN_SLOT_FAMILIES`), as the boundary
+  tiers are.
+- `arc_index.bin` and `arc_vertices.bin`: the tier's arcs, merged by slot.
+- `admin_cells.bin` and `admin_entries.bin`: the cell index at
+  `--admin-level` (L10 by default), interior where both tiers' rings hold
+  the whole cell; the admin cell-index delta.
+- `strings_core.bin` and a `strings_layout.json` of that core alone, as
+  `admin-minimal/` has: the dir resolves no other dir's strings and no other
+  dir resolves its. The diff looks for the other tiers beside the dir, then
+  in `../full` and `../../full`; three levels down there are none, so they
+  are empty pools.
+- `water_meta.json` and `attribution.json`: small JSON, carried inline.
+
+The two `all` dirs hold the same records, rings, cells and strings, byte for
+byte; only their arcs differ. `major/simplified/` is a subset with slots of
+its own.
+
+What keeps a day's patch small:
+
+- **Polygon slots** come from strategy 2 (`IdAllocator`), keyed by OSM
+  identity, not by name: a closed way by its way id, a relation's outer ring
+  by the relation and the smallest vertex of the ring. A ring whose smallest
+  vertex moves keeps its slot by its fallback key, the relation and the
+  ring's place among the relation's outer rings
+  (`admin_polygons.fallback.osm_ids`). A renamed lake changes one record and
+  the strings.
+- **Arcs are cut at OSM way ends** as well as at junctions
+  (`ArcCuts::JunctionsAndWayEnds`): an arc lies within one way, so an edit to
+  a way changes the arcs along it, and those of any other ring through a
+  shared vertex where it adds or removes a way end or junction (every ring is
+  cut at every way end and junction it passes); every other arc keeps its
+  slot (`arc_index.osm_ids`, with the way-set and ends fallbacks of
+  `arc_index.fallback.osm_ids`). One arc per ring would resend a whole lake
+  shore for a one-node edit.
+- **Ring blocks** are still a polygon's whole: an edit that adds or splits a
+  way of a lake with many islands resends the stretch of its ring block
+  between the first and the last ref that changed. Polygons of more than
+  `kSplitMaxHoles` holes are cut into pieces along a fixed grid
+  (`src/water_split.h`), each of at most that many holes or as small as the
+  grid goes; each piece carries the object's name, type and area, and keeps
+  its slot by the relation, the outer ring's place and the piece's cut. A
+  polygon the grid can't cut cleanly (its way runs don't cover its rings, a
+  ring's crossings of a line don't pair up, no cut leaves more than one
+  piece, or the pieces disagree with it at a sample point) stays whole, all
+  its holes in one block, and the build logs it as `Water split: <object>
+  (<name>, <n> holes) kept whole: <reason>`.
+- **Type codes** of `water=*` values outside the fixed table
+  (`src/water_types.h`) are allocated against the previous build's
+  `water_meta.json`, so a new rare value never renumbers another. A build on
+  top of one that wrote water dirs stops when that file can't be read or is
+  none the builder writes. The file lists as many values as fit in 768 KiB
+  (`kMetaVerbatimBytes`), the previous build's first and then those of most
+  objects, so that a patch always carries it inline; a value past that is
+  `natural/water`.
+
+The simplified tier's crossing repair counts only crossings between rings of
+one polygon (`ArcTier::crossings_within_polygons`): water areas overlap
+legitimately (a lake in a wetland, a river in a bay), and repairing their
+crossings would give back vertices that buy nothing and tie one area's
+simplified arcs to its neighbours' edits. A ring its 1.1 m grid would
+collapse with every vertex kept, a pond within a step or two of it, keeps its
+arcs and their junctions on the e7 grid (`ArcTier::collapsing_rings_on_e7`),
+so the tier answers there too.
+
+The sidecars (`*.osm_ids`) sit in `water/all/exact/` for the all set and in
+`water/major/simplified/` for the major tier. They are not client files. The
+nightly fetches yesterday's with every other sidecar before the build, and
+yesterday's `planet/water/all/exact/water_meta.json` beside them: the build
+reads the type codes from it before the fetch of yesterday's client files has
+brought it down. When yesterday's sidecars hold the water dirs' and that
+file doesn't come down, the step fails rather than let the codes start
+afresh; only a day before the water layer starts them so.
+
+#### The seas and oceans
+
+The marine areas (`src/marine.h`, `build-index --marine`) are objects of the
+water layer of their own: each IHO sea area of Marine Regions' EEZ-IHO
+intersect (v5, CC BY 4.0), a `place/sea` or, for the seven named "… Ocean",
+a `place/ocean`, cut to the water off a snapshot of osmdata.openstreetmap.de's
+land polygons (OpenStreetMap's coastline, ODbL) and along a 1-degree grid by
+`tools/marine_import.py`. They go into the same store, records, arcs, cells
+and dirs as OSM's water, and win nowhere a smaller area holds the point: a
+bay, harbour or lake inside a sea answers there, the sea out in open water.
+OSM's own `place=sea` areas stay out of the layer: the marine areas hold the
+seas, and Nominatim answers no `place=sea`. So does an OSM `natural=bay` or
+`strait` of a marine area's name (its `name` or `name:en`, ASCII case,
+spaces and punctuation aside) all of whose water the marine areas of that
+name hold (a shared shore or point aside), such as the Gulf of Oman
+(`drop_marine_namesakes`); every other OSM bay and strait stays, one that
+reaches past them or only overlaps them among them.
+
+- **They don't change from day to day.** The nightly never runs the tool: it
+  downloads the version `data/marine.json` pins (a run of Update Marine
+  Areas, `geocoder-marine.yml`, under `geocoder/marine/<version>/` in the
+  bucket) and checks its sha256, so the same file goes into every build until
+  the pin moves. A pin whose `version`, `path` and `sha256` are all null
+  builds without them; any other that names no file fails the step. A day's water patch carries no marine bytes but where an OSM
+  water area sharing a stretch of coast with them was edited.
+- **Their own id space.** A marine object is the sea area's MRGID, typed
+  `SYNTHETIC` in the build, apart from OSM's ways and relations and from the
+  builder's way-id cap. A polygon's slot identity hashes the MRGID and the
+  smallest vertex of its outer ring, its fallback key the MRGID and the
+  polygon's place among the area's, as a relation's outer ring does.
+- **Arcs cut at the clip's own vertices.** A marine ring has no member ways,
+  so one vertex in `kMarineCutEvery` (256), chosen by a hash of its
+  coordinates, starts a stretch, and each stretch is a way of its own to the
+  arc stage, its id a negative hash of its end vertices. A cut so drawn falls
+  on the same vertex in every ring through it either way round, so the sea
+  either side of a shared border and an OSM bay along the same coast share
+  their arcs; and a coast is cut into arcs of a few hundred vertices, which a
+  lookup decodes only where its ray crosses. A new land snapshot moves the
+  cuts only where the coast moved.
+- **Tiles keep them local.** No marine polygon spans more than a 1-degree
+  tile, so the open ocean is cells listing one polygon each and a coast tile
+  is one polygon of its own with its islands as holes (the water split cuts
+  those of more than `kSplitMaxHoles`).
+- **Where a dataset answers them.** A continent's dataset holds the marine
+  polygons its cells reach (the Geofabrik polygons, which take in the coastal
+  sea); only the planet's covers the open ocean.
+- **Credit.** A water dir holding a marine area lists Marine Regions in its
+  `attribution.json` beside OpenStreetMap, with the changes made: as cut to
+  OpenStreetMap's land the areas are part of the dataset's ODbL derivative,
+  with the CC BY credit kept.
+
+#### Publishing
+
+`tools/compress_index.py` publishes the water dirs as any other: the `arcs`
+and `admin_polygons` transport units (every dir holding all of a unit's files
+publishes it), the other `.bin` files as `.zst`, and `water_meta.json` and
+`attribution.json` among the JSON files (compressed and kept raw). The
+template's `water` axis takes `none`, `major`, `all` or `all-exact`: `none`
+selects no files, and each of the other three is a component of one dir's
+ten client files with `"dir": "water"` and that dir's own patch. A client
+puts them in `<dataset>/water/` and patches that dir with it
+(`generate_patches.sh` diffs every dir holding `.bin` files, these among
+them). `component_sizes` in configurations.json gives each region's
+components' raw and wire bytes.
+
 ## Place search index
 
 The place search index (`geocoder/search`) points into a selection's own
@@ -600,9 +753,10 @@ Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   Every file the new variant dir holds except *.osm_ids, *.gcpatch, *.zst and
   dotfiles, sorted by name, each once: at most 1024 files (MAX_CLIENT_FILES)
   of names at most 255 bytes long; the diff refuses a new dir it cannot list
-  so. JSON files (strings_layout.json, poi_meta.json) are inline and written
-  verbatim. The patcher builds anything not listed in its scratch dir, and
-  every listed file must exist at its listed size.
+  so. JSON files (strings_layout.json, poi_meta.json, attribution.json,
+  poi_attribution.json) are inline and written verbatim. The patcher builds
+  anything not listed in its scratch dir, and every listed file must exist
+  at its listed size.
 
 Old file sizes: n (u32) + n × {file_id:u32, old_size:u64}
   (the old files no section names, UNSECTIONED_OLD_FILES: the entry
@@ -663,7 +817,8 @@ Old file hash: marker 0xFFFFFFF8 (u32) + file_id (u32) + lane_hash of the
   `poi_vertices.bin` (15), in that order right before the POI records'
   section of a dir with POI files, and `addr_points.bin` (3) and
   `addr_vertices.bin` (28), in that order right before the address points'
-  section of a dir with address points. The patcher
+  section of a dir with address points, and (v20) `postcode_grid.bin` (36)
+  right before the postcode grid's section where the old grid has rows. The patcher
   refuses a second hash of a file, a hash of any other file, and a replay
   without the hashes it checks by. A family both of whose sections are
   unchanged is copied as its files sit, and POI records sent unchanged over
@@ -780,6 +935,21 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   `postcode_centroid_cells.bin`, whose sizes the client list gives; a
   family sent unchanged is copied as its files sit. The content merge sends
   a centroid whose point moved as a DELETE and an INSERT.
+  (v20) The postcode grid merges as its logical rows (24 bytes: the run's
+  first cell, its country and its code, as `src/postcode_grid.h` lays a
+  LogicalRow out) under `postcode_grid.bin`'s id, right after the postcode
+  centroids' section, in every patch (an empty merge where neither day has
+  the file). It has no string field: the grid holds its postcodes as text.
+  The patch gives the old file's hash (`HASHED_OLD_FILES`) before the
+  section where the old grid has rows, and the patcher holds the old file to
+  it first. When it replays a merge of the grid, the patcher then decodes
+  the old file strictly and encodes the new rows as `postcode_grid.bin`,
+  whose size the client list gives; a grid sent unchanged is copied as it
+  sits, without decoding it. A dir that gets its first grid or loses its
+  last merges as any other day. The diff walks both days' runs by their
+  first cells, which ascend on each: a run both hold at the same cell with
+  the same postcode is a MATCH however many new runs come before it, and a
+  run whose postcode or first cell moved goes as a DELETE and an INSERT.
   A child stream (street_nodes, interp_nodes, addr_vertices, poi_vertices,
   in the section right after its parent's) replays along its parent by
   position: its MATCH bytes are the old bytes of the parent records at the
@@ -920,8 +1090,8 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 9 to 11 its three lists, which the geo entry deltas name. v19 merges the
 postcode centroids under id 23, and ids 24 and 25 name no file: the patcher
 writes the cells file beside the centroids, and the entries file is gone.
-v22 gives id 38 to the address points' `addr:city`, and ids 36 and 37 name
-no file.
+v20 gives id 36 to the postcode grid. v22 gives id 38 to the address points'
+`addr:city`, and id 37 names no file.
 
 | Id | File | How it travels |
 |----|------|----------------|
@@ -952,7 +1122,8 @@ no file.
 | 29-33 | `strings_core.bin` … `strings_poi.bin` | the strings section, of the decoded pools; a tier the old dir lacks, whole (its FCC2 file) |
 | 34 | `interp_postcodes.bin` | parallel delta along interp_ways, remap kind 2 |
 | 35 | `geo_entries.bin` | the geo index's blocks, rebuilt with `geo_cells.bin` (8) |
-| 36, 37 | none (v22) | never: a section naming either is refused ("Unknown file 36") |
+| 36 | `postcode_grid.bin` | merge of the postcode grid's logical rows (`builder/src/postcode_grid.h`, decoded) at stride 24 (v20), no string field; the patcher encodes `postcode_grid.bin` from them |
+| 37 | none (v22) | never: a section naming it is refused ("Unknown file 37") |
 | 38 | `addr_cities.bin` | parallel delta along addr_points, remap kind 2 (v22), after `interp_postcodes.bin`'s |
 
 The four admin geometry files (`ADMIN_SLOT_FAMILIES`) follow the place nodes

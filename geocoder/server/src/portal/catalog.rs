@@ -22,6 +22,11 @@ pub const REGIONS: [&str; 1] = ["planet"];
 /// dataset :3002 served before the portal had more than one.
 pub const DEFAULT_PRESET: &str = "with-addresses";
 
+/// The water of each selection the portal serves: none. Its datasets are
+/// those of the other axes (AXES), their ids and /datasets naming no water,
+/// and a preset with water names none of them.
+pub const WATER: &str = "none";
+
 /// What the portal reads of configurations.json besides what the
 /// downloader does (downloader::Configurations): the build, the axes, the
 /// constraints and the presets.
@@ -231,6 +236,9 @@ pub struct Plan {
     pub groups: Vec<Group>,
     /// The manifest's attribution, as it is.
     pub attribution: Option<serde_json::Value>,
+    /// The ids of the build's components, sorted: the shell patterns of an attribution
+    /// entry's applies_to name them.
+    pub components: Vec<String>,
 }
 
 /// The values of an axis of `manifest`, in their order (by key where two
@@ -404,6 +412,9 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
         if !preset.selections.get("region").is_some_and(|r| REGIONS.contains(&r.as_str())) {
             continue;
         }
+        if preset.selections.get("water").is_some_and(|w| w != WATER) {
+            continue;
+        }
         let at = datasets.iter().position(|d| {
             std::iter::once("region").chain(AXES).all(|axis| preset.selections.get(axis).map(String::as_str) == d.selection.axis(axis))
         });
@@ -463,6 +474,7 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
         default,
         groups,
         attribution: manifest.attribution.clone(),
+        components: cfg.components.keys().cloned().collect(),
     })
 }
 
@@ -535,7 +547,8 @@ impl Plan {
 
     /// What /datasets answers while the build of the publication ID `id`
     /// (sync::publication_id) is served from its dir `dir`: its attribution
-    /// as the manifest has it, null where it has none.
+    /// as the manifest has it, null where it has none, and the ids of its
+    /// components, which the attribution's applies_to names.
     pub fn json(&self, id: &str, dir: &str) -> serde_json::Value {
         let selection = |s: &RegionSelection| {
             serde_json::json!({ "region": s.region, "mode": s.mode, "quality": s.quality, "poi_tier": s.poi_tier })
@@ -575,6 +588,7 @@ impl Plan {
                 "requires": x.requires,
             })).collect::<Vec<_>>(),
             "attribution": self.attribution,
+            "components": self.components,
         })
     }
 }

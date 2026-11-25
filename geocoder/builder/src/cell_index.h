@@ -16,8 +16,8 @@
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode);
 
-// Tier t's covering of its set's polygons (kArcTiers[t], of `arcs` over the
-// store), per arc: each arc's boundary cells once (admin_arc_cells over the
+// Tier t's covering of its set's polygons (the stage's tier t, of `arcs` over
+// the store), per arc: each arc's boundary cells once (admin_arc_cells over the
 // vertices the tier stores of it), each polygon's the merge of its rings'
 // arcs' (merge_cell_lists), classified over its rings as the tier stores
 // them, the store's own for the exact tier (admin_polygon_cells, at
@@ -43,6 +43,12 @@ AdminTierCells admin_tier_cells(const AdminArcs& arcs, const AdminExactRings& st
 // carry the tables on from there. data.admin_country_cells gets the country
 // polygons' share of the exact tier's, which the builder's links read too.
 void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads = 0);
+
+// The water layer's cell index (water_layer.h) from its arc stage's tiers
+// (`arcs` of `store`, kWaterArcStage): each polygon's cells over both tiers,
+// interior only where interior in both, in canonical order.
+std::vector<CellItemPair> compute_water_index_cells(const AdminArcs& arcs, const AdminExactRings& store,
+                                                    unsigned threads = 0);
 
 // strings_layout.json: each tier's [start, end) in the dir's string-offset
 // space, tier t at [bases[t], bases[t + 1]): the build's
@@ -76,9 +82,16 @@ void normalise_addr_postcodes(ParsedData& data, unsigned threads = 0);
 // only the pairs OSM lacks, of a postcode their country's pattern takes. Run
 // once on the full data before the continent split, so every region writes
 // the same centroids (Nominatim's location_postcode is one table) instead of
-// recomputing them from its own subset of addr points. The last reader of
-// data.admin_exact_rings.
+// recomputing them from its own subset of addr points. With
+// collect_postcode_grid, the last reader of data.admin_exact_rings.
 void collect_postcode_centroids(ParsedData& data);
+
+// The postcode grid's runs (postcode_grid_build.h) of the full data's
+// address points and TIGER lines, each point's country found as the
+// centroids find it, and the planet's postcode_grid.bin, into
+// data.postcode_grid_*. Run once before the continent split, which keeps
+// the runs a query routed to each continent reads (region_rows).
+void collect_postcode_grid(ParsedData& data);
 
 // Strategy-2 persistent dense IDs. Loads the previous build's
 // <prev_dir>/full/<file>.osm_ids sidecars (if present), allocates

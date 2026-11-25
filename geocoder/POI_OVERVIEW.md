@@ -6,6 +6,7 @@ The geocoder now includes a POI layer that tells you what notable places are nea
 
 ```json
 {
+  "licence": "Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright",
   "display_name": "Avenue Anatole France 5, 75007 Paris, France",
   "address": {
     "house_number": "5",
@@ -39,13 +40,36 @@ POIs are extracted from these OSM tag families:
 | Tourism | museum, attraction, viewpoint, theme_park, zoo, gallery, artwork, aquarium, camp_site, resort | Musée du Louvre, Stonehenge, Grand Canyon viewpoint |
 | Historic | castle, monument, ruins, archaeological_site, memorial, battlefield, fort, ship | Edinburgh Castle, Colosseum, Machu Picchu |
 | Amenity | place_of_worship, university, hospital, theatre, cinema, library, marketplace, embassy, casino | Notre-Dame, Harvard, British Museum |
-| Leisure | park, nature_reserve, stadium, garden, water_park, golf_course, marina | Central Park, Serengeti, Wembley |
-| Natural | peak, volcano, beach, cave_entrance, waterfall, glacier, geyser, bay, cape, island | Mount Fuji, Niagara Falls, Iceland glaciers |
+| Leisure | park, nature_reserve, stadium, garden, water_park, golf_course, marina, swimming_area | Central Park, Serengeti, Wembley |
+| Natural | peak, volcano, beach, cave_entrance, waterfall, glacier, geyser, bay, cape, island, water, wetland | Mount Fuji, Niagara Falls, Iceland glaciers |
+| Emergency | fire_water_pond | Löschweiher |
 | Transport | aerodrome, station, ferry_terminal | Heathrow, Gare du Nord |
 | Man-made | tower, lighthouse, windmill, bridge, pier, dam, observatory | Eiffel Tower, Golden Gate Bridge |
 | Building | cathedral, palace | St. Peter's Basilica, Versailles |
 | Boundary | national_park, protected_area | Yellowstone, Great Barrier Reef |
 | Other | winery, brewery, power_plant | Napa Valley wineries |
+
+## POIs and the address
+
+The POI nearest the point can be the answer's primary feature, as Nominatim's
+rank-30 POIs are: it then gives the address its `road` (its parent street)
+and its `postcode`. Water never does, as Nominatim ranks every water kind
+below 30: lakes, ponds and other `natural=water`, wetlands, bays and
+glaciers, and reservoirs and basins mapped as areas. They still show in
+`places`, and all but bays as the `landmark`. Where no boundary or street
+gives the point an address, they do so where the water would have been its
+primary feature: a bay or glacier, as an island, only where no other POI is
+near. A water object that is also a POI of another main tag (a fountain, a
+swimming area, a fire pond, a pier, a shop, ...) is classified as that POI,
+as Nominatim ranks it 30 by that tag; it takes the primary slot like any
+POI. It stays water where a place, an admin landuse or a highway tag ranks
+it lower, as Nominatim's does, where that POI would be a generic one no tier
+ships, and where it is a reservoir whose class Nominatim's POI lane takes
+none of (a building or a place). A water area a highway tag ranks is a
+street there, and answers its own name as the `road` inside it, as a street
+does.
+[NOMINATIM_REFERENCE.md](NOMINATIM_REFERENCE.md#the-primary-poi-nominatims-rank-30-lane)
+traces both to Nominatim's source.
 
 ## Three Tier Levels
 
@@ -58,6 +82,11 @@ Users choose how much POI data they want:
 | **All** | 24.5M | 1.04 GiB | + every named POI: places of worship, peaks, memorials, artwork, libraries, gardens, springs |
 
 Tiers are cumulative — Notable includes all Major POIs, All includes everything.
+A water object that is a POI of a less important category than its water
+kind is that kind in the tiers between, of that kind's importance: a bay
+(notable) that is also a pier (all) is the bay in Notable and the pier in
+All, and a glacier (major) that is also an attraction (notable) the glacier
+in Major, of a glacier's importance.
 
 ## Importance Scoring
 
@@ -175,6 +204,12 @@ POI data is patched independently — each tier directory gets its own patch fil
 | `strings_poi.bin` | variable | POI names: the names of the dir's POI tiers, the head of the build's POI string tier |
 | `strings_layout.json` | — | String tier layout |
 | `poi_meta.json` | — | Category names, scoring parameters |
+
+The mode dir beside a POI tier credits the data in its `attribution.json`.
+A POI tier dir holding a POI whose importance took its Wikidata item's
+sitelink count (in the nightly's builds, ranked by them) holds
+`poi_attribution.json`, crediting Wikidata (CC0) for that importance; the rest of the POI data is OpenStreetMap's, which the mode dir's
+covers.
 
 ## Test Portal
 

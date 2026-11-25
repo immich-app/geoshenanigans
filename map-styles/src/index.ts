@@ -2,7 +2,7 @@ import themes, { ImmichTheme } from './themes';
 import fs from 'fs';
 import path from 'path';
 import { layers } from '@protomaps/basemaps';
-import { validateStyleMin } from '@maplibre/maplibre-gl-style-spec';
+import { validateStyle } from './validate';
 
 // POI kinds the protomaps sprites have no icon for, and the icon to show instead.
 const ICON_FALLBACKS: Record<string, string> = { townhall: 'building' };
@@ -101,14 +101,8 @@ if (!fs.existsSync(dist)) {
   fs.mkdirSync(dist);
 }
 
-// Every Immich client in use loads these styles, and MapLibre GL JS drops a whole style it finds a property it doesn't
-// know in. So each one must validate against the style spec of the oldest maplibre-gl an Immich release still ships
-// (5.6, in Immich 3.1.0): the devDependency pins that spec.
 for (const theme of Object.keys(themes)) {
   const style = generateLayers(theme);
-  const errors = validateStyleMin(style as Parameters<typeof validateStyleMin>[0]);
-  if (errors.length > 0) {
-    throw new Error(`${theme}: ${errors.map((e) => e.message).join('; ')}`);
-  }
+  validateStyle(theme, style);
   fs.writeFileSync(path.resolve(dist, `${theme}.json`), JSON.stringify(style, null, 2));
 }

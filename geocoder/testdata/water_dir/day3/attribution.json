@@ -1,0 +1,22 @@
+[
+  {
+    "id": "osm",
+    "text": "© OpenStreetMap contributors",
+    "url": "https://www.openstreetmap.org/copyright",
+    "licence": "ODbL 1.0",
+    "licence_url": "https://opendatacommons.org/licenses/odbl/1-0/",
+    "notices": [
+      "This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0."
+    ]
+  },
+  {
+    "id": "marine-regions",
+    "text": "Flanders Marine Institute (2024). The intersect of the Exclusive Economic Zones and IHO sea areas, version 5. Available online at https://www.marineregions.org/. https://doi.org/10.14284/699",
+    "url": "https://www.marineregions.org/",
+    "licence": "CC BY 4.0",
+    "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+    "notices": [
+      "Changes: each IHO sea area's parts in every EEZ dissolved into one, cut to the water off OpenStreetMap's land polygons and along a 1-degree grid, the coastal water the sea areas leave out given to the nearest sea area, and simplified in the simplified tiers. Cut to OpenStreetMap's land, the areas are part of this dataset's ODbL derivative database."
+    ]
+  }
+]

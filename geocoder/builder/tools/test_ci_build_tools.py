@@ -301,6 +301,12 @@ class ToolTestsJobTest(unittest.TestCase):
     def test_a_change_to_the_watchdog_runs_these_tests(self):
         self.assertIn(".github/workflows/geocoder-build-watchdog.yml", paths_that_run_the_tests())
 
+    # test_nightly_marine.py runs the Update Marine Areas steps and reads its
+    # concurrency and keys, and that workflow tests marine_import.py alone: a
+    # pull request changing only that workflow must run these tests.
+    def test_a_change_to_the_marine_workflow_runs_these_tests(self):
+        self.assertIn(".github/workflows/geocoder-marine.yml", paths_that_run_the_tests())
+
     # The tests that read the workflows as GitHub does parse them with PyYAML,
     # which the standard library lacks: the job installs it for the system
     # python3 that runs them, rather than count on the runner image.
