@@ -1,6 +1,7 @@
 #include "continent_filter.h"
 #include "admin_cover.h"
 #include "continent_boundaries.h"
+#include "line_middle.h"
 #include "parsed_data.h"
 #include "parallel.h"
 #include "ranked_bits.h"
@@ -434,35 +435,71 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
             });
         grid_runs = rows.size();
         if (!rows.empty()) out.postcode_grid_file = postcode_grid::encode_file(rows);
-        // The postal cities of the postcodes the continent's answers can
-        // give: its runs' own, the others its cells hold votes for, so a
-        // house of its own postcode finds its row, and its postal areas'.
+        // The postal cities of the postcodes the continent's data answers
+        // with, each the planet's row of it (region_rows): its runs', its
+        // postal areas', and the own postcode of each of its houses and TIGER
+        // lines (at the point halfway along it) in a run of a grid country,
+        // whose answers give that country's postcodes. Its runs hold every
+        // cell a query routed here reads, so each of its records lies in one.
         if (!full.postal_city_rows.empty()) {
-            using postcode_grid::code_index;
-            using postcode_grid::pos_of;
-            const std::vector<postal_cities::LogicalRow>& table = full.postal_city_rows;
-            std::vector<uint32_t> kept = parallel_collect<uint32_t>(
-                full.postal_city_other_votes.size(), [&](size_t i, std::vector<uint32_t>& found) {
-                    const uint64_t v = full.postal_city_other_votes[i];
-                    if (cell_in_continent(postcode_grid::cell_at(pos_of(v), postcode_grid::GRID_LEVEL), bbox, polygon))
-                        found.push_back(code_index(v));
-                });
-            for (const postcode_grid::LogicalRow& run : rows) {
-                if (!run.country_code) continue;
-                const postal_cities::LogicalRow key = postal_cities::row_of(run.country_code, postcode_grid::code_of(run), {});
-                const auto at = std::lower_bound(table.begin(), table.end(), key, postal_cities::row_less);
-                if (at != table.end() && !postal_cities::row_less(key, *at)) kept.push_back(uint32_t(at - table.begin()));
+            using postcode_grid::GridCode;
+            std::vector<GridCode> codes;
+            for (const postcode_grid::LogicalRow& run : rows)
+                if (run.country_code) codes.push_back({run.country_code, std::string(postcode_grid::code_of(run))});
+            for (const AdminPolygon& area : out.admin_polygons) {
+                if (area.admin_level != 11 || area.place_type_override == POSTAL_AREA_INVALID || area.name_id == NO_DATA ||
+                    !postcode_grid::grid_country(area.country_code))
+                    continue;
+                if (auto code = postcode_grid::grid_postcode(area.country_code, full.get_string(area.name_id)))
+                    codes.push_back({area.country_code, std::move(*code)});
             }
-            std::sort(kept.begin(), kept.end());
-            kept.erase(std::unique(kept.begin(), kept.end()), kept.end());
-            for (uint32_t r : kept) out.postal_city_rows.push_back(table[r]);
+            // The country of the run whose cells hold the point, 0 for none.
+            auto run_country = [&](double lat, double lng) -> uint16_t {
+                const uint64_t cell = S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(postcode_grid::GRID_LEVEL).id();
+                const auto it = std::upper_bound(rows.begin(), rows.end(), cell,
+                                                 [](uint64_t c, const postcode_grid::LogicalRow& r) { return c < r.cell; });
+                return it == rows.begin() ? 0 : std::prev(it)->country_code;
+            };
+            const size_t n_addrs = std::min(out.addr_points.size(), out.addr_postcode_ids.size());
+            const size_t n_lines = std::min(out.interp_ways.size(), out.interp_postcode_ids.size());
+            const unsigned workers = parallel_threads();
+            // country << 32 | postcode string, each once.
+            std::vector<std::vector<uint64_t>> parts(workers);
+            parallel_for(n_addrs + n_lines, [&](size_t begin, size_t end, unsigned w) {
+                std::vector<uint64_t>& part = parts[w];
+                for (size_t i = begin; i < end; i++) {
+                    uint16_t country = 0;
+                    uint32_t id = NO_DATA;
+                    if (i < n_addrs) {
+                        id = out.addr_postcode_ids[i];
+                        if (id != NO_DATA) country = run_country(out.addr_points[i].lat, out.addr_points[i].lng);
+                    } else {
+                        const InterpWay& line = out.interp_ways[i - n_addrs];
+                        id = out.interp_postcode_ids[i - n_addrs];
+                        if (id == NO_DATA || !line.node_count || size_t(line.node_offset) + line.node_count > out.interp_nodes.size())
+                            continue;
+                        const PackedLocation mid = line_middle(out.interp_nodes.data() + line.node_offset, line.node_count);
+                        country = run_country(mid.lat(), mid.lon());
+                    }
+                    if (country && id != NO_DATA) part.push_back(uint64_t(country) << 32 | id);
+                }
+                std::sort(part.begin(), part.end());
+                part.erase(std::unique(part.begin(), part.end()), part.end());
+            }, workers);
+            std::vector<uint64_t> named;
+            for (auto& part : parts) named.insert(named.end(), part.begin(), part.end()), std::vector<uint64_t>().swap(part);
+            std::sort(named.begin(), named.end());
+            named.erase(std::unique(named.begin(), named.end()), named.end());
+            for (uint64_t v : named)
+                if (auto code = postcode_grid::grid_postcode(uint16_t(v >> 32), full.get_string(uint32_t(v))))
+                    codes.push_back({uint16_t(v >> 32), std::move(*code)});
+            out.postal_city_rows = postal_cities::region_rows(full.postal_city_rows, codes);
             if (!out.postal_city_rows.empty()) out.postal_cities_file = postal_cities::encode_file(out.postal_city_rows);
         }
     }
 
     drop(full.way_parent_ids, full.admin_parent_ids, full.way_postcode_ids, full.interp_postcode_ids,
-         full.addr_postcode_ids, full.postcode_accum, full.postcode_grid_rows, full.postal_city_rows,
-         full.postal_city_other_votes);
+         full.addr_postcode_ids, full.postcode_accum, full.postcode_grid_rows, full.postal_city_rows);
     log_phase(("      " + std::string(bbox.name) + " filter: parent + postcode projection").c_str(), _ft, _fc);
 
     // --- Remap sorted cell arrays for all 5 types (preserving INTERIOR_FLAG) ---

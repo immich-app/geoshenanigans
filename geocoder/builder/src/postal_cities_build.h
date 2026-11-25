@@ -489,35 +489,30 @@ inline Choice choose(const std::vector<Classified>& values, const Place* geoname
     return c;
 }
 
-// The codes a build's postal cities are chosen for, and where an answer can
-// give each: the grid's codes (postcode_grid_build.h) and its postal areas'
-// merged, (country, code) ascending; each grid code's index among them; a
-// vote(pos, index) for each other code a cell holds votes for and for each
-// postal area, at its centroid's cell (the cells' own codes are the grid's
-// cells, through of_grid); and whether each is reachable so: a code that
-// only a foreign address names is not.
+// The codes a build's postal cities are chosen for: the grid's codes
+// (postcode_grid_build.h) and its postal areas' merged, (country, code)
+// ascending; each grid code's index among them; and whether an answer can
+// give each: a code a cell holds votes for (the cell's own, of `cells`, or
+// another, of `other_votes`) or a postal area's is, and one that only a
+// foreign address names is not.
 struct TableCodes {
     std::vector<postcode_grid::GridCode> codes;
     std::vector<uint32_t> of_grid;
-    std::vector<uint64_t> others;
     std::vector<bool> reachable;
 };
 inline TableCodes table_codes(const std::vector<postcode_grid::GridCode>& grid_codes, const std::vector<uint64_t>& cells,
-                              const std::vector<uint64_t>& other_votes,
-                              std::vector<std::pair<postcode_grid::GridCode, uint64_t>> areas) {
+                              const std::vector<uint64_t>& other_votes, std::vector<postcode_grid::GridCode> areas) {
     using postcode_grid::code_index;
-    using postcode_grid::pos_of;
-    using postcode_grid::vote;
     auto less = [](const postcode_grid::GridCode& a, const postcode_grid::GridCode& b) {
         return postcode_grid::postcode_less(a.country, a.code, b.country, b.code);
     };
-    std::stable_sort(areas.begin(), areas.end(), [&](const auto& a, const auto& b) { return less(a.first, b.first); });
+    std::sort(areas.begin(), areas.end(), less);
     TableCodes t;
     t.of_grid.resize(grid_codes.size());
     std::vector<uint32_t> of_area(areas.size());
     for (size_t g = 0, a = 0; g < grid_codes.size() || a < areas.size();) {
-        const bool area_first = a < areas.size() && (g == grid_codes.size() || less(areas[a].first, grid_codes[g]));
-        const postcode_grid::GridCode& code = area_first ? areas[a].first : grid_codes[g];
+        const bool area_first = a < areas.size() && (g == grid_codes.size() || less(areas[a], grid_codes[g]));
+        const postcode_grid::GridCode& code = area_first ? areas[a] : grid_codes[g];
         if (t.codes.empty() || less(t.codes.back(), code)) {
             if (t.codes.size() == postcode_grid::MAX_CODES) throw std::runtime_error("postal cities: more than 2^20 postcodes");
             t.codes.push_back(code);
@@ -525,13 +520,30 @@ inline TableCodes table_codes(const std::vector<postcode_grid::GridCode>& grid_c
         if (area_first) of_area[a++] = uint32_t(t.codes.size() - 1);
         else t.of_grid[g++] = uint32_t(t.codes.size() - 1);
     }
-    t.others.reserve(other_votes.size() + areas.size());
-    for (uint64_t v : other_votes) t.others.push_back(vote(pos_of(v), t.of_grid[code_index(v)]));
-    for (size_t a = 0; a < areas.size(); a++) t.others.push_back(vote(areas[a].second, of_area[a]));
     t.reachable.assign(t.codes.size(), false);
     for (uint64_t c : cells) t.reachable[t.of_grid[code_index(c)]] = true;
-    for (uint64_t v : t.others) t.reachable[code_index(v)] = true;
+    for (uint64_t v : other_votes) t.reachable[t.of_grid[code_index(v)]] = true;
+    for (uint32_t a : of_area) t.reachable[a] = true;
     return t;
+}
+
+// A region's rows of the planet's (`rows`, ascending): the planet's row of
+// each of `codes`, the postcodes the region's data answers with, given in any
+// order and as often as they come; a code the planet has no row of has none.
+inline std::vector<LogicalRow> region_rows(const std::vector<LogicalRow>& rows, const std::vector<postcode_grid::GridCode>& codes) {
+    std::vector<size_t> at;
+    for (const postcode_grid::GridCode& c : codes) {
+        if (c.code.size() > CODE_BYTES) continue;
+        const LogicalRow key = row_of(c.country, c.code, {});
+        const auto it = std::lower_bound(rows.begin(), rows.end(), key, row_less);
+        if (it != rows.end() && !row_less(key, *it)) at.push_back(size_t(it - rows.begin()));
+    }
+    std::sort(at.begin(), at.end());
+    at.erase(std::unique(at.begin(), at.end()), at.end());
+    std::vector<LogicalRow> out;
+    out.reserve(at.size());
+    for (size_t r : at) out.push_back(rows[r]);
+    return out;
 }
 
 // The postal cities of a build: its rows, ascending, each with the index of

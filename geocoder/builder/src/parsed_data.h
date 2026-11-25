@@ -523,16 +523,14 @@ struct ParsedData {
     // (--postal-places, GeoNames' entries; --prev-postal-cities, yesterday's
     // names; --dump-postal-votes, where the votes go, "" for nowhere); the
     // planet's rows, found once on the full data with the grid
-    // (collect_postcode_grid), of the ZIPs an answer can give; where the
-    // continents find theirs beside the rows of their runs' codes: a
-    // postcode_grid::vote(pos, row) for each other row a cell holds votes
-    // for and each postal area's; and the region's postal_cities.bin, which
-    // every mode dir holds alike: empty for a region of no row.
+    // (collect_postcode_grid), of the ZIPs an answer can give, of which a
+    // continent keeps the rows of the postcodes its data answers with
+    // (postal_cities::region_rows); and the region's postal_cities.bin,
+    // which every mode dir holds alike: empty for a region of no row.
     postal_cities::Places postal_places;
     postal_cities::Names prev_postal_names;
     std::string postal_votes_dump;
     std::vector<postal_cities::LogicalRow> postal_city_rows;
-    std::vector<uint64_t> postal_city_other_votes;
     std::vector<uint8_t> postal_cities_file;
 
     // The houses whose tag makes a centroid of another postcode than the

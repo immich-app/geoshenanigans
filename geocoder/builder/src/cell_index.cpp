@@ -771,7 +771,7 @@ void collect_postcode_grid(ParsedData& data) {
     // (the grid's, and its postal areas', which assign_postal_area_countries
     // gave their centroid's country) and the votes of its addresses with a
     // city; then the cities go, before the strategy-2 remap.
-    std::vector<std::pair<GridCode, uint64_t>> areas;
+    std::vector<GridCode> areas;
     const auto& rings = data.admin_exact_rings;
     for (size_t i = 0; i < data.admin_polygons.size() && i < rings.polygons.size(); i++) {
         const AdminPolygon& area = data.admin_polygons[i];
@@ -779,10 +779,7 @@ void collect_postcode_grid(ParsedData& data) {
             !grid_country(area.country_code) || rings.polygons[i].ring_count == 0)
             continue;
         std::optional<std::string> code = grid_postcode(area.country_code, data.get_string(area.name_id));
-        if (!code) continue;
-        const LatLng c = exact_polygon_centroid(rings.vertices.data(), rings.rings_of(static_cast<uint32_t>(i)),
-                                                rings.polygons[i].ring_count);
-        areas.push_back({GridCode{area.country_code, std::move(*code)}, pos_at(c.first, c.second)});
+        if (code) areas.push_back(GridCode{area.country_code, std::move(*code)});
     }
     const size_t postal_areas = areas.size();
     postal_cities::TableCodes codes =
@@ -806,12 +803,6 @@ void collect_postcode_grid(ParsedData& data) {
         dump.flush();
         if (!dump) throw std::runtime_error("failed to write " + data.postal_votes_dump);
     }
-    // Each other row a cell or a postal area gives, which a continent keeps
-    // the rows of its cells by, beside the rows of its runs' codes.
-    std::vector<uint32_t> row_of(codes.codes.size(), NO_DATA);
-    for (size_t r = 0; r < table.row_codes.size(); r++) row_of[table.row_codes[r]] = static_cast<uint32_t>(r);
-    for (uint64_t v : codes.others)
-        if (row_of[code_index(v)] != NO_DATA) data.postal_city_other_votes.push_back(vote(pos_of(v), row_of[code_index(v)]));
     data.postal_city_rows = std::move(table.rows);
     if (!data.postal_city_rows.empty()) data.postal_cities_file = postal_cities::encode_file(data.postal_city_rows);
     std::cerr << "Postal cities: " << table.votes << " votes over " << table.zips << " ZIPs, " << data.postal_city_rows.size()

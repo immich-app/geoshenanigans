@@ -371,17 +371,19 @@ TEST(a_builds_table_names_each_code_of_its_votes_in_code_order) {
 TEST(a_builds_postal_cities_are_chosen_for_the_codes_an_answer_can_give) {
     // Grid codes 0 19018, 1 19026 and 2 19600, which only a foreign address
     // names; cells 10 (19026, and one vote of 19018) and 11 (19018); postal
-    // areas of 19400 at cell 50 and of 19026 at cell 60.
+    // areas of 19400 and of 19026.
     using postcode_grid::vote;
     const std::vector<postcode_grid::GridCode> grid = {{US, "19018"}, {US, "19026"}, {US, "19600"}};
-    const postal_cities::TableCodes t = postal_cities::table_codes(
-        grid, {vote(10, 1), vote(11, 0)}, {vote(10, 0)}, {{{US, "19400"}, 50}, {{US, "19026"}, 60}});
+    const postal_cities::TableCodes t =
+        postal_cities::table_codes(grid, {vote(10, 1), vote(11, 0)}, {vote(10, 0)}, {{US, "19400"}, {US, "19026"}});
     std::vector<std::string> codes;
     for (const auto& c : t.codes) codes.push_back(c.code);
     CHECK(codes == std::vector<std::string>({"19018", "19026", "19400", "19600"}));
     CHECK(t.of_grid == std::vector<uint32_t>({0, 1, 3}));
-    CHECK(t.others == std::vector<uint64_t>({vote(10, 0), vote(60, 1), vote(50, 2)}));
     CHECK(t.reachable == std::vector<bool>({true, true, true, false}));
+    // A code only another vote of a cell names is one an answer gives.
+    CHECK(postal_cities::table_codes(grid, {vote(11, 0)}, {vote(11, 2)}, {}).reachable ==
+          std::vector<bool>({true, false, true}));
     // Each code GeoNames names gets its row where an answer can give it:
     // 19400 by its postal area, and not 19600.
     postal_cities::Places places;
@@ -398,6 +400,18 @@ TEST(a_builds_postal_cities_are_chosen_for_the_codes_an_answer_can_give) {
     CHECK_EQ(g.codes.size(), size_t(3));
     CHECK(g.of_grid == std::vector<uint32_t>({0, 1, 2}));
     CHECK(g.reachable == std::vector<bool>({false, true, false}));
+}
+
+TEST(a_regions_rows_are_the_planets_rows_of_the_postcodes_its_data_answers_with) {
+    const std::vector<postal_cities::LogicalRow> planet = {row(US, "19018", "Clifton Heights"), row(US, "19026", "Drexel Hill"),
+                                                           row(US, "19400", "Postalton")};
+    // In any order and as often as they come; one of no row, and one longer
+    // than a code can be, has none.
+    CHECK(same(postal_cities::region_rows(planet, {{US, "19400"}, {US, "19026"}, {US, "19999"}, {US, "19026"},
+                                                   {US, "123456789012345"}, {pack_country_code('C', 'A'), "19018"}}),
+               {row(US, "19026", "Drexel Hill"), row(US, "19400", "Postalton")}));
+    CHECK(postal_cities::region_rows(planet, {}).empty());
+    CHECK(postal_cities::region_rows({}, {{US, "19026"}}).empty());
 }
 
 TEST(a_build_without_geonames_keeps_yesterdays_names_of_its_zips_of_few_votes) {

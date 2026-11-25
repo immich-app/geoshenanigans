@@ -1590,3 +1590,146 @@ TEST(a_build_writes_the_postal_cities_of_its_us_zips_in_every_mode_dir_and_a_cha
                         yesterday},
                        log));
 }
+
+namespace {
+
+// Europe's edge (builder/data/europe.poly) at `lat`: the side it runs south
+// along from 37.86 N to 35.54 N by 11.6 E, Europe east of it.
+double europe_edge_lng(double lat) {
+    const double lat_a = 37.858610, lng_a = 11.600370, lat_b = 35.538050, lng_b = 11.595620;
+    return lng_b + (lat - lat_b) / (lat_a - lat_b) * (lng_a - lng_b);
+}
+
+// A level-16 cell the edge crosses, whose centre lies west of it: a child of
+// it whose centre lies east of the edge, and one west. The edge runs nearly
+// along a meridian, so it crosses a column of cells at one place for tens of
+// kilometres: the search goes along all of it.
+struct StraddlingCell {
+    S2CellId east, west;
+};
+StraddlingCell straddling_cell() {
+    for (int k = 0; k < 4000; k++) {
+        const double lat = 35.7 + k * 5e-4;
+        const S2CellId c = S2CellId(S2LatLng::FromDegrees(lat, europe_edge_lng(lat))).parent(16);
+        const S2LatLng centre = c.ToLatLng();
+        if (centre.lng().degrees() >= europe_edge_lng(centre.lat().degrees())) continue;
+        StraddlingCell s;
+        for (int i = 0; i < 4; i++) {
+            const S2LatLng at = c.child(i).ToLatLng();
+            const double side = at.lng().degrees() - europe_edge_lng(at.lat().degrees());
+            if (side > 1e-5) s.east = c.child(i);
+            if (side < -1e-5) s.west = c.child(i);
+        }
+        if (s.east.is_valid() && s.west.is_valid()) return s;
+    }
+    return {};
+}
+
+int32_t e7(double degrees) { return int32_t(std::lround(degrees * 1e7)); }
+
+// Testland, the United States, a square across Europe's edge from 11.3 to
+// 11.9 E round the straddling cell; north of the cell a postal area of 19700
+// from 11.40 to 11.62 E, its centroid west of the edge; and in the cell two
+// houses of 19800 west of the edge and one of 19810 east of it, which Europe
+// keeps, beside their street.
+std::vector<TestObject> straddling_fixture(const StraddlingCell& cell) {
+    const double lat0 = cell.east.parent(16).ToLatLng().lat().degrees();
+    std::vector<TestObject> objects;
+    auto square = [&](int64_t first, int64_t way_id, double s, double n, double w, double e) {
+        objects.push_back(node(first, e7(s), e7(w)));
+        objects.push_back(node(first + 1, e7(s), e7(e)));
+        objects.push_back(node(first + 2, e7(n), e7(e)));
+        objects.push_back(node(first + 3, e7(n), e7(w)));
+        objects.push_back(way(way_id, {first, first + 1, first + 2, first + 3, first}));
+    };
+    square(9001, 9000, lat0 - 0.2, lat0 + 0.3, 11.30, 11.90);
+    square(9101, 9100, lat0 + 0.07, lat0 + 0.17, 11.40, 11.62);
+    TestObject country;
+    country.type = OsmType::Relation;
+    country.id = 9050;
+    country.tags = {{"admin_level", "2"}, {"boundary", "administrative"}, {"name", "Testland"},
+                    {"type", "boundary"}, {"ISO3166-1", "US"}, {"ISO3166-1:alpha2", "US"}};
+    country.members.emplace_back(OsmType::Way, 9000, "outer");
+    objects.push_back(country);
+    TestObject area;
+    area.type = OsmType::Relation;
+    area.id = 9120;
+    area.tags = {{"boundary", "postal_code"}, {"postal_code", "19700"}, {"type", "boundary"}};
+    area.members.emplace_back(OsmType::Way, 9100, "outer");
+    objects.push_back(area);
+    auto house = [&](int64_t id, S2CellId at, double nudge, const char* postcode) {
+        const S2LatLng p = at.ToLatLng();
+        objects.push_back(node(id, e7(p.lat().degrees()), e7(p.lng().degrees() + nudge),
+                               {{"addr:housenumber", std::to_string(id)}, {"addr:postcode", postcode},
+                                {"addr:street", "Teststrasse"}}));
+    };
+    const double street_lat = lat0 - 0.0002, edge = europe_edge_lng(lat0);
+    objects.push_back(node(9301, e7(street_lat), e7(edge - 0.003)));
+    objects.push_back(node(9302, e7(street_lat), e7(edge + 0.003)));
+    objects.push_back(way(9300, {9301, 9302}, {{"highway", "residential"}, {"name", "Teststrasse"}}));
+    house(9201, cell.east, 0, "19810");
+    house(9202, cell.west, 0, "19800");
+    house(9203, cell.west, 2e-6, "19800");
+    std::stable_sort(objects.begin(), objects.end(), [](const TestObject& a, const TestObject& b) {
+        return a.type != b.type ? a.type < b.type : a.id < b.id;
+    });
+    return objects;
+}
+
+}  // namespace
+
+TEST(a_regions_postal_cities_hold_the_planets_row_of_each_us_postcode_its_data_answers_with) {
+    const StraddlingCell cell = straddling_cell();
+    REQUIRE(cell.east.is_valid() && cell.west.is_valid());
+    REQUIRE(cell.east.parent(16) == cell.west.parent(16));
+    const ScratchDir root("postal-cities-region");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    write_test_pbf(pbf, straddling_fixture(cell), 1000);
+    const std::string places = root.path() + "/postal_places.tsv";
+    {
+        std::ofstream f(places);
+        f << "US\t19700\tPostalton\tPA\nUS\t19800\tMajorville\tPA\nUS\t19810\tMinorville\tPA\n";
+    }
+    const std::string out = root.path() + "/out";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output", "--multi-quality",
+                         "--postal-places", places},
+                        log));
+    const auto files = tree(out);
+    auto rows_of = [&](const std::string& at) {
+        std::vector<std::string> rows;
+        if (!files.count(at)) return rows;
+        const std::vector<char>& file = files.at(at);
+        postal_cities::decode(reinterpret_cast<const uint8_t*>(file.data()), file.size(), [&](const postal_cities::LogicalRow& r) {
+            rows.push_back(std::string(postal_cities::code_of(r)) + " " + std::string(postal_cities::name_of(r)));
+        });
+        return rows;
+    };
+    const std::string name = postal_cities::FILE_NAME;
+    const std::vector<std::string> all = {"19700 Postalton", "19800 Majorville", "19810 Minorville"};
+    CHECK(rows_of("planet/admin/" + name) == all);
+    // Europe answers with each: the postal area it keeps, whose centroid lies
+    // west of its edge, the grid's 19800 of the cell, and the house of 19810
+    // it keeps, whose cell's centre lies west of the edge too.
+    REQUIRE(files.count(std::string("europe/admin/") + postcode_grid::FILE_NAME));
+    CHECK(rows_of("europe/admin/" + name) == all);
+    // Europe's dir of the full mode, as a client of a preset with addresses
+    // holds it, answers from both: the postal area at a point of it east of
+    // the edge, and the house.
+    const std::string full = root.path() + "/full";
+    fs::create_directories(full);
+    for (const auto& e : fs::directory_iterator(out + "/europe/full"))
+        if (e.is_regular_file()) fs::copy_file(e.path(), full + "/" + e.path().filename().string());
+    for (const char* f : {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin"})
+        fs::copy_file(out + "/europe/quality/exact/" + f, full + "/" + f, fs::copy_options::overwrite_existing);
+    const S2LatLng h = cell.east.ToLatLng();
+    const std::vector<std::pair<double, double>> points = {{h.lat().degrees() + 0.12, 11.61}, {h.lat().degrees(), h.lng().degrees()}};
+    const std::vector<std::string> answers = server_answers(full, points, root.path() + "/q", log);
+    REQUIRE(answers.size() == points.size());
+    CHECK(answer_string(answers[0], {"address", "postcode"}) == std::string("19700"));
+    CHECK(answer_string(answers[0], {"address", "postal_city"}) == std::string("Postalton"));
+    CHECK(answer_string(answers[1], {"address", "house_number"}) == std::string("9201"));
+    CHECK(answer_string(answers[1], {"address", "postcode"}) == std::string("19810"));
+    CHECK(answer_string(answers[1], {"address", "postal_city"}) == std::string("Minorville"));
+    if (answer_string(answers[1], {"address", "postal_city"}) != std::string("Minorville"))
+        for (const std::string& a : answers) std::printf("    europe: %s\n", a.c_str());
+}

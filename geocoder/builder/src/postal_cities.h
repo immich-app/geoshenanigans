@@ -65,8 +65,9 @@ inline LogicalRow row_of(uint16_t country, std::string_view code, std::string_vi
     if (name.size() > NAME_BYTES) malformed("a name longer than " + std::to_string(NAME_BYTES) + " bytes");
     LogicalRow r;
     r.country_code = country;
-    std::memcpy(r.code, code.data(), code.size());
-    std::memcpy(r.name, name.data(), name.size());
+    // An empty view's data() may be null, which memcpy may not take.
+    if (!code.empty()) std::memcpy(r.code, code.data(), code.size());
+    if (!name.empty()) std::memcpy(r.name, name.data(), name.size());
     return r;
 }
 

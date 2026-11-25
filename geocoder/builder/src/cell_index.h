@@ -88,8 +88,8 @@ void collect_postcode_centroids(ParsedData& data);
 // votes of its addresses with a city, the planet's postal_cities.bin, into
 // data.postal_city*, which frees the addresses' cities. Run once before the
 // continent split, which keeps the runs a query routed to each continent
-// reads (region_rows), and the rows of the postcodes they hold, of those its
-// cells hold votes for, and of its postal areas.
+// reads (region_rows), and the rows of the postcodes its data answers with
+// (postal_cities::region_rows).
 void collect_postcode_grid(ParsedData& data);
 
 // Strategy-2 persistent dense IDs. Loads the previous build's
