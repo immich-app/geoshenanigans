@@ -7,14 +7,14 @@
 // centroid misses near the edge.
 //
 // A vote is a point of a grid country with its postcode: an address point
-// with an addr:postcode its country's pattern takes (grid_postcode), or a
-// TIGER line's middle node with the line's ZIP. A cell holding votes takes
-// the postcode most of them name, the least (country, code) of those named
-// most. A cell holding none takes the postcode of the nearer of the cells
-// holding votes before and after it along the curve (the earlier one at the
-// same distance) that reaches it: a cell reaches the cells at most its
-// country's reach away (reach_cells), so a run ends there and the cells past
-// it have no postcode. A step along the curve is to a cell sharing an edge,
+// with an addr:postcode its country's pattern takes (grid_postcode), or the
+// point halfway along a TIGER line (line_middle) with the line's ZIP. A cell
+// holding votes takes the postcode most of them name, the least (country,
+// code) of those named most. A cell holding none takes the postcode of the
+// nearer of the cells holding votes before and after it along the curve (the
+// earlier one at the same distance) that reaches it: a cell reaches the cells
+// at most its country's reach away (reach_cells), so a run ends there and the
+// cells past it have no postcode. A step along the curve is to a cell sharing an edge,
 // so a cell's postcode comes from votes within the reach of it, the
 // country's postcode extent, as far as get_nearest_postcode's box of a
 // centroid reaches.
@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "country_code.h"
+#include "line_middle.h"
 #include "parallel.h"
 #include "postcode_grid.h"
 #include "types.h"
@@ -221,10 +222,11 @@ struct GridCells {
 // The cells of a build's votes: each address point with a postcode string
 // (addr_postcodes, parallel to addrs) and each line of a ZIP
 // (interp_postcodes, parallel to interps, NO_DATA for none: TIGER's lines),
-// at its middle node, whose country (country_at(lat, lng), a packed code) is
-// a grid country that takes the string as a postcode (grid_postcode), in the
-// cell pos_at(lat, lng) gives the position of. string_of(id) gives a postcode
-// string's text. The same whatever `threads` runs it.
+// at the point halfway along it, whose country (country_at(lat, lng), a
+// packed code) is a grid country that takes the string as a postcode
+// (grid_postcode), in the cell pos_at(lat, lng) gives the position of.
+// string_of(id) gives a postcode string's text. The same whatever `threads`
+// runs it.
 template <class StringOf, class CountryAt, class PosAt>
 GridCells grid_cells(const std::vector<AddrPoint>& addrs, const std::vector<uint32_t>& addr_postcodes,
                      const std::vector<InterpWay>& interps, const std::vector<NodeCoord>& interp_nodes,
@@ -286,8 +288,8 @@ GridCells grid_cells(const std::vector<AddrPoint>& addrs, const std::vector<uint
     std::vector<uint64_t> lines = parallel_collect<uint64_t>(n_interps, [&](size_t i, std::vector<uint64_t>& v) {
         const InterpWay& w = interps[i];
         if (interp_postcodes[i] == NO_DATA || !w.node_count || size_t(w.node_offset) + w.node_count > interp_nodes.size()) return;
-        const NodeCoord& mid = interp_nodes[w.node_offset + w.node_count / 2];
-        vote_at(mid.lat, mid.lng, interp_postcodes[i], v);
+        const PackedLocation mid = line_middle(interp_nodes.data() + w.node_offset, w.node_count);
+        vote_at(mid.lat(), mid.lon(), interp_postcodes[i], v);
     }, threads);
     out.tiger_votes = lines.size();
     votes.insert(votes.end(), lines.begin(), lines.end());
