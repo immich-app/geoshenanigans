@@ -285,6 +285,23 @@ class NightlyPostalCitiesTest(unittest.TestCase):
             else:
                 os.remove(os.path.join(self.served, f"s3/bucket/geocoder/{path}"))
         self.assertEqual(self.run_block(block)[0].returncode, 0)
+        # One that lists no files, or lists the table without its sha256: what yesterday held is
+        # unknown, which fails the night as a table it can't read does. An empty list is a build
+        # that published no table.
+        for manifest, why in (({}, "lists no files"), ({"files": []}, "lists no files"),
+                              ({"files": {"planet/admin/postal_cities.bin": {}}}, "without its sha256"),
+                              ({"files": {"planet/admin/postal_cities.bin": "x"}}, "without its sha256"),
+                              ({"files": {"planet/admin/postal_cities.bin": {"sha256": "ABC"}}}, "without its sha256")):
+            self.serve("s3/bucket/geocoder/builds/2026-11-22/configurations.json", json.dumps(manifest))
+            r, outputs = self.run_block(block)
+            self.assertEqual(r.returncode, 1, manifest)
+            self.assertIn("::error::[postal] The configurations.json of 2026-11-22 " + why, r.stdout)
+            self.assertNotIn("prev_postal_cities", outputs)
+        self.serve("s3/bucket/geocoder/builds/2026-11-22/configurations.json", json.dumps({"files": {}}))
+        r, outputs = self.run_block(block)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("published no postal cities", r.stdout)
+        self.build("2026-11-22", b"day 22")
         # The build latest.json names has no configurations.json: no state to go on.
         os.remove(os.path.join(self.served, "s3/bucket/geocoder/builds/2026-11-22/configurations.json"))
         r, _ = self.run_block(block)

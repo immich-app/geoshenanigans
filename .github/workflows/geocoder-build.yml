@@ -642,7 +642,22 @@ jobs:
               echo "::error::[postal] The build of $PREV_TABLE_DATE has no configurations.json — refusing to build without knowing its postal cities"
               exit 1
             fi
-            PREV_TABLE_SHA=$(jq -r '.files["planet/admin/postal_cities.bin"].sha256 // ""' "$WORKDIR/prev-state/configurations.json")
+            # Its files: an object, which lists the table with its sha256 or
+            # not at all (a build that published none); anything else leaves
+            # yesterday's names unknown.
+            PREV_MANIFEST="$WORKDIR/prev-state/configurations.json"
+            if ! jq -e '.files | type == "object"' "$PREV_MANIFEST" > /dev/null; then
+              echo "::error::[postal] The configurations.json of $PREV_TABLE_DATE lists no files — refusing to build without knowing its postal cities"
+              exit 1
+            fi
+            PREV_TABLE_SHA=""
+            if jq -e '.files | has("planet/admin/postal_cities.bin")' "$PREV_MANIFEST" > /dev/null; then
+              PREV_TABLE_SHA=$(jq -r '.files["planet/admin/postal_cities.bin"] | if type == "object" then .sha256 // "" else "" end | tostring' "$PREV_MANIFEST")
+              if ! [[ "$PREV_TABLE_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+                echo "::error::[postal] The configurations.json of $PREV_TABLE_DATE lists planet/admin/postal_cities.bin without its sha256 — refusing to build without its names"
+                exit 1
+              fi
+            fi
             if [ -n "$PREV_TABLE_SHA" ]; then
               $S5 cat "$BUILDS/$PREV_TABLE_DATE/planet/admin/postal_cities.bin.zst" 2>/dev/null \
                 | zstd -d -q -c > "$WORKDIR/prev-state/postal_cities.bin" || true
