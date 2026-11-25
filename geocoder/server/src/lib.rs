@@ -324,18 +324,20 @@ impl GeoOrigin {
     /// The squared distance to the edge from `a` to `b`, and the fraction along it of its point
     /// nearest the point.
     fn segment(&self, a: NodeCoord, b: NodeCoord) -> (f64, f64) {
-        if self.polar.is_none() && !self.strays(a, b) {
-            let c = self.cos_lat;
-            return point_to_segment_with_t(self.lat, self.lng * c, a.lat as f64, self.near_lng(a.lng as f64) * c,
-                                           b.lat as f64, self.near_lng(b.lng as f64) * c, PLANAR);
-        }
-        match (Self::project(&self.basis, a), Self::project(&self.basis, b)) {
-            (Some(a), Some(b)) => {
-                let (r, t) = nearest_to_origin(a, b);
-                (r.atan().powi(2), t)
+        if self.polar.is_some() || self.strays(a, b) {
+            match (Self::project(&self.basis, a), Self::project(&self.basis, b)) {
+                (Some(a), Some(b)) => {
+                    let (r, t) = nearest_to_origin(a, b);
+                    return (r.atan().powi(2), t);
+                }
+                // An end the projection fails for: by a pole, an edge out of reach; else on the plane.
+                _ if self.polar.is_some() => return (f64::MAX, 0.0),
+                _ => {}
             }
-            _ => (f64::MAX, 0.0),
         }
+        let c = self.cos_lat;
+        point_to_segment_with_t(self.lat, self.lng * c, a.lat as f64, self.near_lng(a.lng as f64) * c,
+                                b.lat as f64, self.near_lng(b.lng as f64) * c, PLANAR)
     }
 
     /// The squared distance in plain degrees (as radians², as PostGIS measures a lon/lat line) to

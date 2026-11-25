@@ -437,6 +437,17 @@ fn a_long_edge_is_as_far_as_its_great_circle_where_the_builder_lists_it() {
 }
 
 #[test]
+fn an_edge_with_an_end_past_the_projection_is_measured_on_the_plane() {
+    // An edge along the equator from 85° W to 0.01° E, whose great circle and line in degrees
+    // both run through (0°, 0°): its west end lies more than 84° from the point, past where the
+    // gnomonic projection holds, so it is measured on the plane, at no distance.
+    let origin = GeoOrigin::new(0.0, 0.0, geo_cover(DEFAULT_SEARCH_DISTANCE / 6_371_000.0, DEFAULT_STREET_CELL_LEVEL));
+    let (a, b) = (NodeCoord { lat: 0.0, lng: -85.0 }, NodeCoord { lat: 0.0, lng: 0.01 });
+    assert!(origin.strays(a, b));
+    assert_eq!(origin.segment(a, b).0, 0.0);
+}
+
+#[test]
 fn streets_addresses_and_house_numbers_are_found_across_the_antimeridian() {
     // On the equator, 8 steps of a node's longitude (2^-16°, 1.7 m) west of the antimeridian: a
     // street along the meridian 5 steps east of it, an address node 12 steps east and a building
