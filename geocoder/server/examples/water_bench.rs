@@ -1,36 +1,43 @@
-// Times a water lookup (a water dir of the builder's water layer, read with the admin readers:
-// one cell read, then the ring test of each entry not flagged interior) against the same point's
-// answer without water, at the cells whose non-interior entries carry the most rings: the lakes
-// and bays with thousands of islands, whose holes a ring test visits one by one.
+// Times the server's answer with water (MultiIndex::query_json on a dataset whose index holds a
+// water dir of the builder's water layer: the address, the water lookup and the answer's JSON
+// with its water field) against the same point's answer without water, and the water lookup
+// alone (WaterLayer::at: one cell read, then the ring tests of its entries in answering order,
+// up to the first that holds the point), at the cells whose non-interior entries carry the most
+// rings: the lakes and bays with thousands of islands, whose holes a ring test visits one by
+// one, and the cells of many small polygons.
 //
 //   cargo build --release --example water_bench
 //   ./target/release/examples/water_bench <dataset dir> <water dir> [cells] [rounds] > report.txt
 //
-// <dataset dir> is a flat dir grid_query loads (a mode's files beside a boundary tier); <water
-// dir> is one the builder writes: {region}/water/major/simplified, {region}/water/all/simplified
-// or {region}/water/all/exact, or {region}/water of a single-output build. Both are read at the
-// default cell levels (DEFAULT_ADMIN_CELL_LEVEL, and DEFAULT_STREET_CELL_LEVEL for the dataset's
-// streets), those of a build without --admin-level or --street-level: a dir of other levels
-// fails to load. The cells: of the polygons with the largest ring blocks (200), the L10 cells
-// they reach where their entry is not interior, scored by the rings of every non-interior entry
-// there; the `cells` best (default 40), each sampled at 5 x 5 points spread over it as blends of
-// its corners. Each point is answered once by each path untimed, then `rounds` times
-// (default 200), a round timing the water lookup and then the answer, and the medians kept: of
-// each path and of the two together round by round. Prints each cell, then p50 and p99 over the
-// points of both paths, of the two together, and of the two together against the answer alone,
-// point by point and as quantiles. Missing or bad arguments, a dataset dir of no dataset and
-// cells of no point to time exit with a message and status 2.
+// <dataset dir> is a flat dir grid_query loads (a mode's files beside a boundary tier), without
+// a water dir; <water dir> is one the builder writes: {region}/water/major/simplified,
+// {region}/water/all/simplified or {region}/water/all/exact, or {region}/water of a single-output
+// build. Both are read at the default cell levels (DEFAULT_ADMIN_CELL_LEVEL, and
+// DEFAULT_STREET_CELL_LEVEL for the dataset's streets), those of a build without --admin-level or
+// --street-level: a dir of other levels fails to load. The dataset loads twice, as the server
+// loads a flat dir (one world slot): without water, and with the water dir's layer as its index's
+// water. The cells: of the polygons with the largest ring blocks (200), the L10 cells they reach
+// where their entry is not interior, scored by the rings of every non-interior entry there; the
+// `cells` best (default 40), each sampled at 5 x 5 points spread over it as blends of its
+// corners. Each point's answer with water is the one without but for its water field, which
+// names the lookup's water there (name, class and type), and is absent where it finds none. Each
+// point is answered once by each of the three untimed, then `rounds` times (default 200), a round
+// timing the lookup, the answer without water and the one with it, and the medians kept. Prints
+// each cell, then p50 and p99 over the points of the lookup and of both answers, and of the
+// answer with water against the one without, point by point and as quantiles. Missing or bad
+// arguments, a dataset dir of no dataset and cells of no point to time exit with a message and
+// status 2.
 use query_server::{
-    cell_id_at_level, cell_pairs, mmap_file, AdminGeometry, AdminPoint, AdminPolygon, CellPairs, MultiIndex, PipMemo,
-    ADMIN_POLYGON_RECORD_BYTES, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL, ID_MASK,
-    INTERIOR_FLAG,
+    cell_id_at_level, cell_pairs, mmap_file, AdminGeometry, AdminPolygon, CellPairs, ContinentSlot, Index,
+    MultiIndex, WaterLayer, ADMIN_POLYGON_RECORD_BYTES, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE,
+    DEFAULT_STREET_CELL_LEVEL, ID_MASK, INTERIOR_FLAG,
 };
 use s2::cell::Cell;
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
 use s2::point::Point;
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 const USAGE: &str = "usage: water_bench <dataset dir> <water dir> [cells] [rounds]";
@@ -68,56 +75,37 @@ impl Args {
     }
 }
 
-/// The dataset the answers without water come from; an error for a dir that loads none, whose
-/// answers would all be empty.
-fn baseline(dir: &str) -> Result<MultiIndex, String> {
-    let index = MultiIndex::load(dir, DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE)?;
-    if index.loaded_count() == 0 {
+/// The flat dataset dir `dir` as the server loads it (MultiIndex::load: one world slot), `water`
+/// its index's water layer; an error for a dir that loads no dataset, whose answers would all be
+/// empty.
+fn world(dir: &str, water: Option<WaterLayer>) -> Result<MultiIndex, String> {
+    if !std::path::Path::new(&format!("{dir}/admin_cells.bin")).exists() {
         return Err(format!("{dir} holds no dataset grid_query loads"));
     }
-    Ok(index)
+    let mut index = Index::load(dir, DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE)?;
+    index.water = water;
+    Ok(MultiIndex {
+        continents: vec![ContinentSlot {
+            name: "world",
+            continent: None,
+            index: arc_swap::ArcSwapOption::from(Some(Arc::new(index))),
+            loaded_stamp: None,
+        }],
+        root_dir: dir.to_string(),
+        street_cell_level: DEFAULT_STREET_CELL_LEVEL,
+        admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
+        search_distance: DEFAULT_SEARCH_DISTANCE,
+    })
 }
 
-/// The rank of each type code water_meta.json lists, by code; an error for text that isn't such
-/// a list.
-fn ranks(meta: &str) -> Result<HashMap<u16, u8>, String> {
-    #[derive(serde::Deserialize)]
-    struct Kind {
-        code: u16,
-        rank: u8,
-    }
-    #[derive(serde::Deserialize)]
-    struct Meta {
-        types: Vec<Kind>,
-    }
-    let meta: Meta = serde_json::from_str(meta).map_err(|e| e.to_string())?;
-    Ok(meta.types.into_iter().map(|k| (k.code, k.rank)).collect())
+/// An answer's JSON, parsed.
+fn parsed(json: &str) -> serde_json::Value {
+    serde_json::from_str(json).expect("an answer's JSON")
 }
 
-/// A candidate's place in the order in which water answers: the smaller area, then the higher
-/// rank, then the lower type code, as the layer's answer orders them; then the lower polygon id.
-#[derive(Debug, Clone, Copy)]
-struct Precedence {
-    area: f32,
-    rank: u8,
-    code: u16,
-    id: u32,
-}
-
-impl Precedence {
-    fn order(&self, other: &Precedence) -> Ordering {
-        self.area
-            .total_cmp(&other.area)
-            .then(other.rank.cmp(&self.rank))
-            .then(self.code.cmp(&other.code))
-            .then(self.id.cmp(&other.id))
-    }
-}
-
+/// The water dir's records, cells and rings, which pick the cells timed.
 struct Water {
     records: Vec<AdminPolygon>,
-    /// Each type code's rank (water_meta.json), which breaks ties between areas of one size.
-    ranks: HashMap<u16, u8>,
     index: CellPairs,
     geometry: AdminGeometry,
 }
@@ -139,8 +127,6 @@ impl Water {
                 AdminPolygon::from_record(&bytes[at..at + 16], end)
             })
             .collect();
-        let meta = std::fs::read_to_string(format!("{dir}/water_meta.json")).expect("water_meta.json");
-        let ranks = ranks(&meta).expect("water_meta.json");
         let index = CellPairs::open(
             mmap_file(&format!("{dir}/admin_cells.bin")).expect("admin_cells.bin"),
             mmap_file(&format!("{dir}/admin_entries.bin")).expect("admin_entries.bin"),
@@ -148,35 +134,7 @@ impl Water {
             DEFAULT_ADMIN_CELL_LEVEL,
         )
         .expect("water cell index");
-        Water { records, ranks, index, geometry }
-    }
-
-    /// The water holding the point, by Precedence, as the layer's answer picks it; the polygon
-    /// id. A polygon of a type code water_meta.json lists no rank for answers nothing.
-    fn at(&self, lat: f64, lng: f64) -> Option<u32> {
-        let point = AdminPoint::new(lat, lng);
-        let (lat, lng) = point.degrees();
-        let mut memo = PipMemo::new();
-        let mut best: Option<Precedence> = None;
-        self.index.with_ids(cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL), |ids| {
-            for &id in ids {
-                let poly = &self.records[(id & ID_MASK) as usize];
-                if poly.ring_bytes == 0 {
-                    continue;
-                }
-                let Some(&rank) = self.ranks.get(&poly.country_code) else {
-                    continue;
-                };
-                let key = Precedence { area: poly.area, rank, code: poly.country_code, id: id & ID_MASK };
-                if best.is_some_and(|b| b.order(&key) != Ordering::Greater) {
-                    continue;
-                }
-                if id & INTERIOR_FLAG != 0 || self.geometry.contains(poly, point, &mut memo) {
-                    best = Some(key);
-                }
-            }
-        });
-        best.map(|b| b.id)
+        Water { records, index, geometry }
     }
 }
 
@@ -202,33 +160,40 @@ fn cell_points(cell: u64) -> Vec<(f64, f64)> {
     points
 }
 
-/// A point's medians over its rounds, in microseconds: of the water lookup, of the answer, and
-/// of the two together, round by round.
+/// A point's medians over its rounds, in microseconds: of the water lookup, and of the answers
+/// without water and with it.
 #[derive(Debug, Clone, Copy)]
 struct Timing {
-    water: f64,
-    answer: f64,
-    together: f64,
+    lookup: f64,
+    without: f64,
+    with: f64,
 }
 
-/// Each path called once untimed, warm, then `rounds` rounds of `water` and then `answer`, each
-/// timed by `clock` (microseconds since some fixed instant; `since` in a run).
-fn time_point(rounds: usize, clock: impl Fn() -> f64, mut water: impl FnMut(), mut answer: impl FnMut()) -> Timing {
-    water();
-    answer();
-    let (mut w, mut a, mut both) = (Vec::with_capacity(rounds), Vec::with_capacity(rounds), Vec::with_capacity(rounds));
+/// Each path called once untimed, warm, then `rounds` rounds of `lookup`, `without` and then
+/// `with`, each timed by `clock` (microseconds since some fixed instant; `since` in a run).
+fn time_point(
+    rounds: usize,
+    clock: impl Fn() -> f64,
+    mut lookup: impl FnMut(),
+    mut without: impl FnMut(),
+    mut with: impl FnMut(),
+) -> Timing {
+    lookup();
+    without();
+    with();
+    let (mut l, mut d, mut w) = (Vec::with_capacity(rounds), Vec::with_capacity(rounds), Vec::with_capacity(rounds));
     for _ in 0..rounds {
         let t = clock();
-        water();
-        let tw = clock() - t;
+        lookup();
+        l.push(clock() - t);
         let t = clock();
-        answer();
-        let ta = clock() - t;
-        w.push(tw);
-        a.push(ta);
-        both.push(tw + ta);
+        without();
+        d.push(clock() - t);
+        let t = clock();
+        with();
+        w.push(clock() - t);
     }
-    Timing { water: median(w), answer: median(a), together: median(both) }
+    Timing { lookup: median(l), without: median(d), with: median(w) }
 }
 
 /// A clock of microseconds since `start`, for time_point.
@@ -253,17 +218,17 @@ fn summary(points: &[Timing]) -> Result<String, String> {
         return Err("no point to time: no cell of the water dir lists a polygon not interior to it".to_string());
     }
     let of = |f: fn(&Timing) -> f64| points.iter().map(f).collect::<Vec<f64>>();
-    let (with, without, both, ratio) = (of(|t| t.water), of(|t| t.answer), of(|t| t.together), of(|t| t.together / t.answer));
+    let (lookup, without, with, ratio) = (of(|t| t.lookup), of(|t| t.without), of(|t| t.with), of(|t| t.with / t.without));
     Ok(format!(
-        "WATER_BENCH points={} water_p50_us={:.1} water_p99_us={:.1} answer_p50_us={:.1} answer_p99_us={:.1} together_p50_us={:.1} together_p99_us={:.1} together_p99_over_answer_p99={:.2} pointwise_over_answer_p50={:.2} pointwise_over_answer_p99={:.2}",
+        "WATER_BENCH points={} lookup_p50_us={:.1} lookup_p99_us={:.1} dry_p50_us={:.1} dry_p99_us={:.1} wet_p50_us={:.1} wet_p99_us={:.1} wet_p99_over_dry_p99={:.2} pointwise_wet_over_dry_p50={:.2} pointwise_wet_over_dry_p99={:.2}",
         points.len(),
-        quantile(&with, 0.5),
-        quantile(&with, 0.99),
+        quantile(&lookup, 0.5),
+        quantile(&lookup, 0.99),
         quantile(&without, 0.5),
         quantile(&without, 0.99),
-        quantile(&both, 0.5),
-        quantile(&both, 0.99),
-        quantile(&both, 0.99) / quantile(&without, 0.99),
+        quantile(&with, 0.5),
+        quantile(&with, 0.99),
+        quantile(&with, 0.99) / quantile(&without, 0.99),
         quantile(&ratio, 0.5),
         quantile(&ratio, 0.99)
     ))
@@ -278,7 +243,11 @@ fn fail(why: &str) -> ! {
 fn main() {
     let args = Args::parse(&std::env::args().collect::<Vec<_>>()).unwrap_or_else(|why| fail(&why));
     let water = Water::load(&args.water);
-    let index = baseline(&args.dataset).unwrap_or_else(|why| fail(&why));
+    let open =
+        || WaterLayer::open(&args.water, DEFAULT_ADMIN_CELL_LEVEL).expect("water dir").expect("a water dir's files");
+    let layer = open();
+    let dry = world(&args.dataset, None).unwrap_or_else(|why| fail(&why));
+    let wet = world(&args.dataset, Some(open())).unwrap_or_else(|why| fail(&why));
     let start = Instant::now();
 
     // The polygons with the largest ring blocks, by their rings.
@@ -339,15 +308,27 @@ fn main() {
             if cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL) != cell {
                 continue;
             }
-            held += usize::from(water.at(lat, lng).is_some());
+            // The answer with water is the one without, but for its water field: the lookup's
+            // name, class and type, absent where it finds none.
+            let water = serde_json::to_value(layer.at(lat, lng)).unwrap();
+            held += usize::from(!water.is_null());
+            let dry_answer = parsed(&dry.query_json(lat, lng));
+            let mut wet_answer = parsed(&wet.query_json(lat, lng));
+            let wet_water = wet_answer.as_object_mut().expect("an answer's object").remove("water");
+            assert_eq!(dry_answer.get("water"), None, "the water the answer without water at ({lat}, {lng}) names");
+            assert_eq!(wet_answer, dry_answer, "the answers with and without water at ({lat}, {lng}), but for the water");
+            assert_eq!(wet_water.unwrap_or_default(), water, "the water the answer with water at ({lat}, {lng}) names");
             timed.push(time_point(
                 args.rounds,
                 since(start),
                 || {
-                    std::hint::black_box(water.at(lat, lng));
+                    std::hint::black_box(layer.at(lat, lng));
                 },
                 || {
-                    std::hint::black_box(index.query_json(lat, lng));
+                    std::hint::black_box(dry.query_json(lat, lng));
+                },
+                || {
+                    std::hint::black_box(wet.query_json(lat, lng));
                 },
             ));
         }
@@ -356,11 +337,12 @@ fn main() {
         }
         let (lat, lng) = (LatLng::from(c.center()).lat.deg(), LatLng::from(c.center()).lng.deg());
         println!(
-            "cell {cell:016x} at {lat:.4} {lng:.4}: {} entries, {entries} not interior with {score} rings; {held} of {} points in water; water {:.1} us, answer {:.1} us (medians)",
+            "cell {cell:016x} at {lat:.4} {lng:.4}: {} entries, {entries} not interior with {score} rings; {held} of {} points in water; lookup {:.1} us, answer without water {:.1} us, with water {:.1} us (medians)",
             ids.len(),
             timed.len(),
-            median(timed.iter().map(|t| t.water).collect()),
-            median(timed.iter().map(|t| t.answer).collect())
+            median(timed.iter().map(|t| t.lookup).collect()),
+            median(timed.iter().map(|t| t.without).collect()),
+            median(timed.iter().map(|t| t.with).collect())
         );
         points.extend(timed);
     }
@@ -370,8 +352,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const WATER_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../testdata/water_dir/day3");
 
     fn args(list: &[&str]) -> Result<Args, String> {
         Args::parse(&std::iter::once("water_bench").chain(list.iter().copied()).map(String::from).collect::<Vec<_>>())
@@ -397,59 +377,8 @@ mod tests {
     fn a_dataset_dir_that_loads_no_dataset_is_no_baseline() {
         // The water fixture's days, none a dataset or a continent's dir, and a dir that isn't.
         for dir in [concat!(env!("CARGO_MANIFEST_DIR"), "/../testdata/water_dir"), concat!(env!("CARGO_MANIFEST_DIR"), "/no such dir")] {
-            assert_eq!(baseline(dir).err(), Some(format!("{dir} holds no dataset grid_query loads")));
+            assert_eq!(world(dir, None).err(), Some(format!("{dir} holds no dataset grid_query loads")));
         }
-    }
-
-    #[test]
-    fn of_two_areas_of_one_size_the_higher_rank_answers() {
-        let key = |area: f32, rank: u8, code: u16, id: u32| Precedence { area, rank, code, id };
-        // A pond (code 4, rank 24) before a lake (code 2, rank 20) of its area; the smaller area
-        // first, whatever its rank.
-        assert_eq!(key(1.0, 24, 4, 9).order(&key(1.0, 20, 2, 1)), Ordering::Less);
-        assert_eq!(key(1.0, 20, 2, 1).order(&key(2.0, 24, 4, 9)), Ordering::Less);
-        // Of one rank, the lower code; of one code, the lower id.
-        assert_eq!(key(1.0, 22, 7, 1).order(&key(1.0, 22, 8, 0)), Ordering::Less);
-        assert_eq!(key(1.0, 22, 7, 1).order(&key(1.0, 22, 7, 2)), Ordering::Less);
-        assert_eq!(key(1.0, 22, 7, 1).order(&key(1.0, 22, 7, 1)), Ordering::Equal);
-    }
-
-    // The water fixture's lake given the type code `lake`, and a twin of it of the code `twin`
-    // (the lake's rings, so of its area, a polygon after the fixture's polygons), both listed not
-    // interior in the cell of a point of the lake off its island: the water, the point and the
-    // two ids.
-    fn twins(lake: u16, twin: u16) -> (Water, (f64, f64), u32, u32) {
-        let mut water = Water::load(WATER_DIR);
-        let at = water.records.iter().position(|p| p.country_code == 2 && p.ring_bytes > 0).expect("the fixture's lake");
-        water.records[at].country_code = lake;
-        water.records.push(AdminPolygon { country_code: twin, ..water.records[at] });
-        let (lake_id, twin_id) = (at as u32, water.records.len() as u32 - 1);
-        let point = (47.002, 8.002);
-        let cell = cell_id_at_level(point.0, point.1, DEFAULT_ADMIN_CELL_LEVEL);
-        water.index = cell_pairs::from_pairs([(cell, lake_id), (cell, twin_id)], cell_pairs::ADMIN);
-        (water, point, lake_id, twin_id)
-    }
-
-    #[test]
-    fn at_a_point_of_two_areas_of_one_size_the_higher_rank_answers() {
-        // Of a lake (2, rank 20) and a pond (4, rank 24) the pond, whichever polygon is which,
-        // though its code is the higher; of a lake and a river (29, rank 19) the lake; of two of
-        // rank 22 (50492, 64461) the lower code; of two of one code the lower id.
-        for (lake, twin, twin_answers) in [(2, 4, true), (4, 2, false), (2, 29, false), (64461, 50492, true), (2, 2, false)] {
-            let (water, (lat, lng), lake_id, twin_id) = twins(lake, twin);
-            assert_eq!(water.at(lat, lng), Some(if twin_answers { twin_id } else { lake_id }), "{lake} {twin}");
-        }
-        // A code water_meta.json lists no rank for answers nothing: of two such, neither.
-        let (water, (lat, lng), _, _) = twins(7, 8);
-        assert_eq!(water.at(lat, lng), None);
-    }
-
-    #[test]
-    fn a_water_dir_gives_each_type_code_its_rank() {
-        let water = Water::load(WATER_DIR);
-        let listed: BTreeMap<u16, u8> = water.ranks.iter().map(|(&c, &r)| (c, r)).collect();
-        assert_eq!(listed, BTreeMap::from([(2, 20), (4, 24), (25, 2), (29, 19), (50492, 22), (64461, 22)]));
-        assert!(ranks("{\"types\": 1}").is_err());
     }
 
     #[test]
@@ -488,31 +417,23 @@ mod tests {
     #[test]
     fn a_points_first_answer_of_each_path_is_untimed() {
         let now = std::cell::Cell::new(0.0);
-        let t = time_point(1, || now.get(), timed_call(&now, &[0], 50_000.0, 0.0), timed_call(&now, &[0], 50_000.0, 0.0));
-        assert_eq!((t.water, t.answer, t.together), (0.0, 0.0, 0.0));
+        let slow_first = || timed_call(&now, &[0], 50_000.0, 0.0);
+        let t = time_point(1, || now.get(), slow_first(), slow_first(), slow_first());
+        assert_eq!((t.lookup, t.without, t.with), (0.0, 0.0, 0.0));
     }
 
     #[test]
     fn each_path_is_timed_on_its_own() {
         let now = std::cell::Cell::new(0.0);
-        let t = time_point(3, || now.get(), timed_call(&now, &[], 0.0, 10.0), timed_call(&now, &[], 0.0, 20.0));
-        assert_eq!((t.water, t.answer, t.together), (10.0, 20.0, 30.0));
-    }
-
-    #[test]
-    fn the_two_together_are_the_median_of_each_rounds_sum() {
-        // The first round's water lookup (30 ms) and the second's answer (50 ms) are slow: each
-        // path's median is 0, and of the rounds' sums (30 ms, 50 ms and 0) the median is 30 ms.
-        let now = std::cell::Cell::new(0.0);
-        let t = time_point(3, || now.get(), timed_call(&now, &[1], 30_000.0, 0.0), timed_call(&now, &[2], 50_000.0, 0.0));
-        assert_eq!((t.water, t.answer, t.together), (0.0, 0.0, 30_000.0));
+        let t = time_point(3, || now.get(), timed_call(&now, &[], 0.0, 10.0), timed_call(&now, &[], 0.0, 20.0), timed_call(&now, &[], 0.0, 30.0));
+        assert_eq!((t.lookup, t.without, t.with), (10.0, 20.0, 30.0));
     }
 
     #[test]
     fn a_run_of_no_point_to_time_has_no_summary() {
         assert_eq!(summary(&[]), Err("no point to time: no cell of the water dir lists a polygon not interior to it".to_string()));
-        let line = summary(&[Timing { water: 2.0, answer: 4.0, together: 5.0 }]).unwrap();
-        assert!(line.starts_with("WATER_BENCH points=1 water_p50_us=2.0 water_p99_us=2.0 answer_p50_us=4.0 "), "{line}");
-        assert!(line.contains(" together_p50_us=5.0 ") && line.ends_with(" pointwise_over_answer_p50=1.25 pointwise_over_answer_p99=1.25"), "{line}");
+        let line = summary(&[Timing { lookup: 2.0, without: 4.0, with: 5.0 }]).unwrap();
+        assert!(line.starts_with("WATER_BENCH points=1 lookup_p50_us=2.0 lookup_p99_us=2.0 dry_p50_us=4.0 "), "{line}");
+        assert!(line.contains(" wet_p50_us=5.0 ") && line.ends_with(" pointwise_wet_over_dry_p50=1.25 pointwise_wet_over_dry_p99=1.25"), "{line}");
     }
 }

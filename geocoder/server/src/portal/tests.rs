@@ -245,7 +245,7 @@ fn template_selections() -> Vec<(RegionSelection, bool)> {
     for mode in template_values("mode") {
         for quality in template_values("quality") {
             for poi_tier in template_values("poi_tier") {
-                let s = RegionSelection { region: "planet".into(), mode: mode.clone(), quality: quality.clone(), poi_tier };
+                let s = RegionSelection { region: "planet".into(), mode: mode.clone(), quality: quality.clone(), poi_tier, water: "none".into() };
                 let allowed = t["constraints"].as_array().unwrap().iter().all(|c| {
                     let has = |key: &str| c[key].as_object().unwrap().iter().all(|(axis, value)| s.axis(axis) == value.as_str());
                     !has("when") || has("requires")
@@ -466,6 +466,7 @@ async fn the_portal_serves_the_selections_without_water() {
     let water: BTreeSet<&String> = cfg.files.keys().filter(|f| f.starts_with("planet/water/")).collect();
     assert!(!water.is_empty());
     for d in &plan.datasets {
+        assert_eq!(d.selection.water, catalog::WATER, "{}", d.id);
         assert!(d.files.iter().all(|f| !water.contains(f)), "{}", d.id);
     }
     assert!(plan.objects.iter().flat_map(|o| &o.files).all(|f| !water.contains(f)));

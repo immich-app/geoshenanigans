@@ -24,12 +24,16 @@ pub enum DownloadError {
     NotInManifest(String),
     Decompress(String),
     UnknownRegion(String),
-    /// The selection names a value on `axis` (mode, quality or poi_tier)
-    /// that the build has no component for; `offered` lists those it has.
+    /// The selection names a value on `axis` (mode, quality, poi_tier or
+    /// water) that the build has no component for; `offered` lists those it
+    /// has.
     NotOffered { axis: &'static str, value: String, offered: Vec<String> },
     /// The manifest names a component (as a parent or a variant) that it
     /// doesn't define.
     MissingComponent(String),
+    /// A component of the manifest puts its files in a `dir` that is not
+    /// one plain name: the component and the dir.
+    BadDir { component: String, dir: String },
     /// A transport unit that can't be taken or failed to decode into its
     /// files: the unit's path and why.
     Transport(String),
@@ -59,6 +63,9 @@ impl std::fmt::Display for DownloadError {
             }
             DownloadError::MissingComponent(id) => {
                 write!(f, "the manifest names component \"{id}\" but does not define it")
+            }
+            DownloadError::BadDir { component, dir } => {
+                write!(f, "the manifest's component \"{component}\" puts its files in \"{dir}\", which is no dir of the region's")
             }
             DownloadError::Transport(s) => write!(f, "transport unit {}", s),
             DownloadError::Size(s) => write!(f, "wrong size: {}", s),
@@ -102,6 +109,10 @@ pub struct Component {
     /// `when` it matches.
     #[serde(default)]
     pub variants: Vec<Variant>,
+    /// The sub-dir of the region dir its files go in (`water`), by their
+    /// names; none, the region dir itself.
+    #[serde(default)]
+    pub dir: Option<String>,
 }
 
 /// A component a selection takes when it has every axis value `when` names
@@ -137,7 +148,7 @@ pub struct UnitEntry {
 }
 
 /// The axes a selection takes one component of, `<axis>.<value>`.
-pub const COMPONENT_AXES: [&str; 3] = ["mode", "quality", "poi_tier"];
+pub const COMPONENT_AXES: [&str; 4] = ["mode", "quality", "poi_tier", "water"];
 
 impl Configurations {
     /// The values of `axis` the build has a component for, in order.
@@ -148,8 +159,8 @@ impl Configurations {
 }
 
 /// Fails, naming the value and those the build offers, unless the build has
-/// a component for each of `sel`'s mode, quality and poi_tier. The region
-/// isn't checked: the manifest's files table holds it.
+/// a component for each of `sel`'s mode, quality, poi_tier and water. The
+/// region isn't checked: the manifest's files table holds it.
 pub fn check_selection(cfg: &Configurations, sel: &RegionSelection) -> Result<(), DownloadError> {
     for axis in COMPONENT_AXES {
         let value = sel.axis(axis).unwrap_or_default();
@@ -161,14 +172,15 @@ pub fn check_selection(cfg: &Configurations, sel: &RegionSelection) -> Result<()
 }
 
 /// Per-region selection passed in by the configuration endpoint. The
-/// mode/quality/poi_tier strings have to match component IDs in
+/// mode/quality/poi_tier/water strings have to match component IDs in
 /// configurations.components (e.g. "simplified", "major").
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionSelection {
     pub region: String,
     pub mode: String,
     pub quality: String,
     pub poi_tier: String,
+    pub water: String,
 }
 
 impl RegionSelection {
@@ -179,6 +191,7 @@ impl RegionSelection {
             "mode" => Some(&self.mode),
             "quality" => Some(&self.quality),
             "poi_tier" => Some(&self.poi_tier),
+            "water" => Some(&self.water),
             _ => None,
         }
     }
@@ -198,6 +211,97 @@ pub struct ResolvedFiles {
     pub paths: Vec<String>,
     /// Paths that may legitimately be missing from the manifest.
     pub optional: HashSet<String>,
+    /// Where each path a component with a `dir` lists goes in the region dir:
+    /// its name, under the `dir` of the first such component listing it
+    /// (`water/arc_index.bin`).
+    pub dest: BTreeMap<String, String>,
+}
+
+impl ResolvedFiles {
+    /// Where the file at `path`, one of `paths`, goes in the region dir: as
+    /// `dest` places it, else in the region dir itself by its name.
+    pub fn dest<'a>(&'a self, path: &'a str) -> &'a str {
+        self.dest.get(path).map_or_else(|| basename(path), String::as_str)
+    }
+}
+
+/// `path` with the selection's values in place of its placeholders.
+fn substitute(path: &str, sel: &RegionSelection) -> String {
+    path.replace("{region}", &sel.region)
+        .replace("{mode}", &sel.mode)
+        .replace("{quality}", &sel.quality)
+        .replace("{poi_tier}", &sel.poi_tier)
+        .replace("{water}", &sel.water)
+}
+
+/// The component `id`'s `dir`, none for one without: an error unless it is
+/// one plain name (no separator, none starting with a dot, as `.`, `..` and
+/// the downloader's own names in the region dir do: FETCH_DIR, DOWNLOAD_LOCK),
+/// a dir in the region dir.
+fn dir_of_component<'a>(id: &str, c: &'a Component) -> Result<Option<&'a str>, DownloadError> {
+    let Some(dir) = c.dir.as_deref() else { return Ok(None) };
+    let plain = !dir.is_empty() && !dir.starts_with('.') && !dir.contains(['/', '\\']);
+    if !plain {
+        return Err(DownloadError::BadDir { component: id.to_string(), dir: dir.to_string() });
+    }
+    Ok(Some(dir))
+}
+
+/// Where a file of `name` of the component `id` goes in a region dir:
+/// under the component's `dir`, else in the region dir itself.
+fn placed(id: &str, c: &Component, name: &str) -> Result<String, DownloadError> {
+    Ok(dir_of_component(id, c)?.map_or_else(|| name.to_string(), |dir| format!("{dir}/{name}")))
+}
+
+/// Whether `path` is one the component file template `template` gives, each
+/// `{placeholder}` in it standing for any run of characters but `/`.
+fn of_template(template: &str, path: &str) -> bool {
+    let Some(open) = template.find('{') else { return template == path };
+    let Some(close) = template[open..].find('}').map(|i| open + i) else { return template == path };
+    let Some(rest) = path.strip_prefix(&template[..open]) else { return false };
+    let run = rest.find('/').unwrap_or(rest.len());
+    (0..=run).filter(|&i| rest.is_char_boundary(i)).any(|i| of_template(&template[close + 1..], &rest[i..]))
+}
+
+/// The places in a region dir of the build's files, by name: each file's in
+/// the sub-dir of each component listing it that has a `dir`
+/// (`water/water_meta.json`), in the region dir itself for each that has none
+/// and for a file no component lists (a place search index's). With those,
+/// the places of the files the components with a `dir` list for `sel`, in
+/// the manifest or not.
+fn build_names(cfg: &Configurations, sel: &RegionSelection) -> Result<BTreeSet<String>, DownloadError> {
+    let mut names = BTreeSet::new();
+    for path in cfg.files.keys() {
+        let name = basename(path);
+        let mut listed = false;
+        for (id, c) in &cfg.components {
+            let lists = |t: &String| (basename(t).contains('{') || basename(t) == name) && of_template(t, path);
+            if c.files.iter().chain(&c.optional_files).any(lists) {
+                listed = true;
+                names.insert(placed(id, c, name)?);
+            }
+        }
+        if !listed {
+            names.insert(name.to_string());
+        }
+    }
+    for (id, c) in cfg.components.iter().filter(|(_, c)| c.dir.is_some()) {
+        for f in c.files.iter().chain(&c.optional_files) {
+            names.insert(placed(id, c, basename(&substitute(f, sel)))?);
+        }
+    }
+    Ok(names)
+}
+
+/// The sub-dirs of a region dir the build's components put files in; an
+/// error naming one whose `dir` is not one plain name, whether a selection
+/// takes it or not.
+fn sub_dirs(cfg: &Configurations) -> Result<BTreeSet<&str>, DownloadError> {
+    let mut dirs = BTreeSet::new();
+    for (id, c) in &cfg.components {
+        dirs.extend(dir_of_component(id, c)?);
+    }
+    Ok(dirs)
 }
 
 /// The files of `sel`, or an error when it names a value the build has no
@@ -208,40 +312,40 @@ pub fn resolve_files(cfg: &Configurations, sel: &RegionSelection) -> Result<Reso
     let mut files = Vec::new();
     let mut optional = HashSet::new();
     let mut replaced = HashSet::new();
+    let mut dest = BTreeMap::new();
 
-    fn substitute(path: &str, sel: &RegionSelection) -> String {
-        path.replace("{region}", &sel.region)
-            .replace("{mode}", &sel.mode)
-            .replace("{quality}", &sel.quality)
-            .replace("{poi_tier}", &sel.poi_tier)
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn visit(
         cfg: &Configurations, sel: &RegionSelection, id: &str,
         seen: &mut HashSet<String>, files: &mut Vec<String>,
         optional: &mut HashSet<String>, replaced: &mut HashSet<String>,
+        dest: &mut BTreeMap<String, String>,
     ) -> Result<(), DownloadError> {
         if !seen.insert(id.to_string()) { return Ok(()); }
         let c = cfg.components.get(id).ok_or_else(|| DownloadError::MissingComponent(id.to_string()))?;
         if let Some(parent) = c.extends.as_deref() {
-            visit(cfg, sel, parent, seen, files, optional, replaced)?;
+            visit(cfg, sel, parent, seen, files, optional, replaced, dest)?;
         }
-        for f in &c.files { files.push(substitute(f, sel)); }
-        for f in &c.optional_files {
+        for (f, is_optional) in c.files.iter().map(|f| (f, false)).chain(c.optional_files.iter().map(|f| (f, true))) {
             let path = substitute(f, sel);
-            optional.insert(path.clone());
+            if let Some(dir) = dir_of_component(id, c)? {
+                dest.entry(path.clone()).or_insert_with(|| format!("{dir}/{}", basename(&path)));
+            }
+            if is_optional {
+                optional.insert(path.clone());
+            }
             files.push(path);
         }
         for r in &c.replaces { replaced.insert(substitute(r, sel)); }
         if let Some(v) = c.variants.iter().find(|v| sel.matches(&v.when)) {
-            visit(cfg, sel, &v.component, seen, files, optional, replaced)?;
+            visit(cfg, sel, &v.component, seen, files, optional, replaced, dest)?;
         }
         Ok(())
     }
 
     for axis in COMPONENT_AXES {
         let id = format!("{axis}.{}", sel.axis(axis).unwrap_or_default());
-        visit(cfg, sel, &id, &mut HashSet::new(), &mut files, &mut optional, &mut replaced)?;
+        visit(cfg, sel, &id, &mut HashSet::new(), &mut files, &mut optional, &mut replaced, &mut dest)?;
     }
 
     let paths: Vec<String> = files.into_iter()
@@ -250,7 +354,8 @@ pub fn resolve_files(cfg: &Configurations, sel: &RegionSelection) -> Result<Reso
         .into_iter()
         .collect();
     optional.retain(|p| paths.contains(p));
-    Ok(ResolvedFiles { paths, optional })
+    dest.retain(|p, _| paths.binary_search(p).is_ok());
+    Ok(ResolvedFiles { paths, optional, dest })
 }
 
 // --- Download a single file -------------------------------------------------
@@ -298,28 +403,12 @@ pub fn client_error(e: reqwest::Error) -> DownloadError {
 /// Fetch `{base_url}/builds/{date}/{path}.zst`, a file published as its own
 /// .zst, decompress, verify its size against `expected.size_raw` (no byte
 /// past it is written) and its sha256 against `expected.sha256`, write
-/// atomically to `dest`, through `<dest>.tmp`: a download into a dir runs
-/// under its download lock, and one killed leaves that file for the next to
-/// write over.
+/// atomically to `dest`: as `tmp`, a file beside it which no other download
+/// writes (a region download's, in the FETCH_DIR beside it; the portal
+/// sync's, a name of its own), renamed over it once its bytes are checked.
+/// A download that fails removes it; one whose file can't go into place and
+/// can't remove it either fails with Leftover.
 pub async fn download_file(
-    client: &reqwest::Client,
-    base_url: &str,
-    date: &str,
-    path: &str,
-    expected: &FileEntry,
-    dest: &Path,
-) -> Result<(), DownloadError> {
-    let tmp = dest.with_extension(format!(
-        "{}.tmp", dest.extension().and_then(|s| s.to_str()).unwrap_or("")
-    ));
-    download_file_through(client, base_url, date, path, expected, dest, &tmp).await
-}
-
-/// download_file through the temporary file `tmp`, beside `dest`, which the
-/// caller names: a name no other download writes, where two may write one
-/// file at once. A download that fails removes it; one whose file can't go
-/// into place and can't remove it either fails with Leftover.
-pub async fn download_file_through(
     client: &reqwest::Client,
     base_url: &str,
     date: &str,
@@ -382,8 +471,144 @@ pub async fn download_file_through(
     Ok(())
 }
 
+/// The dir in the region dir, and in each of its sub-dirs, that a fetch of
+/// a file there writes it in by its name (download_file), until it is
+/// renamed into place: the downloader's own, which holds FETCH_MARK from
+/// when it is made (make_fetch_dir). A download that changes the dir
+/// removes it with all it holds once it has made the ledger and removed the
+/// stamp, before its first fetch, and again once its last fetch is in; what
+/// else is at its place fails the download before it changes anything
+/// (own_fetch_dir). Beside its file, on the file system of the dir its file
+/// goes in.
+const FETCH_DIR: &str = ".fetching";
+
+/// The file a download puts in each FETCH_DIR as it makes it, before a fetch
+/// writes there, holding FETCH_MARK_TEXT: a fetch dir whose mark holds that
+/// is the downloader's, and so is an empty one, or one holding nothing but
+/// its mark with the start of that in it (made by a download killed before
+/// its mark was all in).
+const FETCH_MARK: &str = ".downloader";
+
+/// What a download writes in the FETCH_MARK of each FETCH_DIR it makes.
+const FETCH_MARK_TEXT: &str = "the geocoder downloader's fetch dir: a download removes it with all it holds\n";
+
+/// Makes the FETCH_DIR `path`, its FETCH_MARK in it, where it isn't there;
+/// one there was made by an earlier fetch of the download, which removed
+/// those there before its first fetch.
+async fn make_fetch_dir(path: &Path) -> Result<(), DownloadError> {
+    match tokio::fs::create_dir(path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(DownloadError::Io(format!("mkdir {}: {}", path.display(), e))),
+        Ok(()) => {
+            let mark = path.join(FETCH_MARK);
+            tokio::fs::write(&mark, FETCH_MARK_TEXT).await
+                .map_err(|e| DownloadError::Io(format!("write {}: {}", mark.display(), e)))
+        }
+    }
+}
+
+/// Fails, naming `path`, a FETCH_DIR's place, where what is there is none of
+/// the downloader's to remove with all it holds: a file or a link, or a dir
+/// holding files but no FETCH_MARK of the downloader's text (an operator's
+/// notes, say, beside a file of their own by the mark's name). A dir whose
+/// mark holds FETCH_MARK_TEXT is the downloader's, and so is one holding
+/// nothing, or nothing but its mark with the start of that text in it (a
+/// download killed as it wrote the mark, before any fetch), or none. The
+/// mark is read to a byte past the text, not whole.
+async fn own_fetch_dir(path: &Path) -> Result<(), DownloadError> {
+    if fetch_dir_is_ours(path).await? {
+        return Ok(());
+    }
+    Err(DownloadError::Io(format!("{} is none of the downloader's, whose fetch dir holds a {} of the downloader's own text, or nothing: a download removes nothing there", path.display(), FETCH_MARK)))
+}
+
+/// Whether what is at `path`, a FETCH_DIR's place, is the downloader's to
+/// remove with all it holds (own_fetch_dir), or nothing; an error where that
+/// can't be told, as a stat or a read fails.
+async fn fetch_dir_is_ours(path: &Path) -> Result<bool, DownloadError> {
+    use tokio::io::AsyncReadExt;
+    let io = |what: &str, at: &Path, e: std::io::Error| DownloadError::Io(format!("{} {}: {}", what, at.display(), e));
+    let mark = path.join(FETCH_MARK);
+    let ours = match tokio::fs::symlink_metadata(path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => return Err(io("stat", path, e)),
+        Ok(m) if !m.is_dir() => false,
+        Ok(_) => match tokio::fs::symlink_metadata(&mark).await {
+            Ok(m) if m.is_file() => {
+                let mut text = Vec::new();
+                let file = tokio::fs::File::open(&mark).await.map_err(|e| io("open", &mark, e))?;
+                file.take(FETCH_MARK_TEXT.len() as u64 + 1).read_to_end(&mut text).await.map_err(|e| io("read", &mark, e))?;
+                text == FETCH_MARK_TEXT.as_bytes()
+                    || (FETCH_MARK_TEXT.as_bytes().starts_with(&text) && !holds_more_than(path, 1).await.map_err(|e| io("read", path, e))?)
+            }
+            Ok(_) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => !holds_more_than(path, 0).await.map_err(|e| io("read", path, e))?,
+            Err(e) => return Err(io("stat", &mark, e)),
+        },
+    };
+    Ok(ours)
+}
+
+/// Whether the dir `path` holds more than `n` entries, reading no further.
+async fn holds_more_than(path: &Path, n: usize) -> std::io::Result<bool> {
+    let mut entries = tokio::fs::read_dir(path).await?;
+    for _ in 0..=n {
+        if entries.next_entry().await?.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Removes the fetch dir at `path` (FETCH_DIR, one own_fetch_dir took for
+/// the downloader's), where anything is there, with all it holds: its
+/// FETCH_MARK last, then the dir, so that a kill part way leaves the mark
+/// beside what is left, a dir own_fetch_dir takes for the downloader's again.
+/// A link goes, not what it points at.
+async fn clear(path: &Path) -> Result<(), DownloadError> {
+    let io = |at: &Path, e: std::io::Error| DownloadError::Io(format!("remove {}: {}", at.display(), e));
+    let remove = |at: std::path::PathBuf| async move {
+        let gone = match tokio::fs::symlink_metadata(&at).await {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => Err(e),
+            Ok(m) if m.is_dir() => tokio::fs::remove_dir_all(&at).await,
+            Ok(_) => tokio::fs::remove_file(&at).await,
+        };
+        gone.map_err(|e| io(&at, e))
+    };
+    match tokio::fs::symlink_metadata(path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io(path, e)),
+        Ok(m) if !m.is_dir() => return remove(path.to_path_buf()).await,
+        Ok(_) => {}
+    }
+    let mut entries = tokio::fs::read_dir(path).await.map_err(|e| io(path, e))?;
+    let mut held = Vec::new();
+    while let Some(e) = entries.next_entry().await.map_err(|e| io(path, e))? {
+        if e.file_name() != FETCH_MARK {
+            held.push(e.path());
+        }
+    }
+    held.push(path.join(FETCH_MARK));
+    #[cfg(test)]
+    let mut removed = 0;
+    for at in held {
+        remove(at).await?;
+        #[cfg(test)]
+        {
+            removed += 1;
+            if STOP_ONCE_CLEARED.get() == Some(removed) {
+                STOP_ONCE_CLEARED.set(None);
+                return Err(DownloadError::Io(format!("stopped once {removed} of what {} holds went", path.display())));
+            }
+        }
+    }
+    tokio::fs::remove_dir(path).await.map_err(|e| io(path, e))
+}
+
 /// Blocking half of the streaming download: consume compressed chunks
-/// from `rx`, zstd-decode them, write the decompressed bytes to `tmp`
+/// from `rx`, zstd-decode them, write the decompressed bytes to `tmp`, a
+/// file it makes new there (writing nothing through a link at the name),
 /// and hash them incrementally. Returns the sha256 hex of the
 /// decompressed content. RAM use is bounded by the channel depth plus
 /// the zstd window regardless of file size, and the disk's by `size`, the
@@ -418,7 +643,15 @@ fn decode_hash_write(
             self.file.flush()
         }
     }
-    let file = std::fs::File::create(tmp)
+    // A file of its own: what is at the temp name (a killed fetch's file, or
+    // a link, which goes without its file) is removed, not opened.
+    match std::fs::remove_file(tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(DownloadError::Io(format!("remove {}: {}", tmp.display(), e)));
+        }
+        _ => {}
+    }
+    let file = std::fs::File::options().write(true).create_new(true).open(tmp)
         .map_err(|e| DownloadError::Io(format!("create {}: {}", tmp.display(), e)))?;
     let hw = HashWriter { file: std::io::BufWriter::new(file), hasher: Sha256::new(), written: 0, size, past: false };
     let mut dec = zstd::stream::write::Decoder::new(hw)
@@ -497,25 +730,42 @@ pub struct DownloadProgress {
     pub bytes_total: u64,
 }
 
+/// A file a download puts in place: its path in the build, where it goes
+/// in the region dir and its manifest entry.
+#[derive(Clone, Copy)]
+pub struct Placed<'a> {
+    pub path: &'a str,
+    pub dest: &'a str,
+    pub entry: &'a FileEntry,
+}
+
 /// One object a region's download fetches.
 pub enum Fetch<'a> {
     /// A file, through its own .zst of `size` bytes.
-    File { path: &'a str, entry: &'a FileEntry, size: u64 },
-    /// A transport unit of `size` bytes, for its files.
-    Unit { path: &'a str, size: u64, files: Vec<(&'a str, &'a FileEntry)> },
+    File { file: Placed<'a>, size: u64 },
+    /// A transport unit of `size` bytes, for its files, which all go in the
+    /// sub-dir `dir` of the region dir (none: the region dir itself).
+    Unit { path: &'a str, size: u64, dir: Option<&'a str>, files: Vec<Placed<'a>> },
+}
+
+/// The sub-dir of the region dir a file whose destination is `dest` goes
+/// in; none for the region dir itself.
+fn dir_of(dest: &str) -> Option<&str> {
+    dest.rsplit_once('/').map(|(dir, _)| dir)
 }
 
 impl<'a> Fetch<'a> {
     pub fn path(&self) -> &'a str {
         match self {
-            Fetch::File { path, .. } | Fetch::Unit { path, .. } => path,
+            Fetch::File { file, .. } => file.path,
+            Fetch::Unit { path, .. } => path,
         }
     }
 
-    /// The files it puts in place, by path, with their entries.
-    pub fn files(&self) -> Vec<(&'a str, &'a FileEntry)> {
+    /// The files it puts in place.
+    pub fn files(&self) -> Vec<Placed<'a>> {
         match self {
-            Fetch::File { path, entry, .. } => vec![(*path, *entry)],
+            Fetch::File { file, .. } => vec![*file],
             Fetch::Unit { files, .. } => files.clone(),
         }
     }
@@ -527,11 +777,12 @@ impl<'a> Fetch<'a> {
     }
 }
 
-/// What a download of `paths` fetches, in path order: each file's .zst, or
-/// its transport unit, once for all the files it holds. A unit must be of
-/// this build's transport version, and the selection must take all of its
-/// files: decoding it writes every one.
-pub fn fetches<'a>(cfg: &'a Configurations, paths: &[&'a String]) -> Result<Vec<Fetch<'a>>, DownloadError> {
+/// What a download of `paths` (of `resolved`) fetches, in path order: each
+/// file's .zst, or its transport unit, once for all the files it holds. A
+/// unit must be of this build's transport version, the selection must take
+/// all of its files (decoding it writes every one), and they must all go in
+/// one dir, which it decodes into.
+pub fn fetches<'a>(cfg: &'a Configurations, resolved: &'a ResolvedFiles, paths: &[&'a String]) -> Result<Vec<Fetch<'a>>, DownloadError> {
     let taken: HashSet<&str> = paths.iter().map(|p| p.as_str()).collect();
     let mut units = HashSet::new();
     let mut out = Vec::new();
@@ -540,7 +791,7 @@ pub fn fetches<'a>(cfg: &'a Configurations, paths: &[&'a String]) -> Result<Vec<
             .ok_or_else(|| DownloadError::NotInManifest((*path).clone()))?;
         let Some(u) = entry.unit.as_deref() else {
             let size = entry.size_zst.ok_or_else(|| DownloadError::NotInManifest(format!("{}.zst", path)))?;
-            out.push(Fetch::File { path: path.as_str(), entry, size });
+            out.push(Fetch::File { file: Placed { path: path.as_str(), dest: resolved.dest(path), entry }, size });
             continue;
         };
         if !units.insert(u) {
@@ -562,9 +813,14 @@ pub fn fetches<'a>(cfg: &'a Configurations, paths: &[&'a String]) -> Result<Vec<
             if !taken.contains(f.as_str()) {
                 return Err(DownloadError::Transport(format!("{}: holds {}, which the selection doesn't take", u, f)));
             }
-            files.push((f.as_str(), cfg.files.get(f).ok_or_else(|| DownloadError::NotInManifest(f.clone()))?));
+            let entry = cfg.files.get(f).ok_or_else(|| DownloadError::NotInManifest(f.clone()))?;
+            files.push(Placed { path: f.as_str(), dest: resolved.dest(f), entry });
         }
-        out.push(Fetch::Unit { path: u, size: unit.size, files });
+        let dir = dir_of(resolved.dest(path));
+        if files.iter().any(|f| dir_of(f.dest) != dir) {
+            return Err(DownloadError::Transport(format!("{}: its files go in more than one dir", u)));
+        }
+        out.push(Fetch::Unit { path: u, size: unit.size, dir, files });
     }
     Ok(out)
 }
@@ -578,23 +834,30 @@ async fn there(path: &Path) -> Result<bool, DownloadError> {
     }
 }
 
-/// Whether the file at `path` is in `dir` at its size.
-async fn on_disk(dir: &Path, path: &str, entry: &FileEntry) -> bool {
-    matches!(tokio::fs::metadata(dir.join(basename(path))).await, Ok(m) if m.len() == entry.size_raw)
+/// Whether `file` is in the region dir `dir` at its size.
+async fn on_disk(dir: &Path, file: &Placed<'_>) -> bool {
+    matches!(tokio::fs::metadata(dir.join(file.dest)).await, Ok(m) if m.len() == file.entry.size_raw)
 }
 
 /// What each file in a region dir holds, as the dir's ledger (FILE_LEDGER)
-/// tells it: by name, the sha256 of its bytes, or none where they are
+/// tells it: by name (its place in the region dir, `water/<name>` for one
+/// in its water dir), the sha256 of its bytes, or none where they are
 /// unknown. A name it has no line for is unknown too.
 struct Ledger {
     path: std::path::PathBuf,
     held: BTreeMap<String, Option<String>>,
-    /// The name on a last line a kill cut short (no newline after it).
-    torn: Option<String>,
+    /// What the next note writes before its lines where a kill cut the last
+    /// line short (no newline after it): a newline ending that line, and an
+    /// unknown line for its file where the cut left all of its name.
+    mend: String,
 }
 
 impl Ledger {
-    /// The ledger in `dir`, empty when there is none.
+    /// The ledger in `dir`, empty when there is none. A line without a space
+    /// is one a kill cut short before the space after its name, which a later
+    /// note ended: it may hold a part of a name only, so it names no file,
+    /// and makes the one of that exact name unknown where an earlier line
+    /// names it.
     async fn read(dir: &Path) -> Result<Ledger, DownloadError> {
         let path = dir.join(FILE_LEDGER);
         let text = match tokio::fs::read(&path).await {
@@ -603,41 +866,58 @@ impl Ledger {
             Err(e) => return Err(DownloadError::Io(format!("read {}: {}", path.display(), e))),
         };
         let (lines, cut) = text.rsplit_once('\n').unwrap_or(("", text.as_str()));
+        fn unknown_if_named(held: &mut BTreeMap<String, Option<String>>, name: &str) {
+            if let Some(sha256) = held.get_mut(name) {
+                *sha256 = None;
+            }
+        }
         let mut held = BTreeMap::new();
         for line in lines.split('\n').filter(|l| !l.is_empty()) {
-            let (name, sha256) = line.split_once(' ').unwrap_or((line, "-"));
-            held.insert(name.to_string(), (sha256 != "-").then(|| sha256.to_string()));
+            match line.split_once(' ') {
+                Some((name, sha256)) => {
+                    held.insert(name.to_string(), (sha256 != "-").then(|| sha256.to_string()));
+                }
+                None => unknown_if_named(&mut held, line),
+            }
         }
-        // A line cut short says nothing of its file's bytes, whatever it holds.
-        let torn = (!cut.is_empty()).then(|| cut.split_once(' ').map_or(cut, |(name, _)| name).to_string());
-        if let Some(name) = &torn {
-            held.insert(name.clone(), None);
-        }
-        Ok(Ledger { path, held, torn })
+        // A line cut short says nothing of its file's bytes, whatever it
+        // holds; cut before the space after its name, it is one as above.
+        let mend = match cut.split_once(' ') {
+            _ if cut.is_empty() => String::new(),
+            Some((name, _)) => {
+                held.insert(name.to_string(), None);
+                format!("\n{} -\n", name)
+            }
+            None => {
+                unknown_if_named(&mut held, cut);
+                "\n".to_string()
+            }
+        };
+        Ok(Ledger { path, held, mend })
     }
 
-    /// Whether it says the file at `path` holds the bytes of `entry`.
-    fn holds(&self, path: &str, entry: &FileEntry) -> bool {
-        matches!(self.held.get(basename(path)), Some(Some(sha256)) if *sha256 == entry.sha256)
+    /// Whether it says `file` holds the bytes of its entry.
+    fn holds(&self, file: &Placed<'_>) -> bool {
+        matches!(self.held.get(file.dest), Some(Some(sha256)) if *sha256 == file.entry.sha256)
     }
 
     /// Adds a line for each of `files`: its sha256 once it is `in_place`,
     /// else unknown. One write: a kill cuts short at most its last line. A
     /// line cut short before goes on a line of its own, and an unknown line
-    /// for its name after it.
-    async fn note(&mut self, files: &[(&str, &FileEntry)], in_place: bool) -> Result<(), DownloadError> {
+    /// for its name after it where the cut left all of the name.
+    async fn note(&mut self, files: &[Placed<'_>], in_place: bool) -> Result<(), DownloadError> {
         use tokio::io::AsyncWriteExt;
-        let mut lines = self.torn.as_ref().map_or(String::new(), |name| format!("\n{} -\n", name));
-        for (path, entry) in files {
-            lines.push_str(&format!("{} {}\n", basename(path), if in_place { entry.sha256.as_str() } else { "-" }));
+        let mut lines = self.mend.clone();
+        for f in files {
+            lines.push_str(&format!("{} {}\n", f.dest, if in_place { f.entry.sha256.as_str() } else { "-" }));
         }
         let err = |e: std::io::Error| DownloadError::Io(format!("write {}: {}", self.path.display(), e));
         let mut f = tokio::fs::OpenOptions::new().create(true).append(true).open(&self.path).await.map_err(err)?;
         f.write_all(lines.as_bytes()).await.map_err(err)?;
         f.flush().await.map_err(err)?;
-        self.torn = None;
-        for (path, entry) in files {
-            self.held.insert(basename(path).to_string(), in_place.then(|| entry.sha256.clone()));
+        self.mend.clear();
+        for f in files {
+            self.held.insert(f.dest.to_string(), in_place.then(|| f.entry.sha256.clone()));
         }
         Ok(())
     }
@@ -708,38 +988,55 @@ thread_local! {
     /// Set by a test: the next download on this thread stops once it removed
     /// the files its selection doesn't take, before its first fetch.
     static STOP_ONCE_REMOVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by a test: the next removal of a fetch dir on this thread stops
+    /// once that many of the entries it holds went, as a kill there would.
+    static STOP_ONCE_CLEARED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// Resolve and download every file for a single region. A fetch (a file's
-/// .zst, or a transport unit for all its files) is skipped only when each
-/// of its files is on disk at its size and the dir's ledger (FILE_LEDGER)
-/// says it holds the bytes of the manifest's sha256 for its path; size
-/// alone trusts no file, as one of the size another selection or build
-/// left, or a fetch a kill cut short, may hold other bytes. Before a fetch
-/// can replace a file the ledger marks it unknown, and once the fetch is
-/// in place (its bytes checked against the manifest's sha256) names its
-/// sha256. A file the selection doesn't take (an earlier selection's or
-/// build's, which Index::load would read beside this one's) is removed
-/// before the first fetch: each the ledger names, and each of a name a file
-/// of the build has in any selection, the ledger naming it or not (a dir
-/// laid out by hand, or whose ledger was lost); a file of another name
-/// stays. Their lines go when the ledger is rewritten. The dir's stamp
-/// (BUILD_STAMP) says it holds a complete selection of the build it names
-/// and none of those files: a download that fetches or removes anything
-/// makes the ledger where the dir has none, then removes the stamp, before
-/// it writes anything else (a server leaves a dir holding the ledger but no
-/// stamp unloaded, and loads one holding neither), and puts the stamp in
-/// once the last fetch is in, the ledger rewritten with a line a file of
-/// the selection; one that has nothing to fetch or remove in a dir stamped
-/// with its build writes nothing. Downloads into the dir go one at a time,
-/// across processes too, and a server loads the dir only while none runs
-/// (DOWNLOAD_LOCK). Before it reads the dir a download finishes what a
-/// decode killed part way left there (finish_leftovers), or fails, writing
-/// nothing. A unit's files land together, so a download needs the largest
-/// unit's files' size free beside the region. It is to run to its end
-/// (ensure_loaded runs it in a task of its own): dropped part way, it lets
-/// go of the lock while a decode or a file's writer it started goes on
-/// writing the dir on a thread of its own.
+/// .zst, or a transport unit for all its files) is skipped only when each of
+/// its files is on disk at its size and the dir's ledger (FILE_LEDGER) says
+/// it holds the bytes of the manifest's sha256 for its path; size alone
+/// trusts no file, as one of the size another selection or build left, or a
+/// fetch a kill cut short, may hold other bytes. Before a fetch can replace a
+/// file the ledger marks it unknown, and once the fetch is in place (its
+/// bytes checked against the manifest's sha256) names its sha256. A file the
+/// selection doesn't take (an earlier selection's or build's, which
+/// Index::load would read beside this one's) is removed before the first
+/// fetch: each the ledger names, and each at a place a file of the build has
+/// in any selection, the ledger naming it or not (a dir laid out by hand, or
+/// whose ledger was lost); a file at another place stays. Their lines go when
+/// the ledger is rewritten. A file goes in the region dir by its name, or in
+/// the sub-dir its component's `dir` names (`water/`), where the ledger and
+/// the removal name it by its place (`water/admin_polygons.bin`); a sub-dir
+/// that is a link or a file fails the download before it writes anything,
+/// which writes nothing through a link. A file's fetch writes it in the
+/// FETCH_DIR of the dir it goes in, the downloader's own, marked so as it is
+/// made (FETCH_MARK), and renames it into place: a file at the name of one of
+/// the build's with .tmp after it is none of a download's, and stays. The
+/// dir's stamp (BUILD_STAMP) says it holds a complete selection of the build,
+/// from the bucket and of the selection it names (stamp_text), and none of
+/// those files: a download that fetches or removes anything fails where a
+/// fetch dir's place holds what isn't the downloader's (a file, a link, or a
+/// dir holding files but not the mark),
+/// before it makes the ledger or removes the stamp; else it makes the ledger
+/// where the dir has none, then removes the stamp, before it writes anything
+/// else (a server leaves a dir holding the ledger but no stamp unloaded, and
+/// loads one holding neither), then removes the fetch dirs with what killed
+/// fetches left in them, and puts the stamp in once the last fetch is in and
+/// the fetch dirs are gone, the ledger rewritten with a line a file of the
+/// selection; one that has nothing to fetch or remove in a dir stamped so,
+/// with its build, bucket and selection, writes nothing, and one stamped
+/// otherwise or not at all removes the fetch dirs of the downloader's there
+/// (a killed download's) and stamps it. Downloads into the dir go one at a
+/// time, across processes too, and a server loads the dir only while none runs
+/// (DOWNLOAD_LOCK). Before it reads the dir a download finishes what a decode
+/// killed part way left there and in each sub-dir a component's `dir` names
+/// (finish_leftovers), or fails, writing nothing. A unit's files land
+/// together, so a download needs the largest unit's files' size free beside
+/// the region. It is to run to its end (ensure_loaded runs it in a task of
+/// its own): dropped part way, it lets go of the lock while a decode or a
+/// file's writer it started goes on writing the dir on a thread of its own.
 ///
 /// `progress` fires after each file or unit completes with the running
 /// total; the caller logs it.
@@ -755,10 +1052,11 @@ pub async fn download_region(
     if resolved.paths.is_empty() {
         return Err(DownloadError::UnknownRegion(sel.region.clone()));
     }
+    let sub_dirs = sub_dirs(cfg)?;
     let paths: Vec<&String> = resolved.paths.iter()
         .filter(|p| cfg.files.contains_key(*p) || !resolved.optional.contains(*p))
         .collect();
-    let fetches = fetches(cfg, &paths)?;
+    let fetches = fetches(cfg, &resolved, &paths)?;
 
     let bytes_total: u64 = fetches.iter().map(Fetch::size).sum();
     let mut bytes_done: u64 = 0;
@@ -771,47 +1069,77 @@ pub async fn download_region(
         ..Default::default()
     });
 
-    // Files land FLAT under <root>/<region>/ — Index::load (via
-    // install_region) reads a flat dir, not the manifest's nested
-    // {region}/{mode}/... layout. A later path overwrites an earlier
-    // basename: no two .bin files of a template selection share one (its
-    // tests check it), and the strings_layout.json each dir holds are alike.
+    // Files land FLAT under <root>/<region>/, but those of a component with
+    // a `dir`, which land flat in that sub-dir (<root>/<region>/water/):
+    // Index::load (via install_region) reads a flat dir and its water dir,
+    // not the manifest's nested {region}/{mode}/... layout. A later path
+    // overwrites an earlier one of its destination: no two .bin files of a
+    // template selection share one (its tests check it), and the
+    // strings_layout.json each dir holds are alike.
     let region_dir = root.join(&sel.region);
     tokio::fs::create_dir_all(&region_dir).await
         .map_err(|e| DownloadError::Io(format!("mkdir {}: {}", region_dir.display(), e)))?;
     // Held until the download returns.
     let _lock = download_lock(&region_dir).await?;
+    // A sub-dir is a dir of the region dir's own, or not there yet: through
+    // a link (to another dataset's dir, which the lock doesn't guard) or onto
+    // a file nothing is finished, removed or fetched.
+    for sub in &sub_dirs {
+        let path = region_dir.join(sub);
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(m) if m.is_dir() => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(DownloadError::Io(format!("{} is a link or a file, not a dir: a download writes nothing through it", path.display())));
+            }
+            Err(e) => return Err(DownloadError::Io(format!("stat {}: {}", path.display(), e))),
+        }
+    }
     // The only change to the dir's files before the ledger is made and the
     // stamp removed: the leftovers are those of decodes a download ran once
     // it had done both, in a dir that holds the ledger and no stamp since,
-    // which no server loads.
+    // which no server loads. Units decode into the sub-dirs too.
     finish_leftovers(&region_dir).await?;
+    for sub in &sub_dirs {
+        if there(&region_dir.join(sub)).await? {
+            finish_leftovers(&region_dir.join(sub)).await?;
+        }
+    }
 
     let stamp = region_dir.join(BUILD_STAMP);
+    let fetch_dirs: Vec<std::path::PathBuf> = std::iter::once(region_dir.join(FETCH_DIR))
+        .chain(sub_dirs.iter().map(|sub| region_dir.join(sub).join(FETCH_DIR)))
+        .collect();
     let mut ledger = Ledger::read(&region_dir).await?;
     let mut in_place = Vec::with_capacity(fetches.len());
     for fetch in &fetches {
         let mut held = true;
-        for (path, entry) in fetch.files() {
-            held = held && ledger.holds(path, entry) && on_disk(&region_dir, path, entry).await;
+        for file in fetch.files() {
+            held = held && ledger.holds(&file) && on_disk(&region_dir, &file).await;
         }
         in_place.push(held);
     }
     let to_fetch = in_place.contains(&false);
-    let taken: HashSet<&str> = paths.iter().map(|p| basename(p)).collect();
+    let taken: HashSet<&str> = paths.iter().map(|p| resolved.dest(p)).collect();
     // The files the selection doesn't take: each the ledger names, and each
-    // in the dir of a name a file of the build has in any selection, the
-    // ledger naming it or not. Other names stay.
+    // in the dir at a place a file of the build has in any selection, the
+    // ledger naming it or not (build_names). Other names stay.
     let mut others: BTreeSet<String> = ledger.held.keys().filter(|name| !taken.contains(name.as_str())).cloned().collect();
-    let build_names: BTreeSet<&str> = cfg.files.keys().map(|p| basename(p)).filter(|name| !taken.contains(name)).collect();
-    for name in build_names {
-        if !others.contains(name) && there(&region_dir.join(name)).await? {
-            others.insert(name.to_string());
+    for name in build_names(cfg, sel)?.into_iter().filter(|name| !taken.contains(name.as_str())) {
+        if !others.contains(&name) && there(&region_dir.join(&name)).await? {
+            others.insert(name);
         }
     }
     let changes = to_fetch || !others.is_empty();
-    let stamped = tokio::fs::read_to_string(&stamp).await.is_ok_and(|s| s.trim() == cfg.build.date);
+    let record = stamp_text(&cfg.build.date, base_url, sel);
+    let stamped = tokio::fs::read_to_string(&stamp).await.is_ok_and(|s| s == record);
     if changes {
+        // What is at a fetch dir's place goes below with all it holds: the
+        // downloader's own, or the download fails here, having changed
+        // nothing.
+        for fetch_dir in &fetch_dirs {
+            own_fetch_dir(fetch_dir).await?;
+        }
         // The ledger first, where the dir has none (the first download into
         // a dir laid out by hand): killed once the stamp or a file went, the
         // download leaves a dir a server doesn't load, not one it takes for
@@ -826,10 +1154,16 @@ pub async fn download_region(
             }
             _ => {}
         }
+        // What fetches a kill cut short left, of files the selection takes or
+        // not; a link in a fetch dir goes, not what it points at.
+        for fetch_dir in &fetch_dirs {
+            clear(fetch_dir).await?;
+        }
     }
     // Before the fetches, so that their room is free. Their lines go only
     // when the ledger is rewritten: a download killed before then leaves
-    // them, and the next finds their files gone.
+    // them, and the next finds their files gone. A dir at a file's place
+    // fails the download, which leaves the dir unstamped.
     for name in &others {
         let path = region_dir.join(name);
         match tokio::fs::remove_file(&path).await {
@@ -848,12 +1182,24 @@ pub async fn download_region(
         if !held {
             let files = fetch.files();
             ledger.note(&files, false).await?;
+            // A sub-dir is made as its first file comes down.
+            let dir = match fetch {
+                Fetch::File { file, .. } => dir_of(file.dest),
+                Fetch::Unit { dir, .. } => *dir,
+            };
+            let into = dir.map_or_else(|| region_dir.clone(), |d| region_dir.join(d));
+            tokio::fs::create_dir_all(&into).await
+                .map_err(|e| DownloadError::Io(format!("mkdir {}: {}", into.display(), e)))?;
             match fetch {
-                Fetch::File { path, entry, .. } => {
-                    download_file(client, base_url, &cfg.build.date, path, entry, &region_dir.join(basename(path))).await?;
+                Fetch::File { file, .. } => {
+                    let fetch_dir = into.join(FETCH_DIR);
+                    make_fetch_dir(&fetch_dir).await?;
+                    let tmp = fetch_dir.join(basename(file.dest));
+                    download_file(client, base_url, &cfg.build.date, file.path, file.entry, &region_dir.join(file.dest), &tmp).await?;
                 }
                 Fetch::Unit { path, files, .. } => {
-                    download_unit(client, base_url, &cfg.build.date, path, files, &region_dir).await?;
+                    let held: Vec<(&str, &FileEntry)> = files.iter().map(|f| (f.path, f.entry)).collect();
+                    download_unit(client, base_url, &cfg.build.date, path, &held, &into).await?;
                 }
             }
             #[cfg(test)]
@@ -874,15 +1220,61 @@ pub async fn download_region(
         });
     }
 
+    if changes {
+        for fetch_dir in &fetch_dirs {
+            clear(fetch_dir).await?;
+        }
+    } else if !stamped {
+        // Those a download killed once its last fetch was in left, holding
+        // their marks: what else is at their places stays, as this one
+        // changes no file. One that can't be told fails the download before
+        // it stamps the dir, for the next to try again.
+        for fetch_dir in &fetch_dirs {
+            if fetch_dir_is_ours(fetch_dir).await? {
+                clear(fetch_dir).await?;
+            }
+        }
+    }
     if changes || !stamped {
         ledger.compact().await?;
         // A new file renamed into place, never the one there written again:
         // a server loading the dir without its lock tells it from the stamp
         // it found by its inode, should the download run all through while
         // it loaded.
-        write_whole(&stamp, cfg.build.date.as_bytes()).await?;
+        write_whole(&stamp, record.as_bytes()).await?;
     }
     Ok(())
+}
+
+/// What a download writes in the stamp (BUILD_STAMP) of a region dir it
+/// leaves holding a complete selection: the build's date on its first line,
+/// then the bucket it came from (`base_url`) and the selection's value on
+/// each of COMPONENT_AXES, a line each. A server tells the bucket and the
+/// selection of the files it loaded by the stamp the dir held as it loaded
+/// it (stamped_source).
+pub fn stamp_text(date: &str, base_url: &str, sel: &RegionSelection) -> String {
+    let mut text = format!("{date}\nbase_url {base_url}\n");
+    for axis in COMPONENT_AXES {
+        text += &format!("{axis} {}\n", sel.axis(axis).unwrap_or_default());
+    }
+    text
+}
+
+/// The bucket and the selection of `region` the text of a stamp names
+/// (stamp_text); none for text of another form.
+pub fn stamped_source(text: &str, region: &str) -> Option<(String, RegionSelection)> {
+    let mut lines = text.lines();
+    let date = lines.next()?;
+    let mut value = |key: &str| Some(lines.next()?.strip_prefix(key)?.strip_prefix(' ')?.to_string());
+    let base_url = value("base_url")?;
+    let sel = RegionSelection {
+        region: region.to_string(),
+        mode: value("mode")?,
+        quality: value("quality")?,
+        poi_tier: value("poi_tier")?,
+        water: value("water")?,
+    };
+    (stamp_text(date, &base_url, &sel) == text).then_some((base_url, sel))
 }
 
 // --- Regression tests ---------------------------------------------------------
@@ -960,7 +1352,7 @@ mod tests {
         let root = ScratchDir::new();
         let (dest, tmp) = (root.path().join("file.bin"), root.path().join("file.bin.1.tmp"));
 
-        let got = download_file_through(&reqwest::Client::new(), &bucket.url, test_bucket::DATE, path, &smaller, &dest, &tmp).await;
+        let got = download_file(&reqwest::Client::new(), &bucket.url, test_bucket::DATE, path, &smaller, &dest, &tmp).await;
 
         assert_eq!(got.map_err(|e| e.to_string()), Err(format!("wrong size: {path} runs past its {} bytes", smaller.size_raw)));
         assert!(!dest.exists() && !tmp.exists());
@@ -977,7 +1369,7 @@ mod tests {
         let (dest, tmp) = (root.path().join("file.bin"), root.path().join("file.bin.1.tmp"));
         std::fs::create_dir(&dest).unwrap();
 
-        let got = download_file_through(&reqwest::Client::new(), &bucket.url, test_bucket::DATE, path, entry, &dest, &tmp).await;
+        let got = download_file(&reqwest::Client::new(), &bucket.url, test_bucket::DATE, path, entry, &dest, &tmp).await;
 
         let failed = got.unwrap_err().to_string();
         assert!(failed.starts_with(&format!("I/O error: rename {}→{}: ", tmp.display(), dest.display())), "{failed}");
@@ -992,24 +1384,33 @@ mod tests {
             extends: extends.map(|s| s.to_string()),
             optional_files: Vec::new(),
             variants: Vec::new(),
+            dir: None,
         }
     }
 
+    /// A build of `components`, and of no water where they give it none.
     fn cfg(components: Vec<(&str, Component)>) -> Configurations {
+        let mut components: BTreeMap<String, Component> = components.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        components.entry("water.none".into()).or_insert_with(|| component(&[], &[], None));
         Configurations {
             build: BuildMeta { date: "2026-01-01".into() },
-            components: components.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            components,
             files: BTreeMap::new(),
             units: BTreeMap::new(),
         }
     }
 
     fn sel(region: &str, mode: &str, quality: &str, poi_tier: &str) -> RegionSelection {
+        wet(region, mode, quality, poi_tier, "none")
+    }
+
+    fn wet(region: &str, mode: &str, quality: &str, poi_tier: &str, water: &str) -> RegionSelection {
         RegionSelection {
             region: region.to_string(),
             mode: mode.to_string(),
             quality: quality.to_string(),
             poi_tier: poi_tier.to_string(),
+            water: water.to_string(),
         }
     }
 
@@ -1115,6 +1516,8 @@ mod tests {
                    ("mode", "ful".to_string(), strings(&["admin", "admin-minimal", "full", "no-addresses"])));
         assert_eq!(not_offered(sel("europe", "full", "simplified", "majr")),
                    ("poi_tier", "majr".to_string(), strings(&["all", "major", "none", "notable"])));
+        assert_eq!(not_offered(wet("europe", "full", "simplified", "none", "lakes")),
+                   ("water", "lakes".to_string(), strings(&["all", "all-exact", "major", "none"])));
     }
 
     #[test]
@@ -1135,11 +1538,11 @@ mod tests {
 
         assert_eq!(missing(serde_json::json!({
             "mode.full": { "files": ["{region}/full/a.bin"], "extends": "full/base" },
-            "quality.simplified": {}, "poi_tier.none": {}
+            "quality.simplified": {}, "poi_tier.none": {}, "water.none": {}
         })), "full/base");
         assert_eq!(missing(serde_json::json!({
             "mode.full": { "files": ["{region}/full/a.bin"], "variants": [{ "component": "full/alone" }] },
-            "quality.simplified": {}, "poi_tier.none": {}
+            "quality.simplified": {}, "poi_tier.none": {}, "water.none": {}
         })), "full/alone");
     }
 
@@ -1164,7 +1567,8 @@ mod tests {
                 "small/never": { "files": ["{region}/never.bin"] },
                 "quality.simplified": {},
                 "poi_tier.none": {},
-                "poi_tier.major": { "files": ["{region}/poi/{poi_tier}/p.bin"] }
+                "poi_tier.major": { "files": ["{region}/poi/{poi_tier}/p.bin"] },
+                "water.none": {}
             })).unwrap(),
             files: BTreeMap::new(),
             units: BTreeMap::new(),
@@ -1197,6 +1601,52 @@ mod tests {
         assert!(!resolved.optional.contains("europe/full/admin_cells.bin"));
     }
 
+    // A component's `dir` places its files, optional ones too, under that
+    // sub-dir by their names; the others go in the region dir by theirs.
+    #[test]
+    fn resolve_files_places_the_files_of_a_component_with_a_dir_in_it() {
+        let mut water = component(&["{region}/water/{water}/x/admin_cells.bin"], &[], None);
+        water.optional_files = vec!["{region}/water/{water}/x/extra.bin".into()];
+        water.dir = Some("water".into());
+        let c = cfg(vec![
+            ("mode.full", component(&["{region}/full/admin_cells.bin"], &[], None)),
+            ("quality.simplified", component(&[], &[], None)),
+            ("poi_tier.none", component(&[], &[], None)),
+            ("water.all", water),
+        ]);
+
+        let got = resolve_files(&c, &wet("eu", "full", "simplified", "none", "all")).unwrap();
+
+        let placed: Vec<(&str, &str)> = got.paths.iter().map(|p| (p.as_str(), got.dest(p))).collect();
+        assert_eq!(placed, [("eu/full/admin_cells.bin", "admin_cells.bin"), ("eu/water/all/x/admin_cells.bin", "water/admin_cells.bin"),
+                            ("eu/water/all/x/extra.bin", "water/extra.bin")]);
+    }
+
+    // A path components with and without a `dir` both list goes under the
+    // dir of the first listing it that has one, whichever lists it first:
+    // here the mode, without one, before the water value, then two water
+    // values' dirs, the first kept.
+    #[test]
+    fn resolve_files_places_a_path_in_the_dir_of_the_first_component_listing_it_with_one() {
+        let mut water = component(&["{region}/shared/admin_cells.bin"], &[], None);
+        water.dir = Some("water".into());
+        let mut extra = water.clone();
+        extra.dir = Some("extra".into());
+        water.variants = vec![Variant { when: BTreeMap::new(), component: "water.extra".into() }];
+        let c = cfg(vec![
+            ("mode.full", component(&["{region}/shared/admin_cells.bin"], &[], None)),
+            ("quality.simplified", component(&[], &[], None)),
+            ("poi_tier.none", component(&[], &[], None)),
+            ("water.all", water),
+            ("water.extra", extra),
+        ]);
+
+        let got = resolve_files(&c, &wet("eu", "full", "simplified", "none", "all")).unwrap();
+
+        let placed: Vec<(&str, &str)> = got.paths.iter().map(|p| (p.as_str(), got.dest(p))).collect();
+        assert_eq!(placed, [("eu/shared/admin_cells.bin", "water/admin_cells.bin")]);
+    }
+
     /// The template, as JSON and as the downloader reads it.
     fn template() -> (serde_json::Value, Configurations) {
         let v: serde_json::Value = serde_json::from_str(include_str!("../../builder/configurations.template.json")).unwrap();
@@ -1222,50 +1672,58 @@ mod tests {
         })
     }
 
-    /// Every mode × quality × poi_tier the template's constraints allow, in
-    /// europe, and its presets' selections.
+    /// Every mode × quality × poi_tier × water the template's constraints
+    /// allow, in europe, and its presets' selections.
     fn template_selections(v: &serde_json::Value) -> Vec<RegionSelection> {
         let mut all = Vec::new();
         for mode in axis_values(v, "mode") {
             for quality in axis_values(v, "quality") {
                 for poi_tier in axis_values(v, "poi_tier") {
-                    all.push(sel("europe", &mode, &quality, &poi_tier));
+                    for water in axis_values(v, "water") {
+                        all.push(wet("europe", &mode, &quality, &poi_tier, &water));
+                    }
                 }
             }
         }
         all.retain(|s| allowed(v, s));
         for preset in v["presets"].as_array().unwrap() {
             let axis = |name: &str| preset["selections"][name].as_str().unwrap().to_string();
-            all.push(sel(&axis("region"), &axis("mode"), &axis("quality"), &axis("poi_tier")));
+            all.push(wet(&axis("region"), &axis("mode"), &axis("quality"), &axis("poi_tier"), &axis("water")));
         }
         all
     }
 
     // Index::load needs strings_layout.json in every region dir and
     // PoiMeta::load reads poi_meta.json; a selection that resolves without
-    // them downloads GiBs into a dir that can never load. Every selection
-    // takes one mode dir, and with it that dir's attribution.json, the credit
-    // of the data the dataset holds (admin-minimal-poi's beside a POI tier,
-    // the dir that mode takes there); one with a POI tier takes the tier dir's
-    // poi_attribution.json too where the build wrote one (an optional file),
-    // the credit of the sitelinks that rank its POIs, by a name of its own,
-    // as downloads land flat by name.
+    // them downloads GiBs into a dir that can never load. A water dir loads
+    // with all of its files or none. Every selection takes one mode dir, and
+    // with it that dir's attribution.json, the credit of the data the dataset
+    // holds (admin-minimal-poi's beside a POI tier, the dir that mode takes
+    // there); one with a POI tier takes the tier dir's poi_attribution.json
+    // too where the build wrote one (an optional file), the credit of the
+    // sitelinks that rank its POIs, by a name of its own, as downloads outside
+    // the water dir land flat by name; one with water takes the water dir's
+    // own attribution.json in that dir.
     #[test]
     fn template_selections_include_load_sidecars() {
         let (v, c) = template();
         for s in template_selections(&v) {
             let resolved = resolve_files(&c, &s).unwrap();
-            let paths = resolved.paths;
-            let has = |name: &str| paths.iter().any(|p| basename(p) == name);
+            let has = |name: &str| resolved.paths.iter().any(|p| resolved.dest(p) == name);
             assert!(has("strings_layout.json"), "{:?} lacks strings_layout.json", s);
             assert!(has("admin_cells.bin"), "{:?} lacks admin_cells.bin", s);
             assert_eq!(has("poi_meta.json"), s.poi_tier != "none", "{:?} poi_meta.json", s);
-            let credits: Vec<&String> = paths.iter().filter(|p| basename(p) == "attribution.json").collect();
+            for name in query_server::WATER_FILES {
+                assert_eq!(has(&format!("{}/{name}", query_server::WATER_DIR)), s.water != "none", "{:?} water/{name}", s);
+            }
+            let water_credit = format!("{}/attribution.json", query_server::WATER_DIR);
+            assert_eq!(has(&water_credit), s.water != "none", "{:?} {water_credit}", s);
+            let credits: Vec<&String> = resolved.paths.iter().filter(|p| resolved.dest(p) == "attribution.json").collect();
             let mode_dir = if s.mode == "admin-minimal" && s.poi_tier != "none" { "admin-minimal-poi" } else { s.mode.as_str() };
             let credit = format!("{}/{}/attribution.json", s.region, mode_dir);
             assert_eq!(credits, [&credit], "{:?}", s);
             assert!(!resolved.optional.contains(credits[0].as_str()), "{:?}", s);
-            let poi_credits: Vec<&String> = paths.iter().filter(|p| basename(p) == "poi_attribution.json").collect();
+            let poi_credits: Vec<&String> = resolved.paths.iter().filter(|p| resolved.dest(p) == "poi_attribution.json").collect();
             let poi_credit = format!("{}/poi/{}/poi_attribution.json", s.region, s.poi_tier);
             assert_eq!(poi_credits, if s.poi_tier == "none" { vec![] } else { vec![&poi_credit] }, "{:?}", s);
             assert!(poi_credits.iter().all(|p| resolved.optional.contains(p.as_str())), "{:?}", s);
@@ -1296,9 +1754,9 @@ mod tests {
         let minimal: Vec<RegionSelection> = template_selections(&v).into_iter()
             .filter(|s| s.mode == "admin-minimal" && s.region == "europe")
             .collect();
-        assert_eq!(minimal.len(), axis_values(&v, "poi_tier").len());
+        assert_eq!(minimal.len(), axis_values(&v, "poi_tier").len() * axis_values(&v, "water").len());
         for s in minimal {
-            let ResolvedFiles { paths, optional } = resolve_files(&c, &s).unwrap();
+            let ResolvedFiles { paths, optional, .. } = resolve_files(&c, &s).unwrap();
             let (dir, other) = if s.poi_tier == "none" {
                 ("europe/admin-minimal/", "europe/admin-minimal-poi/")
             } else {
@@ -1315,23 +1773,34 @@ mod tests {
         }
     }
 
-    // Downloads land flat by basename, so a selection taking two copies of an
-    // admin geometry file, or a .bin name twice, would mix two sets of arcs.
+    // Downloads land flat by name in the region dir or in the sub-dir their
+    // component names, so a selection taking two copies of an admin geometry
+    // file for one dir, or a .bin name twice in one, would mix two sets of
+    // arcs. The water dir's are the water tier's, never the boundaries'.
     #[test]
     fn template_selections_take_each_admin_geometry_file_once_from_their_dir() {
         let (v, c) = template();
         for s in template_selections(&v) {
-            let paths = resolve_files(&c, &s).unwrap().paths;
+            let resolved = resolve_files(&c, &s).unwrap();
+            let paths = &resolved.paths;
             let dir = match (s.mode.as_str(), s.poi_tier.as_str()) {
                 ("admin-minimal", "none") => format!("{}/admin-minimal/", s.region),
                 ("admin-minimal", _) => format!("{}/admin-minimal-poi/", s.region),
                 _ => format!("{}/quality/{}/", s.region, s.quality),
             };
+            let water_dir = match s.water.as_str() {
+                "none" => None,
+                "all-exact" => Some(format!("{}/water/all/exact/", s.region)),
+                tier => Some(format!("{}/water/{tier}/simplified/", s.region)),
+            };
             for name in std::iter::once("admin_polygons.bin").chain(query_server::ADMIN_GEOMETRY_FILES) {
-                let copies: Vec<&String> = paths.iter().filter(|p| basename(p) == name).collect();
+                let copies: Vec<&String> = paths.iter().filter(|p| resolved.dest(p) == name).collect();
                 assert_eq!(copies, [&format!("{dir}{name}")], "{:?}", s);
+                let water = format!("{}/{name}", query_server::WATER_DIR);
+                let copies: Vec<String> = paths.iter().filter(|p| resolved.dest(p) == water).cloned().collect();
+                assert_eq!(copies, water_dir.iter().map(|d| format!("{d}{name}")).collect::<Vec<_>>(), "{:?}", s);
             }
-            let mut bins: Vec<&str> = paths.iter().map(|p| basename(p)).filter(|n| n.ends_with(".bin")).collect();
+            let mut bins: Vec<&str> = paths.iter().map(|p| resolved.dest(p)).filter(|n| n.ends_with(".bin")).collect();
             let count = bins.len();
             bins.sort_unstable();
             bins.dedup();
@@ -1347,9 +1816,9 @@ mod tests {
     fn the_default_configuration_is_a_selection_the_template_allows() {
         let (v, c) = template();
         let d = crate::region_state::Configuration::default();
-        let s = sel("europe", &d.mode, &d.quality, &d.poi_tier);
+        let s = wet("europe", &d.mode, &d.quality, &d.poi_tier, &d.water);
 
-        for (axis, value) in [("mode", &d.mode), ("quality", &d.quality), ("poi_tier", &d.poi_tier)] {
+        for (axis, value) in [("mode", &d.mode), ("quality", &d.quality), ("poi_tier", &d.poi_tier), ("water", &d.water)] {
             assert!(axis_values(&v, axis).contains(value), "{axis} {value}");
         }
         assert!(allowed(&v, &s));
@@ -1357,7 +1826,7 @@ mod tests {
     }
 
     async fn download(bucket: &TestBucket, s: &RegionSelection, root: &Path) -> Result<(), DownloadError> {
-        download_region(&reqwest::Client::new(), &bucket.url, &bucket.manifest, s, root, |_| {}).await
+        download_region(&reqwest::Client::new(), &bucket.url, &bucket.manifest, s, root, |_| {}).await.map(drop)
     }
 
     // Skipping a value the build lacks fetched the rest of the selection and
@@ -1386,7 +1855,8 @@ mod tests {
         let bucket = test_bucket::serve(serde_json::json!({
             "mode.full": { "files": ["{region}/full/a.bin"], "variants": [{ "component": "full/alone" }] },
             "quality.simplified": {},
-            "poi_tier.none": {}
+            "poi_tier.none": {},
+            "water.none": {}
         })).await;
         let root = ScratchDir::new();
 
@@ -1396,25 +1866,34 @@ mod tests {
         assert_eq!(bucket.files_served(), 0);
     }
 
-    /// The names in a region dir and their bytes.
+    /// The files in a region dir and in its sub-dirs, by their place in it
+    /// (`water/arc_index.bin`), and their bytes.
     fn held(dir: &Path) -> BTreeMap<String, Vec<u8>> {
-        std::fs::read_dir(dir).unwrap()
-            .map(|e| e.unwrap())
-            .map(|e| (e.file_name().into_string().unwrap(), std::fs::read(e.path()).unwrap()))
-            .collect()
+        let mut out = BTreeMap::new();
+        for e in std::fs::read_dir(dir).unwrap().map(|e| e.unwrap()) {
+            let name = e.file_name().into_string().unwrap();
+            if e.file_type().unwrap().is_dir() {
+                out.extend(held(&e.path()).into_iter().map(|(n, b)| (format!("{name}/{n}"), b)));
+            } else {
+                out.insert(name, std::fs::read(e.path()).unwrap());
+            }
+        }
+        out
     }
 
     /// What a download of `s` should leave in its region dir: each file the
-    /// bucket has, by its name, the ledger naming each one's sha256, the
-    /// build's stamp and, on unix, the empty download lock file.
+    /// bucket has, by its place (its name, under its component's dir), the
+    /// ledger naming each one's sha256, the build's stamp and, on unix, the
+    /// empty download lock file.
     fn files_of(bucket: &TestBucket, s: &RegionSelection) -> BTreeMap<String, Vec<u8>> {
-        let mut want: BTreeMap<String, Vec<u8>> = resolve_files(&bucket.manifest, s).unwrap().paths.iter()
+        let resolved = resolve_files(&bucket.manifest, s).unwrap();
+        let mut want: BTreeMap<String, Vec<u8>> = resolved.paths.iter()
             .filter(|p| bucket.manifest.files.contains_key(*p))
-            .map(|p| (basename(p).to_string(), bucket.file(p).to_vec()))
+            .map(|p| (resolved.dest(p).to_string(), bucket.file(p).to_vec()))
             .collect();
         let ledger: String = want.iter().map(|(name, bytes)| format!("{name} {}\n", sha256_of(bytes))).collect();
         want.insert(FILE_LEDGER.into(), ledger.into_bytes());
-        want.insert(BUILD_STAMP.into(), test_bucket::DATE.as_bytes().to_vec());
+        want.insert(BUILD_STAMP.into(), stamp_text(test_bucket::DATE, &bucket.url, s).into_bytes());
         if cfg!(unix) {
             want.insert(DOWNLOAD_LOCK.into(), Vec::new());
         }
@@ -1511,6 +1990,7 @@ mod tests {
                 _ => {
                     let older: Vec<u8> = bytes.iter().map(|b| b ^ 0x5a).collect();
                     ledger.push_str(&format!("{name} {}\n", sha256_of(&older)));
+                    std::fs::create_dir_all(dir.join(&name).parent().unwrap()).unwrap();
                     std::fs::write(dir.join(name), older).unwrap();
                 }
             }
@@ -1643,21 +2123,31 @@ mod tests {
     }
 
     // A download with nothing to fetch into a dir whose stamp doesn't name
-    // the build (one killed once its last fetch was in, before the stamp, or
-    // stamped with an older build) fetches nothing, rewrites the ledger with
-    // a line a file and stamps the dir.
+    // the build, the bucket and the selection (one killed once its last
+    // fetch was in, before the stamp; one stamped with an older build, or
+    // naming another bucket or selection, as a download from another bucket
+    // of the same files, or of another selection taking them, leaves it)
+    // fetches nothing, rewrites the ledger with a line a file and stamps the
+    // dir.
     #[tokio::test]
     async fn a_download_with_nothing_to_fetch_into_a_dir_not_stamped_with_its_build_stamps_it() {
         use std::io::Write;
         let s = sel("europe", "admin", "simplified", "major");
         let bucket = test_bucket::serve(test_bucket::template_components()).await;
-        for stamp in [None, Some("2025-12-01")] {
+        let other_tier = RegionSelection { poi_tier: "all".into(), ..s.clone() };
+        let others = [
+            "2025-12-01".to_string(),
+            stamp_text("2025-12-01", &bucket.url, &s),
+            stamp_text(test_bucket::DATE, "http://another.bucket", &s),
+            stamp_text(test_bucket::DATE, &bucket.url, &other_tier),
+        ];
+        for stamp in std::iter::once(None).chain(others.iter().map(Some)) {
             let root = ScratchDir::new();
             download(&bucket, &s, root.path()).await.unwrap();
             let dir = root.path().join("europe");
             match stamp {
                 None => std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap(),
-                Some(date) => std::fs::write(dir.join(BUILD_STAMP), date).unwrap(),
+                Some(text) => std::fs::write(dir.join(BUILD_STAMP), text).unwrap(),
             }
             let sha256 = &bucket.manifest.files["europe/admin/admin_cells.bin"].sha256;
             let mut ledger = std::fs::OpenOptions::new().append(true).open(dir.join(FILE_LEDGER)).unwrap();
@@ -1673,15 +2163,15 @@ mod tests {
 
     /// How many fetches of `s` a retry makes once a download that stopped at
     /// the fetch at `at` put those before it in place: that one and those
-    /// after it, but those whose files all came down, under their names,
+    /// after it, but those whose files all came down, to their places,
     /// before it (a region's JSON files, alike in each of its dirs).
     fn fetched_on_retry(bucket: &TestBucket, s: &RegionSelection, at: &str) -> usize {
         let resolved = resolve_files(&bucket.manifest, s).unwrap();
         let paths: Vec<&String> = resolved.paths.iter().filter(|p| bucket.manifest.files.contains_key(*p)).collect();
-        let all = fetches(&bucket.manifest, &paths).unwrap();
+        let all = fetches(&bucket.manifest, &resolved, &paths).unwrap();
         let i = all.iter().position(|f| f.path() == at).unwrap();
-        let before: BTreeSet<&str> = all[..i].iter().flat_map(|f| f.files()).map(|(p, _)| basename(p)).collect();
-        all[i..].iter().filter(|f| !f.files().iter().all(|(p, _)| before.contains(basename(p)))).count()
+        let before: BTreeSet<&str> = all[..i].iter().flat_map(|f| f.files()).map(|f| f.dest).collect();
+        all[i..].iter().filter(|f| !f.files().iter().all(|g| before.contains(g.dest))).count()
     }
 
     // The retry fetches again only what had not come down: the object that
@@ -1708,29 +2198,576 @@ mod tests {
     // A download stopped as a kill would once a fetch is in place, before
     // the ledger names its files, leaves them unknown and no stamp; the
     // retry fetches that fetch again and those after it, not those before.
+    // The pois unit, and the water dir's arcs unit, which decodes into it.
     #[tokio::test]
     async fn a_download_stopped_once_a_fetch_was_in_fetches_it_again_on_retry() {
-        let s = sel("europe", "admin", "simplified", "major");
         let bucket = test_bucket::serve(test_bucket::template_components()).await;
-        let (root, whole) = (ScratchDir::new(), ScratchDir::new());
-        download(&bucket, &s, whole.path()).await.unwrap();
-        let all = bucket.files_served();
-        older_build(&bucket, &s, root.path());
-        let dir = root.path().join("europe");
-        STOP_ONCE_FETCHED.set(Some(FAILING_UNIT));
+        for (s, unit, files) in [
+            (sel("europe", "admin", "simplified", "major"), FAILING_UNIT, ["poi_records.bin", "poi_vertices.bin"]),
+            (wet("europe", "admin", "simplified", "none", "all"), "europe/water/all/simplified/arcs.tt.zst", ["water/arc_index.bin", "water/arc_vertices.bin"]),
+        ] {
+            let (root, whole) = (ScratchDir::new(), ScratchDir::new());
+            let before = bucket.files_served();
+            download(&bucket, &s, whole.path()).await.unwrap();
+            let all = bucket.files_served() - before;
+            older_build(&bucket, &s, root.path());
+            let dir = root.path().join("europe");
+            STOP_ONCE_FETCHED.set(Some(unit));
 
-        let stopped = download(&bucket, &s, root.path()).await.map_err(|e| e.to_string());
-        let came_down = bucket.files_served() - all;
-        let (lines, stamped) = (ledger_lines(&dir, &["poi_records.bin", "poi_vertices.bin"]), dir.join(BUILD_STAMP).exists());
+            let stopped = download(&bucket, &s, root.path()).await.map_err(|e| e.to_string());
+            let came_down = bucket.files_served() - before - all;
+            let (lines, stamped) = (ledger_lines(&dir, &files), dir.join(BUILD_STAMP).exists());
+            download(&bucket, &s, root.path()).await.unwrap();
+
+            assert_eq!(stopped, Err(format!("I/O error: stopped once {unit} was in place")));
+            assert_eq!(lines, files.map(|f| format!("{f} -")));
+            assert!(!stamped, "{unit}");
+            let retried = fetched_on_retry(&bucket, &s, unit);
+            assert!(came_down > 1 && retried > 1 && came_down + retried <= all + 1, "{unit}: {came_down} and {retried} of {all}");
+            assert_eq!(bucket.files_served() - before - all - came_down, retried, "{unit}");
+            assert!(held(&dir) == files_of(&bucket, &s), "{unit}");
+        }
+    }
+
+    // A water value's files go in the region dir's water/, the ledger naming
+    // each there, its units decoded into it: beside the boundaries' files of
+    // the same names, which stay the quality dir's.
+    #[tokio::test]
+    async fn a_water_dirs_files_go_in_the_water_dir_beside_the_boundaries() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let s = wet("europe", "admin", "simplified", "none", "all");
+        let root = ScratchDir::new();
+        let dir = root.path().join("europe");
+
         download(&bucket, &s, root.path()).await.unwrap();
 
-        assert_eq!(stopped, Err(format!("I/O error: stopped once {FAILING_UNIT} was in place")));
-        assert_eq!(lines, ["poi_records.bin -", "poi_vertices.bin -"]);
-        assert!(!stamped);
-        let retried = fetched_on_retry(&bucket, &s, FAILING_UNIT);
-        assert!(came_down > 1 && retried > 1 && came_down + retried <= all + 1, "{came_down} and {retried} of {all}");
-        assert_eq!(bucket.files_served() - all - came_down, retried);
-        assert!(held(&dir) == files_of(&bucket, &s));
+        let got = held(&dir);
+        for name in query_server::WATER_FILES.iter().chain(&["attribution.json"]) {
+            assert_eq!(got.get(&format!("water/{name}")).map(Vec::as_slice), Some(bucket.file(&format!("europe/water/all/simplified/{name}"))), "{name}");
+        }
+        for name in ["admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin"] {
+            assert_eq!(got.get(name).map(Vec::as_slice), Some(bucket.file(&format!("europe/quality/simplified/{name}"))), "{name}");
+        }
+        let units: BTreeSet<&str> = resolve_files(&bucket.manifest, &s).unwrap().paths.iter()
+            .filter(|p| p.starts_with("europe/water/"))
+            .filter_map(|p| bucket.manifest.files[p].unit.as_deref())
+            .collect();
+        assert_eq!(units, BTreeSet::from(["europe/water/all/simplified/admin_polygons.tt.zst", "europe/water/all/simplified/arcs.tt.zst"]));
+        let sha256 = &bucket.manifest.files["europe/water/all/simplified/arc_index.bin"].sha256;
+        assert_eq!(ledger_lines(&dir, &["water/arc_index.bin"]), [format!("water/arc_index.bin {sha256}")]);
+        assert!(got == files_of(&bucket, &s));
+    }
+
+    // A switch between water values replaces the water dir's files with the
+    // new value's; a switch to none removes them, their ledger lines with
+    // them, and the boundaries' files stay.
+    #[tokio::test]
+    async fn a_switch_of_water_leaves_the_water_dir_holding_the_new_values_files_only() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let root = ScratchDir::new();
+        let dir = root.path().join("europe");
+        for water in ["all", "all-exact", "none", "major", "none"] {
+            let s = wet("europe", "admin", "simplified", "none", water);
+
+            download(&bucket, &s, root.path()).await.unwrap();
+
+            assert_eq!(differing(&held(&dir), &files_of(&bucket, &s)), Vec::<String>::new(), "{water}");
+            let ledger = std::fs::read_to_string(dir.join(FILE_LEDGER)).unwrap();
+            assert_eq!(ledger.lines().any(|l| l.starts_with("water/")), water != "none", "{water}: {ledger}");
+        }
+    }
+
+    // A switch to no water removes the water dir's files of the build's
+    // names though no ledger names them (it was lost, or the dir laid out by
+    // hand), the dir stamped with the build or not; a file of another name
+    // stays.
+    #[tokio::test]
+    async fn a_switch_to_no_water_removes_the_water_files_no_ledger_names() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (before, after) = (wet("europe", "admin", "simplified", "none", "all"), sel("europe", "admin", "simplified", "none"));
+        for stamped in [true, false] {
+            let root = ScratchDir::new();
+            let dir = root.path().join("europe");
+            download(&bucket, &before, root.path()).await.unwrap();
+            std::fs::remove_file(dir.join(FILE_LEDGER)).unwrap();
+            if !stamped {
+                std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
+            }
+            std::fs::write(dir.join("water/notes.txt"), "not the build's").unwrap();
+
+            download(&bucket, &after, root.path()).await.unwrap();
+
+            let mut want = files_of(&bucket, &after);
+            want.insert("water/notes.txt".into(), b"not the build's".to_vec());
+            assert_eq!(differing(&held(&dir), &want), Vec::<String>::new(), "stamped: {stamped}");
+        }
+    }
+
+    // A file goes by its place: a name the build has only in the water dir
+    // (water_meta.json; attribution.json is the mode dir's credit too) is no
+    // name of the region dir's, and a file of it there stays, as one of
+    // another name does, the selection taking water or not. A dir whose
+    // ledger was lost.
+    #[tokio::test]
+    async fn a_name_the_build_has_only_in_the_water_dir_is_no_name_of_the_region_dirs() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let before = wet("europe", "admin", "simplified", "none", "all");
+        let theirs = [("water_meta.json", "the operator's")];
+        for after in [before.clone(), sel("europe", "admin", "simplified", "none")] {
+            let root = ScratchDir::new();
+            let dir = root.path().join("europe");
+            download(&bucket, &before, root.path()).await.unwrap();
+            std::fs::remove_file(dir.join(FILE_LEDGER)).unwrap();
+            for (name, bytes) in theirs {
+                std::fs::write(dir.join(name), bytes).unwrap();
+            }
+
+            download(&bucket, &after, root.path()).await.unwrap();
+
+            let mut want = files_of(&bucket, &after);
+            want.extend(theirs.map(|(name, bytes)| (name.to_string(), bytes.as_bytes().to_vec())));
+            assert_eq!(differing(&held(&dir), &want), Vec::<String>::new(), "water {}", after.water);
+        }
+    }
+
+    // A file's fetch killed part way leaves its file in the fetch dir beside
+    // its place (FETCH_DIR), which holds the downloader's mark from before
+    // the fetch began (FETCH_MARK), and the ledger naming the file unknown.
+    // A download whose selection no longer takes the file removes the fetch
+    // dir with it: a switch to no water after a fetch of the water dir's
+    // admin_cells.bin was killed, and one to no POIs after a fetch of
+    // poi_cells.bin was. The fetch dir is laid out as the fetch left it
+    // while the bucket held its body back half way, the file's first bytes
+    // in it.
+    #[tokio::test]
+    async fn a_switch_removes_the_temp_file_of_a_killed_fetch_of_a_file_it_doesnt_take() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        for (before, after, killed, object) in [
+            (wet("europe", "admin", "simplified", "none", "all"), sel("europe", "admin", "simplified", "none"), "water/admin_cells.bin", "europe/water/all/simplified/admin_cells.bin.zst"),
+            (sel("europe", "admin", "simplified", "major"), sel("europe", "admin", "simplified", "none"), "poi_cells.bin", "europe/poi/major/poi_cells.bin.zst"),
+        ] {
+            let root = ScratchDir::new();
+            let dir = root.path().join("europe");
+            let fetches = dir.join(killed).parent().unwrap().join(FETCH_DIR);
+            let holding = bucket.hold(object);
+            let downloading = download(&bucket, &before, root.path());
+            tokio::pin!(downloading);
+            let left = tokio::select! {
+                got = &mut downloading => panic!("done while the bucket held {object} back: {got:?}"),
+                () = holding.reached() => held(&fetches),
+            };
+            drop(holding);
+            downloading.await.unwrap();
+            let ledger = std::fs::read_to_string(dir.join(FILE_LEDGER)).unwrap();
+            std::fs::write(dir.join(FILE_LEDGER), format!("{ledger}{killed} -\n")).unwrap();
+            std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
+            std::fs::create_dir_all(&fetches).unwrap();
+            for (name, bytes) in &left {
+                std::fs::write(fetches.join(name), bytes).unwrap();
+            }
+            std::fs::write(fetches.join(basename(killed)), "the first bytes of a fetch").unwrap();
+
+            download(&bucket, &after, root.path()).await.unwrap();
+
+            assert!(left.contains_key(FETCH_MARK), "{killed}: {:?}", left.keys().collect::<Vec<_>>());
+            assert_eq!(differing(&held(&dir), &files_of(&bucket, &after)), Vec::<String>::new(), "{killed}");
+        }
+    }
+
+    /// What is in a dir and in its sub-dirs, by place: a file's bytes, and
+    /// where a link points (not followed), after "-> ".
+    fn places(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        for e in std::fs::read_dir(dir).unwrap().map(|e| e.unwrap()) {
+            let (name, kind) = (e.file_name().into_string().unwrap(), e.file_type().unwrap());
+            if kind.is_symlink() {
+                out.insert(name, format!("-> {}", std::fs::read_link(e.path()).unwrap().display()).into_bytes());
+            } else if kind.is_dir() {
+                out.extend(places(&e.path()).into_iter().map(|(n, b)| (format!("{name}/{n}"), b)));
+            } else {
+                out.insert(name, std::fs::read(e.path()).unwrap());
+            }
+        }
+        out
+    }
+
+    // A fetch dir's place holds the downloader's own dir, which a download
+    // removes with all it holds, or nothing. A dir there that holds files
+    // but not the downloader's mark (FETCH_MARK, holding FETCH_MARK_TEXT),
+    // as an operator's notes in a dir of that name, beside a file of their
+    // own by the mark's name or beside the start of the mark's text, or a
+    // mark with more after its text, or a file or a link there, fails a
+    // download that would change the region dir before it changes anything,
+    // naming the place. Here a switch to water all in a dir of no water: the
+    // dir stays as it was, its stamp and ledger too, what a link points at
+    // as well, and nothing is fetched.
+    #[tokio::test]
+    async fn a_download_fails_on_what_isnt_its_own_at_a_fetch_dirs_place_changing_nothing() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (none, all) = (sel("europe", "admin", "simplified", "none"), wet("europe", "admin", "simplified", "none", "all"));
+        type LayOut = fn(&Path, &Path, &str);
+        let notes: LayOut = |dir, _, at| {
+            std::fs::create_dir(dir.join(at)).unwrap();
+            std::fs::write(dir.join(at).join("notes.txt"), "an operator's notes").unwrap();
+        };
+        let file: LayOut = |dir, _, at| std::fs::write(dir.join(at), "an operator's notes").unwrap();
+        let theirs_marked: LayOut = |dir, _, at| {
+            std::fs::create_dir(dir.join(at)).unwrap();
+            std::fs::write(dir.join(at).join(FETCH_MARK), "an operator's file").unwrap();
+            std::fs::write(dir.join(at).join("notes.txt"), "an operator's notes").unwrap();
+        };
+        let cut_mark_beside_notes: LayOut = |dir, _, at| {
+            std::fs::create_dir(dir.join(at)).unwrap();
+            std::fs::write(dir.join(at).join(FETCH_MARK), &FETCH_MARK_TEXT[..20]).unwrap();
+            std::fs::write(dir.join(at).join("notes.txt"), "an operator's notes").unwrap();
+        };
+        let mark_and_more: LayOut = |dir, _, at| {
+            std::fs::create_dir(dir.join(at)).unwrap();
+            std::fs::write(dir.join(at).join(FETCH_MARK), format!("{FETCH_MARK_TEXT}and an operator's notes")).unwrap();
+        };
+        let mut cases: Vec<(&str, LayOut)> = vec![
+            (".fetching", notes),
+            ("water/.fetching", notes),
+            (".fetching", file),
+            (".fetching", theirs_marked),
+            ("water/.fetching", theirs_marked),
+            (".fetching", cut_mark_beside_notes),
+            ("water/.fetching", mark_and_more),
+        ];
+        #[cfg(unix)]
+        {
+            let link: LayOut = |dir, other, at| std::os::unix::fs::symlink(other.join("theirs"), dir.join(at)).unwrap();
+            cases.extend([(".fetching", link), ("water/.fetching", link)]);
+        }
+        for (at, lay_out) in cases {
+            let (root, other) = (ScratchDir::new(), ScratchDir::new());
+            let dir = root.path().join("europe");
+            download(&bucket, &none, root.path()).await.unwrap();
+            std::fs::create_dir_all(other.path().join("theirs")).unwrap();
+            std::fs::write(other.path().join("theirs/notes.txt"), "an operator's notes").unwrap();
+            std::fs::create_dir_all(dir.join("water")).unwrap();
+            lay_out(&dir, other.path(), at);
+            let (before, theirs, served) = (places(&dir), held(other.path()), bucket.files_served());
+
+            let got = download(&bucket, &all, root.path()).await.map_err(|e| e.to_string());
+
+            let case = format!("{at}: {:?}", before.keys().filter(|n| n.starts_with(at)).collect::<Vec<_>>());
+            let want = format!("I/O error: {} is none of the downloader's, whose fetch dir holds a {FETCH_MARK} of the downloader's own text, or nothing: a download removes nothing there", dir.join(at).display());
+            assert_eq!(got, Err(want), "{case}");
+            assert!(places(&dir) == before, "{case}: {:?}", places(&dir).keys().collect::<Vec<_>>());
+            assert!(held(other.path()) == theirs, "{case}");
+            assert_eq!(bucket.files_served(), served, "{case}");
+        }
+    }
+
+    // A file at a file's name with .tmp after it is none of a download's: a
+    // fetch writes its file in the fetch dir beside its place, never there,
+    // so it stays whatever the ledger says of the file (an operator's copy,
+    // say). Here an operator's water/admin_polygons.bin.tmp, through a
+    // download of water all whose polygons unit failed once the ledger
+    // marked the unit's files unknown, and the switch to no water after it.
+    #[tokio::test]
+    async fn a_temp_name_beside_the_file_of_a_units_failed_fetch_stays() {
+        const UNIT: &str = "europe/water/all/simplified/admin_polygons.tt.zst";
+        let (failing, bucket) = (failing_at(UNIT).await, test_bucket::serve(test_bucket::template_components()).await);
+        let (all, none) = (wet("europe", "admin", "simplified", "none", "all"), sel("europe", "admin", "simplified", "none"));
+        let root = ScratchDir::new();
+        let dir = root.path().join("europe");
+        std::fs::create_dir_all(dir.join("water")).unwrap();
+        std::fs::write(dir.join("water/admin_polygons.bin.tmp"), "an operator's copy").unwrap();
+
+        let failed = download(&failing, &all, root.path()).await.map_err(|e| e.to_string());
+        let lines = ledger_lines(&dir, &["water/admin_polygons.bin"]);
+        download(&bucket, &none, root.path()).await.unwrap();
+
+        assert!(failed.as_ref().is_err_and(|e| e.starts_with(&format!("transport unit {UNIT}: "))), "{failed:?}");
+        assert_eq!(lines, ["water/admin_polygons.bin -"]);
+        let mut want = files_of(&bucket, &none);
+        want.insert("water/admin_polygons.bin.tmp".into(), b"an operator's copy".to_vec());
+        assert_eq!(differing(&held(&dir), &want), Vec::<String>::new());
+    }
+
+    // A file beside a file the selection doesn't take, by the name of that
+    // one's with .tmp after it, stays: no fetch of a download left it (an
+    // operator's copy, say). Here poi_cells.bin.tmp in a dir of no POIs,
+    // which never held poi_cells.bin, and water/admin_cells.bin.tmp on a
+    // switch to no water, the ledger naming the sha256 of
+    // water/admin_cells.bin.
+    #[tokio::test]
+    async fn a_temp_name_beside_a_file_no_fetch_left_unknown_stays() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let none = sel("europe", "admin", "simplified", "none");
+        for (before, kept) in [(none.clone(), "poi_cells.bin.tmp"), (wet("europe", "admin", "simplified", "none", "all"), "water/admin_cells.bin.tmp")] {
+            let root = ScratchDir::new();
+            let dir = root.path().join("europe");
+            download(&bucket, &before, root.path()).await.unwrap();
+            std::fs::write(dir.join(kept), "an operator's copy").unwrap();
+
+            download(&bucket, &none, root.path()).await.unwrap();
+
+            let mut want = files_of(&bucket, &none);
+            want.insert(kept.into(), b"an operator's copy".to_vec());
+            assert_eq!(differing(&held(&dir), &want), Vec::<String>::new(), "{kept}");
+        }
+    }
+
+    // A fetch writes nothing through a link, to a file or a dir outside the
+    // region dir, which the dir's lock doesn't guard: not through one in a
+    // fetch dir of the downloader's (a killed fetch's), which goes with the
+    // fetch dir before a fetch writes there, nor through one at a file's
+    // name with .tmp after it, which stays, as it is none of a download's.
+    // Each file comes down in place and the links' files stay as they were,
+    // in the region dir and in its water dir alike. One at a fetch dir's
+    // place fails the download (a_download_fails_on_what_isnt_its_own_at_a_fetch_dirs_place_changing_nothing).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fetch_writes_nothing_through_a_link_at_its_temp_name() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let s = wet("europe", "admin", "simplified", "none", "all");
+        let links: [&[(&str, &str)]; 2] = [
+            &[(".fetching/admin_cells.bin", "notes.txt"), ("water/.fetching/admin_cells.bin", "notes.txt"), ("admin_cells.bin.tmp", "notes.txt")],
+            &[(".fetching/admin_cells.bin", "theirs"), ("water/.fetching/admin_cells.bin", "theirs/water"), ("water/admin_cells.bin.tmp", "notes.txt")],
+        ];
+        for links in links {
+            let (root, other) = (ScratchDir::new(), ScratchDir::new());
+            std::fs::create_dir_all(other.path().join("theirs/water")).unwrap();
+            for name in ["notes.txt", "theirs/admin_cells.bin", "theirs/water/admin_cells.bin"] {
+                std::fs::write(other.path().join(name), "an operator's notes").unwrap();
+            }
+            let before = held(other.path());
+            let dir = root.path().join("europe");
+            for (at, to) in links {
+                let parent = dir.join(at).parent().unwrap().to_path_buf();
+                if parent.ends_with(FETCH_DIR) {
+                    std::fs::create_dir_all(parent.parent().unwrap()).unwrap();
+                    make_fetch_dir(&parent).await.unwrap();
+                } else {
+                    std::fs::create_dir_all(&parent).unwrap();
+                }
+                std::os::unix::fs::symlink(other.path().join(to), dir.join(at)).unwrap();
+            }
+
+            download(&bucket, &s, root.path()).await.unwrap();
+
+            let case = format!("{links:?}");
+            assert!(held(other.path()) == before, "{case}");
+            for fetches in [".fetching", "water/.fetching"] {
+                assert!(std::fs::symlink_metadata(dir.join(fetches)).is_err(), "{case}: {fetches}");
+            }
+            for name in ["admin_cells.bin", "water/admin_cells.bin"] {
+                assert!(!std::fs::symlink_metadata(dir.join(name)).unwrap().file_type().is_symlink(), "{case}: {name}");
+            }
+            let mut want = files_of(&bucket, &s);
+            for (at, _) in links.iter().filter(|(at, _)| at.ends_with(".tmp")) {
+                assert!(std::fs::symlink_metadata(dir.join(at)).unwrap().file_type().is_symlink(), "{case}: {at}");
+                want.insert(at.to_string(), b"an operator's notes".to_vec());
+            }
+            assert!(held(&dir) == want, "{case}: {:?}", held(&dir).keys().collect::<Vec<_>>());
+        }
+    }
+
+    // A file in a fetch dir of the downloader's (a killed fetch's, in a dir
+    // with no ledger here) goes with the fetch dir before a fetch writes
+    // there, and so does an empty one (killed before its mark went in, or an
+    // operator's, holding nothing) and one holding nothing but its mark,
+    // empty or with the start of its text (killed as the mark went in):
+    // each file comes down in place, in the
+    // region dir and in its water dir alike, and no fetch dir stays. A file
+    // at a file's name with .tmp after it is none of a download's, and stays.
+    #[tokio::test]
+    async fn a_fetch_replaces_a_file_at_its_temp_name() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let s = wet("europe", "admin", "simplified", "none", "all");
+        for water_mark in [None, Some(""), Some(&FETCH_MARK_TEXT[..20])] {
+            let root = ScratchDir::new();
+            let dir = root.path().join("europe");
+            std::fs::create_dir_all(dir.join("water/.fetching")).unwrap();
+            if let Some(text) = water_mark {
+                std::fs::write(dir.join("water/.fetching").join(FETCH_MARK), text).unwrap();
+            }
+            make_fetch_dir(&dir.join(".fetching")).await.unwrap();
+            for temp in [".fetching/admin_cells.bin", "admin_cells.bin.tmp"] {
+                std::fs::write(dir.join(temp), "the first bytes of a fetch").unwrap();
+            }
+
+            let got = download(&bucket, &s, root.path()).await.map_err(|e| e.to_string());
+
+            assert_eq!(got, Ok(()), "{water_mark:?}");
+            for fetches in [".fetching", "water/.fetching"] {
+                assert!(!dir.join(fetches).exists(), "{water_mark:?}: {fetches}");
+            }
+            let mut want = files_of(&bucket, &s);
+            want.insert("admin_cells.bin.tmp".into(), b"the first bytes of a fetch".to_vec());
+            assert!(held(&dir) == want, "{water_mark:?}: {:?}", held(&dir).keys().collect::<Vec<_>>());
+        }
+    }
+
+    // A download removes what a fetch dir of the downloader's holds before
+    // its mark (FETCH_MARK), and the mark before the dir: killed part way
+    // through, it leaves the mark beside what is left, a dir the next
+    // download takes for the downloader's and removes. Here a fetch dir
+    // holding what four killed fetches left, the download stopped once it
+    // removed one, two, three and four of its five entries.
+    #[tokio::test]
+    async fn a_download_killed_while_it_removes_a_fetch_dir_leaves_the_dir_marked() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let s = wet("europe", "admin", "simplified", "none", "all");
+        let left = ["admin_cells.bin", "admin_entries.bin", "place_cells.bin", "strings_core.bin"];
+        for removed in 1..=left.len() {
+            let root = ScratchDir::new();
+            let (dir, fetches) = (root.path().join("europe"), root.path().join("europe").join(FETCH_DIR));
+            std::fs::create_dir_all(&dir).unwrap();
+            make_fetch_dir(&fetches).await.unwrap();
+            for name in left {
+                std::fs::write(fetches.join(name), "the first bytes of a fetch").unwrap();
+            }
+            STOP_ONCE_CLEARED.set(Some(removed));
+
+            let stopped = download(&bucket, &s, root.path()).await.map_err(|e| e.to_string());
+            let marked = fetches.join(FETCH_MARK).exists();
+            let got = download(&bucket, &s, root.path()).await.map_err(|e| e.to_string());
+
+            assert_eq!(stopped, Err(format!("I/O error: stopped once {removed} of what {} holds went", fetches.display())));
+            assert_eq!((marked, got), (true, Ok(())), "{removed} removed");
+            assert!(held(&dir) == files_of(&bucket, &s), "{removed} removed: {:?}", held(&dir).keys().collect::<Vec<_>>());
+        }
+    }
+
+    // A download killed once its last fetch was in, before it removed the
+    // fetch dirs, leaves them holding their marks: the next, which has
+    // nothing to fetch, removes those of the downloader's as it stamps the
+    // dir. One at a fetch dir's place that is none of the downloader's
+    // stays, as such a download changes no file.
+    #[tokio::test]
+    async fn a_download_with_nothing_to_fetch_removes_the_fetch_dirs_a_killed_one_left() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let s = wet("europe", "admin", "simplified", "none", "all");
+        for theirs in [false, true] {
+            let root = ScratchDir::new();
+            let dir = root.path().join("europe");
+            download(&bucket, &s, root.path()).await.unwrap();
+            std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
+            make_fetch_dir(&dir.join(FETCH_DIR)).await.unwrap();
+            if theirs {
+                std::fs::create_dir(dir.join("water").join(FETCH_DIR)).unwrap();
+                std::fs::write(dir.join("water").join(FETCH_DIR).join("notes.txt"), "an operator's notes").unwrap();
+            } else {
+                make_fetch_dir(&dir.join("water").join(FETCH_DIR)).await.unwrap();
+            }
+            let served = bucket.files_served();
+
+            download(&bucket, &s, root.path()).await.unwrap();
+
+            assert_eq!(bucket.files_served(), served, "theirs: {theirs}");
+            let mut want = files_of(&bucket, &s);
+            if theirs {
+                want.insert("water/.fetching/notes.txt".into(), b"an operator's notes".to_vec());
+            }
+            assert!(held(&dir) == want, "theirs: {theirs}: {:?}", held(&dir).keys().collect::<Vec<_>>());
+        }
+    }
+
+    // What a decode killed in the water dir left there is finished before
+    // the download lists the files to remove, as in the region dir: water
+    // all, then a download of major killed once its admin_polygons.bin went
+    // in over all's, then a switch to no water. The decode's dir would else
+    // stay, to put all's file back on the next decode into the water dir.
+    // And where the ledger was lost and none is in the file's place, the
+    // file the decode's dir puts back is one of the build's names there,
+    // which goes: listed before the dir was finished, it would stay.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_download_finishes_what_a_killed_decode_left_in_the_water_dir() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (all, major) = (wet("europe", "admin", "simplified", "none", "all"), wet("europe", "admin", "simplified", "none", "major"));
+        let after = sel("europe", "admin", "simplified", "none");
+        let ours = files_of(&bucket, &major)["water/admin_polygons.bin"].clone();
+        for lost in [false, true] {
+            let root = ScratchDir::new();
+            let (dir, water) = (root.path().join("europe"), root.path().join("europe/water"));
+            download(&bucket, &all, root.path()).await.unwrap();
+            let ledger = std::fs::read_to_string(dir.join(FILE_LEDGER)).unwrap();
+            std::fs::write(dir.join(FILE_LEDGER), format!("{ledger}water/admin_polygons.bin -\n")).unwrap();
+            std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
+            std::fs::create_dir(water.join(KILLED_DECODES_DIR)).unwrap();
+            std::fs::rename(water.join("admin_polygons.bin"), water.join(KILLED_DECODES_DIR).join(".earlier.admin_polygons.bin")).unwrap();
+            if lost {
+                std::fs::remove_file(dir.join(FILE_LEDGER)).unwrap();
+            } else {
+                std::fs::write(water.join("admin_polygons.bin"), &ours).unwrap();
+            }
+
+            download(&bucket, &after, root.path()).await.unwrap();
+
+            assert!(!water.join(KILLED_DECODES_DIR).exists(), "lost: {lost}");
+            assert_eq!(differing(&held(&dir), &files_of(&bucket, &after)), Vec::<String>::new(), "lost: {lost}");
+        }
+    }
+
+    // A component's dir is one name in the region dir: one that would put
+    // files elsewhere is refused before a byte is fetched or anything is
+    // written, a component's the selection doesn't take too, and so is one
+    // starting with a dot, as the downloader's own names there do (a fetch
+    // dir, whose files a download removes once its last fetch is in). Here
+    // a killed decode's dir lies in the dir beside the region's, where
+    // "../elsewhere" and its absolute path point, which a download that
+    // finished it there would empty.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_component_whose_dir_is_no_dir_of_the_region_is_refused_before_fetching_a_file() {
+        for (component, water) in [("water.all", "all"), ("water.major", "none")] {
+            let root = ScratchDir::new();
+            let elsewhere = root.path().join("elsewhere");
+            for dir in ["../elsewhere", elsewhere.to_str().unwrap(), "water/deeper", "..", ".", ".fetching", ".water"] {
+                let mut components = test_bucket::template_components();
+                components[component]["dir"] = serde_json::json!(dir);
+                let bucket = test_bucket::serve(components).await;
+                let killed = elsewhere.join(KILLED_DECODES_DIR);
+                std::fs::create_dir_all(&killed).unwrap();
+                std::fs::write(killed.join(".earlier.notes.txt"), "not the region's").unwrap();
+
+                let got = download(&bucket, &wet("europe", "admin", "simplified", "none", water), root.path()).await.map_err(|e| e.to_string());
+
+                assert_eq!(got, Err(format!("the manifest's component \"{component}\" puts its files in \"{dir}\", which is no dir of the region's")));
+                assert_eq!(bucket.files_served(), 0, "{component} {dir}");
+                assert!(killed.join(".earlier.notes.txt").exists(), "{component} {dir}");
+                assert!(!root.path().join("europe").join(FILE_LEDGER).exists(), "{component} {dir}");
+            }
+        }
+    }
+
+    // A download writes nothing through a link: where the region's water
+    // dir is a link (to another dataset's water dir, say) or a file, it is
+    // refused before anything is fetched, finished, removed or written, the
+    // selection taking water or not, and the other dataset's files stay as
+    // they were.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_water_dir_that_is_a_link_or_a_file_is_refused_before_anything_is_written() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let water_all = wet("europe", "admin", "simplified", "none", "all");
+        for after in [water_all.clone(), sel("europe", "admin", "simplified", "none")] {
+            for link in [true, false] {
+                let (root, other) = (ScratchDir::new(), ScratchDir::new());
+                download(&bucket, &water_all, other.path()).await.unwrap();
+                let (theirs, served) = (held(&other.path().join("europe")), bucket.files_served());
+                let dir = root.path().join("europe");
+                std::fs::create_dir(&dir).unwrap();
+                if link {
+                    std::os::unix::fs::symlink(other.path().join("europe/water"), dir.join("water")).unwrap();
+                } else {
+                    std::fs::write(dir.join("water"), "not a dir").unwrap();
+                }
+
+                let got = download(&bucket, &after, root.path()).await.map_err(|e| e.to_string());
+
+                let case = format!("water {}, link: {link}", after.water);
+                assert_eq!(got, Err(format!("I/O error: {} is a link or a file, not a dir: a download writes nothing through it", dir.join("water").display())), "{case}");
+                assert_eq!(bucket.files_served(), served, "{case}");
+                assert!(held(&other.path().join("europe")) == theirs, "{case}");
+                assert!(!dir.join(FILE_LEDGER).exists(), "{case}");
+            }
+        }
     }
 
     // Only the ledger tells a file holds the build's bytes: a dir stamped
@@ -1744,7 +2781,7 @@ mod tests {
         download(&bucket, &s, whole.path()).await.unwrap();
         let all = bucket.files_served();
         older_build(&bucket, &s, root.path());
-        std::fs::write(root.path().join("europe").join(BUILD_STAMP), test_bucket::DATE).unwrap();
+        std::fs::write(root.path().join("europe").join(BUILD_STAMP), stamp_text(test_bucket::DATE, &bucket.url, &s)).unwrap();
 
         download(&bucket, &s, root.path()).await.unwrap();
 
@@ -1760,7 +2797,8 @@ mod tests {
             "mode.admin": { "files": ["{region}/admin/admin_cells.bin"] },
             "quality.simplified": {},
             "poi_tier.major": { "files": ["{region}/poi/major/arc_index.bin"] },
-            "poi_tier.all": { "files": ["{region}/poi/all/arc_index.bin"] }
+            "poi_tier.all": { "files": ["{region}/poi/all/arc_index.bin"] },
+            "water.none": {}
         })
     }
 
@@ -1791,7 +2829,7 @@ mod tests {
             assert_eq!((fetched, replaced == theirs), (1, true), "stopped: {stopped}");
             // The dir was stamped with the build before the switch: one that
             // stopped part way leaves it stamped with none.
-            assert_eq!(stamp.as_deref(), (!stopped).then_some(test_bucket::DATE), "stopped: {stopped}");
+            assert_eq!(stamp, (!stopped).then(|| stamp_text(test_bucket::DATE, &bucket.url, &all)), "stopped: {stopped}");
             assert_eq!(bucket.files_served() - before, 2, "stopped: {stopped}");
             assert!(held(&root.path().join("europe")) == files_of(&bucket, &major), "stopped: {stopped}");
         }
@@ -2086,6 +3124,109 @@ mod tests {
         assert!(held(&dir) == files_of(&bucket, &s));
     }
 
+    // A last line a kill cut short before the space after its name (at the
+    // water dir's name, just past its slash, inside a file's name or at its
+    // end) may hold a part of a name only, and names no file: a retry, and a
+    // switch to no water, go through, the water dir left a dir and a file of
+    // another's at the cut's name kept, and the line goes with the ledger's
+    // rewrite. A download stopped once it wrote lines after the cut one
+    // leaves it naming none either.
+    #[tokio::test]
+    async fn a_ledgers_last_line_cut_short_at_the_water_dirs_name_names_no_file() {
+        use std::io::Write;
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let water_all = wet("europe", "admin", "simplified", "none", "all");
+        for after in [water_all.clone(), sel("europe", "admin", "simplified", "none")] {
+            for cut in ["water", "water/", "water/arc_", "water/arc_index.bin"] {
+                let root = ScratchDir::new();
+                let dir = root.path().join("europe");
+                download(&bucket, &water_all, root.path()).await.unwrap();
+                std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
+                write!(std::fs::OpenOptions::new().append(true).open(dir.join(FILE_LEDGER)).unwrap(), "{cut}").unwrap();
+                std::fs::write(dir.join("water/arc_"), "an operator's notes").unwrap();
+                std::fs::remove_file(dir.join("admin_cells.bin")).unwrap();
+                STOP_ONCE_FETCHED.set(Some("europe/admin/admin_cells.bin"));
+
+                let stopped = download(&bucket, &after, root.path()).await.map_err(|e| e.to_string());
+                let kept = std::fs::read_to_string(dir.join("water/arc_")).ok();
+                let got = download(&bucket, &after, root.path()).await.map_err(|e| e.to_string());
+
+                let case = format!("water {}, cut at {cut:?}", after.water);
+                assert_eq!(stopped, Err("I/O error: stopped once europe/admin/admin_cells.bin was in place".to_string()), "{case}");
+                assert_eq!((kept.as_deref(), got), (Some("an operator's notes"), Ok(())), "{case}");
+                let mut want = files_of(&bucket, &after);
+                want.insert("water/arc_".into(), b"an operator's notes".to_vec());
+                assert_eq!(differing(&held(&dir), &want), Vec::<String>::new(), "{case}");
+            }
+        }
+    }
+
+    // A file the selection doesn't take that is a dir, not a file, can't be
+    // removed: the download fails naming it, and leaves no stamp, so that no
+    // server loads a dir the water layer's open would refuse. Here a dir at
+    // water/admin_cells.bin, named by the ledger, and the same where the dir
+    // has no ledger (laid out by hand), on a switch to no water.
+    #[tokio::test]
+    async fn a_dir_at_the_place_of_a_file_the_selection_doesnt_take_fails_the_download() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let none = sel("europe", "admin", "simplified", "none");
+        for ledger in [true, false] {
+            let root = ScratchDir::new();
+            let dir = root.path().join("europe");
+            download(&bucket, &wet("europe", "admin", "simplified", "none", "all"), root.path()).await.unwrap();
+            if !ledger {
+                std::fs::remove_file(dir.join(FILE_LEDGER)).unwrap();
+            }
+            std::fs::remove_file(dir.join("water/admin_cells.bin")).unwrap();
+            std::fs::create_dir(dir.join("water/admin_cells.bin")).unwrap();
+
+            let got = download(&bucket, &none, root.path()).await.map_err(|e| e.to_string());
+
+            let at = dir.join("water/admin_cells.bin");
+            let removing = format!("I/O error: remove {}: ", at.display());
+            assert!(got.as_ref().is_err_and(|e| e.starts_with(&removing)), "ledger {ledger}: {got:?}");
+            assert!(!dir.join(BUILD_STAMP).exists(), "ledger {ledger}");
+            assert!(at.is_dir(), "ledger {ledger}");
+        }
+    }
+
+    // A stamp names the bucket and the selection a download left: its text
+    // gives them back, for the region of its dir. Text of another form (a
+    // date alone, a line out of place or missing, a bucket with a newline in
+    // it) names none.
+    #[test]
+    fn a_stamp_names_the_bucket_and_the_selection_of_its_download() {
+        let s = wet("europe", "full", "exact", "major", "all-exact");
+        let text = stamp_text("2026-01-01", "http://bucket/geocoder", &s);
+
+        assert_eq!(text, "2026-01-01\nbase_url http://bucket/geocoder\nmode full\nquality exact\npoi_tier major\nwater all-exact\n");
+        assert_eq!(stamped_source(&text, "europe"), Some(("http://bucket/geocoder".to_string(), s.clone())));
+        let swapped = text.replace("mode full\nquality exact", "quality exact\nmode full");
+        let cut = text.trim_end_matches("water all-exact\n").to_string();
+        for other in ["2026-01-01".to_string(), swapped, cut, stamp_text("2026-01-01", "http://bucket\nmode admin", &s)] {
+            assert_eq!(stamped_source(&other, "europe"), None, "{other:?}");
+        }
+    }
+
+    // A bucket that serves objects of other bytes gives the true objects'
+    // sizes in its manifest, as a bucket serving those does: the sizes of
+    // what it serves once mended. Here a unit and a file's .zst, each
+    // served with bytes after its own.
+    #[tokio::test]
+    async fn a_tampered_buckets_manifest_gives_the_sizes_of_what_it_serves_once_mended() {
+        const UNIT: &str = "europe/water/all/simplified/arcs.tt.zst";
+        const FILE: &str = "europe/admin/admin_cells.bin";
+        let tampered = test_bucket::serve_tampered(test_bucket::template_components(), |path, bytes| {
+            if path == UNIT || path == format!("{FILE}.zst") {
+                bytes.extend_from_slice(b"and more");
+            }
+        }).await;
+        let true_one = test_bucket::serve(test_bucket::template_components()).await;
+
+        let sizes = |b: &TestBucket| (b.manifest.units[UNIT].size, b.manifest.files[FILE].size_zst);
+        assert_eq!(sizes(&tampered), sizes(&true_one));
+    }
+
     // A complete download leaves the ledger a line a file, each naming the
     // build's sha256, however many lines it held, and the stamp.
     #[tokio::test]
@@ -2103,7 +3244,7 @@ mod tests {
         let want = files_of(&bucket, &s);
         assert!(lines > want.len(), "{lines}");
         assert_eq!(std::fs::read_to_string(dir.join(FILE_LEDGER)).unwrap(), String::from_utf8(want[FILE_LEDGER].clone()).unwrap());
-        assert_eq!(std::fs::read_to_string(dir.join(BUILD_STAMP)).unwrap(), test_bucket::DATE);
+        assert_eq!(std::fs::read_to_string(dir.join(BUILD_STAMP)).unwrap(), stamp_text(test_bucket::DATE, &bucket.url, &s));
     }
 
     // A unit with one bad byte, in a file's bytes (decoded, of another
@@ -2173,7 +3314,7 @@ mod tests {
         drop(other);
         let late = match early {
             Some(_) => None,
-            None => Some(waiting.await.map_err(|e| e.to_string())),
+            None => Some(waiting.await.map(drop).map_err(|e| e.to_string())),
         };
 
         assert_eq!(early, None, "done while the lock was held");
@@ -2286,13 +3427,15 @@ mod tests {
     #[tokio::test]
     async fn a_unit_this_build_cant_take_is_refused_before_fetching_a_file() {
         let bucket = test_bucket::serve(test_bucket::template_components()).await;
-        let s = sel("europe", "admin", "simplified", "none");
+        let s = wet("europe", "admin", "simplified", "none", "all");
         let unit = "europe/admin/places.tt.zst";
         for (change, error) in [
             (Box::new(|u: &mut UnitEntry| u.transport_version = 2) as Box<dyn Fn(&mut UnitEntry)>,
              format!("transport unit {unit}: a unit of transport version 2: this build reads version {TRANSPORT_VERSION} only")),
             (Box::new(|u: &mut UnitEntry| u.files.push("europe/full/street_ways.bin".into())),
              format!("transport unit {unit}: holds europe/full/street_ways.bin, which the selection doesn't take")),
+            (Box::new(|u: &mut UnitEntry| u.files.push("europe/water/all/simplified/admin_cells.bin".into())),
+             format!("transport unit {unit}: its files go in more than one dir")),
         ] {
             let mut manifest = bucket.manifest.clone();
             change(manifest.units.get_mut(unit).unwrap());
@@ -2359,6 +3502,10 @@ mod tests {
         assert_eq!(
             DownloadError::MissingComponent("dir.admin-minimal".into()).to_string(),
             "the manifest names component \"dir.admin-minimal\" but does not define it"
+        );
+        assert_eq!(
+            DownloadError::BadDir { component: "water.all".into(), dir: "../up".into() }.to_string(),
+            "the manifest's component \"water.all\" puts its files in \"../up\", which is no dir of the region's"
         );
         assert_eq!(
             DownloadError::Transport("europe/admin/places.tt.zst: transport: the unit ends early, past byte 12".into()).to_string(),

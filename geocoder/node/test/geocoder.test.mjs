@@ -1,5 +1,6 @@
-// The binding: reverse geocoding finds a place in its cell, a boundary by its arcs and nothing
-// off the globe. Place search uses an index shipped beside its dataset as is,
+// The binding: reverse geocoding finds a place in its cell, a boundary by its arcs, the water of
+// the dataset's water dir and nothing off the globe. Place search uses an index shipped beside its
+// dataset as is,
 // rebuilds one shipped for other files, builds a missing one on the device, and refuses files
 // replaced under a loaded geocoder. A transport unit streamed into its decoder becomes its files,
 // each of its sha256, or leaves the dir as it was.
@@ -108,27 +109,15 @@ function fcc2(strings) {
   return Buffer.concat([...body, ...table, u32(buckets), u32(raw), Buffer.from('FCC2')]);
 }
 
-// A dataset as the builder writes one: a country boundary, listed in the admin cell of
-// COUNTRY_CELL, and two places named `names`.
-function writeDataset(dir, names) {
-  const strings = [];
-  let size = 0;
-  const string = (s) => {
-    const at = size;
-    const bytes = Buffer.from(s);
-    strings.push(bytes);
-    size += bytes.length + 1;
-    return at;
-  };
-  const country = string('Testland');
-  const places = names.map(string);
-  // The country's ring as one arc in e7 units (builder/src/arc_blocks.h): a flags byte (grid
-  // exponent 0, first-order deltas, base width b over 2 in bits 3-6, no box), the first vertex,
-  // then the zigzag deltas in groups of 16: a byte of the group's widths over b (lat << 4 |
-  // lng), then its lat and its lng deltas at those widths, LSB first. A short group's widths
-  // sum to 8 or more. Its ring block is one chunk of one ref, to slot 0, that ends the ring.
-  const ring = [[10, 20], [10, 21], [11, 21], [11, 20], [10, 20]].map(([lat, lng]) => [lat * 1e7, lng * 1e7]);
-  const width = (v) => (v ? v.toString(2).length : 0);
+const width = (v) => (v ? v.toString(2).length : 0);
+
+// A closed ring of [lat, lng] degrees as one arc in e7 units (builder/src/arc_blocks.h): a flags
+// byte (grid exponent 0, first-order deltas, base width b over 2 in bits 3-6, no box), the first
+// vertex, then the zigzag deltas in groups of 16: a byte of the group's widths over b (lat << 4 |
+// lng), then its lat and its lng deltas at those widths, LSB first. A short group's widths sum to
+// 8 or more.
+function arcOf(degrees) {
+  const ring = degrees.map(([lat, lng]) => [Math.round(lat * 1e7), Math.round(lng * 1e7)]);
   const zl = ring.slice(1).map(([lat], i) => zigzag(lat - ring[i][0]));
   const zg = ring.slice(1).map(([, lng], i) => zigzag(lng - ring[i][1]));
   const b = 2 * Math.floor((Math.max(0, Math.max(...zl.map(width), ...zg.map(width)) - 15) + 1) / 2);
@@ -149,7 +138,33 @@ function writeDataset(dir, names) {
     for (let i = 0; i < bytes.length; i++) bytes[i] = Number((bits >> BigInt(8 * i)) & 0xffn);
     groups.push(Buffer.from([((wl - b) << 4) | (wg - b)]), bytes);
   }
-  const arc = Buffer.concat([Buffer.from([(b / 2) << 3]), i32(ring[0][0]), i32(ring[0][1]), ...groups]);
+  return Buffer.concat([Buffer.from([(b / 2) << 3]), i32(ring[0][0]), i32(ring[0][1]), ...groups]);
+}
+
+// A string pool's strings, each placed at its offset: [strings, offset of each, the pool's size].
+function pool(names) {
+  let size = 0;
+  const offsets = names.map((s) => {
+    const at = size;
+    size += Buffer.from(s).length + 1;
+    return at;
+  });
+  return [names.map((s) => Buffer.from(s)), offsets, size];
+}
+
+// The layout of a dataset whose strings are a core tier of `size` bytes.
+const coreLayout = (size) => JSON.stringify({ tiers: Array.from({ length: 5 }, (_, t) => ({ start: t === 0 ? 0 : size, end: size })) });
+
+// The country's ring: (10, 20) to (11, 21).
+const COUNTRY = [[10, 20], [10, 21], [11, 21], [11, 20], [10, 20]];
+
+// A dataset as the builder writes one: a country boundary of the ring `ring`, listed in the admin
+// cell of COUNTRY_CELL, and two places named `names`.
+function writeDataset(dir, names, ring = COUNTRY) {
+  const [strings, [country, ...places], size] = pool(['Testland', ...names]);
+  // The country's ring as one arc. Its ring block is one chunk of one ref, to slot 0, that ends
+  // the ring.
+  const arc = arcOf(ring);
   const rings = Buffer.from([(1 << 2) | 1, 0]);
   // Its record: its ring block at 0 (to the end of admin_rings.bin), its name, area, country
   // code and admin level 2 (level << 4 | place type).
@@ -178,7 +193,6 @@ function writeDataset(dir, names) {
   for (let i = 0; i < block.length; i++) block[i] = Number((rowBits >> BigInt(8 * i)) & 0xffn);
   const nodes = Buffer.concat([block, u32(latBase), u32(lngBase), u32(0), Buffer.from([wl, wg, wn, 0]), u32(rows.length), Buffer.from('PNL3')]);
   const placeCells = Buffer.concat(rows.map((r, i) => Buffer.concat([u32(r.key), u32(i)])));
-  const tiers = Array.from({ length: 5 }, (_, t) => ({ start: t === 0 ? 0 : size, end: size }));
   const [adminCells, adminEntries] = adminIndex(COUNTRY_CELL, 0);
   const files = {
     'admin_polygons.bin': polygons,
@@ -193,21 +207,47 @@ function writeDataset(dir, names) {
     'place_nodes.bin': nodes,
     'place_hidden.bin': Buffer.alloc(0),
     'strings_core.bin': fcc2(strings),
-    'strings_layout.json': JSON.stringify({ tiers }),
+    'strings_layout.json': coreLayout(size),
   };
-  for (const [name, bytes] of Object.entries(files)) {
-    // As a patch replaces a file: a new one renamed over it.
-    writeFileSync(join(dir, `${name}.new`), bytes);
-    renameSync(join(dir, `${name}.new`), join(dir, name));
-  }
+  writeFiles(dir, files);
   return dir;
 }
 
+// Writes `files` into `dir` as a patch replaces a file: a new one renamed over it.
+function writeFiles(dir, files) {
+  for (const [name, bytes] of Object.entries(files)) {
+    writeFileSync(join(dir, `${name}.new`), bytes);
+    renameSync(join(dir, `${name}.new`), join(dir, name));
+  }
+}
+
+// A water dir as the builder writes one (builder/src/water_layer.h), the admin files of a set of
+// their own: Testsee, a lake (type code 2, water_meta.json's water/lake) around (10.5, 20.5),
+// listed in the admin cell of COUNTRY_CELL (about 10.47 to 10.56 by 20.43 to 20.52), not
+// interior: the cell holds points outside it, as (10.5, 20.45). Its record carries its type code
+// where a boundary's carries a country code.
+function writeWater(dir) {
+  mkdirSync(dir, { recursive: true });
+  const [strings, [lake], size] = pool(['Testsee']);
+  const [cells, entries] = adminIndex(COUNTRY_CELL, 0);
+  writeFiles(dir, {
+    'admin_polygons.bin': Buffer.concat([u32(0), u32(lake), f32(0.0004), u16(2), Buffer.from([0, 0])]),
+    'admin_rings.bin': Buffer.from([(1 << 2) | 1, 0]),
+    'arc_index.bin': u32(0),
+    'arc_vertices.bin': arcOf([[10.49, 20.49], [10.49, 20.51], [10.51, 20.51], [10.51, 20.49], [10.49, 20.49]]),
+    'admin_cells.bin': cells,
+    'admin_entries.bin': entries,
+    'strings_core.bin': fcc2(strings),
+    'strings_layout.json': coreLayout(size),
+    'water_meta.json': JSON.stringify({ types: [{ code: 2, class: 'water', type: 'lake', rank: 20 }] }),
+  });
+}
+
 let datasets = 0;
-const dataset = (names) => {
+const dataset = (names, ring) => {
   const dir = join(root, `ds${datasets++}`);
   mkdirSync(dir);
-  return writeDataset(dir, names);
+  return writeDataset(dir, names, ring);
 };
 
 test('reverse geocoding finds a place in its cell', async () => {
@@ -227,6 +267,34 @@ test('reverse geocoding inside the country finds it by its arcs', async () => {
   const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));
 
   assert.equal(JSON.parse(await geocoder.reverseGeocode(10.5, 20.5)).address.country, 'Testland');
+});
+
+test('reverse geocoding finds the water of the dataset\'s water dir, last in the answer', async () => {
+  const dir = dataset(['Testville', 'Otherton']);
+  const without = Geocoder.load(dir);
+  const [dry, dryBeside] = [await without.reverseGeocode(10.5, 20.5), await without.reverseGeocode(10.5, 20.45)];
+  writeWater(join(dir, 'water'));
+  const geocoder = Geocoder.load(dir);
+
+  const wet = await geocoder.reverseGeocode(10.5, 20.5);
+
+  assert.equal(wet, `${dry.slice(0, -1)},"water":{"name":"Testsee","class":"water","type":"lake"}}`);
+  assert.equal(JSON.parse(wet).address.country, 'Testland');
+  // Beside the lake in the cell that lists it: the answer without water, byte for byte.
+  assert.equal(await geocoder.reverseGeocode(10.5, 20.45), dryBeside);
+});
+
+// A point no boundary holds (the open sea; here east of a country whose ring stops short of
+// the lake) has an empty address, and keeps the water of the dataset's water dir.
+test('reverse geocoding a point in water outside every boundary finds the water alone', async () => {
+  const dir = dataset(['Testville', 'Otherton'], [[10, 20], [10, 20.4], [11, 20.4], [11, 20], [10, 20]]);
+  const dry = await Geocoder.load(dir).reverseGeocode(10.5, 20.5);
+  writeWater(join(dir, 'water'));
+
+  const wet = await Geocoder.load(dir).reverseGeocode(10.5, 20.5);
+
+  assert.equal(dry, '{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","address":{}}');
+  assert.equal(wet, '{"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","address":{},"water":{"name":"Testsee","class":"water","type":"lake"}}');
 });
 
 test('reverse geocoding off the globe finds nothing', async () => {
@@ -262,6 +330,19 @@ test('an index shipped for these files is used as is', async () => {
   await Geocoder.load(ci).openPlaceSearch();
   const dir = dataset(['Testville', 'Otherton']);
   cpSync(join(ci, 'search'), join(dir, 'search'), { recursive: true });
+  const geocoder = Geocoder.load(dir);
+
+  assert.equal(await geocoder.openPlaceSearch(), 'current');
+
+  assert.deepEqual(await names(geocoder, 'otherton'), ['Otherton']);
+});
+
+test('an index shipped for these files is used as is beside a water dir', async () => {
+  const ci = dataset(['Testville', 'Otherton']);
+  await Geocoder.load(ci).openPlaceSearch();
+  const dir = dataset(['Testville', 'Otherton']);
+  cpSync(join(ci, 'search'), join(dir, 'search'), { recursive: true });
+  writeWater(join(dir, 'water'));
   const geocoder = Geocoder.load(dir);
 
   assert.equal(await geocoder.openPlaceSearch(), 'current');

@@ -412,7 +412,7 @@ pub fn hold_volume(data: &Path) -> Result<std::fs::File, String> {
 static TRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One try at `object` of the build of `date` at `base_url`
-/// (downloader::download_file_through or download_unit), its files'
+/// (downloader::download_file or download_unit), its files'
 /// entries those of `cfg`, into the build dir `root`. A file's try writes
 /// a temporary file of its own beside it, `<file>.<pid>.<n>.tmp`, as a
 /// unit's decode writes a dir of its own: a try whose round has gone may
@@ -428,7 +428,7 @@ pub async fn try_object(http: &reqwest::Client, base_url: &str, date: &str, cfg:
     let dest = root.join(&object.path);
     let mut tmp = dest.as_os_str().to_owned();
     tmp.push(format!(".{}.{}.tmp", std::process::id(), TRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
-    downloader::download_file_through(http, base_url, date, &object.path, files[0].1, &dest, Path::new(&tmp)).await
+    downloader::download_file(http, base_url, date, &object.path, files[0].1, &dest, Path::new(&tmp)).await
 }
 
 #[derive(Deserialize)]

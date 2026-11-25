@@ -35,6 +35,8 @@ pub mod postcode_grid;
 pub mod side_blocks;
 pub mod strings;
 pub mod transport;
+mod water;
+pub use water::{WaterDetail, WaterKind, WaterLayer, WaterMeta, WATER_DIR, WATER_FILES};
 pub mod way_files;
 pub use addr_files::{AddrFiles, AddrRecord};
 pub use place_files::PlaceFiles;
@@ -110,6 +112,15 @@ impl FileBytes {
                 let off = off as usize;
                 std::borrow::Cow::Borrowed(&m[off..off + len])
             }
+        }
+    }
+
+    /// Hints how a mapped file is read from here on: in order, where the kernel reads ahead of
+    /// each fault, or at random (as mmap_file maps it), where it reads only the page a fault
+    /// needs. Never changes what a read returns; a no-op for owned bytes.
+    pub fn advise_in_order(&self, in_order: bool) {
+        if let Self::Mmap(m) = self {
+            let _ = m.advise(if in_order { memmap2::Advice::Sequential } else { memmap2::Advice::Random });
         }
     }
 
@@ -1279,6 +1290,12 @@ impl StringPool {
     }
 
     pub fn load(dir: &str) -> Result<Self, String> {
+        Self::load_tiers(dir, STR_TIER_COUNT)
+    }
+
+    /// `load`, opening only the first `count` tiers' files: the strings of a later tier read as
+    /// "", whether its file is there or not.
+    pub fn load_tiers(dir: &str, count: usize) -> Result<Self, String> {
         let layout_path = format!("{}/strings_layout.json", dir);
         let layout_src = std::fs::read_to_string(&layout_path)
             .map_err(|e| format!("Failed to read {}: {}", layout_path, e))?;
@@ -1297,6 +1314,9 @@ impl StringPool {
             let end   = entry.get("end").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             bases[t] = start;
             bases[t + 1] = end;
+            if t >= count {
+                continue;
+            }
             let path = format!("{}/{}", dir, STR_TIER_FILENAMES[t]);
             tiers[t] = mmap_file_optional(&path)
                 .map(strings::Tier::open)
@@ -1538,6 +1558,8 @@ pub struct Index {
     pub postcode_grid: Option<postcode_grid::PostcodeGrid>,
     pub admin_config: AdminLevelConfig,
     pub strings: StringPool,
+    /// The water layer of the dataset's water dir (water.rs); none without one.
+    pub water: Option<WaterLayer>,
     pub street_cell_level: u64,
     pub admin_cell_level: u64,
     pub max_distance_sq: f64,
@@ -1692,6 +1714,22 @@ fn with_footprint<R>(read: impl FnOnce(&mut Vec<NodeCoord>) -> R) -> R {
 // and the low 31 bits carry the polygon/POI index.
 pub const INTERIOR_FLAG: u32 = 0x80000000;
 pub const ID_MASK: u32 = 0x7FFFFFFF;
+
+/// Record `idx` of the admin_polygons.bin `polygons`, a tombstone's too, beside an
+/// admin_rings.bin of `rings_len` bytes; None past the end.
+pub(crate) fn polygon_record(polygons: &FileBytes, rings_len: u64, idx: u32) -> Option<AdminPolygon> {
+    let at = u64::from(idx) * ADMIN_POLYGON_RECORD_BYTES;
+    if at + ADMIN_POLYGON_RECORD_BYTES > polygons.len() { return None; }
+    // The record and the next one's ring offset, where its block ends.
+    let last = at + 2 * ADMIN_POLYGON_RECORD_BYTES > polygons.len();
+    let bytes = polygons.read_chunk(at, if last { 16 } else { 20 });
+    let ring_end = if last {
+        rings_len
+    } else {
+        u64::from(u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]))
+    };
+    Some(AdminPolygon::from_record(&bytes, ring_end))
+}
 
 pub fn mmap_file(path: &str) -> Result<FileBytes, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path, e))?;
@@ -1889,6 +1927,7 @@ impl Index {
             postcode_grid,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::load(dir)?,
+            water: WaterLayer::open(&format!("{dir}/{WATER_DIR}"), admin_cell_level)?,
             street_cell_level,
             admin_cell_level,
             max_distance_sq,
@@ -1958,17 +1997,7 @@ impl Index {
 
     /// Record `idx` of admin_polygons.bin, a tombstone's too; None past the end.
     pub fn admin_polygon_record(&self, idx: u32) -> Option<AdminPolygon> {
-        let (m, at) = (&self.admin_polygons, u64::from(idx) * ADMIN_POLYGON_RECORD_BYTES);
-        if at + ADMIN_POLYGON_RECORD_BYTES > m.len() { return None; }
-        // The record and the next one's ring offset, where its block ends.
-        let last = at + 2 * ADMIN_POLYGON_RECORD_BYTES > m.len();
-        let bytes = m.read_chunk(at, if last { 16 } else { 20 });
-        let ring_end = if last {
-            self.admin_geometry.rings_len()
-        } else {
-            u64::from(u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]))
-        };
-        Some(AdminPolygon::from_record(&bytes, ring_end))
+        polygon_record(&self.admin_polygons, self.admin_geometry.rings_len(), idx)
     }
 
     pub fn admin_polygon(&self, idx: u32) -> Option<AdminPolygon> {
@@ -3821,6 +3850,9 @@ impl Index {
             return Address::default();
         }
         let max_dist = self.max_distance_sq;
+        // The water holding the point, which nothing else in the answer depends on: a point no
+        // address anchors (open sea) keeps it.
+        let water = self.water.as_ref().and_then(|w| w.at(lat, lng));
 
         // Run geo lookups first so we know the primary street
         let (addr, interp, street) = self.query_geo(lat, lng);
@@ -4203,7 +4235,7 @@ impl Index {
                 .is_some()
         };
         if !anchored && !place_nodes_only && !water_holds() {
-            return Address::default();
+            return Address { water, ..Address::default() };
         }
         // Nor does the nearest postcode centroid give one where water alone holds the point.
         let resolved_postcode = resolved_postcode.filter(|_| anchored || place_nodes_only);
@@ -4344,7 +4376,7 @@ impl Index {
             address.crosscheck(&rows, &areas);
         }
         let display_name = format_address(&address);
-        Address { licence: Licence, display_name, address, places }
+        Address { licence: Licence, display_name, address, places, water }
     }
 
     /// The rows of an address that are named `name` (a string id), in Nominatim's order within a
@@ -4688,7 +4720,8 @@ fn planar_segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
 // continent subdirs.
 
 /// The stamp of a continent dir the server's downloader fills: the date of
-/// the build it holds a complete selection of, and no other file the
+/// the build it holds a complete selection of, with the bucket and the
+/// selection (the downloader's stamp_text), and no other file the
 /// downloader put there nor of a name a file of the build has. The
 /// downloader removes it before it writes or removes anything else in the
 /// dir but FILE_LEDGER, and puts it back once the last of the selection is
@@ -4823,18 +4856,34 @@ fn cant_write(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EROFS | libc::EACCES | libc::EPERM))
 }
 
+/// A file's device and FileStamp (inode, size, modification time): which
+/// file is at a path, one renamed into place over it another.
+pub type FileMark = (u64, FileStamp);
+
+/// The mark of the file at `path`, None where none is there.
+pub fn file_mark(path: &std::path::Path) -> std::io::Result<Option<FileMark>> {
+    match std::fs::metadata(path) {
+        #[cfg(unix)]
+        Ok(m) => Ok(Some((std::os::unix::fs::MetadataExt::dev(&m), FileStamp::of(&m)))),
+        #[cfg(not(unix))]
+        Ok(m) => Ok(Some((0, FileStamp::of(&m)))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// A continent dir's BUILD_STAMP and FILE_LEDGER as a load finds them: each
-/// None where it isn't there, else its device and FileStamp (inode, size,
-/// modification time). A download that changes a file in the dir changes
-/// one of them first: it makes the ledger where the dir has none, and
-/// removes the stamp. It appends to the ledger or renames a new one over
-/// it, and writes the stamp only under a temp name renamed into place, a
-/// new inode. So a load that finds them the same before it checks the dir
-/// and once it loaded it knows no download changed the dir meanwhile.
+/// None where it isn't there, else its FileMark. A download that changes a
+/// file in the dir changes one of them first: it makes the ledger where the
+/// dir has none, and removes the stamp. It appends to the ledger or renames
+/// a new one over it, and writes the stamp only under a temp name renamed
+/// into place, a new inode. So a load that finds them the same before it
+/// checks the dir and once it loaded it knows no download changed the dir
+/// meanwhile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DirMarks {
-    stamp: Option<(u64, FileStamp)>,
-    ledger: Option<(u64, FileStamp)>,
+    stamp: Option<FileMark>,
+    ledger: Option<FileMark>,
 }
 
 impl DirMarks {
@@ -4842,14 +4891,7 @@ impl DirMarks {
     fn of(dir: &str) -> Result<DirMarks, String> {
         let mark = |name: &str| {
             let path = format!("{}/{}", dir, name);
-            match std::fs::metadata(&path) {
-                #[cfg(unix)]
-                Ok(m) => Ok(Some((std::os::unix::fs::MetadataExt::dev(&m), FileStamp::of(&m)))),
-                #[cfg(not(unix))]
-                Ok(m) => Ok(Some((0, FileStamp::of(&m)))),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(format!("can't check {}: {}", path, e)),
-            }
+            file_mark(std::path::Path::new(&path)).map_err(|e| format!("can't check {}: {}", path, e))
         };
         Ok(DirMarks { stamp: mark(BUILD_STAMP)?, ledger: mark(FILE_LEDGER)? })
     }
@@ -4895,14 +4937,17 @@ thread_local! {
 /// checked and again once Index::load returned, and a load that finds them
 /// changed is dropped. That holds where the lock is taken too: a download
 /// on a file system whose locks don't reach other machines may not see it,
-/// and the check costs a few stats. The files stay mapped after. None for
-/// a dir that isn't there or holds no admin_cells.bin. An error, why the
-/// dir doesn't load, for a lock that can't be taken, a download that broke
-/// off (unfinished_download): it can leave files of a build or selection
-/// beside those of the one before, which Index::load can't tell apart; for
-/// a dir Index::load refuses; and for one a download changed while it
-/// loaded.
-fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Option<Index>, String> {
+/// and the check costs a few stats. The files stay mapped after. With the
+/// index, the text of the stamp the dir held as it loaded, which names the
+/// bucket and the selection of the files it loaded (None for a dir laid out
+/// by other means).
+/// None for a dir that isn't there or holds no admin_cells.bin. An error,
+/// why the dir doesn't load, for a lock that can't be taken, a download that
+/// broke off (unfinished_download): it can leave files of a build or
+/// selection beside those of the one before, which Index::load can't tell
+/// apart; for a dir Index::load refuses; and for one a download changed
+/// while it loaded.
+fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Option<(Index, Option<String>)>, String> {
     // A dir that isn't there holds nothing to load, and gets no lock file.
     if !std::path::Path::new(dir).is_dir() {
         return Ok(None);
@@ -4916,6 +4961,14 @@ fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, sear
     if let Some(why) = marks.unfinished_download() {
         return Err(why);
     }
+    // Read before the dir is, under its lock: a stamp a download put in
+    // meanwhile changes the marks, which the check below finds.
+    let stamp_path = format!("{}/{}", dir, BUILD_STAMP);
+    let stamp = match std::fs::read_to_string(&stamp_path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("can't read {}: {}", stamp_path, e)),
+    };
     #[cfg(test)]
     BEFORE_INDEX_LOAD.with_borrow_mut(|told| {
         if let Some(tell) = told {
@@ -4928,7 +4981,7 @@ fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, sear
     if DirMarks::of(dir)? != marks {
         return Err(format!("a download into it ran while it loaded ({} or {} changed): it may mix two selections' files", BUILD_STAMP, FILE_LEDGER));
     }
-    Ok(Some(index))
+    Ok(Some((index, stamp)))
 }
 
 pub struct ContinentSlot {
@@ -4940,6 +4993,11 @@ pub struct ContinentSlot {
     /// Hot-add via `MultiIndex::install_region` swaps a fresh Arc in
     /// without locking out concurrent queries.
     pub index: arc_swap::ArcSwapOption<Index>,
+    /// The text of the stamp (BUILD_STAMP) its dir held as MultiIndex::load
+    /// loaded it there, which names the bucket and the selection of its
+    /// files: None where it loaded none, and for a dir laid out by other
+    /// means. An install later does not change it.
+    pub loaded_stamp: Option<String>,
 }
 
 pub struct MultiIndex {
@@ -4971,6 +5029,7 @@ impl MultiIndex {
                     name: "world",
                     continent: None,
                     index: arc_swap::ArcSwapOption::from(Some(Arc::new(idx))),
+                    loaded_stamp: None,
                 }],
                 root_dir: root.to_string(),
                 street_cell_level, admin_cell_level, search_distance,
@@ -4986,17 +5045,19 @@ impl MultiIndex {
             // A dir a download broke off in, or that can't load, must not
             // take down the continents that did load; the slot stays empty
             // so the downloader can complete it later.
-            let arc_opt = match load_continent(&dir, street_cell_level, admin_cell_level, search_distance) {
-                Ok(idx) => idx.map(Arc::new),
+            let (arc_opt, loaded_stamp) = match load_continent(&dir, street_cell_level, admin_cell_level, search_distance) {
+                Ok(Some((idx, stamp))) => (Some(Arc::new(idx)), stamp),
+                Ok(None) => (None, None),
                 Err(why) => {
                     eprintln!("skipping continent {}: {}", continent.name, why);
-                    None
+                    (None, None)
                 }
             };
             slots.push(ContinentSlot {
                 name: continent.name,
                 continent: Some(continent),
                 index: arc_swap::ArcSwapOption::from(arc_opt),
+                loaded_stamp,
             });
         }
         Ok(MultiIndex {
@@ -5070,37 +5131,51 @@ impl MultiIndex {
     /// where the dir holds no admin_cells.bin, an error, the slot as it was.
     /// It blocks as long as that download runs: an async caller runs it on a
     /// thread of its own (spawn_blocking), not on one of the runtime's.
-    pub fn install_region(&self, name: &str) -> Result<(), String> {
+    /// Returns the text of the stamp the dir held as it loaded, which names
+    /// the bucket and the selection of the files it loaded.
+    pub fn install_region(&self, name: &str) -> Result<Option<String>, String> {
         let slot = self.continents.iter().find(|c| c.name == name)
             .ok_or_else(|| format!("unknown continent: {}", name))?;
         let dir = format!("{}/{}", self.root_dir, name);
-        let idx = load_continent(&dir, self.street_cell_level, self.admin_cell_level, self.search_distance)?
+        let (idx, stamp) = load_continent(&dir, self.street_cell_level, self.admin_cell_level, self.search_distance)?
             .ok_or_else(|| format!("{}/admin_cells.bin isn't there", dir))?;
         slot.index.store(Some(Arc::new(idx)));
-        Ok(())
+        Ok(stamp)
     }
 
     /// Reverse-geocode dispatch. Picks the best result among matching
     /// loaded continents — "best" = the one whose Address chain has the
-    /// most populated fields (deeper admin chain wins). On the typical
-    /// non-boundary case there's only one match and this is just a
-    /// pass-through.
+    /// most populated fields (deeper admin chain wins), the first of
+    /// those that tie. On the typical non-boundary case there's only one
+    /// match and this is just a pass-through.
     ///
-    /// Returns (Vec<Arc<Index>>, JSON-serialized response). The Arcs
-    /// are returned alongside so the caller can keep them alive while
-    /// the borrowed-string Address gets serialized — borrowing across
-    /// an Arc deref is sound only while the Arc is held.
+    /// The water doesn't count towards the pick, so it never moves an
+    /// address to another continent. It is the one of all the matching
+    /// continents' that answers first in a water dir's order (water.rs),
+    /// the picked answer's where they tie: a continent's water dirs hold
+    /// only the water its region takes in, and continents downloaded on
+    /// other days, or of other water tiers, can hold other water at the
+    /// point.
+    ///
+    /// The answers borrow their strings from the continents' indexes,
+    /// whose Arcs are held here until the chosen one is serialized.
     pub fn query_json(&self, lat: f64, lng: f64) -> String {
         let arcs = self.loaded_matches(lat, lng);
-        let mut best_json: Option<(i32, String)> = None;
-        for arc in &arcs {
-            let r = arc.query(lat, lng);
-            let s = address_score(&r);
-            if best_json.as_ref().map_or(true, |(prev, _)| s > *prev) {
-                best_json = Some((s, serde_json::to_string(&r).unwrap_or_default()));
+        let mut answers: Vec<Address<'_>> = arcs.iter().map(|arc| arc.query(lat, lng)).collect();
+        let mut best: Option<(i32, usize)> = None;
+        for (i, r) in answers.iter().enumerate() {
+            let s = address_score(r);
+            if best.map_or(true, |(prev, _)| s > prev) {
+                best = Some((s, i));
             }
         }
-        best_json.map(|(_, j)| j).unwrap_or_else(|| "{}".to_string())
+        let Some((_, chosen)) = best else { return "{}".to_string() };
+        let mut answer = answers.remove(chosen);
+        answer.water = std::iter::once(answer.water.take())
+            .chain(answers.into_iter().map(|r| r.water))
+            .flatten()
+            .min_by(WaterDetail::order);
+        serde_json::to_string(&answer).unwrap_or_default()
     }
 }
 
@@ -5301,6 +5376,7 @@ mod query_tests {
             postcode_grid: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, end, end, end, end, end]),
+            water: None,
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
             admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
             max_distance_sq: (DEFAULT_SEARCH_DISTANCE / 6_371_000.0).powi(2),
@@ -5366,6 +5442,114 @@ mod query_tests {
 
         assert_eq!(village(elsewhere), None);
         assert_eq!(village(AdminPolygon { ring_bytes: 0, ..elsewhere }).as_deref(), Some("Shoals Village"));
+    }
+
+    // The water field is an extension of the answer: last, and absent where no water holds the
+    // point, so that the answer there is the one of a dataset without water, byte for byte; where
+    // water holds it, the rest of the answer is still that one.
+    #[test]
+    fn water_comes_last_and_changes_no_other_field() {
+        use crate::water::fixture::{WaterFixture, LAKE};
+        // A state (the fixture's boundaries have no country code), listed in the cell of its
+        // centre, where the point is.
+        let (testland, (lat, lng)) = (("Testland", 4, [0.0, 0.0, 2.0, 2.0]), (1.0, 1.0));
+        let with = |water: Option<WaterLayer>| {
+            let mut idx = index(&[testland], &[]);
+            idx.water = water;
+            serde_json::to_string(&idx.query(lat, lng)).unwrap()
+        };
+        let lake = |span| Some(WaterFixture::new().area("Testsee", LAKE, span, &[]).layer());
+
+        let dry = with(None);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&dry).unwrap()["address"], serde_json::json!({"state": "Testland"}));
+        assert_eq!(with(lake((0.5, 0.5, 0.9, 0.9))), dry);
+        let wet = format!("{},\"water\":{{\"name\":\"Testsee\",\"class\":\"water\",\"type\":\"lake\"}}}}", dry.strip_suffix('}').unwrap());
+        assert_eq!(with(lake((0.9, 0.9, 1.1, 1.1))), wet);
+    }
+
+    // A point no boundary, street or place node anchors (open sea) has an empty address, and
+    // keeps its water; off the globe there is none.
+    #[test]
+    fn an_open_sea_point_keeps_its_water() {
+        use crate::water::fixture::{WaterFixture, SEA};
+        let mut idx = index(&[SHOALS], &[]);
+        idx.water = Some(WaterFixture::new().area("South China Sea", SEA, (4.0, 111.0, 6.0, 114.0), &[]).layer());
+
+        let sea = serde_json::json!({"licence": OSM_LICENCE, "address": {}, "water": {"name": "South China Sea", "class": "place", "type": "sea"}});
+        assert_eq!(answer(&idx, 5.5, 113.5), sea);
+        assert_eq!(answer(&idx, 5.05, 112.65), sea);
+        assert_eq!(answer(&idx, 7.0, 113.5), serde_json::json!({"licence": OSM_LICENCE, "address": {}}));
+        assert_eq!(answer(&idx, 5.5, 473.5), serde_json::json!({"licence": OSM_LICENCE, "address": {}}));
+    }
+
+    /// A dispatcher over the continents named (of continents()), each with the index given, in
+    /// the order given.
+    fn multi(slots: Vec<(&'static str, Index)>) -> MultiIndex {
+        let continents = slots.into_iter()
+            .map(|(name, index)| ContinentSlot {
+                name,
+                continent: continents().iter().find(|c| c.name == name),
+                index: arc_swap::ArcSwapOption::from(Some(Arc::new(index))),
+                loaded_stamp: None,
+            })
+            .collect();
+        MultiIndex {
+            continents, root_dir: String::new(),
+            street_cell_level: DEFAULT_STREET_CELL_LEVEL, admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL, search_distance: DEFAULT_SEARCH_DISTANCE,
+        }
+    }
+
+    // Where continents overlap (the Sinai: africa and asia), the answer is the continent's with the
+    // fuller address, as without water, the first of those that tie; its water is the one of all
+    // theirs that answers first in a water dir's order (water.rs), the address's continent's or
+    // another's: continents downloaded on other days, or of other water tiers, can hold other
+    // water at the point.
+    #[test]
+    fn the_water_of_overlapping_continents_answers_in_a_water_dirs_order() {
+        use crate::water::fixture::{WaterFixture, BAY, SEA};
+        // South Sinai, a state, is listed in the cell of its centre, where the point is; the Gulf
+        // of Suez lies in the Red Sea around it.
+        let (lat, lng) = (28.5, 33.6);
+        let egypt = ("South Sinai", 4, [27.5, 32.6, 29.5, 34.6]);
+        let (gulf, sea) = ((28.0, 33.0, 29.0, 34.0), (27.0, 32.0, 30.0, 35.0));
+        let water = |name: &str, code: u16, span| Some(WaterFixture::new().area(name, code, span, &[]).layer());
+        let with = |mut idx: Index, w: Option<WaterLayer>| {
+            idx.water = w;
+            idx
+        };
+        let json = |slots: Vec<(&'static str, Index)>| serde_json::from_str::<serde_json::Value>(&multi(slots).query_json(lat, lng)).unwrap();
+        let named = |name: &str, class: &str, r#type: &str| serde_json::json!({"name": name, "class": class, "type": r#type});
+        let both_orders = |africa: &dyn Fn() -> Index, asia: &dyn Fn() -> Index| {
+            [json(vec![("africa", africa()), ("asia", asia())]), json(vec![("asia", asia()), ("africa", africa())])]
+        };
+
+        // Africa's answer, Asia's water, whichever comes first.
+        let mut want = serde_json::to_value(index(&[egypt], &[]).query(lat, lng)).unwrap();
+        assert_eq!(want["address"], serde_json::json!({"state": "South Sinai"}));
+        want["water"] = named("Gulf of Suez", "natural", "bay");
+        assert_eq!(both_orders(&|| index(&[egypt], &[]), &|| with(index(&[], &[]), water("Gulf of Suez", BAY, gulf))), [want.clone(), want.clone()]);
+        // The smaller body, Africa's or Asia's, beside Africa's address.
+        let gulf_in_asia = both_orders(&|| with(index(&[egypt], &[]), water("Red Sea", SEA, sea)), &|| with(index(&[], &[]), water("Gulf of Suez", BAY, gulf)));
+        assert_eq!(gulf_in_asia, [want.clone(), want.clone()]);
+        let gulf_in_africa = both_orders(&|| with(index(&[egypt], &[]), water("Gulf of Suez", BAY, gulf)), &|| with(index(&[], &[]), water("Red Sea", SEA, sea)));
+        assert_eq!(gulf_in_africa, [want.clone(), want.clone()]);
+        // Bodies of one area, rank and type code: the smaller name, Africa's or Asia's.
+        for (africa, asia) in [("Gulf of Suez", "Gulf of Aqaba"), ("Gulf of Aqaba", "Gulf of Suez")] {
+            let got = both_orders(&|| with(index(&[egypt], &[]), water(africa, BAY, gulf)), &|| with(index(&[], &[]), water(asia, BAY, gulf)));
+            assert_eq!(got.map(|g| g["water"].clone()), [named("Gulf of Aqaba", "natural", "bay"), named("Gulf of Aqaba", "natural", "bay")]);
+        }
+        // Water counts for nothing in the pick: of two empty addresses the first answers, with
+        // the water of the second, and so does the first of two that tie, a state each.
+        let got = json(vec![("africa", index(&[], &[])), ("asia", with(index(&[], &[]), water("Gulf of Suez", BAY, gulf)))]);
+        assert_eq!(got, serde_json::json!({"licence": OSM_LICENCE, "address": {}, "water": named("Gulf of Suez", "natural", "bay")}));
+        assert_eq!(json(vec![("africa", index(&[], &[])), ("asia", index(&[], &[]))]), serde_json::json!({"licence": OSM_LICENCE, "address": {}}));
+        let north = ("North Sinai", 4, [27.5, 32.6, 29.5, 34.6]);
+        for (first, second) in [(egypt, north), (north, egypt)] {
+            let mut want = serde_json::to_value(index(&[first], &[]).query(lat, lng)).unwrap();
+            want["water"] = named("Gulf of Suez", "natural", "bay");
+            let got = json(vec![("africa", index(&[first], &[])), ("asia", with(index(&[second], &[]), water("Gulf of Suez", BAY, gulf)))]);
+            assert_eq!(got, want, "{}", first.0);
+        }
     }
 
     /// (metres north of `origin()`, metres east, name or None for a tombstone, category,
@@ -7206,6 +7390,12 @@ pub struct Address<'a> {
     pub address: AddressDetails<'a>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub places: Vec<PoiDetail>,
+    /// The body of water holding the point, from the dataset's water dir (water.rs): an
+    /// extension of Nominatim's answer, which no other field depends on. Last, and absent where
+    /// no water holds the point, so an answer without water is the answer of a dataset without
+    /// a water dir.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub water: Option<WaterDetail<'a>>,
 }
 
 // Address formatting patterns by country code
@@ -9138,6 +9328,62 @@ mod query_path_tests {
         assert_eq!(address_at(&index, -20_000.0, 100.0)["hamlet"], "Lowfield");
     }
 
+    /// A lake 1 to 3 km north and east of `origin`, with an island 1.8 to 2.2 km north and east.
+    fn lake_near(origin: (f64, f64)) -> crate::water::fixture::WaterFixture {
+        let span = |s: f64, w: f64, n: f64, e: f64| {
+            let (sw, ne) = (at_from(origin, s, w), at_from(origin, n, e));
+            (sw.lat as f64, sw.lng as f64, ne.lat as f64, ne.lng as f64)
+        };
+        let mut water = crate::water::fixture::WaterFixture::new();
+        water.area("Testsee", crate::water::fixture::LAKE, span(1_000.0, 1_000.0, 3_000.0, 3_000.0), &[span(1_800.0, 1_800.0, 2_200.0, 2_200.0)]);
+        water
+    }
+
+    // A dataset dir's water/ holds its water layer: all of its files, or none of them (a dataset
+    // without water, the dir there or not); some without the rest fail the load, naming them.
+    #[test]
+    fn a_dataset_loads_the_water_layer_of_its_water_dir() {
+        let dir = ScratchDir::new();
+        oldtown().write(dir.path());
+        let water = |idx: &Index, north: f64, east: f64| {
+            let p = at(north, east);
+            serde_json::to_value(idx.query(p.lat as f64, p.lng as f64)).unwrap()["water"].clone()
+        };
+        let load = || Index::load(dir.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE);
+
+        assert!(load().unwrap().water.is_none());
+        std::fs::create_dir(dir.path().join(WATER_DIR)).unwrap();
+        assert!(load().unwrap().water.is_none());
+        lake_near(ORIGIN).write(&dir.path().join(WATER_DIR));
+        let idx = load().unwrap();
+        assert_eq!(water(&idx, 1_500.0, 1_500.0), serde_json::json!({"name": "Testsee", "class": "water", "type": "lake"}));
+        assert_eq!((water(&idx, 2_000.0, 2_000.0), water(&idx, 500.0, 500.0)), (serde_json::Value::Null, serde_json::Value::Null));
+        assert_eq!(address_at(&idx, 1_500.0, 1_500.0), address_at(&oldtown().load(), 1_500.0, 1_500.0));
+        std::fs::remove_file(dir.path().join(WATER_DIR).join("admin_rings.bin")).unwrap();
+        assert_eq!(load().err(), Some(format!("Partial water dir {}/{WATER_DIR}: missing [admin_rings.bin]", dir.path().display())));
+    }
+
+    // A continent dir's water/ loads with it, when a server starts and when a download is in.
+    #[test]
+    fn a_continent_loads_the_water_layer_of_its_water_dir() {
+        let paris = (48.85, 2.35);
+        let root = ScratchDir::new();
+        let europe = root.path().join("europe");
+        std::fs::create_dir(&europe).unwrap();
+        TestIndex::around(paris).write(&europe);
+        lake_near(paris).write(&europe.join(WATER_DIR));
+        let p = at_from(paris, 1_500.0, 1_500.0);
+        let water = |mi: &MultiIndex| serde_json::from_str::<serde_json::Value>(&mi.query_json(p.lat as f64, p.lng as f64)).unwrap()["water"]["name"].clone();
+        let load = || MultiIndex::load(root.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+
+        assert_eq!(water(&load()), "Testsee");
+        let late = load();
+        late.continents.iter().for_each(|c| c.index.store(None));
+        assert_eq!(late.loaded_count(), 0);
+        late.install_region("europe").unwrap();
+        assert_eq!(water(&late), "Testsee");
+    }
+
     #[test]
     fn a_claimed_place_node_is_no_answer() {
         let mut dataset = oldtown();
@@ -9868,7 +10114,7 @@ mod query_path_tests {
             let (early, late) = std::thread::scope(|s| {
                 let (done, added) = std::sync::mpsc::channel();
                 let mi = &mi;
-                s.spawn(move || done.send(mi.install_region("europe")).unwrap());
+                s.spawn(move || done.send(mi.install_region("europe").map(drop)).unwrap());
                 let early = added.recv_timeout(std::time::Duration::from_millis(500)).ok();
                 if stopped {
                     std::fs::remove_file(europe.join(BUILD_STAMP)).unwrap();
@@ -9895,7 +10141,7 @@ mod query_path_tests {
         let telling = told.clone();
         BEFORE_INDEX_LOAD.set(Some(Box::new(move |dir: &str| telling.borrow_mut().push(free(std::path::Path::new(dir))))));
 
-        let added = mi.install_region("europe");
+        let added = mi.install_region("europe").map(drop);
 
         BEFORE_INDEX_LOAD.set(None);
         assert_eq!((added, mi.loaded_count()), (Ok(()), 2));
@@ -9910,6 +10156,7 @@ mod query_path_tests {
                 name: "world",
                 continent: None,
                 index: arc_swap::ArcSwapOption::from(Some(Arc::new(TestIndex::new().load()))),
+                loaded_stamp: None,
             }],
             root_dir: String::new(),
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
@@ -11917,6 +12164,7 @@ mod admin_scan_tests {
             postcode_grid: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, len, len, len, len, len]),
+            water: None,
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
             admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
             max_distance_sq: 1.0,
