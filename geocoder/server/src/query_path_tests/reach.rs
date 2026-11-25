@@ -120,6 +120,23 @@ fn addresses_and_house_numbers_are_found_within_their_reach_from_anywhere_in_a_c
                     assert_eq!(number.is_some(), found, "address {}", at(metres));
                     let interpolated = index.find_interp_on_way(from.0, from.1, "Main Street", radians_sq(100.0));
                     assert_eq!(interpolated.is_some(), found, "interpolation {}", at(metres));
+
+                    // The answer: the street the road, with the number of its address; or, in the
+                    // US, without an address, the number of its interpolation line.
+                    let address = TestIndex::around(from)
+                        .street("Main Street", &across(20.0, bearing + 180.0))
+                        .address("7", north, east)
+                        .load();
+                    let mut us = TestIndex::around(from);
+                    us.polygons[0].0.country_code = u16::from_be_bytes(*b"US");
+                    let line = us.street("Main Street", &across(20.0, bearing + 180.0))
+                        .interpolation("Main St", (2, 100, 1), &across(metres, bearing))
+                        .load();
+                    for (index, what) in [(&address, "address"), (&line, "interpolation")] {
+                        let answer = serde_json::to_value(index.query(from.0, from.1)).unwrap()["address"].clone();
+                        assert_eq!(answer["road"], "Main Street", "{what} {}: {answer}", at(metres));
+                        assert_eq!(answer["house_number"].is_string(), found, "{what} {}: {answer}", at(metres));
+                    }
                 }
             }
         }
