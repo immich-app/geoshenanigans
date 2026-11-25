@@ -259,8 +259,9 @@ fn unit_vector(lat: f64, lng: f64) -> [f64; 3] {
 /// point's, so across the antimeridian too. Near a pole, where that plane would stray from the
 /// sphere by more than half CELL_REACH_SLACK within the cover round the point, the gnomonic
 /// projection about the point instead, where a point is as far as it is and an edge is its great
-/// circle, as the builder lists it (cover_edge); and there too an edge whose line in degrees can
-/// stray from its great circle by more than half CELL_REACH_SLACK of the cover.
+/// circle, as the builder lists it (cover_edge). Wherever the point lies, an edge whose line in
+/// degrees can stray from its great circle by more than half CELL_REACH_SLACK of the cover is
+/// measured on that projection too, unless an end lies past where the projection holds.
 #[derive(Clone, Copy)]
 struct GeoOrigin {
     lat: f64,
