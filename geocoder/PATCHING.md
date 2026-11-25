@@ -343,7 +343,7 @@ The data is owed credit, and the dataset carries it in two places:
   | `codepoint-open` | Ordnance Survey Code-Point Open, which GB_full is derived from, with the Ordnance Survey, Royal Mail and National Statistics statements of its licence | OGL v3.0 | the same, beside `geonames` where a GB centroid is there |
   | `tiger` | US Census Bureau TIGER/Line: US address ranges and ZIPs, and postcode centroids where OSM has none | Public domain, credited as a courtesy | the same |
   | `wikidata` | Wikidata: the sitelink counts of the POIs' items, which their importance takes (`--wikidata-sitelinks`, which the nightly passes) | CC0 1.0 | the POI tier dirs holding a POI whose importance took one |
-  | `marine-regions` | Marine Regions (Flanders Marine Institute): the seas and oceans, its intersect of the EEZs and IHO sea areas, with the changes the dataset made (cut to OpenStreetMap's land, which makes them part of its ODbL derivative database) | CC BY 4.0 | the water dirs holding a sea or ocean (`--marine-areas`, in builds that pin the marine areas) |
+  | `marine-regions` | Marine Regions (Flanders Marine Institute): the seas and oceans, its intersect of the EEZs and IHO sea areas, with the changes the dataset made (cut to OpenStreetMap's land, which makes them part of its ODbL derivative database) | CC BY 4.0 | the water dirs holding a sea or ocean (`--marine`, in builds that pin the marine areas) |
 
 - **`attribution.json`** in every mode dir (`full/`, `no-addresses/`,
   `admin/`, `admin-minimal/`, `admin-minimal-poi/`) and every water dir
