@@ -6326,11 +6326,12 @@ impl<'a> AddressDetails<'a> {
 /// puts a row named by one of them first in its rank, and only a rank's first row is shown. The
 /// first of each rank's rows of `named`, the rows named by a value in Nominatim's order within a
 /// rank, is that rank's row of `rows` (the address's, the finest first), but a row of the
-/// country.
+/// country and a row at the country's rank: Nominatim lists the country's name whatever its rank
+/// shows (_finalize_entry, results.py:508-528).
 pub fn crosscheck<'a>(rows: &mut Vec<AddressRow<'a>>, named: &[AddressRow<'a>]) {
     let mut done = 0u32;
     for row in named {
-        if row.label == Some("country") { continue; }
+        if row.label == Some("country") || rows.iter().any(|r| r.rank == row.rank && r.label == Some("country")) { continue; }
         let bit = 1u32.checked_shl(u32::from(row.rank)).unwrap_or(0);
         if done & bit != 0 { continue; }
         done |= bit;
@@ -6431,6 +6432,17 @@ pub fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
 #[cfg(test)]
 mod pure_helper_tests {
     use super::*;
+
+    #[test]
+    fn a_crosscheck_row_takes_no_country_s_rank() {
+        // A rank-4 boundary named by the house's addr:city and labelled state, as a level-2
+        // boundary with a place=state label node would be: the answer keeps its country, which
+        // Nominatim always lists (_finalize_entry adds the country's name at rank 4).
+        let row = |rank: u8, name: &'static str, label: &'static str| AddressRow { rank, name: Cow::Borrowed(name), label: Some(label) };
+        let mut rows = vec![row(16, "Testville", "city"), row(4, "Testland", "country")];
+        crosscheck(&mut rows, &[row(4, "Weirdland", "state"), row(16, "Weirdland", "town")]);
+        assert_eq!(rows, [row(16, "Weirdland", "town"), row(4, "Testland", "country")]);
+    }
 
     #[test]
     fn coords_in_range_accepts_the_globe_only() {
