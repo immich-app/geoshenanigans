@@ -217,6 +217,13 @@ class NightlyPostalCitiesTest(unittest.TestCase):
         r, _ = self.run_block(block)
         self.assertEqual(r.returncode, 1)
         self.assertIn("::error::[postal] The postal cities of 2026-11-22", r.stdout)
+        # And so does a table that reads well but is another than the one it names.
+        self.serve("s3/bucket/geocoder/builds/2026-11-22/planet/admin/postal_cities.bin.zst",
+                   subprocess.run(["zstd", "-q", "-c"], input=b"wrong day", capture_output=True, check=True).stdout)
+        r, outputs = self.run_block(block)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("::error::[postal] The postal cities of 2026-11-22 are not the file its configurations.json names", r.stdout)
+        self.assertNotIn("prev_postal_cities", outputs)
 
     def test_a_rerun_of_a_day_takes_the_postal_cities_its_first_run_took(self):
         block = postal_block()
