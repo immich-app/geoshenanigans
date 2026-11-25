@@ -462,6 +462,16 @@ fn fixture_datasets_come_back_and_the_readers_read_them_as_before() {
 }
 
 #[test]
+fn a_place_area_s_own_place_type_comes_back() {
+    // A record's last byte is a column of its own: a place area (admin_level 15) of its own
+    // place=suburb (4), labelled town (2) by the node it links.
+    let record = AdminPolygon { place_type_override: 2, own_place_type: 4, ..crate::arc_fixture::record(3, 15, 0.25) };
+    let bytes = record.record_bytes().to_vec();
+    assert_eq!((bytes[14], bytes[15]), (15 << 4 | 2, 4));
+    round_trip(Kind::Cols, Some("admin_polygons.bin"), &[("admin_polygons.bin", bytes)]);
+}
+
+#[test]
 fn empty_members_of_every_kind_come_back() {
     let (places, _) = crate::place_files::encode(&[], crate::DEFAULT_ADMIN_CELL_LEVEL);
     round_trip(Kind::Places, None, &members_of(Kind::Places, vec![places.cells, places.nodes, places.hidden]));
@@ -532,7 +542,10 @@ fn golden_sets() -> Vec<(&'static str, Kind, Option<&'static str>, Files)> {
     fx.arc(3, &[PointE7 { lat: -1000, lng: 2000 }]);
     let mut polygons = Vec::new();
     for (ring_offset, name_id, area, country_code, admin_level) in [(0, 7, 0.5f32, 528u16, 2u8), (96, 11, 0.0625, 528, 8), (160, 12, 3.25, 36, 4)] {
-        let p = AdminPolygon { ring_offset, ring_bytes: 0, name_id, admin_level, place_type_override: (admin_level == 8) as u8, area, country_code };
+        let p = AdminPolygon {
+            ring_offset, ring_bytes: 0, name_id, admin_level, place_type_override: (admin_level == 8) as u8, own_place_type: 0, area,
+            country_code, of_way: false,
+        };
         polygons.extend(p.record_bytes());
     }
     polygons.extend([1, 2, 3, 4, 5]);
@@ -1135,11 +1148,19 @@ fn a_decode_leaves_the_files_named_as_its_members_and_tmp_alone() {
 
 /// Every path under `dir`, relative to it, with a file's bytes; none for a dir.
 fn tree(dir: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+    tree_but(dir, None)
+}
+
+/// tree() of `dir`, without `skipped`, a path under it, nor what is under that.
+fn tree_but(dir: &Path, skipped: Option<&Path>) -> Vec<(String, Option<Vec<u8>>)> {
     let mut paths = Vec::new();
     let mut dirs = vec![dir.to_path_buf()];
     while let Some(d) = dirs.pop() {
         for e in std::fs::read_dir(&d).unwrap() {
             let p = e.unwrap().path();
+            if Some(p.as_path()) == skipped {
+                continue;
+            }
             let rel = p.strip_prefix(dir).unwrap().to_string_lossy().into_owned();
             if p.is_dir() {
                 paths.push((rel, None));
@@ -1175,6 +1196,531 @@ fn a_member_that_cant_go_in_place_puts_back_the_files_of_the_members_before_it()
         assert_eq!(tree(dir.path()), before, "{blocked} {earlier_files}");
         assert!(e.contains(&format!("{name}: is a directory")), "{blocked} {earlier_files}: {e}");
     }
+}
+
+/// Writes `files` (paths relative to `dir`, their parent dirs made) into `dir`.
+fn put_tree(dir: &Path, files: &[(&str, &[u8])]) {
+    for (rel, bytes) in files {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+}
+
+/// What decodes killed before they cleaned up leave: their dirs, with members half written, the
+/// files they replaced, and what else.
+const LEFTOVERS: &[(&str, &[u8])] = &[
+    (".transport.4000000.0/place_nodes.bin", b"half a member"),
+    (".transport.4000000.0/.earlier.place_cells.bin", b"a file a member replaced"),
+    (".transport.1.8/a/b", b"deeper"),
+];
+
+/// Names a decode's dir doesn't have, which no decode removes.
+const LOOKALIKES: &[(&str, &[u8])] = &[
+    (".transport.notes/x", b"x"),
+    (".transport.1/x", b"x"),
+    (".transport.1.2.3/x", b"x"),
+    (".transport.-1.2/x", b"x"),
+    (".transport.01.2/x", b"x"),
+    (".transport.+1.2/x", b"x"),
+    (".transport.1.02/x", b"x"),
+    ("transport.1.2/x", b"x"),
+    (".transport.5.6", b"a file, not a dir"),
+];
+
+#[cfg(unix)]
+#[test]
+fn a_decode_removes_the_dirs_of_decodes_that_stopped_before_cleaning_up() {
+    let (unit, members, dir) = published_places();
+    let (_, _, clean) = published_places();
+    put_tree(dir.path(), LOOKALIKES);
+    put_tree(dir.path(), LEFTOVERS);
+    std::fs::create_dir(dir.path().join(".transport.1.7")).unwrap();
+
+    decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).unwrap();
+    decode_into_dir(&unit[..], clean.path(), Some(&expected(&members))).unwrap();
+
+    put_tree(clean.path(), LOOKALIKES);
+    assert_eq!(tree(dir.path()), tree(clean.path()));
+}
+
+/// A pois unit's members, as an older build's files.
+const OLDER_POIS: &[(&str, &[u8])] = &[("poi_records.bin", b"an older build's records"), ("poi_vertices.bin", b"an older build's vertices")];
+
+#[cfg(unix)]
+#[test]
+fn a_decode_finishes_what_a_decode_killed_while_putting_its_members_in_left() {
+    // A decode of a pois unit into the dir, killed while it put its members in place, the files
+    // they replace those of OLDER_POIS: what it left, and what is there once a decode of a places
+    // unit into the dir has run, beside the places unit's members.
+    let cases: [(&str, &[(&str, &[u8])], &[(&str, &[u8])]); 4] = [
+        (
+            "killed between moving a file away and moving its member in: the file goes back",
+            &[
+                (".transport.9.0/.earlier.poi_records.bin", b"an older build's records"),
+                (".transport.9.0/poi_records.bin", b"a member"),
+                (".transport.9.0/poi_vertices.bin", b"a member"),
+                ("poi_vertices.bin", b"an older build's vertices"),
+            ],
+            OLDER_POIS,
+        ),
+        (
+            "killed once a member went in over a file: the file goes back over it",
+            &[(".transport.9.0/.earlier.poi_records.bin", b"an older build's records"), ("poi_records.bin", b"a member"), (".transport.9.0/poi_vertices.bin", b"a member"), ("poi_vertices.bin", b"an older build's vertices")],
+            OLDER_POIS,
+        ),
+        (
+            "killed once all its members were in: they stay, the files they replaced go",
+            &[(".transport.9.0/.installed", b""), (".transport.9.0/.earlier.poi_records.bin", b"an older build's records"), ("poi_records.bin", b"a member"), ("poi_vertices.bin", b"a member")],
+            &[("poi_records.bin", b"a member"), ("poi_vertices.bin", b"a member")],
+        ),
+        (
+            "a file that can't go back, a directory in its place: the dir stays, holding it",
+            &[
+                (".transport.9.0/.earlier.poi_records.bin", b"an older build's records"),
+                (".transport.9.0/.earlier.poi_vertices.bin", b"an older build's vertices"),
+                ("poi_records.bin/inside", b"a file of the dir's"),
+                ("poi_vertices.bin", b"a member"),
+            ],
+            &[(".transport.9.0/.earlier.poi_records.bin", b"an older build's records"), ("poi_records.bin/inside", b"a file of the dir's"), ("poi_vertices.bin", b"an older build's vertices")],
+        ),
+    ];
+    for (case, left, after) in cases {
+        let (unit, members, dir) = published_places();
+        let (_, _, want) = published_places();
+        put_tree(dir.path(), left);
+
+        decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).unwrap();
+        decode_into_dir(&unit[..], want.path(), Some(&expected(&members))).unwrap();
+
+        put_tree(want.path(), after);
+        assert_eq!(tree(dir.path()), tree(want.path()), "{case}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_decode_killed_once_its_members_were_in_leaves_its_dir_marked_and_they_stay() {
+    // A pois decode into a dir holding an older build's files, stopped as a kill would once all
+    // its members are in place, before it removes the files they replaced: its dir holds those
+    // files and INSTALLED. A decode of a places unit into the dir then removes them, and the
+    // pois members stay.
+    let (_, _, pois, pois_unit) = golden_units().swap_remove(1);
+    let pois_unit = zstd::encode_all(&pois_unit[..], 3).unwrap();
+    let (unit, members, dir) = published_places();
+    put_tree(dir.path(), OLDER_POIS);
+
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        SEAM.with_borrow_mut(|s| s.stop = Some(Step::AllIn));
+        decode_into_dir(&pois_unit[..], dir.path(), Some(&expected(&pois)))
+    }));
+
+    assert!(stopped.is_err());
+    let decodes_dirs: Vec<std::path::PathBuf> =
+        std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path()).filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with(".transport.")).collect();
+    assert_eq!(decodes_dirs.len(), 1, "{decodes_dirs:?}");
+    let replaced: Vec<(String, Vec<u8>)> = OLDER_POIS.iter().map(|(n, b)| (format!(".earlier.{n}"), b.to_vec())).chain([(INSTALLED.to_string(), Vec::new())]).collect();
+    assert_eq!(dir_files(&decodes_dirs[0]), replaced);
+    for (name, bytes) in &pois {
+        assert_eq!(&std::fs::read(dir.path().join(name)).unwrap(), bytes, "{name}");
+    }
+
+    decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).unwrap();
+
+    let (_, _, want) = published_places();
+    decode_into_dir(&unit[..], want.path(), Some(&expected(&members))).unwrap();
+    for (name, bytes) in &pois {
+        std::fs::write(want.path().join(name), bytes).unwrap();
+    }
+    assert_eq!(tree(dir.path()), tree(want.path()));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_decode_that_fails_leaves_the_dir_as_it_was_once_it_finished_what_killed_decodes_left() {
+    // A pois decode killed once a member went in over an older build's file left its dir; a
+    // places unit cut short into the dir fails, and the dir is as that decode undone leaves it.
+    let (unit, members, dir) = published_places();
+    let (_, _, want) = published_places();
+    put_tree(dir.path(), &[(".transport.9.0/.earlier.poi_records.bin", b"an older build's records"), ("poi_records.bin", b"a member"), ("poi_vertices.bin", b"an older build's vertices")]);
+
+    let cut = decode_into_dir(&unit[..unit.len() - 9], dir.path(), Some(&expected(&members)));
+
+    assert!(cut.is_err());
+    put_tree(want.path(), OLDER_POIS);
+    assert_eq!(tree(dir.path()), tree(want.path()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dir_the_decode_cant_open_fails_the_decode() {
+    // Of mode 0o300 a decode could make its dir in it and move files in and out, but can't open
+    // it to take a lock. Root opens any dir: run as root, the dir is nobody's and the decode runs
+    // on a thread whose file system uid is nobody's, which takes root's power over modes away.
+    use std::os::unix::fs::PermissionsExt;
+    const NOBODY: u32 = 65534;
+    let (unit, members, dir) = published_places();
+    let expect = expected(&members);
+    let before = dir_files(dir.path());
+    let as_root = unsafe { libc::geteuid() } == 0;
+    if as_root {
+        std::os::unix::fs::chown(dir.path(), Some(NOBODY), None).unwrap();
+    }
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+
+    let got = std::thread::scope(|s| {
+        s.spawn(|| {
+            if as_root {
+                // Returns the uid it had: the second call tells the first took.
+                unsafe { libc::syscall(libc::SYS_setfsuid, NOBODY) };
+                assert_eq!(unsafe { libc::syscall(libc::SYS_setfsuid, NOBODY) }, NOBODY as libc::c_long);
+            }
+            decode_into_dir(&unit[..], dir.path(), Some(&expect)).map(|_| ()).map_err(|e| e.to_string())
+        })
+        .join()
+        .unwrap()
+    });
+
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(got, Err(format!("{}: Permission denied (os error 13)", dir.path().display())));
+    assert_eq!(dir_files(dir.path()), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_decode_puts_no_member_in_while_a_leftover_it_cant_finish_would_put_back_the_file_it_replaces() {
+    // A pois decode killed once a member went in over an older build's file left its dir, which
+    // the decodes after it can't finish: of mode 0o555, no file can leave it, or of 0o300, it
+    // can't be opened to lock or read. A pois decode, then a places decode, run while it stays;
+    // then it can be finished, and a places decode finishes it.
+    // - Killed before all its members were in: the pois decode fails before it puts a member
+    //   in, naming the dir, which once finished would put the older file back over its member;
+    //   the places decode, whose members it holds no file of, goes in. Finished, the dir puts
+    //   the older file back: the pois files are all the older build's.
+    // - Killed once all were in: finished, it only removes the older file. Both decodes go in.
+    // - Of 0o300: no decode can tell what it holds, and both fail.
+    // Run as root, the dataset dir is nobody's and the decodes run on a thread whose file system
+    // uid is nobody's (a_dir_the_decode_cant_open_fails_the_decode).
+    use std::os::unix::fs::PermissionsExt;
+    const NOBODY: u32 = 65534;
+    let (_, _, pois, pois_unit) = golden_units().swap_remove(1);
+    let pois_unit = zstd::encode_all(&pois_unit[..], 3).unwrap();
+    let killed_before_all_in: &[(&str, &[u8])] = &[(".transport.9.0/.earlier.poi_records.bin", b"an older build's records"), ("poi_records.bin", b"a member"), ("poi_vertices.bin", b"an older build's vertices")];
+    let killed_once_all_in: &[(&str, &[u8])] = &[(".transport.9.0/.installed", b""), (".transport.9.0/.earlier.poi_records.bin", b"an older build's records"), ("poi_records.bin", b"a member"), ("poi_vertices.bin", b"a member")];
+    let pois_files: Vec<(&str, &[u8])> = pois.iter().map(|(n, b)| (*n, &b[..])).collect();
+    let cases: [(&str, &[(&str, &[u8])], u32, bool, bool, &[(&str, &[u8])]); 3] = [
+        ("killed before all its members were in", killed_before_all_in, 0o555, true, false, OLDER_POIS),
+        ("killed once all its members were in", killed_once_all_in, 0o555, false, false, &pois_files),
+        ("of 0o300", killed_before_all_in, 0o300, true, true, OLDER_POIS),
+    ];
+    for (case, found, mode, pois_fail, places_fail, pois_after) in cases {
+        let (unit, members, dir) = published_places();
+        let leftover = dir.path().join(".transport.9.0");
+        put_tree(dir.path(), found);
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(mode)).unwrap();
+        let as_root = unsafe { libc::geteuid() } == 0;
+        if as_root {
+            std::os::unix::fs::chown(dir.path(), Some(NOBODY), None).unwrap();
+        }
+        let before = tree_but(dir.path(), Some(&leftover));
+
+        let (pois_got, after_pois, places_got, after_places) = std::thread::scope(|s| {
+            s.spawn(|| {
+                if as_root {
+                    unsafe { libc::syscall(libc::SYS_setfsuid, NOBODY) };
+                    assert_eq!(unsafe { libc::syscall(libc::SYS_setfsuid, NOBODY) }, NOBODY as libc::c_long);
+                }
+                let pois_got = decode_into_dir(&pois_unit[..], dir.path(), Some(&expected(&pois))).map(|_| ()).map_err(|e| e.to_string());
+                let after_pois = tree_but(dir.path(), Some(&leftover));
+                let places_got = decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).map(|_| ()).map_err(|e| e.to_string());
+                (pois_got, after_pois, places_got, tree_but(dir.path(), Some(&leftover)))
+            })
+            .join()
+            .unwrap()
+        });
+        let left = leftover.exists();
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o755)).unwrap();
+        decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).unwrap();
+
+        let refused = |got: &Result<(), String>, what: &str| match got {
+            Ok(()) => false,
+            Err(e) => {
+                assert!(e.starts_with(&format!("{} can't be finished (Permission denied (os error 13)): {what}", leftover.display())), "{case}: {e}");
+                true
+            }
+        };
+        let why = if mode == 0o300 { "it may hold a file a member replaced" } else { "it holds the file poi_records.bin replaced" };
+        assert_eq!((refused(&pois_got, why), refused(&places_got, why), left), (pois_fail, places_fail, true), "{case}");
+        if pois_fail {
+            assert_eq!(after_pois, before, "{case}");
+        }
+        if places_fail {
+            assert_eq!(after_places, after_pois, "{case}");
+        }
+        let (_, _, want) = published_places();
+        decode_into_dir(&unit[..], want.path(), Some(&expected(&members))).unwrap();
+        put_tree(want.path(), pois_after);
+        assert_eq!(tree(dir.path()), tree(want.path()), "{case}");
+    }
+}
+
+#[test]
+fn a_file_that_cant_go_back_is_left_for_a_later_decode_only_where_decodes_take_locks() {
+    // put_back after an error, the file a member replaced gone from the decode's dir: it can't
+    // go back. Where decodes take locks, a later decode finishes the dir and puts it back; where
+    // they take none, none does, and it is to be moved back by hand.
+    let dir = ScratchDir::new();
+    let (dest, earlier) = (dir.path().join("a.bin"), dir.path().join(".transport.1.0/.earlier.a.bin"));
+    let told = |locks| put_back(vec![Moved { dest: dest.clone(), earlier: Some(earlier.clone()), installed: true }], io::Error::other("it failed"), locks).to_string();
+    let stays = format!("it failed; the file {} replaced stays at {}", dest.display(), earlier.display());
+
+    let (with, without) = (told(true), told(false));
+
+    assert!(with.starts_with(&format!("{stays}, for a later decode into the dir to put back: ")), "{with}");
+    assert!(without.starts_with(&format!("{stays}, to be moved back by hand: ")), "{without}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_decode_goes_without_a_lock_only_where_the_file_system_has_none() {
+    // The errors taking the install lock after which a decode goes on without locks; any other
+    // fails it.
+    assert!(no_locks_here(&io::Error::from(io::ErrorKind::Unsupported)));
+    assert!(no_locks_here(&io::Error::from_raw_os_error(libc::ENOLCK)));
+    for code in [libc::EBADF, libc::EINTR, libc::EINVAL, libc::EIO, libc::EACCES, libc::ENOMEM] {
+        assert!(!no_locks_here(&io::Error::from_raw_os_error(code)), "{}", io::Error::from_raw_os_error(code));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_decode_that_took_the_install_lock_fails_when_it_cant_take_it_again_before_a_member_moves() {
+    // A decode took the install lock to make its dir: decodes into the dir take locks. Taking it
+    // again to put its members in fails, ENOLCK (which flock gives also when the kernel is out of
+    // lock records) as any other error: the decode fails before a member moves, its dir removed,
+    // the dir as it was. Gone on without the lock, its install could go in beside another's, or
+    // before a killed decode's leftover is finished.
+    for code in [libc::ENOLCK, libc::EIO] {
+        let (unit, members, dir) = published_places();
+        let before = tree(dir.path());
+
+        SEAM.with_borrow_mut(|s| s.fail_install_lock = Some(code));
+        let got = decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).map(|_| ()).map_err(|e| e.to_string());
+
+        assert_eq!(got, Err(format!("{}: {}", dir.path().display(), io::Error::from_raw_os_error(code))), "{code}");
+        assert_eq!(tree(dir.path()), before, "{code}");
+    }
+}
+
+#[test]
+fn a_decode_finishes_the_dirs_of_decodes_that_are_gone_but_not_of_one_still_running() {
+    // A decode holds its dir, its members written, while another runs from start to end. The
+    // leftovers that appear meanwhile, dirs whose lock no decode holds, go with that one; the
+    // running decode's dir, locked, stays, and its decode then puts its members in place.
+    let (unit, members, dir) = published_places();
+    let expect = expected(&members);
+    let (path, expect) = (dir.path(), &expect);
+    let decodes_dirs = || -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(path).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).filter(|n| n.starts_with(".transport.")).collect();
+        v.sort();
+        v
+    };
+    let leftovers = [".transport.1.8", ".transport.4000000.0"];
+
+    std::thread::scope(|s| {
+        let (at_end, held) = mpsc::channel();
+        let (go, wait) = mpsc::channel();
+        let held_unit = HeldAtEnd { bytes: unit.clone(), at: 0, at_end: Some(at_end), go: wait };
+        let first = s.spawn(move || decode_into_dir(held_unit, path, Some(expect)).map(|_| ()).map_err(|e| e.to_string()));
+        held.recv().unwrap();
+        let running = decodes_dirs();
+        assert_eq!(running.len(), 1, "{running:?}");
+        put_tree(path, LEFTOVERS);
+
+        decode_into_dir(&unit[..], path, Some(expect)).unwrap();
+
+        if cfg!(unix) {
+            assert_eq!(decodes_dirs(), running);
+        } else {
+            // No decode takes a lock there, so none can tell a leftover from a running decode's
+            // dir, and none finishes either.
+            let mut all: Vec<String> = running.into_iter().chain(leftovers.map(String::from)).collect();
+            all.sort();
+            assert_eq!(decodes_dirs(), all);
+        }
+        go.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), Ok(()));
+    });
+
+    if cfg!(unix) {
+        assert!(decodes_dirs().is_empty());
+    } else {
+        assert_eq!(decodes_dirs(), leftovers);
+    }
+    let mut want: Vec<(String, Option<Vec<u8>>)> = members.iter().map(|(n, b)| (n.to_string(), Some(b.clone()))).collect();
+    want.sort();
+    assert_eq!(tree(path).into_iter().filter(|(rel, _)| !rel.starts_with(".transport.")).collect::<Vec<_>>(), want);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_decode_killed_while_putting_its_members_in_is_undone_before_another_puts_its_own_in() {
+    // Two decodes of the places unit into one dir of older files at once: the second decodes
+    // while the first, putting its members in place, stops as a kill would once it moved the
+    // file its first member replaces into its dir. The second undoes it, that file back in its
+    // place, before it puts its own members in; a decode of the pois unit into the dir then
+    // leaves them as they are.
+    let (_, _, pois, pois_unit) = golden_units().swap_remove(1);
+    let pois_unit = zstd::encode_all(&pois_unit[..], 3).unwrap();
+    let (unit, members, dir) = published_places();
+    let (path, expect) = (dir.path(), &expected(&members));
+    let first = members[0].0;
+
+    let (killed, replaced, second) = std::thread::scope(|s| {
+        let (at_end, held) = mpsc::channel();
+        let (go, wait) = mpsc::channel();
+        let held_unit = HeldAtEnd { bytes: unit.clone(), at: 0, at_end: Some(at_end), go: wait };
+        let second = s.spawn(move || decode_into_dir(held_unit, path, Some(expect)).map(|_| ()).map_err(|e| e.to_string()));
+        held.recv().unwrap();
+        let killed = s
+            .spawn(|| {
+                SEAM.with_borrow_mut(|s| s.stop = Some(Step::MovedAway));
+                decode_into_dir(&unit[..], path, Some(expect))
+            })
+            .join()
+            .is_err();
+        // Where the first member goes, and the file it replaces, in the killed decode's dir.
+        let replaced: Vec<(String, Option<Vec<u8>>)> = tree(path)
+            .into_iter()
+            .filter(|(rel, _)| *rel == first || rel.ends_with(&format!("/.earlier.{first}")))
+            .map(|(rel, b)| (rel.rsplit('/').next().unwrap().to_string(), b))
+            .collect();
+        go.send(()).unwrap();
+        (killed, replaced, second.join().unwrap())
+    });
+    decode_into_dir(&pois_unit[..], path, Some(&expected(&pois))).unwrap();
+
+    assert!(killed);
+    assert_eq!(replaced, [(format!(".earlier.{first}"), Some(b"an older build's".to_vec()))]);
+    assert_eq!(second, Ok(()));
+    let (_, _, want) = published_places();
+    for (name, bytes) in members.iter().chain(&pois) {
+        std::fs::write(want.path().join(name), bytes).unwrap();
+    }
+    assert_eq!(tree(path), tree(want.path()));
+}
+
+/// Receives the steps `told` tells onto `seen`, up to `want`.
+fn told_up_to(told: &mpsc::Receiver<(&'static str, Step)>, seen: &mut Vec<(&'static str, Step)>, want: (&'static str, Step)) {
+    loop {
+        let got = told.recv().unwrap();
+        seen.push(got);
+        if got == want {
+            return;
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_decode_puts_its_members_in_only_once_another_let_go_of_the_install_lock() {
+    // Decodes A and B of the places unit into one dir: B decodes while A is held at a step at
+    // which it holds the install lock, making its dir or putting its members in place, up to
+    // having removed its dir. B, its members decoded, waits for the lock while A is held, and
+    // takes it only once A let go of it.
+    for at in [Step::Made, Step::MovedAway, Step::AllIn, Step::Done] {
+        let (unit, members, dir) = published_places();
+        let (path, expect) = (dir.path(), &expected(&members));
+        let (tell, told) = mpsc::channel();
+        let mut seen = Vec::new();
+
+        let (a, b, meanwhile) = std::thread::scope(|s| {
+            let (at_end, held) = mpsc::channel();
+            let (go_b, wait_b) = mpsc::channel();
+            let held_unit = HeldAtEnd { bytes: unit.clone(), at: 0, at_end: Some(at_end), go: wait_b };
+            let tell_b = tell.clone();
+            let b = s.spawn(move || {
+                SEAM.with_borrow_mut(|s| s.tell = Some(("B", tell_b)));
+                decode_into_dir(held_unit, path, Some(expect)).map(|_| ()).map_err(|e| e.to_string())
+            });
+            held.recv().unwrap();
+            let (go_a, wait_a) = mpsc::channel();
+            let tell_a = tell.clone();
+            let unit = &unit;
+            let a = s.spawn(move || {
+                SEAM.with_borrow_mut(|s| {
+                    s.tell = Some(("A", tell_a));
+                    s.hold = Some((at, wait_a));
+                });
+                decode_into_dir(&unit[..], path, Some(expect)).map(|_| ()).map_err(|e| e.to_string())
+            });
+            told_up_to(&told, &mut seen, ("A", at));
+            go_b.send(()).unwrap();
+            told_up_to(&told, &mut seen, ("B", Step::WaitsToInstall));
+            let meanwhile = told.recv_timeout(std::time::Duration::from_millis(500));
+            go_a.send(()).unwrap();
+            (a.join().unwrap(), b.join().unwrap(), meanwhile)
+        });
+        drop(tell);
+        seen.extend(told.iter());
+
+        assert_eq!(meanwhile, Err(mpsc::RecvTimeoutError::Timeout), "{at:?}");
+        assert_eq!((a, b), (Ok(()), Ok(())), "{at:?}");
+        if at != Step::Made {
+            let when = |step| seen.iter().position(|s| *s == step).unwrap();
+            assert!(when(("A", Step::Done)) < when(("B", Step::Installs)), "{at:?}: {seen:?}");
+        }
+        let mut want: Vec<(String, Vec<u8>)> = members.iter().map(|(n, b)| (n.to_string(), b.clone())).collect();
+        want.sort();
+        assert_eq!(dir_files(path), want, "{at:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_sweep_finds_nothing_to_finish_in_a_decodes_dir_removed_once_it_opened_it() {
+    // A decode of the places unit cut short is held at the unit's end, its dir made and locked,
+    // while a sweep of the dir opens that dir and is held before it tries its lock: the
+    // downloader's (finish_leftovers_in), or a decode's before its install, its own dir
+    // elsewhere. The cut decode then fails: it removes its dir, and only then lets go of its
+    // lock. The sweep takes that lock, of a dir no longer there, which holds nothing to finish:
+    // it goes on, and the dir is as it was.
+    let (unit, members, dir) = published_places();
+    let (path, expect) = (dir.path(), &expected(&members));
+    let before = tree(path);
+    let elsewhere = ScratchDir::new();
+    let sweeps: [(&str, &(dyn Fn() -> io::Result<()> + Sync)); 2] =
+        [("the downloader's", &|| finish_leftovers_in(path)), ("a decode's", &|| Staging::new_in(elsewhere.path())?.install(path, &[]))];
+
+    let mut got = Vec::new();
+    for (whose, sweep) in sweeps {
+        let (tell, told) = mpsc::channel();
+        let mut seen = Vec::new();
+        let (cut, swept) = std::thread::scope(|s| {
+            let (at_end, held) = mpsc::channel();
+            let (go_cut, wait_cut) = mpsc::channel();
+            let cut_unit = HeldAtEnd { bytes: unit[..unit.len() - 9].to_vec(), at: 0, at_end: Some(at_end), go: wait_cut };
+            let cut = s.spawn(move || decode_into_dir(cut_unit, path, Some(expect)).map(|_| ()).map_err(|e| e.to_string()));
+            held.recv().unwrap();
+            let (go_sweep, wait_sweep) = mpsc::channel();
+            let swept = s.spawn(move || {
+                SEAM.with_borrow_mut(|s| {
+                    s.tell = Some(("sweep", tell));
+                    s.hold = Some((Step::Opened, wait_sweep));
+                });
+                sweep().map_err(|e| e.to_string())
+            });
+            told_up_to(&told, &mut seen, ("sweep", Step::Opened));
+            go_cut.send(()).unwrap();
+            let cut = cut.join().unwrap();
+            go_sweep.send(()).unwrap();
+            (cut, swept.join().unwrap())
+        });
+        assert!(cut.as_ref().is_err_and(|e| e.contains("ends early") || e.contains("incomplete")), "{whose}: {cut:?}");
+        got.push((whose, swept, tree(path) == before));
+    }
+
+    assert_eq!(got, [("the downloader's", Ok(()), true), ("a decode's", Ok(()), true)]);
 }
 
 #[test]

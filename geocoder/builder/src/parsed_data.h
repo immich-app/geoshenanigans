@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -502,12 +503,56 @@ struct ParsedData {
     };
     std::unordered_map<uint64_t, PostcodeAccum> postcode_accum;
 
+    // The houses whose tag makes a centroid of another postcode than the
+    // one they keep (normalise_addr_postcodes), those of a country of no
+    // pattern of its own: update_postcodes reads the tag (placex.address)
+    // with PostcodeFormatter's default, .*, and the clean-postcodes
+    // sanitizer with its own. Each as its addr_osm_ids entry, the postcode
+    // it keeps (NO_DATA for none) and postcode_key of the centroid's
+    // (kNoCentroid for none), sorted, their strings in the postcode tier
+    // (partition_strings_into_tiers), for collect_postcode_centroids
+    // (build-time only).
+    struct HouseCentroid {
+        uint64_t osm_id;
+        uint32_t house;
+        uint64_t key;
+        bool operator<(const HouseCentroid& o) const {
+            return std::tie(osm_id, house, key) < std::tie(o.osm_id, o.house, o.key);
+        }
+        bool operator==(const HouseCentroid& o) const {
+            return osm_id == o.osm_id && house == o.house && key == o.key;
+        }
+    };
+    static constexpr uint64_t kNoCentroid = UINT64_MAX;
+    std::vector<HouseCentroid> house_centroids;
+
     // Boundaries' label/wikidata claims on place nodes (build-time only,
     // consumed by link_places_by_name to hide the nodes like Nominatim's
     // linked_place_id and name their claimant); filled from parallel
     // relation workers under the mutex.
     std::vector<PlaceClaim> place_claims;
+    // The place nodes of each boundary's wikidata that it covers (build-time
+    // only), which link_wikidata_places links once every input's boundaries
+    // are in; filled from parallel relation workers under the mutex too.
+    std::vector<WikidataCandidate> wikidata_candidates;
     std::unique_ptr<std::mutex> linked_pn_mutex = std::make_unique<std::mutex>();
+    // The wikidata of the boundaries (admin levels 2 to 10), as (their
+    // relation_boundary_id or way_boundary_id, its Q number) sorted at use,
+    // and of the place nodes (parallel to place_nodes, 0 for none), which the
+    // name step compares; the boundaries that link a place node (a label
+    // member, a node of their wikidata or name), and of those the ones whose
+    // label member is of a place type of no rank_address between 4 and 25,
+    // for take_out_repeated_boundaries (build-time only).
+    std::vector<std::pair<uint64_t, uint64_t>> boundary_wikidata;
+    std::vector<uint32_t> place_qids;
+    // The AdminPlaceType of the place tag of the boundaries of admin levels
+    // 8 to 10 that have one, as (boundary id, type) sorted at use: the type
+    // find_linked_place's place-type step asks for (extratags 'place'), which
+    // a linked_place tag, though it stands for a place type too, is not
+    // (build-time only).
+    std::vector<std::pair<uint64_t, uint8_t>> boundary_place_tags;
+    std::vector<uint64_t> linking_boundaries;
+    std::vector<uint64_t> unranked_label_boundaries;
 
     // Post-canonical-sort: strings partitioned into per-consumer tiers.
     // Global offset space is contiguous: tier N occupies
@@ -655,6 +700,8 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
         mark_each(data.interp_postcode_ids.size(), [&](size_t i) { mark(data.interp_postcode_ids[i], STR_TIER_BIT_POSTCODE); });
         mark_each(data.addr_postcode_ids.size(), [&](size_t i) { mark(data.addr_postcode_ids[i], STR_TIER_BIT_POSTCODE); });
         for (const auto& [key, _acc] : data.postcode_accum) mark(postcode_key_pc(key), STR_TIER_BIT_POSTCODE);
+        for (const ParsedData::HouseCentroid& h : data.house_centroids)
+            if (h.key != ParsedData::kNoCentroid) mark(postcode_key_pc(h.key), STR_TIER_BIT_POSTCODE);
 
         mark_each(data.poi_records.size(), [&](size_t i) {
             const auto& pr = data.poi_records[i];
@@ -815,6 +862,23 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
             if (!placed.inserted) placed.position->second = placed.node.mapped();
         }
         accum = std::move(remapped);
+    }
+    {
+        // A house whose postcode no address keeps any more is no house's.
+        auto& houses = data.house_centroids;
+        std::vector<ParsedData::HouseCentroid> kept;
+        kept.reserve(houses.size());
+        for (ParsedData::HouseCentroid h : houses) {
+            const uint32_t house = new_offset(h.house);
+            if (h.house != NO_DATA && house == NO_DATA) continue;
+            h.house = house;
+            if (h.key != ParsedData::kNoCentroid)
+                h.key = postcode_key(postcode_key_cc(h.key), new_offset(postcode_key_pc(h.key)));
+            kept.push_back(h);
+        }
+        std::sort(kept.begin(), kept.end());
+        kept.erase(std::unique(kept.begin(), kept.end()), kept.end());
+        houses = std::move(kept);
     }
 }
 

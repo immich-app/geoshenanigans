@@ -9,9 +9,8 @@ use napi::bindgen_prelude::*;
 use napi::Env;
 use napi_derive::napi;
 use place_search::constants::{DATASET_SEARCH_DIR, DEFAULT_LIMIT};
-use place_search::dataset::{self, BuildOnDevice, Origin, Stamps};
-use place_search::query::Searcher;
-use place_search::reader::SearchIndex;
+use place_search::dataset::{self, BuildOnDevice, Origin, PlaceSearch, Stamps};
+use place_search::query::results_json;
 use query_server::transport::{self, ChunkReader, Expected};
 use query_server::Index;
 use std::path::{Path, PathBuf};
@@ -48,27 +47,6 @@ impl Task for QueryTask {
     }
 }
 
-/// An open place search index and the geocoder index its postings point into.
-pub struct PlaceSearch {
-    // Fields drop in order: the searcher borrows the index, which borrows the geocoder index.
-    searcher: Searcher<'static, 'static>,
-    _index: Arc<SearchIndex<'static>>,
-    _geo: Arc<Index>,
-}
-
-impl PlaceSearch {
-    /// `dataset::open` of the index in `index_dir` for `geo`, the dataset in `dir` stamped `loaded`.
-    fn open(geo: Arc<Index>, loaded: &Stamps, dir: &Path, index_dir: &Path, on_device: &BuildOnDevice) -> std::result::Result<(PlaceSearch, Origin), String> {
-        // SAFETY: the borrows point into the two Arcs' shared allocations, which never move and
-        // are held by this struct until after the searcher and the index that borrow them drop.
-        let geo_ref: &'static Index = unsafe { &*Arc::as_ptr(&geo) };
-        let (index, origin) = dataset::open(geo_ref, loaded, dir, index_dir, on_device)?;
-        let index = Arc::new(index);
-        let index_ref: &'static SearchIndex<'static> = unsafe { &*Arc::as_ptr(&index) };
-        Ok((PlaceSearch { searcher: Searcher::new(index_ref), _index: index, _geo: geo }, origin))
-    }
-}
-
 pub struct SearchTask {
     search: Arc<PlaceSearch>,
     query: String,
@@ -80,9 +58,8 @@ impl Task for SearchTask {
     type JsValue = String;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        let (found, _) = self.search.searcher.search(&self.query, self.limit);
-        let results: Vec<String> = found.iter().map(|f| f.to_json().to_string()).collect();
-        Ok(format!("[{}]", results.join(",")))
+        let (found, _) = self.search.search(&self.query, self.limit);
+        Ok(results_json(&found))
     }
 
     fn resolve(&mut self, _env: Env, output: Self::JsValue) -> Result<Self::JsValue> {
@@ -187,9 +164,20 @@ const QUEUED_CHUNKS: usize = 8;
 /// It decodes on a thread of its own, holding a few chunks, the zstd window and one chunk of the
 /// unit's columns, and writes the files in a dir of its own in the dataset dir; once the whole
 /// unit decoded and every file is of its sha256, it moves them all into place and `finish`
-/// resolves. A unit that fails (cut short, refused, a file of another sha256, one that can't go
-/// in place) leaves the dir as it was; a download that broke off should still `finish`, which
-/// then rejects. Decoders of one unit into a dir at once each put complete files in place
+/// resolves. On unix a decoder takes the dir's install lock before it starts and again before it
+/// moves its files in, each time first finishing what decoders killed in the dir left, so that
+/// decoders move their files in one at a time and one killed part way is finished before any
+/// later one moves its files in; meanwhile it decodes as others do. Finishing one killed while it
+/// moved its files in puts back each file it replaced, but a file it moved in that replaced none
+/// stays, complete and of its sha256: the dir then holds some of that unit's files without the
+/// rest, until the unit is decoded into it again or those files are removed. A unit that fails
+/// (cut short, refused, a file of another sha256, one that can't go in place, a killed decoder's
+/// dir that can't be finished and would put a file back over one of its files) leaves the dir as
+/// it was once those were finished; a download that broke off should still `finish`, which then
+/// rejects.
+/// Decoders of one unit into a dir at once on one machine each put complete files in place, the
+/// later's standing. On a file system without locks decoders take none, and finish nothing; a
+/// dir that several machines share (NFS, SMB) is to be decoded into from one at a time
 /// (transport::decode_into_dir).
 #[napi]
 pub struct TransportDecoder {
