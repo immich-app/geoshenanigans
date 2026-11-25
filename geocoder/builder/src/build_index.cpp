@@ -3677,7 +3677,7 @@ static int run(int argc, char* argv[]) {
                             poly.area = exact.area(static_cast<uint32_t>(poly_base + k));
                             const char* cc = pp.country_code.empty() ? nullptr : pp.country_code.c_str();
                             poly.country_code = (cc && cc[0] && cc[1])
-                                ? pack_country_code(cc[0], cc[1]) : 0;
+                                ? pack_tag_country_code(cc[0], cc[1]) : 0;
                             data.admin_polygons[poly_base + k] = poly;
                             // Strategy-2 stable identity, packed like addr/poi:
                             // top 8 bits = ObjectType, bottom 56 bits = the

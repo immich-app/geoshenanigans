@@ -1067,3 +1067,17 @@ TEST(a_boundary_whose_name_en_is_empty_goes_by_its_nodes_english_name) {
     std::printf("    %s\n", answers[0].c_str());
     CHECK(names(answers[0], "town", "Sosnovka"));
 }
+
+TEST(a_country_code_of_lower_case_letters_ranks_as_its_upper_case_one) {
+    // Australia tagged ISO3166-1:alpha2=au: Nominatim lower-cases every country code, so its
+    // admin_level 6 still ranks 0 there (address-levels.json) and is no part of the address.
+    Fixture f;
+    f.boundary(-30, 150, -26, 154, 2, "Australia", {{"ISO3166-1", "au"}, {"ISO3166-1:alpha2", "au"}});
+    f.boundary(-29, 152, -27, 153.9, 4, "Queensland");
+    f.boundary(-28.2, 153.2, -27.7, 153.6, 6, "Gold Coast City");
+    const std::vector<std::string> answers = answers_of(f, "lower-case-country", {{-27.95, 153.40}});
+    REQUIRE(answers.size() == 1);
+    std::printf("    %s\n", answers[0].c_str());
+    CHECK(names(answers[0], "state", "Queensland"));
+    CHECK(answers[0].find("Gold Coast City") == std::string::npos);
+}

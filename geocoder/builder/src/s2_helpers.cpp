@@ -277,7 +277,7 @@ void add_admin_polygon(ParsedData& data,
     data.admin_exact_rings.append(vertices, {}, runs);
     poly.area = data.admin_exact_rings.area(poly_id);
     poly.country_code = (country_code && country_code[0] && country_code[1])
-        ? pack_country_code(country_code[0], country_code[1])
+        ? pack_tag_country_code(country_code[0], country_code[1])
         : 0;
     data.admin_polygons.push_back(poly);
     // Strategy-2 stable identity, packed like addr/poi: top 8 bits =
