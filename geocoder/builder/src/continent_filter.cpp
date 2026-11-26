@@ -476,7 +476,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
             for (const postcode_grid::LogicalRow& run : rows)
                 if (run.country_code) codes.push_back({run.country_code, std::string(postcode_grid::code_of(run))});
             for (const AdminPolygon& area : out.admin_polygons) {
-                if (area.admin_level != 11 || area.place_type_override == POSTAL_AREA_INVALID || area.name_id == NO_DATA ||
+                if (area.admin_level != POSTAL_AREA_LEVEL || area.place_type_override == POSTAL_AREA_INVALID || area.name_id == NO_DATA ||
                     !postcode_grid::grid_country(area.country_code))
                     continue;
                 if (auto code = postcode_grid::grid_postcode(area.country_code, full.get_string(area.name_id)))

@@ -802,7 +802,7 @@ void collect_postcode_grid(ParsedData& data) {
     const auto& rings = data.admin_exact_rings;
     for (size_t i = 0; i < data.admin_polygons.size() && i < rings.polygons.size(); i++) {
         const AdminPolygon& area = data.admin_polygons[i];
-        if (area.admin_level != 11 || area.place_type_override == POSTAL_AREA_INVALID || area.name_id == NO_DATA ||
+        if (area.admin_level != POSTAL_AREA_LEVEL || area.place_type_override == POSTAL_AREA_INVALID || area.name_id == NO_DATA ||
             !grid_country(area.country_code) || rings.polygons[i].ring_count == 0)
             continue;
         std::optional<std::string> code = grid_postcode(area.country_code, data.get_string(area.name_id));
