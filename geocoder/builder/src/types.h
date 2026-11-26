@@ -777,14 +777,22 @@ static constexpr uint8_t POI_FLAG_WIKIDATA  = 0x02;
 // tourism=attraction, rank 30 in nominatim) — both land in our POI index
 // as PoiCategory::ATTRACTION.
 static constexpr uint8_t POI_FLAG_HIGHWAY   = 0x04;
+// A secondary ring of a multi-ring POI, which the place-search index leaves
+// out (server/src/lib.rs POI_FLAG_SECONDARY_RING). No build writes it yet,
+// but no other bit of a file may take it.
+static constexpr uint8_t POI_FLAG_SECONDARY_RING = 0x08;
 // A generic rank-30 feature (PoiCategory::GENERIC_RANK30) of a tag
 // address-levels.json ranks below 30 alone: a natural=* other than tree,
 // spring, cave_entrance, geyser, hot_spring, rock and stone, a waterway=*,
 // leisure=common or historic=neighbourhood. Nominatim makes no rank-30 row
 // of it, so it is no feature near a point (the server's
-// poi_is_reverse_feature), though it stays a POI near one. A file's bit:
-// while the build runs, the water bits hold it (POI_BUILD_BELOW_RANK30).
-static constexpr uint8_t POI_FLAG_BELOW_RANK30 = 0x08;
+// poi_is_reverse_feature), though it stays a POI near one, and one the
+// place-search index names. A file's bit: while the build runs, the water
+// bits hold it (POI_BUILD_BELOW_RANK30).
+static constexpr uint8_t POI_FLAG_BELOW_RANK30 = 0x10;
+static_assert((POI_FLAG_BELOW_RANK30 & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA | POI_FLAG_HIGHWAY |
+                                        POI_FLAG_SECONDARY_RING)) == 0,
+              "a file's POI flags must be bits of their own");
 // While the build runs, a water object that takes its category from a
 // rank-30 tag (poi_classify.h classify_poi) carries its water kind in these
 // bits where the kind ships in a lower tier than the category: the dirs of

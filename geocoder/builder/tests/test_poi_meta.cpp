@@ -246,8 +246,8 @@ TEST(poi_flags_carry_each_water_kind_and_none) {
 
 TEST(a_generic_feature_of_a_lower_rank_is_written_with_its_files_flag) {
     // The build holds POI_FLAG_BELOW_RANK30 in the water bits (POI_BUILD_BELOW_RANK30), as no
-    // water kind: every tier writes it as the files' bit. A water kind a POI carries, the lake's
-    // (whose bits hold that one), is written as none.
+    // water kind: every tier writes it as the files' bit. A water kind a POI carries, a wetland's
+    // or a bay's (whose bits hold that one), is written as none.
     PoiRecord stream = poi(PoiCategory::GENERIC_RANK30, 3);
     stream.flags = POI_FLAG_WIKIDATA | POI_BUILD_BELOW_RANK30;
     CHECK(poi_build_below_rank30(stream.flags));

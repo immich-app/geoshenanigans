@@ -166,6 +166,10 @@ pub const DEFAULT_ADMIN_CELL_LEVEL: u64 = 10;
 /// 660 m), but a road that far off is no longer the road the point is on (NOMINATIM_REFERENCE.md).
 pub const DEFAULT_SEARCH_DISTANCE: f64 = 130.0;
 
+// The bits of a POI record's flags byte, each its own (builder/src/types.h's POI_FLAG_*).
+/// The POI has a wikidata tag.
+pub const POI_FLAG_WIKIDATA: u8 = 0x02;
+
 // Matches POI_FLAG_HIGHWAY in builder/src/types.h — feature is a
 // highway-class polygon (highway=pedestrian/footway/etc.). Nominatim
 // ranks these as rank_search=26 (road) rather than the POI default
@@ -173,10 +177,15 @@ pub const DEFAULT_SEARCH_DISTANCE: f64 = 130.0;
 // than falling through to `parent_street`.
 pub const POI_FLAG_HIGHWAY: u8 = 0x04;
 
+/// A secondary ring of a multi-ring POI, which the place-search index leaves out (it is no POI
+/// of its own).
+pub const POI_FLAG_SECONDARY_RING: u8 = 0x08;
+
 /// Matches POI_FLAG_BELOW_RANK30 in builder/src/types.h: a generic feature (GENERIC_RANK30) of a
 /// tag address-levels.json ranks below 30 alone, a waterway=* or most natural=* ones, which is
 /// no rank-30 row of placex.
-pub const POI_FLAG_BELOW_RANK30: u8 = 0x08;
+pub const POI_FLAG_BELOW_RANK30: u8 = 0x10;
+const _: () = assert!(POI_FLAG_BELOW_RANK30 & (POI_FLAG_WIKIDATA | POI_FLAG_HIGHWAY | POI_FLAG_SECONDARY_RING) == 0);
 
 /// Whether (lat, lng) is a point on the globe: lat within ±90 and lng within ±180, so neither is NaN.
 pub fn coords_in_range(lat: f64, lng: f64) -> bool {

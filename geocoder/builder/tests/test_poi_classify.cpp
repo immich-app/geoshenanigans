@@ -189,14 +189,15 @@ TEST(poi_classify_marks_a_generic_feature_of_no_rank_30_row) {
 TEST(poi_classify_marks_no_water_object_of_a_lower_rank) {
     // A lake that is a building yields to it (a rank-30 POI), and is a generic feature of a wiki
     // tag that carries the lake for poi/notable; without one it stays the lake. Neither is a
-    // feature of a lower rank, though the lake's bits of the build hold POI_FLAG_BELOW_RANK30's.
+    // feature of a lower rank, though the lake's water bits, which hold that flag in the build,
+    // are set.
     Tags lake; lake.natural = "water"; lake.building = "yes"; lake.area = true;
     Tags named = lake; named.wikidata = "Q1";
     auto c = classify(named);
     REQUIRE(c.has_value());
     CHECK_EQ(uint8_t(c->category), uint8_t(PoiCategory::GENERIC_RANK30));
     CHECK(poi_water_of(c->flags) == PoiCategory::NATURAL_WATER);
-    CHECK((c->flags & POI_FLAG_BELOW_RANK30) != 0);
+    CHECK((c->flags & POI_FLAG_WATER_MASK) != 0);
     CHECK(!poi_build_below_rank30(c->flags));
     c = classify(lake);
     REQUIRE(c.has_value());

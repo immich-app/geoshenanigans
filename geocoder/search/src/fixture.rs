@@ -114,6 +114,12 @@ impl Geo {
         self.pois.len() as u32 - 1
     }
 
+    /// POI `poi` of `category` and tier `tier`, its flags byte `flags`.
+    pub fn classify_poi(&mut self, poi: u32, category: u8, tier: u8, flags: u8) {
+        let p = &mut self.pois[poi as usize];
+        (p.category, p.tier, p.flags) = (category, tier, flags);
+    }
+
     /// The files as the builder writes them, by name. A boundary is listed in the admin cells of
     /// a grid of points over its bounding box and of each place node and POI inside the box; the
     /// own names beside the polygons, empty without any.

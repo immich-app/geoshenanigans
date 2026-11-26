@@ -2452,4 +2452,30 @@ mod tests {
             std::fs::write(imp.join(file), vec![0u8; n]).unwrap();
         }
     }
+
+    #[test]
+    fn a_poi_below_rank_30_is_indexed_and_a_secondary_ring_is_not() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        use crate::query::Searcher;
+        use crate::reader::SearchIndex;
+        use query_server::{POI_FLAG_BELOW_RANK30, POI_FLAG_WIKIDATA};
+        // A wiki-tagged waterway=stream (GENERIC_RANK30, which its tag lifts into poi/all) is no
+        // rank-30 row of placex, which the builder flags; the search still names it. A secondary
+        // ring of a multi-ring POI is no POI of its own.
+        let mut g = Geo::default();
+        let brook = g.poi("Hartley Brook", 10.05, 20.05, 0);
+        g.classify_poi(brook, 170, 3, POI_FLAG_WIKIDATA | POI_FLAG_BELOW_RANK30);
+        let ring = g.poi("Quenby Mere", 10.1, 20.1, 0);
+        g.classify_poi(ring, 0, 1, POI_FLAG_SECONDARY_RING);
+        let dir = TempDir::new("below-rank-30");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
+        let s = Searcher::new(&idx);
+        let found = |q: &str| s.search(q, 5).0.iter().map(|f| f.hit.entity).collect::<Vec<_>>();
+
+        assert_eq!(found("Hartley Brook"), [brook | POI_BIT]);
+        assert_eq!(found("Quenby Mere"), [0u32; 0]);
+    }
 }
