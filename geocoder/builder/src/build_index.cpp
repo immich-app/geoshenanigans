@@ -16,6 +16,7 @@
 #include <numeric>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -73,6 +74,7 @@
 #include "output_dir.h"
 #include "write_schedule.h"
 #include "water_layer.h"
+#include "zlib_blob.h"
 
 // The POI writer reads PoiRecord as the logical record it encodes.
 static_assert(sizeof(PoiRecord) == poi_files::LOGICAL_STRIDE && offsetof(PoiRecord, vertex_offset) == poi_files::OFF_VERTEX_OFFSET &&
@@ -314,6 +316,40 @@ static ExternalPostcodes read_external_postcodes(const std::string& path) {
         out.rows.push_back({std::move(*norm), lat, lng, cc});
     }
     return out;
+}
+
+// GeoNames' postal places (--postal-places, postal_cities_build.h's
+// parse_places: our TSV, or GeoNames' own files, plain or gzipped), by
+// their ZIP as the postcode grid's pattern takes it. A gzipped file is
+// inflated in memory: its path goes to no shell.
+static postal_cities::Places read_postal_places(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("--postal-places: failed to open " + path);
+    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (f.bad()) throw std::runtime_error("--postal-places: failed to read " + path);
+    if (path.size() > 3 && path.compare(path.size() - 3, 3, ".gz") == 0) {
+        try {
+            text = gzip_inflate(text);
+        } catch (const std::runtime_error& e) {
+            throw std::runtime_error("--postal-places: " + path + ": " + e.what());
+        }
+    }
+    std::istringstream in(std::move(text));
+    postal_cities::Places places = postal_cities::parse_places(in, postcode_grid::grid_postcode);
+    // A file given that names no ZIP is none of GeoNames': a build of it
+    // would name a ZIP of few votes as one without --postal-places does.
+    if (places.empty()) throw std::runtime_error("--postal-places: no row of a ZIP in " + path);
+    return places;
+}
+
+// Yesterday's postal cities (--prev-postal-cities): any mode dir's
+// postal_cities.bin of yesterday's planet, whose names keep their margin.
+static postal_cities::Names read_prev_postal_cities(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("--prev-postal-cities: failed to open " + path);
+    const std::vector<uint8_t> file((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (f.bad()) throw std::runtime_error("--prev-postal-cities: failed to read " + path);
+    return postal_cities::names_of(file);
 }
 
 static void load_external_postcodes(ParsedData& data, const std::string& path,
@@ -2523,6 +2559,9 @@ static int run(int argc, char* argv[]) {
         std::cerr << "  --tiger-data <path>          Load TIGER address data (tar.gz or directory of CSVs)" << std::endl;
         std::cerr << "  --external-postcodes <path>  Load GeoNames postcode centroids (CSV or .csv.gz)" << std::endl;
         std::cerr << "  --wikidata-sitelinks <path>  Load QID→sitelinks binary for POI importance" << std::endl;
+        std::cerr << "  --postal-places <path>       GeoNames' US postal place names for postal_cities.bin (TSV or .gz)" << std::endl;
+        std::cerr << "  --prev-postal-cities <path>  Yesterday's postal_cities.bin, whose names keep a margin" << std::endl;
+        std::cerr << "  --dump-postal-votes <path>   Write each ZIP's postal city votes as TSV" << std::endl;
         std::cerr << "  --marine <path>              Load the seas and oceans (tools/marine_import.py) into the water layer"
                   << std::endl;
         return 1;
@@ -2533,6 +2572,7 @@ static int run(int argc, char* argv[]) {
     std::string wikidata_sitelinks_path;
     std::string tiger_data_path;
     std::string external_postcodes_path;
+    std::string postal_places_path, prev_postal_cities_path, postal_votes_dump_path;
     std::string marine_path;
     // strategy-2: previous build's output root, used to read
     // <prev_dir>/<region>/<variant>/*.osm_ids sidecars and assign
@@ -2585,6 +2625,12 @@ static int run(int argc, char* argv[]) {
             marine_path = argv[++i];
         } else if (arg == "--prev-output" && i + 1 < argc) {
             prev_output_dir = argv[++i];
+        } else if (arg == "--postal-places" && i + 1 < argc) {
+            postal_places_path = argv[++i];
+        } else if (arg == "--prev-postal-cities" && i + 1 < argc) {
+            prev_postal_cities_path = argv[++i];
+        } else if (arg == "--dump-postal-votes" && i + 1 < argc) {
+            postal_votes_dump_path = argv[++i];
         } else {
             input_files.push_back(arg);
         }
@@ -2602,6 +2648,17 @@ static int run(int argc, char* argv[]) {
     if (!marine_path.empty()) marine::check_file(marine_path);
 
     ParsedData data;
+    // The postal cities' inputs, small and read before the parse, so a bad
+    // one fails the build at once.
+    if (!postal_places_path.empty()) {
+        data.postal_places = read_postal_places(postal_places_path);
+        std::cerr << "Loaded " << data.postal_places.size() << " postal places from " << postal_places_path << std::endl;
+    }
+    if (!prev_postal_cities_path.empty()) {
+        data.prev_postal_names = read_prev_postal_cities(prev_postal_cities_path);
+        std::cerr << "Loaded " << data.prev_postal_names.size() << " postal cities from " << prev_postal_cities_path << std::endl;
+    }
+    data.postal_votes_dump = postal_votes_dump_path;
     auto _pt = std::chrono::steady_clock::now();
     auto _cpu = CpuTicks::now();
 
@@ -3222,7 +3279,9 @@ static int run(int argc, char* argv[]) {
                     std::vector<uint64_t> addr_cells;
                     std::vector<std::pair<uint32_t, uint32_t>> addr_strings; // {hn, street}
                     std::vector<uint32_t> addr_postcodes; // parallel to addr_strings
-                    std::vector<uint32_t> addr_cities; // parallel to addr_strings
+                    // addr:city, parallel to addr_strings: interned in the
+                    // pool and, for the postal cities' votes, apart from it.
+                    std::vector<uint32_t> addr_cities;
                     std::vector<int64_t> addr_osm_node_ids; // parallel to addr_coords; strategy-2 stable identity
                     uint64_t count = 0;
                     uint64_t nodes = 0;
@@ -3533,6 +3592,13 @@ static int run(int argc, char* argv[]) {
                         for (uint32_t code : r < 2 * n_tl ? local.poi_names : local.place_names) emit(code);
                     }
                 }, data.string_pool);
+                // The addresses' addr:city values go to a pool of their own
+                // too, the postal cities' votes', which no file holds.
+                std::vector<uint32_t> city_runs(n_tl);
+                for (size_t r = 0; r < n_tl; r++) city_runs[r] = static_cast<uint32_t>(r);
+                const auto city_ids = intern_dicts(dicts, city_runs, [&](uint32_t r, auto&& emit) {
+                    for (uint32_t code : ntld[r].addr_cities) emit(code);
+                }, data.postal_vote_pool);
                 log_phase("      Node merge: strings", _mt, _mc);
 
                 // Merge address points
@@ -3545,7 +3611,8 @@ static int run(int argc, char* argv[]) {
                         put_addr_point(data, addr_base + at, local.addr_coords[j].lat, local.addr_coords[j].lng,
                                        ids(local.addr_strings[j].first), ids(local.addr_strings[j].second),
                                        ids(local.addr_postcodes[j]), ids(local.addr_cities[j]), local.addr_cells[j],
-                                       pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, node_id));
+                                       pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, node_id), NO_DATA, 0,
+                                       city_ids[k](local.addr_cities[j]));
                     }
                 });
                 uint64_t total_addrs = 0;
@@ -3667,7 +3734,7 @@ static int run(int argc, char* argv[]) {
                     std::vector<uint32_t> way_orig_names;   // way original name (always name tag)
                     std::vector<std::pair<uint32_t, uint32_t>> addr_strings; // building addr {hn, street}
                     std::vector<uint32_t> addr_postcodes; // parallel to addr_strings
-                    std::vector<uint32_t> addr_cities;    // parallel to addr_strings
+                    std::vector<uint32_t> addr_cities;    // addr:city, parallel to addr_strings
                     std::vector<uint32_t> interp_strings;   // interp street name strings
                     uint64_t way_count = 0;
                     uint64_t building_addr_count = 0;
@@ -4122,6 +4189,13 @@ static int run(int argc, char* argv[]) {
                         break;
                     }
                 }, data.string_pool);
+                // The building addresses' addr:city values, to the postal
+                // cities' own pool (the node merge's).
+                std::vector<uint32_t> city_runs(tld.size());
+                for (size_t r = 0; r < tld.size(); r++) city_runs[r] = static_cast<uint32_t>(r);
+                const auto city_ids = intern_dicts(dicts, city_runs, [&](uint32_t r, auto&& emit) {
+                    for (uint32_t code : tld[r].addr_cities) emit(code);
+                }, data.postal_vote_pool);
                 log_phase("      Way merge: strings", _mt, _mc);
                 parallel_for_each(tld.size(), [&](size_t k, unsigned) { free_storage(tld[k].strings); });
                 uint64_t total_ways = 0, total_building_addrs = 0, total_interps = 0;
@@ -4203,7 +4277,7 @@ static int run(int argc, char* argv[]) {
                                        local.building_addr_cells[i],
                                        pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, bldg_way_id),
                                        has_poly ? static_cast<uint32_t>(bldg_vert_base + bldg_vert_at[k] + poly_off) : NO_DATA,
-                                       has_poly ? poly_cnt : 0);
+                                       has_poly ? poly_cnt : 0, city_ids[k](local.addr_cities[i]));
                     }
                 });
                 parallel_for_each(tld.size(), [&](size_t k, unsigned) {
@@ -5034,6 +5108,7 @@ static int run(int argc, char* argv[]) {
         log_mem("data.addr_vertices",                vec_bytes(data.addr_vertices));
         log_mem("data.addr_postcode_ids",            vec_bytes(data.addr_postcode_ids));
         log_mem("data.addr_city_ids",                vec_bytes(data.addr_city_ids));
+        log_mem("data.addr_vote_city_ids",           vec_bytes(data.addr_vote_city_ids));
         log_mem("data.addr_cells",                   vec_bytes(data.addr_cells));
         log_mem("data.admin_polygons",               vec_bytes(data.admin_polygons));
         log_mem("data.admin_osm_ids",                vec_bytes(data.admin_osm_ids));

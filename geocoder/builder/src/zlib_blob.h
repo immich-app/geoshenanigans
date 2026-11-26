@@ -1,12 +1,14 @@
-// Whole zlib-format (RFC 1950) blobs through libdeflate, which inflates PBF
-// blobs 2.5x and deflates them 2.2x faster than zlib on the planet. Inflating
-// gives zlib's bytes; deflating gives other, equally valid bytes. Streaming
-// and partial inflates (the .osc.gz reader, pbf-apply's blob peeks) stay on
-// zlib: libdeflate only takes a whole buffer.
+// Whole zlib-format (RFC 1950) blobs and gzip files (RFC 1952) through
+// libdeflate, which inflates PBF blobs 2.5x and deflates them 2.2x faster
+// than zlib on the planet. Inflating gives zlib's bytes; deflating gives
+// other, equally valid bytes. Streaming and partial inflates (the .osc.gz
+// reader, pbf-apply's blob peeks) stay on zlib: libdeflate only takes a
+// whole buffer.
 #pragma once
 
 #include <libdeflate.h>
 
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <new>
@@ -29,6 +31,36 @@ inline size_t zlib_inflate(std::string_view in, char* out, size_t capacity) {
         case LIBDEFLATE_INSUFFICIENT_SPACE: throw std::runtime_error("zlib data inflates past its raw size");
         default: throw std::runtime_error("zlib data is corrupt");
     }
+}
+
+// The bytes of a whole gzip file (RFC 1952), every member's in turn. Throws
+// on bytes that are no gzip members back to back, corrupt or cut short.
+inline std::string gzip_inflate(std::string_view in) {
+    struct Free {
+        void operator()(libdeflate_decompressor* d) const { libdeflate_free_decompressor(d); }
+    };
+    thread_local std::unique_ptr<libdeflate_decompressor, Free> decompressor(libdeflate_alloc_decompressor());
+    if (!decompressor) throw std::bad_alloc();
+
+    std::string out;
+    size_t at = 0, room = std::max<size_t>(4 * in.size(), 1 << 16);
+    do {
+        size_t used = 0, size = 0;
+        out.resize(out.size() + room);
+        char* to = out.data() + out.size() - room;
+        switch (libdeflate_gzip_decompress_ex(decompressor.get(), in.data() + at, in.size() - at, to, room, &used, &size)) {
+            case LIBDEFLATE_SUCCESS:
+                out.resize(out.size() - room + size);
+                at += used;
+                break;
+            case LIBDEFLATE_INSUFFICIENT_SPACE:
+                out.resize(out.size() - room);
+                room *= 2;
+                break;
+            default: throw std::runtime_error("gzip data is corrupt or cut short");
+        }
+    } while (at < in.size());
+    return out;
 }
 
 // The zlib data of raw at a compression level of 0-12 (zlib's 0-9 and three

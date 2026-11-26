@@ -1,0 +1,112 @@
+name: Update GeoNames Postal Places
+
+# GeoNames' postal place names of the United States and its territories, which the nightly's
+# postal_cities.bin falls back on where a ZIP's OpenStreetMap addresses name too few cities
+# (builder/src/postal_cities_build.h). The nightly reads this cache, never geonames.org, and fails
+# without it, as without TIGER's data.
+
+on:
+  schedule:
+    - cron: '37 3 * * 1'  # Weekly on Monday at 3:37 UTC
+  workflow_dispatch:
+
+# One refresh at a time: each reads the rows the cache holds before it replaces latest.json, so two
+# at once could both pass the check against the same rows.
+concurrency:
+  group: geocoder-geonames
+  cancel-in-progress: false
+
+env:
+  S3_BUCKET: geoshenanigans-reverse-geocoding
+  S3_ENDPOINT: https://t3.storage.dev
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
+            -o /tmp/s5cmd.tar.gz
+          sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
+
+      - name: Configure credentials
+        run: |
+          set -euo pipefail
+          echo "AWS_ACCESS_KEY_ID=$KEY" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$SECRET" >> "$GITHUB_ENV"
+        env:
+          KEY: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+
+      - name: Download GeoNames postal code files
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          GN="$RUNNER_TEMP/geonames"
+          mkdir -p "$GN"
+          for CC in US PR VI GU AS MP; do
+            curl -sSfL --connect-timeout 30 --max-time 300 --retry 3 --retry-delay 20 --retry-all-errors \
+              -o "$GN/$CC.zip" "https://download.geonames.org/export/zip/$CC.zip"
+            echo "$CC.zip: $(stat -c%s "$GN/$CC.zip") bytes"
+          done
+          curl -sSfL --connect-timeout 30 --max-time 60 --retry 3 --retry-delay 20 --retry-all-errors \
+            -o "$GN/readme.txt" "https://download.geonames.org/export/zip/readme.txt"
+          # The licence the cache's credit rests on (configurations.template.json, attribution).
+          grep -q "Creative Commons Attribution 4.0" "$GN/readme.txt" \
+            || { echo "::error::GeoNames' readme no longer gives CC BY 4.0"; exit 1; }
+
+      - name: Build and upload postal_places.tsv.gz
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5"
+          GN="$RUNNER_TEMP/geonames"
+          # The rows the cache holds now, read from the bucket itself (the public URL may serve an
+          # older copy): a refresh that loses more than 1% of them is refused, and the cache stays
+          # as it was. Only a bucket that holds no latest.json is a first refresh; a read that
+          # fails, or a latest.json of no row count, fails the run.
+          if $S5 cat "s3://$S3_BUCKET/geocoder/geonames/latest.json" > "$GN/latest.json" 2> "$GN/latest.err"; then
+            PREVIOUS_ROWS=$(jq -e '.rows | select(type == "number" and . >= 0 and . == floor)' "$GN/latest.json") \
+              || { echo "::error::geocoder/geonames/latest.json gives no row count; the cache stays as it was"; exit 1; }
+          elif grep -q "given object .* not found" "$GN/latest.err"; then
+            PREVIOUS_ROWS=0
+          else
+            echo "::error::Could not read geocoder/geonames/latest.json ($(tr '\n' ' ' < "$GN/latest.err")); the cache stays as it was"
+            exit 1
+          fi
+          echo "The cache holds $PREVIOUS_ROWS rows"
+          SUMMARY=$(python3 geocoder/builder/tools/postal_places.py "$GN/postal_places.tsv.gz" \
+            "$GN"/{US,PR,VI,GU,AS,MP}.zip --previous-rows "$PREVIOUS_ROWS")
+          echo "$SUMMARY" | jq .
+          # A run's own key, never overwritten: a nightly reading the file latest.json named before
+          # this run still finds it.
+          DATE=$(date -u +%Y%m%d)
+          KEY="geonames/$DATE/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          $S5 cp "$GN/postal_places.tsv.gz" "s3://$S3_BUCKET/geocoder/$KEY/postal_places.tsv.gz"
+          $S5 cp "$GN/readme.txt" "s3://$S3_BUCKET/geocoder/$KEY/readme.txt"
+          echo "$SUMMARY" | jq \
+            --arg date "$DATE" \
+            --arg path "$KEY/postal_places.tsv.gz" \
+            --arg readme "$KEY/readme.txt" \
+            --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{date: $date, path: $path, readme: $readme, rows: .rows, size: .size, sha256: .sha256, sources: .sources, updated_at: $updated_at}' \
+            | $S5 pipe "s3://$S3_BUCKET/geocoder/geonames/latest.json"
+          $S5 cat "s3://$S3_BUCKET/geocoder/geonames/latest.json" | jq .
+          {
+            echo "## GeoNames Postal Places"
+            echo "- Key: geocoder/$KEY"
+            echo "- Rows: $(echo "$SUMMARY" | jq -r .rows) (the cache held $PREVIOUS_ROWS)"
+            echo "- Per file: $(echo "$SUMMARY" | jq -c .sources)"
+          } >> "$GITHUB_STEP_SUMMARY"

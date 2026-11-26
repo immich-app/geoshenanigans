@@ -8,11 +8,15 @@ on:
       - "geocoder/search/**"
       - "geocoder/server/**"
       - "geocoder/test-portal/**"
+      # The vectors the builder's and the server's tests both read.
+      - "geocoder/testdata/**"
       - ".github/workflows/geocoder-tests.yml"
-      # The tool tests read the nightly's package list, and run the nightly's
-      # steps, its watchdog's scripts and the marine areas' workflow's steps.
+      # The tool tests read the nightly's package list and its postal
+      # inputs, run the nightly's steps, its watchdog's scripts and the marine
+      # areas' workflow's steps, and read the postal places' cache.
       - ".github/workflows/geocoder-build.yml"
       - ".github/workflows/geocoder-build-watchdog.yml"
+      - ".github/workflows/geocoder-geonames.yml"
       - ".github/workflows/geocoder-marine.yml"
 
 permissions:

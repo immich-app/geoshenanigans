@@ -11,12 +11,17 @@ TEST(grow_addr_points_grows_every_parallel_array_and_returns_the_first_slot) {
     ParsedData d;
     CHECK_EQ(grow_addr_points(d, 2), size_t(0));
     put_addr_point(d, 1, 1.5f, 2.5f, 7, NO_DATA, 9, 11, 42, 1001);
+    put_addr_point(d, 0, 1.5f, 2.5f, 7, NO_DATA, 9, NO_DATA, 42, 1002, NO_DATA, 0, 13);
     CHECK_EQ(grow_addr_points(d, 3), size_t(2));
     CHECK_EQ(d.addr_points.size(), size_t(5));
     CHECK_EQ(d.addr_osm_ids.size(), size_t(5));
     CHECK_EQ(d.addr_postcode_ids.size(), size_t(5));
     CHECK_EQ(d.addr_city_ids.size(), size_t(5));
     CHECK_EQ(d.addr_cells.size(), size_t(5));
+    CHECK_EQ(d.addr_vote_city_ids.size(), size_t(5));
+    CHECK_EQ(d.addr_vote_city_ids[0], 13u);
+    CHECK_EQ(d.addr_vote_city_ids[1], NO_DATA);
+    CHECK_EQ(d.addr_city_ids[0], NO_DATA);
     CHECK_EQ(d.addr_points[1].housenumber_id, 7u);
     CHECK_EQ(d.addr_points[1].parent_way_id, NO_DATA);
     CHECK_EQ(d.addr_osm_ids[1], uint64_t(1001));
@@ -35,5 +40,10 @@ TEST(grow_addr_points_refuses_parallel_arrays_of_different_lengths) {
     grow_addr_points(cities, 2);
     cities.addr_city_ids.pop_back();
     CHECK_EQ(refusal_of<std::logic_error>([&] { grow_addr_points(cities, 1); }),
+             std::string("addr_points and its parallel arrays differ in length"));
+    ParsedData votes;
+    grow_addr_points(votes, 2);
+    votes.addr_vote_city_ids.pop_back();
+    CHECK_EQ(refusal_of<std::logic_error>([&] { grow_addr_points(votes, 1); }),
              std::string("addr_points and its parallel arrays differ in length"));
 }

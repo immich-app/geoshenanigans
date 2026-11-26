@@ -1750,7 +1750,7 @@ mod tests {
         let (v, c) = template();
         let files = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin",
                      "arc_index.bin", "arc_vertices.bin", "attribution.json", "place_cells.bin", "place_hidden.bin", "place_nodes.bin",
-                     "postcode_grid.bin", "strings_core.bin", "strings_layout.json"];
+                     "postal_cities.bin", "postcode_grid.bin", "strings_core.bin", "strings_layout.json"];
         let minimal: Vec<RegionSelection> = template_selections(&v).into_iter()
             .filter(|s| s.mode == "admin-minimal" && s.region == "europe")
             .collect();
@@ -1788,6 +1788,17 @@ mod tests {
                 ("admin-minimal", _) => format!("{}/admin-minimal-poi/", s.region),
                 _ => format!("{}/quality/{}/", s.region, s.quality),
             };
+            // The postal cities, once, from the mode's own dir, and optional: a region of no US
+            // ZIP has none.
+            let mode_dir = match (s.mode.as_str(), s.poi_tier.as_str()) {
+                ("admin-minimal", "none") => format!("{}/admin-minimal/", s.region),
+                ("admin-minimal", _) => format!("{}/admin-minimal-poi/", s.region),
+                (mode, _) => format!("{}/{mode}/", s.region),
+            };
+            let postal = format!("{mode_dir}postal_cities.bin");
+            let tables: Vec<&String> = paths.iter().filter(|p| basename(p) == "postal_cities.bin").collect();
+            assert_eq!(tables, [&postal], "{:?}", s);
+            assert!(resolved.optional.contains(&postal), "{:?}", s);
             let water_dir = match s.water.as_str() {
                 "none" => None,
                 "all-exact" => Some(format!("{}/water/all/exact/", s.region)),
@@ -1805,8 +1816,9 @@ mod tests {
             bins.sort_unstable();
             bins.dedup();
             assert_eq!(bins.len(), count, "{:?}: {:?}", s, paths);
+            // The keyhole geometry files arcs replaced.
             let stale: Vec<&String> = paths.iter()
-                .filter(|p| basename(p) == "admin_vertices.bin" || basename(p).starts_with("postal_"))
+                .filter(|p| ["admin_vertices.bin", "postal_polygons.bin", "postal_vertices.bin"].contains(&basename(p)))
                 .collect();
             assert!(stale.is_empty(), "{:?}: {:?}", s, stale);
         }

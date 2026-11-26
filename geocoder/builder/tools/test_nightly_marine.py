@@ -344,8 +344,12 @@ class NightlyTest(unittest.TestCase):
             f.write(FAKE_BUILD_INDEX)
         os.chmod(path, 0o755)
         recorded = os.path.join(self.tmp.name, "build-index-args")
+        # The step refuses to build without GeoNames' postal places (test_nightly_postal_cities).
+        places = os.path.join(self.tmp.name, "postal_places.tsv.gz")
+        with open(places, "wb") as f:
+            f.write(b"x")
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "WORKDIR": self.work, "MARINE_FILE": marine,
-               "BUILD_INDEX_ARGS": recorded}
+               "POSTAL_PLACES_FILE": places, "BUILD_INDEX_ARGS": recorded}
         run = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", block], env=env, capture_output=True, text=True,
                              timeout=60)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)

@@ -71,6 +71,36 @@ TEST(attribution_of_geonames_says_how_the_dataset_changed_its_data) {
     }
 }
 
+TEST(attribution_of_the_postal_cities_gives_geonames_the_notice_of_its_names_alone) {
+    // A dir of postal cities whose names GeoNames's US places chose, and no
+    // GeoNames centroid (admin-minimal's), credits GeoNames with the readme's
+    // notice of every file and the changes to its names, not those to its
+    // centroids, nor GB_full's or Code-Point Open's.
+    const std::string postal_changes =
+        R"("Changes: this dataset names a US ZIP code with the place name GeoNames's postal code files give it where )"
+        R"(the ZIP's OpenStreetMap addresses name too few cities, choose that name, or favour another by fewer votes )"
+        R"(than the extra ones that name counts, spelt as OpenStreetMap addresses spell it where they do, in its own )"
+        R"(format; it holds none of the files' other fields.")";
+    const std::string cities = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_POSTAL_CITIES);
+    const size_t at = cities.find("\"id\": \"geonames\"");
+    REQUIRE(at != std::string::npos);
+    CHECK(cities.find("The Data is provided", at) < cities.find(postal_changes, at));
+    CHECK(cities.find(postal_changes, at) != std::string::npos);
+    CHECK(cities.find("as their centroids") == std::string::npos);
+    CHECK(cities.find("GB_full") == std::string::npos);
+    CHECK(cities.find("\"id\": \"codepoint-open\"") == std::string::npos);
+    // The readme's notice opens its notices.
+    CHECK(cities.find(R"("notices": [
+      "The Data is provided)", at) != std::string::npos);
+    // The centroids alone give no notice of the names; both, both notices,
+    // the centroids' first, under one entry.
+    CHECK(attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES).find(postal_changes) == std::string::npos);
+    const std::string both = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES | ATTRIBUTION_POSTAL_CITIES);
+    CHECK(both.find("\"id\": \"geonames\"") == both.rfind("\"id\": \"geonames\""));
+    CHECK(both.find("as their centroids") < both.find(postal_changes));
+    CHECK(both.find(postal_changes) != std::string::npos);
+}
+
 TEST(attribution_of_geonames_carries_the_credit_of_code_point_open) {
     // GeoNames's GB_full is derived from Ordnance Survey's Code-Point Open,
     // whose entry, under the Open Government Licence, travels with it: the
@@ -264,7 +294,8 @@ TEST(attribution_entries_are_the_templates) {
     const size_t at = json.find(key);
     REQUIRE(at != std::string::npos && json.find(key, at + 1) == std::string::npos);
     const std::string all = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES | ATTRIBUTION_CODEPOINT |
-                                             ATTRIBUTION_TIGER | ATTRIBUTION_WIKIDATA | ATTRIBUTION_MARINE);
+                                             ATTRIBUTION_TIGER | ATTRIBUTION_WIKIDATA | ATTRIBUTION_MARINE |
+                                             ATTRIBUTION_POSTAL_CITIES);
     const std::string templates = canonical(json, at + key.size() - 1, "applies_to"), written = canonical_document(all);
     if (templates != written) std::printf("    template: %s\n    written:  %s\n", templates.c_str(), written.c_str());
     CHECK(templates == written);
