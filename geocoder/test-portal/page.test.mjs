@@ -417,6 +417,28 @@ test('the field table marks the fields the answers disagree on or lack', () => {
   assert.deepEqual(plain(fieldRows([{ city: 'Paris' }, { city: 'Paris' }])), [{ field: 'city', values: ['Paris', 'Paris'], differs: false, missing: false }]);
 });
 
+// Nominatim's column lacks an extension field by its contract: no mark,
+// and n/a in its cell; another column lacking one is marked.
+test('the field table marks no extension field missing in the Nominatim column', () => {
+  const { fieldRows, detailHtml } = core();
+  const ours = { postcode: '19026', postal_city: 'Drexel Hill' };
+  const theirs = { postcode: '19026' };
+  const row = (rows) => plain(rows).find((r) => r.field === 'postal_city');
+  assert.deepEqual(row(fieldRows([ours, theirs], [false, true])), { field: 'postal_city', values: ['Drexel Hill', ''], differs: false, missing: false });
+  assert.equal(row(fieldRows([ours, theirs])).missing, true);
+  assert.equal(row(fieldRows([ours, theirs], [false, true])).missing, false);
+  const views = [
+    { label: 'ours', color: '#fff', dataset: null, answer: { data: { display_name: 'x', address: ours } } },
+    { label: 'Nominatim', color: '#000', dataset: null, nominatim: true, answer: { data: { display_name: 'x', address: theirs } } },
+  ];
+  const detail = detailHtml(views, '2026-11-20');
+  const postal = detail.slice(detail.indexOf('>postal_city<') - 40, detail.indexOf('</tr>', detail.indexOf('>postal_city<')));
+  assert.ok(!postal.includes('missing'), postal);
+  assert.ok(postal.includes('<td class="empty" title="Not a Nominatim field">n/a</td>'), postal);
+  const other = detailHtml([views[0], { ...views[1], nominatim: false, label: 'other' }], '2026-11-20');
+  assert.ok(other.slice(other.indexOf('>postal_city<') - 40, other.indexOf('>postal_city<')).includes('missing'));
+});
+
 test('answers differ by display name, a field, or the places and their distances', () => {
   const { answersDiffer } = core();
   const paris = { display_name: 'Paris', address: { city: 'Paris' }, places: [{ name: 'Louvre', category: 'museum', distance_m: 12 }] };
@@ -2042,7 +2064,8 @@ const OSM = {
 const NOTICES = {
   geonames: ['UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.',
     'The Data is provided "as is" without warranty or any representation of accuracy, timeliness or completeness.',
-    "Changes: this dataset holds the coordinates of the postcodes of GeoNames's postal code files that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the files' other fields."],
+    "Changes: this dataset holds the coordinates of the postcodes of GeoNames's postal code files that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the files' other fields.",
+    "Changes: this dataset names a US ZIP code with the place name GeoNames's postal code files give it where the ZIP's OpenStreetMap addresses name too few cities, choose that name, or favour another by fewer votes than the extra ones that name counts, spelt as OpenStreetMap addresses spell it where they do, in its own format; it holds none of the files' other fields."],
   'codepoint-open': ["GeoNames's GB_full.csv.zip is derived from Code-Point Open.",
     'Contains Ordnance Survey data © Crown copyright and database right 2022.',
     'Contains Royal Mail data © Royal Mail copyright and database right 2022.',

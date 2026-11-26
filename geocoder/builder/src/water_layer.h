@@ -8,12 +8,16 @@
 //                                         piece of either, water_split.h),
 //                                         with its holes, carrying the
 //                                         object's name, type code (in
-//                                         country_code) and whole area (its
+//                                         country_code), whole area (its
 //                                         polygons' exact areas less their
 //                                         holes, summed, square degrees), so
-//                                         records' areas don't add up
+//                                         records' areas don't add up, and
+//                                         flags (kWeakName, in the place type)
 //   arc_index.bin + arc_vertices.bin      the tier's arcs (kWaterArcStage:
 //                                         rings cut at member way ends)
+//   water_cut_arcs.bin                    a bit per arc slot, set for a cut:
+//                                         an arc only one object's polygons
+//                                         use, twice or more
 //   admin_cells.bin + admin_entries.bin   the cell index at the admin cell
 //                                         level (--admin-level, L10 by
 //                                         default), interior where both
@@ -206,6 +210,7 @@ struct Object {
     double km2 = 0;        // the same on the sphere, km² (the major tier's thresholds)
     uint32_t name_key = UINT32_MAX;  // the naming key it took (NamingLines::keys), UINT32_MAX for none
     uint32_t key_qid = 0;            // the lowest wikidata item of that key's lines in it, 0 for none
+    bool weak_name = false;          // its name is its key's, taken weakly (water_names.h's weak_name)
 };
 
 // The layer's build over the planet's objects, step by step (build_index.cpp
@@ -247,7 +252,8 @@ Build assemble(Collected& c, unsigned threads);
 
 // Leaves out each OSM natural=bay or strait that is a marine area's
 // namesake, in place: its name or local name (name:en or name) is the
-// marine area's, ASCII case, spaces and punctuation aside, and the polygons
+// marine area's (the name it shows or its IHO name, marine::shown_name),
+// ASCII case, spaces and punctuation aside, and the polygons
 // of the marine areas of its name hold all its water (polygons_cover: its
 // polygons' rings even-odd, its holes left out, within the union of the
 // areas', each area's rings even-odd, a shared shore aside; each area's
@@ -266,8 +272,11 @@ size_t drop_marine_namesakes(Build& b);
 // name of its own) the key's local name its local name. An unnamed one
 // takes the choice's name, and its local name with the key alone: one of an
 // item of its own takes the name alone otherwise, and no local name to join
-// a river by. Returns how many objects it named.
-size_t apply_names(Build& b, const std::vector<NameChoice>& choices);
+// a river by. Then marks each name so taken that is weak (weak_name: its
+// key's length inside the object and its waterway's length against the
+// object's area). Returns how many objects it named and, of those, how many
+// weakly.
+std::pair<size_t, size_t> apply_names(Build& b, const std::vector<NameChoice>& choices);
 
 // Cuts each polygon of more than kSplitMaxHoles holes into pieces along the
 // grid (water_split.h), in place: each piece a polygon of the same object
@@ -297,7 +306,8 @@ struct PolygonIdentities {
 PolygonIdentities polygon_identities(const Build& b);
 
 // The major tier of the planet (water_classify.h): every marine area, each
-// other object by its own area, and each river object by its river's, the
+// other object by its own area and kind, and each river object by its
+// river's, the
 // river objects grouped by their waterway relation (a naming key of one), by
 // wikidata item (theirs, or that of a line of their key in them) and by
 // local name (none of an object without one) along river polygons that

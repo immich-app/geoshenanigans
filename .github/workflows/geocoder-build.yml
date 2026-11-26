@@ -413,6 +413,7 @@ jobs:
           TODAY_SEQ: ${{ steps.setup.outputs.today_seq }}
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
           PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}
+          SEED_PREVIOUS: ${{ inputs.seed_previous }}
         run: |
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
@@ -478,7 +479,8 @@ jobs:
             IDX_PID=$!
           fi
 
-          # ── Background: wikidata sitelinks, GeoNames postcodes, TIGER ──
+          # ── Background: wikidata sitelinks, GeoNames postcodes, TIGER,
+          # GeoNames' postal places and yesterday's postal cities ──
           # Small and independent of the PBF, so they come down beside it
           # (~2 min one after another, against ~3 for the PBF).
           (
@@ -581,6 +583,146 @@ jobs:
             echo "::error::[tiger] No TIGER data available at $S3_PUBLIC_URL/geocoder/tiger/latest.json — refusing to build a US-less planet index"
             exit 1
           fi
+
+          # ── Postal places: GeoNames' US place names, from our cache ──
+          # postal_cities.bin names a ZIP its addresses name too few cities
+          # for with GeoNames' name, which Update GeoNames Postal Places
+          # caches weekly: the night never reads geonames.org, and a missing
+          # or bad cache fails it, as TIGER's does.
+          echo "[postal] Checking for GeoNames postal places..."
+          PP_LATEST=$(curl -sL --fail --connect-timeout 30 --max-time 60 "$S3_PUBLIC_URL/geocoder/geonames/latest.json" 2>/dev/null || echo '{}')
+          PP_PATH=$(echo "$PP_LATEST" | jq -r '.path // ""' 2>/dev/null || echo "")
+          PP_SIZE=$(echo "$PP_LATEST" | jq -r '.size // 0' 2>/dev/null || echo 0)
+          PP_SHA=$(echo "$PP_LATEST" | jq -r '.sha256 // ""' 2>/dev/null || echo "")
+          if ! [[ "$PP_PATH" =~ ^geonames/[0-9]{8}/[0-9]+-[0-9]+/postal_places\.tsv\.gz$ && "$PP_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::[postal] No postal places named by $S3_PUBLIC_URL/geocoder/geonames/latest.json (path '$PP_PATH') — refusing to build US postal cities without GeoNames' names; run Update GeoNames Postal Places"
+            exit 1
+          fi
+          curl -sL --fail --connect-timeout 30 --max-time 300 --retry 3 -o "$WORKDIR/postal_places.tsv.gz" \
+            "$S3_PUBLIC_URL/geocoder/$PP_PATH" || true
+          PP_GOT=$(stat -c%s "$WORKDIR/postal_places.tsv.gz" 2>/dev/null || echo 0)
+          PP_GOT_SHA=$(sha256sum "$WORKDIR/postal_places.tsv.gz" 2>/dev/null | cut -d' ' -f1 || true)
+          if [ "$PP_GOT" != "$PP_SIZE" ] || [ "$PP_GOT_SHA" != "$PP_SHA" ]; then
+            echo "::error::[postal] Postal places $PP_PATH missing or not the file latest.json names: got $PP_GOT bytes, sha256 '$PP_GOT_SHA'; latest.json says $PP_SIZE, $PP_SHA"
+            exit 1
+          fi
+          echo "[postal] Downloaded $PP_PATH: $(echo "$PP_LATEST" | jq -r '.rows // 0') rows"
+          echo "postal_places=$WORKDIR/postal_places.tsv.gz" >> "$GITHUB_OUTPUT"
+
+          # ── Yesterday's postal cities, whose names keep their margin ──
+          # The table of the newest build latest.json names before today's,
+          # whatever its build version, so a fresh night keeps the names a
+          # near tie would flip (postal_cities_build.h). A rerun of a day
+          # already uploaded takes the table its configurations.json says
+          # the day was built from (build.postal_cities_previous), held to
+          # the sha256 it gives (build.postal_cities_previous_sha256), so the
+          # same inputs give the same names, whatever latest.json names
+          # since, or the night fails where that day was rebuilt with other
+          # names since. A scratch prefix's patch night (seed_previous)
+          # takes the table of the live build Setup seeded it with, as the
+          # live night after it would. It goes to prev-state/, apart from
+          # old-output/, which
+          # fetch_previous_index.sh fills beside the build. A build that
+          # published none (the first night) leaves none; one that did and
+          # can't be read fails the night, as does a latest.json or
+          # configurations.json that can't be read, or a latest.json that
+          # names no build: only an object the bucket holds none of is no
+          # state.
+          mkdir -p "$WORKDIR/prev-state"
+          # s3_json URL FILE: the JSON object at URL in FILE, status 0;
+          # status 1 where the bucket holds no object there. Fails the night
+          # on any other failed read, and on bytes that are no JSON object.
+          s3_json() {
+            if $S5 cat "$1" > "$2" 2> "$2.err"; then
+              jq -e 'type == "object"' "$2" > /dev/null 2>&1 && return 0
+              echo "::error::[postal] $1 holds no JSON object — refusing to build without knowing yesterday's postal cities"
+              exit 1
+            fi
+            grep -q "given object .* not found" "$2.err" && return 1
+            echo "::error::[postal] Could not read $1 ($(tr '\n' ' ' < "$2.err")) — refusing to build without knowing yesterday's postal cities"
+            exit 1
+          }
+          BUILDS="s3://$S3_BUCKET/$S3_PREFIX/builds"
+          DAY_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+          PREV_TABLE_DATE=""
+          RERUN=""
+          PINNED_SHA=""
+          if s3_json "$BUILDS/$TODAY/configurations.json" "$WORKDIR/prev-state/today.json" \
+            && jq -e '(.build // {}) | has("postal_cities_previous")' "$WORKDIR/prev-state/today.json" > /dev/null; then
+            PREV_TABLE_DATE=$(jq -r '.build.postal_cities_previous // ""' "$WORKDIR/prev-state/today.json")
+            RERUN=1
+            PINNED_SHA=$(jq -r '.build.postal_cities_previous_sha256 // "" | tostring' "$WORKDIR/prev-state/today.json")
+            echo "[postal] A rerun of $TODAY, which took the postal cities of ${PREV_TABLE_DATE:-no day}: taking them again"
+          elif [ "${SEED_PREVIOUS:-}" = true ]; then
+            PREV_TABLE_DATE=$YESTERDAY
+            echo "[postal] A patch night seeded with the live build of $YESTERDAY: taking its postal cities"
+          elif s3_json "$BUILDS/latest.json" "$WORKDIR/prev-state/latest.json"; then
+            # A pointer names a build: latest a day, previous a day or null.
+            if ! jq -e --arg day "$DAY_RE" '(.latest | type == "string" and test($day))
+                and ((.previous // null) == null or (.previous | type == "string" and test($day)))' \
+                "$WORKDIR/prev-state/latest.json" > /dev/null; then
+              echo "::error::[postal] $BUILDS/latest.json names no build (latest $(jq -c '.latest' "$WORKDIR/prev-state/latest.json"), previous $(jq -c '.previous' "$WORKDIR/prev-state/latest.json")) — refusing to build without knowing yesterday's postal cities"
+              exit 1
+            fi
+            PREV_TABLE_DATE=$(jq -r --arg today "$TODAY" \
+              'if (.latest // "") != "" and .latest < $today then .latest elif (.previous // "") != "" and .previous < $today then .previous else "" end' \
+              "$WORKDIR/prev-state/latest.json")
+          fi
+          if [ -n "$PREV_TABLE_DATE" ] && ! [[ "$PREV_TABLE_DATE" =~ $DAY_RE && "$PREV_TABLE_DATE" < "$TODAY" ]]; then
+            echo "::error::[postal] '$PREV_TABLE_DATE' is no day before $TODAY to take yesterday's postal cities from"
+            exit 1
+          fi
+          # A rerun's record of a day gives the sha256 of the table it took.
+          if [ -n "$RERUN" ] && [ -n "$PREV_TABLE_DATE" ] && ! [[ "$PINNED_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::[postal] The configurations.json of $TODAY names the postal cities of $PREV_TABLE_DATE it took without their sha256 — refusing to take any but those"
+            exit 1
+          fi
+          PREV_TABLE_USED=""
+          if [ -n "$PREV_TABLE_DATE" ]; then
+            if ! s3_json "$BUILDS/$PREV_TABLE_DATE/configurations.json" "$WORKDIR/prev-state/configurations.json"; then
+              echo "::error::[postal] The build of $PREV_TABLE_DATE has no configurations.json — refusing to build without knowing its postal cities"
+              exit 1
+            fi
+            # Its files: an object, which lists the table with its sha256 or
+            # not at all (a build that published none); anything else leaves
+            # yesterday's names unknown.
+            PREV_MANIFEST="$WORKDIR/prev-state/configurations.json"
+            if ! jq -e '.files | type == "object"' "$PREV_MANIFEST" > /dev/null; then
+              echo "::error::[postal] The configurations.json of $PREV_TABLE_DATE lists no files — refusing to build without knowing its postal cities"
+              exit 1
+            fi
+            PREV_TABLE_SHA=""
+            if jq -e '.files | has("planet/admin/postal_cities.bin")' "$PREV_MANIFEST" > /dev/null; then
+              PREV_TABLE_SHA=$(jq -r '.files["planet/admin/postal_cities.bin"] | if type == "object" then .sha256 // "" else "" end | tostring' "$PREV_MANIFEST")
+              if ! [[ "$PREV_TABLE_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+                echo "::error::[postal] The configurations.json of $PREV_TABLE_DATE lists planet/admin/postal_cities.bin without its sha256 — refusing to build without its names"
+                exit 1
+              fi
+            fi
+            if [ -n "$RERUN" ] && [ "$PREV_TABLE_SHA" != "$PINNED_SHA" ]; then
+              echo "::error::[postal] The postal cities of $PREV_TABLE_DATE are not the ones the first run of $TODAY took (sha256 $PINNED_SHA): $PREV_TABLE_DATE was rebuilt since — refusing to build with other names than that run's"
+              exit 1
+            fi
+            if [ -n "$PREV_TABLE_SHA" ]; then
+              $S5 cat "$BUILDS/$PREV_TABLE_DATE/planet/admin/postal_cities.bin.zst" 2>/dev/null \
+                | zstd -d -q -c > "$WORKDIR/prev-state/postal_cities.bin" || true
+              if [ "$(sha256sum "$WORKDIR/prev-state/postal_cities.bin" | cut -d' ' -f1)" != "$PREV_TABLE_SHA" ]; then
+                echo "::error::[postal] The postal cities of $PREV_TABLE_DATE are not the file its configurations.json names — refusing to build without their names, which a near tie would flip"
+                exit 1
+              fi
+              echo "[postal] Previous postal cities from $PREV_TABLE_DATE"
+              echo "prev_postal_cities=$WORKDIR/prev-state/postal_cities.bin" >> "$GITHUB_OUTPUT"
+              PREV_TABLE_USED=$PREV_TABLE_DATE
+            else
+              echo "[postal] The build of $PREV_TABLE_DATE published no postal cities: building without a margin"
+            fi
+          else
+            echo "[postal] No build before $TODAY to take postal cities from: building without a margin"
+          fi
+          # The day whose table this build takes and its sha256, for its
+          # configurations.json.
+          echo "prev_postal_cities_date=${PREV_TABLE_USED:-null}" >> "$GITHUB_OUTPUT"
+          echo "prev_postal_cities_sha256=$([ -n "$PREV_TABLE_USED" ] && echo "$PREV_TABLE_SHA" || echo null)" >> "$GITHUB_OUTPUT"
           ) &
           EXTRAS_PID=$!
 
@@ -885,6 +1027,8 @@ jobs:
           WIKIDATA_DATE: ${{ steps.download.outputs.wikidata_date }}
           TIGER_FILE: ${{ steps.download.outputs.tiger_data }}
           GEONAMES_FILE: ${{ steps.download.outputs.postcode_centroids_external }}
+          POSTAL_PLACES_FILE: ${{ steps.download.outputs.postal_places }}
+          PREV_POSTAL_CITIES: ${{ steps.download.outputs.prev_postal_cities }}
           MARINE_FILE: ${{ steps.download.outputs.marine_areas }}
           PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}
           RUNNER_TEMP: ${{ runner.temp }}
@@ -934,6 +1078,18 @@ jobs:
           if [ -n "$GEONAMES_FILE" ] && [ -f "$GEONAMES_FILE" ]; then
             BUILD_ARGS="$BUILD_ARGS --external-postcodes $GEONAMES_FILE"
             echo "Using GeoNames postcode data"
+          fi
+          # GeoNames' postal places (the download fails without them) and
+          # yesterday's postal cities, where a build before today published
+          # them.
+          if ! [ -s "$POSTAL_PLACES_FILE" ]; then
+            echo "::error::No GeoNames postal places for postal_cities.bin"
+            exit 1
+          fi
+          BUILD_ARGS="$BUILD_ARGS --postal-places $POSTAL_PLACES_FILE"
+          if [ -n "$PREV_POSTAL_CITIES" ] && [ -f "$PREV_POSTAL_CITIES" ]; then
+            BUILD_ARGS="$BUILD_ARGS --prev-postal-cities $PREV_POSTAL_CITIES"
+            echo "Using the previous postal cities"
           fi
           if [ -n "$MARINE_FILE" ] && [ -f "$MARINE_FILE" ]; then
             BUILD_ARGS="$BUILD_ARGS --marine $MARINE_FILE"
@@ -1366,6 +1522,8 @@ jobs:
           OLD_DATE: ${{ steps.setup.outputs.yesterday }}
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
           WIKIDATA_DATE: ${{ steps.download.outputs.wikidata_date || 'null' }}
+          POSTAL_CITIES_PREVIOUS: ${{ steps.download.outputs.prev_postal_cities_date || 'null' }}
+          POSTAL_CITIES_PREVIOUS_SHA256: ${{ steps.download.outputs.prev_postal_cities_sha256 || 'null' }}
           PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
@@ -1407,16 +1565,22 @@ jobs:
           echo "Tigris upload first pass complete in $(($(date +%s) - UPLOAD_START))s"
 
           # ── Augment configurations.json with build metadata ─────────
-          # Splices date / previous / built_at / wikidata_date into the
+          # Splices date / previous / built_at / wikidata_date /
+          # postal_cities_previous / postal_cities_previous_sha256 into the
           # `build` block (which the static template stamps with
           # build_version + patch_version). A build whose patches failed
           # verify published none, so it must not claim a previous build.
+          # postal_cities_previous is the day whose postal cities gave this
+          # build yesterday's names, and its sha256 theirs, which a rerun of
+          # this day takes again.
           PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && [ -z "${PATCH_VERIFY_FAILED:-}" ] && echo "$OLD_DATE" || echo "null" )"
           jq --arg date "$NEW_DATE" \
              --arg previous "$PREV_VAL" \
              --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
              --arg wikidata_date "$WIKIDATA_DATE" \
-             '.build = ((.build // {}) + {date: $date, previous: (if $previous == "null" then null else $previous end), built_at: $built_at, wikidata_date: (if $wikidata_date == "null" then null else $wikidata_date end)})' \
+             --arg postal_cities_previous "$POSTAL_CITIES_PREVIOUS" \
+             --arg postal_cities_previous_sha256 "$POSTAL_CITIES_PREVIOUS_SHA256" \
+             '.build = ((.build // {}) + {date: $date, previous: (if $previous == "null" then null else $previous end), built_at: $built_at, wikidata_date: (if $wikidata_date == "null" then null else $wikidata_date end), postal_cities_previous: (if $postal_cities_previous == "null" then null else $postal_cities_previous end), postal_cities_previous_sha256: (if $postal_cities_previous_sha256 == "null" then null else $postal_cities_previous_sha256 end)})' \
              "$WORKDIR/output/configurations.json" > "$WORKDIR/output/configurations.tmp" \
              && mv "$WORKDIR/output/configurations.tmp" "$WORKDIR/output/configurations.json"
           echo "configurations.json size: $(stat -c%s "$WORKDIR/output/configurations.json") bytes"

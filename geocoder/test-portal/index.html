@@ -624,7 +624,7 @@ const PREFERRED_ORDER = [
   'house_number', 'road', 'city_block', 'neighbourhood', 'quarter',
   'suburb', 'borough', 'city_district', 'city', 'town', 'village',
   'hamlet', 'municipality', 'district', 'county', 'state_district',
-  'region', 'province', 'state', 'postcode', 'country', 'country_code',
+  'region', 'province', 'state', 'postcode', 'postal_city', 'country', 'country_code',
 ];
 
 // `s` as HTML text, in an element or a quoted attribute.
@@ -860,16 +860,22 @@ function answerOf(status, header, body, ms) {
   }
 }
 
+// The fields of our answers that are no Nominatim field: Nominatim's column
+// lacks them by its contract, not by a difference.
+const EXTENSION_FIELDS = new Set(['postal_city']);
+
 // The field table's rows: each address field of any of `addresses` (null
 // for a column without an answer, which lacks no field), in PREFERRED_ORDER
 // then by name, with each one's value ('' for none), whether two values
-// disagree, and whether an answer lacks the field.
-function fieldRows(addresses) {
+// disagree, and whether an answer lacks the field. A column `nominatim`
+// marks (true at its index) lacks no extension field either.
+function fieldRows(addresses, nominatim = []) {
   const fields = [...new Set(addresses.flatMap((a) => Object.keys(a || {})))];
   const rank = (f) => (PREFERRED_ORDER.includes(f) ? PREFERRED_ORDER.indexOf(f) : PREFERRED_ORDER.length);
   fields.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
   return fields
-    .map((field) => compared(field, addresses.map((a) => (a && a[field] != null && a[field] !== '' ? String(a[field]) : '')), addresses))
+    .map((field) => compared(field, addresses.map((a) => (a && a[field] != null && a[field] !== '' ? String(a[field]) : '')),
+      EXTENSION_FIELDS.has(field) ? addresses.map((a, i) => (nominatim[i] ? null : a)) : addresses))
     .filter((row) => row.values.some((v) => v));
 }
 
@@ -1742,7 +1748,7 @@ function detailHtml(views, served, countryNames = {}) {
 
   const datas = views.map((v) => (v.answer && v.answer.data) || null);
   const shown = datas.some((d) => d) ? displayRows(datas, countryNames) : [];
-  const rows = fieldRows(datas.map((d) => (d ? d.address || {} : null)));
+  const rows = fieldRows(datas.map((d) => (d ? d.address || {} : null)), views.map((v) => Boolean(v.nominatim)));
   if (shown.length || rows.length) {
     html += '<table class="fields"><tr><th style="color:var(--text-dim);width:140px">Field</th>';
     for (const v of views) html += `<th style="color:${v.color}">${esc(v.label)}</th>`;
@@ -1756,7 +1762,10 @@ function detailHtml(views, served, countryNames = {}) {
         + `<td class="field"${display ? ` title="${esc(SHOWN_TITLES[row.field])}"` : ''}>${esc(row.field)}</td>`;
       row.values.forEach((value, i) => {
         const note = row.fallback && row.fallback[i] ? fellBack : '';
-        html += value ? `<td class="value">${esc(value)}${note}</td>` : `<td class="empty">${datas[i] ? '—' : ''}${note}</td>`;
+        const outside = !value && datas[i] && views[i].nominatim && EXTENSION_FIELDS.has(row.field);
+        html += value ? `<td class="value">${esc(value)}${note}</td>`
+          : outside ? '<td class="empty" title="Not a Nominatim field">n/a</td>'
+          : `<td class="empty">${datas[i] ? '—' : ''}${note}</td>`;
       });
       html += '</tr>';
     }
@@ -1840,7 +1849,7 @@ function nominatimView(entry) {
     : entry.nominatim ? { data: entry.nominatim }
     : entry.nominatimError ? { error: entry.nominatimError }
     : null;
-  return { label: 'Nominatim', color: NOMINATIM_COLOR, dataset: null, answer };
+  return { label: 'Nominatim', color: NOMINATIM_COLOR, dataset: null, nominatim: true, answer };
 }
 
 // A result as the page saves it: its point, where it came from, Nominatim's
@@ -2191,6 +2200,7 @@ const DATA_CREDITS = [
       'UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.',
       'The Data is provided "as is" without warranty or any representation of accuracy, timeliness or completeness.',
       "Changes: this dataset holds the coordinates of the postcodes of GeoNames's postal code files that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the files' other fields.",
+      "Changes: this dataset names a US ZIP code with the place name GeoNames's postal code files give it where the ZIP's OpenStreetMap addresses name too few cities, choose that name, or favour another by fewer votes than the extra ones that name counts, spelt as OpenStreetMap addresses spell it where they do, in its own format; it holds none of the files' other fields.",
     ],
   },
   {

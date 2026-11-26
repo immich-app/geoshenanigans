@@ -4,11 +4,11 @@
 //! the neighbours along a border share (arc_blocks.rs).
 
 use crate::arc_blocks::{
-    arc_box, arc_vertices, ring_block_contains, walk_rings, ArcFiles, ArcMemo, ArcRef, ChunkBox, RingVisitor,
-    CHUNK_BOX_SLACK_E7,
+    arc_box, arc_chunk_box, arc_vertices, ring_block_contains, walk_rings, ArcFiles, ArcMemo, ArcRef, ChunkBox,
+    RingVisitor, CHUNK_BOX_SLACK_E7,
 };
 use crate::exact_pip::{edge_crosses, on_edge, to_e7, PointE7};
-use crate::{mmap_file, AdminPolygon, FileBytes};
+use crate::{mmap_file, AdminPolygon, FileBytes, METRES_PER_DEGREE};
 use std::sync::Mutex;
 
 /// A point as every admin test takes it: rounded once to the e7 grid, as the builder rounds the
@@ -207,6 +207,11 @@ impl AdminGeometry {
         ArcFiles { index: self.arc_index.as_slice(), vertices: self.arc_vertices.as_slice() }
     }
 
+    /// The arc slots arc_index.bin holds, dead ones included.
+    pub fn arc_slots(&self) -> usize {
+        self.arcs().slots()
+    }
+
     /// `poly`'s ring block; none for a tombstone, a polygon a tier left without rings, and a
     /// block past the end of the file.
     fn ring_block(&self, poly: &AdminPolygon) -> Option<&[u8]> {
@@ -238,6 +243,37 @@ impl AdminGeometry {
     /// `contains` without a memo, for callers that test no ring block twice at `p`.
     pub fn contains_once(&self, poly: &AdminPolygon, p: AdminPoint) -> bool {
         self.ring_block(poly).and_then(|block| ring_block_contains(block, self.arcs(), p.e7(), None)).unwrap_or(false)
+    }
+
+    /// Whether an edge of `poly`'s rings that lies nearer than `metres` to `p`, measured flat in
+    /// the local frame at `p` (METRES_PER_DEGREE a degree of latitude, that times the cosine of
+    /// `p`'s latitude one of longitude), is one `counts` takes, given its arc slot and its ends
+    /// in the arc's order: false without rings, true for a malformed ring block. The walk reads
+    /// only the chunks and arcs whose boxes, widened by `metres`, reach `p`, and stops at the
+    /// first edge taken.
+    pub fn edge_within(&self, poly: &AdminPolygon, p: AdminPoint, metres: f64, counts: impl FnMut(u32, PointE7, PointE7) -> bool)
+                       -> bool {
+        self.edge_walk(poly, p, metres, counts).0
+    }
+
+    /// `edge_within`, and how many arcs it read the vertices of.
+    fn edge_walk(&self, poly: &AdminPolygon, p: AdminPoint, metres: f64, counts: impl FnMut(u32, PointE7, PointE7) -> bool)
+                 -> (bool, u32) {
+        let Some(block) = self.ring_block(poly) else { return (false, 0) };
+        let (reach, scale) = reach_of(p, metres);
+        let mut walk =
+            EdgeWithin { arcs: self.arcs(), p: p.e7(), reach, scale, metres2: metres * metres, counts, found: false, arcs_read: 0 };
+        let walked = walk_rings(block, &mut walk).is_some();
+        (walk.found || !walked, walk.arcs_read)
+    }
+
+    /// Whether `poly`'s rings use one of the arc slots `slots` in a chunk whose box, widened by
+    /// `metres`, reaches `p` (as every chunk that uses an arc with an edge that near does): its
+    /// refs alone read, no arc. False without rings, true for a malformed ring block.
+    pub fn uses_arc_near(&self, poly: &AdminPolygon, p: AdminPoint, metres: f64, slots: &[u32]) -> bool {
+        let Some(block) = self.ring_block(poly) else { return false };
+        let mut scan = UsesArc { p: p.e7(), reach: reach_of(p, metres).0, slots, found: false };
+        walk_rings(block, &mut scan).is_none() || scan.found
     }
 
     /// `poly`'s rings for GeoJSON: the outer ring, then its holes, each closed, as [lng, lat]
@@ -1025,6 +1061,85 @@ impl RingVisitor for InsideOffEdges<'_> {
         self.on_edge |= touches;
         Some(())
     }
+}
+
+/// Whether an edge of a ring block within a distance of `p` is one `counts` takes
+/// (`AdminGeometry::edge_within`): `reach` the distance in e7 units of latitude and of
+/// longitude, `scale` the metres in one of each, `metres2` the distance squared.
+struct EdgeWithin<'a, C> {
+    arcs: ArcFiles<'a>,
+    p: PointE7,
+    reach: (i64, i64),
+    scale: (f64, f64),
+    metres2: f64,
+    counts: C,
+    found: bool,
+    arcs_read: u32,
+}
+
+impl<C: FnMut(u32, PointE7, PointE7) -> bool> RingVisitor for EdgeWithin<'_, C> {
+    fn wants_chunk(&mut self, bbox: &ChunkBox) -> bool {
+        !self.found && !bbox.excludes_within(self.p, self.reach.0, self.reach.1)
+    }
+
+    fn arc(&mut self, r: ArcRef) -> Option<()> {
+        if self.found {
+            return Some(());
+        }
+        let block = self.arcs.block(r.slot)?;
+        if arc_chunk_box(block).is_some_and(|b| b.excludes_within(self.p, self.reach.0, self.reach.1)) {
+            return Some(());
+        }
+        self.arcs_read += 1;
+        let (p, (ky, kx), metres2) = (self.p, self.scale, self.metres2);
+        let (mut prev, mut found, counts) = (None::<PointE7>, false, &mut self.counts);
+        arc_vertices(block, |v| {
+            if let Some(a) = prev {
+                found = found || (flat_distance2(p, a, v, kx, ky) < metres2 && counts(r.slot, a, v));
+            }
+            prev = Some(v);
+        })?;
+        self.found = found;
+        Some(())
+    }
+}
+
+/// `metres` about `p` in e7 units of latitude and of longitude, and the metres in an e7 unit of
+/// each, in the local frame at `p` (`AdminGeometry::edge_within`).
+fn reach_of(p: AdminPoint, metres: f64) -> ((i64, i64), (f64, f64)) {
+    let ky = METRES_PER_DEGREE / 1e7;
+    let kx = ky * p.degrees().0.to_radians().cos().max(1e-6);
+    (((metres / ky).ceil() as i64, (metres / kx).ceil() as i64), (ky, kx))
+}
+
+/// Whether a ring block uses one of `slots` in a chunk that reaches `p` (`AdminGeometry::uses_arc_near`).
+struct UsesArc<'s> {
+    p: PointE7,
+    reach: (i64, i64),
+    slots: &'s [u32],
+    found: bool,
+}
+
+impl RingVisitor for UsesArc<'_> {
+    fn wants_chunk(&mut self, bbox: &ChunkBox) -> bool {
+        !self.found && !bbox.excludes_within(self.p, self.reach.0, self.reach.1)
+    }
+
+    fn arc(&mut self, r: ArcRef) -> Option<()> {
+        self.found = self.found || self.slots.contains(&r.slot);
+        Some(())
+    }
+}
+
+/// The square of the distance in metres from `p` to the segment a-b, flat in the local frame at
+/// `p`: `kx` and `ky` the metres in an e7 unit of longitude and of latitude.
+fn flat_distance2(p: PointE7, a: PointE7, b: PointE7, kx: f64, ky: f64) -> f64 {
+    let (ax, ay) = ((a.lng - p.lng) as f64 * kx, (a.lat - p.lat) as f64 * ky);
+    let (dx, dy) = ((b.lng - a.lng) as f64 * kx, (b.lat - a.lat) as f64 * ky);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 { (-(ax * dx + ay * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+    let (x, y) = (ax + t * dx, ay + t * dy);
+    x * x + y * y
 }
 
 #[cfg(test)]

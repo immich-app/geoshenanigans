@@ -79,11 +79,11 @@ pub struct PlaceSearchOptions {
 #[napi]
 impl Geocoder {
     /// Load an index directory and its optional `water/` layer. Index data is memory-mapped;
-    /// opening a water layer also reads its metadata and validates its cell index. A memory
-    /// limit counts the mapped pages lookups touch and their page tables: under one of 32 MiB
-    /// the planet's datasets answered (2026-11), but `full` with the `all-exact` water tier,
-    /// whose page tables outgrew it part way through 12,265 lookups; `full` with `all` stayed
-    /// within it.
+    /// opening a water layer also reads its metadata, validates its cell index and checks that
+    /// its cut arcs cover its arc slots. A memory limit counts the mapped pages lookups touch
+    /// and their page tables: under one of 32 MiB the planet's datasets answered (2026-11), but
+    /// `full` with the `all-exact` water tier, whose page tables outgrew it part way through
+    /// 12,265 lookups; `full` with `all` stayed within it.
     #[napi(factory)]
     pub fn load(dir: String) -> Result<Geocoder> {
         let (idx, loaded) = dataset::load(Path::new(&dir), || {
@@ -101,7 +101,8 @@ impl Geocoder {
     /// Lookup on the libuv worker pool — cold-cache page faults never
     /// block the event loop. Resolves to the address JSON, `{}` for a point off the globe; its
     /// `water` (last, `{name, class, type}`) names the water holding the point, where the
-    /// dataset's `water/` dir holds some.
+    /// dataset's `water/` dir holds some, and carries `landmark: true` last where the location
+    /// line names that water in its landmark's place (geocoder/README.md).
     #[napi(ts_return_type = "Promise<string>")]
     pub fn reverse_geocode(&self, lat: f64, lng: f64) -> AsyncTask<QueryTask> {
         AsyncTask::new(QueryTask { inner: self.inner.clone(), lat, lng })

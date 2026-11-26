@@ -16,6 +16,8 @@ struct WayTags {
     const char* housenumber = nullptr;
     const char* street = nullptr;
     const char* postcode = nullptr;
+    // A building address's addr:city (addr_cities.bin, and the postal
+    // cities' votes: postal_cities_build.h).
     const char* city = nullptr;
     const char* highway = nullptr;
     const char* footway = nullptr;

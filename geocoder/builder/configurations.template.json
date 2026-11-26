@@ -31,12 +31,15 @@
       "notices": [
         "UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.",
         "The Data is provided \"as is\" without warranty or any representation of accuracy, timeliness or completeness.",
-        "Changes: this dataset holds the coordinates of the postcodes of GeoNames's postal code files that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the files' other fields."
+        "Changes: this dataset holds the coordinates of the postcodes of GeoNames's postal code files that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the files' other fields.",
+        "Changes: this dataset names a US ZIP code with the place name GeoNames's postal code files give it where the ZIP's OpenStreetMap addresses name too few cities, choose that name, or favour another by fewer votes than the extra ones that name counts, spelt as OpenStreetMap addresses spell it where they do, in its own format; it holds none of the files' other fields."
       ],
       "applies_to": [
         "mode.full",
         "mode.no-addresses",
-        "mode.admin"
+        "mode.admin",
+        "dir.admin-minimal",
+        "dir.admin-minimal-poi"
       ]
     },
     {
@@ -170,7 +173,7 @@
         },
         "admin-minimal": {
           "label": "Admin minimal",
-          "description": "Admin boundaries (within 37.5 m, on an 11 m grid) + place nodes + US postcodes from the postcode grid — no other postcodes, no postcode areas. Smallest possible deployable. Country/state/city + cities500-equivalent place names.",
+          "description": "Admin boundaries (within 37.5 m, on an 11 m grid) + place nodes + US postcodes from the postcode grid and their postal cities — no other postcodes, no postcode areas. Smallest possible deployable. Country/state/city + cities500-equivalent place names.",
           "order": 4
         }
       }
@@ -234,7 +237,7 @@
         "major": {
           "label": "Major (~98K areas)",
           "precision_m": 37.5,
-          "description": "The seas and oceans, in builds that pin the marine areas; every named water area of 100 km² or more, whatever its kind (lakes, reservoirs, bays, straits, wetlands, glaciers and the rest); and whole rivers and canals whose areas sum to 100 km², or 5 km² with a Wikidata item. Those are the thresholds to enter: one in the previous build's tier stays down to 90 km², or 4.5 km² for a river or canal with a Wikidata item. ~37 m shores.",
+          "description": "The seas and oceans, in builds that pin the marine areas; every named water area of 100 km² or more, whatever its kind (lakes, reservoirs, wetlands, glaciers and the rest), and bays, straits, fjords, sounds, lagoons and harbours of 10 km² or more; and whole rivers and canals whose areas sum to 100 km², or 5 km² with a Wikidata item. Those are the thresholds to enter: one in the previous build's tier stays down to 90 km², 9 km² for coastal water, or 4.5 km² for a river or canal with a Wikidata item. ~37 m shores.",
           "order": 2
         },
         "all": {
@@ -296,7 +299,8 @@
         "{region}/admin-minimal/attribution.json"
       ],
       "optional_files": [
-        "{region}/admin-minimal/postcode_grid.bin"
+        "{region}/admin-minimal/postcode_grid.bin",
+        "{region}/admin-minimal/postal_cities.bin"
       ],
       "replaces": [
         "{region}/quality/{quality}/admin_own_names.bin",
@@ -324,7 +328,8 @@
         "{region}/admin-minimal-poi/attribution.json"
       ],
       "optional_files": [
-        "{region}/admin-minimal-poi/postcode_grid.bin"
+        "{region}/admin-minimal-poi/postcode_grid.bin",
+        "{region}/admin-minimal-poi/postal_cities.bin"
       ],
       "replaces": [
         "{region}/quality/{quality}/admin_own_names.bin",
@@ -349,7 +354,8 @@
       "optional_files": [
         "{region}/admin/postcode_centroids.bin",
         "{region}/admin/postcode_centroid_cells.bin",
-        "{region}/admin/postcode_grid.bin"
+        "{region}/admin/postcode_grid.bin",
+        "{region}/admin/postal_cities.bin"
       ]
     },
     "mode.no-addresses": {
@@ -375,7 +381,8 @@
       "optional_files": [
         "{region}/no-addresses/postcode_centroids.bin",
         "{region}/no-addresses/postcode_centroid_cells.bin",
-        "{region}/no-addresses/postcode_grid.bin"
+        "{region}/no-addresses/postcode_grid.bin",
+        "{region}/no-addresses/postal_cities.bin"
       ]
     },
     "mode.full": {
@@ -410,7 +417,8 @@
         "{region}/full/interp_postcodes.bin",
         "{region}/full/postcode_centroids.bin",
         "{region}/full/postcode_centroid_cells.bin",
-        "{region}/full/postcode_grid.bin"
+        "{region}/full/postcode_grid.bin",
+        "{region}/full/postal_cities.bin"
       ]
     },
     "quality.simplified": {
@@ -491,6 +499,7 @@
         "{region}/water/major/simplified/arc_vertices.bin",
         "{region}/water/major/simplified/strings_core.bin",
         "{region}/water/major/simplified/strings_layout.json",
+        "{region}/water/major/simplified/water_cut_arcs.bin",
         "{region}/water/major/simplified/water_meta.json",
         "{region}/water/major/simplified/attribution.json"
       ]
@@ -507,6 +516,7 @@
         "{region}/water/all/simplified/arc_vertices.bin",
         "{region}/water/all/simplified/strings_core.bin",
         "{region}/water/all/simplified/strings_layout.json",
+        "{region}/water/all/simplified/water_cut_arcs.bin",
         "{region}/water/all/simplified/water_meta.json",
         "{region}/water/all/simplified/attribution.json"
       ]
@@ -523,6 +533,7 @@
         "{region}/water/all/exact/arc_vertices.bin",
         "{region}/water/all/exact/strings_core.bin",
         "{region}/water/all/exact/strings_layout.json",
+        "{region}/water/all/exact/water_cut_arcs.bin",
         "{region}/water/all/exact/water_meta.json",
         "{region}/water/all/exact/attribution.json"
       ]

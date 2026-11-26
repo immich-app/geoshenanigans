@@ -46,13 +46,15 @@ void add_addr_point(ParsedData& data, double lat, double lng,
                     uint32_t polygon_vertex_count = 0);
 
 // Appends one address point whose strings are already interned (NO_DATA
-// for a missing street, postcode or city); `cell` is point_to_cell() of its
+// for a missing street, postcode or city; vote_city_id the city again, an
+// offset in data.postal_vote_pool); `cell` is point_to_cell() of its
 // location (lat/lng are stored as float).
 void append_addr_point(ParsedData& data, double lat, double lng,
                        uint32_t housenumber_id, uint32_t street_id, uint32_t postcode_id,
                        uint32_t city_id, S2CellId cell, uint64_t osm_id_packed,
                        const NodeCoord* polygon_vertices = nullptr,
-                       uint32_t polygon_vertex_count = 0);
+                       uint32_t polygon_vertex_count = 0,
+                       uint32_t vote_city_id = NO_DATA);
 
 // Appends the admin polygon of a closed way's ring, with the ring itself to
 // the exact rings and their area as the polygon's.

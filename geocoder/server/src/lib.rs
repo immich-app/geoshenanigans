@@ -29,13 +29,15 @@ pub use hex::lower_hex;
 pub mod place_files;
 pub mod poi_files;
 pub mod geography_box;
+pub mod postal_cities;
 pub mod postcode_files;
 pub mod postcode_grid;
 pub mod side_blocks;
 pub mod strings;
 pub mod transport;
 mod water;
-pub use water::{WaterDetail, WaterKind, WaterLayer, WaterMeta, WATER_DIR, WATER_FILES};
+pub use water::{CutArcs, LandmarkPoi, WaterDetail, WaterGroup, WaterKind, WaterLayer, WaterMeta, WATER_DIR, WATER_FILES};
+use water::LocationLine;
 pub mod way_files;
 pub use addr_files::{AddrFiles, AddrRecord};
 pub use place_files::PlaceFiles;
@@ -1388,6 +1390,9 @@ pub struct Index {
     pub postcode_centroids: Option<PostcodeFiles>,
     /// The postcode grid (postcode_grid.bin): each cell's postcode in the countries it covers
     pub postcode_grid: Option<postcode_grid::PostcodeGrid>,
+    /// The postal cities (postal_cities.bin): the place name mail to each postcode of the
+    /// countries it covers is addressed with
+    pub postal_cities: Option<postal_cities::PostalCities>,
     pub strings: StringPool,
     /// The water layer of the dataset's water dir (water.rs); none without one.
     pub water: Option<WaterLayer>,
@@ -1715,6 +1720,9 @@ impl Index {
         let postcode_grid = file(postcode_grid::FILE)
             .map(|f| postcode_grid::PostcodeGrid::open(f).map_err(|e| format!("{dir}: {e}")))
             .transpose()?;
+        let postal_cities = file(postal_cities::FILE)
+            .map(|f| postal_cities::PostalCities::open(f).map_err(|e| format!("{dir}: {e}")))
+            .transpose()?;
         // A cell pair index (cell_pairs.rs) of the dir, an error naming its cells file.
         let pairs = |prefix: &str, cells: FileBytes, entries: FileBytes, format: cell_pairs::Format| {
             CellPairs::open(cells, entries, format, admin_cell_level).map_err(|e| format!("{dir}/{prefix}_cells.bin: {e}"))
@@ -1765,6 +1773,7 @@ impl Index {
             way_postcodes,
             postcode_centroids,
             postcode_grid,
+            postal_cities,
             strings: StringPool::load(dir)?,
             water: WaterLayer::open(&format!("{dir}/{WATER_DIR}"), admin_cell_level)?,
             street_cell_level,
@@ -3433,12 +3442,13 @@ impl Index {
     /// POI that answers, `interp` the TIGER line near a street that answers, `postcode_area` the
     /// postal area's postcode at the query point and `country_code` the answer's country.
     pub fn resolve_postcode<'a>(&'a self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, postcode_area: Option<Cow<'a, str>>, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
-        self.resolve_postcode_in(lat, lng, street, addr, poi, interp, postcode_area, country_code).map(|(postcode, _)| postcode)
+        self.resolve_postcode_in(lat, lng, street, addr, poi, interp, postcode_area, country_code).map(|(postcode, _, _)| postcode)
     }
 
-    /// `resolve_postcode`'s postcode, with the country it is of: the one get_nearest_postcode
-    /// takes it in at a street's middle, and a house of the street, else `country_code`.
-    fn resolve_postcode_in<'a>(&'a self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, postcode_area: Option<Cow<'a, str>>, country_code: Option<[u8; 2]>) -> Option<(Cow<'a, str>, Option<[u8; 2]>)> {
+    /// `resolve_postcode`'s postcode, with the country it is of (the one get_nearest_postcode
+    /// takes it in at a street's middle, and a house of the street, else `country_code`) and
+    /// where it came from.
+    fn resolve_postcode_in<'a>(&'a self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, postcode_area: Option<Cow<'a, str>>, country_code: Option<[u8; 2]>) -> Option<(Cow<'a, str>, Option<[u8; 2]>, PostcodeSource)> {
         // 0. The house's own postcode (from addr_postcodes.bin)
         // Matches Nominatim's token_get_postcode — the feature's own
         // addr:postcode tag is the highest-priority source. The
@@ -3452,7 +3462,7 @@ impl Index {
             if let Some(pid) = Self::sidecar_u32(apc, addr_id as u64) {
                 let own = self.get_string(pid);
                 if country_code.is_none_or(|cc| !country_has_no_postcode(&cc) && postcode_looks_valid(&cc, &own)) {
-                    return Some((own, country_code));
+                    return Some((own, country_code, PostcodeSource::Address));
                 }
             }
         }
@@ -3463,7 +3473,7 @@ impl Index {
             if let Some(pid) = Self::sidecar_u32(wpc, way_id as u64) {
                 let middle = u32::try_from(way_id).ok().and_then(|id| self.street_middle(id));
                 let country = middle.and_then(|(m_lat, m_lng)| self.postal_areas_at(m_lat, m_lng, false).2);
-                return Some((self.get_string(pid), country.or(country_code)));
+                return Some((self.get_string(pid), country.or(country_code), PostcodeSource::Street));
             }
         }
 
@@ -3473,7 +3483,7 @@ impl Index {
         // memory locality.
         if let Some(p) = poi {
             if p.parent_postcode_id != NO_DATA {
-                return Some((self.get_string(p.parent_postcode_id), country_code));
+                return Some((self.get_string(p.parent_postcode_id), country_code, PostcodeSource::Poi));
             }
         }
 
@@ -3502,7 +3512,7 @@ impl Index {
                         && street_tokens_overlap(seg_street, &self.get_string(way.name))
                     {
                         if let Some(pid) = Self::sidecar_u32(ipc, iw_idx as u64) {
-                            return Some((self.get_string(pid), country_code));
+                            return Some((self.get_string(pid), country_code, PostcodeSource::Tiger));
                         }
                     }
                 }
@@ -3521,27 +3531,48 @@ impl Index {
             if let Some((m_lat, m_lng)) = u32::try_from(way_id).ok().and_then(|id| self.street_middle(id)) {
                 let (areas, point, country_there) = self.postal_areas_at(m_lat, m_lng, true);
                 country_code = country_there.or(country_code);
-                let found = self.postal_area_postcode(&areas, &upper_country(country_code), point)
-                    .or_else(|| self.grid_postcode(m_lat, m_lng, country_code))
-                    .or_else(|| self.centroid_postcode(m_lat, m_lng, country_code));
+                let found = self.postal_area_postcode(&areas, &upper_country(country_code), point).map(|p| (p, PostcodeSource::PostalArea))
+                    .or_else(|| self.grid_postcode(m_lat, m_lng, country_code).map(|p| (p, PostcodeSource::Grid)))
+                    .or_else(|| self.centroid_postcode(m_lat, m_lng, country_code).map(|p| (p, PostcodeSource::Centroid)));
                 if found.is_some() || addr.is_none() {
-                    return found.map(|postcode| (postcode, country_code));
+                    return found.map(|(postcode, source)| (postcode, country_code, source));
                 }
             }
         }
         if let Some((_, house)) = addr {
-            let (h_lat, h_lng) = (house.lat as f64, house.lng as f64);
-            return self.postal_area_at(h_lat, h_lng, country_code)
-                .or_else(|| self.grid_postcode(h_lat, h_lng, country_code))
-                .or_else(|| self.centroid_postcode(h_lat, h_lng, country_code))
-                .map(|postcode| (postcode, country_code));
+            return self.nearest_postcode_at(house.lat as f64, house.lng as f64, country_code)
+                .map(|(postcode, source)| (postcode, country_code, source));
         }
         // The postcode area covering the point: get_nearest_postcode takes
         // one before any centroid (ORDER BY osm_id is null).
-        postcode_area
-            .or_else(|| self.grid_postcode(lat, lng, country_code))
-            .or_else(|| self.centroid_postcode(lat, lng, country_code))
-            .map(|postcode| (postcode, country_code))
+        if let Some(area) = postcode_area {
+            return Some((area, country_code, PostcodeSource::PostalArea));
+        }
+        self.grid_postcode(lat, lng, country_code).map(|p| (p, PostcodeSource::Grid))
+            .or_else(|| self.centroid_postcode(lat, lng, country_code).map(|p| (p, PostcodeSource::Centroid)))
+            .map(|(postcode, source)| (postcode, country_code, source))
+    }
+
+    /// get_nearest_postcode at the point (lat, lng) of the country `country_code`: the postal
+    /// area holding it, which the rule takes before any centroid (ORDER BY osm_id is null), else
+    /// the postcode grid's cell of it where the dir has a grid of the country, in place of the
+    /// nearest centroid, else the nearest centroid whose box holds it.
+    fn nearest_postcode_at<'a>(&'a self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> Option<(Cow<'a, str>, PostcodeSource)> {
+        self.postal_area_at(lat, lng, country_code).map(|p| (p, PostcodeSource::PostalArea))
+            .or_else(|| self.grid_postcode(lat, lng, country_code).map(|p| (p, PostcodeSource::Grid)))
+            .or_else(|| self.centroid_postcode(lat, lng, country_code).map(|p| (p, PostcodeSource::Centroid)))
+    }
+
+    /// The postal city of an answer's postcode (postal_cities.bin): the place name mail to it is
+    /// addressed with, where the dir's table has a row of the postcode's country and the
+    /// postcode's code. None for a postcode the nearest centroid gave, which names the ZIP of a
+    /// centroid near the point rather than the one the point is in.
+    fn postal_city<'a>(&'a self, postcode: &str, source: PostcodeSource, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
+        if source == PostcodeSource::Centroid {
+            return None;
+        }
+        let (table, cc) = (self.postal_cities.as_ref()?, country_code?);
+        table.name(cc, postal_cities::postal_key(cc, postcode)?).map(Cow::Borrowed)
     }
 
     /// The postcode grid's at the point (lat, lng), where the cell's run is of the country
@@ -3725,9 +3756,10 @@ impl Index {
         with_way_nodes(|nodes| if streets.way(id, nodes) { closest_point_on_line(nodes, lat, lng) } else { None })
     }
 
-    // Collect the most-specific surfaceable landmark name plus the
-    // name-deduped list of nearby POIs for the response.
-    fn collect_landmark_and_places(&self, lat: f64, lng: f64) -> (Option<Cow<'_, str>>, Vec<PoiDetail>) {
+    // Collect the most-specific surfaceable landmark name, with its
+    // POI's category and polygon area, plus the name-deduped list of
+    // nearby POIs for the response.
+    fn collect_landmark_and_places(&self, lat: f64, lng: f64) -> (Option<(Cow<'_, str>, LandmarkPoi)>, Vec<PoiDetail>) {
         let pois = self.find_pois(lat, lng);
         // Landmark: name of the smallest contained polygon POI whose
         // category is a surfaceable landmark class (filters out
@@ -3736,10 +3768,10 @@ impl Index {
         // sorts contained polygons first by area ascending, so the
         // first qualifying hit is the most specific enclosing
         // landmark.
-        let landmark_name: Option<Cow<'_, str>> = pois.iter().find_map(|p| {
+        let landmark = pois.iter().find_map(|p| {
             if !p.contained { return None; }
             if poi_category_to_osm_class(p.category_id).is_some() {
-                Some(p.name.clone())
+                Some((p.name.clone(), LandmarkPoi { category: p.category_id, area: p.area }))
             } else {
                 None
             }
@@ -3764,7 +3796,7 @@ impl Index {
                 });
             }
         }
-        (landmark_name, places)
+        (landmark, places)
     }
 
     /// The address of (lat, lng); none for a point off the globe, or NaN: S2 would wrap it onto
@@ -4155,7 +4187,6 @@ impl Index {
             admin.country_code,
         );
 
-        let (landmark_name, places) = self.collect_landmark_and_places(lat, lng);
         // Where no street, house or POI is near, Nominatim answers with an area round the point,
         // and one of AREA_RESULT_RANK leads the answer (area_result). A dir without streets knows
         // of none: its answers stand for those of a street at the point, which leave such an area
@@ -4211,6 +4242,9 @@ impl Index {
         // Nor does the nearest postcode centroid give one where water alone holds the point.
         let resolved_postcode = resolved_postcode.filter(|_| anchored || place_nodes_only);
 
+        let (landmark, places) = self.collect_landmark_and_places(lat, lng);
+        let (landmark_name, landmark_poi) = landmark.map_or((None, None), |(name, poi)| (Some(name), Some(poi)));
+
         // Note on name-suffix normalisation (previously considered as
         // Option 6): Nominatim does not normalise the localname it
         // surfaces in the reverse response — `classtypes.get_label_tag`
@@ -4248,35 +4282,43 @@ impl Index {
             let named = self.crosscheck_rows(addr_city, &area_rows, &mut admin_scan, &node_rows, feature);
             crosscheck(&mut rows, &named);
         }
+        // Postcode from resolve_postcode(): 3-tier chain
+        // (own → inherited → postal area, grid or nearest centroid).
+        // Reject if its country has no postal-code system or if
+        // the string doesn't match the country's pattern, then
+        // normalise whitespace/separators per country.
+        let (postcode, postcode_country, postcode_source) = match resolved_postcode {
+            Some((pc, postcode_country, source)) => (match postcode_country {
+                Some(cc) => {
+                    if country_has_no_postcode(&cc) || !postcode_looks_valid(&cc, &pc) {
+                        None
+                    } else {
+                        // The postcode as read unless formatting changes it.
+                        let formatted = match format_postcode(&cc, &pc) {
+                            Cow::Owned(s) => Some(s),
+                            Cow::Borrowed(_) => None,
+                        };
+                        Some(formatted.map_or(pc, Cow::Owned))
+                    }
+                }
+                None => Some(pc),
+            }, postcode_country, Some(source)),
+            None => (None, None, None),
+        };
+        // The postal city of that postcode, of the postcode's country, beside it: not
+        // Nominatim's, and never in display_name.
+        let postal_city = match (&postcode, postcode_source) {
+            (Some(pc), Some(source)) => self.postal_city(pc, source, postcode_country),
+            _ => None,
+        };
         let mut address = AddressDetails {
             landmark: landmark_name,
             // A string in a tier this mode doesn't ship (admin mode has no
             // street or addr strings) resolves to "" — omit the field.
             house_number: house_number.filter(|s| !s.is_empty()),
             road: road.filter(|s| !s.is_empty()),
-            // Postcode from resolve_postcode(): 3-tier chain
-            // (own → inherited → postal area, grid or nearest centroid).
-            // Reject if its country has no postal-code system or if
-            // the string doesn't match the country's pattern, then
-            // normalise whitespace/separators per country.
-            postcode: match resolved_postcode {
-                Some((pc, postcode_country)) => match postcode_country {
-                    Some(cc) => {
-                        if country_has_no_postcode(&cc) || !postcode_looks_valid(&cc, &pc) {
-                            None
-                        } else {
-                            // The postcode as read unless formatting changes it.
-                            let formatted = match format_postcode(&cc, &pc) {
-                                Cow::Owned(s) => Some(s),
-                                Cow::Borrowed(_) => None,
-                            };
-                            Some(formatted.map_or(pc, Cow::Owned))
-                        }
-                    }
-                    None => Some(pc),
-                },
-                None => None,
-            },
+            postcode,
+            postal_city,
             country_code,
             ..AddressDetails::default()
         };
@@ -4292,7 +4334,7 @@ impl Index {
         }
         address.label(rows);
         let display_name = format_address(&address);
-        Address { licence: Licence, display_name, address, places, water }
+        Address { licence: Licence, display_name, address, places, water, landmark_poi }
     }
 
     /// The rows of an address that are named `name` (a string id), in Nominatim's order within a
@@ -5007,9 +5049,22 @@ impl MultiIndex {
     /// other days, or of other water tiers, can hold other water at the
     /// point.
     ///
+    /// Once the water is the answer's, whether the location line names
+    /// it in its landmark's place is decided against the address and
+    /// landmark served (`water.landmark`, water.rs).
+    ///
     /// The answers borrow their strings from the continents' indexes,
     /// whose Arcs are held here until the chosen one is serialized.
     pub fn query_json(&self, lat: f64, lng: f64) -> String {
+        self.query_json_with_water(lat, lng, None)
+    }
+
+    /// query_json, with `water`, a water dir's layer the caller holds apart from the continents'
+    /// (the test portal's water= picks one), answering the water where no matching continent's
+    /// water holds the point, as a continent whose water dir held it would: its water.landmark
+    /// decided as query_json decides a continent's. A point no loaded continent covers has no
+    /// answer, as in query_json.
+    pub fn query_json_with_water(&self, lat: f64, lng: f64, water: Option<&WaterLayer>) -> String {
         let arcs = self.loaded_matches(lat, lng);
         let mut answers: Vec<Address<'_>> = arcs.iter().map(|arc| arc.query(lat, lng)).collect();
         let mut best: Option<(i32, usize)> = None;
@@ -5025,6 +5080,13 @@ impl MultiIndex {
             .chain(answers.into_iter().map(|r| r.water))
             .flatten()
             .min_by(WaterDetail::order);
+        if answer.water.is_none() {
+            answer.water = water.and_then(|w| w.at(lat, lng));
+        }
+        let landmark = answer.water.as_ref().is_some_and(|w| w.takes_landmark(lat, lng, &answer.location_line()));
+        if let Some(water) = answer.water.as_mut() {
+            water.landmark = landmark;
+        }
         serde_json::to_string(&answer).unwrap_or_default()
     }
 }
@@ -5227,6 +5289,7 @@ mod query_tests {
             way_postcodes: None,
             postcode_centroids: None,
             postcode_grid: None,
+            postal_cities: None,
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, end, end, end, end, end]),
             water: None,
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
@@ -5373,7 +5436,9 @@ mod query_tests {
             idx
         };
         let json = |slots: Vec<(&'static str, Index)>| serde_json::from_str::<serde_json::Value>(&multi(slots).query_json(lat, lng)).unwrap();
-        let named = |name: &str, class: &str, r#type: &str| serde_json::json!({"name": name, "class": class, "type": r#type});
+        // Each lies far inside its shore, beside an address of no landmark or country: the
+        // location line names it.
+        let named = |name: &str, class: &str, r#type: &str| serde_json::json!({"name": name, "class": class, "type": r#type, "landmark": true});
         let both_orders = |africa: &dyn Fn() -> Index, asia: &dyn Fn() -> Index| {
             [json(vec![("africa", africa()), ("asia", asia())]), json(vec![("asia", asia()), ("africa", africa())])]
         };
@@ -5405,6 +5470,106 @@ mod query_tests {
             let got = json(vec![("africa", index(&[first], &[])), ("asia", with(index(&[second], &[]), water("Gulf of Suez", BAY, gulf)))]);
             assert_eq!(got, want, "{}", first.0);
         }
+    }
+
+    // The location line names the water in its landmark's place (water.landmark, water.rs) as
+    // the address served decides: the flag comes last inside water, only where it is set, and
+    // changes nothing else in the answer.
+    #[test]
+    fn the_water_landmark_is_decided_against_the_address_served_and_changes_nothing_else() {
+        use crate::water::fixture::{WaterFixture, LAKE};
+        // Vaud in Switzerland, both listed in the cell of their centre, where the point is.
+        let (lat, lng) = (46.45, 6.55);
+        let (switzerland, vaud) = (("Switzerland", 2, [45.45, 5.55, 47.45, 7.55]), ("Vaud", 4, [45.95, 6.05, 46.95, 7.05]));
+        let with = |water: Option<WaterLayer>| {
+            let mut idx = index(&[switzerland, vaud], &[]);
+            if let FileBytes::Owned(records) = &mut idx.admin_polygons {
+                records[12..14].copy_from_slice(&(u16::from(b'c') << 8 | u16::from(b'h')).to_le_bytes());
+            }
+            idx.water = water;
+            multi(vec![("europe", idx)]).query_json(lat, lng)
+        };
+        let lake = |name: &str, span| Some(WaterFixture::new().area(name, LAKE, span, &[]).layer());
+
+        let dry = with(None);
+        let address = serde_json::from_str::<serde_json::Value>(&dry).unwrap()["address"].clone();
+        assert_eq!((address["state"].as_str(), address["country"].as_str()), (Some("Vaud"), Some("Switzerland")));
+        let wet = |name: &str, flag: &str| {
+            format!("{},\"water\":{{\"name\":\"{name}\",\"class\":\"water\",\"type\":\"lake\"{flag}}}}}", dry.strip_suffix('}').unwrap())
+        };
+        // Far inside its shore.
+        assert_eq!(with(lake("Lac Léman", (46.2, 6.1, 46.6, 6.9))), wet("Lac Léman", ",\"landmark\":true"));
+        // 33 m inside it; or of the name of the state the line shows.
+        assert_eq!(with(lake("Lac Léman", (46.4497, 6.1, 46.6, 6.9))), wet("Lac Léman", ""));
+        assert_eq!(with(lake("Vaud", (46.2, 6.1, 46.6, 6.9))), wet("Vaud", ""));
+        // Without water, the answer is the dry one, byte for byte.
+        assert_eq!(with(lake("Lac Léman", (46.5, 6.1, 46.6, 6.9))), dry);
+    }
+
+    // A water dir's layer held apart from the continents (the test portal's water= one) answers
+    // the water where no continent's water holds the point, its water.landmark decided as
+    // query_json decides a continent's: the answer is the one a continent whose water dir holds
+    // the layer gives. A continent's own water stays its own, and a point no continent covers
+    // still has no answer.
+    #[test]
+    fn a_water_layer_held_apart_answers_as_a_continents_water_where_theirs_holds_none() {
+        use crate::water::fixture::{WaterFixture, LAKE};
+        let (lat, lng) = (46.45, 6.55);
+        let (switzerland, vaud) = (("Switzerland", 2, [45.45, 5.55, 47.45, 7.55]), ("Vaud", 4, [45.95, 6.05, 46.95, 7.05]));
+        let europe = |water: Option<WaterLayer>| {
+            let mut idx = index(&[switzerland, vaud], &[]);
+            if let FileBytes::Owned(records) = &mut idx.admin_polygons {
+                records[12..14].copy_from_slice(&(u16::from(b'c') << 8 | u16::from(b'h')).to_le_bytes());
+            }
+            idx.water = water;
+            multi(vec![("europe", idx)])
+        };
+        let lake = |name: &str, span| WaterFixture::new().area(name, LAKE, span, &[]).layer();
+        let (far_in, near_shore) = ((46.2, 6.1, 46.6, 6.9), (46.4497, 6.1, 46.6, 6.9));
+
+        for span in [far_in, near_shore] {
+            let held = lake("Lac Léman", span);
+            let got = europe(None).query_json_with_water(lat, lng, Some(&held));
+            assert_eq!(got, europe(Some(lake("Lac Léman", span))).query_json(lat, lng));
+            assert_eq!(got.contains("\"landmark\":true"), span == far_in);
+        }
+        assert!(europe(None).query_json_with_water(lat, lng, Some(&lake("Lac Léman", far_in))).ends_with(
+            "\"water\":{\"name\":\"Lac Léman\",\"class\":\"water\",\"type\":\"lake\",\"landmark\":true}}"));
+        // None held, or one that doesn't hold the point: query_json's answer.
+        let dry = europe(None).query_json(lat, lng);
+        assert!(!dry.contains("water"));
+        assert_eq!(europe(None).query_json_with_water(lat, lng, None), dry);
+        assert_eq!(europe(None).query_json_with_water(lat, lng, Some(&lake("Lac Léman", (46.5, 6.1, 46.6, 6.9)))), dry);
+        // The continent's own water answers before the held one.
+        let own = europe(Some(lake("Lac de Joux", far_in)));
+        assert_eq!(own.query_json_with_water(lat, lng, Some(&lake("Lac Léman", far_in))), own.query_json(lat, lng));
+        assert!(own.query_json(lat, lng).contains("Lac de Joux"));
+        // Off every continent's cover: no answer.
+        assert_eq!(europe(None).query_json_with_water(91.0, lng, Some(&lake("Lac Léman", far_in))), "{}");
+    }
+
+    // The line the water is decided against is the one Immich shows: the first of the address's
+    // city keys and of its state keys, with its country; none of them without a country; and the
+    // landmark with its POI.
+    #[test]
+    fn the_location_line_is_immichs_city_state_and_country_and_the_landmark() {
+        let poi = LandmarkPoi { category: 66, area: 2.0e-6 };
+        let answer = |address: AddressDetails<'static>| Address { address, landmark_poi: Some(poi), ..Address::default() };
+        let name = |s: &'static str| Some(Cow::Borrowed(s));
+
+        let town = answer(AddressDetails { landmark: name("Port Hercule"), town: name("Monaco"), municipality: name("Monte Carlo"),
+                                           country: name("Monaco"), ..AddressDetails::default() });
+        let line = town.location_line();
+        assert_eq!(line.shown, [Some("Monaco"), Some("Monte Carlo"), Some("Monaco")]);
+        assert_eq!(line.landmark, Some(("Port Hercule", Some(poi))));
+        let county = answer(AddressDetails { village: name("Kona"), county: name("Hawaii County"), state: None, country: name("United States"),
+                                             ..AddressDetails::default() });
+        assert_eq!(county.location_line().shown, [Some("Kona"), Some("Hawaii County"), Some("United States")]);
+        let city = answer(AddressDetails { city: name("Zürich"), country: name("Switzerland"), ..AddressDetails::default() });
+        assert_eq!(city.location_line().shown, [Some("Zürich"), Some("Zürich"), Some("Switzerland")]);
+        let at_sea = answer(AddressDetails { city: name("Nowhere"), state: name("Elsewhere"), ..AddressDetails::default() });
+        assert_eq!(at_sea.location_line().shown, [None, None, None]);
+        assert_eq!(Address::default().location_line().landmark, None);
     }
 
     /// (metres north of `origin()`, metres east, name or None for a tombstone, category,
@@ -6928,6 +7093,20 @@ pub fn rank_bits<'a>(ranked: impl IntoIterator<Item = &'a RankedPoly>) -> u32 {
         .fold(0, |bits, r| bits | 1 << r.rank_address)
 }
 
+/// Where an answer's postcode came from (resolve_postcode's tiers): the house's own, its
+/// street's stored one, the POI's, the TIGER line's, and get_nearest_postcode's at a point, which
+/// takes the postal area holding it, else the postcode grid's cell, else the nearest centroid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostcodeSource {
+    Address,
+    Street,
+    Poi,
+    Tiger,
+    Grid,
+    PostalArea,
+    Centroid,
+}
+
 #[derive(Serialize, Default)]
 pub struct AddressDetails<'a> {
     /// The address's rows of polygons and place nodes, the finest first,
@@ -6986,6 +7165,12 @@ pub struct AddressDetails<'a> {
     pub locality: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postcode: Option<Cow<'a, str>>,
+    /// The place name mail to `postcode` is addressed with (postal_cities.bin): in the United
+    /// States the ZIP's postal city, which may differ from the city or town the point lies in. Not
+    /// a Nominatim field, and never part of display_name; absent where the postcode came from
+    /// the nearest centroid or the table has no row of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postal_city: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7171,6 +7356,32 @@ pub struct Address<'a> {
     /// a water dir.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub water: Option<WaterDetail<'a>>,
+    /// The POI the address's landmark names, which the location line reads (water.rs) and no
+    /// answer shows.
+    #[serde(skip)]
+    pub landmark_poi: Option<LandmarkPoi>,
+}
+
+impl Address<'_> {
+    /// What the location line shows beside the water: Immich's city, state and country of the
+    /// address (none without a country), the first of each list it has: city, town, village,
+    /// hamlet or municipality; state, province, region, county, municipality or city; and the
+    /// landmark, with its POI.
+    fn location_line(&self) -> LocationLine<'_> {
+        let a = &self.address;
+        fn first<'s>(fields: &[&'s Option<Cow<'_, str>>]) -> Option<&'s str> {
+            fields.iter().find_map(|f| f.as_deref())
+        }
+        let shown = match a.country.as_deref() {
+            Some(country) => [
+                first(&[&a.city, &a.town, &a.village, &a.hamlet, &a.municipality]),
+                first(&[&a.state, &a.province, &a.region, &a.county, &a.municipality, &a.city]),
+                Some(country),
+            ],
+            None => [None; 3],
+        };
+        LocationLine { shown, landmark: a.landmark.as_deref().map(|name| (name, self.landmark_poi)) }
+    }
 }
 
 // Address formatting patterns by country code
@@ -8412,6 +8623,7 @@ mod query_path_tests {
     mod area_result;
     mod crosscheck;
     mod display_name;
+    mod postal_city;
     mod postcodes;
     mod ranks;
     mod rows;
@@ -8570,6 +8782,8 @@ mod query_path_tests {
         own_names: Vec<(u32, u32)>,
         /// The postcode grid's runs, in cell order.
         grid: Vec<postcode_grid::LogicalRow>,
+        /// The postal cities' rows, any order.
+        postal_cities: Vec<postal_cities::LogicalRow>,
     }
 
     impl TestIndex {
@@ -8870,6 +9084,13 @@ mod query_path_tests {
             self
         }
 
+        /// A row of the postal cities: the postcode `code` of Testland's country, named `name`.
+        fn postal_city(&mut self, code: &str, name: &str) -> &mut Self {
+            let country_code = self.polygons[0].0.country_code;
+            self.postal_cities.push(postal_cities::LogicalRow { country_code, code: code.to_string(), name: name.to_string() });
+            self
+        }
+
         /// The side files with a value set, each with its values: NO_DATA for every other record
         /// of the file it sits beside.
         fn side_values(&self) -> Vec<(&'static str, Vec<u32>)> {
@@ -8936,6 +9157,12 @@ mod query_path_tests {
 
             if !self.grid.is_empty() {
                 files.push((postcode_grid::FILE, postcode_grid::encode(&self.grid)));
+            }
+
+            if !self.postal_cities.is_empty() {
+                let mut rows = self.postal_cities.clone();
+                rows.sort_by(|a, b| (a.country_code, &a.code).cmp(&(b.country_code, &b.code)));
+                files.push((postal_cities::FILE, postal_cities::encode(&rows)));
             }
 
             if !(self.streets.is_empty() && self.addrs.is_empty() && self.interps.is_empty()) {
@@ -12070,6 +12297,7 @@ mod admin_scan_tests {
             way_parents: None, admin_parents: None, addr_postcodes: None, addr_cities: None, way_postcodes: None,
             postcode_centroids: None,
             postcode_grid: None,
+            postal_cities: None,
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, len, len, len, len, len]),
             water: None,
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,

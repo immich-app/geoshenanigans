@@ -94,8 +94,13 @@ void collect_postcode_centroids(ParsedData& data);
 // The postcode grid's runs (postcode_grid_build.h) of the full data's
 // address points and TIGER lines, each point's country found as the
 // centroids find it, and the planet's postcode_grid.bin, into
-// data.postcode_grid_*. Run once before the continent split, which keeps
-// the runs a query routed to each continent reads (region_rows).
+// data.postcode_grid_*; and the postal cities (postal_cities_build.h) of
+// the ZIPs an answer can give, the grid's and its postal areas', from the
+// votes of its addresses with a city, the planet's postal_cities.bin, into
+// data.postal_city*, which frees the addresses' cities. Run once before the
+// continent split, which keeps the runs a query routed to each continent
+// reads (region_rows), and the rows of the postcodes its data answers with
+// (postal_cities::region_rows).
 void collect_postcode_grid(ParsedData& data);
 
 // Strategy-2 persistent dense IDs. Loads the previous build's

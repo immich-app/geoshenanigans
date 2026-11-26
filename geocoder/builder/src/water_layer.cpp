@@ -405,12 +405,14 @@ Build assemble(Collected& c, unsigned threads) {
     free_storage(assembled);
     free_storage(c.relations);
     // The marine areas, each polygon as the file gives it, each ring's runs
-    // its stretches.
+    // its stretches; each shows the name it goes by (marine::shown_name),
+    // its IHO name its local one.
     for (marine::Area& area : c.marine) {
         if (area.polygons.empty()) continue;
         ObjectTags t;
         t.code = area.kind == marine::kOcean ? code::kPlaceOcean : code::kPlaceSea;
-        t.name = t.local_name = area.name;
+        t.name = marine::shown_name(area.name);
+        t.local_name = area.name;
         const uint32_t object = add_object(ObjectType::SYNTHETIC, static_cast<int64_t>(area.id), std::move(t));
         uint32_t rank = 0;
         for (auto& rings : area.polygons) {
@@ -499,6 +501,7 @@ Build assemble(Collected& c, unsigned threads) {
         std::vector<PackedLocation>().swap(l.vertices);
     }
     free_storage(c.lines);
+    measure_waterways(b.lines, threads);
     return b;
 }
 
@@ -736,10 +739,16 @@ bool polygons_cover(const AdminExactRings& rings, const std::vector<uint32_t>& o
 }  // namespace
 
 size_t drop_marine_namesakes(Build& b) {
-    // The marine areas by their names' keys, and each object's polygons.
+    // The marine areas by their names' keys, the name each shows and its IHO
+    // name, and each object's polygons.
     std::map<std::string, std::vector<uint32_t>> marine;
-    for (uint32_t o = 0; o < b.objects.size(); o++)
-        if (b.objects[o].type == ObjectType::SYNTHETIC) marine[namesake_key(b.objects[o].tags.name)].push_back(o);
+    for (uint32_t o = 0; o < b.objects.size(); o++) {
+        const Object& obj = b.objects[o];
+        if (obj.type != ObjectType::SYNTHETIC) continue;
+        marine[namesake_key(obj.tags.name)].push_back(o);
+        if (namesake_key(obj.tags.local_name) != namesake_key(obj.tags.name))
+            marine[namesake_key(obj.tags.local_name)].push_back(o);
+    }
     if (marine.empty()) return 0;
     std::vector<uint32_t> first(b.objects.size() + 1, 0);
     for (uint32_t o : b.object_of) first[o + 1]++;
@@ -808,9 +817,12 @@ size_t drop_marine_namesakes(Build& b) {
     return dropped;
 }
 
-size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
+std::pair<size_t, size_t> apply_names(Build& b, const std::vector<NameChoice>& choices) {
     size_t named = 0;
     std::vector<uint8_t> keep(b.objects.size(), 0);
+    // The length inside of the key that named each object so, and the length
+    // of its waterway, by object.
+    std::vector<uint64_t> named_mm(b.objects.size(), 0), waterway_mm(b.objects.size(), 0);
     for (size_t o = 0; o < b.objects.size(); o++) {
         Object& obj = b.objects[o];
         if (o < choices.size() && choices[o].named()) {
@@ -829,11 +841,22 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
             if (obj.tags.name.empty()) {
                 obj.tags.name = b.lines.displays[choices[o].display];
                 if (own) obj.tags.local_name = b.lines.key_local[choices[o].key];
+                named_mm[o] = choices[o].mm;
+                waterway_mm[o] = choices[o].waterway_mm;
                 named++;
             }
         }
         keep[o] = !obj.tags.name.empty();
     }
+    // In the kept objects' order, as keep_objects leaves them.
+    size_t kept = 0;
+    for (size_t o = 0; o < b.objects.size(); o++)
+        if (keep[o]) {
+            waterway_mm[kept] = waterway_mm[o];
+            named_mm[kept++] = named_mm[o];
+        }
+    named_mm.resize(kept);
+    waterway_mm.resize(kept);
     keep_objects(b, keep);
     AdminExactRings& r = b.rings;
     for (Object& obj : b.objects) obj.area_deg2 = obj.km2 = 0;
@@ -842,7 +865,13 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
         obj.area_deg2 += r.area(static_cast<uint32_t>(p));
         obj.km2 += polygon_km2(r, static_cast<uint32_t>(p));
     }
-    return named;
+    size_t weak = 0;
+    for (size_t o = 0; o < b.objects.size(); o++) {
+        Object& obj = b.objects[o];
+        obj.weak_name = named_mm[o] != 0 && weak_name(named_mm[o], obj.km2, waterway_mm[o]);
+        weak += obj.weak_name;
+    }
+    return {named, weak};
 }
 
 void split_polygons(Build& b, unsigned threads) {
@@ -1182,7 +1211,8 @@ std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const
         const Object& obj = b.objects[o];
         auto keeps = [&](bool margin) {
             if (obj.type == ObjectType::SYNTHETIC) return true;
-            if (water_major_keeps(obj.km2, false, false, margin && was_major[o])) return true;
+            if (water_major_keeps(obj.km2, false, false, margin && was_major[o], is_coastal(obj.tags.code)))
+                return true;
             if (!obj.tags.river_area) return false;
             const uint32_t g = groups.find(o);
             return water_major_keeps(river_km2[g], true, river_wikidata[g], margin && river_was_major[g]);
@@ -1234,6 +1264,7 @@ Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::
         rec.ring_offset = 0;
         rec.name_id = offset[static_cast<size_t>(std::lower_bound(names.begin(), names.end(), o.tags.name) - names.begin())];
         rec.admin_level = 0;
+        rec.place_type_override = o.weak_name ? kWeakName : 0;
         rec.area = static_cast<float>(o.area_deg2);
         rec.country_code = o.tags.code ? o.tags.code : out.types->verbatim_code(o.tags.verbatim);
         out.records[p] = rec;
@@ -1241,9 +1272,10 @@ Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::
     out.major = std::move(major);
     out.marine.resize(n);
     for (size_t p = 0; p < n; p++) out.marine[p] = b.objects[b.object_of[p]].type == ObjectType::SYNTHETIC;
+    out.objects = b.object_of;
     out.arcs = std::move(arcs);
     out.cells = std::move(cells);
-    if (out.major.size() != n || out.arcs.polygons.size() != n)
+    if (out.major.size() != n || out.objects.size() != n || out.arcs.polygons.size() != n)
         throw std::logic_error("water layer parts out of step with its polygons");
     return out;
 }
@@ -1268,6 +1300,7 @@ Layer subset_layer(const Layer& planet, const std::vector<uint8_t>& masks, uint8
         out.fallbacks.push_back(planet.fallbacks[id]);
         out.major.push_back(planet.major[id]);
         out.marine.push_back(planet.marine[id]);
+        out.objects.push_back(planet.objects[id]);
         mark_bit(name_used, planet.records[id].name_id);
     }
     StringSubset names(planet.names, name_used);
@@ -1322,12 +1355,13 @@ std::vector<uint64_t> share_bytes(const Layer& planet, const std::vector<uint8_t
     // The last offsets of a region's ring refs and of each tier's blocks.
     const ArcStage& stage = *planet.arcs.stage;
     add(any, (1 + stage.tier_count) * sizeof(uint32_t));
-    // Each polygon's: its record, identities and marks, its name, its rings'
-    // refs and its ring blocks; and the regions of each arc its rings use.
+    // Each polygon's: its record, identities, marks and object, its name, its
+    // rings' refs and its ring blocks; and the regions of each arc its rings
+    // use.
     const ArcSetBlocks& set = planet.arcs.set(ArcSet::Full);
     std::vector<uint8_t> of_arc(set.arcs(), 0);
-    constexpr uint64_t kPolygonBytes =
-        sizeof(AdminPolygon) + 2 * sizeof(uint64_t) + 2 * sizeof(uint8_t) + sizeof(AdminArcPolygon);
+    constexpr uint64_t kPolygonBytes = sizeof(AdminPolygon) + 2 * sizeof(uint64_t) + 2 * sizeof(uint8_t) +
+                                       sizeof(uint32_t) + sizeof(AdminArcPolygon);
     for (size_t p = 0; p < planet.size(); p++) {
         const uint8_t mask = of_polygon[p];
         if (!mask) continue;
@@ -1413,10 +1447,44 @@ std::string attribution_json(bool marine) {
 
 namespace {
 
+// water_cut_arcs.bin of the polygons `ids` of the layer, whose ring blocks
+// are in `blocks` (its polygons `ids`'s, in order): a bit per slot of its
+// full set, bit s % 32 of u32 word s / 32 for slot s, set for an arc that is
+// a cut, one that only one object's polygons use and that they use twice or
+// more (two pieces of a lake split along the grid, two tiles of a marine
+// area), so that the object's water lies on both sides of it. An arc of two
+// objects, or of one ring once, is a shore.
+std::vector<uint32_t> cut_arc_words(const Layer& layer, const std::vector<uint32_t>& ids,
+                                    const AdminArcBlocks& blocks) {
+    const ArcSetBlocks& set = blocks.set(ArcSet::Full);
+    constexpr uint32_t kNone = UINT32_MAX, kShared = UINT32_MAX - 1;
+    std::vector<uint32_t> object(set.arcs(), kNone);
+    std::vector<uint8_t> uses(set.arcs(), 0);
+    for (size_t k = 0; k < ids.size(); k++) {
+        const AdminArcPolygon& p = blocks.polygons[k];
+        const uint32_t o = layer.objects[ids[k]];
+        for (uint32_t r = p.first_ring; r < p.first_ring + p.ring_count; r++) {
+            if (!set.has_ring(r)) continue;
+            for (uint32_t i = set.ring_refs[r]; i < set.ring_refs[r + 1]; i++) {
+                const uint32_t a = set.refs[i].arc;
+                object[a] = object[a] == kNone || object[a] == o ? o : kShared;
+                uses[a] = static_cast<uint8_t>(std::min(uses[a] + 1, 2));
+            }
+        }
+    }
+    const std::vector<uint32_t> arc_of = arc_at_slot(set);
+    std::vector<uint32_t> words((arc_of.size() + 31) / 32, 0);
+    for (size_t slot = 0; slot < arc_of.size(); slot++) {
+        const uint32_t a = arc_of[slot];
+        if (a != UINT32_MAX && uses[a] >= 2 && object[a] != kShared) words[slot / 32] |= 1u << (slot % 32);
+    }
+    return words;
+}
+
 // One water dir set: the records of `ids` (polygons of the layer) in their
 // slots, with their ring blocks in `blocks` (whose polygons are `ids`'s, in
-// order), its cells, strings, kinds and credit, into each of `dirs`; tier
-// t's arcs into tier_dirs[t]. Returns its summary.
+// order), its cut arcs, cells, strings, kinds and credit, into each of
+// `dirs`; tier t's arcs into tier_dirs[t]. Returns its summary.
 std::string write_set(const Layer& layer, const std::vector<uint32_t>& ids, const AdminArcBlocks& blocks,
                       const PolygonSlots& slots, const std::vector<std::string>& dirs,
                       const std::vector<std::pair<size_t, std::string>>& tier_dirs) {
@@ -1439,6 +1507,12 @@ std::string write_set(const Layer& layer, const std::vector<uint32_t>& ids, cons
     }
     const size_t ring_bytes = write_ring_files(dirs, blocks, ArcSet::Full, at_slot, polygon_of);
     for (const auto& [t, dir] : tier_dirs) write_arc_files(dir, blocks.set(ArcSet::Full), blocks.tiers[t]);
+    const std::vector<uint32_t> cuts = cut_arc_words(layer, ids, blocks);
+    size_t cut_arcs = 0;
+    for (uint32_t w : cuts) cut_arcs += static_cast<size_t>(__builtin_popcount(w));
+    for (const std::string& dir : dirs)
+        write_binary_file(dir + "/water_cut_arcs.bin", reinterpret_cast<const char*>(cuts.data()),
+                          cuts.size() * sizeof(uint32_t));
 
     std::vector<CellItemPair> cells = parallel_collect<CellItemPair>(layer.cells.size(),
         [&](size_t i, std::vector<CellItemPair>& out) {
@@ -1468,8 +1542,8 @@ std::string write_set(const Layer& layer, const std::vector<uint32_t>& ids, cons
     std::ostringstream line;
     line << ids.size() << " polygons in " << slots.count << " slots (" << slots.kept << " kept, " << slots.by_fallback
          << " by fallback, " << slots.recycled << " recycled), " << ring_bytes << " ring bytes, " << arc_bytes
-         << " arc bytes, " << count_cells(cells) << " cells, " << cells.size() << " entries, " << names.bytes().size()
-         << " name bytes, " << codes.size() << " types";
+         << " arc bytes, " << cut_arcs << " cut arcs, " << count_cells(cells) << " cells, " << cells.size()
+         << " entries, " << names.bytes().size() << " name bytes, " << codes.size() << " types";
     return line.str();
 }
 
@@ -1542,12 +1616,13 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
         contested += choices[o].named() && choices[o].runner_up_mm * 4 >= choices[o].mm;
     }
     const size_t before = b.objects.size();
-    const size_t named = apply_names(b, choices);
+    const auto [named, weak] = apply_names(b, choices);
     std::cerr << "  Water names: " << river_polygons.size() << " river and canal polygons of " << river_objects
               << " objects, " << unnamed_rivers << " without a name of their own; " << counts.cover_entries
               << " cover entries, " << counts.segments_in_cover << " segments in their cells, " << counts.probes
               << " probed (" << counts.probes_inside << " inside), " << counts.credits << " credits; " << named
-              << " named by their waterway, " << before - b.objects.size() << " left unnamed and out, " << contested
+              << " named by their waterway (" << weak << " weakly, by a short one that runs a short way in), "
+              << before - b.objects.size() << " left unnamed and out, " << contested
               << " with a runner-up of a quarter or more" << std::endl;
     free_storage(b.lines.lines);
     free_storage(b.lines.vertices);

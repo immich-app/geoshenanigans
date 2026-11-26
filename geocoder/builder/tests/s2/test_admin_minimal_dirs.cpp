@@ -404,10 +404,13 @@ TEST(the_boundary_tiers_share_their_records_and_rings_and_postcode_areas_are_rec
         CHECK(shared[slot].area == r.data.admin_polygons[slot].area);
         CHECK(shared[slot].name_id == r.data.admin_polygons[slot].name_id);
     }
-    // The postcode area is a record of its level there; no dir has postal files.
+    // The postcode area is a record of its level there; no dir has postal
+    // geometry files.
     CHECK_EQ(level_of(shared[6]), POSTAL_AREA_LEVEL);
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(r.tmp.path))
-        CHECK(entry.path().filename().string().rfind("postal_", 0) != 0);
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(r.tmp.path)) {
+        const std::string name = entry.path().filename().string();
+        CHECK(name != "postal_polygons.bin" && name != "postal_vertices.bin");
+    }
     // The slots' sidecars beside the exact tier only.
     for (const char* sidecar : {"/admin_polygons.osm_ids", "/arc_index.osm_ids", "/arc_index.fallback.osm_ids"}) {
         CHECK(std::filesystem::exists(r.exact_dir + sidecar));

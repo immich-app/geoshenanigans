@@ -1,11 +1,13 @@
-// The postcode centroid files (postcode_files.h) and the postcode grid
-// (postcode_grid.h) of a patch test's dir.
+// The postcode centroid files (postcode_files.h), the postcode grid
+// (postcode_grid.h) and the postal cities (postal_cities.h) of a patch test's
+// dir.
 #pragma once
 
 #include <cstdint>
 #include <vector>
 
 #include "cell_pairs.h"
+#include "postal_cities.h"
 #include "postcode_files.h"
 #include "postcode_grid.h"
 #include "tool_runs.h"
@@ -50,4 +52,10 @@ inline std::vector<char> logical_bytes(const std::vector<postcode_files::Logical
 inline void put_grid(gctest::BuildDir& d, const std::vector<postcode_grid::LogicalRow>& rows) {
     const std::vector<uint8_t> file = postcode_grid::encode_file(rows);
     d[postcode_grid::FILE_NAME].assign(file.begin(), file.end());
+}
+
+// The postal cities of rows into d, as the builder writes them.
+inline void put_postal(gctest::BuildDir& d, const std::vector<postal_cities::LogicalRow>& rows) {
+    const std::vector<uint8_t> file = postal_cities::encode_file(rows);
+    d[postal_cities::FILE_NAME].assign(file.begin(), file.end());
 }

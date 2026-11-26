@@ -17,7 +17,8 @@ WATER_DIR_WITH_A_SEA = os.path.join(HERE, "..", "..", "testdata", "water_dir", "
 
 # The client files of a water dir, as the builder writes them (water_layer.h).
 WATER_DIR_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin", "arc_index.bin",
-                   "arc_vertices.bin", "strings_core.bin", "strings_layout.json", "water_meta.json", "attribution.json"]
+                   "arc_vertices.bin", "strings_core.bin", "strings_layout.json", "water_cut_arcs.bin", "water_meta.json",
+                   "attribution.json"]
 WATER_DIRS = {"major": "water/major/simplified", "all": "water/all/simplified", "all-exact": "water/all/exact"}
 
 
@@ -78,7 +79,7 @@ class WaterAxisTest(unittest.TestCase):
             return float(re.search(rf"inline constexpr double {name} = ([0-9.]+);", header).group(1))
 
         keep = constant("kMajorKeepPercent") / 100
-        km2 = [constant("kMajorAreaKm2"), constant("kMajorWikidataRiverKm2")]
+        km2 = [constant("kMajorAreaKm2"), constant("kMajorCoastalKm2"), constant("kMajorWikidataRiverKm2")]
         with open(PATCHING) as f:
             row = next(line for line in f if line.startswith("| `water/major/"))
         for text in (load_template()["axes"]["water"]["values"]["major"]["description"], row):

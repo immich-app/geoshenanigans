@@ -18,10 +18,10 @@ namespace water {
 
 // A region's water: one record per polygon (an outer ring with its holes,
 // in polygon order), each with its slot identity, its fallback key, whether
-// the major tier holds it and whether it is a marine area's (marine.h); its
-// names; its arcs (the stage's encoding, the planet's or a region's share
-// with its own slots) and its cell index over the polygons, interior where
-// both tiers' rings hold the whole cell.
+// the major tier holds it, whether it is a marine area's (marine.h) and its
+// object; its names; its arcs (the stage's encoding, the planet's or a
+// region's share with its own slots) and its cell index over the polygons,
+// interior where both tiers' rings hold the whole cell.
 struct Layer {
     Layer() { arcs.stage = &kWaterArcStage; }
 
@@ -33,6 +33,7 @@ struct Layer {
     std::vector<uint64_t> fallbacks;   // gc::id_alloc::kNoFallbackKey for none
     std::vector<uint8_t> major;
     std::vector<uint8_t> marine;
+    std::vector<uint32_t> objects;  // the planet's numbering of the objects
     std::vector<char> names;  // NUL-terminated, back to back, alphabetical
     AdminArcBlocks arcs;
     std::vector<CellItemPair> cells;
@@ -41,8 +42,8 @@ struct Layer {
     bool empty() const { return records.empty(); }
     uint64_t bytes() const {
         auto held = [](const auto& v) { return uint64_t(v.size()) * sizeof(v[0]); };
-        return held(records) + held(identities) + held(fallbacks) + held(major) + held(marine) + held(names) +
-               held(cells) + arcs.bytes();
+        return held(records) + held(identities) + held(fallbacks) + held(major) + held(marine) + held(objects) +
+               held(names) + held(cells) + arcs.bytes();
     }
 };
 

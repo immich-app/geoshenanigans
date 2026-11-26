@@ -34,16 +34,23 @@ enum AttributionSource : uint8_t {
     // The seas and oceans of a water dir (--marine, tools/marine_import.py),
     // Marine Regions' sea areas cut to OSM's land (water_layer.h).
     ATTRIBUTION_MARINE = 1 << 5,
+    // The postal cities' names (postal_cities_build.h) of a build given
+    // GeoNames's US postal places (--postal-places) or yesterday's table,
+    // whose names they chose (--prev-postal-cities): GeoNames's entry, with
+    // its notice of them, beside ATTRIBUTION_GEONAMES or without it.
+    ATTRIBUTION_POSTAL_CITIES = 1 << 6,
 };
 
 struct AttributionNotice {
     const char* text = nullptr;
-    // The sources it is owed for besides its entry's, 0 for none: a notice
-    // of GeoNames's GB data alone.
+    // The sources it is owed for, any of them; 0 for any of its entry's: a
+    // notice of GeoNames's GB data alone, of its centroids or of its postal
+    // cities' names.
     uint8_t needs = 0;
 };
 
 struct AttributionEntry {
+    // The sources it is owed for, any of them.
     uint8_t source;
     const char* id;
     const char* text;
@@ -60,7 +67,9 @@ struct AttributionEntry {
 // nightly keeps each GB row's postcode and coordinates (geocoder-build.yml),
 // and the build those its country's pattern takes, as the postcode the
 // pattern makes of each (match_postcode, read_external_postcodes), whose pair
-// OSM has no centroid for (collect_postcode_centroids).
+// OSM has no centroid for (collect_postcode_centroids); and where the postal
+// cities name a ZIP with US.zip's place name, how its votes take that name
+// (postal_cities_build.h choose).
 // Code-Point Open's, owed for the GB centroids alone, are the attribution
 // statements of its licence.txt (Doc/licence.txt in its download), verbatim
 // but for the year, 2022, the one of GeoNames's Royal Mail notice, of the
@@ -71,14 +80,20 @@ inline constexpr AttributionEntry kAttribution[] = {
     {ATTRIBUTION_OSM, "osm", "© OpenStreetMap contributors", "https://www.openstreetmap.org/copyright", "ODbL 1.0",
      "https://opendatacommons.org/licenses/odbl/1-0/",
      {{"This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0."}}},
-    {ATTRIBUTION_GEONAMES, "geonames", "GeoNames", "https://www.geonames.org/", "CC BY 4.0",
+    {ATTRIBUTION_GEONAMES | ATTRIBUTION_POSTAL_CITIES, "geonames", "GeoNames", "https://www.geonames.org/", "CC BY 4.0",
      "https://creativecommons.org/licenses/by/4.0/",
      {{"UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.",
        ATTRIBUTION_CODEPOINT},
       {"The Data is provided \"as is\" without warranty or any representation of accuracy, timeliness or completeness."},
       {"Changes: this dataset holds the coordinates of the postcodes of GeoNames's postal code files that are of a "
        "valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none "
-       "of the files' other fields."}}},
+       "of the files' other fields.",
+       ATTRIBUTION_GEONAMES},
+      {"Changes: this dataset names a US ZIP code with the place name GeoNames's postal code files give it where the "
+       "ZIP's OpenStreetMap addresses name too few cities, choose that name, or favour another by fewer votes than "
+       "the extra ones that name counts, spelt as OpenStreetMap addresses spell it where they do, in its own format; "
+       "it holds none of the files' other fields.",
+       ATTRIBUTION_POSTAL_CITIES}}},
     {ATTRIBUTION_CODEPOINT, "codepoint-open", "Ordnance Survey Code-Point Open",
      "https://www.ordnancesurvey.co.uk/products/code-point-open", "OGL v3.0",
      "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",

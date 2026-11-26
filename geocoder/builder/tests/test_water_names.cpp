@@ -244,3 +244,79 @@ TEST(a_choice_carries_the_lowest_wikidata_item_of_its_keys_lines_in_the_object) 
     CHECK_EQ(choices[0].qid, 4u);
     CHECK_EQ(choices[1].qid, 0u);
 }
+
+TEST(a_name_is_weak_where_its_lines_run_a_short_way_into_the_object_and_its_waterway_is_short_beside_it) {
+    // The East River's area, 6.67 km²: Newtown Creek, 5.6 km long, runs
+    // 424 m into it, as a tributary's line ends in the river it flows into.
+    CHECK(weak_name(424000, 6.67, 5570000));
+    // Half the side of a square of the area, 1.29 km, is short; an own
+    // river's 1.3 km and more is not, however short the river.
+    CHECK(weak_name(1290000, 6.67, 5570000));
+    CHECK(!weak_name(1300000, 6.67, 5570000));
+    CHECK(!weak_name(20000000, 6.67, 20000000));
+    // A riverbank of 100 m by 3 km, its river along it; a wide reach of 1.5
+    // by 2 km, its river through it.
+    CHECK(!weak_name(3000000, 0.3, 3000000));
+    CHECK(!weak_name(2000000, 3.0, 2000000));
+    // A river's own line through its delta, estuary or a piece at its side,
+    // a short way in: the waterway is long beside the area. The Lena's delta
+    // (537 km², 500 m in, 6,730 km), the Northern Dvina's (180 km², 5.1 km
+    // in, 1,187 km), the Penna's estuary (22 km², 280 m, 579 km).
+    CHECK(!weak_name(500000, 537.0, 6730000000ull));
+    CHECK(!weak_name(5080000, 179.7, 1186600000ull));
+    CHECK(!weak_name(280000, 22.0, 578900000ull));
+    // A waterway is long from 64 sides of the square: 64 km beside 1 km².
+    CHECK(weak_name(100000, 1.0, 63900000));
+    CHECK(!weak_name(100000, 1.0, 64000000));
+    CHECK(weak_name(100000, 4.0, 127900000));
+    CHECK(!weak_name(100000, 4.0, 128000000));
+    // A waterway is as long as its lines inside at least.
+    CHECK(weak_name(300000, 6.67, 0));
+}
+
+TEST(a_lines_waterway_is_its_relation_or_the_lines_of_its_name_it_joins) {
+    // Keys sorted: a name's, then a relation's.
+    NamingLines lines;
+    lines.keys = {"nCreek", "r7"};
+    lines.key_local = {"Creek", "Creek"};
+    lines.displays = {"Creek"};
+    auto add = [&](uint32_t key, std::vector<PackedLocation> v) {
+        lines.lines.push_back({int64_t(lines.lines.size() + 1), key, 0, 0, lines.vertices.size(), uint32_t(v.size())});
+        lines.vertices.insert(lines.vertices.end(), v.begin(), v.end());
+    };
+    // Lines 0 to 2 of the name join, end to end and an end to a vertex
+    // within another; line 3 of the name is another creek far off; line 4's
+    // only segment crosses the antimeridian, which counts no length.
+    add(0, {{0, 0}, {0, 10000}});
+    add(0, {{0, 10000}, {0, 15000}, {0, 20000}});
+    add(0, {{5000, 15000}, {0, 15000}});
+    add(0, {{100000, 0}, {100000, 10000}});
+    add(0, {{400000, 1799990000}, {400000, -1799990000}});
+    // A relation's lines are one waterway, joined or not.
+    add(1, {{200000, 0}, {200000, 1000}});
+    add(1, {{300000, 0}, {300000, 1000}});
+    auto len = [&](size_t l) { return naming_line_mm(lines, lines.lines[l]); };
+    CHECK_EQ(len(0), segment_mm({0, 0}, {0, 10000}));
+    CHECK_EQ(len(4), uint64_t(0));
+    NamingLines one = lines, many = lines;
+    measure_waterways(one, 1);
+    measure_waterways(many, 8);
+    const uint64_t creek = len(0) + len(1) + len(2), relation = len(5) + len(6);
+    const std::vector<uint64_t> want = {creek, creek, creek, len(3), 0, relation, relation};
+    for (size_t l = 0; l < want.size(); l++) {
+        CHECK_EQ(one.lines[l].waterway_mm, want[l]);
+        CHECK_EQ(many.lines[l].waterway_mm, want[l]);
+    }
+}
+
+TEST(a_choice_carries_the_longest_waterway_of_its_keys_lines_in_the_object) {
+    // Object 0 takes key 1 (500 + 400 against key 0's 800), whose lines in
+    // it are of waterways of 5 and 9 km; key 0's is 70 km long.
+    std::vector<Credit> credits = {
+        {0, 1, 3, 500, 0, 5000000}, {0, 1, 2, 400, 0, 9000000}, {0, 0, 1, 800, 0, 70000000}, {1, 5, 7, 100, 0, 0},
+    };
+    const std::vector<NameChoice> choices = pick_names(credits, 2, 1);
+    CHECK_EQ(choices[0].key, 1u);
+    CHECK_EQ(choices[0].waterway_mm, uint64_t(9000000));
+    CHECK_EQ(choices[1].waterway_mm, uint64_t(0));
+}

@@ -371,8 +371,8 @@ with `amenity=fountain`).
 | How far the closest street or address is looked for (`lookup_street_poi` runs `_find_closest_street_or_poi` within 0.006°) | `DEFAULT_SEARCH_DISTANCE`, 130 m: how far the street and address lookups reach, wherever the point lies in its street cell, and none farther: the nearest street way (measured to its segments) and address point that compete to be the answer's feature, and the interpolation lines that give a street that wins its house number | ℹ️ Divergence — Nominatim reaches 0.006° (about 660 m), but a road that far off is no longer the road the point is on: no street way past 130 m names the road. An address or POI that wins still gives the road it names, and a street that wins still takes its house number from within 100 m, as `_find_housenumber_for_street` does within 0.001° |
 | Suburb/neighbourhood rank adjustment | Builder rank pass (Step 4); the server reads the stored address ranks | ✅ Implemented |
 | TIGER address interpolation | `--tiger-data` loads Nominatim's TIGER export (address ranges, one CSV per county) as interpolation lines, with each line's ZIP in interp_postcodes.bin | ✅ Implemented — a US street that wins without an address point takes its house number from the nearest interpolation line of that street, as Nominatim's `_find_tiger_number_for_street` does |
-| Postal city names | Not implemented | ❌ Deferred — in the US, USPS assigns city names to ZIP codes that may differ from the actual municipal jurisdiction (e.g., "Cumming, GA" for unincorporated Forsyth County). Neither we nor Nominatim handle this — would require external USPS data or addr:city extraction. |
-| `layer=natural` water bodies | The `water` field beside the address, from an optional water dir: the smallest area holding the point, then rank; river and canal areas named by their waterway; seas and oceans from Marine Regions (see "Water" above) | ℹ️ Extension — Nominatim's default answer has no body of water, and its `layer=natural` area order is rank first |
+| Postal city names | `address.postal_city` (US): the ZIP's postal city, from postal_cities.bin: from five votes, the `addr:city` most of its addresses carry, GeoNames' USPS place name and yesterday's name counting max(2, 10 %) more; below five, GeoNames' name; spelt as the ZIP's or its state's addresses spell it (`builder/src/postal_cities_build.h`) | ➕ An addition, not a Nominatim field — USPS assigns city names to ZIP codes that may differ from the municipal jurisdiction (e.g., "Cumming, GA" for unincorporated Forsyth County). Nominatim's own address rows reach some of these names (Pittsburgh, Miami) as place parts, from the houses' `addr:city`; `postal_city` changes no field Nominatim has, nor `display_name`. |
+| `layer=natural` water bodies | The `water` field beside the address, from an optional water dir: the smallest area holding the point, then rank; river and canal areas named by their waterway; seas and oceans from Marine Regions; `water.landmark` where a location line names the water (see "Water" above) | ℹ️ Extension — Nominatim's default answer has no body of water, and its `layer=natural` area order is rank first |
 | Name localisation | Not implemented — we store one name per feature, `name:en` where present, else `name` | ❌ Deferred — Nominatim supports `accept-language` header to return locale-specific names (e.g., `name:en=Borough of Luton` instead of `name=Luton`). Builder would need to store `name:en`, `name:fr`, etc. in the string pool (or a separate name table), and server would need to select based on client language preference. |
 
 ## Water (an extension)
@@ -448,7 +448,11 @@ with `amenity=fountain`).
   answers `{"address": {}, "water": {...}}`, where Nominatim answers
   `Unable to geocode`. Only a dataset whose region covers the open sea answers
   there: the planet's; a continent's dirs hold the coastal seas its region
-  takes in.
+  takes in. An area answers by the name its sea goes by where the IHO's reads
+  awkwardly in a line (`marine::kShownNames`: "Mediterranean Sea" for either
+  basin, "Barents Sea" for "Barentsz Sea", "Andaman Sea" for "Andaman or Burma
+  Sea"); a name in dispute ("Japan Sea", "Persian Gulf") stays as the source
+  has it.
 - **River naming.** River and canal areas are answers, as `waterway/river` and
   `waterway/canal`, named by themselves or by a waterway; an unnamed one that no
   waterway names is left out. An unnamed one takes the waterway with the
@@ -462,7 +466,13 @@ with `amenity=fountain`).
   across a missing node), the `name:en` of the most length among them, a tie
   going to the smaller name; else the relation's `name`. So neither one way's
   `name:en` nor a reach's local name renames the river. A river mapped only as
-  a line has no area and gets no `water`.
+  a line has no area and gets no `water`. A name so taken is weak where the
+  river's lines run under half the side of a square of the area's size inside
+  it and the river itself, its relation or the lines of its name joined up, is
+  under 64 such sides long, as a creek's line ends in the river it flows into
+  (the East River's unnamed area takes "Newtown Creek"): the record says so,
+  and the location line (below) doesn't name it. A river's own line through a
+  piece of its delta or estuary, a long river beside the piece, is not weak.
 - **Kinds out of scope**, as in Nominatim: unnamed water (but river and canal
   areas a waterway names, above), `water=stream|ditch|drain|fish_pass`, `water=*` without
   `natural=water`, `natural=coastline`. Left out for the Marine Regions areas:
@@ -471,6 +481,21 @@ with `amenity=fountain`).
 - **Precision.** `water=all-exact` holds every OSM point of every shore. `major`
   and `all` are simplified within 37.5 m, so a point within that of a shore can
   fall either side of it.
+- **The location line (`water.landmark`).** Nominatim has nothing like it. The
+  answer's `water` carries `"landmark": true`, last and only when true, where a
+  photo's location line would show the water in its landmark's place
+  (`landmark = water.landmark ? water.name : address.landmark`): a kind people
+  name (no basin, fishpond, lock or `water=*` value of its own), a name that is
+  no catalogue number nor a weak river name, still water and wetlands of 1 ha
+  or more, a name the line's city, state, country or landmark doesn't hold
+  already, a landmark that gives way (none; a nature reserve, national park or
+  protected area to a notable lake, glacier, coastal water or river smaller than
+  it; a natural feature to smaller water; never a sea, ocean or wetland over a
+  park), and no shore of the water within 40 m of the point, a cut between
+  pieces of one water and a marine tile line with sea across it aside. It is
+  decided in the multi-continent answer once the water and the address are
+  final, the same on every tier; `display_name`, `address` and `places` don't
+  change. README.md gives each rule.
 
 The server's lookup is `server/src/water.rs`; the builder's kinds, ranks and
 naming are `builder/src/water_classify.h`, `water_types.h` and `water_names.h`.
@@ -518,5 +543,7 @@ The postcode is also populated from the `place_addressline` chain — if a stree
    1. Of the postal areas holding it of its country (any where the point has none known) whose postcode the country has, the one whose centroid is nearest it in plain degrees
    2. Else, in the United States, the postcode grid's (postcode_grid.bin, `builder/src/postcode_grid_build.h`): the postcode most of the address points and the points halfway along the TIGER lines in the point's level-16 cell carry, as Nominatim's pattern takes their tags (`(ddddd)(?:-dddd)?`, the five digits), or, in a cell holding none, the nearer such cell's along the curve within the country's extent (25 km over the longest cell edge, 150 cells); none past that, and the centroids name the point. Nominatim has no such table: its `get_nearest_postcode()` takes the nearest centroid, whose ZIP area may end nearer the point than its own, where the houses round the point carry the postcode Nominatim answers with at zoom 18 (the house's or the TIGER line's it lands on). The grid stands in for it at the same point, after the postal areas, which `ORDER BY osm_id is null` puts before any centroid, and before the centroids. Only the US's: its postcodes are areas with next to no postal boundaries in OSM, where for other countries the centroids or the postal areas answer better
    3. Else the postcode centroid of the same country nearest it in plain degrees among those whose box holds it (postcode_centroids.bin). A centroid of no country stands for one of the point's, and where the point has no country every centroid counts, each with its own country's box. The box is `expand_by_meters`' (`geography_box.rs`): the envelope of the centroid's buffer on the geography, a diamond of the extent in the point's UTM zone or, beyond 70°, the polar Lambert azimuthal equal-area, as PostGIS's `_ST_BestSRID` picks; a degree of latitude there is a meridian degree, 110,574 m at the equator. A box across the antimeridian spans the longitudes between its corners the long way round, as `ST_Envelope` makes it, and holds no point on the antimeridian. The server looks for the boxes holding a point among the centroids within its country's extent of it (`BOX_REACH_FACTOR`), and among the centroids within that extent of the antimeridian at the point's latitude, at any distance, unless none of those can be as near as the best so far: those are the boxes that reach across it, which can hold a point however far west or east of the centroid
+
+`address.postal_city`, which is ours, names the postcode of any of these where the dir's table has a row of it, but the nearest centroid's (2.3): a centroid's ZIP is the one whose centre is near the point, not the one it lies in.
 
 Nominatim keeps only postal areas whose postcode matches the country's pattern (`_update_postcode_areas`); the builder marks the others (place type 15) and neither it nor the server takes a postcode from them. A postal area's centroid is that of the ring holding the point, where Nominatim's is the whole relation's. Nominatim's street also takes the postcode of the finest of its address areas that has one (`insert_addresslines`: an area's own postcode tag, or the one postcode whose centroid lies inside it) before `get_nearest_postcode()`; the polygons carry no postcode, so the server leaves that step out.

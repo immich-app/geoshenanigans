@@ -1451,6 +1451,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "unicode-normalization",
  "zstd",
 ]
 

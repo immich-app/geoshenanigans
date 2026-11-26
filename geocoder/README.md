@@ -432,6 +432,24 @@ that found nothing carries it too (`{"licence": "...", "address": {}}`).
 Where no loaded region covers the point the answer is `{}`, without it, as
 Nominatim's `{"error":"Unable to geocode"}` is.
 
+In the United States an answer whose postcode is a ZIP also carries
+`postal_city`, right after `postcode`: the place name mail to that ZIP is
+addressed with, which may differ from the city or town the point lies in
+(19026 is Drexel Hill, in Upper Darby). It comes from the `addr:city` of
+the ZIP's OpenStreetMap addresses (`postal_cities.bin`): where five or more
+name a place, the name most of them carry, GeoNames' USPS place name
+counting max(2, 10 %) of their votes more and yesterday's name as many
+again, so a near tie keeps its name; where fewer do, GeoNames' name (without
+one, a name more than half of three or four carry). Either is spelt as the
+ZIP's addresses spell it, else as its state's do, else as GeoNames does:
+GeoNames' Mc Lean is McLean. It is not a Nominatim field and never part of
+`display_name`. An answer has none whose postcode came from the nearest
+postcode centroid, nor one of a ZIP the dir's table has no row of (one too
+few addresses name, without GeoNames' name) or from a dir of no table. Every
+preset carries it where the answer has a ZIP of a row: in with-addresses and
+max-quality the house's, the street's, a TIGER line's, a postal area's or
+the postcode grid's; in immich-recommended and smallest, mostly the grid's.
+
 Where the dataset has a water dir (a `water` value other than `none`), an
 answer whose point lies in a body of water carries it last, beside the
 address, which it never changes (46.45, 6.55, in Lake Geneva):
@@ -447,7 +465,7 @@ address, which it never changes (46.45, 6.55, in Lake Geneva):
     "country": "France",
     "country_code": "FR"
   },
-  "water": { "name": "Lake Geneva", "class": "water", "type": "lake" }
+  "water": { "name": "Lake Geneva", "class": "water", "type": "lake", "landmark": true }
 }
 ```
 
@@ -464,6 +482,43 @@ answer has no water at all; [NOMINATIM_REFERENCE.md](NOMINATIM_REFERENCE.md#wate
 gives how this field relates to its `layer=natural` lookup, the selection rule
 and how river areas are named.
 
+`"landmark": true`, last inside `water` and there only when true, says that a
+location line shows this water in the landmark's place, before the city, state
+and country: `landmark = water.landmark ? water.name : address.landmark`, as
+Immich stores it. Nothing else in the answer changes with it. The server sets it
+when all of these hold, the same on every water tier:
+
+- **A kind people name**: a sea or ocean; a bay, strait, cove, fjord, sound,
+  lagoon or harbour; a lake, reservoir, pond, oxbow or `natural/water`; a river
+  or canal area; a glacier; a wetland. Never a basin, fountain, fishpond, lock,
+  moat, salt pool or wastewater, nor a `water=*` value of its own.
+- **A real name**: none without a letter ("49,0"), nor a number after "No",
+  "Nr", "#", "№", or a word such as "Lake" or "Glacier" alone ("№30",
+  "Lake 938"); nor a river area's name taken weakly from a waterway that runs
+  only a short way into it and is short beside it (a creek's, as "Newtown
+  Creek" for the East River's unnamed area; not a long river's through a piece
+  of its delta, as the Lena's).
+- **Big enough**: still water and wetlands of 1 ha or more; rivers, canals,
+  coastal water, seas and glaciers at any size.
+- **Not in the line already**: its name, lower case with letters and digits
+  alone and accents aside (NFKD, its marks dropped), is not the city, state or
+  country Immich shows (the first of `city`,
+  `town`, `village`, `hamlet`, `municipality`; of `state`, `province`,
+  `region`, `county`, `municipality`, `city`; and `country`, none without a
+  country), and neither it nor the landmark's name holds the other (from 4
+  characters: "Lake Titicaca (Peruvian sector)" names Lake Titicaca).
+- **The landmark gives way**: with no landmark, or a nature reserve, national
+  park or protected area (UNESCO zones among them) whose polygon is larger than
+  the water and the water a lake, glacier or coastal water of 0.1 km² or more,
+  or a river; or a natural feature (a beach, a glacier) whose polygon is larger
+  than the water. A sea, an ocean or a wetland never displaces a park, and
+  every other landmark (a bridge, a pier, a marina, a park, a building) stays.
+- **On the water, not at its edge**: no shore of that water within 40 m of the
+  point, in the dir's own geometry, its pieces past a cut included; a cut
+  between two pieces of the same water (`water_cut_arcs.bin`) is no shore, nor
+  is a marine area's edge along a tenth-of-a-degree tile line with sea on both
+  sides of it.
+
 Status codes:
 - `200` - success
 - `401` - missing or invalid API key
@@ -479,7 +534,7 @@ The project consists of four components:
 
 - **Builder** (`builder/`, C++) - `build-index` parses OSM PBF files and creates a compact binary index using S2 geometry cells for spatial lookup. `geocoder-diff` and `geocoder-patch` make and apply the daily patches ([builder/PATCHING.md](builder/PATCHING.md)), and `pbf-apply` applies OSM replication diffs to a PBF.
 - **Server** (`server/`, Rust) - Memory-maps the index files and serves queries via HTTP/HTTPS with sub-millisecond latency. It is also the `query_server` library the binding wraps.
-- **Node binding** (`node/`) - The native module Immich uses to geocode in-process: `Geocoder.load(dir)` (the dataset and its `water/` dir), then `reverseGeocode(lat, lng)` resolves to the response JSON as a string, `water` among it. `openPlaceSearch()` opens the place search index of the dataset (shipped with the bigger packs, else built on the device; see [builder/PATCHING.md](builder/PATCHING.md#place-search-index)), then `searchPlaces(query)` resolves to the results as a JSON string. `createTransportDecoder(dir, files)` decodes a downloading transport unit into the dir it is given, an existing one: the dataset dir for the units of the dataset's own dirs, `<dataset>/water/` for those of a water dir, whose files have the names of the boundary units' ([PATCHING.md](PATCHING.md#transport-units)).
+- **Node binding** (`node/`) - The native module Immich uses to geocode in-process: `Geocoder.load(dir)` (the dataset and its `water/` dir), then `reverseGeocode(lat, lng)` resolves to the response JSON as a string, `water` (and its `landmark` flag) among it. `openPlaceSearch()` opens the place search index of the dataset (shipped with the bigger packs, else built on the device; see [builder/PATCHING.md](builder/PATCHING.md#place-search-index)), then `searchPlaces(query)` resolves to the results as a JSON string. `createTransportDecoder(dir, files)` decodes a downloading transport unit into the dir it is given, an existing one: the dataset dir for the units of the dataset's own dirs, `<dataset>/water/` for those of a water dir, whose files have the names of the boundary units' ([PATCHING.md](PATCHING.md#transport-units)).
 - **Test portal** (`test-portal/`) - The map page served at `/test`, and the image and compose file of `query-portal`, which serves every dataset of the published planet build without water for the page to compare side by side.
 
 ### Index Structure
@@ -508,13 +563,14 @@ to the same files ([builder/PATCHING.md](builder/PATCHING.md#transport-units)).
 | `place_cells.bin`, `place_nodes.bin`, `place_hidden.bin` | Place nodes (city, town, village, suburb, ...): the visible ones in admin cell order, bit-packed in blocks of 64, each marked where a relation of its rank promotes it, with each cell's first row; the ones a boundary hides (its label for place search) beside them (`builder/src/place_files.h`) |
 | `postcode_centroids.bin`, `postcode_centroid_cells.bin` | Postcode centroids in admin cell order, Rice-coded steps in blocks of 32 with a box per block (PCC1, `builder/src/postcode_files.h`), and each admin cell's rows of them |
 | `postcode_grid.bin` | In the United States, the postcode of each level-16 S2 cell: the one most of the address points and TIGER lines in it carry, or in a cell holding none the nearer such cell's along the curve within the country's extent (25 km), none past that (`builder/src/postcode_grid_build.h`); as runs of cells in cell order, Rice-coded steps in blocks of 128 with each block's postcodes as text (PGR1, `builder/src/postcode_grid.h`); the same bytes in every mode dir of a region, the planet's runs a query routed there reads |
+| `postal_cities.bin` | In the United States, the place name mail to each ZIP is addressed with: from five votes, the `addr:city` most of the ZIP's addresses carry, GeoNames' USPS place name and yesterday's name counting max(2, 10 %) more; below five, GeoNames' name; spelt as the ZIP's or its state's addresses spell it (`builder/src/postal_cities_build.h`); rows of country, code and name as text in blocks of 64 (PCY1, `builder/src/postal_cities.h`), the same bytes in every mode dir of a region holding the country |
 | `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin` | Points of interest and their cell index (a list per cell) |
 | `strings_core.bin`, `strings_street.bin`, `strings_addr.bin`, `strings_postcode.bin`, `strings_poi.bin` | Deduplicated string pool, in five tiers so each variant ships only the strings it uses; each tier front-coded in buckets cut by content (FCC2, `builder/src/string_files.h`), a string's id still its offset in the tier's pool |
 | `strings_layout.json` | Start and end of each string tier, which place every string offset |
 | `poi_meta.json` | POI category names and scoring parameters |
 | `attribution.json` | In each mode dir: the credit of the data it holds, one entry per source ([PATCHING.md](PATCHING.md#attribution)) |
 | `poi_attribution.json` | In a POI tier dir: Wikidata's credit, where its sitelinks ranked a POI of it ([PATCHING.md](PATCHING.md#attribution)) |
-| `water/` | The water layer, a set of its own in the admin files' formats (`admin_polygons.bin`, `admin_rings.bin`, `arc_index.bin`, `arc_vertices.bin`, `admin_cells.bin`, `admin_entries.bin`, `strings_core.bin`, `strings_layout.json`) and `water_meta.json`, each type code's class, type and Nominatim rank: a record per polygon carrying its OSM object's name, type code and area, and nothing pointing into the other files (`server/src/water.rs`, `builder/src/water_layer.h`) |
+| `water/` | The water layer, a set of its own in the admin files' formats (`admin_polygons.bin`, `admin_rings.bin`, `arc_index.bin`, `arc_vertices.bin`, `admin_cells.bin`, `admin_entries.bin`, `strings_core.bin`, `strings_layout.json`), `water_cut_arcs.bin`, a bit per arc slot marking the cuts between two pieces of one water, and `water_meta.json`, each type code's class, type and Nominatim rank: a record per polygon carrying its OSM object's name, type code, area and flags, and nothing pointing into the other files (`server/src/water.rs`, `builder/src/water_layer.h`) |
 
 ## Building from Source
 
@@ -619,7 +675,8 @@ The indexes are a derivative database of [OpenStreetMap](https://www.openstreetm
 (© OpenStreetMap contributors, ODbL 1.0), with GB postcode centroids from
 [GeoNames](https://www.geonames.org/) (CC BY 4.0), derived from Ordnance
 Survey's Code-Point Open (OGL v3.0; contains OS, Royal Mail and National
-Statistics data), US address ranges and ZIP codes from the US Census
+Statistics data), US ZIPs' postal place names from GeoNames' postal code
+files (CC BY 4.0), US address ranges and ZIP codes from the US Census
 Bureau's TIGER/Line files (public domain), and POI importance from
 [Wikidata](https://www.wikidata.org/)'s sitelink counts (CC0). The
 `attribution` list of each build's configurations.json gives every source's

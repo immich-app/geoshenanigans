@@ -20,11 +20,13 @@
 //   landuse=basin                                         landuse/basin
 //   natural=bay | strait | wetland | glacier              natural/<value>
 //
-// The major tier (water_major_keeps) holds areas of 100 km² or more and
-// whole rivers: a river's areas together, by its waterway relation, its
-// wikidata item or its name along connected areas, when they sum to 100 km²
-// or more, or 5 km² or more with a wikidata item. An area or river in the
-// previous build's major tier stays while it holds kMajorKeepPercent of its
+// The major tier (water_major_keeps) holds areas of 100 km² or more, coastal
+// water (is_coastal: bays, harbours, fjords and the like) of 10 km² or more,
+// so that a harbour answers there by its name and not its sea's, and whole
+// rivers: a river's areas together, by its waterway relation, its wikidata
+// item or its name along connected areas, when they sum to 100 km² or more,
+// or 5 km² or more with a wikidata item. An area or river in the previous
+// build's major tier stays while it holds kMajorKeepPercent of its
 // threshold, so one at the threshold doesn't come and go.
 #pragma once
 
@@ -92,15 +94,37 @@ inline bool is_naming_waterway(const char* waterway) { return is(waterway, "rive
 // --- The major tier ---
 
 inline constexpr double kMajorAreaKm2 = 100.0;
+inline constexpr double kMajorCoastalKm2 = 10.0;
 inline constexpr double kMajorWikidataRiverKm2 = 5.0;
 inline constexpr double kMajorKeepPercent = 90.0;
 
+// Whether type code `code` is coastal water: a natural=bay or strait, or a
+// water=bay, cove, fjord, sound, strait, sea, lagoon or harbour.
+inline bool is_coastal(uint16_t code) {
+    switch (code) {
+        case 8:   // water/lagoon
+        case 10:  // water/harbour
+        case 15:  // water/cove
+        case 16:  // water/bay
+        case 17:  // water/fjord
+        case 18:  // water/sound
+        case 19:  // water/strait
+        case 20:  // water/sea
+        case code::kNaturalBay:
+        case code::kNaturalStrait:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Whether an area (or a river's areas together) of `km2` is in the major
 // tier: `river` a river's, `wikidata` with a wikidata item, `was_major` in
-// the previous build's major tier.
-inline bool water_major_keeps(double km2, bool river, bool wikidata, bool was_major) {
+// the previous build's major tier, `coastal` of coastal water.
+inline bool water_major_keeps(double km2, bool river, bool wikidata, bool was_major, bool coastal = false) {
     const double scale = was_major ? kMajorKeepPercent / 100.0 : 1.0;
     if (km2 >= kMajorAreaKm2 * scale) return true;
+    if (coastal && km2 >= kMajorCoastalKm2 * scale) return true;
     return river && wikidata && km2 >= kMajorWikidataRiverKm2 * scale;
 }
 
