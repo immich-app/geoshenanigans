@@ -1060,14 +1060,19 @@ class TemplateAttributionTest(unittest.TestCase):
             for pattern in e["applies_to"]:
                 self.assertTrue(fnmatch.filter(self.components, pattern), (e["id"], pattern))
         self.assertEqual(self.applies(self.entries[0]), sorted(self.components))
-        centroids = sorted(c for c, comp in self.components.items()
-                           if any(f.endswith("/postcode_centroids.bin") for f in comp.get("files", []) + comp.get("optional_files", [])))
+        def holding(name):
+            return sorted(c for c, comp in self.components.items()
+                          if any(f.endswith("/" + name) for f in comp.get("files", []) + comp.get("optional_files", [])))
+        centroids = holding("postcode_centroids.bin")
         self.assertEqual(centroids, ["mode.admin", "mode.full", "mode.no-addresses"])
-        for e in self.entries[1:3]:
-            self.assertEqual(self.applies(e), centroids, e["id"])
+        # Code-Point Open's GB centroids are in the dirs of postcode centroids alone; GeoNames's
+        # US place names, which name the ZIPs of the postal cities, in the admin-minimal dirs too.
+        self.assertEqual(self.applies(self.entries[2]), centroids)
+        postal = holding("postal_cities.bin")
+        self.assertEqual(postal, ["dir.admin-minimal", "dir.admin-minimal-poi", "mode.admin", "mode.full", "mode.no-addresses"])
+        self.assertEqual(self.applies(self.entries[1]), sorted(set(centroids) | set(postal)))
         # TIGER's ZIPs vote in the postcode grid, which the admin-minimal dirs hold too.
-        grids = sorted(c for c, comp in self.components.items()
-                       if any(f.endswith("/postcode_grid.bin") for f in comp.get("files", []) + comp.get("optional_files", [])))
+        grids = holding("postcode_grid.bin")
         self.assertEqual(grids, ["dir.admin-minimal", "dir.admin-minimal-poi", "mode.admin", "mode.full", "mode.no-addresses"])
         self.assertEqual(self.applies(self.entries[3]), grids)
         # Wikidata's sitelinks rank the POIs of the tiers that hold any.

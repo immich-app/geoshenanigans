@@ -312,7 +312,7 @@ def flat(paths):
 class TemplateTest(unittest.TestCase):
     MINIMAL_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin",
                      "arc_index.bin", "arc_vertices.bin", "attribution.json", "place_cells.bin", "place_hidden.bin",
-                     "place_nodes.bin", "postcode_grid.bin", "strings_core.bin", "strings_layout.json"]
+                     "place_nodes.bin", "postal_cities.bin", "postcode_grid.bin", "strings_core.bin", "strings_layout.json"]
 
     def test_admin_minimal_takes_its_poi_dir_beside_a_poi_tier(self):
         # admin-minimal/ holds strings of its own, which a POI tier's names and parent polygons don't
@@ -348,7 +348,9 @@ class TemplateTest(unittest.TestCase):
             # Every dir holds the same strings_layout.json; any other JSON name is one file's.
             sidecars = [n for n in names if n.endswith(".json") and n != "strings_layout.json"]
             self.assertEqual(len(sidecars), len(set(sidecars)), sel)
-            self.assertEqual([n for n in names if n == "admin_vertices.bin" or n.startswith("postal_")], [], sel)
+            # The keyhole geometry files arcs replaced.
+            gone = {"admin_vertices.bin", "postal_polygons.bin", "postal_vertices.bin"}
+            self.assertEqual([n for n in names if n in gone], [], sel)
 
     def test_presets_take_their_boundaries_from_the_tier_they_name(self):
         # smallest: admin-minimal's own; recommended and with-addresses: simplified; max: exact.

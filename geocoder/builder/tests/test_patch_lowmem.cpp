@@ -1275,11 +1275,20 @@ std::vector<postcode_grid::LogicalRow> some_grid(uint32_t first) {
     return rows;
 }
 
+// The postal cities of 30 US ZIPs from 19000, every other one named `even`,
+// the rest `odd`: of any two names of five letters each, as many bytes.
+std::vector<postal_cities::LogicalRow> some_postal(const std::string& even, const std::string& odd) {
+    std::vector<postal_cities::LogicalRow> rows;
+    for (uint32_t i = 0; i < 30; i++)
+        rows.push_back(postal_cities::row_of(uint16_t('U' << 8 | 'S'), std::to_string(19000 + i), i % 2 ? odd : even));
+    return rows;
+}
+
 // A dir of every encoded family: 40 street ways of two nodes in a geo cell,
 // with a parent each; 30 interpolations of three nodes; 60 address points,
 // two in three with a footprint, with a postcode each and three in four with
 // a city; 50 POIs, two in three polygons; 20 place nodes; 30 postcode
-// centroids; a postcode grid of 40 runs.
+// centroids; a postcode grid of 40 runs; the postal cities of 30 ZIPs.
 BuildDir every_family(std::mt19937& rng) {
     BuildDir d, meta;
     std::vector<uint32_t> names;
@@ -1310,6 +1319,7 @@ BuildDir every_family(std::mt19937& rng) {
     put_places(d, some_places(20));
     put_centroids(d, some_centroids(30));
     put_grid(d, some_grid(19000));
+    put_postal(d, some_postal("Media", "Wayne"));
     return d;
 }
 
@@ -1459,6 +1469,47 @@ TEST(patch_holds_the_files_of_a_family_it_copies_to_their_hashes) {
     REQUIRE(write_file(grid, other[postcode_grid::FILE_NAME]));
     CHECK(not_refused(c, ALL_MODES, c.patch(), "other-grid", "Old postcode_grid.bin is not the one the patch was made from").empty());
     REQUIRE(write_file(grid, written));
+    // So do the postal cities their names: a table of other names, as many
+    // bytes and rows, is refused.
+    const std::string postal = c.dir("old") + "/" + postal_cities::FILE_NAME;
+    const std::vector<char> table = read_file(postal);
+    put_postal(other, some_postal("Paoli", "Exton"));
+    REQUIRE(other[postal_cities::FILE_NAME].size() == table.size() && other[postal_cities::FILE_NAME] != table);
+    REQUIRE(write_file(postal, other[postal_cities::FILE_NAME]));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "other-postal", "Old postal_cities.bin is not the one the patch was made from").empty());
+    REQUIRE(write_file(postal, table));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// A day that renames a ZIP replays the postal cities over the old file's
+// rows: a table of other names, as many bytes and rows, decodes as well as
+// the one the patch was made from, so the patcher holds it to the old file's
+// hash first, and refuses it in every mode.
+TEST(patch_holds_the_old_postal_cities_it_replays_to_their_hash) {
+    ScratchDir dir("lowmem-postal-replay-hash");
+    std::mt19937 rng(20261125);
+    const BuildDir base = every_family(rng);
+    BuildDir day = base;
+    std::vector<postal_cities::LogicalRow> rows = some_postal("Media", "Wayne");
+    rows[6] = postal_cities::row_of(rows[6].country_code, postal_cities::code_of(rows[6]), "Wayne");
+    put_postal(day, rows);
+    const LowMemCase c{dir.path(), "postal-day"};
+    REQUIRE(prepare(c, base, day).empty());
+    // It replays the table: decodes the old rows and encodes the day's.
+    const LogCheck replayed = [](const std::string& log) {
+        for (const char* line : {"decode postal:", "encode postal:"})
+            if (log.find(line) == std::string::npos) return std::string("no ") + line + " line";
+        return std::string();
+    };
+    CHECK(apply_modes(c, ALL_MODES, replayed).bad.empty());
+    const std::string postal = c.dir("old") + "/" + postal_cities::FILE_NAME;
+    const std::vector<char> written = read_file(postal);
+    BuildDir other;
+    put_postal(other, some_postal("Paoli", "Exton"));
+    REQUIRE(other[postal_cities::FILE_NAME].size() == written.size() && other[postal_cities::FILE_NAME] != written);
+    REQUIRE(write_file(postal, other[postal_cities::FILE_NAME]));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "other-postal", "Old postal_cities.bin is not the one the patch was made from").empty());
+    REQUIRE(write_file(postal, written));
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 

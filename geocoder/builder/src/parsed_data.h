@@ -33,6 +33,7 @@
 #include "id_allocator.h"
 #include "place_claims.h"
 #include "parallel.h"
+#include "postal_cities_build.h"
 #include "postcode_grid_build.h"
 #include "ranked_bits.h"
 #include "water_layer_data.h"
@@ -499,6 +500,12 @@ struct ParsedData {
     // where a place node or a boundary has its string, a core one, and makes
     // it NO_DATA where not.
     std::vector<uint32_t> addr_city_ids;
+    // Per addr_point its addr:city again (NO_DATA for none), an offset in
+    // postal_vote_pool: the postal cities' votes (postal_cities_build.h),
+    // which no file holds. Both live from the parse to collect_postcode_grid,
+    // which counts the votes and frees them; the string tiers never see them.
+    std::vector<uint32_t> addr_vote_city_ids;
+    StringPool postal_vote_pool;
 
     // External postcode centroids (TIGER segments, GeoNames rows) keyed by
     // postcode_key(country, postcode string id), like Nominatim's
@@ -537,6 +544,24 @@ struct ParsedData {
     std::vector<postcode_grid::LogicalRow> postcode_grid_rows;
     std::vector<uint8_t> postcode_grid_file;
     uint8_t postcode_grid_sources = 0;
+
+    // The postal cities (postal_cities.h): the build's inputs to them
+    // (--postal-places, GeoNames' entries; --prev-postal-cities, yesterday's
+    // names; --dump-postal-votes, where the votes go, "" for nowhere); the
+    // planet's rows, found once on the full data with the grid
+    // (collect_postcode_grid), of the ZIPs an answer can give, of which a
+    // continent keeps the rows of the postcodes its data answers with
+    // (postal_cities::region_rows); and the region's postal_cities.bin,
+    // which every mode dir holds alike: empty for a region of no row. The
+    // sources of the planet's names (attribution.h): GeoNames's where the
+    // build had its entries or yesterday's names, which a region's table
+    // holds with the rows it takes.
+    postal_cities::Places postal_places;
+    postal_cities::Names prev_postal_names;
+    std::string postal_votes_dump;
+    std::vector<postal_cities::LogicalRow> postal_city_rows;
+    std::vector<uint8_t> postal_cities_file;
+    uint8_t postal_cities_sources = 0;
 
     // The houses whose tag makes a centroid of another postcode than the
     // one they keep (normalise_addr_postcodes), those of a country of no
@@ -642,31 +667,35 @@ inline size_t grow_by(std::vector<T>& v, size_t n) {
 // Grows addr_points and the arrays parallel to it by n points, which
 // put_addr_point then fills (from many threads at once); returns the first.
 inline size_t grow_addr_points(ParsedData& data, size_t n) {
-    // put_addr_point writes one index into all five arrays.
+    // put_addr_point writes one index into all six arrays.
     const size_t size = data.addr_points.size();
     if (data.addr_osm_ids.size() != size || data.addr_postcode_ids.size() != size ||
-        data.addr_city_ids.size() != size || data.addr_cells.size() != size)
+        data.addr_city_ids.size() != size || data.addr_cells.size() != size || data.addr_vote_city_ids.size() != size)
         throw std::logic_error("addr_points and its parallel arrays differ in length");
     grow_by(data.addr_osm_ids, n);
     grow_by(data.addr_postcode_ids, n);
     grow_by(data.addr_city_ids, n);
     grow_by(data.addr_cells, n);
+    grow_by(data.addr_vote_city_ids, n);
     return grow_by(data.addr_points, n);
 }
 
 // Stores address point i, its strings already interned (NO_DATA for a
 // missing street, postcode or city); `cell` is point_to_cell() of its
-// location. A building's polygon already sits at addr_vertices[vertex_offset].
+// location; vote_city_id the city again, an offset in data.postal_vote_pool.
+// A building's polygon already sits at addr_vertices[vertex_offset].
 inline void put_addr_point(ParsedData& data, size_t i, float lat, float lng,
                            uint32_t housenumber_id, uint32_t street_id, uint32_t postcode_id,
                            uint32_t city_id, uint64_t cell, uint64_t osm_id_packed,
-                           uint32_t vertex_offset = NO_DATA, uint32_t vertex_count = 0) {
+                           uint32_t vertex_offset = NO_DATA, uint32_t vertex_count = 0,
+                           uint32_t vote_city_id = NO_DATA) {
     // parent_way_id is filled in during the nearest-street sweep.
     data.addr_points[i] = {lat, lng, housenumber_id, street_id, NO_DATA, vertex_offset, vertex_count};
     data.addr_osm_ids[i] = osm_id_packed;
     data.addr_postcode_ids[i] = postcode_id;
     data.addr_city_ids[i] = city_id;
     data.addr_cells[i] = cell;
+    data.addr_vote_city_ids[i] = vote_city_id;
 }
 
 // Offset -> string index over a pool of NUL-terminated strings: a bit per

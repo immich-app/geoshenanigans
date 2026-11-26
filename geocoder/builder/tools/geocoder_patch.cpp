@@ -1251,9 +1251,11 @@ static int run(int argc, char* argv[]) {
         require_merge_records(fname, old_size, new_size, actual_stride, file_records_max);
         // The old postcode grid is held to its hash before its runs are replayed: one of other
         // postcodes, as many runs, decodes as well as the one the patch was made from, and its
-        // MATCH runs would go to the new grid.
+        // MATCH runs would go to the new grid. So are the postal cities, of their names.
         if (file_id == (uint32_t)PatchFileId::POSTCODE_GRID && old_size > 0)
             require_old_file_hash(cur_dir, PatchFileId::POSTCODE_GRID, old_hash_of(PatchFileId::POSTCODE_GRID, "the postcode grid's runs"));
+        if (file_id == (uint32_t)PatchFileId::POSTAL_CITIES && old_size > 0)
+            require_old_file_hash(cur_dir, PatchFileId::POSTAL_CITIES, old_hash_of(PatchFileId::POSTAL_CITIES, "the postal cities' rows"));
 
         // Records with string offset fields are rewritten one at a time.
         const std::vector<size_t> string_fields = string_field_offsets(static_cast<PatchFileId>(file_id));

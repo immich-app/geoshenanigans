@@ -1,4 +1,4 @@
-// Unit tests for zlib_blob.h (whole zlib blobs through libdeflate).
+// Unit tests for zlib_blob.h (whole zlib blobs and gzip files through libdeflate).
 #include "zlib_blob.h"
 
 #include <stdexcept>
@@ -38,7 +38,44 @@ std::string zlib_uncompress(const std::string& z, size_t raw_size) {
     return raw;
 }
 
+// raw as one gzip member (RFC 1952), as gzip and Python's gzip write it.
+std::string gzip_compress(const std::string& raw) {
+    z_stream z{};
+    if (deflateInit2(&z, 6, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) throw std::runtime_error("deflateInit2 failed");
+    std::string out(deflateBound(&z, static_cast<uLong>(raw.size())) + 32, '\0');
+    z.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(raw.data()));
+    z.avail_in = static_cast<uInt>(raw.size());
+    z.next_out = reinterpret_cast<Bytef*>(out.data());
+    z.avail_out = static_cast<uInt>(out.size());
+    const int rc = deflate(&z, Z_FINISH);
+    out.resize(z.total_out);
+    deflateEnd(&z);
+    if (rc != Z_STREAM_END) throw std::runtime_error("deflate failed");
+    return out;
+}
+
 }  // namespace
+
+TEST(gzip_inflate_gives_a_gzip_files_bytes_of_every_member) {
+    for (size_t n : {size_t(0), size_t(1), size_t(1000), size_t(3) << 20}) {
+        const std::string raw = sample(n);
+        CHECK(gzip_inflate(gzip_compress(raw)) == raw);
+    }
+    // Members back to back, as `cat a.gz b.gz` makes: their bytes in turn.
+    CHECK(gzip_inflate(gzip_compress("US\t19026\tDrexel Hill\tPA\n") + gzip_compress(sample(70000))) ==
+          "US\t19026\tDrexel Hill\tPA\n" + sample(70000));
+}
+
+TEST(gzip_inflate_rejects_a_file_that_is_no_whole_gzip) {
+    const std::string gz = gzip_compress(sample(5000));
+    CHECK_EQ(refusal_of([&] { gzip_inflate(gz.substr(0, gz.size() - 5)); }), std::string("gzip data is corrupt or cut short"));
+    std::string corrupt = gz;
+    corrupt[corrupt.size() / 2] ^= 0x5a;
+    CHECK_EQ(refusal_of([&] { gzip_inflate(corrupt); }), std::string("gzip data is corrupt or cut short"));
+    CHECK_EQ(refusal_of([&] { gzip_inflate("US\t19026\tDrexel Hill\tPA\n"); }), std::string("gzip data is corrupt or cut short"));
+    CHECK_EQ(refusal_of([&] { gzip_inflate(gz + "x"); }), std::string("gzip data is corrupt or cut short"));
+    CHECK_EQ(refusal_of([&] { gzip_inflate(std::string_view()); }), std::string("gzip data is corrupt or cut short"));
+}
 
 TEST(zlib_inflate_gives_the_bytes_zlib_compressed) {
     for (size_t n : {size_t(1), size_t(1000), size_t(3) << 20}) {
