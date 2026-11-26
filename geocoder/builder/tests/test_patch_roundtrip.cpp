@@ -23,6 +23,7 @@
 #include "patch_decompress.h"
 #include "patch_format.h"
 #include "place_test_files.h"
+#include "postcode_grid.h"
 #include "postcode_test_files.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
@@ -1307,6 +1308,108 @@ TEST(patch_round_trip_merges_the_admin_own_names_as_records_of_a_string_field) {
     const RoundTrip gone = round_trip(old_d, emptied);
     CHECK(gone.mismatches.empty());
     CHECK(logged(gone, std::string(kAdminOwnNamesFile) + ": full replace 0 bytes"));
+}
+
+// --decode-logical writes a dir's postcode grid as its 24-byte rows, and none
+// for a dir without one; a grid the encoder would not write is refused.
+TEST(decode_logical_writes_the_postcode_grids_rows) {
+    ScratchDir dir("decode-logical-grid");
+    const std::string log = dir.path() + "/tools.log";
+    const uint16_t US = uint16_t('U' << 8 | 'S');
+    const std::vector<postcode_grid::LogicalRow> rows = {
+        postcode_grid::row_of(postcode_grid::cell_at(1000, 16), US, "19026"), postcode_grid::row_of(postcode_grid::cell_at(1150, 16), 0, ""),
+        postcode_grid::row_of(postcode_grid::cell_at(9000, 16), US, "19073")};
+    BuildDir d = with_pool(OLD_POOL);
+    put_grid(d, rows);
+    const std::string in = dir.path() + "/in", out = in + ".logical";
+    REQUIRE(write_dir(in, d));
+    REQUIRE(run({GEOCODER_DIFF_BIN, "--decode-logical", in, out}, log));
+    const char* p = reinterpret_cast<const char*>(rows.data());
+    CHECK(gctest::read_dir(out) == BuildDir({{postcode_grid::FILE_NAME, std::vector<char>(p, p + rows.size() * 24)}}));
+    const std::vector<char> text = read_file(log);
+    CHECK(std::string(text.begin(), text.end()).find("  grid: 72 logical bytes") != std::string::npos);
+
+    const std::string bare = dir.path() + "/bare";
+    REQUIRE(write_dir(bare, with_pool(OLD_POOL)));
+    REQUIRE(run({GEOCODER_DIFF_BIN, "--decode-logical", bare, bare + ".logical"}, log));
+    CHECK(gctest::read_dir(bare + ".logical").empty());
+
+    BuildDir bad = d;
+    bad[postcode_grid::FILE_NAME][0] ^= 4;  // its first block's count of entries
+    const std::string broken = dir.path() + "/broken";
+    REQUIRE(write_dir(broken, bad));
+    CHECK(!run({GEOCODER_DIFF_BIN, "--decode-logical", broken, broken + ".logical"}, log));
+    const std::vector<char> refused = read_file(log);
+    CHECK(std::string(refused.begin(), refused.end()).find("Malformed postcode grid") != std::string::npos);
+}
+
+// A grid's runs over three blocks on both days: a run whose postcode
+// changes, one split in two by a cell of another, one gone into the runs
+// round it. The content merge sends each changed row as a delete and an
+// insert, and the rest MATCH; a dir that gets its grid or loses it merges as
+// any other day; a day that changes no run sends the file unchanged, and the
+// patcher copies it from the old dir as it sits.
+TEST(patch_round_trip_merges_the_postcode_grid_as_logical_rows) {
+    const uint16_t US = uint16_t('U' << 8 | 'S');
+    auto row = [&](uint64_t pos, const std::string& code) {
+        return postcode_grid::row_of(postcode_grid::cell_at(pos, 16), code.empty() ? 0 : US, code);
+    };
+    std::vector<postcode_grid::LogicalRow> old_rows, new_rows;
+    for (uint64_t i = 0; i < 400; i++) old_rows.push_back(row(1000 + 20 * i, i % 5 == 4 ? "" : std::to_string(19000 + i % 4)));
+    for (uint64_t i = 0; i < 400; i++) {
+        if (i == 300) continue;  // gone: its cells are the run before it's
+        new_rows.push_back(old_rows[i]);
+        if (i == 10) new_rows.back() = row(1000 + 20 * i, "19099");  // another postcode
+        if (i == 200) {
+            new_rows.push_back(row(1000 + 20 * i + 7, "19098"));  // a cell of another postcode
+            new_rows.push_back(row(1000 + 20 * i + 8, std::string(postcode_grid::code_of(old_rows[i]))));
+        }
+    }
+    // Run 300's neighbours, 299 and 301, differ from each other.
+    REQUIRE(!postcode_grid::same_postcode(old_rows[299], old_rows[301]));
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(OLD_POOL);
+    put_grid(old_d, old_rows);
+    put_grid(new_d, new_rows);
+    const RoundTrip changed = round_trip(old_d, new_d);
+    CHECK(changed.mismatches.empty());
+    CHECK(logged(changed, "postcode_grid.bin: seq="));
+    CHECK(logged(changed, "recs m/i/d/r=398/3/2/0"));
+
+    const RoundTrip same = round_trip(old_d, old_d);
+    CHECK(same.mismatches.empty());
+    CHECK(logged(same, "postcode_grid.bin: unchanged (copied "));
+    CHECK(!logged(same, "encode grid:"));
+
+    // A dir's first grid, and its last.
+    const BuildDir without = with_pool(OLD_POOL);
+    CHECK(round_trip(without, new_d).mismatches.empty());
+    CHECK(round_trip(old_d, without).mismatches.empty());
+    CHECK(round_trip(without, without).mismatches.empty());
+}
+
+// A day whose new runs lie 12,000 in a row ahead of runs both days hold: the
+// merge walks both days' runs by cell, so each run both hold at the same cell
+// MATCHes however many new runs come before it, and only the new runs go in
+// the patch. The 500 kept runs are sent once, as a MATCH.
+TEST(patch_round_trip_matches_the_grid_runs_after_any_number_of_new_ones) {
+    const uint16_t US = uint16_t('U' << 8 | 'S');
+    auto row = [&](uint64_t pos, uint32_t code) {
+        return postcode_grid::row_of(postcode_grid::cell_at(pos, 16), US, std::to_string(code));
+    };
+    std::vector<postcode_grid::LogicalRow> old_rows, new_rows;
+    for (uint64_t i = 0; i < 12000; i++) new_rows.push_back(row(1000 + 3 * i, 19000 + i % 2));
+    for (uint64_t i = 0; i < 500; i++) old_rows.push_back(row(100000 + 5 * i, 19002 + i % 2));
+    new_rows.insert(new_rows.end(), old_rows.begin(), old_rows.end());
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(OLD_POOL);
+    put_grid(old_d, old_rows);
+    put_grid(new_d, new_rows);
+    const RoundTrip r = round_trip(old_d, new_d);
+    CHECK(r.mismatches.empty());
+    CHECK(logged(r, "recs m/i/d/r=500/12000/0/0"));
+    if (!logged(r, "recs m/i/d/r=500/12000/0/0")) {
+        const size_t at = r.log.find("postcode_grid.bin: seq=");
+        std::printf("    %s\n", at == std::string::npos ? "no grid merge line" : r.log.substr(at, r.log.find('\n', at) - at).c_str());
+    }
 }
 
 // The moved postcode's string fixups take 2 bytes each. Under a limit of 2

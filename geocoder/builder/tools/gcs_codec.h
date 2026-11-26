@@ -1,5 +1,6 @@
 // In-process incremental codecs for the low-memory client update. The formats the builder writes
-// (src/way_files.h, addr_files.h, poi_files.h, place_files.h, postcode_files.h, side_blocks.h) byte
+// (src/way_files.h, addr_files.h, poi_files.h, place_files.h, postcode_files.h, postcode_grid.h,
+// side_blocks.h) byte
 // for byte,
 // structured so the patcher drives them:
 //   Decoder: produces today's-format bytes on demand, one unit (way, row, record, block piece) per
@@ -19,6 +20,7 @@
 #include "place_files.h"
 #include "poi_files.h"
 #include "postcode_files.h"
+#include "postcode_grid.h"
 #include "sequential_file_reader.h"
 #include "side_blocks.h"
 #include "way_files.h"
@@ -1367,5 +1369,163 @@ struct Enc : Encoder {
     }
 };
 }  // namespace postcodes
+
+// ------------------------------------------------------------------ postcode grid (postcode_grid.h)
+namespace grid {
+namespace pg = postcode_grid;
+// The codec's buffers: the file streams front to back a block at a time (a few KiB at most).
+static const size_t SMALL_BUF = size_t(4) << 10, BLOCKS_BUF = size_t(16) << 10;
+
+inline bool has_file(const std::string& dir) {
+    struct stat st;
+    return stat((dir + "/" + pg::FILE_NAME).c_str(), &st) == 0;
+}
+
+// postcode_grid.bin's footer, of a file of `size` bytes.
+inline pg::Footer footer_of(const std::string& path, uint64_t size) {
+    uint8_t f[pg::FOOTER_BYTES] = {};
+    if (size >= pg::FOOTER_BYTES) {
+        Reader footer(path, pg::FOOTER_BYTES, size - pg::FOOTER_BYTES);
+        memcpy(f, footer.take(pg::FOOTER_BYTES), pg::FOOTER_BYTES);
+    }
+    return pg::read_footer(f, size);
+}
+
+// A dir's grid's decoded size, LOGICAL_STRIDE a row, from its footer alone: 0 without the file.
+inline uint64_t decoded_size(const std::string& dir) {
+    if (!has_file(dir)) return 0;
+    const std::string path = dir + "/" + pg::FILE_NAME;
+    return pg::logical_size(footer_of(path, file_size(path)));
+}
+
+// Port 0 = postcode_grid.bin's logical stream (pg::LogicalRow). A step: a block of rows, checked as
+// postcode_grid::decode checks it (the strict decoder encodes each block again). A dir without the
+// file decodes to none. With the last block it checks how the file ends: its level is its rows'.
+struct Dec : Decoder {
+    std::unique_ptr<Reader> N, T;  // the blocks' bytes, and the table
+    std::unique_ptr<pg::Decoder> d;
+    pg::Footer f;
+    size_t b = 0;
+    uint64_t at = 0;  // the bytes of the blocks decoded
+    uint8_t entry[pg::TABLE_ENTRY_BYTES] = {}, next[pg::TABLE_ENTRY_BYTES] = {};
+    explicit Dec(const std::string& src) : Decoder("grid", {pg::FILE_NAME}) {
+        if (!has_file(src)) return;
+        const std::string path = src + "/" + pg::FILE_NAME;
+        const uint64_t size = file_size(path);
+        f = footer_of(path, size);
+        d.reset(new pg::Decoder(f));
+        N.reset(new Reader(path, BLOCKS_BUF, 0, f.table_at));
+        T.reset(new Reader(path, SMALL_BUF, f.table_at, size - pg::FOOTER_BYTES));
+        if (f.blocks) memcpy(entry, T->take(pg::TABLE_ENTRY_BYTES), pg::TABLE_ENTRY_BYTES);
+        else end();
+    }
+    uint64_t decoded_size(int) const override { return pg::logical_size(f); }
+    void end() {
+        d->finish();
+        d.reset();
+        N.reset();
+        T.reset();
+    }
+    bool step() override {
+        if (!d) return false;
+        // The block runs to the next one's offset, the last to the table.
+        uint64_t stop = f.table_at;
+        if (b + 1 < f.blocks) {
+            memcpy(next, T->take(pg::TABLE_ENTRY_BYTES), pg::TABLE_ENTRY_BYTES);
+            stop = pg::get32(next + 8);
+        }
+        if (pg::get32(entry + 8) != at) pg::malformed("block " + std::to_string(b) + " is not where the blocks before it end");
+        if (stop < at || stop > f.table_at) pg::malformed("block " + std::to_string(b) + " ends past the blocks or before it starts");
+        // Before the reader's buffer grows to the block, which a malformed table can make any size.
+        if (stop - at > pg::max_block_bytes(f.rows_of(b)))
+            pg::malformed("block " + std::to_string(b) + " has more bytes than its rows can take");
+        const size_t n = size_t(stop - at);
+        static const uint8_t none = 0;
+        const uint8_t* p = n ? N->take(n) : &none;
+        uint8_t* o = emit_reserve(0, f.rows_of(b) * pg::LOGICAL_STRIDE);
+        d->block(entry, p, n, [&](const pg::LogicalRow& r) {
+            memcpy(o, &r, pg::LOGICAL_STRIDE);
+            o += pg::LOGICAL_STRIDE;
+        });
+        at = stop;
+        memcpy(entry, next, pg::TABLE_ENTRY_BYTES);
+        if (++b == f.blocks) end();
+        return true;
+    }
+};
+
+// Port 0 = the logical stream in; the file out. The blocks go to postcode_grid.bin as they are
+// encoded, and their table entries to a scratch file beside it, which finish appends with the
+// footer: nothing grows with the grid but the file.
+struct Enc : Encoder {
+    using Sink = std::function<void(const uint8_t*, size_t)>;
+    std::unique_ptr<Writer> NW, TW;
+    std::string tpath;
+    pg::Encoder<Sink> enc;
+    explicit Enc(const std::string& od)
+        : Encoder("grid", od, 1),
+          NW(new Writer(od + "/" + pg::FILE_NAME, BLOCKS_BUF)),
+          TW(new Writer(od + "/.postcode_grid.table", SMALL_BUF, true)),
+          tpath(od + "/.postcode_grid.table"),
+          enc([this](const uint8_t* p, size_t n) { NW->put(p, n); }) {}
+    void spill() {
+        if (enc.table().empty()) return;
+        for (const auto& e : enc.table()) TW->put(e.data(), e.size());
+        enc.clear_table();
+    }
+    void add(const uint8_t* row) {
+        pg::LogicalRow r;
+        memcpy(&r, row, pg::LOGICAL_STRIDE);
+        enc.add(r);
+        spill();
+    }
+    // Every byte straight from the writer (nothing queued): a row a write cuts waits in carry.
+    uint8_t carry[pg::LOGICAL_STRIDE];
+    size_t carried = 0;
+    size_t consume(int, const uint8_t* p, size_t n) override {
+        size_t used = 0;
+        if (carried) {
+            used = std::min(pg::LOGICAL_STRIDE - carried, n);
+            memcpy(carry + carried, p, used);
+            carried += used;
+            if (carried < pg::LOGICAL_STRIDE) return n;
+            add(carry);
+            carried = 0;
+        }
+        for (; n - used >= pg::LOGICAL_STRIDE; used += pg::LOGICAL_STRIDE) add(p + used);
+        memcpy(carry, p + used, n - used);
+        carried = n - used;
+        return n;
+    }
+    void pump() override {
+        ByteQueue& q = in[0];
+        while (q.size() >= pg::LOGICAL_STRIDE) {
+            add(q.data());
+            q.pop(pg::LOGICAL_STRIDE);
+        }
+    }
+    void finish() override {
+        require_empty();
+        if (carried) die("grid: the stream ends %zu bytes into a row", carried);
+        enc.finish();
+        spill();
+        TW->flush();
+        std::vector<uint8_t> buf(BLOCKS_BUF);
+        for (uint64_t off = 0, n = TW->tell(); off < n;) {
+            const size_t k = size_t(std::min<uint64_t>(buf.size(), n - off));
+            pread_all(TW->fd, buf.data(), k, off, tpath);
+            NW->put(buf.data(), k);
+            off += k;
+        }
+        const auto footer = enc.footer();
+        NW->put(footer.data(), footer.size());
+        TW->finish();
+        if (unlink(tpath.c_str())) die("unlink %s: %s", tpath.c_str(), strerror(errno));
+        NW->finish();
+        TW.reset();
+        NW.reset();
+    }
+};
+}  // namespace grid
 
 }  // namespace gcs

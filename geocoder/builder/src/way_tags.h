@@ -9,6 +9,7 @@
 
 #include "admin_rank_config.h"
 #include "geometry.h"
+#include "poi_classify.h"
 
 struct WayTags {
     const char* interpolation = nullptr;
@@ -39,12 +40,19 @@ struct WayTags {
     const char* power = nullptr;
     const char* place = nullptr;
     const char* waterway = nullptr;
+    const char* water = nullptr;
     const char* office = nullptr;
     const char* wikipedia = nullptr;
     const char* wikidata = nullptr;
     const char* ele = nullptr;
     const char* shop = nullptr;
     const char* landuse = nullptr;
+    // area=*: a closed way of a highway tag is a polygon in Nominatim where
+    // it is yes alone (init.lua process_way), a line else.
+    const char* area = nullptr;
+    // Classifies a POI way (poi_classify.h), and makes one on its own where
+    // it is fire_water_pond, a category of its own, as a node of it is.
+    const char* emergency = nullptr;
 
     // Prefer name:en where present (English-only mode)
     const char* best_name() const { return (name_en && name_en[0]) ? name_en : name; }
@@ -54,7 +62,18 @@ struct WayTags {
             natural || aeroway || railway || man_made || building ||
             craft || power || place || waterway || office ||
             (boundary && (std::strcmp(boundary, "national_park") == 0 ||
-                          std::strcmp(boundary, "protected_area") == 0));
+                          std::strcmp(boundary, "protected_area") == 0)) ||
+            (emergency && std::strcmp(emergency, "fire_water_pond") == 0) ||
+            // A reservoir or basin beside a POI main tag is a POI of that tag
+            // (poi_classify.h), whose key (emergency, shop) may make no POI
+            // way alone.
+            (landuse && (std::strcmp(landuse, "reservoir") == 0 || std::strcmp(landuse, "basin") == 0) &&
+             has_poi_main_tag(amenity, leisure, emergency, tourism, historic, shop, craft, office, aeroway, railway,
+                              man_made)) ||
+            // So is one that is a street (poi_water_street) of area=yes, which
+            // alone makes a closed way of a highway tag a polygon (init.lua
+            // process_way): its own name answers inside it.
+            (area && std::strcmp(area, "yes") == 0 && poi_water_street(natural, landuse, highway, footway, place));
     }
 };
 
@@ -76,6 +95,7 @@ inline WayTags parse_way_tags(const uint32_t* tag_keys, const uint32_t* tag_vals
                 else if (k == "addr:postcode") t.postcode = v;
                 else if (k == "addr:city") t.city = v;
                 else if (k == "admin_level") t.admin_level = v;
+                else if (k == "area") t.area = v;
                 else if (k == "amenity") t.amenity = v;
                 else if (k == "aeroway") t.aeroway = v;
                 break;
@@ -84,7 +104,10 @@ inline WayTags parse_way_tags(const uint32_t* tag_keys, const uint32_t* tag_vals
                 else if (k == "building") t.building = v;
                 break;
             case 'c': if (k == "craft") t.craft = v; break;
-            case 'e': if (k == "ele") t.ele = v; break;
+            case 'e':
+                if (k == "ele") t.ele = v;
+                else if (k == "emergency") t.emergency = v;
+                break;
             case 'f': if (k == "footway") t.footway = v; break;
             case 'h':
                 if (k == "highway") t.highway = v;
@@ -115,6 +138,7 @@ inline WayTags parse_way_tags(const uint32_t* tag_keys, const uint32_t* tag_vals
             case 'I': if (k == "ISO3166-1:alpha2") t.iso = v; break;
             case 'w':
                 if (k == "waterway") t.waterway = v;
+                else if (k == "water") t.water = v;
                 else if (k == "wikipedia") t.wikipedia = v;
                 else if (k == "wikidata") t.wikidata = v;
                 break;

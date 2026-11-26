@@ -113,10 +113,12 @@ fn a_poi_whose_point_is_near_but_whose_outline_is_not_leaves_the_locality_in() {
 #[test]
 fn a_street_past_the_antimeridian_gives_the_answer_none_of_its_rows_or_its_postcode() {
     // On Taveuni the 180th meridian runs across the island: the point lies 42 m west of it, in
-    // Testland, the postal area 6000 and the locality Waiyevo, and Lavena Road 5 m east of it, in
-    // the street cells round the point, its parent the country Otherland, its postcode 4999.
-    // Planar on lon/lat, as ST_DWithin, the road lies 360 degrees off, beyond lookup_street_poi's
-    // reach: Waiyevo answers, with the areas and the postcode round the point (lookup_area).
+    // Testland, the postal area 6000 and the locality Waiyevo, and Lavena Road 170 m east of it,
+    // its parent the country Otherland, its postcode 4999. The street lookups measure it the short
+    // way round, 213 m off, past the 130 m they reach; planar on lon/lat, as ST_DWithin, it lies
+    // 360 degrees off, beyond lookup_street_poi's reach too: Waiyevo answers, with the areas and
+    // the postcode round the point (lookup_area). A road 5 m east of the meridian is within the
+    // lookups' reach, and answers (streets_addresses_and_house_numbers_are_found_across_the_antimeridian).
     let taveuni = (-16.8, 179.9996);
     let mut dataset = TestIndex { origin: taveuni, ..TestIndex::default() };
     let otherland = 1;
@@ -129,7 +131,7 @@ fn a_street_past_the_antimeridian_gives_the_answer_none_of_its_rows_or_its_postc
     dataset.polygons[otherland].0.country_code = u16::from_be_bytes(*b"NZ");
     dataset.polygons[3].0.country_code = u16::from_be_bytes(*b"AU");
     dataset
-        .street_through("Lavena Road", vec![NodeCoord { lat: -16.8005, lng: -179.99995 }, NodeCoord { lat: -16.7995, lng: -179.99995 }])
+        .street_through("Lavena Road", vec![NodeCoord { lat: -16.8005, lng: -179.9984 }, NodeCoord { lat: -16.7995, lng: -179.9984 }])
         .way_parent(otherland as u32)
         .way_postcode("4999");
     let mut index = dataset.load();

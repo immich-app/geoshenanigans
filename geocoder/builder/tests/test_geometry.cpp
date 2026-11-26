@@ -360,10 +360,16 @@ TEST(highway_allowlist_rejects_non_streets) {
 }
 
 TEST(highway_full_filter_footway_subtypes) {
-    // footway=sidewalk / crossing are road adjuncts and excluded; any other
-    // footway subtype (or none) passes.
-    CHECK(!is_included_highway_full("footway", "sidewalk"));
-    CHECK(!is_included_highway_full("footway", "crossing"));
+    // footway=sidewalk, crossing, link and traffic_aisle make highway=footway
+    // no main tag in Nominatim (presets.lua filter_footways) and are
+    // excluded; any other footway subtype (or none) passes.
+    for (const char* footway : {"sidewalk", "crossing", "link", "traffic_aisle"}) {
+        CHECK(is_excluded_footway(footway));
+        CHECK(!is_included_highway_full("footway", footway));
+    }
+    CHECK(!is_excluded_footway("access_aisle"));
+    CHECK(!is_excluded_footway(nullptr));
+    CHECK(is_included_highway_full("footway", "access_aisle"));
     CHECK(is_included_highway_full("footway", "alley"));
     CHECK(is_included_highway_full("footway", nullptr));
     // The subtype filter applies to footway only.

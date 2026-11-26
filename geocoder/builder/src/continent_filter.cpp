@@ -4,8 +4,10 @@
 #include "parsed_data.h"
 #include "parallel.h"
 #include "ranked_bits.h"
+#include "s2_helpers.h"
 #include "string_subset.h"
 #include "subset_copy.h"
+#include "water_layer.h"
 
 #include <algorithm>
 #include <atomic>
@@ -14,6 +16,7 @@
 #include <future>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
 
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
@@ -50,7 +53,7 @@ static bool cell_in_bbox(uint64_t cell_id, const ContinentBBox& bbox) {
 // record classes), hand-written bbox fallback otherwise. The bbox-only test
 // dropped admin data for zones the bboxes miss but the Geofabrik polygons
 // cover (Guam, Adak, the Azores, island territories).
-static bool cell_in_continent(uint64_t cell_id, const ContinentBBox& bbox, const PolygonIndex* polygon) {
+bool cell_in_continent(uint64_t cell_id, const ContinentBBox& bbox, const PolygonIndex* polygon) {
     if (!polygon) return cell_in_bbox(cell_id, bbox);
     S2CellId cell(cell_id);
     S2LatLng center = cell.ToLatLng();
@@ -76,6 +79,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     const std::vector<uint8_t>& interp_masks,
     const std::vector<uint8_t>& poi_masks,
     const std::vector<uint8_t>& place_masks,
+    const std::vector<uint8_t>& water_masks,
     const std::vector<std::pair<double,double>>* boundary,
     PlanetRecords records) {
 
@@ -266,6 +270,16 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         drop(full.admin_polygons, full.admin_osm_ids);
     };
 
+    // Water: the polygons the continent's cells of the water cell index list,
+    // or the ring of cells around them (its bit of water_masks), whole, with
+    // their arcs.
+    auto copy_water = [&]() {
+        if (water_masks.size() != full.water.cells.size())
+            throw std::logic_error("water continent masks out of step with the water cells");
+        out.water = water::subset_layer(full.water, water_masks, continent_bit);
+        if (consume) full.water = water::Layer();
+    };
+
     // POIs — coord polygon refinement, preserve vertex arrays for polygon POIs
     // A point POI's vertex_offset also moves to the current end of the
     // vertex array, as it always has.
@@ -283,7 +297,10 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
             [](PoiRecord& p, uint32_t offset, uint32_t) { p.vertex_offset = offset; },
             out.poi_records, out.poi_vertices);
         out.poi_osm_ids = subset_osm_ids(used_poi_ids, poi_remap, out.poi_records.size(), full.poi_osm_ids);
-        drop(full.poi_records, full.poi_vertices, full.poi_osm_ids);
+        if (!full.poi_water_importance.empty())
+            out.poi_water_importance =
+                subset_osm_ids(used_poi_ids, poi_remap, out.poi_records.size(), full.poi_water_importance);
+        drop(full.poi_records, full.poi_vertices, full.poi_osm_ids, full.poi_water_importance);
     };
 
     // Place nodes — parent_poly_id remapped in a second pass below, after
@@ -309,6 +326,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         // copies grow.
         copy_interps();
         copy_admins();
+        copy_water();
         copy_places();
         copy_ways();
         copy_pois();
@@ -317,7 +335,8 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         std::future<void> copies[] = {
             std::async(std::launch::async, copy_ways), std::async(std::launch::async, copy_addrs),
             std::async(std::launch::async, copy_interps), std::async(std::launch::async, copy_admins),
-            std::async(std::launch::async, copy_pois), std::async(std::launch::async, copy_places)};
+            std::async(std::launch::async, copy_pois), std::async(std::launch::async, copy_places),
+            std::async(std::launch::async, copy_water)};
         for (auto& f : copies) f.get();
     }
     log_phase(("      " + std::string(bbox.name) + " filter: data remap (masked)").c_str(), _ft, _fc);
@@ -425,8 +444,28 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         for (const Postcode* p : inside) out.postcode_accum.emplace(p->first, p->second);
     }
 
+    // --- The postcode grid's file: the planet's runs a query routed here reads ---
+    // (region_rows), at the admin cells the server routes queries by
+    // (admin_cell_routed), so the continent answers as the planet does at
+    // every point routed to it; none in place of the other runs.
+    size_t grid_runs = 0;
+    {
+        std::unordered_map<uint64_t, bool> routed;
+        const std::vector<postcode_grid::LogicalRow> rows = postcode_grid::region_rows(
+            full.postcode_grid_rows, postcode_grid::GRID_LEVEL, kAdminCellLevel, [&](uint64_t cell) {
+                const auto [at, fresh] = routed.try_emplace(cell, false);
+                if (fresh) at->second = admin_cell_routed(cell, holds);
+                return at->second;
+            });
+        grid_runs = rows.size();
+        if (!rows.empty()) {
+            out.postcode_grid_file = postcode_grid::encode_file(rows);
+            out.postcode_grid_sources = full.postcode_grid_sources;
+        }
+    }
+
     drop(full.way_parent_ids, full.admin_parent_ids, full.way_postcode_ids, full.interp_postcode_ids,
-         full.addr_postcode_ids, full.addr_city_ids, full.postcode_accum);
+         full.addr_postcode_ids, full.addr_city_ids, full.postcode_accum, full.postcode_grid_rows);
     log_phase(("      " + std::string(bbox.name) + " filter: parent + postcode projection").c_str(), _ft, _fc);
 
     // --- Remap sorted cell arrays for all 5 types (preserving INTERIOR_FLAG) ---
@@ -566,7 +605,9 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
               << " pois=" << out.poi_records.size()
               << " places=" << out.place_nodes.size()
               << " admins=" << out.admin_polygons.size()
+              << " waters=" << out.water.size()
               << " postcodes=" << out.postcode_accum.size()
+              << " postcode_grid_runs=" << grid_runs
               << std::endl;
 
     return out;

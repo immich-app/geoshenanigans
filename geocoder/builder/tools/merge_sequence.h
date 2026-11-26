@@ -454,6 +454,48 @@ inline MergeSequence build_merge_seq(
     return seq;
 }
 
+// The merge of two files whose records ascend by a u64 key at their start,
+// no key twice on a side (the postcode grid's runs, by first cell): a walk of
+// both by key. A record both days hold at the same key with the same bytes is
+// a MATCH; between two MATCHes the old records go as one DELETE and the new
+// ones as one INSERT after it. It looks no distance ahead, so a stretch of
+// new records of any length leaves the records after it to MATCH.
+inline MergeSequence build_keyed_merge_seq(const char* old_data, size_t old_size, const char* new_data, size_t new_size,
+                                           size_t stride) {
+    const size_t old_n = old_size / stride, new_n = new_size / stride;
+    auto key = [&](const char* data, size_t i) {
+        uint64_t k;
+        memcpy(&k, data + i * stride, 8);
+        return k;
+    };
+    MergeSequence seq;
+    size_t i = 0, j = 0, gap_i = 0, gap_j = 0;  // the stretch since the last MATCH starts at gap_i, gap_j
+    uint32_t match_run = 0;
+    auto flush = [&] {
+        if (match_run) seq.add_match(match_run), match_run = 0;
+        if (i > gap_i) seq.add_delete(static_cast<uint32_t>(i - gap_i));
+        if (j > gap_j) seq.add_insert(new_data + gap_j * stride, static_cast<uint32_t>(j - gap_j), stride);
+    };
+    while (i < old_n || j < new_n) {
+        const bool both = i < old_n && j < new_n;
+        if (both && key(old_data, i) == key(new_data, j)) {
+            if (memcmp(old_data + i * stride, new_data + j * stride, stride) == 0) {
+                if (i > gap_i || j > gap_j) flush();
+                match_run++;
+                gap_i = ++i, gap_j = ++j;
+            } else {
+                i++, j++;
+            }
+        } else if (j == new_n || (i < old_n && key(old_data, i) < key(new_data, j))) {
+            i++;
+        } else {
+            j++;
+        }
+    }
+    flush();
+    return seq;
+}
+
 // A parent record's block of its child stream: where it starts and its
 // bytes.
 struct ChildBlock { size_t off, size; };

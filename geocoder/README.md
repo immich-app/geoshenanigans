@@ -10,6 +10,7 @@ Based on the open source [Traccar Geocoder](https://github.com/traccar/traccar-g
 - Address point, street name, and address interpolation lookup (TIGER ranges in the US)
 - Administrative boundary resolution (country, state, county, city, postcode)
 - Points of interest in three tiers ([POI_OVERVIEW.md](POI_OVERVIEW.md))
+- Bodies of water (seas, oceans, lakes, rivers, canals, bays, straits, wetlands, glaciers) in a `water` field beside the address, from an optional water dir
 - Sub-millisecond query latency with memory-mapped index files
 - Nightly indexes with daily patches ([PATCHING.md](PATCHING.md))
 - Automatic HTTPS with Let's Encrypt
@@ -21,7 +22,7 @@ and eight continents from the day's OSM data and publishes every index
 variant, with a patch from the previous day, to Tigris:
 `https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io/geocoder/builds/latest.json`.
 [PATCHING.md](PATCHING.md) describes the layout, the variants (mode, boundary
-quality, POI tier) and how a client downloads and patches them.
+quality, POI tier, water) and how a client downloads and patches them.
 
 ## Monitoring
 
@@ -77,30 +78,68 @@ cargo build --release --manifest-path server/Cargo.toml
 ```
 
 The server downloads a continent from the latest build the first time a query
-lands in it: `admin` mode, `simplified` boundaries and no POIs unless an admin sets
-another selection with `PUT /admin/configuration` (a JSON body of `base_url`,
-`mode`, `quality`, `poi_tier` and the regions to `preload`). A value the build
-doesn't offer fails each download, naming those it does, and the PUT is refused
-with them (400) when the server has the build's manifest at hand. Downloads
-check the bucket's certificate against the system's CA store: on Linux and the
-other Unix systems but macOS, its certificate bundle (`ca-certificates` on
-Debian), or another that `SSL_CERT_FILE` or `SSL_CERT_DIR` names; on macOS and
-Windows, the system's trust store, which those variables don't change. On a
-host without one the server starts and serves what its data dir holds, and each
-download fails, naming why. A continent
-dir keeps a ledger of what each of its files holds, `.file_sha256` (a line
-`<name> <sha256>` each, `-` while unknown), and a download skips a file only
-where the ledger names the build's sha256 for it. It removes the files its
-selection doesn't take (another selection's or build's) that the ledger names,
-or whose names files of the build have, the ledger naming them or not; files of
-other names stay. The dir names its build in `.build_date` once a whole
-selection of it is in and those are gone; a download that fetches or removes
-anything removes it first, once it has made the ledger where the dir has none
-(a dir holding neither was laid out by hand, and a server loads it). Before it
-reads the dir a download finishes what a transport decode killed part way left
-there (PATCHING.md), which would otherwise put back the files the decode
-replaced once the download had listed the files to remove; one it can't finish
-fails the download.
+lands in it: `admin` mode, `simplified` boundaries, no POIs and no water unless an
+admin sets another selection with `PUT /admin/configuration` (a JSON body of
+`base_url`, `mode`, `quality`, `poi_tier`, `water` and the regions to `preload`;
+a body without `water` takes `none`). A PUT downloads each loaded continent
+again for its selection, with the latest build of its `base_url`, unless the
+`.build_date` (below) its dir held as its files loaded names that bucket and
+selection (its own download's, or that of another server's download into the
+dir after it, on the same data dir), and loads it once that is in. Until then,
+or if the download or load fails, the running process keeps serving the old
+index and retries the switch on the next PUT, of whichever selection. If the
+failed download removed `.build_date`, a restart leaves that continent
+unloaded until a download succeeds. A PUT writes its configuration to
+`configuration.json` before its downloads run: a server that starts with one
+downloads, as that PUT would, its preloads and each loaded continent whose
+`.build_date` names another bucket or selection. A loaded continent whose dir
+holds neither the downloader's ledger nor its stamp (`.file_sha256`,
+`.build_date`, below) was laid out by other means, by hand or by the test
+portal, and is never downloaded again. A value the build doesn't offer fails
+each download, naming those it does, and the PUT is refused with them (400)
+when the server has the build's manifest at hand. Downloads check the bucket's
+certificate against the system's CA store: on Linux and the other Unix systems
+but macOS, its certificate bundle (`ca-certificates` on Debian), or another
+that `SSL_CERT_FILE` or `SSL_CERT_DIR` names; on macOS and Windows, the
+system's trust store, which those variables don't change. On a host without one
+the server starts and serves what its data dir holds, and each download fails,
+naming why. The files of a component with a `dir`
+(the water values') go in that sub-dir of the continent dir, `water/`, which the
+server loads with it; a `dir` that is not one plain name, or that starts with a
+dot as the downloader's own names do, fails the download before it fetches. A
+continent dir keeps a ledger of what each of its files holds, `.file_sha256`
+(a line `<name> <sha256>` each, `-` while unknown, a water file's name
+`water/<name>`), and a download skips a file only where the ledger
+names the build's sha256 for it. It removes the files its selection doesn't
+take (another selection's or build's) that the ledger names, or whose names
+files of the build have in the dir or in the sub-dir their component names, the
+ledger naming them or not; files of other names stay. A `water/` that is a link
+or a file fails the download before it writes dataset files: it writes nothing
+through a link, as the dir's lock guards only the continent dir. A fetch writes
+its file in `.fetching/` beside its place (the continent dir's, or `water/`'s),
+a dir of the downloader's own, which holds a `.downloader` file of the
+downloader's own text from when it is made, and renames it into place; a file
+at the name of one of the build's with `.tmp` after it
+(`water/admin_polygons.bin.tmp`, an operator's copy, say) is none of a
+download's, and stays. The dir names its build, the bucket (`base_url`)
+and the selection in `.build_date` once a whole selection of it is in and those
+are gone (a download with nothing to fetch into a dir stamped otherwise, or not
+at all, stamps it, and removes the `.fetching/` dirs of the downloader's
+there); a download that fetches or removes anything fails where a `.fetching`
+is a file, a link, or a dir holding files but no `.downloader` of the
+downloader's own text (an operator's, say; a `.downloader` holding only the
+start of that text, as a download killed while
+it wrote it leaves, is the downloader's only where it is all the dir holds),
+before it changes the ledger or the stamp; else it removes the stamp first,
+once it has made the ledger where the dir has none (a dir holding neither was
+laid out by hand, and a server loads it), then removes each `.fetching/`, with
+what killed fetches left there, its `.downloader` last (so that a kill part way
+leaves the dir the downloader's), and again once its last fetch is in. Before
+it reads the dir a download finishes what a transport decode killed part way
+left there and in `water/`, which the water dirs' units decode into
+(PATCHING.md): such a decode would otherwise put back
+the files it replaced once the download had listed the files to remove; one it
+can't finish fails the download.
 Downloads into a dir go one at a time, those of other servers on the data dir
 too: each holds a lock on the dir's `.download.lock` to its end, and runs to
 its end though the query that started it gave up. A server checks and
@@ -119,9 +158,11 @@ left unloaded. A server that finds a ledger but no stamp in a dir leaves that
 continent unloaded until a query or a preload finishes its download. Queries
 need an API key from the dashboard (see Authentication below).
 
-Servers can share a data dir. Those that run as one user are safe side by
-side: their downloads into a dir go one at a time and their loads wait for
-them, by the lock on `.download.lock`. A server that can't write the data dir
+Servers on Unix can share a data dir; elsewhere a download takes no lock on
+the dirs it writes, so a data dir is one server's. Those that run as one user
+are safe side by side: their downloads into a dir go one at a time and their
+loads wait for them, by the lock on `.download.lock`. A server that can't write
+the data dir
 (a read-only mount, or a dir of another user) is safe beside one that
 downloads into it: it takes the lock where `.download.lock` is there, else
 loads the dir without it and drops what it loaded where a download ran
@@ -144,7 +185,8 @@ server at `/test`, where it asks that server. Its compose file runs
 `query-portal`, a binary of the search crate whose sources are the server
 crate's, which serves every dataset of
 the latest published planet build: each selection of a mode, a boundary
-precision and a POI tier the manifest's constraints allow (28). Its page
+precision and a POI tier the manifest's constraints allow (28), without
+water, whose files it doesn't fetch. Its page
 compares up to 4 of them side by side, each a preset or a pick by axis, and
 its URL holds the columns, the point, the build (`b=`, its publication
 ID: `<date>-<the first 12 hex digits of its manifest's sha256>`, the same on
@@ -368,6 +410,7 @@ Response follows [Nominatim](https://nominatim.org/release-docs/latest/api/Rever
 
 ```json
 {
+  "licence": "Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright",
   "display_name": "Avenue de la Costa 42, 98000 Monaco, Monaco",
   "address": {
     "house_number": "42",
@@ -382,7 +425,44 @@ Response follows [Nominatim](https://nominatim.org/release-docs/latest/api/Rever
 }
 ```
 
-Fields are omitted when not available.
+Fields are omitted when not available, but `licence`, which every answer
+carries first, as Nominatim's results do, worded as Nominatim words it
+(`OSM_ATTRIBUTION` in its `src/nominatim_api/v1/classtypes.py`); an answer
+that found nothing carries it too (`{"licence": "...", "address": {}}`).
+Where no loaded region covers the point the answer is `{}`, without it, as
+Nominatim's `{"error":"Unable to geocode"}` is.
+
+Where the dataset has a water dir (a `water` value other than `none`), an
+answer whose point lies in a body of water carries it last, beside the
+address, which it never changes (46.45, 6.55, in Lake Geneva):
+
+```json
+{
+  "display_name": "Thonon-les-Bains, Upper Savoy, Auvergne-Rhône-Alpes, Metropolitan France, France",
+  "address": {
+    "municipality": "Thonon-les-Bains",
+    "state": "Auvergne-Rhône-Alpes",
+    "region": "Metropolitan France",
+    "county": "Upper Savoy",
+    "country": "France",
+    "country_code": "FR"
+  },
+  "water": { "name": "Lake Geneva", "class": "water", "type": "lake" }
+}
+```
+
+`class` and `type` are this dataset's feature labels. They generally follow
+Nominatim's categories (`water/lake`, `water/reservoir`, `natural/bay`,
+`natural/wetland`, ...), with extensions for features such as river areas
+(`waterway/river`, `waterway/canal`) and Marine Regions seas and oceans
+(`place/sea`, `place/ocean`). The
+smallest body of water holding the point answers: a lake in a wetland, a river
+in an estuary, a bay in a sea. A point at sea that no address reaches answers
+`{"address": {}, "water": {...}}`. A point on an island mapped as a hole of its
+lake is in no water, unless a larger one holds the island. Nominatim's default
+answer has no water at all; [NOMINATIM_REFERENCE.md](NOMINATIM_REFERENCE.md#water-an-extension)
+gives how this field relates to its `layer=natural` lookup, the selection rule
+and how river areas are named.
 
 Status codes:
 - `200` - success
@@ -399,8 +479,8 @@ The project consists of four components:
 
 - **Builder** (`builder/`, C++) - `build-index` parses OSM PBF files and creates a compact binary index using S2 geometry cells for spatial lookup. `geocoder-diff` and `geocoder-patch` make and apply the daily patches ([builder/PATCHING.md](builder/PATCHING.md)), and `pbf-apply` applies OSM replication diffs to a PBF.
 - **Server** (`server/`, Rust) - Memory-maps the index files and serves queries via HTTP/HTTPS with sub-millisecond latency. It is also the `query_server` library the binding wraps.
-- **Node binding** (`node/`) - The native module Immich uses to geocode in-process: `Geocoder.load(dir)`, then `reverseGeocode(lat, lng)` resolves to the response JSON as a string. `openPlaceSearch()` opens the place search index of the dataset (shipped with the bigger packs, else built on the device; see [builder/PATCHING.md](builder/PATCHING.md#place-search-index)), then `searchPlaces(query)` resolves to the results as a JSON string. `createTransportDecoder(dir, files)` decodes a downloading transport unit into the dataset dir ([PATCHING.md](PATCHING.md#transport-units)).
-- **Test portal** (`test-portal/`) - The map page served at `/test`, and the image and compose file of `query-portal`, which serves every dataset of the published planet build for the page to compare side by side.
+- **Node binding** (`node/`) - The native module Immich uses to geocode in-process: `Geocoder.load(dir)` (the dataset and its `water/` dir), then `reverseGeocode(lat, lng)` resolves to the response JSON as a string, `water` among it. `openPlaceSearch()` opens the place search index of the dataset (shipped with the bigger packs, else built on the device; see [builder/PATCHING.md](builder/PATCHING.md#place-search-index)), then `searchPlaces(query)` resolves to the results as a JSON string. `createTransportDecoder(dir, files)` decodes a downloading transport unit into the dir it is given, an existing one: the dataset dir for the units of the dataset's own dirs, `<dataset>/water/` for those of a water dir, whose files have the names of the boundary units' ([PATCHING.md](PATCHING.md#transport-units)).
+- **Test portal** (`test-portal/`) - The map page served at `/test`, and the image and compose file of `query-portal`, which serves every dataset of the published planet build without water for the page to compare side by side.
 
 ### Index Structure
 
@@ -427,10 +507,14 @@ to the same files ([builder/PATCHING.md](builder/PATCHING.md#transport-units)).
 | `admin_parents.bin` | Per admin polygon: the next larger polygon containing it |
 | `place_cells.bin`, `place_nodes.bin`, `place_hidden.bin` | Place nodes (city, town, village, suburb, ...): the visible ones in admin cell order, bit-packed in blocks of 64, each marked where a relation of its rank promotes it, with each cell's first row; the ones a boundary hides (its label for place search) beside them (`builder/src/place_files.h`) |
 | `postcode_centroids.bin`, `postcode_centroid_cells.bin` | Postcode centroids in admin cell order, Rice-coded steps in blocks of 32 with a box per block (PCC1, `builder/src/postcode_files.h`), and each admin cell's rows of them |
+| `postcode_grid.bin` | In the United States, the postcode of each level-16 S2 cell: the one most of the address points and TIGER lines in it carry, or in a cell holding none the nearer such cell's along the curve within the country's extent (25 km), none past that (`builder/src/postcode_grid_build.h`); as runs of cells in cell order, Rice-coded steps in blocks of 128 with each block's postcodes as text (PGR1, `builder/src/postcode_grid.h`); the same bytes in every mode dir of a region, the planet's runs a query routed there reads |
 | `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin` | Points of interest and their cell index (a list per cell) |
 | `strings_core.bin`, `strings_street.bin`, `strings_addr.bin`, `strings_postcode.bin`, `strings_poi.bin` | Deduplicated string pool, in five tiers so each variant ships only the strings it uses; each tier front-coded in buckets cut by content (FCC2, `builder/src/string_files.h`), a string's id still its offset in the tier's pool |
 | `strings_layout.json` | Start and end of each string tier, which place every string offset |
 | `poi_meta.json` | POI category names and scoring parameters |
+| `attribution.json` | In each mode dir: the credit of the data it holds, one entry per source ([PATCHING.md](PATCHING.md#attribution)) |
+| `poi_attribution.json` | In a POI tier dir: Wikidata's credit, where its sitelinks ranked a POI of it ([PATCHING.md](PATCHING.md#attribution)) |
+| `water/` | The water layer, a set of its own in the admin files' formats (`admin_polygons.bin`, `admin_rings.bin`, `arc_index.bin`, `arc_vertices.bin`, `admin_cells.bin`, `admin_entries.bin`, `strings_core.bin`, `strings_layout.json`) and `water_meta.json`, each type code's class, type and Nominatim rank: a record per polygon carrying its OSM object's name, type code and area, and nothing pointing into the other files (`server/src/water.rs`, `builder/src/water_layer.h`) |
 
 ## Building from Source
 
@@ -528,6 +612,21 @@ The server is designed to run inside memory-constrained deployments
 |----------|-------------|---------|
 | `GEOCODER_WORKER_THREADS` | Async worker pool size | `min(cores, 8)` |
 | `GEOCODER_ALLOW_ANONYMOUS` | `true` accepts requests without an API key, configuration changes included, with no rate limit: only for a server on a private container network | (disabled) |
+
+## Data and licences
+
+The indexes are a derivative database of [OpenStreetMap](https://www.openstreetmap.org/copyright)
+(© OpenStreetMap contributors, ODbL 1.0), with GB postcode centroids from
+[GeoNames](https://www.geonames.org/) (CC BY 4.0), derived from Ordnance
+Survey's Code-Point Open (OGL v3.0; contains OS, Royal Mail and National
+Statistics data), US address ranges and ZIP codes from the US Census
+Bureau's TIGER/Line files (public domain), and POI importance from
+[Wikidata](https://www.wikidata.org/)'s sitelink counts (CC0). The
+`attribution` list of each build's configurations.json gives every source's
+credit and licence, and each mode dir's `attribution.json` and POI tier dir's
+`poi_attribution.json` the ones of the data it holds
+([PATCHING.md](PATCHING.md#attribution));
+show those wherever the data is shown. The licence below is the code's.
 
 ## License
 

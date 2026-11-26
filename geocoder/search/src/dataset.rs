@@ -12,7 +12,7 @@ use crate::build::{
 use crate::constants::*;
 use crate::query::{Found, QueryStats, Searcher};
 use crate::reader::SearchIndex;
-use query_server::{lower_hex, FileStamp, Index};
+use query_server::{lower_hex, FileStamp, Index, WATER_DIR, WATER_FILES};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -51,31 +51,53 @@ pub struct Stamps(BTreeMap<String, FileStamp>);
 impl Stamps {
     /// The stamps of the dataset files in `dir`.
     pub fn of(dir: &Path) -> std::io::Result<Stamps> {
-        let mut out = BTreeMap::new();
-        for name in DATASET_FILES {
-            match std::fs::metadata(dir.join(name)) {
-                Ok(m) => {
-                    out.insert(name.to_string(), FileStamp::of(&m));
-                }
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(Stamps(out))
+        stamps_of(dir, &DATASET_FILES).map(Stamps)
     }
 }
 
+/// The stat of each of the files `names` present in `dir`, by name; an error names the file it
+/// is of.
+fn stamps_of(dir: &Path, names: &[&str]) -> std::io::Result<BTreeMap<String, FileStamp>> {
+    let mut out = BTreeMap::new();
+    for name in names {
+        let path = dir.join(name);
+        match std::fs::metadata(&path) {
+            Ok(m) => {
+                out.insert(name.to_string(), FileStamp::of(&m));
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+        }
+    }
+    Ok(out)
+}
+
 /// Runs `load` (which loads the geocoder index of the dataset in `dir`) and returns what it
-/// loaded with the stamps of the files it read: the same before and after the load, else the
-/// files were being replaced and it fails.
+/// loaded with the stamps of the dataset files it read: those and the files of the dataset's
+/// water dir (WATER_FILES, which the geocoder index loads and an index of place search derives
+/// nothing from) the same before and after the load, else the files were being replaced and it
+/// fails. A dir of continent dirs (one holding no admin_cells.bin, which MultiIndex::load
+/// loads continent by continent) has each continent dir's dataset and water files checked so
+/// too, a continent whose files can't be looked up taken as such (MultiIndex::load skips it,
+/// and loads the others); the stamps returned are still those of `dir`'s own.
 pub fn load<T>(dir: &Path, load: impl FnOnce() -> Result<T, String>) -> Result<(T, Stamps), String> {
-    let stamps = || Stamps::of(dir).map_err(|e| format!("{}: {e}", dir.display()));
+    let continents: Vec<std::path::PathBuf> = if dir.join("admin_cells.bin").exists() {
+        Vec::new()
+    } else {
+        query_server::continents().iter().map(|c| dir.join(c.name)).filter(|d| d.is_dir()).collect()
+    };
+    let of = |d: &Path| Ok::<_, std::io::Error>((Stamps::of(d)?, stamps_of(&d.join(WATER_DIR), &WATER_FILES)?));
+    let stamps = || {
+        let own = of(dir).map_err(|e| e.to_string())?;
+        Ok::<_, String>((own, continents.iter().map(|d| of(d).ok()).collect::<Vec<_>>()))
+    };
     let before = stamps()?;
     let loaded = load()?;
     if stamps()? != before {
         return Err(format!("The dataset in {} changed while it was loading", dir.display()));
     }
-    Ok((loaded, before))
+    let ((own, _), _) = before;
+    Ok((loaded, own))
 }
 
 /// Hashes of dataset files, each with the stat it was taken at; kept beside an index
@@ -144,7 +166,7 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// hashing or after it, as the files hashed would not be the ones loaded.
 fn fingerprint_loaded(dir: &Path, loaded: &Stamps, hashes: &mut HashCache) -> Result<Fingerprint, String> {
     let io = |e: std::io::Error| format!("{}: {e}", dir.display());
-    let unchanged = || match Stamps::of(dir).map_err(io)? {
+    let unchanged = || match Stamps::of(dir).map_err(|e| e.to_string())? {
         now if now == *loaded => Ok(()),
         _ => Err(format!("The dataset in {} changed since it was loaded: load it again", dir.display())),
     };
@@ -856,6 +878,106 @@ mod tests {
         });
 
         assert!(refused.unwrap_err().contains("changed while it was loading"));
+    }
+
+    // The geocoder index loads the dataset's water dir too: a water file replaced, added or
+    // removed during the load fails it. The stamps kept are of the files place search reads,
+    // which a water dir leaves as they are.
+    #[test]
+    fn load_refuses_a_water_dir_replaced_while_loading() {
+        let ds = TempDir::new("water");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let water = ds.0.join(WATER_DIR);
+        std::fs::create_dir(&water).unwrap();
+        std::fs::write(water.join("admin_polygons.bin"), b"day 1").unwrap();
+        std::fs::write(water.join("water_meta.json"), b"day 1").unwrap();
+        let replace = |name: &str| {
+            let new = water.join(format!("{name}.new"));
+            std::fs::write(&new, b"day 2").unwrap();
+            std::fs::rename(&new, water.join(name)).unwrap();
+        };
+
+        let kept = load(&ds.0, || Ok(()));
+        let replaced = load(&ds.0, || {
+            replace("admin_polygons.bin");
+            Ok(())
+        });
+        let added = load(&ds.0, || {
+            replace("arc_index.bin");
+            Ok(())
+        });
+        let removed = load(&ds.0, || std::fs::remove_file(water.join("water_meta.json")).map_err(|e| e.to_string()));
+
+        for (what, got) in [("replaced", replaced), ("added", added), ("removed", removed)] {
+            assert!(got.unwrap_err().contains("changed while it was loading"), "{what}");
+        }
+        assert_eq!(kept.unwrap().1, Stamps::of(&ds.0).unwrap());
+    }
+
+    // A dir of continent dirs (no admin_cells.bin of its own) loads each continent's dataset
+    // and water dir, as MultiIndex::load does: a file of either replaced during the load fails
+    // it too. The stamps kept are still those of the dir's own dataset files, of which it holds
+    // none.
+    #[test]
+    fn load_refuses_a_continents_files_replaced_while_loading() {
+        let ds = TempDir::new("continents");
+        let europe = ds.0.join("europe");
+        std::fs::create_dir(&europe).unwrap();
+        dataset(["Testville", "Otherton"]).write(&europe);
+        std::fs::create_dir(europe.join(WATER_DIR)).unwrap();
+        std::fs::write(europe.join(WATER_DIR).join("admin_polygons.bin"), b"day 1").unwrap();
+        let replace = |path: PathBuf| {
+            let new = path.with_extension("new");
+            std::fs::write(&new, b"day 2").unwrap();
+            std::fs::rename(&new, path).unwrap();
+        };
+
+        let kept = load(&ds.0, || Ok(()));
+        let water = load(&ds.0, || {
+            replace(europe.join(WATER_DIR).join("admin_polygons.bin"));
+            Ok(())
+        });
+        let dataset_file = load(&ds.0, || {
+            replace(europe.join("place_nodes.bin"));
+            Ok(())
+        });
+
+        for (what, got) in [("water", water), ("dataset", dataset_file)] {
+            assert!(got.is_err_and(|e| e.contains("changed while it was loading")), "{what}");
+        }
+        assert_eq!(kept.unwrap().1, Stamps::default());
+    }
+
+    // A continent whose files can't be looked up (here under a water dir that is a file) is one
+    // MultiIndex::load skips, loading the others: it fails no load of the dir of continents.
+    #[test]
+    fn a_continent_whose_files_cant_be_looked_up_fails_no_regional_load() {
+        let ds = TempDir::new("unsearchable-continent");
+        for name in ["europe", "asia"] {
+            std::fs::create_dir(ds.0.join(name)).unwrap();
+            dataset(["Testville", "Otherton"]).write(&ds.0.join(name));
+        }
+        std::fs::write(ds.0.join("asia").join(WATER_DIR), b"not a dir").unwrap();
+
+        let got = load(&ds.0, || Ok(()));
+
+        assert_eq!(got.map(|(_, stamps)| stamps), Ok(Stamps::default()));
+    }
+
+    // A file that can't be looked up (here under a water dir that is a file, as under one that
+    // can't be searched) fails the load before the geocoder index opens it, naming it.
+    #[test]
+    fn load_names_a_file_it_cant_look_up() {
+        let ds = TempDir::new("unsearchable");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let water = ds.0.join(WATER_DIR);
+        std::fs::write(&water, b"not a dir").unwrap();
+        let first = water.join(WATER_FILES[0]);
+
+        let got = load(&ds.0, || Ok(()));
+
+        assert!(got.as_ref().is_err_and(|e| e.starts_with(&format!("{}: ", first.display()))), "{got:?}");
+        assert_eq!(stamps_of(&water, &WATER_FILES).unwrap_err().kind(), ErrorKind::NotADirectory);
     }
 
     #[test]

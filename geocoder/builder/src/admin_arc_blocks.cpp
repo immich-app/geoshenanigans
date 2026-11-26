@@ -33,11 +33,19 @@ using arc_blocks::DecodedArc;
 
 constexpr size_t set_index(ArcSet s) { return static_cast<size_t>(s); }
 const char* set_name(ArcSet s) { return s == ArcSet::Full ? "full" : "minimal"; }
+// What a stage's log lines call one of its sets.
+const char* set_word(const ArcStage& stage, ArcSet s) { return s == ArcSet::Full ? stage.set_word : "minimal"; }
+
+// The sets a stage holds: the full set, and the minimal set where a tier is of it.
+std::vector<ArcSet> stage_sets(const ArcStage& stage) {
+    if (stage.has_minimal()) return {ArcSet::Full, ArcSet::Minimal};
+    return {ArcSet::Full};
+}
 
 // The tier that stores every raw vertex of the full set's arcs.
-size_t exact_tier() {
-    for (size_t t = 0; t < kArcTierCount; t++)
-        if (kArcTiers[t].set == ArcSet::Full && !kArcTiers[t].simplifies()) return t;
+size_t exact_tier(const ArcStage& stage) {
+    for (size_t t = 0; t < stage.tier_count; t++)
+        if (stage.tiers[t].set == ArcSet::Full && !stage.tiers[t].simplifies()) return t;
     throw std::logic_error("no exact tier of the full set");
 }
 
@@ -79,7 +87,7 @@ struct EncodeScratch {
 // (vertex_grid_e7, no finer than the block's), within kChunkBoxSlackE7 of
 // them, ending where the arc does.
 ArcBlocks encode_tier(const AdminArcs& arcs, const AdminExactRings& store, size_t t, unsigned threads) {
-    const ArcTier& tier = kArcTiers[t];
+    const ArcTier& tier = arcs.stage->tiers[t];
     const ArcTierState& state = arcs.tiers[t];
     const size_t n = tier.set == ArcSet::Full ? arcs.arcs.size() : arcs.minimal.arcs.size();
     std::vector<EncodeScratch> scratch(threads);
@@ -160,7 +168,8 @@ void check_chains_close(const AdminArcs& arcs, const AdminExactRings& store, Arc
 // each arc is on.
 void check_stored_chains_close(const AdminArcs& arcs, const AdminExactRings& store, size_t t, const ArcBlocks& blocks,
                                unsigned threads) {
-    const bool full = kArcTiers[t].set == ArcSet::Full;
+    const ArcTier& tier = arcs.stage->tiers[t];
+    const bool full = tier.set == ArcSet::Full;
     const std::vector<uint32_t>& ring_refs = full ? arcs.ring_refs : arcs.minimal.ring_refs;
     const std::vector<ArcRef>& refs = full ? arcs.refs : arcs.minimal.refs;
     // Each arc's first and last stored vertex.
@@ -169,7 +178,7 @@ void check_stored_chains_close(const AdminArcs& arcs, const AdminExactRings& sto
     parallel_for_dynamic(blocks.size(), 256, [&](size_t begin, size_t end, unsigned worker) {
         for (size_t a = begin; a < end; a++) {
             if (!arc_blocks::decode_arc(blocks.data(a), blocks.bytes_of(a), decoded[worker]))
-                check_failed(std::string("arc ") + std::to_string(a) + " of " + kArcTiers[t].dir + " doesn't decode");
+                check_failed(std::string("arc ") + std::to_string(a) + " of " + tier.dir + " doesn't decode");
             ends[a] = {decoded[worker].vertices.front(), decoded[worker].vertices.back()};
         }
     }, threads);
@@ -182,7 +191,7 @@ void check_stored_chains_close(const AdminArcs& arcs, const AdminExactRings& sto
             };
             for (uint32_t i = 0; i < n; i++)
                 if (walked(refs[first + i]).second != walked(refs[first + (i + 1) % n]).first)
-                    check_failed(std::string("ring ") + std::to_string(r) + "'s arcs in " + kArcTiers[t].dir +
+                    check_failed(std::string("ring ") + std::to_string(r) + "'s arcs in " + tier.dir +
                                  " don't chain at ref " + std::to_string(i));
         }
     }, threads);
@@ -193,7 +202,7 @@ void check_stored_chains_close(const AdminArcs& arcs, const AdminExactRings& sto
 void check_coarsened_tier(const AdminArcs& arcs, const AdminExactRings& store, size_t t, const ArcBlocks& blocks,
                           unsigned threads) {
     if (threads == 0) threads = parallel_threads();
-    const ArcTier& tier = kArcTiers[t];
+    const ArcTier& tier = arcs.stage->tiers[t];
     const ArcTierState& state = arcs.tiers[t];
     const bool full = tier.set == ArcSet::Full;
     const std::vector<uint32_t>& ring_refs = full ? arcs.ring_refs : arcs.minimal.ring_refs;
@@ -317,7 +326,7 @@ void encode_ring_blocks(AdminArcBlocks& blocks, ArcSet set, unsigned threads) {
 void check_lossless(const AdminArcs& arcs, const AdminArcBlocks& blocks, const AdminExactRings& store, unsigned threads) {
     if (threads == 0) threads = parallel_threads();
     if (blocks.polygons.size() != store.polygons.size()) throw std::logic_error("encoded arcs out of step with the store");
-    const ArcBlocks& exact = blocks.tiers[exact_tier()];
+    const ArcBlocks& exact = blocks.tiers[exact_tier(*blocks.stage)];
     struct Scratch {
         DecodedArc decoded;
         std::vector<PackedLocation> arc, part, ring;
@@ -364,7 +373,7 @@ void check_lossless(const AdminArcs& arcs, const AdminArcBlocks& blocks, const A
         for (uint32_t k = 0; k < store.polygons[p].ring_count; k++) vertices += float(store.rings_of(uint32_t(p))[k].count);
         return vertices;
     }, threads);
-    for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
+    for (ArcSet set : stage_sets(*blocks.stage)) {
         const ArcSetBlocks& s = blocks.set(set);
         const std::vector<uint32_t> arc_of = arc_at_slot(s);
         std::vector<Scratch> scratch(threads);
@@ -375,7 +384,8 @@ void check_lossless(const AdminArcs& arcs, const AdminArcBlocks& blocks, const A
                 const AdminArcPolygon& poly = blocks.polygons[p];
                 const BlockSpan span = poly.blocks[set_index(set)];
                 auto fail = [&](const std::string& what) {
-                    check_failed("polygon " + std::to_string(p) + " in the " + set_name(set) + " set " + what);
+                    check_failed("polygon " + std::to_string(p) + " in the " + set_word(*blocks.stage, set) + " set " +
+                                 what);
                 };
                 if (poly.first_ring != store.polygons[p].first_ring || poly.ring_count != store.polygons[p].ring_count)
                     fail("numbers other rings than the store");
@@ -418,10 +428,13 @@ std::string slot_line(const AdminArcSlotCounts& c, size_t slots) {
 
 AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& store, unsigned threads) {
     if (threads == 0) threads = parallel_threads();
-    if (arcs.tiers.size() != kArcTierCount) throw std::logic_error("admin arcs without their tiers");
+    const ArcStage& stage = *arcs.stage;
+    if (arcs.tiers.size() != stage.tier_count) throw std::logic_error("admin arcs without their tiers");
+    const std::string arcs_name = "      " + std::string(stage.name) + " arcs: ";
     auto t = std::chrono::steady_clock::now();
     auto cpu = CpuTicks::now();
     AdminArcBlocks out;
+    out.stage = &stage;
     out.polygons.resize(store.polygons.size());
     for (size_t p = 0; p < store.polygons.size(); p++)
         out.polygons[p] = {store.polygons[p].first_ring, store.polygons[p].ring_count, {}};
@@ -450,18 +463,18 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
     minimal.refs = arcs.minimal.refs;
     for (ArcSetBlocks* s : {&full, &minimal}) s->slots = s->planet_slots;
 
-    for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) check_chains_close(arcs, store, set, threads);
-    log_phase("      Admin arcs: chains close", t, cpu);
-    for (size_t k = 0; k < kArcTierCount; k++) {
+    for (ArcSet set : stage_sets(stage)) check_chains_close(arcs, store, set, threads);
+    log_phase((arcs_name + "chains close").c_str(), t, cpu);
+    for (size_t k = 0; k < stage.tier_count; k++) {
         out.tiers[k] = encode_tier(arcs, store, k, threads);
         check_stored_chains_close(arcs, store, k, out.tiers[k], threads);
-        if (kArcTiers[k].coarsens()) check_coarsened_tier(arcs, store, k, out.tiers[k], threads);
-        log_phase((std::string("      Admin arcs: encode ") + kArcTiers[k].dir).c_str(), t, cpu);
+        if (stage.tiers[k].coarsens()) check_coarsened_tier(arcs, store, k, out.tiers[k], threads);
+        log_phase((arcs_name + "encode " + stage.tiers[k].dir).c_str(), t, cpu);
     }
-    for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) encode_ring_blocks(out, set, threads);
-    log_phase("      Admin arcs: ring blocks", t, cpu);
+    for (ArcSet set : stage_sets(stage)) encode_ring_blocks(out, set, threads);
+    log_phase((arcs_name + "ring blocks").c_str(), t, cpu);
     check_lossless(arcs, out, store, threads);
-    log_phase("      Admin arcs: lossless", t, cpu);
+    log_phase((arcs_name + "lossless").c_str(), t, cpu);
 
     // The counts, as ARC_CHECK lines (tools/o11y_report.py).
     size_t polygons = 0, minimal_polygons = 0;
@@ -472,24 +485,27 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
     const AdminArcCounts& c = arcs.counts;
     const MinimalArcCounts& m = arcs.minimal.counts;
     std::ostringstream line;
-    line << "ARC_CHECK set=full junctions=" << c.junctions << " arcs=" << c.arcs << " closed_arcs=" << c.closed_arcs
-         << " refs=" << c.refs << " rings=" << store.rings.size() << " polygons=" << polygons
-         << " hash_collisions=" << c.hash_collisions << " duplicate_keys=" << c.duplicate_keys
+    line << "ARC_CHECK set=" << stage.set_word << " junctions=" << c.junctions << " arcs=" << c.arcs
+         << " closed_arcs=" << c.closed_arcs << " refs=" << c.refs << " rings=" << store.rings.size()
+         << " polygons=" << polygons << " hash_collisions=" << c.hash_collisions << " duplicate_keys=" << c.duplicate_keys
          << " arcs_without_ways=" << c.arcs_without_ways << " shared_way_sets=" << c.shared_way_sets
-         << " shared_ends=" << c.shared_ends
-         << " rings_nest_raw=" << arcs.rings_nest_raw
+         << " shared_ends=" << c.shared_ends;
+    if (stage.cuts == ArcCuts::JunctionsAndWayEnds) line << " way_ends=" << c.way_ends;
+    line << " rings_nest_raw=" << arcs.rings_nest_raw
          << " slots=" << full.sidecar.size() << " ring_block_bytes=" << full.ring_blocks.size() << "\n";
-    line << "ARC_CHECK set=minimal arcs=" << m.arcs << " closed_arcs=" << m.closed_arcs << " refs=" << m.refs
-         << " rings=" << m.rings << " polygons=" << minimal_polygons << " joined_junctions=" << m.joined_junctions
-         << " turnback_junctions=" << m.turnback_junctions << " duplicate_keys=" << m.duplicate_keys
-         << " shared_way_sets=" << m.shared_way_sets << " shared_ends=" << m.shared_ends << " slots=" << minimal.sidecar.size()
-         << " ring_block_bytes=" << minimal.ring_blocks.size() << "\n";
-    for (size_t k = 0; k < kArcTierCount; k++) {
+    if (stage.has_minimal())
+        line << "ARC_CHECK set=minimal arcs=" << m.arcs << " closed_arcs=" << m.closed_arcs << " refs=" << m.refs
+             << " rings=" << m.rings << " polygons=" << minimal_polygons << " joined_junctions=" << m.joined_junctions
+             << " turnback_junctions=" << m.turnback_junctions << " duplicate_keys=" << m.duplicate_keys
+             << " shared_way_sets=" << m.shared_way_sets << " shared_ends=" << m.shared_ends
+             << " slots=" << minimal.sidecar.size() << " ring_block_bytes=" << minimal.ring_blocks.size() << "\n";
+    for (size_t k = 0; k < stage.tier_count; k++) {
+        const ArcTier& tier = stage.tiers[k];
         const ArcTierCounts& tc = arcs.tiers[k].counts;
-        line << "ARC_CHECK tier=" << kArcTiers[k].dir << " set=" << set_name(kArcTiers[k].set)
+        line << "ARC_CHECK tier=" << tier.dir << " set=" << set_word(stage, tier.set)
              << " stored_vertices=" << tc.stored_vertices << " single_point_arcs=" << tc.single_point_arcs
              << " block_bytes=" << out.tiers[k].bytes.size();
-        if (kArcTiers[k].simplifies())
+        if (tier.simplifies())
             line << " kept_vertices=" << tc.kept_vertices << " validity_rounds=" << tc.validity_rounds
                  << " validity_restored=" << tc.validity_restored << " degenerate_rings=" << tc.degenerate_rings
                  << " crossings_simplified=" << tc.crossings_simplified << " repair_rounds=" << tc.repair_rounds
@@ -497,7 +513,8 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
                  << " e7_grid_rounds=" << tc.e7_grid_rounds << " e7_grid_arcs=" << tc.e7_grid_arcs
                  << " crossings_left=" << tc.crossings_left << " unrepairable_segments=" << tc.unrepairable_segments
                  << " raw_crossings=" << tc.raw_crossings << " rings_nest_introduced=" << tc.rings_nest_introduced;
-        if (kArcTiers[k].coarsens())
+        if (tier.collapsing_rings_on_e7) line << " e7_collapsing_rings=" << tc.e7_collapsing_rings;
+        if (tier.coarsens())
             line << " fine_degenerate_rings=" << tc.fine_degenerate_rings << " fine_crossings_left=" << tc.fine_crossings_left
                  << " crossings_coarse=" << tc.crossings_coarse << " coarse_rounds=" << tc.coarse_rounds
                  << " fine_rings=" << tc.fine_rings << " fine_junctions=" << tc.fine_junctions << " fine_arcs=" << tc.fine_arcs
@@ -511,9 +528,12 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
     return out;
 }
 
-AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector<uint32_t>& polygons, unsigned threads) {
+AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector<uint32_t>& polygons, unsigned threads,
+                                 uint32_t tiers) {
     if (threads == 0) threads = parallel_threads();
+    const ArcStage& stage = *planet.stage;
     AdminArcBlocks out;
+    out.stage = &stage;
     out.polygons.resize(polygons.size());
     std::vector<uint32_t> planet_ring;  // each of the subset's rings' number in the planet
     for (size_t k = 0; k < polygons.size(); k++) {
@@ -523,7 +543,7 @@ AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector
         for (uint32_t r = 0; r < p.ring_count; r++) planet_ring.push_back(p.first_ring + r);
     }
     std::vector<uint32_t> kept_arcs[2];
-    for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
+    for (ArcSet set : stage_sets(stage)) {
         const ArcSetBlocks& from = planet.set(set);
         ArcSetBlocks& to = out.set(set);
         std::vector<std::atomic<uint64_t>> used(from.arcs() / 64 + 1);
@@ -555,8 +575,9 @@ AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector
             }
         }, threads);
     }
-    for (size_t t = 0; t < kArcTierCount; t++) {
-        const std::vector<uint32_t>& arcs = kept_arcs[set_index(kArcTiers[t].set)];
+    for (size_t t = 0; t < stage.tier_count; t++) {
+        if (!(tiers >> t & 1)) continue;
+        const std::vector<uint32_t>& arcs = kept_arcs[set_index(stage.tiers[t].set)];
         const ArcBlocks& from = planet.tiers[t];
         lay_out_blocks(arcs.size(), out.tiers[t].bytes, out.tiers[t].at,
             [&](size_t i, unsigned) { return from.bytes_of(arcs[i]); },
@@ -564,21 +585,23 @@ AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector
                 std::copy_n(from.data(arcs[i]), from.bytes_of(arcs[i]), to);
                 return from.bytes_of(arcs[i]);
             },
-            std::string(kArcTiers[t].dir) + " arc_vertices", threads);
+            std::string(stage.tiers[t].dir) + " arc_vertices", threads);
     }
     return out;
 }
 
 void assign_region_arc_slots(AdminArcBlocks& blocks, const std::string& prev_region_dir, const std::string& region,
                              unsigned threads) {
+    const ArcStage& stage = *blocks.stage;
     std::ostringstream line;
-    line << "  " << region << " arcs:";
-    for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
+    line << "  " << region << (stage.has_minimal() ? "" : std::string(" ") + stage.set_word) << " arcs:";
+    for (ArcSet set : stage_sets(stage)) {
         ArcSetBlocks& s = blocks.set(set);
-        const std::string prev = prev_region_dir.empty() ? "" : arc_sidecar_path(prev_region_dir, set);
-        const std::string prev_fallback = prev_region_dir.empty() ? "" : arc_fallback_sidecar_path(prev_region_dir, set);
+        const std::string prev = prev_region_dir.empty() ? "" : arc_sidecar_path(prev_region_dir, set, stage);
+        const std::string prev_fallback =
+            prev_region_dir.empty() ? "" : arc_fallback_sidecar_path(prev_region_dir, set, stage);
         ArcSlots slots = allocate_arc_slots(s.keys, prev, s.fallback_keys, prev_fallback);
-        std::cerr << arc_slot_start_lines(region, set, prev, slots.counts);
+        std::cerr << arc_slot_start_lines(region, set_word(stage, set), prev, slots.counts);
         s.slots = std::move(slots.slots);
         s.sidecar = std::move(slots.sidecar);
         s.slot_counts = slots.counts;
@@ -587,6 +610,21 @@ void assign_region_arc_slots(AdminArcBlocks& blocks, const std::string& prev_reg
              << ";";
     }
     std::cerr << line.str() << "\n";
+}
+
+std::string assign_full_set_slots(AdminArcBlocks& blocks, const std::string& prev_sidecar,
+                                  const std::string& prev_fallback_sidecar, const std::string& region,
+                                  const std::string& labels, unsigned threads) {
+    ArcSetBlocks& s = blocks.set(ArcSet::Full);
+    ArcSlots slots = allocate_arc_slots(s.keys, prev_sidecar, s.fallback_keys, prev_fallback_sidecar);
+    const std::string words = std::string(blocks.stage->set_word) + " " + labels;
+    std::string lines = arc_slot_start_lines(region, words.c_str(), prev_sidecar, slots.counts);
+    s.slots = std::move(slots.slots);
+    s.sidecar = std::move(slots.sidecar);
+    s.slot_counts = slots.counts;
+    encode_ring_blocks(blocks, ArcSet::Full, threads);
+    return lines + "  " + region + " " + words + " arcs: full " + std::to_string(s.arcs()) +
+           " arcs, slots " + slot_line(s.slot_counts, s.sidecar.size()) + ";\n";
 }
 
 void write_arc_files(const std::string& dir, const ArcSetBlocks& set, const ArcBlocks& tier) {
@@ -628,17 +666,20 @@ size_t write_ring_files(const std::vector<std::string>& dirs, const AdminArcBloc
         at += span.size;
         if (at > UINT32_MAX) throw std::length_error("admin_rings.bin past 4 GiB: admin_polygons.bin holds 32-bit offsets");
     }
-    // The own names beside them (types.h AdminOwnName), a tombstone of none.
+    // The own names beside them (types.h AdminOwnName), a tombstone of none;
+    // the water layer's polygons (water_layer.h) go by their own names alone.
+    const bool own_names = blocks.stage == &kAdminArcStage;
     std::vector<AdminOwnName> own;
-    for (size_t slot = 0; slot < records.size(); slot++)
+    for (size_t slot = 0; own_names && slot < records.size(); slot++)
         if (records[slot].own_name_id != NO_DATA) own.push_back({static_cast<uint32_t>(slot), records[slot].own_name_id});
     for (size_t d = 0; d < dirs.size(); d++) {
         files[d].flush();
         if (!files[d]) throw std::runtime_error("failed to write " + dirs[d] + "/admin_rings.bin");
         write_binary_file(dirs[d] + "/admin_polygons.bin", reinterpret_cast<const char*>(out.data()),
                           out.size() * sizeof(AdminPolygonRecord));
-        write_binary_file(dirs[d] + "/" + kAdminOwnNamesFile, reinterpret_cast<const char*>(own.data()),
-                          own.size() * sizeof(AdminOwnName));
+        if (own_names)
+            write_binary_file(dirs[d] + "/" + kAdminOwnNamesFile, reinterpret_cast<const char*>(own.data()),
+                              own.size() * sizeof(AdminOwnName));
     }
     return at;
 }

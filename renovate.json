@@ -8,6 +8,12 @@
       "matchPackageNames": ["@protomaps/basemaps"],
       "groupName": null,
       "dependencyDashboardApproval": true
+    },
+    {
+      "description": "map-styles validates every style against the style spec of the oldest maplibre-gl an Immich release still ships, so that alias moves only when the oldest release does",
+      "matchDepNames": ["maplibre-gl-style-spec-oldest"],
+      "groupName": null,
+      "dependencyDashboardApproval": true
     }
   ]
 }

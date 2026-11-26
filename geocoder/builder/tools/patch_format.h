@@ -97,6 +97,10 @@ static constexpr size_t POSTCODE_CENTROID_STRIDE = 20;
 static constexpr size_t POSTCODE_CENTROID_POSTCODE_ID_OFF = 8;
 // The client file postcode_centroids.bin's section writes beside it.
 static constexpr const char* POSTCODE_SIDE_FILES[] = {"postcode_centroid_cells.bin"};
+// postcode_grid.bin's logical rows (postcode_grid.h LogicalRow): its section
+// replays the grid's runs, which its codec (gcs_codec.h grid) writes as
+// postcode_grid.bin. No string field: the grid holds its postcodes as text.
+static constexpr size_t POSTCODE_GRID_STRIDE = 24;
 // The client file addr_points.bin's and addr_vertices.bin's sections write
 // besides them (addr_files.h).
 static constexpr const char* ADDR_SIDE_FILES[] = {"addr_index.bin"};
@@ -276,17 +280,23 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // postcode_centroids.bin and postcode_centroid_cells.bin. No sparse delta
 // carries them (remap kind 3 is gone), no cell list delta (stride 0xFB)
 // carries any index, and file ids 24 and 25 name no file.
+// v20: the postcode grid (postcode_grid.h) merges as one logical stream of
+// 24-byte rows in cell order under file id 36, postcode_grid.bin, which the
+// patcher encodes again; a section of it right after the postcode
+// centroids', in every patch (an empty merge where neither day has it), with
+// the old file's hash before it where the old grid has rows
+// (HASHED_OLD_FILES).
 // v22: addr_cities.bin, an address point's addr:city as a core string
 // offset, follows addr_points.bin under file id 38 as a parallel delta of
-// string offsets after the other side files; ids 36 and 37 name no file.
-// v24: admin_polygons.bin's last byte is the polygon's rank_address, and the
+// string offsets after the other side files; id 37 names no file.
+// v25: admin_polygons.bin's last byte is the polygon's rank_address, and the
 // place files are PNL4: a visible row's type field is 4 bits, its top bit a
 // promoted node, so a logical place row's byte 14 is its rank_address (0 for
-// a hidden node). File id 39 names admin_own_names.bin, the own name of each
+// a hidden node). File id 40 names admin_own_names.bin, the own name of each
 // polygon that goes by its place node's English name, which merges as a
-// record file of a string field after the admin geometry. Versions 20, 21
-// and 23 are other formats'.
-static constexpr uint32_t GCPATCH_VERSION = 24;
+// record file of a string field after the admin geometry; id 39 names no
+// file. Versions 23 and 24 are other formats'.
+static constexpr uint32_t GCPATCH_VERSION = 25;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -343,16 +353,19 @@ enum class PatchFileId : uint32_t {
     INTERP_POSTCODES = 34,
     // The geo index's blocks, beside its top file (GEO_CELLS).
     GEO_ENTRIES = 35,
-    // No files (v22): names_no_file.
-    UNUSED_36 = 36,
+    // The postcode grid's logical rows (v20).
+    POSTCODE_GRID = 36,
+    // No file (v22): names_no_file.
     UNUSED_37 = 37,
     // Per address point: its addr:city, a core string offset (NO_DATA for
     // none), along addr_points (v22).
     ADDR_CITIES = 38,
+    // No file (v25): names_no_file.
+    UNUSED_39 = 39,
     // Beside admin_polygons.bin: (slot, own name) of each polygon that goes
-    // by its place node's English name (v24).
-    ADMIN_OWN_NAMES = 39,
-    COUNT = 40
+    // by its place node's English name (v25).
+    ADMIN_OWN_NAMES = 40,
+    COUNT = 41
 };
 
 static const char* patch_file_names[] = {
@@ -370,8 +383,10 @@ static const char* patch_file_names[] = {
     "strings_postcode.bin", "strings_poi.bin",
     "interp_postcodes.bin",
     "geo_entries.bin",
-    "unused (36)", "unused (37)",
+    "postcode_grid.bin",
+    "unused (37)",
     "addr_cities.bin",
+    "unused (39)",
     "admin_own_names.bin"
 };
 
@@ -511,12 +526,12 @@ inline bool is_geo_list_id(uint32_t id) {
 // Whether an id of the file table names no file, so no file section's: the
 // legacy strings.bin (no patch sends it), the geo index's lists, (v19) ids
 // 24 and 25, the postcode centroid cells, which the patcher writes beside
-// postcode_centroids.bin, and the entries file the centroids had, and (v22)
-// ids 36 and 37.
+// postcode_centroids.bin, and the entries file the centroids had, (v22)
+// id 37 and (v25) id 39.
 inline bool names_no_file(uint32_t id) {
     return id == uint32_t(PatchFileId::STRINGS) || is_geo_list_id(id) || id == uint32_t(PatchFileId::POSTCODE_CENTROID_CELLS) ||
-           id == uint32_t(PatchFileId::POSTCODE_CENTROID_ENTRIES) || id == uint32_t(PatchFileId::UNUSED_36) ||
-           id == uint32_t(PatchFileId::UNUSED_37);
+           id == uint32_t(PatchFileId::POSTCODE_CENTROID_ENTRIES) || id == uint32_t(PatchFileId::UNUSED_37) ||
+           id == uint32_t(PatchFileId::UNUSED_39);
 }
 
 // Secondary ID remap marker: 0xFFFFFFF6
@@ -828,15 +843,19 @@ static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 // (way_replay.h) the node blocks of the groups a day leaves whole and their
 // rows' anchors, counts and codes (both files of each way pair), the address
 // replay (addr_replay.h) the old footprint blobs and the records whose
-// points they sit under (addr_vertices.bin and addr_points.bin). The diff
-// sends one for each file of HASHED_OLD_FILES the old dir holds and whose
-// family has a section. The patcher refuses a second hash of a file, a hash
-// of any other file, and a replay without the hashes it checks by. A family
-// both of whose sections are unchanged is copied as its files sit, and POI
-// records sent unchanged over blocks that change go through the codecs: the
-// patcher holds each hashed file of such a family to its hash before it
-// reads it. The hash of an old file without records is read and checks
-// nothing.
+// points they sit under (addr_vertices.bin and addr_points.bin). The
+// postcode grid's is checked before its runs are replayed and before the
+// copy below: its postcodes are text, which no string tier's hash covers,
+// and a grid of other postcodes, as many runs, decodes as well as the old
+// one. The diff sends one for each file of
+// HASHED_OLD_FILES the old dir holds and whose family has a section, the
+// grid's where the old grid has rows. The patcher refuses a second hash of a
+// file, a hash of any other file, and a replay without the hashes it checks
+// by. A family both of whose sections are unchanged is copied as its files
+// sit, and POI records sent unchanged over blocks that change go through the
+// codecs: the patcher holds each hashed file of such a family to its hash
+// before it reads it. The hash of an old file without records is read and
+// checks nothing.
 static constexpr uint32_t OLD_FILE_HASH_MARKER = 0xFFFFFFF8;
 static constexpr PatchFileId HASHED_OLD_FILES[] = {
     PatchFileId::POI_RECORDS,
@@ -847,6 +866,7 @@ static constexpr PatchFileId HASHED_OLD_FILES[] = {
     PatchFileId::INTERP_NODES,
     PatchFileId::ADDR_POINTS,
     PatchFileId::ADDR_VERTICES,
+    PatchFileId::POSTCODE_GRID,
 };
 inline bool is_hashed_old_file(uint32_t fid) {
     return std::find(std::begin(HASHED_OLD_FILES), std::end(HASHED_OLD_FILES), static_cast<PatchFileId>(fid)) !=

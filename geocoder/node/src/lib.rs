@@ -71,14 +71,19 @@ impl Task for SearchTask {
 pub struct PlaceSearchOptions {
     /// Where the index lives; default `<dataset dir>/search`, where packs that ship one put it.
     pub index_dir: Option<String>,
-    /// Sort memory of a build on this device in MiB (default 16: the build then fits a 32 MiB
-    /// memory limit).
+    /// Sort memory of a build on this device in MiB (default 16: the build's own memory then fits
+    /// a 32 MiB limit; the dataset's mapped files count apart, as `load` says).
     pub build_memory_mb: Option<u32>,
 }
 
 #[napi]
 impl Geocoder {
-    /// Load an index directory (mmap; near-instant, ~3 MiB resident).
+    /// Load an index directory and its optional `water/` layer. Index data is memory-mapped;
+    /// opening a water layer also reads its metadata and validates its cell index. A memory
+    /// limit counts the mapped pages lookups touch and their page tables: under one of 32 MiB
+    /// the planet's datasets answered (2026-11), but `full` with the `all-exact` water tier,
+    /// whose page tables outgrew it part way through 12,265 lookups; `full` with `all` stayed
+    /// within it.
     #[napi(factory)]
     pub fn load(dir: String) -> Result<Geocoder> {
         let (idx, loaded) = dataset::load(Path::new(&dir), || {
@@ -94,7 +99,9 @@ impl Geocoder {
     }
 
     /// Lookup on the libuv worker pool — cold-cache page faults never
-    /// block the event loop. Resolves to the address JSON, `{}` for a point off the globe.
+    /// block the event loop. Resolves to the address JSON, `{}` for a point off the globe; its
+    /// `water` (last, `{name, class, type}`) names the water holding the point, where the
+    /// dataset's `water/` dir holds some.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn reverse_geocode(&self, lat: f64, lng: f64) -> AsyncTask<QueryTask> {
         AsyncTask::new(QueryTask { inner: self.inner.clone(), lat, lng })
@@ -102,9 +109,10 @@ impl Geocoder {
 
     /// Opens place search for this dataset: the index in `indexDir` when it was built from these
     /// files (the one a pack ships, or one built here before), else builds it there on this
-    /// device first, on a thread of its own (seconds to minutes, within 32 MiB). After a patch,
-    /// load the patched dataset and open place search on that geocoder: this one rejects files
-    /// replaced since it loaded them. Resolves to "current" or "built".
+    /// device first, on a thread of its own (seconds to minutes, its sort within
+    /// `buildMemoryMb`). After a patch, load the patched dataset and open place search on that
+    /// geocoder: this one rejects files replaced since it loaded them. Resolves to "current" or
+    /// "built".
     #[napi(ts_return_type = "Promise<'current' | 'built'>")]
     pub fn open_place_search<'env>(&self, env: &'env Env, options: Option<PlaceSearchOptions>) -> Result<Object<'env>> {
         let PlaceSearchOptions { index_dir, build_memory_mb } = options.unwrap_or(PlaceSearchOptions { index_dir: None, build_memory_mb: None });

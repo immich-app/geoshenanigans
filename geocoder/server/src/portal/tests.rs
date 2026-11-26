@@ -245,7 +245,7 @@ fn template_selections() -> Vec<(RegionSelection, bool)> {
     for mode in template_values("mode") {
         for quality in template_values("quality") {
             for poi_tier in template_values("poi_tier") {
-                let s = RegionSelection { region: "planet".into(), mode: mode.clone(), quality: quality.clone(), poi_tier };
+                let s = RegionSelection { region: "planet".into(), mode: mode.clone(), quality: quality.clone(), poi_tier, water: "none".into() };
                 let allowed = t["constraints"].as_array().unwrap().iter().all(|c| {
                     let has = |key: &str| c[key].as_object().unwrap().iter().all(|(axis, value)| s.axis(axis) == value.as_str());
                     !has("when") || has("requires")
@@ -452,6 +452,35 @@ async fn a_builds_objects_cover_every_selection_it_serves_and_its_sync_fetches_e
             assert_eq!(inode(&root.join(SETS).join(&d.id).join(&name)), inode(&root.join(&path)), "{} {name}", d.id);
         }
     }
+}
+
+// The portal serves each selection without water (catalog::WATER): no
+// dataset takes a file of the build's water dirs, and no sync fetches one;
+// a preset of a selection with water names none of its datasets, as a
+// preset of another region names none.
+#[tokio::test]
+async fn the_portal_serves_the_selections_without_water() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let (cfg, _) = manifest_of(&bucket).await;
+    let plan = plan_edited(&bucket, |_| {}).await.unwrap();
+    let water: BTreeSet<&String> = cfg.files.keys().filter(|f| f.starts_with("planet/water/")).collect();
+    assert!(!water.is_empty());
+    for d in &plan.datasets {
+        assert_eq!(d.selection.water, catalog::WATER, "{}", d.id);
+        assert!(d.files.iter().all(|f| !water.contains(f)), "{}", d.id);
+    }
+    assert!(plan.objects.iter().flat_map(|o| &o.files).all(|f| !water.contains(f)));
+
+    let wet = plan_edited(&bucket, |m| {
+        let mut wet = m["presets"][0].clone();
+        wet["id"] = "wet".into();
+        wet["selections"]["water"] = "all".into();
+        m["presets"].as_array_mut().unwrap().push(wet);
+    })
+    .await
+    .unwrap();
+    let presets = |plan: &catalog::Plan| plan.presets.iter().map(|(p, at)| (p.id.clone(), *at)).collect::<Vec<_>>();
+    assert_eq!(presets(&wet), presets(&plan));
 }
 
 // A build of another build version is refused once its manifest says so,
@@ -969,8 +998,8 @@ async fn a_sync_killed_part_way_resumes_in_its_dir_fetching_only_what_had_not_co
     let mut want: Vec<String> = order[3..].iter().map(|o| format!("{DATE}/{}", object_url(o))).collect();
     want.sort();
     assert_eq!(resumed, want);
-    let (cfg, _) = manifest_of(&bucket).await;
-    for f in cfg.files.keys().filter(|f| f.starts_with("planet/")) {
+    let (cfg, manifest) = manifest_of(&bucket).await;
+    for f in catalog::plan(&cfg, &manifest).unwrap().objects.iter().flat_map(|o| &o.files) {
         assert!(std::fs::read(root.join(f)).unwrap() == bucket.file(f), "{f}");
     }
 }
@@ -1648,6 +1677,19 @@ async fn datasets_passes_on_the_builds_attribution_as_it_is() {
         m.as_object_mut().unwrap().remove("attribution");
     }).await.unwrap();
     assert_eq!(plan.json("id", "dir")["attribution"], serde_json::Value::Null);
+}
+
+// /datasets lists the ids of the build's components, sorted, which
+// the shell patterns of its attribution's applies_to name: the page tells a
+// credit of the water alone by the components its patterns match.
+#[tokio::test]
+async fn datasets_lists_the_ids_of_the_builds_components() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let mut ids: Vec<String> = template()["components"].as_object().unwrap().keys().cloned().collect();
+    ids.sort();
+    assert!(ids.contains(&"water.major".to_string()) && ids.contains(&"dir.admin-minimal".to_string()), "{ids:?}");
+    let plan = plan_edited(&bucket, |_| {}).await.unwrap();
+    assert_eq!(plan.json("id", "dir")["components"], serde_json::json!(ids));
 }
 
 // The lookups run a few at once over every client, each on a blocking

@@ -150,6 +150,48 @@ class FetchPreviousIndexTest(unittest.TestCase):
         with open(self.log) as f:
             self.assertEqual(f.read().splitlines(), [f"decode - {self.dest}/planet/admin"])
 
+    def test_a_water_dir_three_dirs_down_comes_down_as_any_other(self):
+        # A water dir: its units, a .bin.zst, its JSON files (kept raw beside their .zst) and its
+        # sidecars, which the build fetched earlier.
+        arcs = {"arc_index.bin": content(5, 400), "arc_vertices.bin": content(6)}
+        rings = content(7, 900)
+        water = "geocoder/builds/2026-11-16/planet/water/all/exact"
+        published = {
+            "arcs.tt.zst": tar(arcs),
+            "admin_polygons.tt.zst": tar({"admin_polygons.bin": content(8, 160)}),
+            "admin_rings.bin.zst": subprocess.run(["zstd", "-q", "-c"], input=rings, capture_output=True,
+                                                  check=True).stdout,
+            "water_meta.json": b'{"types": []}',
+            "water_meta.json.zst": b"zst",
+            "attribution.json": b"[]",
+            "admin_polygons.osm_ids": b"ids",
+            "admin_polygons.fallback.osm_ids": b"keys",
+            "patch.gcpatch": b"GCPATCH",
+        }
+        for name, data in published.items():
+            path = os.path.join(self.bucket, water, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+        self.built_with(0)
+
+        status, out = self.fetch()
+
+        self.assertEqual(status, "0", out)
+        d = "planet/water/all/exact"
+        for name, data in arcs.items():
+            self.assertEqual(self.held(f"{d}/{name}"), data, name)
+        self.assertEqual(self.held(f"{d}/admin_polygons.bin"), content(8, 160))
+        self.assertEqual(self.held(f"{d}/admin_rings.bin"), rings)
+        self.assertEqual(self.held(f"{d}/water_meta.json"), b'{"types": []}')
+        self.assertEqual(self.held(f"{d}/attribution.json"), b"[]")
+        for name in ("admin_polygons.osm_ids", "admin_polygons.fallback.osm_ids", "arcs.tt.zst"):
+            self.assertIsNone(self.held(f"{d}/{name}"), name)
+        with open(self.log) as f:
+            self.assertEqual(sorted(f.read().splitlines()), sorted([f"decode - {self.dest}/planet/admin",
+                                                                   f"decode - {self.dest}/{d}",
+                                                                   f"decode - {self.dest}/{d}"]))
+
     def test_a_unit_cut_off_mid_stream_is_fetched_whole_and_decoded(self):
         self.built_with(0)
 

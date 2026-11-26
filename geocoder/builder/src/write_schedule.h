@@ -12,8 +12,8 @@
 
 // The record kinds a region holds; the continent split shares out each one
 // by its cell pairs.
-enum class RecordKind { Ways, Addrs, Interps, Pois, Places, Admins };
-constexpr size_t RECORD_KIND_COUNT = 6;
+enum class RecordKind { Ways, Addrs, Interps, Pois, Places, Admins, Waters };
+constexpr size_t RECORD_KIND_COUNT = 7;
 
 // Per record kind: bytes held (sizes, not capacities: room a vector never
 // filled costs no memory) or records.
@@ -55,6 +55,8 @@ inline KindValues record_bytes(const ParsedData& d) {
         + vector_bytes(d.admin_sidecar_blob) + vector_bytes(d.admin_parent_ids) + vector_bytes(d.admin_index_cells)
         + vector_bytes(d.admin_minimal_index_cells) + map_bytes_approx(d.postcode_accum) + strings
         + d.admin_arcs.bytes();
+    // The water layer: its records, names, encoded arcs and cells.
+    at(b, RecordKind::Waters) = d.water.bytes();
     return b;
 }
 
@@ -69,7 +71,10 @@ inline KindValues record_counts(const ParsedData& d) {
     return n;
 }
 
-// The cell pairs of each kind a region's records sit in (admins have none).
+// The cell pairs of each kind a region's records sit in: the waters' their
+// cell index's entries, which the continent split routes; admins have none.
+// The strategy-2 passes and the ordering steps never see water records:
+// record_counts leaves them out.
 inline KindValues pair_counts(const ParsedData& d) {
     KindValues n{};
     at(n, RecordKind::Ways) = d.sorted_way_cells.size();
@@ -77,6 +82,7 @@ inline KindValues pair_counts(const ParsedData& d) {
     at(n, RecordKind::Interps) = d.sorted_interp_cells.size();
     at(n, RecordKind::Pois) = d.sorted_poi_cells.size();
     at(n, RecordKind::Places) = d.sorted_place_cells.size();
+    at(n, RecordKind::Waters) = d.water.cells.size();
     return n;
 }
 
@@ -101,7 +107,11 @@ constexpr uint64_t kStrategy2BytesPerRecord = 56;
 // The continent split's planet-sized scratch: an id map per record (4 B)
 // and, while ids are collected, 3 bits per record (the bit every worker
 // marks, and its RankedBits blocks of 16 B per 64 records); beside it, the
-// workers' copies of a share of the subset's cell pairs.
+// workers' copies of a share of the subset's cell pairs. The water split
+// reads the planet's water masks (a byte a water cell entry, held with the
+// other kinds' masks while the continents run), and marks each of the
+// planet's water polygons, and beside those each of its arcs, as the
+// records are marked: 3 bits each, with no id map.
 constexpr uint64_t kFilterMapBytesPerRecord = 4;
 constexpr uint64_t kFilterMarkBitsPerRecord = 3;
 constexpr uint64_t kFilterPairCopyDivisor = 2;
@@ -125,6 +135,56 @@ constexpr uint64_t kModeBytes = uint64_t(256) << 20;
 constexpr uint64_t kAdminTierAdminDivisor = 16;
 constexpr uint64_t kAdminMinimalAdminDivisor = 3;
 constexpr uint64_t kPoiTierPoiTenths = 4;
+
+// The water stage's working set against the layer it reads: the records in
+// their slots for each set, the names a set uses, and the major tier's
+// share of the arcs and ring blocks, its slots and the sidecars (planet
+// 261020: about half of it); and beside the layer's cells, the copy of them
+// renumbered to a set's slots, collected in the workers' parts beside it and
+// sorted through a buffer as large (three times the cells).
+constexpr uint64_t kWaterStageWaterTenths = 6;
+constexpr uint64_t kWaterStageCellTimes = 3;
+
+// The water stage's arrays by slot, which a set's slot table sizes,
+// tombstones and all: the records at their slots, each slot's polygon and
+// the records it writes. The share of the layer above counts those of
+// today's polygons; a previous build whose slots outnumber them (water
+// gone since) leaves the rest to these.
+constexpr uint64_t kWaterSlotBytes = sizeof(AdminPolygon) + sizeof(uint32_t) + sizeof(AdminPolygonRecord);
+
+// What a water set's polygon slot allocation (polygon_slots) holds for each
+// slot of the previous build's sidecar it loads, tombstones among them,
+// before the arrays above exist: the slot as loaded, its key among the
+// previous keys and the sort's copy of them, a fallback pass's key of it
+// and the sort's copy, its fallback key, and its marks.
+constexpr uint64_t kWaterSlotAllocationBytes =
+    sizeof(gc::id_alloc::SidecarSlot) + 4 * sizeof(gc::id_alloc::KeyIdx) + sizeof(uint64_t) + 2;
+
+// Each slot of the previous build's water dirs: the more of the two.
+constexpr uint64_t kWaterPreviousSlotBytes = std::max(kWaterSlotBytes, kWaterSlotAllocationBytes);
+
+// What a water set's arc slot allocation (allocate_arc_slots) holds for
+// each slot of the previous build's sidecar it loads, tombstones among
+// them: the slot as loaded and the key it can be claimed by, its key among
+// the previous keys and the sort's copy of them, its fallback keys, a
+// fallback pass's key of it and the sort's copy, and its marks; past those
+// the write's offset and arc of a slot (write_arc_files) are less. The
+// share of the layer above counts the slots of today's arcs; a previous
+// build whose slots outnumber them (water gone since) leaves the rest to
+// these.
+constexpr uint64_t kWaterArcSlotBytes = sizeof(gc::id_alloc::SidecarSlot) + sizeof(uint64_t) +
+                                        4 * sizeof(gc::id_alloc::KeyIdx) + sizeof(ArcFallbackKeys) + 2;
+
+// The previous build's arc slots of a region's water dirs past its arcs
+// today (water::previous_arc_slots, water::arc_counts): the larger of the
+// all set's and, `with_major` (a build that writes the major tier), the
+// major tier's, whose allocations run one after the other (none past where
+// today's are as many or more).
+inline uint64_t water_arc_slots_past(const water::ArcCounts& previous, const water::ArcCounts& today,
+                                     bool with_major = true) {
+    auto past = [](uint64_t slots, uint64_t arcs) { return slots > arcs ? slots - arcs : 0; };
+    return std::max(past(previous.all, today.all), with_major ? past(previous.major, today.major) : 0);
+}
 
 // What write_place_files holds beside the nodes it is given, as a multiple
 // of their bytes (20 a node): each node's cell key, the order and the sort's
@@ -189,10 +249,14 @@ inline uint64_t ordering_cost(const ParsedData& d) {
     return copies + (sum(counts) - at(counts, RecordKind::Admins)) * kReorderBytesPerRecord;
 }
 
-// What the continent split holds beyond the subset it builds.
-inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& continent_pairs) {
+// What the continent split holds beyond the subset it builds, of a planet
+// of `water_polygons` water polygons over `water_arcs` arcs, which
+// record_counts leaves out.
+inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& continent_pairs,
+                            uint64_t water_polygons = 0, uint64_t water_arcs = 0) {
     const uint64_t records = sum(planet_counts);
-    return records * kFilterMapBytesPerRecord + records * kFilterMarkBitsPerRecord / 8
+    return records * kFilterMapBytesPerRecord
+         + (records + water_polygons + water_arcs) * kFilterMarkBitsPerRecord / 8
          + sum(continent_pairs) * sizeof(CellItemPair) / kFilterPairCopyDivisor;
 }
 
@@ -200,16 +264,22 @@ inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& c
 // runs, the boundary tiers and both admin-minimal dirs (which write the arc
 // geometry) among them.
 struct StageCosts {
-    uint64_t modes = 0, admin_tiers = 0, places = 0, admin_minimal = 0, poi_tiers = 0;
+    uint64_t modes = 0, admin_tiers = 0, places = 0, admin_minimal = 0, poi_tiers = 0, water = 0;
 
-    uint64_t total() const { return modes + admin_tiers + places + admin_minimal + poi_tiers; }
-    uint64_t largest() const { return std::max({modes, admin_tiers, places, admin_minimal, poi_tiers}); }
+    uint64_t total() const { return modes + admin_tiers + places + admin_minimal + poi_tiers + water; }
+    uint64_t largest() const { return std::max({modes, admin_tiers, places, admin_minimal, poi_tiers, water}); }
 };
 
 // The place stage writes its dirs one after another, each through the place
 // writer; an admin-minimal dir writes the nodes it keeps, a copy of at most
-// all of them, through the same writer.
-inline StageCosts stage_costs(const KindValues& bytes) {
+// all of them, through the same writer. `water_pairs` are the water cell
+// index's entries, among the waters' bytes; `water_slots` the previous
+// build's slots of the water dirs (water::previous_slots), each of which
+// the slot allocation loads and the write keeps; `water_arc_slots` the
+// previous build's arc slots past today's arcs (water_arc_slots_past),
+// which the slot allocations load.
+inline StageCosts stage_costs(const KindValues& bytes, uint64_t water_pairs = 0, uint64_t water_slots = 0,
+                              uint64_t water_arc_slots = 0) {
     StageCosts c;
     const uint64_t admins = at(bytes, RecordKind::Admins), places = at(bytes, RecordKind::Places);
     c.modes = 3 * kModeBytes;
@@ -217,6 +287,10 @@ inline StageCosts stage_costs(const KindValues& bytes) {
     c.places = places * kPlaceWriterTimes;
     c.admin_minimal = admins / kAdminMinimalAdminDivisor + places * (1 + kPlaceWriterTimes);
     c.poi_tiers = at(bytes, RecordKind::Pois) * kPoiTierPoiTenths / 10;
+    const uint64_t waters = at(bytes, RecordKind::Waters);
+    const uint64_t cells = std::min<uint64_t>(waters, water_pairs * sizeof(CellItemPair));
+    c.water = (waters - cells) * kWaterStageWaterTenths / 10 + cells * kWaterStageCellTimes +
+              water_slots * kWaterPreviousSlotBytes + water_arc_slots * kWaterArcSlotBytes;
     return c;
 }
 
@@ -228,8 +302,9 @@ struct RegionCost {
 };
 
 inline uint64_t region_peak(const KindValues& bytes, const KindValues& counts, uint64_t filter_bytes,
-                            RunOrder order) {
-    const StageCosts stages = stage_costs(bytes);
+                            RunOrder order, uint64_t water_pairs = 0, uint64_t water_slots = 0,
+                            uint64_t water_arc_slots = 0) {
+    const StageCosts stages = stage_costs(bytes, water_pairs, water_slots, water_arc_slots);
     const uint64_t steps = order == RunOrder::Serial ? stages.largest() : stages.total();
     return sum(bytes) + std::max({filter_bytes, strategy2_cost(counts, order), steps});
 }
@@ -238,29 +313,36 @@ inline uint64_t region_peak(const KindValues& bytes, const KindValues& counts, u
 // after another. It holds its whole reservation: its write takes no stage
 // leases of its own.
 inline RegionCost continent_cost(const KindValues& bytes, const KindValues& counts, uint64_t filter_bytes,
-                                 uint64_t capacity) {
-    const uint64_t at_once = region_peak(bytes, counts, filter_bytes, RunOrder::Concurrent);
+                                 uint64_t capacity, uint64_t water_pairs = 0, uint64_t water_slots = 0,
+                                 uint64_t water_arc_slots = 0) {
+    const uint64_t at_once =
+        region_peak(bytes, counts, filter_bytes, RunOrder::Concurrent, water_pairs, water_slots, water_arc_slots);
     if (at_once <= capacity) return {at_once, RunOrder::Concurrent};
 
-    return {region_peak(bytes, counts, filter_bytes, RunOrder::Serial), RunOrder::Serial};
+    return {region_peak(bytes, counts, filter_bytes, RunOrder::Serial, water_pairs, water_slots, water_arc_slots),
+            RunOrder::Serial};
 }
 
 // A continent's share of the planet's values, kind by kind, from its share
 // of each kind's cell pairs, with kShareMarginPercent. Admins have no pairs:
-// they take the share the other kinds' values add up to.
+// they take the share the values of the kinds of records (all but the
+// waters) add up to. The waters take `waters`: a polygon its cells list
+// comes whole, with its arcs, however few of its cells those are, so the
+// split's share of them is counted polygon by polygon (water::share_bytes).
 inline KindValues continent_share(const KindValues& planet, const KindValues& planet_pairs,
-                                  const KindValues& continent_pairs) {
+                                  const KindValues& continent_pairs, uint64_t waters = 0) {
     KindValues out{};
     double shared = 0, total = 0;
     for (size_t k = 0; k < RECORD_KIND_COUNT; k++) {
-        if (planet_pairs[k] == 0) continue;
+        if (planet_pairs[k] == 0 || k == static_cast<size_t>(RecordKind::Waters)) continue;
         double share = std::min(1.0, static_cast<double>(continent_pairs[k]) / static_cast<double>(planet_pairs[k]));
+        out[k] = static_cast<uint64_t>(static_cast<double>(planet[k]) * share * kShareMarginPercent / 100);
         shared += static_cast<double>(planet[k]) * share;
         total += static_cast<double>(planet[k]);
-        out[k] = static_cast<uint64_t>(static_cast<double>(planet[k]) * share * kShareMarginPercent / 100);
     }
     const double admin_share = total > 0 ? shared / total : 0;
-    at(out, RecordKind::Admins) = static_cast<uint64_t>(
-        static_cast<double>(at(planet, RecordKind::Admins)) * admin_share * kShareMarginPercent / 100);
+    const double admins = static_cast<double>(at(planet, RecordKind::Admins));
+    at(out, RecordKind::Admins) = static_cast<uint64_t>(admins * admin_share * kShareMarginPercent / 100);
+    at(out, RecordKind::Waters) = waters;
     return out;
 }

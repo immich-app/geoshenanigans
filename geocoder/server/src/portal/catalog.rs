@@ -22,6 +22,11 @@ pub const REGIONS: [&str; 1] = ["planet"];
 /// dataset :3002 served before the portal had more than one.
 pub const DEFAULT_PRESET: &str = "with-addresses";
 
+/// The water of each selection the portal serves: none. Its datasets are
+/// those of the other axes (AXES), their ids and /datasets naming no water,
+/// and a preset with water names none of them.
+pub const WATER: &str = "none";
+
 /// What the portal reads of configurations.json besides what the
 /// downloader does (downloader::Configurations): the build, the axes, the
 /// constraints and the presets.
@@ -231,6 +236,9 @@ pub struct Plan {
     pub groups: Vec<Group>,
     /// The manifest's attribution, as it is.
     pub attribution: Option<serde_json::Value>,
+    /// The ids of the build's components, sorted: the shell patterns of an attribution
+    /// entry's applies_to name them.
+    pub components: Vec<String>,
 }
 
 /// The values of an axis of `manifest`, in their order (by key where two
@@ -342,6 +350,7 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
                         mode: mode.to_string(),
                         quality: quality.to_string(),
                         poi_tier: tier.to_string(),
+                        water: WATER.to_string(),
                     };
                     let id = dataset_id(&sel);
                     if !plain_name(&id) {
@@ -363,21 +372,21 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
                             return Err(format!("{id}: {path} is not in the manifest"));
                         }
                     }
-                    let fetches = downloader::fetches(cfg, &files).map_err(|e| format!("{id}: {e}"))?;
+                    let fetches = downloader::fetches(cfg, &resolved, &files).map_err(|e| format!("{id}: {e}"))?;
                     for fetch in &fetches {
-                        for path in std::iter::once(fetch.path()).chain(fetch.files().into_iter().map(|(path, _)| path)) {
+                        for path in std::iter::once(fetch.path()).chain(fetch.files().into_iter().map(|f| f.path)) {
                             check_path(path, region).map_err(|why| format!("{id}: {why}"))?;
                         }
                         // A unit decodes into its own dir.
                         let dir = |path: &str| path.rsplit_once('/').map(|(dir, _)| dir.to_string());
-                        if fetch.files().iter().any(|(path, _)| dir(path) != dir(fetch.path())) {
+                        if fetch.files().iter().any(|f| dir(f.path) != dir(fetch.path())) {
                             return Err(format!("{id}: {} holds files of another dir", fetch.path()));
                         }
                         objects.entry(fetch.path().to_string()).or_insert_with(|| Object {
                             path: fetch.path().to_string(),
                             unit: matches!(fetch, downloader::Fetch::Unit { .. }),
                             size: fetch.size(),
-                            files: fetch.files().iter().map(|(path, _)| path.to_string()).collect(),
+                            files: fetch.files().iter().map(|f| f.path.to_string()).collect(),
                             link: None,
                         });
                     }
@@ -402,6 +411,9 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
     let mut presets = Vec::new();
     for preset in &manifest.presets {
         if !preset.selections.get("region").is_some_and(|r| REGIONS.contains(&r.as_str())) {
+            continue;
+        }
+        if preset.selections.get("water").is_some_and(|w| w != WATER) {
             continue;
         }
         let at = datasets.iter().position(|d| {
@@ -463,6 +475,7 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
         default,
         groups,
         attribution: manifest.attribution.clone(),
+        components: cfg.components.keys().cloned().collect(),
     })
 }
 
@@ -535,7 +548,8 @@ impl Plan {
 
     /// What /datasets answers while the build of the publication ID `id`
     /// (sync::publication_id) is served from its dir `dir`: its attribution
-    /// as the manifest has it, null where it has none.
+    /// as the manifest has it, null where it has none, and the ids of its
+    /// components, which the attribution's applies_to names.
     pub fn json(&self, id: &str, dir: &str) -> serde_json::Value {
         let selection = |s: &RegionSelection| {
             serde_json::json!({ "region": s.region, "mode": s.mode, "quality": s.quality, "poi_tier": s.poi_tier })
@@ -575,6 +589,7 @@ impl Plan {
                 "requires": x.requires,
             })).collect::<Vec<_>>(),
             "attribution": self.attribution,
+            "components": self.components,
         })
     }
 }

@@ -1,3 +1,4 @@
+mod acme;
 mod auth;
 mod downloader;
 mod handlers;
@@ -101,6 +102,16 @@ async fn health(
     // poll this; keep it allocation-light and unauthenticated.
     let body = format!("{{\"status\":\"ok\",\"regions\":{}}}", index.loaded_count());
     ([(axum::http::header::CONTENT_TYPE, "application/json")], body)
+}
+
+// The credit of the data this server answers from, as HTML: the loaded
+// datasets' attribution.json and poi_attribution.json (credits_html),
+// read-only and unauthenticated, as /test is.
+async fn test_credits(index: axum::extract::Extension<Arc<MultiIndex>>) -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        credits_html(&index.credits()),
+    )
 }
 
 async fn get_configuration(
@@ -215,27 +226,19 @@ async fn async_main() {
 
     let region_state = Arc::new(RegionState::new(index.clone(), std::path::PathBuf::from(data_dir)));
 
-    // On startup, kick off any preload downloads from the persisted
-    // configuration. Skipped silently if there's no persisted file —
-    // server starts empty and waits for a PUT /admin/configuration.
-    {
-        let s = region_state.clone();
-        let cfg = s.get_configuration().await;
-        for region in cfg.preload {
-            let s = s.clone();
-            tokio::spawn(async move {
-                if let Err(e) = s.ensure_loaded(&region).await {
-                    eprintln!("startup preload {}: {}", region, e);
-                }
-            });
-        }
-    }
+    // On startup, kick off the downloads the persisted configuration asks
+    // for: its preloads, and each loaded region whose files are of another
+    // bucket or selection (a PUT's whose downloads had not gone through).
+    // Skipped if there's no persisted file — the server waits for a PUT
+    // /admin/configuration.
+    drop(region_state.resume().await);
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/reverse", get(reverse_geocode))
         .route("/polygons", get(polygons_geojson))
         .route("/test", get(handlers::test_portal))
+        .route("/test/credits", get(test_credits))
         .route("/admin/configuration", get(get_configuration).put(put_configuration))
         .merge(auth::router())
         .layer(axum::Extension(index))
@@ -260,7 +263,7 @@ async fn async_main() {
             .cache(DirCache::new(cache_dir.clone()))
             .directory_lets_encrypt(true)
             .state();
-        let acceptor = state.axum_acceptor(state.default_rustls_config());
+        let acceptor = acme::AxumAcceptor::new(&state, state.default_rustls_config());
 
         tokio::spawn(async move {
             loop {
