@@ -569,13 +569,17 @@ async fn water_is_none_or_a_water_dir_of_the_build_and_all_by_default() {
     assert_eq!(water["values"][0].get("size_disk"), None);
     assert_eq!(fetch(&format!("{url}/health")).await.json()["water"], serde_json::json!(["water/major", "water/all", "water/all-exact"]));
 
-    let lake = serde_json::json!({"name": "Test Lake", "class": "water", "type": "lake"});
+    let lake = serde_json::json!({"name": "Test Lake", "class": "water", "type": "lake", "landmark": true});
     for (water, named) in [("", "all"), ("&water=all", "all"), ("&water=major", "major"), ("&water=all-exact", "all-exact"), ("&water=none", "none")] {
         for dataset in ["", "&dataset=smallest"] {
             let got = fetch(&format!("{url}/reverse?lat=47.005&lon=8.002&key=test{water}{dataset}")).await;
             assert_eq!((got.status, got.header("x-geocoder-water")), (200, Some(named)), "{water}{dataset}");
             assert!(got.header("access-control-expose-headers").unwrap().contains("x-geocoder-water"));
-            let want = if named == "none" { serde_json::json!({"address": {}}) } else { serde_json::json!({"address": {}, "water": lake}) };
+            let want = if named == "none" {
+                serde_json::json!({"licence": query_server::OSM_LICENCE, "address": {}})
+            } else {
+                serde_json::json!({"licence": query_server::OSM_LICENCE, "address": {}, "water": lake})
+            };
             assert_eq!(got.json(), want, "{water}{dataset}");
         }
     }

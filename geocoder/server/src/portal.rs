@@ -577,8 +577,9 @@ async fn held(places: &Arc<tokio::sync::Semaphore>, served: &Served, at: usize, 
 /// `water`, as a dataset whose water/ dir holds those files answers it
 /// (query_server::Address's water: last, absent where no water holds the
 /// point, and never in an answer of no continent): query-server's
-/// (handlers::reverse_answer), its water field that of `water`, debug=all's
-/// result's too. The other debug answers tell nothing of water.
+/// (handlers::reverse_answer), its water field that of `water`, its landmark
+/// decided as the server decides it (MultiIndex::query_json_with_water),
+/// debug=all's result's too. The other debug answers tell nothing of water.
 pub fn reverse_with_water(index: &MultiIndex, water: Option<&WaterLayer>, lat: f64, lon: f64, debug: Option<&str>) -> Response {
     let Some(water) = water.filter(|_| matches!(debug, None | Some("all"))) else {
         return handlers::reverse_answer(index, lat, lon, debug);
@@ -601,16 +602,7 @@ pub fn reverse_with_water(index: &MultiIndex, water: Option<&WaterLayer>, lat: f
         });
         return json_answer(serde_json::to_string_pretty(&combined).unwrap_or_default());
     }
-    let mut json = index.query_json(lat, lon);
-    if json != "{}" && json.ends_with('}') {
-        if let Some(detail) = water.at(lat, lon) {
-            json.pop();
-            json.push_str(",\"water\":");
-            json.push_str(&serde_json::to_string(&detail).unwrap_or_default());
-            json.push('}');
-        }
-    }
-    json_answer(json)
+    json_answer(index.query_json_with_water(lat, lon, Some(water)))
 }
 
 /// /reverse of a dataset, checked as query-server checks it, answered as a
