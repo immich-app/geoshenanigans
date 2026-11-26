@@ -379,12 +379,22 @@ class DownloadStepTest(unittest.TestCase):
         `pbf_seconds` by the step's clock and, unless `no_postal`, the postal places' cache; returns its outputs,
         its output lines and how long it took. `fails`: the step must fail, and gives no outputs."""
         output = os.path.join(self.root, "output")
+        # The step reads two files of the workspace: the diff fetcher, and the marine areas' pin, which here
+        # pins none, so these runs don't depend on the version the repo pins (test_nightly_marine covers that).
+        ws = os.path.join(self.root, "ws")
+        tools, data = os.path.join(ws, "geocoder", "builder", "tools"), os.path.join(ws, "geocoder", "builder", "data")
+        if not os.path.exists(ws):
+            os.makedirs(tools)
+            os.makedirs(data)
+            os.symlink(os.path.join(HERE, "fetch_day_diff.sh"), os.path.join(tools, "fetch_day_diff.sh"))
+            with open(os.path.join(data, "marine.json"), "w") as f:
+                json.dump({"version": None, "path": None, "sha256": None}, f)
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "WORKDIR": self.work, "CACHE_ENDPOINT": "http://cache.invalid",
                "CACHE_BUCKET": "cache", "CACHE_AWS_KEY": "k", "CACHE_AWS_SECRET": "s", "YESTERDAY": "2026-11-20",
                "TODAY": "2026-11-21", "TODAY_SEQ": "4710", "HAS_PREVIOUS": "false", "PBF_CACHE": pbf_cache,
                "S3_ENDPOINT": "https://s3.invalid", "S3_BUCKET": "bucket", "S3_PREFIX": "geocoder",
                "S3_PUBLIC_URL": "https://public.invalid", "GITHUB_OUTPUT": output,
-               "GITHUB_WORKSPACE": os.path.join(HERE, "..", "..", ".."), "FAKE_CALLS": self.calls,
+               "GITHUB_WORKSPACE": ws, "FAKE_CALLS": self.calls,
                "FAKE_CACHED": ":".join(cached), "FAKE_DIFF": diff, "FAKE_DIFF_PID": self.diff_pid,
                "FAKE_CLOCK": os.path.join(self.root, "clock"), "FAKE_PBF_SECONDS": str(pbf_seconds),
                "FAKE_NO_POSTAL": "1" if no_postal else ""}
