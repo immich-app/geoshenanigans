@@ -541,12 +541,13 @@ class GeneratePatchesTest(unittest.TestCase):
         self.assertEqual(night.events, {})
 
 
-# A water dir on three days (geocoder/testdata/water_dir, which the builder's
+# A water dir on four days (geocoder/testdata/water_dir, which the builder's
 # s2 tests check is what the water layer writes): admin geometry, admin cells
 # and a core of its own, no place files and no other string tier, slots of its
 # own; day 2 moves one vertex of one of its four polygons, day 3 adds a pond of
 # a water=* value of its own and a sea, so its water_meta.json and
-# attribution.json change.
+# attribution.json change, day 4 a lake the split cuts into pieces, whose cut
+# arcs run on into words of water_cut_arcs.bin past day 3's.
 WATER_DIR_FIXTURE = os.path.join(HERE, "..", "..", "testdata", "water_dir")
 
 
@@ -610,9 +611,10 @@ class RealToolTest(unittest.TestCase):
         self.assertIsNone(self.found("geocoder-gone"))
 
 
-def patch_water_days(test, old_day, new_day):
+def patch_water_days(test, old_day, new_day, old_lacks=()):
     """Runs generate_patches.sh with the real tools from the fixture's old_day to its new_day, each at
-    <root>/{old,new}/r/water/all/exact, beside a mode dir's street tier."""
+    <root>/{old,new}/r/water/all/exact, beside a mode dir's street tier; the old day without the files
+    `old_lacks` names."""
     test.root = tempfile.mkdtemp()
     test.addCleanup(shutil.rmtree, test.root)
     test.old, test.new = os.path.join(test.root, "old"), os.path.join(test.root, "new")
@@ -621,6 +623,8 @@ def patch_water_days(test, old_day, new_day):
         # A mode dir's street tier, which a variant one or two dirs down would borrow as its own (a dir of
         # one .bin file is no variant).
         write_file(os.path.join(day, "r", "full", "strings_street.bin"), 4 << 20)
+    for name in old_lacks:
+        os.remove(os.path.join(test.old, "r", "water", "all", "exact", name))
     test.results, test.logs = os.path.join(test.root, "results"), os.path.join(test.root, "logs")
     os.makedirs(os.path.join(test.root, "scratch"))
     # Scratch space the scheduler takes as ample, whatever the volume holds and the environment reserves.
@@ -641,8 +645,8 @@ class WaterDirPatchTest(unittest.TestCase):
     def test_a_water_dir_diffs_patches_and_verifies_on_its_own(self):
         self.assertEqual(self.run_.returncode, 0, self.run_.stdout + self.run_.stderr)
         result = read(os.path.join(self.results, "r_water_all_exact")).split()
-        # All ten client files, the JSON ones among them, as the new day's.
-        self.assertEqual(result[:2], ["PASS", "10"], result)
+        # All eleven client files, the JSON ones among them, as the new day's.
+        self.assertEqual(result[:2], ["PASS", "11"], result)
         self.assertTrue(os.path.getsize(os.path.join(self.new, "r", "water", "all", "exact", "patch.gcpatch")) > 0)
         self.assertEqual(read(os.path.join(self.results, "r_full")).split(), ["SKIP"])
         # Its strings are its core alone, three dirs down from the mode dirs: its estimate holds no street tier.
@@ -657,6 +661,7 @@ class WaterDirPatchTest(unittest.TestCase):
         self.assertRegex(log, r"admin_polygons\.bin by slot: match=3 replace=1 insert=0 delete=0")
         self.assertIn("admin_rings.bin: unchanged", log)
         self.assertIn("arc_index.bin: unchanged", log)
+        self.assertIn("water_cut_arcs.bin: unchanged", log)
         arcs = re.search(r"arc_vertices\.bin: .* recs m/i/d/r=(\d+)/(\d+)/(\d+)/(\d+)", log)
         self.assertIsNotNone(arcs, log)
         kept, inserted, deleted, replaced = map(int, arcs.groups())
@@ -683,10 +688,45 @@ class WaterDirKindsPatchTest(unittest.TestCase):
             self.assertNotEqual(before, after, name)
         self.assertEqual(self.run_.returncode, 0, self.run_.stdout + self.run_.stderr)
         result = read(os.path.join(self.results, "r_water_all_exact")).split()
-        # All ten client files as the new day's, the changed JSON ones among them.
-        self.assertEqual(result[:2], ["PASS", "10"], result)
+        # All eleven client files as the new day's, the changed JSON ones among them.
+        self.assertEqual(result[:2], ["PASS", "11"], result)
         log = read(os.path.join(self.logs, "r_water_all_exact.log"))
         self.assertRegex(log, r"admin_polygons\.bin by slot: match=\d+ replace=\d+ insert=[1-9]")
+        # The side the sea's tiles share is a cut, of a slot the day before didn't have: the one word of the
+        # cut arcs, which holds that slot too, changes.
+        self.assertIn("water_cut_arcs.bin: sparse delta 1/1 ", log)
+
+
+@unittest.skipUnless(HAS_REAL_TOOLS, NEEDS_REAL_TOOLS)
+class WaterDirCutArcsPatchTest(unittest.TestCase):
+    """The real diff and patcher on a water dir's cut arcs: words past the old day's, and a day that first holds
+    them."""
+
+    def cut_words(self, day):
+        with open(os.path.join(WATER_DIR_FIXTURE, day, "water_cut_arcs.bin"), "rb") as f:
+            data = f.read()
+        return [int.from_bytes(data[i:i + 4], "little") for i in range(0, len(data), 4)]
+
+    def test_cut_arcs_past_the_old_days_words_come_through_the_patch(self):
+        old, new = self.cut_words("day3"), self.cut_words("day4")
+        # Day 4's lake cuts arcs of slots past every word of day 3's, and day 3's cut stays.
+        self.assertGreater(len(new), len(old))
+        self.assertTrue(all(n & o == o for o, n in zip(old, new)), (old, new))
+        self.assertTrue(any(new[len(old):]), new)
+        patch_water_days(self, "day3", "day4")
+        self.assertEqual(self.run_.returncode, 0, self.run_.stdout + self.run_.stderr)
+        self.assertEqual(read(os.path.join(self.results, "r_water_all_exact")).split()[:2], ["PASS", "11"])
+        log = read(os.path.join(self.logs, "r_water_all_exact.log"))
+        # A change of the delta for each word past day 3's and each of its own that gained a cut.
+        changes = len(new) - len(old) + sum(o != n for o, n in zip(old, new))
+        self.assertIn(f"water_cut_arcs.bin: sparse delta {changes}/{len(new)} ", log)
+
+    def test_a_day_that_first_holds_the_cut_arcs_sends_them_whole(self):
+        patch_water_days(self, "day2", "day3", old_lacks=["water_cut_arcs.bin"])
+        self.assertEqual(self.run_.returncode, 0, self.run_.stdout + self.run_.stderr)
+        self.assertEqual(read(os.path.join(self.results, "r_water_all_exact")).split()[:2], ["PASS", "11"])
+        log = read(os.path.join(self.logs, "r_water_all_exact.log"))
+        self.assertIn("water_cut_arcs.bin: no old file, using full replace (4 bytes)", log)
 
 
 def sizing_loop():

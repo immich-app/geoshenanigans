@@ -444,17 +444,27 @@ dirs under each region: `water/all/simplified/`, `water/all/exact/` and
 `water/major/simplified/`. A build without it writes one, `water/` beside
 the region's mode files: the `all` set's exact tier, its polygons in their
 own order as slots, with none of the sidecars (`*.osm_ids`) the patches'
-slots come from. Each is made of file names the patch format already has a
-section for, so no file id, GCPATCH or transport version changes:
+slots come from. Each is made of file names the patch format has a section
+for, the admin geometry's and one of its own (file id 39, GCPATCH v24):
 
 - `admin_polygons.bin` and `admin_rings.bin`: one 16-byte record per polygon
   (an outer ring of an OSM object, with the holes inside it), its name in the
   dir's own `strings_core.bin`, its type code in the `country_code` field
-  (`water_meta.json` gives each code's class, type and Nominatim rank) and
-  the object's area, its polygons' exact areas less their holes, summed, in
-  the `area` field. Merged by slot (`ADMIN_SLOT_FAMILIES`), as the boundary
-  tiers are.
+  (`water_meta.json` gives each code's class, type and Nominatim rank), the
+  object's area, its polygons' exact areas less their holes, summed, in the
+  `area` field, and its flags in byte 14's place type: `kWeakName` where a
+  river area's name is a waterway's that runs under half the side of a square
+  of its area inside it and is under 64 sides long all told (`weak_name`,
+  `src/water_names.h`), a creek's or tributary's.
+  Merged by slot (`ADMIN_SLOT_FAMILIES`), as the boundary tiers are.
 - `arc_index.bin` and `arc_vertices.bin`: the tier's arcs, merged by slot.
+- `water_cut_arcs.bin`: a bit per arc slot, in u32 words (bit `s % 32` of
+  word `s / 32`), set where the arc is a cut: one only one object's polygons
+  use, and use twice or more (two pieces of a lake the split cut, two tiles
+  of a marine area), so that its water lies on both sides. The server takes
+  it for no shore. A sparse delta of its words (`SPARSE_DELTA_FILES`), raw:
+  its words follow the slots, so a day changes the words of the slots it
+  changes.
 - `admin_cells.bin` and `admin_entries.bin`: the cell index at
   `--admin-level` (L10 by default), interior where both tiers' rings hold
   the whole cell; the admin cell-index delta.
@@ -465,9 +475,12 @@ section for, so no file id, GCPATCH or transport version changes:
   are empty pools.
 - `water_meta.json` and `attribution.json`: small JSON, carried inline.
 
-The two `all` dirs hold the same records, rings, cells and strings, byte for
-byte; only their arcs differ. `major/simplified/` is a subset with slots of
-its own.
+The two `all` dirs hold the same records, rings, cut arcs, cells and strings,
+byte for byte; only their arcs differ. `major/simplified/` is a subset with
+slots of its own: every marine area, objects of 100 km² or more, coastal water
+(bays, straits, fjords, sounds, lagoons and harbours, `is_coastal`) of 10 km²
+or more, so that a harbour answers there by its own name and not its sea's,
+and whole rivers (`src/water_classify.h`).
 
 What keeps a day's patch small:
 
@@ -542,6 +555,10 @@ spaces and punctuation aside) all of whose water the marine areas of that
 name hold (a shared shore or point aside), such as the Gulf of Oman
 (`drop_marine_namesakes`); every other OSM bay and strait stays, one that
 reaches past them or only overlaps them among them.
+An area shows the name its sea goes by where the IHO's reads awkwardly in a
+line (`marine::kShownNames`: "Mediterranean Sea" for either basin, "Barents
+Sea" for "Barentsz Sea"), a name in dispute as the source has it; its
+namesakes are those of either name.
 
 - **They don't change from day to day.** The nightly never runs the tool: it
   downloads the version `data/marine.json` pins (a run of Update Marine
@@ -584,7 +601,7 @@ publishes it), the other `.bin` files as `.zst`, and `water_meta.json` and
 `attribution.json` among the JSON files (compressed and kept raw). The
 template's `water` axis takes `none`, `major`, `all` or `all-exact`: `none`
 selects no files, and each of the other three is a component of one dir's
-ten client files with `"dir": "water"` and that dir's own patch. A client
+eleven client files with `"dir": "water"` and that dir's own patch. A client
 puts them in `<dataset>/water/` and patches that dir with it
 (`generate_patches.sh` diffs every dir holding `.bin` files, these among
 them). `component_sizes` in configurations.json gives each region's
@@ -734,7 +751,7 @@ build 23's unit of the old rows with their cells and entries files, and take
 257,858,727 B (245.91 MiB), and with-addresses and max-quality, whose full
 dir holds the same two files, 0.14 MiB more than above too.
 
-## Patch Format (.gcpatch, version 23)
+## Patch Format (.gcpatch, version 24)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -744,8 +761,8 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=23 (u32) + flags=0 (u32)
-  (a v23 patcher accepts only v23 patches; the v8 to v23 changes are marked
+Header: "GCPATCH\0" (8) + version=24 (u32) + flags=0 (u32)
+  (a v24 patcher accepts only v24 patches; the v8 to v24 changes are marked
   below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
@@ -881,7 +898,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     remap_kind 0 raw, 2 a string offset, as its file's row of
     SPARSE_DELTA_FILES gives it, and the patcher refuses any other.
     v14: no kind 1, an admin id the patch remapped; v19: no kind 3, a
-    16-byte postcode centroid, whose file merges instead)
+    16-byte postcode centroid, whose file merges instead; v24: file id 39,
+    a water dir's water_cut_arcs.bin, raw)
   stride=0xFA (v8): parallel delta for a per-record side file (way_parents,
     way_postcodes, addr_postcodes, interp_postcodes, and from v22
     addr_cities, after the others), rebuilt along its
@@ -1104,6 +1122,7 @@ postcode centroids under id 23, and ids 24 and 25 name no file: the patcher
 writes the cells file beside the centroids, and the entries file is gone.
 v20 gives id 36 to the postcode grid. v22 gives id 38 to the address points'
 `addr:city`, and id 37 names no file; v23 gives id 37 to the postal cities.
+v24 gives id 39 to a water dir's cut arcs.
 
 | Id | File | How it travels |
 |----|------|----------------|
@@ -1137,6 +1156,7 @@ v20 gives id 36 to the postcode grid. v22 gives id 38 to the address points'
 | 36 | `postcode_grid.bin` | merge of the postcode grid's logical rows (`builder/src/postcode_grid.h`, decoded) at stride 24 (v20), no string field; the patcher encodes `postcode_grid.bin` from them |
 | 37 | `postal_cities.bin` | merge of the postal cities' logical rows (`builder/src/postal_cities.h`, decoded) at stride 64 (v23; no file in v22), no string field; the patcher encodes `postal_cities.bin` from them |
 | 38 | `addr_cities.bin` | parallel delta along addr_points, remap kind 2 (v22), after `interp_postcodes.bin`'s |
+| 39 | `water_cut_arcs.bin` | a water dir's cut arcs: sparse delta of its u32 words, remap kind 0 (v24) |
 
 The four admin geometry files (`ADMIN_SLOT_FAMILIES`) follow the place nodes
 as arc_index, arc_vertices, admin_polygons, admin_rings, ahead of the admin

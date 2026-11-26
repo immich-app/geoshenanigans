@@ -106,9 +106,16 @@ impl ChunkBox {
     /// Whether, besides `excludes`, `p` is on no edge of the chunk's arcs.
     #[inline]
     pub fn excludes_on_edge(&self, p: PointE7) -> bool {
-        p.lng < self.min_lng as i64 - CHUNK_BOX_SLACK_E7
-            || p.lng > self.max_lng as i64 + CHUNK_BOX_SLACK_E7
-            || p.lat > self.max_lat as i64 + CHUNK_BOX_SLACK_E7
+        self.excludes_within(p, 0, 0)
+    }
+
+    /// Whether no edge of the chunk's arcs comes within `lat` e7 units of latitude and `lng` of
+    /// longitude of `p`: the box, with its slack, widened by those, misses `p`.
+    #[inline]
+    pub fn excludes_within(&self, p: PointE7, lat: i64, lng: i64) -> bool {
+        p.lng < self.min_lng as i64 - CHUNK_BOX_SLACK_E7 - lng
+            || p.lng > self.max_lng as i64 + CHUNK_BOX_SLACK_E7 + lng
+            || p.lat > self.max_lat as i64 + CHUNK_BOX_SLACK_E7 + lat
     }
 }
 
@@ -371,6 +378,18 @@ pub(crate) fn arc_vertices(block: &[u8], mut f: impl FnMut(PointE7)) -> Option<u
 pub(crate) fn arc_box(block: &[u8]) -> Option<[i64; 3]> {
     let head = arc_head(block)?;
     head.bbox.map(|side| side.map(|c| c * head.step))
+}
+
+/// The box of an arc block's vertices as a chunk's box has it, in e7 units; None for a block
+/// without a box, and a malformed one.
+pub(crate) fn arc_chunk_box(block: &[u8]) -> Option<ChunkBox> {
+    let head = arc_head(block)?;
+    // Grid units whose e7 value fits i32 (arc_head), so each product does too.
+    head.bbox.map(|[min_lng, max_lng, max_lat]| ChunkBox {
+        min_lng: (min_lng * head.step) as i32,
+        max_lng: (max_lng * head.step) as i32,
+        max_lat: (max_lat * head.step) as i32,
+    })
 }
 
 /// What the ray from a point towards +lat does at one arc.

@@ -1,0 +1,9 @@
+{
+  "tiers": [
+    {"name": "core", "file": "strings_core.bin", "start": 0, "end": 65},
+    {"name": "street", "file": "strings_street.bin", "start": 65, "end": 65},
+    {"name": "addr", "file": "strings_addr.bin", "start": 65, "end": 65},
+    {"name": "postcode", "file": "strings_postcode.bin", "start": 65, "end": 65},
+    {"name": "poi", "file": "strings_poi.bin", "start": 65, "end": 65}
+  ]
+}

@@ -37,7 +37,8 @@ pub mod side_blocks;
 pub mod strings;
 pub mod transport;
 mod water;
-pub use water::{WaterDetail, WaterKind, WaterLayer, WaterMeta, WATER_DIR, WATER_FILES};
+pub use water::{CutArcs, LandmarkPoi, WaterDetail, WaterGroup, WaterKind, WaterLayer, WaterMeta, WATER_DIR, WATER_FILES};
+use water::LocationLine;
 pub mod way_files;
 pub use addr_files::{AddrFiles, AddrRecord};
 pub use place_files::PlaceFiles;
@@ -3813,9 +3814,10 @@ impl Index {
         with_way_nodes(|nodes| if streets.way(id, nodes) { closest_point_on_line(nodes, lat, lng) } else { None })
     }
 
-    // Collect the most-specific surfaceable landmark name plus the
-    // name-deduped list of nearby POIs for the response.
-    fn collect_landmark_and_places(&self, lat: f64, lng: f64) -> (Option<Cow<'_, str>>, Vec<PoiDetail>) {
+    // Collect the most-specific surfaceable landmark name, with its
+    // POI's category and polygon area, plus the name-deduped list of
+    // nearby POIs for the response.
+    fn collect_landmark_and_places(&self, lat: f64, lng: f64) -> (Option<(Cow<'_, str>, LandmarkPoi)>, Vec<PoiDetail>) {
         let pois = self.find_pois(lat, lng);
         // Landmark: name of the smallest contained polygon POI whose
         // category is a surfaceable landmark class (filters out
@@ -3824,10 +3826,10 @@ impl Index {
         // sorts contained polygons first by area ascending, so the
         // first qualifying hit is the most specific enclosing
         // landmark.
-        let landmark_name: Option<Cow<'_, str>> = pois.iter().find_map(|p| {
+        let landmark = pois.iter().find_map(|p| {
             if !p.contained { return None; }
             if poi_category_to_osm_class(p.category_id).is_some() {
-                Some(p.name.clone())
+                Some((p.name.clone(), LandmarkPoi { category: p.category_id, area: p.area }))
             } else {
                 None
             }
@@ -3852,7 +3854,7 @@ impl Index {
                 });
             }
         }
-        (landmark_name, places)
+        (landmark, places)
     }
 
     /// The address of (lat, lng); none for a point off the globe, or NaN: S2 would wrap it onto
@@ -4278,7 +4280,8 @@ impl Index {
         // Nor does the nearest postcode centroid give one where water alone holds the point.
         let resolved_postcode = resolved_postcode.filter(|_| anchored || place_nodes_only);
 
-        let (landmark_name, places) = self.collect_landmark_and_places(lat, lng);
+        let (landmark, places) = self.collect_landmark_and_places(lat, lng);
+        let (landmark_name, landmark_poi) = landmark.map_or((None, None), |(name, poi)| (Some(name), Some(poi)));
 
         // Note on name-suffix normalisation (previously considered as
         // Option 6): Nominatim does not normalise the localname it
@@ -4357,7 +4360,7 @@ impl Index {
         };
         address.label(rows);
         let display_name = format_address(&address);
-        Address { licence: Licence, display_name, address, places, water }
+        Address { licence: Licence, display_name, address, places, water, landmark_poi }
     }
 
     /// The rows of an address that are named `name` (a string id), in Nominatim's order within a
@@ -5188,9 +5191,22 @@ impl MultiIndex {
     /// other days, or of other water tiers, can hold other water at the
     /// point.
     ///
+    /// Once the water is the answer's, whether the location line names
+    /// it in its landmark's place is decided against the address and
+    /// landmark served (`water.landmark`, water.rs).
+    ///
     /// The answers borrow their strings from the continents' indexes,
     /// whose Arcs are held here until the chosen one is serialized.
     pub fn query_json(&self, lat: f64, lng: f64) -> String {
+        self.query_json_with_water(lat, lng, None)
+    }
+
+    /// query_json, with `water`, a water dir's layer the caller holds apart from the continents'
+    /// (the test portal's water= picks one), answering the water where no matching continent's
+    /// water holds the point, as a continent whose water dir held it would: its water.landmark
+    /// decided as query_json decides a continent's. A point no loaded continent covers has no
+    /// answer, as in query_json.
+    pub fn query_json_with_water(&self, lat: f64, lng: f64, water: Option<&WaterLayer>) -> String {
         let arcs = self.loaded_matches(lat, lng);
         let mut answers: Vec<Address<'_>> = arcs.iter().map(|arc| arc.query(lat, lng)).collect();
         let mut best: Option<(i32, usize)> = None;
@@ -5206,6 +5222,13 @@ impl MultiIndex {
             .chain(answers.into_iter().map(|r| r.water))
             .flatten()
             .min_by(WaterDetail::order);
+        if answer.water.is_none() {
+            answer.water = water.and_then(|w| w.at(lat, lng));
+        }
+        let landmark = answer.water.as_ref().is_some_and(|w| w.takes_landmark(lat, lng, &answer.location_line()));
+        if let Some(water) = answer.water.as_mut() {
+            water.landmark = landmark;
+        }
         serde_json::to_string(&answer).unwrap_or_default()
     }
 }
@@ -5552,7 +5575,9 @@ mod query_tests {
             idx
         };
         let json = |slots: Vec<(&'static str, Index)>| serde_json::from_str::<serde_json::Value>(&multi(slots).query_json(lat, lng)).unwrap();
-        let named = |name: &str, class: &str, r#type: &str| serde_json::json!({"name": name, "class": class, "type": r#type});
+        // Each lies far inside its shore, beside an address of no landmark or country: the
+        // location line names it.
+        let named = |name: &str, class: &str, r#type: &str| serde_json::json!({"name": name, "class": class, "type": r#type, "landmark": true});
         let both_orders = |africa: &dyn Fn() -> Index, asia: &dyn Fn() -> Index| {
             [json(vec![("africa", africa()), ("asia", asia())]), json(vec![("asia", asia()), ("africa", africa())])]
         };
@@ -5584,6 +5609,106 @@ mod query_tests {
             let got = json(vec![("africa", index(&[first], &[])), ("asia", with(index(&[second], &[]), water("Gulf of Suez", BAY, gulf)))]);
             assert_eq!(got, want, "{}", first.0);
         }
+    }
+
+    // The location line names the water in its landmark's place (water.landmark, water.rs) as
+    // the address served decides: the flag comes last inside water, only where it is set, and
+    // changes nothing else in the answer.
+    #[test]
+    fn the_water_landmark_is_decided_against_the_address_served_and_changes_nothing_else() {
+        use crate::water::fixture::{WaterFixture, LAKE};
+        // Vaud in Switzerland, both listed in the cell of their centre, where the point is.
+        let (lat, lng) = (46.45, 6.55);
+        let (switzerland, vaud) = (("Switzerland", 2, [45.45, 5.55, 47.45, 7.55]), ("Vaud", 4, [45.95, 6.05, 46.95, 7.05]));
+        let with = |water: Option<WaterLayer>| {
+            let mut idx = index(&[switzerland, vaud], &[]);
+            if let FileBytes::Owned(records) = &mut idx.admin_polygons {
+                records[12..14].copy_from_slice(&(u16::from(b'c') << 8 | u16::from(b'h')).to_le_bytes());
+            }
+            idx.water = water;
+            multi(vec![("europe", idx)]).query_json(lat, lng)
+        };
+        let lake = |name: &str, span| Some(WaterFixture::new().area(name, LAKE, span, &[]).layer());
+
+        let dry = with(None);
+        let address = serde_json::from_str::<serde_json::Value>(&dry).unwrap()["address"].clone();
+        assert_eq!((address["state"].as_str(), address["country"].as_str()), (Some("Vaud"), Some("Switzerland")));
+        let wet = |name: &str, flag: &str| {
+            format!("{},\"water\":{{\"name\":\"{name}\",\"class\":\"water\",\"type\":\"lake\"{flag}}}}}", dry.strip_suffix('}').unwrap())
+        };
+        // Far inside its shore.
+        assert_eq!(with(lake("Lac Léman", (46.2, 6.1, 46.6, 6.9))), wet("Lac Léman", ",\"landmark\":true"));
+        // 33 m inside it; or of the name of the state the line shows.
+        assert_eq!(with(lake("Lac Léman", (46.4497, 6.1, 46.6, 6.9))), wet("Lac Léman", ""));
+        assert_eq!(with(lake("Vaud", (46.2, 6.1, 46.6, 6.9))), wet("Vaud", ""));
+        // Without water, the answer is the dry one, byte for byte.
+        assert_eq!(with(lake("Lac Léman", (46.5, 6.1, 46.6, 6.9))), dry);
+    }
+
+    // A water dir's layer held apart from the continents (the test portal's water= one) answers
+    // the water where no continent's water holds the point, its water.landmark decided as
+    // query_json decides a continent's: the answer is the one a continent whose water dir holds
+    // the layer gives. A continent's own water stays its own, and a point no continent covers
+    // still has no answer.
+    #[test]
+    fn a_water_layer_held_apart_answers_as_a_continents_water_where_theirs_holds_none() {
+        use crate::water::fixture::{WaterFixture, LAKE};
+        let (lat, lng) = (46.45, 6.55);
+        let (switzerland, vaud) = (("Switzerland", 2, [45.45, 5.55, 47.45, 7.55]), ("Vaud", 4, [45.95, 6.05, 46.95, 7.05]));
+        let europe = |water: Option<WaterLayer>| {
+            let mut idx = index(&[switzerland, vaud], &[]);
+            if let FileBytes::Owned(records) = &mut idx.admin_polygons {
+                records[12..14].copy_from_slice(&(u16::from(b'c') << 8 | u16::from(b'h')).to_le_bytes());
+            }
+            idx.water = water;
+            multi(vec![("europe", idx)])
+        };
+        let lake = |name: &str, span| WaterFixture::new().area(name, LAKE, span, &[]).layer();
+        let (far_in, near_shore) = ((46.2, 6.1, 46.6, 6.9), (46.4497, 6.1, 46.6, 6.9));
+
+        for span in [far_in, near_shore] {
+            let held = lake("Lac Léman", span);
+            let got = europe(None).query_json_with_water(lat, lng, Some(&held));
+            assert_eq!(got, europe(Some(lake("Lac Léman", span))).query_json(lat, lng));
+            assert_eq!(got.contains("\"landmark\":true"), span == far_in);
+        }
+        assert!(europe(None).query_json_with_water(lat, lng, Some(&lake("Lac Léman", far_in))).ends_with(
+            "\"water\":{\"name\":\"Lac Léman\",\"class\":\"water\",\"type\":\"lake\",\"landmark\":true}}"));
+        // None held, or one that doesn't hold the point: query_json's answer.
+        let dry = europe(None).query_json(lat, lng);
+        assert!(!dry.contains("water"));
+        assert_eq!(europe(None).query_json_with_water(lat, lng, None), dry);
+        assert_eq!(europe(None).query_json_with_water(lat, lng, Some(&lake("Lac Léman", (46.5, 6.1, 46.6, 6.9)))), dry);
+        // The continent's own water answers before the held one.
+        let own = europe(Some(lake("Lac de Joux", far_in)));
+        assert_eq!(own.query_json_with_water(lat, lng, Some(&lake("Lac Léman", far_in))), own.query_json(lat, lng));
+        assert!(own.query_json(lat, lng).contains("Lac de Joux"));
+        // Off every continent's cover: no answer.
+        assert_eq!(europe(None).query_json_with_water(91.0, lng, Some(&lake("Lac Léman", far_in))), "{}");
+    }
+
+    // The line the water is decided against is the one Immich shows: the first of the address's
+    // city keys and of its state keys, with its country; none of them without a country; and the
+    // landmark with its POI.
+    #[test]
+    fn the_location_line_is_immichs_city_state_and_country_and_the_landmark() {
+        let poi = LandmarkPoi { category: 66, area: 2.0e-6 };
+        let answer = |address: AddressDetails<'static>| Address { address, landmark_poi: Some(poi), ..Address::default() };
+        let name = |s: &'static str| Some(Cow::Borrowed(s));
+
+        let town = answer(AddressDetails { landmark: name("Port Hercule"), town: name("Monaco"), municipality: name("Monte Carlo"),
+                                           country: name("Monaco"), ..AddressDetails::default() });
+        let line = town.location_line();
+        assert_eq!(line.shown, [Some("Monaco"), Some("Monte Carlo"), Some("Monaco")]);
+        assert_eq!(line.landmark, Some(("Port Hercule", Some(poi))));
+        let county = answer(AddressDetails { village: name("Kona"), county: name("Hawaii County"), state: None, country: name("United States"),
+                                             ..AddressDetails::default() });
+        assert_eq!(county.location_line().shown, [Some("Kona"), Some("Hawaii County"), Some("United States")]);
+        let city = answer(AddressDetails { city: name("Zürich"), country: name("Switzerland"), ..AddressDetails::default() });
+        assert_eq!(city.location_line().shown, [Some("Zürich"), Some("Zürich"), Some("Switzerland")]);
+        let at_sea = answer(AddressDetails { city: name("Nowhere"), state: name("Elsewhere"), ..AddressDetails::default() });
+        assert_eq!(at_sea.location_line().shown, [None, None, None]);
+        assert_eq!(Address::default().location_line().landmark, None);
     }
 
     /// (metres north of `origin()`, metres east, name or None for a tombstone, category,
@@ -7385,6 +7510,32 @@ pub struct Address<'a> {
     /// a water dir.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub water: Option<WaterDetail<'a>>,
+    /// The POI the address's landmark names, which the location line reads (water.rs) and no
+    /// answer shows.
+    #[serde(skip)]
+    pub landmark_poi: Option<LandmarkPoi>,
+}
+
+impl Address<'_> {
+    /// What the location line shows beside the water: Immich's city, state and country of the
+    /// address (none without a country), the first of each list it has: city, town, village,
+    /// hamlet or municipality; state, province, region, county, municipality or city; and the
+    /// landmark, with its POI.
+    fn location_line(&self) -> LocationLine<'_> {
+        let a = &self.address;
+        fn first<'s>(fields: &[&'s Option<Cow<'_, str>>]) -> Option<&'s str> {
+            fields.iter().find_map(|f| f.as_deref())
+        }
+        let shown = match a.country.as_deref() {
+            Some(country) => [
+                first(&[&a.city, &a.town, &a.village, &a.hamlet, &a.municipality]),
+                first(&[&a.state, &a.province, &a.region, &a.county, &a.municipality, &a.city]),
+                Some(country),
+            ],
+            None => [None; 3],
+        };
+        LocationLine { shown, landmark: a.landmark.as_deref().map(|name| (name, self.landmark_poi)) }
+    }
 }
 
 // Address formatting patterns by country code

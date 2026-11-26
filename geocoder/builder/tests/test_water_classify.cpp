@@ -196,6 +196,22 @@ TEST(the_major_tier_takes_100_km2_and_wikidata_rivers_of_5_and_keeps_its_own_at_
     CHECK(!water_major_keeps(4.49, true, true, true));
 }
 
+TEST(the_major_tier_takes_coastal_water_of_10_km2_and_keeps_its_own_at_9) {
+    CHECK(water_major_keeps(10, false, false, false, true));
+    CHECK(!water_major_keeps(9.9, false, false, false, true));
+    CHECK(water_major_keeps(9, false, false, true, true));
+    CHECK(!water_major_keeps(8.9, false, false, true, true));
+    CHECK(!water_major_keeps(50, false, false, false, false));
+    // Bays, straits, coves, fjords, sounds, seas, lagoons and harbours, by
+    // their class and type; no other kind.
+    std::set<std::string> coastal;
+    for (uint16_t code = 1; code <= kFixedKindCount; code++)
+        if (is_coastal(code)) coastal.insert(std::string(kFixedKinds[code - 1].cls) + "/" + kFixedKinds[code - 1].type);
+    CHECK(coastal == std::set<std::string>({"natural/bay", "natural/strait", "water/bay", "water/cove", "water/fjord",
+                                            "water/harbour", "water/lagoon", "water/sea", "water/sound", "water/strait"}));
+    CHECK(!is_coastal(kVerbatimBase));
+}
+
 TEST(a_riverbank_tagged_natural_water_too_is_a_river_area) {
     // waterway=riverbank comes before a bare natural=water, so that an
     // unnamed one can take its waterway's name; a water=* of its own still

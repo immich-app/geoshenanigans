@@ -294,7 +294,9 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // after the postcode grid's, in every patch (an empty merge where neither
 // day has it), with the old file's hash before it where the old table has
 // rows (HASHED_OLD_FILES).
-static constexpr uint32_t GCPATCH_VERSION = 23;
+// v24: file id 39 names a water dir's water_cut_arcs.bin, a bit per arc slot
+// in u32 words, sent as a sparse delta of its words (SPARSE_DELTA_FILES).
+static constexpr uint32_t GCPATCH_VERSION = 24;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -358,7 +360,9 @@ enum class PatchFileId : uint32_t {
     // Per address point: its addr:city, a core string offset (NO_DATA for
     // none), along addr_points (v22).
     ADDR_CITIES = 38,
-    COUNT = 39
+    // A water dir's cut arcs: a bit per arc slot, in u32 words (v24).
+    WATER_CUT_ARCS = 39,
+    COUNT = 40
 };
 
 static const char* patch_file_names[] = {
@@ -378,7 +382,8 @@ static const char* patch_file_names[] = {
     "geo_entries.bin",
     "postcode_grid.bin",
     "postal_cities.bin",
-    "addr_cities.bin"
+    "addr_cities.bin",
+    "water_cut_arcs.bin"
 };
 
 // The string offset fields of a record file the patch merges, as byte
@@ -401,9 +406,10 @@ inline std::vector<size_t> string_field_offsets(PatchFileId fid) {
 // The files sent as SPARSE_DELTA_STRIDE sections, in emission order, with
 // the value each position holds:
 //   remap_kind 0 = raw, 2 = string offset.
-// Admin parents are admin slots, which polygons keep, so they go raw; kind 1
-// (an admin id the patch remapped) and kind 3 (a 16-byte postcode centroid,
-// to v18) name no file.
+// Admin parents are admin slots, which polygons keep, so they go raw, as do
+// a water dir's cut arcs, whose words follow the arc slots; kind 1 (an admin
+// id the patch remapped) and kind 3 (a 16-byte postcode centroid, to v18)
+// name no file.
 struct SparseDeltaFile { PatchFileId fid; uint32_t value_stride, remap_kind; };
 static constexpr SparseDeltaFile SPARSE_DELTA_FILES[] = {
     {PatchFileId::ADDR_POSTCODES, 4, 2},
@@ -411,6 +417,7 @@ static constexpr SparseDeltaFile SPARSE_DELTA_FILES[] = {
     {PatchFileId::WAY_PARENTS, 4, 0},
     {PatchFileId::WAY_POSTCODES, 4, 2},
     {PatchFileId::INTERP_POSTCODES, 4, 2},
+    {PatchFileId::WATER_CUT_ARCS, 4, 0},
     {PatchFileId::ADDR_CITIES, 4, 2},
 };
 

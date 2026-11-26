@@ -30,9 +30,9 @@ builds/
       water/
         all/
           simplified/  admin_rings.bin.zst + admin_cells.bin.zst + admin_entries.bin.zst
-                       + strings_core.bin.zst + arcs.tt.zst + admin_polygons.tt.zst
-                       + strings_layout.json(.zst) + water_meta.json(.zst)
-                       + attribution.json(.zst) + patch.gcpatch
+                       + strings_core.bin.zst + water_cut_arcs.bin.zst + arcs.tt.zst
+                       + admin_polygons.tt.zst + strings_layout.json(.zst)
+                       + water_meta.json(.zst) + attribution.json(.zst) + patch.gcpatch
           exact/       ...
         major/
           simplified/  ...
@@ -105,14 +105,16 @@ POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.
 
 | Water | Files | Description |
 |-------|-------|-------------|
-| `water/major/simplified/` | 10 files | The seas and oceans, in builds that pin the marine areas; every named water area of 100 km² or more, whatever its kind (lakes, reservoirs, bays, straits, wetlands, glaciers and the rest); whole rivers and canals whose areas sum to 100 km² (5 km² with a Wikidata item). Those are the thresholds to enter: one in the previous build's tier stays down to 90 km² (4.5 km²). Shores simplified with a tolerance of 37.5 m |
-| `water/all/simplified/` | 10 files | Every named water area, every river or canal area its waterway names, and the seas and oceans in builds that pin the marine areas. Shores simplified with a tolerance of 37.5 m |
-| `water/all/exact/` | 10 files | The same with every OSM point of every shore |
+| `water/major/simplified/` | 11 files | The seas and oceans, in builds that pin the marine areas; every named water area of 100 km² or more, whatever its kind (lakes, reservoirs, wetlands, glaciers and the rest), and bays, straits, fjords, sounds, lagoons and harbours of 10 km² or more; whole rivers and canals whose areas sum to 100 km² (5 km² with a Wikidata item). Those are the thresholds to enter: one in the previous build's tier stays down to 90 km² (9 km² for coastal water, 4.5 km² for a river). Shores simplified with a tolerance of 37.5 m |
+| `water/all/simplified/` | 11 files | Every named water area, every river or canal area its waterway names, and the seas and oceans in builds that pin the marine areas. Shores simplified with a tolerance of 37.5 m |
+| `water/all/exact/` | 11 files | The same with every OSM point of every shore |
 
 Water files: `admin_polygons.bin`, `admin_rings.bin`, `arc_index.bin`,
 `arc_vertices.bin`, `admin_cells.bin`, `admin_entries.bin`,
-`strings_core.bin`, `strings_layout.json`, `water_meta.json` (each type
-code's class, type and Nominatim rank) and `attribution.json`. The names of
+`strings_core.bin`, `strings_layout.json`, `water_cut_arcs.bin` (a bit per
+arc slot, set for a cut between two pieces of one water, which the server's
+`water.landmark` takes for no shore), `water_meta.json` (each type code's
+class, type and Nominatim rank) and `attribution.json`. The names of
 the admin geometry, but a set of their own: their records, slots, arcs,
 cells and strings point into nothing else, and nothing points into them. A
 client puts them in `<dataset>/water/` (their component's `dir`, below), not
@@ -418,7 +420,7 @@ also carries Nominatim's `licence` string (README.md).
      city files are only in a region holding the United States)
    - builds/{date}/europe/quality/simplified/…  (4 files)
    - builds/{date}/europe/poi/notable/…         (7 files + 1 optional, with a POI tier)
-   - builds/{date}/europe/water/all/simplified/… (10 files, optional), into <dataset>/water/
+   - builds/{date}/europe/water/all/simplified/… (11 files, optional), into <dataset>/water/
    The JSON files (strings_layout.json, poi_meta.json, water_meta.json,
    attribution.json, poi_attribution.json) are part of the set: the server
    can't load a region without the first two, water_meta.json gives a water

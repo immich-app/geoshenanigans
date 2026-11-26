@@ -4,9 +4,10 @@
 //! formats but are a set of their own, pointing into nothing else:
 //! - admin_polygons.bin and admin_rings.bin: a record per polygon, an OSM object's outer ring
 //!   with its holes or a piece of it cut along a grid, carrying the object's name, its type code
-//!   in the country code's place and its area: that of all its outer rings, their holes taken
-//!   off, in square degrees;
+//!   in the country code's place, its area (that of all its outer rings, their holes taken off,
+//!   in square degrees) and in byte 14 its flags (WEAK_NAME);
 //! - arc_index.bin and arc_vertices.bin: the arcs of those rings;
+//! - water_cut_arcs.bin: which arc slots are cuts, a bit per slot (CutArcs);
 //! - admin_cells.bin and admin_entries.bin: each L10 cell's polygons, flagged interior where
 //!   their rings hold the whole cell;
 //! - strings_core.bin and strings_layout.json: the names, in a core tier of their own;
@@ -14,15 +15,18 @@
 //!
 //! The water at a point is the smallest object whose rings hold it, holes honoured, then the one
 //! of the higher rank, the lower type code and the smaller name. It answers beside the address,
-//! never changing it: an extension of Nominatim's answer (NOMINATIM_REFERENCE.md).
+//! never changing it: an extension of Nominatim's answer (NOMINATIM_REFERENCE.md). Where the
+//! location line names it in its landmark's place, it says so (`WaterDetail::takes_landmark`).
 
 use crate::{
-    cell_id_at_level, coords_in_range, mmap_file, polygon_record, AdminGeometry, AdminPoint, AdminPolygon,
-    CellPairs, FileBytes, PipMemo, StringPool, ADMIN_POLYGON_RECORD_BYTES, ID_MASK, INTERIOR_FLAG, NO_DATA,
+    cell_id_at_level, cell_neighbors_at_level, coords_in_range, mmap_file, poi_category_to_osm_class, polygon_record,
+    AdminGeometry, AdminPoint, AdminPolygon, CellPairs, FileBytes, PipMemo, PointE7, StringPool, ADMIN_POLYGON_RECORD_BYTES,
+    ID_MASK, INTERIOR_FLAG, NO_DATA,
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use unicode_normalization::{char::canonical_combining_class, UnicodeNormalization};
 
 /// The dir of a dataset that holds its water layer.
 pub const WATER_DIR: &str = "water";
@@ -31,7 +35,7 @@ pub const WATER_DIR: &str = "water";
 const SEAM_E7: i64 = 1_800_000_000;
 
 /// The files a water layer loads from, by name: a dir holds all of them or none.
-pub const WATER_FILES: [&str; 9] = [
+pub const WATER_FILES: [&str; 10] = [
     "admin_cells.bin",
     "admin_entries.bin",
     "admin_polygons.bin",
@@ -40,17 +44,108 @@ pub const WATER_FILES: [&str; 9] = [
     "arc_vertices.bin",
     "strings_core.bin",
     "strings_layout.json",
+    "water_cut_arcs.bin",
     "water_meta.json",
 ];
 
+/// A water record's flag, in byte 14 (a boundary's level and place type): its name is that of a
+/// short waterway that runs only a short way into it, an unnamed river or canal area that a
+/// creek or tributary named (builder/src/water_names.h), which the location line takes for no
+/// name of note.
+pub const WEAK_NAME: u8 = 1;
+
+/// How far from the point the shore of the water the location line names must lie at least, in
+/// metres: past a phone's error in town, the simplified tier's tolerance and a quay at the
+/// water's edge.
+pub const LANDMARK_SHORE_M: f64 = 40.0;
+
+/// Square kilometres in a square degree at the equator.
+const KM2_PER_DEG2: f64 = 111.319_49 * 111.319_49;
+
+/// A kind's group, as the location line reads it (`WaterDetail::takes_landmark`): the named
+/// natural water people name, and the kinds it never names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaterGroup {
+    /// The seas and oceans: place/sea and place/ocean.
+    Sea,
+    /// Bays, straits, coves, fjords, sounds, seas, lagoons and harbours.
+    Coastal,
+    /// Lakes, reservoirs, ponds, oxbows and natural/water.
+    Still,
+    /// River and canal areas.
+    River,
+    Glacier,
+    Wetland,
+    /// Every other kind: basins, wastewater, fountains, fishponds, locks, salt pools, moats and
+    /// every water=* value of its own. The water field names them; the line never does.
+    #[default]
+    Other,
+}
+
+impl WaterGroup {
+    /// The group of Nominatim's class and type.
+    pub fn of(class: &str, r#type: &str) -> WaterGroup {
+        match (class, r#type) {
+            ("place", "sea" | "ocean") => WaterGroup::Sea,
+            ("natural", "bay" | "strait")
+            | ("water", "bay" | "cove" | "fjord" | "sound" | "strait" | "sea" | "lagoon" | "harbour") => WaterGroup::Coastal,
+            ("water", "lake" | "reservoir" | "pond" | "oxbow") | ("landuse", "reservoir") | ("natural", "water") => WaterGroup::Still,
+            ("waterway" | "water", "river" | "canal") => WaterGroup::River,
+            ("natural", "glacier") => WaterGroup::Glacier,
+            ("natural", "wetland") => WaterGroup::Wetland,
+            _ => WaterGroup::Other,
+        }
+    }
+}
+
+/// How well a body of water is known, from its group and its area: a minor one never names the
+/// line, a notable one or larger takes the place of a park that holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Prominence {
+    Minor,
+    Local,
+    Notable,
+    Major,
+}
+
+impl Prominence {
+    /// A body of `group` of `km2` square kilometres: under 1 ha still water and wetland are minor;
+    /// coastal water, glaciers and still water notable from 0.1 km² and major from 10 km²; a
+    /// river or canal area notable at any size, major from 10 km²; a sea or ocean local, as is a
+    /// wetland from 1 ha. Every other kind is minor.
+    fn of(group: WaterGroup, km2: f64) -> Prominence {
+        let by_area = |floor: Prominence| {
+            if km2 >= 10.0 {
+                Prominence::Major
+            } else if km2 >= 0.1 {
+                Prominence::Notable
+            } else {
+                floor
+            }
+        };
+        match group {
+            WaterGroup::Sea => Prominence::Local,
+            WaterGroup::Coastal | WaterGroup::Glacier => by_area(Prominence::Local),
+            WaterGroup::Still if km2 < 0.01 => Prominence::Minor,
+            WaterGroup::Still => by_area(Prominence::Local),
+            WaterGroup::River => by_area(Prominence::Notable),
+            WaterGroup::Wetland if km2 < 0.01 => Prominence::Minor,
+            WaterGroup::Wetland => Prominence::Local,
+            WaterGroup::Other => Prominence::Minor,
+        }
+    }
+}
+
 /// A type code's kind, as water_meta.json lists it: Nominatim's class and type, and its
-/// rank_search (settings/address-levels.json).
+/// rank_search (settings/address-levels.json); and its group, from the class and type.
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WaterKind {
     pub code: u16,
     pub class: String,
     pub r#type: String,
     pub rank: u8,
+    #[serde(skip)]
+    pub group: WaterGroup,
 }
 
 /// The kinds of a water dir's type codes (water_meta.json), by code.
@@ -60,8 +155,8 @@ pub struct WaterMeta {
 }
 
 impl WaterMeta {
-    /// The kinds water_meta.json's text lists; an error for text that isn't such a list, or
-    /// that gives a code twice.
+    /// The kinds water_meta.json's text lists, each with its group; an error for text that isn't
+    /// such a list, or that gives a code twice.
     pub fn from_json(text: &str) -> Result<WaterMeta, String> {
         #[derive(Deserialize)]
         struct Listed {
@@ -72,6 +167,9 @@ impl WaterMeta {
         if let Some(twice) = kinds.windows(2).find(|w| w[0].code == w[1].code) {
             return Err(format!("type code {} listed twice", twice[0].code));
         }
+        for k in &mut kinds {
+            k.group = WaterGroup::of(&k.class, &k.r#type);
+        }
         Ok(WaterMeta { kinds })
     }
 
@@ -81,16 +179,49 @@ impl WaterMeta {
     }
 }
 
+/// water_cut_arcs.bin: which arc slots of a water dir are cuts, an arc only one object's polygons
+/// use, two of them along it (the cut between two pieces of a lake split along the grid, or two
+/// tiles of a marine area), with that object's water on both sides. Bit s % 32 of the
+/// little-endian u32 at 4 × (s / 32) for slot s: as many words as the slots take.
+pub struct CutArcs {
+    words: FileBytes,
+}
+
+impl CutArcs {
+    /// The cut arcs of `words` beside an arc index of `slots` slots; an error unless it holds just
+    /// the words those take.
+    pub fn new(words: FileBytes, slots: usize) -> Result<CutArcs, String> {
+        let want = slots.div_ceil(32) as u64 * 4;
+        if words.len() != want {
+            return Err(format!("{} bytes for {slots} arc slots, not {want}", words.len()));
+        }
+        Ok(CutArcs { words })
+    }
+
+    /// Whether arc slot `slot` is a cut.
+    pub fn is_cut(&self, slot: u32) -> bool {
+        let at = (slot / 32) as usize * 4;
+        self.words.as_slice().get(at..at + 4).is_some_and(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) >> (slot % 32) & 1 == 1)
+    }
+}
+
 /// The water an answer names: the object's name, and its kind's class and type, which are the
-/// `category` and `type` Nominatim gives it (`type` the key its `address` names it by).
+/// `category` and `type` Nominatim gives it (`type` the key its `address` names it by); and,
+/// last, whether the location line names it in its landmark's place (`takes_landmark`), there
+/// only where it does.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct WaterDetail<'a> {
     pub name: Cow<'a, str>,
     pub class: &'a str,
     pub r#type: &'a str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub landmark: bool,
     /// Where its object comes in the order in which water answers, which no answer shows.
     #[serde(skip)]
     precedence: Precedence,
+    /// The polygon that answers, for the location line.
+    #[serde(skip)]
+    source: Source<'a>,
 }
 
 impl WaterDetail<'_> {
@@ -98,6 +229,135 @@ impl WaterDetail<'_> {
     /// hold a point): by Precedence, then the smaller name.
     pub(crate) fn order(&self, other: &Self) -> Ordering {
         self.precedence.cmp(&other.precedence).then_with(|| self.name.cmp(&other.name))
+    }
+
+    /// Whether the location line beside this water at (lat, lng), whose address `line` gives,
+    /// names it in its landmark's place. Each rule says no in turn, the cheapest first:
+    /// 1. a kind the line never names (WaterGroup::Other);
+    /// 2. a catalogue name: no letter in it, or a number after "No", "Nr", "#", "№", "lake",
+    ///    "pond", "pool", "tank", "basin", "reservoir" or "glacier" alone ("Lake 938");
+    /// 3. a minor body (Prominence::of at the point's latitude), or one of a weak name
+    ///    (WEAK_NAME);
+    /// 4. a name the line has: the city, state or country it shows, folded (`fold`), or one the
+    ///    landmark names (`same_name`);
+    /// 5. a landmark that stays: every one but a nature reserve, national park or protected area
+    ///    (a UNESCO zone among them), which gives way to a notable body smaller than its polygon,
+    ///    and a natural feature, which gives way to a smaller body;
+    /// 6. a shore of its object within LANDMARK_SHORE_M of the point, in the tier's own geometry
+    ///    (`WaterLayer::shore_within`).
+    pub(crate) fn takes_landmark(&self, lat: f64, lng: f64, line: &LocationLine<'_>) -> bool {
+        let Source { layer, poly, group, weak } = self.source;
+        if group == WaterGroup::Other || catalogue_name(&self.name) {
+            return false;
+        }
+        let km2 = f64::from(self.precedence.area) * KM2_PER_DEG2 * lat.to_radians().cos();
+        let prominence = if weak { Prominence::Minor } else { Prominence::of(group, km2) };
+        if prominence == Prominence::Minor {
+            return false;
+        }
+        let name = fold(&self.name);
+        if line.shown.iter().flatten().any(|s| fold(s) == name) {
+            return false;
+        }
+        if let Some((landmark, poi)) = line.landmark {
+            if same_name(landmark, &self.name) {
+                return false;
+            }
+            let smaller = poi.is_some_and(|p| f64::from(self.precedence.area) < p.area);
+            let gives_way = match poi.map(|p| p.category) {
+                Some(61 | 130 | 131) => prominence >= Prominence::Notable && smaller,
+                Some(c) if poi_category_to_osm_class(c) == Some("natural") => smaller,
+                _ => false,
+            };
+            if !gives_way {
+                return false;
+            }
+        }
+        !layer.shore_within(&poly, group == WaterGroup::Sea, lat, lng, LANDMARK_SHORE_M)
+    }
+}
+
+/// What the location line shows beside the water: the city, state and country Immich takes from
+/// the answer's address (none without a country), and its landmark with that POI's category and
+/// polygon area where known.
+#[derive(Debug, Default)]
+pub(crate) struct LocationLine<'s> {
+    pub shown: [Option<&'s str>; 3],
+    pub landmark: Option<(&'s str, Option<LandmarkPoi>)>,
+}
+
+/// The POI an answer's landmark names: its category (builder/src/types.h) and its polygon's
+/// area, in square degrees as a water record's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LandmarkPoi {
+    pub category: u8,
+    pub area: f64,
+}
+
+/// A name as the line compares names: its compatibility decomposition (NFKD) without its
+/// combining marks, in lower case, letters and digits alone ("Lágoa D'água" and "Lagoa D'Agua"
+/// alike).
+fn fold(name: &str) -> String {
+    name.nfkd()
+        .filter(|&c| canonical_combining_class(c) == 0)
+        .flat_map(char::to_lowercase)
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+/// Whether two names name one thing: folded (`fold`), equal, or the shorter, of 4 characters or
+/// more, inside the longer ("Lake Titicaca (Peruvian sector)" and "Lake Titicaca").
+fn same_name(a: &str, b: &str) -> bool {
+    let (a, b) = (fold(a), fold(b));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let (short, long) = if a.chars().count() <= b.chars().count() { (&a, &b) } else { (&b, &a) };
+    short == long || (short.chars().count() >= 4 && long.contains(short.as_str()))
+}
+
+/// Whether a name is a catalogue number, not a name: no letter in it ("49,0"), or "No", "Nr",
+/// "#" or "№" ("No." and "Nr." too), or "lake", "pond", "pool", "tank", "basin", "reservoir" or
+/// "glacier", in any case, then a number and at most one letter or digit after it, alone
+/// ("№30", "No. 116", "Lake 938", "Glacier 5b").
+fn catalogue_name(name: &str) -> bool {
+    let name = name.trim();
+    if !name.chars().any(char::is_alphabetic) {
+        return true;
+    }
+    let lower = name.to_lowercase();
+    let words = ["№", "no.", "no", "nr.", "nr", "#", "lake", "pond", "pool", "tank", "basin", "reservoir", "glacier"];
+    words.iter().any(|w| {
+        lower.strip_prefix(w).is_some_and(|rest| {
+            let rest = rest.trim_start();
+            let digits = rest.chars().take_while(|c| c.is_numeric()).count();
+            let after: Vec<char> = rest.chars().skip(digits).collect();
+            digits > 0 && (after.is_empty() || (after.len() == 1 && (after[0].is_alphanumeric() || after[0] == '_')))
+        })
+    })
+}
+
+/// The polygon a water answer comes from: its layer and record, its kind's group and whether its
+/// name is weak.
+#[derive(Clone, Copy)]
+struct Source<'a> {
+    layer: &'a WaterLayer,
+    poly: AdminPolygon,
+    group: WaterGroup,
+    weak: bool,
+}
+
+impl PartialEq for Source<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.layer, other.layer) && same_polygon(&self.poly, &other.poly)
+    }
+}
+
+impl Eq for Source<'_> {}
+
+impl std::fmt::Debug for Source<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Source {{ ring_offset: {}, group: {:?}, weak: {} }}", self.poly.ring_offset, self.group, self.weak)
     }
 }
 
@@ -154,6 +414,7 @@ pub struct WaterLayer {
     index: CellPairs,
     polygons: FileBytes,
     geometry: AdminGeometry,
+    cuts: CutArcs,
     strings: StringPool,
     meta: WaterMeta,
     cell_level: u64,
@@ -161,8 +422,9 @@ pub struct WaterLayer {
 
 impl WaterLayer {
     /// The layer of these files; `index` is read at `cell_level`.
-    pub fn new(index: CellPairs, polygons: FileBytes, geometry: AdminGeometry, strings: StringPool, meta: WaterMeta, cell_level: u64) -> Self {
-        WaterLayer { index, polygons, geometry, strings, meta, cell_level }
+    pub fn new(index: CellPairs, polygons: FileBytes, geometry: AdminGeometry, cuts: CutArcs, strings: StringPool, meta: WaterMeta,
+               cell_level: u64) -> Self {
+        WaterLayer { index, polygons, geometry, cuts, strings, meta, cell_level }
     }
 
     /// The water layer in `dir` (a dataset's water dir), its cells at `cell_level`: none where
@@ -192,10 +454,14 @@ impl WaterLayer {
         let meta_path = format!("{dir}/water_meta.json");
         let meta = std::fs::read_to_string(&meta_path).map_err(|e| format!("Failed to read {meta_path}: {e}"))?;
         let meta = WaterMeta::from_json(&meta).map_err(|e| format!("{meta_path}: {e}"))?;
+        let geometry = AdminGeometry::load(dir)?;
+        let cuts_path = format!("{dir}/water_cut_arcs.bin");
+        let cuts = CutArcs::new(mmap_file(&cuts_path)?, geometry.arc_slots()).map_err(|e| format!("{cuts_path}: {e}"))?;
         Ok(Some(WaterLayer {
             index,
             polygons: mmap_file(&format!("{dir}/admin_polygons.bin"))?,
-            geometry: AdminGeometry::load(dir)?,
+            geometry,
+            cuts,
             // Every name of the layer is in its core tier.
             strings: StringPool::load_tiers(dir, 1)?,
             meta,
@@ -278,16 +544,141 @@ impl WaterLayer {
                 _ => Some(c),
             };
         }
-        best.map(|b| WaterDetail { name: self.strings.get(b.poly.name_id), class: &b.kind.class, r#type: &b.kind.r#type, precedence: b.precedence() })
+        best.map(|b| WaterDetail {
+            name: self.strings.get(b.poly.name_id),
+            class: &b.kind.class,
+            r#type: &b.kind.r#type,
+            landmark: false,
+            precedence: b.precedence(),
+            source: Source {
+                layer: self,
+                poly: b.poly,
+                group: b.kind.group,
+                weak: b.poly.place_type_override & WEAK_NAME != 0,
+            },
+        })
+    }
+
+    /// Whether a shore of the object of `poly` (a polygon holding (lat, lng)) lies nearer than
+    /// `metres` to the point: an edge of its rings, or of the object's polygons its water runs on
+    /// into there, but one along which it runs on, which is no shore:
+    /// - a cut arc's (CutArcs), which the polygon on its other side uses too;
+    /// - for a sea or ocean (`marine`), one along a line of a tenth of a degree of latitude or
+    ///   longitude with sea either side of it (`seas_beside`), where the marine areas are cut
+    ///   into tiles, their sides along it not always of the same vertices.
+    ///
+    /// Only the polygons the water so runs on into within the distance are read beyond `poly`:
+    /// the object's polygons across those tile lines, and those of the cells around the point
+    /// (`object_near`) that use a cut arc met.
+    fn shore_within(&self, poly: &AdminPolygon, marine: bool, lat: f64, lng: f64, metres: f64) -> bool {
+        // A tenth of a degree in e7 units.
+        const TILE_E7: i64 = 1_000_000;
+        let p = AdminPoint::new(lat, lng);
+        let tile_line = |a: PointE7, b: PointE7| (a.lat == b.lat && a.lat % TILE_E7 == 0) || (a.lng == b.lng && a.lng % TILE_E7 == 0);
+        // The polygons walked and to walk, the cut arcs met, and the object's polygons near.
+        let (mut walked, mut todo, mut cuts) = (Vec::new(), vec![*poly], Vec::new());
+        let mut near: Option<Vec<AdminPolygon>> = None;
+        while let Some(q) = todo.pop() {
+            walked.push(q);
+            let met = cuts.len();
+            let mut across = Vec::new();
+            let shore = self.geometry.edge_within(&q, p, metres, |slot, a, b| {
+                if self.cuts.is_cut(slot) {
+                    if !cuts.contains(&slot) {
+                        cuts.push(slot);
+                    }
+                    return false;
+                }
+                if !(marine && tile_line(a, b)) {
+                    return true;
+                }
+                let Some(seas) = self.seas_beside(p.e7(), a, b) else { return true };
+                across.extend(seas.into_iter().filter(|sea| same_object(sea, poly)));
+                false
+            });
+            if shore {
+                return true;
+            }
+            if cuts.len() > met {
+                let near = near.get_or_insert_with(|| self.object_near(poly, p));
+                across.extend(near.iter().filter(|r| self.geometry.uses_arc_near(r, p, metres, &cuts[met..])));
+            }
+            for r in across {
+                if !walked.iter().chain(&todo).any(|w| same_polygon(w, &r)) {
+                    todo.push(r);
+                }
+            }
+        }
+        false
+    }
+
+    /// The polygons of the seas or oceans either side of the edge a-b, which runs along a
+    /// parallel or a meridian: those that hold the points an e7 unit off the line each way, at
+    /// the point of the edge nearest `p` (inside its ends); none unless both sides are sea.
+    fn seas_beside(&self, p: PointE7, a: PointE7, b: PointE7) -> Option<[AdminPolygon; 2]> {
+        let along = |at: i64, x: i64, y: i64| if (x - y).abs() >= 2 { at.clamp(x.min(y) + 1, x.max(y) - 1) } else { x };
+        let sides = if a.lat == b.lat {
+            let lng = along(p.lng, a.lng, b.lng);
+            [PointE7 { lat: a.lat - 1, lng }, PointE7 { lat: a.lat + 1, lng }]
+        } else {
+            let lat = along(p.lat, a.lat, b.lat);
+            [PointE7 { lat, lng: a.lng - 1 }, PointE7 { lat, lng: a.lng + 1 }]
+        };
+        Some([self.sea_at(sides[0])?, self.sea_at(sides[1])?])
+    }
+
+    /// The polygon of a sea or ocean of the layer that holds the point, if any.
+    fn sea_at(&self, point: PointE7) -> Option<AdminPolygon> {
+        let (lat, lng) = point.degrees();
+        let point = AdminPoint::new(lat, lng);
+        let mut memo = PipMemo::new();
+        self.index.with_ids(cell_id_at_level(lat, lng, self.cell_level), |ids| {
+            ids.iter().find_map(|&id| {
+                let poly = polygon_record(&self.polygons, self.geometry.rings_len(), id & ID_MASK)?;
+                let sea = poly.name_id != NO_DATA
+                    && self.geometry.has_rings(&poly)
+                    && self.meta.kind(poly.country_code).is_some_and(|k| k.group == WaterGroup::Sea)
+                    && (id & INTERIOR_FLAG != 0 || self.geometry.contains(&poly, point, &mut memo));
+                sea.then_some(poly)
+            })
+        })
+    }
+
+    /// The polygons of the object of `poly` (its name, type code and area) that the cells around
+    /// `p` list: those of the cell holding it and of the cells beside that one, which hold every
+    /// point within a cell's width of it. `poly` among them.
+    fn object_near(&self, poly: &AdminPolygon, p: AdminPoint) -> Vec<AdminPolygon> {
+        let (lat, lng) = p.degrees();
+        let cell = cell_id_at_level(lat, lng, self.cell_level);
+        let mut ids = Vec::new();
+        for c in std::iter::once(cell).chain(cell_neighbors_at_level(cell, self.cell_level)) {
+            self.index.with_ids(c, |listed| ids.extend(listed.iter().map(|&id| id & ID_MASK)));
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter()
+            .filter_map(|id| polygon_record(&self.polygons, self.geometry.rings_len(), id))
+            .filter(|q| same_object(q, poly) && self.geometry.has_rings(q))
+            .collect()
     }
 }
 
+/// Whether two records are one polygon: their ring blocks the same.
+fn same_polygon(a: &AdminPolygon, b: &AdminPolygon) -> bool {
+    (a.ring_offset, a.ring_bytes) == (b.ring_offset, b.ring_bytes)
+}
+
+/// Whether two records are polygons of one object: of its name, type code and area.
+fn same_object(a: &AdminPolygon, b: &AdminPolygon) -> bool {
+    (a.name_id, a.country_code, a.area.to_bits()) == (b.name_id, b.country_code, b.area.to_bits())
+}
+
 /// Water dirs as the builder writes them, for the tests: rectangular areas with rectangular
-/// holes, each ring one arc.
+/// holes, each ring one arc, and objects of two pieces either side of a cut along a meridian.
 #[cfg(test)]
 pub(crate) mod fixture {
     use super::*;
-    use crate::arc_fixture::{self, ArcFixture};
+    use crate::arc_fixture::{self, ArcFixture, Ref};
     use crate::{cell_pairs, strings, DEFAULT_ADMIN_CELL_LEVEL, STR_TIER_COUNT};
     use s2::cellid::CellID;
     use s2::rect::Rect;
@@ -302,26 +693,49 @@ pub(crate) mod fixture {
   {"code": 1, "class": "natural", "type": "water", "rank": 22},
   {"code": 2, "class": "water", "type": "lake", "rank": 20},
   {"code": 4, "class": "water", "type": "pond", "rank": 24},
+  {"code": 10, "class": "water", "type": "harbour", "rank": 22},
+  {"code": 12, "class": "water", "type": "fishpond", "rank": 22},
   {"code": 21, "class": "natural", "type": "bay", "rank": 22},
   {"code": 23, "class": "natural", "type": "wetland", "rank": 22},
+  {"code": 24, "class": "natural", "type": "glacier", "rank": 22},
   {"code": 25, "class": "place", "type": "sea", "rank": 2},
-  {"code": 29, "class": "waterway", "type": "river", "rank": 19}
+  {"code": 26, "class": "place", "type": "ocean", "rank": 22},
+  {"code": 29, "class": "waterway", "type": "river", "rank": 19},
+  {"code": 30, "class": "waterway", "type": "canal", "rank": 20},
+  {"code": 32768, "class": "water", "type": "ganga_river", "rank": 22}
 ]}
 "#;
     pub const NATURAL_WATER: u16 = 1;
     pub const LAKE: u16 = 2;
     pub const POND: u16 = 4;
+    pub const HARBOUR: u16 = 10;
+    pub const FISHPOND: u16 = 12;
     pub const BAY: u16 = 21;
     pub const WETLAND: u16 = 23;
+    pub const GLACIER: u16 = 24;
     pub const SEA: u16 = 25;
+    pub const OCEAN: u16 = 26;
     pub const RIVER: u16 = 29;
+    pub const CANAL: u16 = 30;
+    pub const VERBATIM: u16 = 32768;
+
+    /// How an area's polygons lie: one, `outer` with its holes; or two pieces either side of a
+    /// cut along a meridian (its south end, then its north end), sharing the arc along it, which
+    /// water_cut_arcs.bin marks where `marked`. `sides` hold the west piece's other vertices from
+    /// the cut's north end round to its south end and the east piece's from its south end round
+    /// to its north end, `holes` each piece's holes; a cell inside a piece is interior only
+    /// where the piece is a rectangle (`rect`).
+    enum Shape {
+        Whole { outer: Span, holes: Vec<Span> },
+        Pieces { cut: [(f64, f64); 2], sides: [Vec<(f64, f64)>; 2], holes: [Vec<Span>; 2], marked: bool, rect: bool },
+    }
 
     struct Area {
         name: String,
         code: u16,
         area: Option<f32>,
-        outer: Span,
-        holes: Vec<Span>,
+        flags: u8,
+        shape: Shape,
     }
 
     /// The polygons of a water dir, in slot order.
@@ -333,6 +747,10 @@ pub(crate) mod fixture {
 
     fn ring((s, w, n, e): Span) -> Vec<crate::PointE7> {
         [(s, w), (s, e), (n, e), (n, w), (s, w)].iter().map(|&(lat, lng)| arc_fixture::e7(lat, lng)).collect()
+    }
+
+    fn line(points: &[(f64, f64)]) -> Vec<crate::PointE7> {
+        points.iter().map(|&(lat, lng)| arc_fixture::e7(lat, lng)).collect()
     }
 
     /// The L10 cells meeting the span.
@@ -355,6 +773,12 @@ pub(crate) mod fixture {
         b.lat_lo().deg() < n && b.lat_hi().deg() > s && b.lng_lo().deg() < e && b.lng_hi().deg() > w
     }
 
+    /// The span of the points.
+    fn span_of(points: &[(f64, f64)]) -> Span {
+        let start = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        points.iter().fold(start, |(s, w, n, e), &(lat, lng)| (s.min(lat), w.min(lng), n.max(lat), e.max(lng)))
+    }
+
     impl WaterFixture {
         pub fn new() -> Self {
             Self::default()
@@ -362,14 +786,55 @@ pub(crate) mod fixture {
 
         /// An area of its own: its record's area that of its rings.
         pub fn area(&mut self, name: &str, code: u16, outer: Span, holes: &[Span]) -> &mut Self {
-            self.areas.push(Area { name: name.into(), code, area: None, outer, holes: holes.to_vec() });
+            self.areas.push(Area { name: name.into(), code, area: None, flags: 0, shape: Shape::Whole { outer, holes: holes.to_vec() } });
             self
         }
 
         /// A polygon of an object of `area` square degrees (a piece of one the builder cut, or
         /// one of its outer rings): its record's area the object's.
         pub fn piece(&mut self, name: &str, code: u16, area: f32, outer: Span) -> &mut Self {
-            self.areas.push(Area { name: name.into(), code, area: Some(area), outer, holes: Vec::new() });
+            self.areas.push(Area { name: name.into(), code, area: Some(area), flags: 0, shape: Shape::Whole { outer, holes: Vec::new() } });
+            self
+        }
+
+        /// An object of two polygons, `outer` cut along the meridian `at`, the west piece first,
+        /// each record's area that of the whole; the arc along the cut is marked a cut where
+        /// `marked`.
+        pub fn split(&mut self, name: &str, code: u16, (s, w, n, e): Span, at: f64, marked: bool) -> &mut Self {
+            let sides = [vec![(n, w), (s, w)], vec![(s, e), (n, e)]];
+            let shape = Shape::Pieces { cut: [(s, at), (n, at)], sides, holes: [Vec::new(), Vec::new()], marked, rect: true };
+            self.areas.push(Area { name: name.into(), code, area: None, flags: 0, shape });
+            self
+        }
+
+        /// An object of two polygons either side of the cut along a meridian from `cut[0]` north
+        /// to `cut[1]`, the west piece first: `west` its other vertices from the cut's north end
+        /// round to its south end, `east` the east piece's from its south end round to its north
+        /// end; each record's area that of the whole, and the cut marked where `marked`.
+        pub fn pieces(&mut self, name: &str, code: u16, cut: [(f64, f64); 2], west: &[(f64, f64)], east: &[(f64, f64)], marked: bool)
+                      -> &mut Self {
+            assert_eq!(cut[0].1, cut[1].1, "a cut along a meridian");
+            let shape = Shape::Pieces { cut, sides: [west.to_vec(), east.to_vec()], holes: [Vec::new(), Vec::new()], marked, rect: false };
+            self.areas.push(Area { name: name.into(), code, area: None, flags: 0, shape });
+            self
+        }
+
+        /// A hole in the last area: in the piece on its side of the cut, where it has two.
+        pub fn island(&mut self, hole: Span) -> &mut Self {
+            match &mut self.areas.last_mut().expect("an area for the island").shape {
+                Shape::Whole { holes, .. } => holes.push(hole),
+                Shape::Pieces { cut, holes, .. } => {
+                    let (_, w, _, e) = hole;
+                    assert!(e < cut[0].1 || w > cut[0].1, "an island on one side of the cut");
+                    holes[usize::from(w > cut[0].1)].push(hole);
+                }
+            }
+            self
+        }
+
+        /// The last area's records carry `flags` in byte 14.
+        pub fn flags(&mut self, flags: u8) -> &mut Self {
+            self.areas.last_mut().expect("an area to flag").flags = flags;
             self
         }
 
@@ -379,9 +844,9 @@ pub(crate) mod fixture {
             self
         }
 
-        /// The files, by name. Each polygon is listed in every cell meeting its outer ring,
-        /// flagged interior where the cell lies inside it and meets none of its holes; the
-        /// names are the strings of a core tier.
+        /// The files, by name. Each polygon is listed in every cell meeting its outer ring's
+        /// span, flagged interior where the cell lies inside a rectangle of it and meets none of
+        /// its holes; the names are the strings of a core tier.
         pub fn files(&self) -> Vec<(&'static str, Vec<u8>)> {
             let (mut pool, mut offsets) = (Vec::new(), BTreeMap::new());
             for a in &self.areas {
@@ -393,26 +858,62 @@ pub(crate) mod fixture {
                 });
             }
             let mut arcs = ArcFixture::new();
+            let mut cut = Vec::new();
             let mut listed: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-            for (id, a) in self.areas.iter().enumerate() {
-                let rings: Vec<Vec<crate::PointE7>> = std::iter::once(a.outer).chain(a.holes.iter().copied()).map(ring).collect();
-                let area = a.area.unwrap_or_else(|| arc_fixture::exact_area(&rings));
-                let record = AdminPolygon { country_code: a.code, ..arc_fixture::record(offsets[&a.name], 0, area) };
-                arcs.ring_polygon(record, 0, &rings);
-                for cell in cells(a.outer) {
-                    let interior = inside(cell, a.outer) && !a.holes.iter().any(|&h| meets(cell, h));
-                    listed.entry(cell).or_default().push(id as u32 | if interior { INTERIOR_FLAG } else { 0 });
+            let mut list = |id: u32, span: Span, holes: &[Span], rect: bool| {
+                for cell in cells(span) {
+                    let interior = rect && inside(cell, span) && !holes.iter().any(|&h| meets(cell, h));
+                    listed.entry(cell).or_default().push(id | if interior { INTERIOR_FLAG } else { 0 });
+                }
+            };
+            for a in &self.areas {
+                let record = |area: f32| AdminPolygon {
+                    country_code: a.code,
+                    place_type_override: a.flags,
+                    ..arc_fixture::record(offsets[&a.name], 0, area)
+                };
+                match &a.shape {
+                    Shape::Whole { outer, holes } => {
+                        let rings: Vec<Vec<crate::PointE7>> = std::iter::once(*outer).chain(holes.iter().copied()).map(ring).collect();
+                        let id = arcs.ring_polygon(record(a.area.unwrap_or_else(|| arc_fixture::exact_area(&rings))), 0, &rings);
+                        list(id, *outer, holes, true);
+                    }
+                    Shape::Pieces { cut: [south, north], sides, holes, marked, rect } => {
+                        // Each piece's outer ring, from the cut's end it leaves round to the other.
+                        let outers = [[&[*north][..], &sides[0], &[*south]].concat(), [&[*south][..], &sides[1], &[*north]].concat()];
+                        let rings = |k: usize| -> Vec<Vec<crate::PointE7>> {
+                            let closed = [&outers[k][..], &outers[k][..1]].concat();
+                            std::iter::once(line(&closed)).chain(holes[k].iter().map(|&h| ring(h))).collect()
+                        };
+                        let area = a.area.unwrap_or_else(|| arc_fixture::exact_area(&rings(0)) + arc_fixture::exact_area(&rings(1)));
+                        let along = arcs.arc(0, &line(&[*south, *north]));
+                        if *marked {
+                            cut.push(along);
+                        }
+                        for (k, way) in [(0, Ref::fwd(along)), (1, Ref::rev(along))] {
+                            let side = arcs.arc(0, &line(&outers[k]));
+                            let mut refs = vec![vec![Ref::fwd(side), way]];
+                            refs.extend(holes[k].iter().map(|&h| vec![Ref::fwd(arcs.arc(0, &ring(h)))]));
+                            let id = arcs.polygon(record(area), &refs);
+                            list(id, span_of(&outers[k]), &holes[k], *rect);
+                        }
+                    }
                 }
             }
             let (cells, entries) = cell_pairs::write(&listed.into_iter().collect::<Vec<_>>(), cell_pairs::ADMIN);
             let end = pool.len();
             let tiers: Vec<String> = (0..STR_TIER_COUNT).map(|t| format!("{{\"start\": {}, \"end\": {end}}}", if t == 0 { 0 } else { end })).collect();
+            let mut words = vec![0u32; (arcs.arc_index().len() / 4).div_ceil(32)];
+            for slot in cut {
+                words[slot as usize / 32] |= 1 << (slot % 32);
+            }
             let mut files: Vec<(&'static str, Vec<u8>)> = arcs.files().into();
             files.extend([
                 ("admin_cells.bin", cells),
                 ("admin_entries.bin", entries),
                 ("strings_core.bin", strings::encode(&pool)),
                 ("strings_layout.json", format!("{{\"tiers\": [{}]}}", tiers.join(", ")).into_bytes()),
+                ("water_cut_arcs.bin", words.iter().flat_map(|w| w.to_le_bytes()).collect()),
                 ("water_meta.json", self.meta.clone().unwrap_or_else(|| META.into()).into_bytes()),
             ]);
             files
@@ -434,10 +935,13 @@ pub(crate) mod fixture {
             let end = layout["tiers"][0]["end"].as_u64().unwrap() as u32;
             let core = strings::Tier::open(file("strings_core.bin")).unwrap();
             let strings = StringPool::from_parts([Some(core), None, None, None, None], [0, end, end, end, end, end]);
+            let geometry = AdminGeometry::new(file("admin_rings.bin"), file("arc_index.bin"), file("arc_vertices.bin"));
+            let cuts = CutArcs::new(file("water_cut_arcs.bin"), geometry.arc_slots()).unwrap();
             WaterLayer::new(
                 CellPairs::open(file("admin_cells.bin"), file("admin_entries.bin"), cell_pairs::ADMIN, DEFAULT_ADMIN_CELL_LEVEL).unwrap(),
                 file("admin_polygons.bin"),
-                AdminGeometry::new(file("admin_rings.bin"), file("arc_index.bin"), file("arc_vertices.bin")),
+                geometry,
+                cuts,
                 strings,
                 WaterMeta::from_json(std::str::from_utf8(&files["water_meta.json"]).unwrap()).unwrap(),
                 DEFAULT_ADMIN_CELL_LEVEL,
@@ -592,10 +1096,12 @@ mod tests {
         assert_eq!(arcs_read(&fixture(true, true), 0.25, 0.18).0.as_deref(), Some("Sea"));
     }
 
-    // geocoder/testdata/water_dir holds the files the builder's water layer writes on three days
+    // geocoder/testdata/water_dir holds the files the builder's water layer writes on four days
     // (builder/tests/s2/test_water_layer.cpp): a lake relation with an island, a pond, a river
-    // area its waterway names and one none names, a lake of a water=* value of its own, and from
-    // day 3 a salt pond of another and a marine sea. Each answers as the builder made it.
+    // area its waterway names and one none names, a lake of a water=* value of its own, from
+    // day 3 a salt pond of another and a marine sea of two tiles, and on day 4 a lake of many
+    // islands in pieces. Each answers as the builder made it, and the side the tiles share is a
+    // cut, no shore.
     #[test]
     fn the_builders_water_dirs_answer_as_it_wrote_them() {
         let day = |d: &str| {
@@ -617,6 +1123,13 @@ mod tests {
         assert_eq!((at(&one, 47.06005, 8.00005), at(&one, 45.001, 8.001)), (None, None));
         assert_eq!(at(&three, 47.06005, 8.00005), kind("Salzweiher", "water", "salt_pond"));
         assert_eq!(at(&three, 45.001, 8.001), kind("North Sea", "place", "sea"));
+        // 16 m from the side the tiles share, 110 m and more from every other; 11 m from their
+        // north side, and from their south side, on a line of a tenth of a degree with no sea
+        // across it.
+        let line = |(lat, lng): (f64, f64)| three.at(lat, lng).unwrap().takes_landmark(lat, lng, &LocationLine::default());
+        assert!(line((45.001, 8.0018)));
+        assert!(!line((45.0001, 8.001)));
+        assert!(!line((45.0019, 8.001)));
     }
 
     #[test]
@@ -718,5 +1231,245 @@ mod tests {
             std::fs::create_dir(water.join(name)).unwrap();
         }
         assert_eq!(open(), Err(format!("{}/admin_cells.bin: not a file", water.display())));
+    }
+
+    /// Whether the location line beside the water at the point, `line` its address, names it.
+    fn takes(layer: &WaterLayer, (lat, lng): (f64, f64), line: &LocationLine<'_>) -> bool {
+        layer.at(lat, lng).expect("water at the point").takes_landmark(lat, lng, line)
+    }
+
+    /// A lake of 0.01 degrees at the equator (1.2 km², notable), its south side at latitude 0.
+    const SQUARE: Span = (0.0, 0.0, 0.01, 0.01);
+    const MIDDLE: (f64, f64) = (0.005, 0.005);
+
+    /// A line without a landmark, city, state or country.
+    fn bare() -> LocationLine<'static> {
+        LocationLine::default()
+    }
+
+    /// A line whose landmark is a POI of `category` and polygon area `area`.
+    fn under(name: &str, category: u8, area: f64) -> LocationLine<'_> {
+        LocationLine { landmark: Some((name, Some(LandmarkPoi { category, area }))), ..LocationLine::default() }
+    }
+
+    #[test]
+    fn a_lake_takes_the_landmark_40_m_or_more_inside_its_shore() {
+        // 0.0003 degrees is 33.4 m at the equator, 0.0004 degrees 44.5 m.
+        let lake = WaterFixture::new().area("Lac Léman", LAKE, SQUARE, &[]).layer();
+
+        assert!(takes(&lake, MIDDLE, &bare()));
+        assert!(takes(&lake, (0.0004, 0.005), &bare()));
+        for p in [(0.0003, 0.005), (0.005, 0.0097), (0.0097, 0.0097), (0.00001, 0.00001)] {
+            assert!(!takes(&lake, p, &bare()), "{p:?}");
+        }
+        // An island's shore is a shore.
+        let island = WaterFixture::new().area("Lac Léman", LAKE, SQUARE, &[(0.004, 0.004, 0.006, 0.006)]).layer();
+        assert!(takes(&island, (0.003, 0.005), &bare()));
+        assert!(!takes(&island, (0.0037, 0.005), &bare()));
+    }
+
+    #[test]
+    fn kinds_the_line_never_names_never_take_the_landmark() {
+        let named = |code: u16| takes(&WaterFixture::new().area("Testwasser", code, SQUARE, &[]).layer(), MIDDLE, &bare());
+
+        for code in [NATURAL_WATER, LAKE, POND, HARBOUR, BAY, WETLAND, GLACIER, SEA, OCEAN, RIVER, CANAL] {
+            assert!(named(code), "code {code}");
+        }
+        for code in [FISHPOND, VERBATIM] {
+            assert!(!named(code), "code {code}");
+        }
+        assert_eq!([("water", "moat"), ("landuse", "basin"), ("water", "wastewater"), ("water", "river")].map(|(c, t)| WaterGroup::of(c, t)),
+                   [WaterGroup::Other, WaterGroup::Other, WaterGroup::Other, WaterGroup::River]);
+    }
+
+    #[test]
+    fn a_catalogue_number_is_no_name() {
+        for name in ["№30", "No. 116", "no 5", "Nr.12", "#4", "Lake 938", "lake938", "Glacier 5b", "Pond 12", "49,0", "1-2", "Tank 3"] {
+            assert!(catalogue_name(name), "{name}");
+        }
+        for name in ["Lake Geneva", "Lake 938 North", "Lakes 5", "Nolan 5", "North Lake", "Pond 12 Upper", "Lake 938ab", "Moat"] {
+            assert!(!catalogue_name(name), "{name}");
+        }
+        let lake = |name: &str| takes(&WaterFixture::new().area(name, LAKE, SQUARE, &[]).layer(), MIDDLE, &bare());
+        assert!(!lake("Lake 938"));
+        assert!(lake("Lake Geneva"));
+    }
+
+    #[test]
+    fn still_water_and_wetland_under_a_hectare_never_take_the_landmark_rivers_of_any_size_do() {
+        // A hectare is 8.07e-7 square degrees at the equator and twice that at 60 degrees north;
+        // the record's area is the object's, whatever its polygon here.
+        let of = |code: u16, area: f32, span: Span, p: (f64, f64)| takes(&WaterFixture::new().piece("Testwasser", code, area, span).layer(), p, &bare());
+
+        assert!(!of(POND, 7.0e-7, SQUARE, MIDDLE));
+        assert!(of(POND, 9.0e-7, SQUARE, MIDDLE));
+        assert!(!of(WETLAND, 7.0e-7, SQUARE, MIDDLE));
+        assert!(of(WETLAND, 9.0e-7, SQUARE, MIDDLE));
+        assert!(of(RIVER, 1.0e-8, SQUARE, MIDDLE));
+        assert!(of(CANAL, 1.0e-8, SQUARE, MIDDLE));
+        let north = (60.0, 0.0, 60.01, 0.02);
+        assert!(!of(LAKE, 1.5e-6, north, (60.005, 0.01)));
+        assert!(of(LAKE, 1.7e-6, north, (60.005, 0.01)));
+    }
+
+    #[test]
+    fn a_weak_name_never_takes_the_landmark() {
+        let river = |flags: u8| takes(&WaterFixture::new().area("Newtown Creek", RIVER, SQUARE, &[]).flags(flags).layer(), MIDDLE, &bare());
+
+        assert!(river(0));
+        assert!(!river(WEAK_NAME));
+    }
+
+    #[test]
+    fn a_name_the_line_has_already_never_takes_the_landmark() {
+        let lake = |name: &str, line: &LocationLine<'_>| takes(&WaterFixture::new().area(name, LAKE, SQUARE, &[]).layer(), MIDDLE, line);
+        let shown = |city, state, country| LocationLine { shown: [city, state, country], ..LocationLine::default() };
+
+        assert!(!lake("Jämijärvi", &shown(Some("Jämijärvi"), Some("Satakunta"), Some("Finland"))));
+        assert!(!lake("Lake-Geneva", &shown(None, Some("lake geneva"), Some("Switzerland"))));
+        assert!(!lake("Aral", &shown(None, None, Some("ARAL"))));
+        assert!(lake("Jämijärvi", &shown(Some("Jämijärvi town"), Some("Satakunta"), Some("Finland"))));
+        // Within the landmark's name, or the landmark within the water's, from 4 characters.
+        let reserve = |name: &'static str| under(name, 131, 1.0);
+        assert!(!lake("Mill Pond", &reserve("Setauket Mill Pond")));
+        assert!(!lake("Lake Titicaca", &reserve("Lake Titicaca (Peruvian sector)")));
+        assert!(!lake("Lake Titicaca", &reserve("lake titicaca")));
+        assert!(!lake("Milford Sound", &reserve("Piopiotahi (Milford Sound) Marine Reserve")));
+        assert!(lake("Mill Pond", &reserve("Mil")));
+        assert!(lake("Tonle Sap Lake", &reserve("Boeung Tonle Sap Protected Area")));
+        // Accents aside (NFKD, its marks dropped), and compatibility forms too.
+        assert!(!lake("Lagoa D'água", &shown(Some("Lágoa D'água"), Some("Bahia"), Some("Brazil"))));
+        assert!(!lake("Jamijarvi", &shown(Some("Jämijärvi"), None, Some("Finland"))));
+        assert!(!lake("Lake Mahinapua", &reserve("Lake Māhinapua Scenic Reserve")));
+        assert!(!lake("Ｌａｋｅ Ｂｌｅｄ", &shown(None, Some("Lake Bled"), Some("Slovenia"))));
+        assert!(lake("Lagoa D'água", &shown(Some("Lagoa Dourada"), Some("Bahia"), Some("Brazil"))));
+        assert_eq!(fold("Lágoa D'Água"), "lagoadagua");
+        assert_eq!(fold("Ångström-Sjön №5"), "angstromsjonno5");
+    }
+
+    #[test]
+    fn a_landmark_stays_but_for_a_park_under_notable_smaller_water_and_a_natural_one_under_smaller_water() {
+        // The square's object is 1.0e-4 square degrees.
+        let water = |code: u16, line: &LocationLine<'_>| takes(&WaterFixture::new().area("Testwasser", code, SQUARE, &[]).layer(), MIDDLE, line);
+        let small = |line: &LocationLine<'_>| takes(&WaterFixture::new().piece("Testwasser", LAKE, 4.0e-6, SQUARE).layer(), MIDDLE, line);
+
+        // A nature reserve (61), national park (130) or protected area (131) larger than a
+        // notable lake, glacier, bay or river gives way to it.
+        for category in [61, 130, 131] {
+            for code in [LAKE, GLACIER, BAY, RIVER] {
+                assert!(water(code, &under("Testpark", category, 1.0)), "{category} {code}");
+                assert!(!water(code, &under("Testpark", category, 5.0e-5)), "{category} {code}: a smaller park");
+            }
+            // A sea, an ocean and a wetland never; nor a lake of under 0.1 km².
+            for code in [SEA, OCEAN, WETLAND] {
+                assert!(!water(code, &under("Testpark", category, 1.0)), "{category} {code}");
+            }
+            assert!(!small(&under("Testpark", category, 1.0)));
+        }
+        // A natural feature (a beach, 82; a glacier, 86) gives way to smaller water, whatever its
+        // size; a sea too.
+        for category in [82, 86] {
+            assert!(water(LAKE, &under("Testfeature", category, 1.0)));
+            assert!(small(&under("Testfeature", category, 1.0)));
+            assert!(water(SEA, &under("Testfeature", category, 1.0)));
+            assert!(!water(LAKE, &under("Testfeature", category, 5.0e-5)));
+        }
+        // Every other landmark stays: a bridge (113), a park (60), an attraction (1), a marina
+        // (66); and one whose POI the answer doesn't know.
+        for category in [113, 60, 1, 66] {
+            assert!(!water(LAKE, &under("Testlandmark", category, 1.0)), "{category}");
+        }
+        assert!(!water(LAKE, &LocationLine { landmark: Some(("Testlandmark", None)), ..LocationLine::default() }));
+    }
+
+    #[test]
+    fn a_cut_between_two_pieces_of_one_object_is_no_shore() {
+        // A lake cut along the meridian 0.01 into two pieces; the points 22 m either side of it.
+        let split = |marked: bool| WaterFixture::new().split("Testsee", LAKE, (0.0, 0.0, 0.01, 0.02), 0.01, marked).layer();
+        let (west, east) = ((0.005, 0.0098), (0.005, 0.0102));
+
+        assert!(takes(&split(true), west, &bare()));
+        assert!(takes(&split(true), east, &bare()));
+        assert!(!takes(&split(false), west, &bare()));
+        assert!(!takes(&split(false), east, &bare()));
+        // Its other shores are shores still.
+        assert!(!takes(&split(true), (0.0002, 0.0098), &bare()));
+    }
+
+    #[test]
+    fn a_shore_of_another_piece_of_the_object_past_a_cut_is_a_shore() {
+        // A lake cut along the meridian 0.01, an island in its east piece 22 m past the cut: 11 m
+        // west of the cut, the point is 33 m from the island's shore, and 550 m and more from
+        // every shore of the piece that holds it.
+        let island =
+            WaterFixture::new().split("Testsee", LAKE, (0.0, 0.0, 0.01, 0.02), 0.01, true).island((0.0045, 0.0102, 0.0055, 0.0105)).layer();
+        assert!(!takes(&island, (0.005, 0.0099), &bare()));
+        assert!(takes(&island, (0.005, 0.0095), &bare()));
+
+        // The lake's north shore runs north-west from the cut's north end in the west piece and
+        // falls steeply to the south-east from it in the east piece: 20 m west of the cut and
+        // 40 m south of its end, the point is 45 m from the end and 36 m from the east piece's
+        // shore; 60 m south of the end, 45 m from it.
+        let m = 1.0 / crate::METRES_PER_DEGREE;
+        let bank = WaterFixture::new()
+            .pieces("Testsee", LAKE, [(0.0, 0.01), (0.01, 0.01)], &[(0.011, 0.009), (0.011, 0.0), (0.0, 0.0)], &[(0.0, 0.015)], true)
+            .layer();
+        assert!(!takes(&bank, (0.01 - 40.0 * m, 0.01 - 20.0 * m), &bare()));
+        assert!(takes(&bank, (0.01 - 60.0 * m, 0.01 - 20.0 * m), &bare()));
+    }
+
+    #[test]
+    fn a_seas_line_of_a_tenth_of_a_degree_is_no_shore_where_sea_lies_across_it() {
+        // Two tiles of a sea either side of the meridian 0.1, each a ring of its own (no arc
+        // shared, none marked a cut), as the marine areas are cut along those lines: the line
+        // between them is no shore. Their south sides lie on the parallel 0, with no sea south
+        // of it: a coast, as is a sea's edge off those lines.
+        let tiles = |east: &str| {
+            WaterFixture::new().piece("North Sea", SEA, 0.02, (0.0, 0.0, 0.1, 0.1)).piece(east, SEA, 0.02, (0.0, 0.1, 0.1, 0.2)).layer()
+        };
+        let (seam, south) = ((0.05, 0.0998), (0.0002, 0.05));
+        assert!(takes(&tiles("North Sea"), seam, &bare()));
+        assert!(!takes(&tiles("North Sea"), south, &bare()));
+        // A tile of another sea across the line.
+        assert!(takes(&tiles("Norwegian Sea"), seam, &bare()));
+        // Past the line, the shore of the sea's tile there is its shore: an island 22 m east of
+        // it, 33 m from the point.
+        let island = WaterFixture::new()
+            .piece("North Sea", SEA, 0.02, (0.0, 0.0, 0.1, 0.1))
+            .piece("North Sea", SEA, 0.02, (0.0, 0.1, 0.1, 0.2))
+            .island((0.0495, 0.1002, 0.0505, 0.1005))
+            .layer();
+        assert!(!takes(&island, (0.05, 0.0999), &bare()));
+        assert!(takes(&island, (0.05, 0.0995), &bare()));
+        // A sea alone, its sides on those lines but its east one: each a coast.
+        let sea = WaterFixture::new().area("North Sea", SEA, (0.0, 0.0, 0.1, 0.10005), &[]).layer();
+        for p in [(0.0002, 0.05), (0.05, 0.0002), (0.05, 0.1)] {
+            assert!(!takes(&sea, p, &bare()), "{p:?}");
+        }
+        // A lake's edges on them are shores, whatever lies across.
+        let lakes =
+            WaterFixture::new().piece("Testsee", LAKE, 0.02, (0.0, 0.0, 0.1, 0.1)).piece("Testsee", LAKE, 0.02, (0.0, 0.1, 0.1, 0.2)).layer();
+        assert!(!takes(&lakes, seam, &bare()));
+    }
+
+    #[test]
+    fn a_water_answer_carries_landmark_last_and_only_when_set() {
+        let lake = WaterFixture::new().area("Le Léman", LAKE, SQUARE, &[]).layer();
+        let mut water = lake.at(MIDDLE.0, MIDDLE.1).unwrap();
+
+        assert_eq!(serde_json::to_string(&water).unwrap(), r#"{"name":"Le Léman","class":"water","type":"lake"}"#);
+        water.landmark = true;
+        assert_eq!(serde_json::to_string(&water).unwrap(), r#"{"name":"Le Léman","class":"water","type":"lake","landmark":true}"#);
+    }
+
+    #[test]
+    fn a_cut_arc_file_holds_a_bit_per_arc_slot() {
+        let words = |bytes: &[u8], slots: usize| CutArcs::new(FileBytes::Owned(bytes.to_vec()), slots);
+
+        let cuts = words(&[0b10, 0, 0, 0x80, 1, 0, 0, 0], 33).unwrap();
+        assert_eq!((0..34).filter(|&s| cuts.is_cut(s)).collect::<Vec<u32>>(), [1, 31, 32]);
+        assert!(words(&[], 0).is_ok());
+        assert_eq!(words(&[0; 4], 33).err(), Some("4 bytes for 33 arc slots, not 8".to_string()));
+        assert_eq!(words(&[0; 8], 32).err(), Some("8 bytes for 32 arc slots, not 4".to_string()));
     }
 }

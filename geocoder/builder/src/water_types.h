@@ -85,6 +85,11 @@ inline constexpr uint16_t kCanal = 30;
 // The first code of the water=* values outside the fixed table.
 inline constexpr uint16_t kVerbatimBase = 0x8000;
 
+// A water record's flags, in the place type of its byte 14 (a boundary's
+// level and place type): kWeakName for a name it took weakly from a
+// waterway (water_names.h).
+inline constexpr uint8_t kWeakName = 1;
+
 // Nominatim's rank of a water=* value outside the fixed table: the water
 // class's default.
 inline constexpr uint8_t kVerbatimRank = 22;

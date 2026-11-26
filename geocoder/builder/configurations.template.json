@@ -2,7 +2,7 @@
   "schema_version": 1,
   "build": {
     "version": 24,
-    "patch_version": 23
+    "patch_version": 24
   },
   "attribution": [
     {
@@ -237,7 +237,7 @@
         "major": {
           "label": "Major (~98K areas)",
           "precision_m": 37.5,
-          "description": "The seas and oceans, in builds that pin the marine areas; every named water area of 100 km² or more, whatever its kind (lakes, reservoirs, bays, straits, wetlands, glaciers and the rest); and whole rivers and canals whose areas sum to 100 km², or 5 km² with a Wikidata item. Those are the thresholds to enter: one in the previous build's tier stays down to 90 km², or 4.5 km² for a river or canal with a Wikidata item. ~37 m shores.",
+          "description": "The seas and oceans, in builds that pin the marine areas; every named water area of 100 km² or more, whatever its kind (lakes, reservoirs, wetlands, glaciers and the rest), and bays, straits, fjords, sounds, lagoons and harbours of 10 km² or more; and whole rivers and canals whose areas sum to 100 km², or 5 km² with a Wikidata item. Those are the thresholds to enter: one in the previous build's tier stays down to 90 km², 9 km² for coastal water, or 4.5 km² for a river or canal with a Wikidata item. ~37 m shores.",
           "order": 2
         },
         "all": {
@@ -493,6 +493,7 @@
         "{region}/water/major/simplified/arc_vertices.bin",
         "{region}/water/major/simplified/strings_core.bin",
         "{region}/water/major/simplified/strings_layout.json",
+        "{region}/water/major/simplified/water_cut_arcs.bin",
         "{region}/water/major/simplified/water_meta.json",
         "{region}/water/major/simplified/attribution.json"
       ]
@@ -509,6 +510,7 @@
         "{region}/water/all/simplified/arc_vertices.bin",
         "{region}/water/all/simplified/strings_core.bin",
         "{region}/water/all/simplified/strings_layout.json",
+        "{region}/water/all/simplified/water_cut_arcs.bin",
         "{region}/water/all/simplified/water_meta.json",
         "{region}/water/all/simplified/attribution.json"
       ]
@@ -525,6 +527,7 @@
         "{region}/water/all/exact/arc_vertices.bin",
         "{region}/water/all/exact/strings_core.bin",
         "{region}/water/all/exact/strings_layout.json",
+        "{region}/water/all/exact/water_cut_arcs.bin",
         "{region}/water/all/exact/water_meta.json",
         "{region}/water/all/exact/attribution.json"
       ]
