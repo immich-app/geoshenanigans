@@ -42,10 +42,11 @@ function core() {
 // the axes (of region, planet only) and their values in order, the presets,
 // each planet selection the constraints allow as a dataset (the preset's
 // label and description for a preset's, of size its place in GiB on disk and
-// half that to download) and those they rule out, and the ids of the
-// build's components. As catalog.rs, a preset names the dataset of its
-// region, mode, quality and POI tier, and one with water names none: the
-// portal serves the selections without water.
+// half that to download) and those they rule out, the ids of the build's
+// components, and the water dirs served beside the datasets (none first,
+// then each other water value of the template, all the default). As
+// catalog.rs, a preset names the dataset of its region, mode, quality and
+// POI tier, and one with water names none.
 function catalog(edit = () => {}) {
   const t = structuredClone(template);
   edit(t);
@@ -89,7 +90,16 @@ function catalog(edit = () => {}) {
     id: p.id, label: p.label, description: p.description, dataset: `${p.selections.mode}.${p.selections.quality}.${p.selections.poi_tier}`,
   }));
   const components = Object.keys(t.components).sort();
-  return { build: { date: '2026-11-20', version: 24, id: ID, dir: '2026-11-20-1' }, default: 'full.simplified.all', axes, presets, datasets, excluded, components };
+  const water = t.axes.water && {
+    label: t.axes.water.label,
+    description: t.axes.water.description ?? null,
+    default: 'all',
+    values: values('water').map(([v, x], i) => ({
+      id: v, label: x.label, description: x.description ?? null,
+      ...(v === 'none' ? {} : { region: 'planet', size_disk: i * 2 ** 28, size_download: i * 2 ** 27 }),
+    })),
+  };
+  return { build: { date: '2026-11-20', version: 24, id: ID, dir: '2026-11-20-1' }, default: 'full.simplified.all', axes, presets, datasets, excluded, components, water: water || null };
 }
 
 // The publication IDs of two builds of 2026-11-20, the second published
@@ -198,13 +208,14 @@ test('the link names a dataset per column, the points and the build', () => {
     points: [{ lat: 48.8584, lng: 2.2945 }, { lat: -33.85, lng: 151.2 }],
     build: '2026-11-19',
     q: '',
+    water: null,
   });
   assert.equal(
     linkSearch({ datasets: ['with-addresses', 'europe/full.simplified.all'], point: { lat: 48.8584, lng: 2.2945 }, build: '2026-11-20' }),
     '?d=with-addresses&d=europe/full.simplified.all&at=48.8584,2.2945&b=2026-11-20',
   );
   assert.deepEqual(plain(parseLink(linkSearch({ datasets: ['smallest'], point: { lat: 1.000000123, lng: -2.5 }, build: null }))),
-    { datasets: ['smallest'], points: [{ lat: 1.000000123, lng: -2.5 }], build: null, q: '' });
+    { datasets: ['smallest'], points: [{ lat: 1.000000123, lng: -2.5 }], build: null, q: '', water: null });
   assert.equal(linkSearch({ datasets: [], point: null, build: null }), '');
   assert.equal(parseLink(`?d=smallest&b=${AGAIN}`).build, AGAIN);
   assert.equal(linkSearch({ datasets: ['smallest'], point: null, build: AGAIN }), `?d=smallest&b=${AGAIN}`);
@@ -2034,6 +2045,29 @@ test('an empty answer at sea shows no address, and falls back to what Immich sto
   assert.ok(!detailHtml([{ ...views[0], answer: { loading: true } }], ID, NAMES).includes('Full address'));
 });
 
+test('the water the location line names is the landmark in Immich, and at sea stands with what Immich stores', () => {
+  const lake = { name: 'Lake Geneva', class: 'water', type: 'lake', landmark: true };
+  const lausanne = { display_name: 'x', address: { city: 'Lausanne', state: 'Vaud', country: 'Switzerland', country_code: 'ch' } };
+  const shown = (data, others = []) => shownRows([data, ...others])['In Immich'];
+  assert.equal(shown({ ...lausanne, water: lake }).values[0], 'Lake Geneva, Lausanne, Vaud, Switzerland');
+  // Water the line doesn't name changes nothing.
+  const { landmark: _, ...unnamed } = lake;
+  assert.equal(shown({ ...lausanne, water: unnamed }).values[0], 'Lausanne, Vaud, Switzerland');
+  // It takes the place of the address's landmark.
+  const seine = { display_name: 'x', water: { name: 'La Seine', class: 'waterway', type: 'river', landmark: true },
+    address: { landmark: 'Banks of the Seine', city: 'Paris', state: 'Ile-de-France', country: 'France', country_code: 'fr' } };
+  assert.equal(shown(seine).values[0], 'La Seine, Paris, Ile-de-France, France');
+  assert.equal(shown({ ...seine, water: { ...seine.water, landmark: undefined } }).values[0], 'Banks of the Seine, Paris, Ile-de-France, France');
+  // At sea: the water alone, or before what Immich's own lookup stores.
+  const sea = { address: {}, water: { name: 'North Sea', class: 'place', type: 'sea', landmark: true } };
+  assert.deepEqual(plain(shown(sea)), { field: 'In Immich', values: ['North Sea'], differs: false, missing: false, fallback: [true] });
+  const shelf = { address: {}, water: { name: 'Filchner-Ronne Ice Shelf', class: 'natural', type: 'glacier', landmark: true } };
+  const ne = immichData('natural_earth', { city: null, state: null, country: 'Antarctica' });
+  assert.deepEqual(plain(shown(shelf, [ne]).values), ['Filchner-Ronne Ice Shelf, Antarctica', 'Antarctica']);
+  // Water at sea the line doesn't name: what Immich's lookup stores, as before.
+  assert.deepEqual(plain(shown({ ...shelf, water: { ...shelf.water, landmark: undefined } }, [ne]).values), ['Antarctica', 'Antarctica']);
+});
+
 test("the page names our answers' countries by the Immich column's names, none without it", () => {
   const { immichCountryNames } = core();
   assert.deepEqual(plain(immichCountryNames(withImmich())), NAMES);
@@ -2203,16 +2237,26 @@ test("the page's credit is the template's attribution but the water's own", () =
   for (const e of template.attribution.filter(ofWaterAlone)) assert.ok(!DATA_CREDITS.some((d) => d.id === e.id), e.id);
 });
 
-// The portal serves the selections without water (catalog.rs's WATER), so
-// a source the build credits for its water alone is none of the answers',
-// the page's own credit or the build's.
-test('the disclosure credits no source of the water alone, which the portal serves none of', () => {
+// The portal's datasets are the selections without water (catalog.rs's
+// NO_WATER), its water dirs beside them: a source the build credits for its
+// water alone is the answers' only while the columns ask with a water it
+// names, never the page's own credit.
+test('the disclosure credits a source of the water alone only while the columns ask with a water it names', () => {
   const { creditsHtml } = core();
   const sea = { id: 'sea', text: 'Seas of somewhere', url: 'https://seas.example.org/', notices: ['The seas, cut to the land.'], applies_to: ['water.major', 'water.all'] };
-  for (const c of [null, catalog(), { ...catalog(), attribution: template.attribution }, { ...catalog(), attribution: [OSM, sea] }]) {
-    const out = creditsHtml(c);
-    assert.ok(!/marine/i.test(out), out);
-    assert.ok(!out.includes('Seas of somewhere') && !text(out).includes('The seas, cut to the land.'), out);
+  for (const water of [undefined, null, 'none', 'all-exact']) {
+    for (const c of [null, catalog(), { ...catalog(), attribution: template.attribution }, { ...catalog(), attribution: [OSM, sea] }]) {
+      const out = creditsHtml(c, water);
+      assert.ok(water === 'all-exact' && c && c.attribution === template.attribution ? /marineregions\.org/.test(out) : !/marine/i.test(out), `${water} ${out}`);
+      assert.ok(!out.includes('Seas of somewhere') && !text(out).includes('The seas, cut to the land.'), out);
+    }
+  }
+  for (const water of ['major', 'all']) {
+    const out = creditsHtml({ ...catalog(), attribution: [OSM, sea] }, water);
+    assert.ok(out.startsWith('<div class="credit-group" data-from="build">'), out);
+    assert.ok(text(out).includes('The seas, cut to the land.'), water);
+    assert.ok(/marineregions\.org/.test(creditsHtml({ ...catalog(), attribution: template.attribution }, water)), water);
+    assert.ok(!/marine/i.test(creditsHtml(null, water)), water);
   }
   // A list of the water's sources alone credits none of the answers: the
   // page's is shown.
@@ -2250,4 +2294,119 @@ test("the build's credit from the template credits every source of the answers o
   }
   // Each source once.
   assert.deepEqual(plain(dataCredits(c).map((e) => e.id)).sort(), plain(DATA_CREDITS.map((e) => e.id)).sort());
+});
+
+// -- Water --
+
+// The water of Lake Geneva, as an answer's water field gives it.
+const GENEVA = { name: 'Lac Léman', class: 'natural', type: 'water' };
+
+test('the water toggle offers the build\'s water, all by default, and nothing for a build without water', () => {
+  const { waterValues, waterOf, waterToggleHtml } = core();
+  const c = catalog();
+  assert.deepEqual(plain(waterValues(c).map((v) => v.id)), ['none', 'major', 'all', 'all-exact']);
+  assert.equal(waterOf(c, null), 'all');
+  assert.equal(waterOf(c, 'major'), 'major');
+  assert.equal(waterOf(c, 'none'), 'none');
+  assert.equal(waterOf(c, 'oceans'), 'all');
+  // Without all, the default the build gives; without water, none at all.
+  const majorOnly = { ...c, water: { ...c.water, default: 'none', values: c.water.values.slice(0, 2) } };
+  assert.equal(waterOf(majorOnly, 'all'), 'none');
+  const dry = { ...c, water: null };
+  assert.deepEqual(plain(waterValues(dry)), []);
+  assert.equal(waterOf(dry, 'all'), null);
+  assert.equal(waterToggleHtml(dry, null), '');
+
+  const out = waterToggleHtml(c, 'major');
+  assert.deepEqual([...out.matchAll(/data-water="([^"]+)"/g)].map((m) => m[1]), ['none', 'major', 'all', 'all-exact']);
+  assert.deepEqual([...out.matchAll(/<button[^>]*>([^<]*)<\/button>/g)].map((m) => m[1]), ['None', 'Major', 'All', 'All, exact']);
+  assert.match(out, /class="water-btn on" data-water="major" aria-pressed="true"/);
+  assert.equal(out.match(/aria-pressed="true"/g).length, 1);
+  // Each button is titled with its label, description and sizes; none's has no sizes.
+  assert.match(out, /data-water="major" aria-pressed="true" title="Major \(~98K areas\): The seas and oceans[,;][^"]*\(0\.25 GiB on disk, 0\.13 GiB download\)"/);
+  assert.match(out, /data-water="none" aria-pressed="false" title="None: No water areas\.">/);
+  // Every string of the manifest is escaped.
+  const hostileWater = { ...c, water: { ...c.water, label: '<u>water</u>', values: [{ id: '"><img src=x>', label: '<b>x</b>', description: '<i>y</i>' }] } };
+  assertEscaped(waterToggleHtml(hostileWater, null));
+});
+
+test('a column asks with the water the toggle picks, the Immich column without; each water\'s answers are kept apart', () => {
+  const { resolveColumn, reverseUrl, answerKey, takesWater, columnKey } = core();
+  const c = withImmich();
+  const geocoder = resolveColumn(c, 'with-addresses');
+  const immich = resolveColumn(c, 'immich-cities500');
+  const single = { single: true, token: null, dataset: null };
+  assert.equal(reverseUrl(46.45, 6.55, geocoder, 'major'), '/reverse?lat=46.45&lon=6.55&key=test&dataset=full.simplified.all&water=major');
+  assert.equal(reverseUrl(46.45, 6.55, geocoder, null), '/reverse?lat=46.45&lon=6.55&key=test&dataset=full.simplified.all');
+  assert.equal(reverseUrl(46.45, 6.55, immich, 'major'), '/reverse?lat=46.45&lon=6.55&key=test&dataset=immich-cities500');
+  assert.equal(reverseUrl(46.45, 6.55, single, 'all'), '/reverse?lat=46.45&lon=6.55&key=test');
+  assert.deepEqual([geocoder, immich, single].map(takesWater), [true, false, false]);
+
+  assert.equal(answerKey(geocoder, 'all'), 'full.simplified.all~all');
+  assert.equal(answerKey(geocoder, 'none'), 'full.simplified.all~none');
+  assert.equal(answerKey(geocoder, null), 'full.simplified.all');
+  assert.equal(answerKey(immich, 'all'), 'immich-cities500');
+  assert.equal(answerKey(single, 'all'), '');
+  // The polygons' key is the dataset's, whatever the water.
+  assert.equal(columnKey(geocoder), 'full.simplified.all');
+});
+
+test('a link carries the water where it is not the build\'s default', () => {
+  const { parseLink, linkSearch } = core();
+  const search = linkSearch({ datasets: ['with-addresses', 'smallest'], water: 'all-exact', point: { lat: 46.45, lng: 6.55 }, build: ID });
+  assert.equal(search, `?d=with-addresses&d=smallest&w=all-exact&at=46.45,6.55&b=${ID}`);
+  assert.equal(parseLink(search).water, 'all-exact');
+  assert.equal(parseLink('?d=smallest').water, null);
+});
+
+test('an answer keeps the water it was answered with', () => {
+  const { answerOf } = core();
+  const headers = { 'x-geocoder-build-id': ID, 'x-geocoder-dataset': 'full.simplified.all', 'x-geocoder-water': 'major' };
+  const header = (name) => headers[name.toLowerCase()] ?? null;
+  assert.deepEqual(plain(answerOf(200, header, `{"address":{},"water":${JSON.stringify(GENEVA)}}`, 3)),
+    { data: { address: {}, water: GENEVA }, build: ID, dataset: 'full.simplified.all', water: 'major', ms: 3 });
+  assert.equal(answerOf(400, header, 'unknown water', 1).water, 'major');
+});
+
+test('each column shows its answer\'s water, which a row of the field table compares; the Immich column and Nominatim show none', () => {
+  const { detailHtml, resolveColumn, cardHtml, nominatimView } = core();
+  const c = withImmich();
+  const full = resolveColumn(c, 'with-addresses').dataset;
+  const smallest = resolveColumn(c, 'smallest').dataset;
+  const answer = (water, extra = {}) => ({ data: { display_name: 'Lausanne', address: { city: 'Lausanne' }, ...(water ? { water } : {}) }, build: ID, water: 'all', ms: 3, ...extra });
+  const views = [
+    { label: full.label, color: '#111', dataset: full, answer: answer(GENEVA) },
+    { label: smallest.label, color: '#222', dataset: smallest, answer: answer(GENEVA) },
+    { label: IMMICH.label, color: '#333', dataset: IMMICH,
+      answer: { data: immichData('cities500', { city: 'Lausanne', state: 'Vaud', country: 'Switzerland' }, { place: PARIS, in_box: 3 }), build: null, ms: 2 } },
+    { ...nominatimView({ nominatim: { display_name: 'Lac Léman', address: { water: 'Lac Léman' } } }) },
+  ];
+  const out = detailHtml(views, ID);
+  // In each geocoder column's head: the name, then its class and type, and
+  // the water it was asked with.
+  assert.equal(out.match(/<div class="answer-water">Water: <strong>Lac Léman<\/strong> <span class="water-kind">natural\/water<\/span><\/div>/g).length, 2, out);
+  assert.ok(out.includes('full.simplified.all · water all · build'), out);
+  // The row: the two geocoder columns agree; the Immich column and
+  // Nominatim take no part, and lack nothing.
+  const row = out.match(/<tr class="water">([\s\S]*?)<\/tr>/);
+  assert.ok(row, out);
+  assert.deepEqual([...row[1].matchAll(/<td[^>]*>([^<]*)<\/td>/g)].map((m) => m[1]), ['Water', 'Lac Léman (natural/water)', 'Lac Léman (natural/water)', '', '']);
+  assert.match(row[1], /<td class="field" title="The answer&#39;s water field/);
+  // Where one column has water and another none, the row says so.
+  const lacking = detailHtml([views[0], { ...views[1], answer: answer(null) }], ID);
+  assert.match(lacking, /<tr class="missing water">\s*<td[^>]*>Water<\/td><td class="value">Lac Léman \(natural\/water\)<\/td><td class="empty">—<\/td>/);
+  // Where no answer has water, no row.
+  const dry = detailHtml([{ ...views[0], answer: answer(null) }, views[2]], ID);
+  assert.ok(!dry.includes('class="water"') && !dry.includes('answer-water'), dry);
+  // An Immich answer never shows water, even one that carried it.
+  const immichWet = detailHtml([{ ...views[2], answer: { ...views[2].answer, data: { ...views[2].answer.data, water: GENEVA } } }], ID);
+  assert.ok(!immichWet.includes('answer-water') && !immichWet.includes('class="water"'), immichWet);
+
+  const card = cardHtml({ id: 1, lat: 46.45, lng: 6.55 }, views, false);
+  assert.ok(card.includes('<div class="result-water">Water: Lac Léman (natural/water)</div>'), card);
+  assert.ok(!cardHtml({ id: 1, lat: 46.45, lng: 6.55 }, [views[2], views[0]], false).includes('result-water'));
+  // Every string of the water field is escaped.
+  const hostileWater = { name: '<img src=x onerror=alert(1)>', class: '<b>c</b>', type: '<em>t</em>' };
+  const escaped = detailHtml([{ ...views[0], answer: answer(hostileWater, { water: '<u>w</u>' }) }], ID) + cardHtml({ id: 1, lat: 0, lng: 0 }, [{ ...views[0], answer: answer(hostileWater) }], false);
+  assertEscaped(escaped);
 });

@@ -7,8 +7,9 @@
 // A build dir holds configurations.json, the build's files as it lays them
 // out (<region>/<dir>/<name>), a dir of links per dataset (sets/<id>/, hard
 // links of the build's files, each by its name, as a client's flat download
-// holds them), the ledger of the objects in place (FETCHED) and, once all
-// are and the build checks out, COMPLETE. Each sync of a build goes into a
+// holds them), a dir of links per water dir served beside the datasets
+// (sets/water/<value>/, catalog::Water), the ledger of the objects in place
+// (FETCHED) and, once all are and the build checks out, COMPLETE. Each sync of a build goes into a
 // dir of its own, named anew, which no server maps until it is complete: a
 // sync never writes into the dir of the build served, and a build found
 // damaged is fetched again into a new dir. A sync killed part way resumes
@@ -251,9 +252,17 @@ fn relink(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::hard_link(from, to)
 }
 
+/// The dirs of links of `plan`'s sets, each by its dir in the sets dir, with
+/// its links: each dataset's (sets/<id>), then each water dir's
+/// (sets/water/<value>, catalog::Water::set).
+fn sets(plan: &Plan) -> Vec<(String, std::collections::BTreeMap<String, String>)> {
+    let datasets = plan.datasets.iter().map(|d| (d.id.clone(), d.links()));
+    datasets.chain(plan.water.iter().map(|w| (w.set(), w.links()))).collect()
+}
+
 /// The files the build holds elsewhere byte for byte, as hard links of
-/// those (catalog::Object::link); then each dataset's dir of links, made
-/// anew.
+/// those (catalog::Object::link); then each dataset's dir of links, and each
+/// water dir's, made anew.
 fn link(root: &Path, plan: &Plan) -> Result<(), String> {
     let err = |path: &Path, e: std::io::Error| format!("link {}: {e}", path.display());
     for object in &plan.objects {
@@ -261,13 +270,13 @@ fn link(root: &Path, plan: &Plan) -> Result<(), String> {
             relink(&root.join(from), &root.join(to)).map_err(|e| err(&root.join(to), e))?;
         }
     }
-    for dataset in &plan.datasets {
-        let dir = root.join(SETS).join(&dataset.id);
+    for (set, links) in sets(plan) {
+        let dir = root.join(SETS).join(&set);
         match std::fs::remove_dir_all(&dir) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(err(&dir, e)),
             _ => {}
         }
-        for (name, path) in dataset.links() {
+        for (name, path) in links {
             relink(&root.join(&path), &dir.join(&name)).map_err(|e| err(&dir.join(&name), e))?;
         }
     }
@@ -275,7 +284,8 @@ fn link(root: &Path, plan: &Plan) -> Result<(), String> {
 }
 
 /// Whether every file of the complete build dir `root` is there at its
-/// size, and each dataset's dir holds its dataset's files and nothing else,
+/// size, and each dataset's dir (and each water dir's) holds its dataset's
+/// files and nothing else,
 /// each the build's file itself (a hard link of it: of its device and
 /// inode), so that a dataset loads no bytes but those verify reads; else
 /// the first that isn't.
@@ -288,8 +298,8 @@ fn in_place(root: &Path, cfg: &Configurations, plan: &Plan) -> Result<(), String
     }
     // A regular file's device and inode, not a symlink's or its target's.
     let file = |at: &str| std::fs::symlink_metadata(root.join(at)).ok().filter(|m| m.is_file()).map(|m| (m.dev(), m.ino()));
-    for dataset in &plan.datasets {
-        let (dir, links) = (format!("{SETS}/{}", dataset.id), dataset.links());
+    for (set, links) in sets(plan) {
+        let dir = format!("{SETS}/{set}");
         for entry in std::fs::read_dir(root.join(&dir)).map_err(|e| format!("{dir}: {e}"))? {
             let name = entry.map_err(|e| format!("{dir}: {e}"))?.file_name().to_string_lossy().into_owned();
             if !links.contains_key(&name) {
@@ -621,13 +631,15 @@ impl Portal {
 
     /// Every dataset of the build dir `name`, whose configurations.json is of
     /// sha256 `manifest_sha256`, loaded, named by its publication ID
-    /// (publication_id); or the first that doesn't load, and why. Each
-    /// keeps the stamps of the files it loaded from
-    /// (place_search::dataset::load), which its place search opens over;
-    /// one whose files changed while it loaded doesn't load.
+    /// (publication_id), and each water dir served beside them, once; or the
+    /// first that doesn't load, and why. Each dataset keeps the stamps of the
+    /// files it loaded from (place_search::dataset::load), which its place
+    /// search opens over; one whose files changed while it loaded doesn't
+    /// load.
     async fn load(&self, name: &str, plan: Plan, manifest_sha256: String) -> Result<Served, String> {
         let root = self.builds().join(name);
         let (sets, load, dir) = (root.join(SETS), self.config.load.clone(), name.to_string());
+        let load_water = self.config.load_water.clone();
         tokio::task::spawn_blocking(move || {
             let (mut indexes, mut loaded) = (Vec::with_capacity(plan.datasets.len()), Vec::with_capacity(plan.datasets.len()));
             for dataset in &plan.datasets {
@@ -637,10 +649,13 @@ impl Portal {
                 indexes.push(index.clone());
                 loaded.push(Loaded { id: dataset.id.clone(), index, stamps, dir: set });
             }
+            let water = plan.water.iter()
+                .map(|w| load_water(&sets.join(w.set())).map(Arc::new).map_err(|e| format!("water {}: {e}", w.set())))
+                .collect::<Result<Vec<_>, String>>()?;
             let id = publication_id(&plan.date, &manifest_sha256);
             let datasets_json = plan.json(&id, &dir).to_string();
             let search = Arc::new(Searches::new(root.join(SEARCH), &plan, loaded));
-            Ok(Served { id, dir, manifest_sha256, plan, indexes, datasets_json, search })
+            Ok(Served { id, dir, manifest_sha256, plan, indexes, water, datasets_json, search })
         })
         .await
         .map_err(|e| format!("load task: {e}"))?
