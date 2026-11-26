@@ -78,6 +78,14 @@ std::vector<AdminPolygonRecord> polygons_of(const std::string& dir) {
     return records<AdminPolygonRecord>(dir + "/admin_polygons.bin");
 }
 
+// A dir's admin_own_names.bin: (slot, own name) of each polygon named by its
+// place node.
+std::vector<std::pair<uint32_t, uint32_t>> own_names_of(const std::string& dir) {
+    std::vector<std::pair<uint32_t, uint32_t>> out;
+    for (const AdminOwnName& n : records<AdminOwnName>(dir + "/" + kAdminOwnNamesFile)) out.push_back({n.slot, n.name_id});
+    return out;
+}
+
 // The bytes of a record's ring block: to the next record's offset, the last
 // one's to the end of admin_rings.bin.
 uint32_t block_bytes(const std::vector<AdminPolygonRecord>& polygons, size_t slot, size_t rings_len) {
@@ -168,7 +176,8 @@ uint8_t pt(PlaceType t) { return static_cast<uint8_t>(t); }
 // (a strategy-2 tombstone); place nodes the city and the borough claim, a
 // suburb, a hamlet and a town; and POIs in the city and
 // the borough, one named like a street (a core string no admin-minimal
-// record names).
+// record names). The city and the borough go by their nodes' English names,
+// their own names Hafen and Altstadt.
 struct Region {
     ParsedData data;
     TempDir tmp;
@@ -177,8 +186,9 @@ struct Region {
     // The place nodes, in the order they are added.
     enum Places : size_t { HARBOUR_CITY, MILL_VILLAGE, DOCKS_SUBURB, FORD_HAMLET, ATLANTIS_TOWN };
 
-    // A square 0.4 degrees wide at `lat`, its north edge bowing out.
-    void add_polygon(const char* name, uint8_t level, uint64_t relation, double lat) {
+    // A square 0.4 degrees wide at `lat`, its north edge bowing out; `own`
+    // its own name where it goes by its node's English name.
+    void add_polygon(const char* name, uint8_t level, uint64_t relation, double lat, const char* own = nullptr) {
         const int32_t south = static_cast<int32_t>(lat * 1e7), side = 4000000;
         data.admin_exact_rings.append({{south, 200000000}, {south, 204000000}, {south + side, 204000000},
                                        {south + side + 130567, 202000000}, {south + side, 200000000},
@@ -186,6 +196,7 @@ struct Region {
                                       {});
         AdminPolygon ap{};
         ap.name_id = data.string_pool.intern(name);
+        if (own) ap.own_name_id = data.string_pool.intern(own);
         ap.admin_level = level;
         ap.area = data.admin_exact_rings.area(static_cast<uint32_t>(data.admin_polygons.size()));
         data.admin_polygons.push_back(ap);
@@ -198,6 +209,7 @@ struct Region {
         pn.lng = 20.1f;
         pn.name_id = data.string_pool.intern(name);
         pn.place_type = pt(type);
+        pn.rank_address = place_node_rank(pn.place_type);
         pn._pad1 = flags;
         pn.parent_poly_id = parent;
         data.place_nodes.push_back(pn);
@@ -217,11 +229,11 @@ struct Region {
     Region() {
         // Their slots once strategy-2's tombstone is in at 3:
         add_polygon("Atlantis", 2, 11, 10.0);        // 0, kept
-        add_polygon("Old Town", 9, 12, 11.0);        // 1, a borough: dropped
-        add_polygon("Harbour", 8, 13, 12.0);         // 2, kept
+        add_polygon("Old Town", 9, 12, 11.0, "Altstadt");  // 1, a borough: dropped
+        add_polygon("Harbour", 8, 13, 12.0, "Hafen");      // 2, kept
         add_polygon("Quay", 10, 14, 13.0);           // 4, a quarter: dropped
         add_polygon("Northern State", 4, 15, 14.0);  // 5, kept
-        add_polygon("1234", 11, 16, 15.0);           // 6, a postcode area: dropped
+        add_polygon("1234", POSTAL_AREA_LEVEL, 16, 15.0);  // 6, a postcode area: dropped
         std::vector<bool> in_minimal;
         for (const AdminPolygon& p : data.admin_polygons)
             in_minimal.push_back(admin_minimal_keeps(p.admin_level, p.place_type_override));
@@ -267,11 +279,11 @@ struct Region {
 TEST(admin_minimal_ships_only_the_core_strings_its_records_name) {
     const Region r;
 
-    // Its kept polygons' and place nodes' names, in the shared core's order;
-    // not the dropped borough's, quarter's or suburb's, nor the POI's that
-    // a street shares.
+    // Its kept polygons' and place nodes' names, the city's own name among
+    // them, in the shared core's order; not the dropped borough's, quarter's
+    // or suburb's, nor the POI's that a street shares.
     CHECK(strings_of(pool_bytes(r.own_dir + "/strings_core.bin")) ==
-          (std::vector<std::string>{"Atlantis", "Ford", "Harbour", "Mill", "Northern State"}));
+          (std::vector<std::string>{"Atlantis", "Ford", "Hafen", "Harbour", "Mill", "Northern State"}));
     const uint32_t size = static_cast<uint32_t>(pool_bytes(r.own_dir + "/strings_core.bin").size());
     CHECK(layout_of(r.own_dir) == (std::vector<std::pair<uint32_t, uint32_t>>{
                                   {0, size}, {size, size}, {size, size}, {size, size}, {size, size}}));
@@ -392,9 +404,9 @@ TEST(the_boundary_tiers_share_their_records_and_rings_and_postcode_areas_are_rec
         CHECK(shared[slot].area == r.data.admin_polygons[slot].area);
         CHECK(shared[slot].name_id == r.data.admin_polygons[slot].name_id);
     }
-    // The postcode area is a level-11 record there; no dir has postal
+    // The postcode area is a record of its level there; no dir has postal
     // geometry files.
-    CHECK_EQ(level_of(shared[6]), uint8_t(11));
+    CHECK_EQ(level_of(shared[6]), POSTAL_AREA_LEVEL);
     for (const auto& entry : std::filesystem::recursive_directory_iterator(r.tmp.path)) {
         const std::string name = entry.path().filename().string();
         CHECK(name != "postal_polygons.bin" && name != "postal_vertices.bin");
@@ -404,4 +416,29 @@ TEST(the_boundary_tiers_share_their_records_and_rings_and_postcode_areas_are_rec
         CHECK(std::filesystem::exists(r.exact_dir + sidecar));
         CHECK(!std::filesystem::exists(r.simplified_dir + sidecar));
     }
+}
+
+TEST(each_dir_of_polygons_holds_the_own_names_of_those_named_by_their_nodes) {
+    // admin_own_names.bin beside each admin_polygons.bin: the slot and the own name of each
+    // polygon that goes by its place node's English name, ascending by slot. The boundary tiers
+    // hold the borough's and the city's at their slots, the same bytes in both; admin-minimal/
+    // the city's alone at its own slot, in its own core strings, and admin-minimal-poi/ the
+    // city's at the shared slot, of the shared strings.
+    const Region r;
+    const std::vector<std::pair<uint32_t, uint32_t>> tiers = own_names_of(r.exact_dir);
+    REQUIRE(tiers.size() == 2);
+    CHECK(tiers[0].first == 1 && r.shared_name(tiers[0].second) == "Altstadt");
+    CHECK(tiers[1].first == 2 && r.shared_name(tiers[1].second) == "Hafen");
+    CHECK(file_bytes(r.simplified_dir + "/" + kAdminOwnNamesFile) == file_bytes(r.exact_dir + "/" + kAdminOwnNamesFile));
+    CHECK(r.shared_name(polygons_of(r.exact_dir)[2].name_id) == "Harbour");
+
+    const std::vector<std::pair<uint32_t, uint32_t>> own = own_names_of(r.own_dir);
+    REQUIRE(own.size() == 1);
+    CHECK_EQ(own[0].first, 1u);
+    CHECK_EQ(name_in(r.own_dir, own[0].second), std::string("Hafen"));
+    CHECK_EQ(name_in(r.own_dir, polygons_of(r.own_dir)[1].name_id), std::string("Harbour"));
+
+    const std::vector<std::pair<uint32_t, uint32_t>> poi = own_names_of(r.poi_dir);
+    REQUIRE(poi.size() == 1);
+    CHECK(poi[0] == tiers[1]);
 }

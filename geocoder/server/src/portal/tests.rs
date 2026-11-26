@@ -58,7 +58,7 @@ fn write_dataset(dir: &Path, country: &str) {
     let cell = cell_id_at_level(POINT.0, POINT.1, DEFAULT_ADMIN_CELL_LEVEL);
     let (cells, entries) = cell_pairs::write(&[(cell, vec![0])], cell_pairs::ADMIN);
     let node = PlaceNode {
-        lat: POINT.0 as f32, lng: POINT.1 as f32, name_id: town, place_type: 1, _pad1: 0, _pad2: 0, parent_poly_id: NO_DATA,
+        lat: POINT.0 as f32, lng: POINT.1 as f32, name_id: town, place_type: 1, _pad1: 0, rank_address: 16, parent_poly_id: NO_DATA,
     };
     let (places, _) = place_files::encode(&[node], DEFAULT_ADMIN_CELL_LEVEL);
     let tiers: Vec<String> = (0..STR_TIER_COUNT)

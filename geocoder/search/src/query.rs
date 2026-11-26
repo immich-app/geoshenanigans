@@ -460,16 +460,17 @@ impl<'a, 'g> Searcher<'a, 'g> {
     }
 
     /// Context words a candidate's point satisfies: the boundaries covering its admin cell whose
-    /// name (or ISO code, or country code) matches a word, and that contain the point (the
-    /// cell's interior flag, else point-in-polygon only for those boundaries). A one-cell slice
-    /// of the reverse lookup, without its field mapping. The candidate is at (`lat`, `lng`).
+    /// name (or own name, admin_own_names.bin, or ISO code, or country code) matches a word, and
+    /// that contain the point (the cell's interior flag, else point-in-polygon only for those
+    /// boundaries). A one-cell slice of the reverse lookup, without its field mapping. The
+    /// candidate is at (`lat`, `lng`).
     fn context_mask(&self, ctx: &Context, names: &mut HashMap<(u32, u16, bool), u64>, (lat, lng): (f32, f32)) -> u64 {
         let geo: &Index = self.idx.geo;
         let point = AdminPoint::new(lat as f64, lng as f64);
         let mut m = 0u64;
-        for (_, ap, interior) in self.cell_polygons(lat, lng) {
-            let nm = *names.entry(context_mask_key(ap.name_id, ap.country_code, ap.admin_level)).or_insert_with(|| {
-                let folded = normalize(&geo.get_string(ap.name_id));
+        for (id, ap, interior) in self.cell_polygons(lat, lng) {
+            let mut name_mask = |name_id: u32| *names.entry(context_mask_key(name_id, ap.country_code, ap.admin_level)).or_insert_with(|| {
+                let folded = normalize(&geo.get_string(name_id));
                 let cc = cc_of(ap.country_code);
                 let mut nm = ctx.mask_of(&folded);
                 if ap.admin_level == 2 && ap.country_code != 0 {
@@ -484,6 +485,10 @@ impl<'a, 'g> Searcher<'a, 'g> {
                 }
                 nm
             });
+            let mut nm = name_mask(ap.name_id);
+            if let Some(own) = geo.admin_own_name(id) {
+                nm |= name_mask(own);
+            }
             if nm == 0 || m & nm == nm {
                 continue;
             }

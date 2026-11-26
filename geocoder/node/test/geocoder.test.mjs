@@ -167,13 +167,14 @@ function writeDataset(dir, names, ring = COUNTRY) {
   const arc = arcOf(ring);
   const rings = Buffer.from([(1 << 2) | 1, 0]);
   // Its record: its ring block at 0 (to the end of admin_rings.bin), its name, area, country
-  // code and admin level 2 (level << 4 | place type).
-  const polygons = Buffer.concat([u32(0), u32(country), f32(1), Buffer.from('tl'), Buffer.from([2 << 4, 0])]);
+  // code, admin level 2 (level << 4 | place type) and rank_address, a country's 4.
+  const polygons = Buffer.concat([u32(0), u32(country), f32(1), Buffer.from('tl'), Buffer.from([2 << 4, 4])]);
   // The places, towns, as the builder lays them out (builder/src/place_files.h): visible nodes
   // by their admin cell's key, in one block (of 64 rows at most) of a row per node, LSB first:
   // its lat and lng order keys (f32 bit patterns in the floats' order) less the block's least
-  // ones, its place type (3 bits) and its name, at the block's widths; then the block table and
-  // the footer. place_cells.bin lists each cell's key and first row; none are hidden.
+  // ones, its type (4 bits: the place type, and in the top bit whether the node is promoted,
+  // none here) and its name, at the block's widths; then the block table and the footer.
+  // place_cells.bin lists each cell's key and first row; none are hidden.
   const f32bits = (v) => f32(v).readUInt32LE(0);
   const orderKey = (bits) => (bits & 0x80000000 ? ~bits : bits | 0x80000000) >>> 0;
   const rows = places
@@ -184,14 +185,14 @@ function writeDataset(dir, names, ring = COUNTRY) {
   const wn = width(Math.max(...rows.map((r) => r.name)));
   let rowBits = 0n, at = 0n;
   for (const r of rows) {
-    for (const [v, w] of [[r.lat - latBase, wl], [r.lng - lngBase, wg], [1, 3], [r.name, wn]]) {
+    for (const [v, w] of [[r.lat - latBase, wl], [r.lng - lngBase, wg], [1, 4], [r.name, wn]]) {
       rowBits |= BigInt(v) << at;
       at += BigInt(w);
     }
   }
   const block = Buffer.alloc(Number((at + 7n) / 8n));
   for (let i = 0; i < block.length; i++) block[i] = Number((rowBits >> BigInt(8 * i)) & 0xffn);
-  const nodes = Buffer.concat([block, u32(latBase), u32(lngBase), u32(0), Buffer.from([wl, wg, wn, 0]), u32(rows.length), Buffer.from('PNL3')]);
+  const nodes = Buffer.concat([block, u32(latBase), u32(lngBase), u32(0), Buffer.from([wl, wg, wn, 0]), u32(rows.length), Buffer.from('PNL4')]);
   const placeCells = Buffer.concat(rows.map((r, i) => Buffer.concat([u32(r.key), u32(i)])));
   const [adminCells, adminEntries] = adminIndex(COUNTRY_CELL, 0);
   const files = {
@@ -415,13 +416,13 @@ function goldenUnits() {
   });
 }
 
-// A cols unit (server/src/transport.rs) of one file whose rows are fields of `widths` bytes: the
-// header, one chunk of its whole rows with each field raw (R) in a column of its own, and the
-// bytes after them as the tail.
+// A cols unit (server/src/transport.rs, transport version 2) of one file whose rows are fields of
+// `widths` bytes: the header, one chunk of its whole rows with each field raw (R) in a column of
+// its own, and the bytes after them as the tail.
 function colsUnit(name, bytes, widths) {
   const stride = widths.reduce((a, w) => a + w, 0);
   const rows = Math.floor(bytes.length / stride);
-  const head = Buffer.concat([Buffer.from('GTT1'), u32(1), Buffer.from([4, 1, name.length]), Buffer.from(name), u64(bytes.length),
+  const head = Buffer.concat([Buffer.from('GTT1'), u32(2), Buffer.from([4, 1, name.length]), Buffer.from(name), u64(bytes.length),
     u16(widths.length), ...widths.map((w, c) => Buffer.concat([Buffer.from([w]), u16(c)]))]);
   let at = 0;
   const cols = widths.map((w) => {

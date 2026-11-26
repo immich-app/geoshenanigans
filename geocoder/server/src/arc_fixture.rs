@@ -233,12 +233,30 @@ pub fn record_bytes(p: &AdminPolygon) -> Vec<u8> {
     p.record_bytes().to_vec()
 }
 
-/// A record with every field but the name, level and area at 0, for `ArcFixture::polygon` to
-/// give its rings.
+/// A record with every field but the name, level, area and rank at 0, for `ArcFixture::polygon`
+/// to give its rings; its rank is `default_rank`'s.
 pub fn record(name_id: u32, admin_level: u8, area: f32) -> AdminPolygon {
     AdminPolygon {
-        ring_offset: 0, ring_bytes: 0, name_id, admin_level, place_type_override: 0, own_place_type: 0, area, country_code: 0,
-        of_way: false,
+        ring_offset: 0, ring_bytes: 0, name_id, admin_level, place_type_override: 0, rank_address: default_rank(admin_level, 0),
+        area, country_code: 0,
+    }
+}
+
+/// The rank_address the builder gives a polygon that nothing nests, contains or links, outside
+/// any country's own ranks (address-levels.json): a boundary its level's, a place area (level 15)
+/// its place type's, a postal area (POSTCODE_AREA_LEVEL) 0.
+pub fn default_rank(admin_level: u8, place_type_override: u8) -> u8 {
+    match (admin_level, place_type_override) {
+        (2..=12, _) => 2 * admin_level,
+        (15, 1..=3) => 16,
+        (15, 4 | 13) => 20,
+        (15, 5) => 24,
+        (15, 6) => 22,
+        (15, 10 | 11) => 12,
+        (15, 12) => 18,
+        (15, 14) => 14,
+        (15, 15) => 25,
+        _ => 0,
     }
 }
 

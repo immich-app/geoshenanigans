@@ -6,17 +6,19 @@ fn files(f: &PlaceFileBytes) -> PlaceFiles {
     PlaceFiles::open(FileBytes::Owned(f.cells.clone()), FileBytes::Owned(f.nodes.clone()), FileBytes::Owned(f.hidden.clone())).unwrap()
 }
 
+/// A visible node of its type's rank.
 fn node(lat: f32, lng: f32, name_id: u32, place_type: u8) -> PlaceNode {
-    PlaceNode { lat, lng, name_id, place_type, _pad1: 0, _pad2: 0, parent_poly_id: NO_DATA }
+    PlaceNode { lat, lng, name_id, place_type, _pad1: 0, rank_address: base_rank(place_type), parent_poly_id: NO_DATA }
 }
 
 fn same(a: &PlaceNode, b: &PlaceNode) -> bool {
     a.lat.to_bits() == b.lat.to_bits() && a.lng.to_bits() == b.lng.to_bits() && a.name_id == b.name_id
-        && a.place_type == b.place_type && a._pad1 == b._pad1 && a._pad2 == b._pad2 && a.parent_poly_id == b.parent_poly_id
+        && a.place_type == b.place_type && a._pad1 == b._pad1 && a.rank_address == b.rank_address
+        && a.parent_poly_id == b.parent_poly_id
 }
 
-/// Nodes around a few towns (many to a cell, more than a block to some), a few far away, labels
-/// and other hidden nodes among them, names up to 2^27 and both zeros.
+/// Nodes around a few towns (many to a cell, more than a block to some), a few far away, some
+/// promoted, labels and other hidden nodes among them, names up to 2^27 and both zeros.
 fn random_nodes(rng: &mut Rng, n: usize) -> Vec<PlaceNode> {
     let towns = [(52.37f64, 4.89f64), (-33.87, 151.21), (0.0, 0.0), (64.1, -21.9), (-0.0, -179.99)];
     (0..n)
@@ -32,12 +34,19 @@ fn random_nodes(rng: &mut Rng, n: usize) -> Vec<PlaceNode> {
             if i % 11 == 3 {
                 pn.lat = if i % 2 == 0 { 0.0 } else { -0.0 };
             }
+            if rng.next() % 3 == 0 && PROMOTABLE_RANKS.contains(&pn.rank_address) {
+                pn.rank_address += PLACE_NODE_PROMOTION;
+            }
             match rng.next() % 10 {
                 0 => {
                     pn._pad1 = PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF;
                     pn.parent_poly_id = (rng.next() % 5000) as u32;
+                    pn.rank_address = 0;
                 }
-                1 => pn._pad1 = PLACE_FLAG_HIDDEN,
+                1 => {
+                    pn._pad1 = PLACE_FLAG_HIDDEN;
+                    pn.rank_address = 0;
+                }
                 _ => {}
             }
             pn
@@ -185,7 +194,7 @@ fn place_files_read_as_the_shared_vectors_say_and_the_test_encoder_writes_them()
                     name_id: n(2),
                     place_type: n(3) as u8,
                     _pad1: n(4) as u8,
-                    _pad2: 0,
+                    rank_address: n(7) as u8,
                     parent_poly_id: n(5),
                 };
                 (pn, n(6))
@@ -216,4 +225,37 @@ fn the_last_block_of_the_most_rows_ends_at_the_read_end() {
     assert_eq!(block_end(0, 10), 10);
     assert_eq!(block_end(0, 64), 64);
     assert_eq!(block_end(1, 200), 128);
+}
+
+#[test]
+fn a_visible_rows_top_type_bit_promotes_the_node_by_2() {
+    // A promoted village ranks 18 and a quarter 24; the bit is all that differs from the rows of
+    // the unpromoted ones.
+    for (place_type, rank) in [(2u8, 18u8), (6, 24)] {
+        let plain = node(1.0, 1.0, 3, place_type);
+        let promoted = PlaceNode { rank_address: rank, ..plain };
+        let (a, _) = encode(&[plain], DEFAULT_ADMIN_CELL_LEVEL);
+        let (b, _) = encode(&[promoted], DEFAULT_ADMIN_CELL_LEVEL);
+        // One row: no coordinate bits, the type field first.
+        assert_eq!(a.nodes[0] & 0x0F, place_type);
+        assert_eq!(b.nodes[0], a.nodes[0] | 0x08);
+        assert_eq!(files(&b).node(0).unwrap().rank_address, rank);
+        assert_eq!(files(&a).node(0).unwrap().rank_address, rank - PLACE_NODE_PROMOTION);
+    }
+}
+
+#[test]
+fn a_row_promoting_a_node_no_relation_promotes_is_left_out() {
+    // A neighbourhood (24) and a node of no place type (7, rank 0) with the promoted bit: no
+    // builder writes either (place_files.h refuses them), and the reader reads neither.
+    for place_type in [5u8, 7] {
+        let (mut f, _) = encode(&[node(1.0, 1.0, 3, place_type)], DEFAULT_ADMIN_CELL_LEVEL);
+        assert_eq!(f.nodes[0] & 0x0F, place_type);
+        f.nodes[0] |= 0x08;
+        let p = files(&f);
+        assert!(p.node(0).is_none(), "type {place_type}");
+        let mut rows = 0;
+        p.for_rows(0, 1, |_, _| rows += 1);
+        assert_eq!(rows, 0, "type {place_type}");
+    }
 }

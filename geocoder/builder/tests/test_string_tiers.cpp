@@ -383,6 +383,39 @@ TEST(partition_keeps_a_string_a_way_s_original_name_shares_where_a_street_name_w
     CHECK(poi_names(d) == std::vector<std::string>({"Zulu", "Alpha"}));
 }
 
+TEST(partition_keeps_the_own_name_of_a_polygon_named_by_its_node_as_a_core_string) {
+    // Сосновка's boundary goes by its town node's English name, Sosnovka, and keeps its own name
+    // aside for the addr:city crosscheck and place search: a core string though no record is
+    // named so, which an addr:city of that name keeps; Тамбов names nothing that ships.
+    ParsedData d;
+    d.string_pool.intern("Тамбов");
+    AdminPolygon renamed{}, other{};
+    renamed.name_id = d.string_pool.intern("Sosnovka");
+    renamed.own_name_id = d.string_pool.intern("Сосновка");
+    other.name_id = d.string_pool.intern("Кирсанов");
+    d.admin_polygons = {renamed, other};
+    WayHeader way{};
+    way.name_id = d.string_pool.intern("улица Ленина");
+    d.ways.push_back(way);
+    for (const char* city : {"Сосновка", "Тамбов"}) {
+        AddrPoint a{};
+        a.street_id = way.name_id;
+        a.housenumber_id = d.string_pool.intern("1");
+        a.vertex_offset = NO_DATA;
+        d.addr_points.push_back(a);
+        d.addr_city_ids.push_back(d.string_pool.intern(city));
+    }
+    partition_strings_into_tiers(d);
+    const std::string core = std::string("Sosnovka") + '\0' + "Кирсанов" + '\0' + "Сосновка" + '\0';
+    CHECK(tier_bytes(d, 0) == core);
+    CHECK_EQ(d.admin_polygons[0].name_id, 0u);
+    CHECK_EQ(d.admin_polygons[0].own_name_id, uint32_t(core.find("Сосновка")));
+    CHECK_EQ(d.admin_polygons[1].own_name_id, NO_DATA);
+    REQUIRE(d.addr_city_ids.size() == size_t(2));
+    CHECK_EQ(d.addr_city_ids[0], d.admin_polygons[0].own_name_id);
+    CHECK_EQ(d.addr_city_ids[1], NO_DATA);
+}
+
 TEST(partition_keeps_an_addr_city_only_where_its_string_is_a_core_one_and_writes_none) {
     // Drexel Hill names a place node and Upper Darby a boundary, so both are
     // core strings; Garrett Road names only a street, Lansdowne nothing at

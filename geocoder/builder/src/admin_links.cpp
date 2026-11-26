@@ -262,16 +262,18 @@ bool AdminRings::contains(uint32_t pid, PackedLocation p) const {
 }
 
 bool AdminRings::covers(uint32_t pid, PackedLocation p) const {
-    if (contains(pid, p)) return true;
     const auto& polygon = rings_.polygons[pid];
+    bool inside = false;
     for (uint32_t r = polygon.first_ring; r < polygon.first_ring + polygon.ring_count; r++) {
         const ExactRingBox& box = boxes_[r];
+        // Outside the ring's closed box, which holds its edges, the ring adds nothing.
         if (p.lat_e7 < box.lat_lo || p.lat_e7 > box.lat_hi || p.lon_e7 < box.lng_lo || p.lon_e7 > box.lng_hi) continue;
         const RingSpan& span = rings_.rings[r];
-        if (edges_[r] ? edges_[r]->touches(p) : exact_ring_touches(rings_.vertices.data() + span.begin, span.count, p))
-            return true;
+        const PackedLocation* v = rings_.vertices.data() + span.begin;
+        if (edges_[r] ? edges_[r]->on_edge(p) : exact_ring_on_edge(v, span.count, p)) return true;
+        inside ^= edges_[r] ? edges_[r]->contains(p) : exact_ring_contains(v, span.count, p);
     }
-    return false;
+    return inside;
 }
 
 uint32_t AdminRings::first_containing(const std::vector<uint32_t>& ranked, PackedLocation p) const {
@@ -331,151 +333,6 @@ void compute_admin_parent_chain(ParsedData& data, unsigned int num_threads) {
     }
 }
 
-uint16_t polygon_country(const ParsedData& data, const AdminRings& countries, uint32_t i) {
-    const AdminPolygon& poly = data.admin_polygons[i];
-    if (poly.country_code != 0) return poly.country_code;
-    const auto& rings = data.admin_exact_rings;
-    const uint32_t ring_count = rings.polygons[i].ring_count;
-    if (ring_count == 0) return 0;
-    const LatLng inside = interior_point(rings.vertices.data(), rings.rings_of(i), ring_count);
-    return country_code_at_point(data, countries, inside.first, inside.second);
-}
-
-size_t take_out_repeated_boundaries(ParsedData& data, unsigned int num_threads) {
-    const size_t n = data.admin_polygons.size();
-    if (n == 0 || data.admin_osm_ids.size() != n) return 0;
-    auto& qids = data.boundary_wikidata;
-    std::sort(qids.begin(), qids.end());
-    qids.erase(std::unique(qids.begin(), qids.end()), qids.end());
-    auto& linking = data.linking_boundaries;
-    std::sort(linking.begin(), linking.end());
-    linking.erase(std::unique(linking.begin(), linking.end()), linking.end());
-    auto& unranked = data.unranked_label_boundaries;
-    std::sort(unranked.begin(), unranked.end());
-    if (qids.empty()) return 0;
-    auto qid_of = [&](uint64_t boundary) {
-        const auto it = std::lower_bound(qids.begin(), qids.end(), std::make_pair(boundary, uint64_t(0)));
-        return it != qids.end() && it->first == boundary ? it->second : uint64_t(0);
-    };
-    // The rings of each boundary relation of levels 4 to 10, a boundary's
-    // together, and the polygon standing for it.
-    std::vector<std::pair<uint64_t, uint32_t>> slots;
-    for (uint32_t p = 0; p < n; p++) {
-        const uint8_t level = data.admin_polygons[p].admin_level;
-        if (level >= 4 && level <= 10 && admin_relation_ring(data.admin_osm_ids[p]))
-            slots.push_back({admin_boundary_id(data.admin_osm_ids[p]), p});
-    }
-    std::sort(slots.begin(), slots.end());
-    auto slots_of = [&](uint64_t boundary) {
-        return std::equal_range(slots.begin(), slots.end(), std::make_pair(boundary, uint32_t(0)),
-                                [](const auto& a, const auto& b) { return a.first < b.first; });
-    };
-    const auto boundaries = boundary_polygons(data.admin_polygons, data.admin_osm_ids);
-    const auto& rings = data.admin_exact_rings;
-    auto same_boundary = [&](uint64_t a, uint64_t b) {
-        const auto [a_first, a_last] = slots_of(a);
-        const auto [b_first, b_last] = slots_of(b);
-        if (a_last - a_first != b_last - b_first) return false;
-        std::vector<bool> used(static_cast<size_t>(b_last - b_first));
-        for (auto x = a_first; x != a_last; ++x) {
-            bool found = false;
-            for (auto y = b_first; y != b_last && !found; ++y) {
-                const size_t k = static_cast<size_t>(y - b_first);
-                if (!used[k] && same_polygon(rings, x->second, y->second)) used[k] = found = true;
-            }
-            if (!found) return false;
-        }
-        return true;
-    };
-
-    const AdminRings countries = border_country_rings(data, num_threads);
-    // Each polygon's rank_address in its country, found the first time it
-    // is asked for, on any thread: 0 not yet, else kKnown and the rank.
-    constexpr uint32_t kKnown = 1u << 8;
-    std::vector<std::atomic<uint32_t>> rank_memo(n);
-    auto rank_of = [&](uint32_t p) {
-        const uint32_t memo = rank_memo[p].load(std::memory_order_relaxed);
-        if (memo != 0) return static_cast<uint8_t>(memo);
-        const uint8_t rank = admin_rank_address(polygon_country(data, countries, p), data.admin_polygons[p].admin_level);
-        rank_memo[p].store(kKnown | rank, std::memory_order_relaxed);
-        return rank;
-    };
-    // The rings a boundary can repeat, of the boundary relations of levels
-    // 4 to 9, edge-indexed for the tests at the boundaries' points.
-    auto may_repeat = [&](uint32_t p) {
-        const uint8_t level = data.admin_polygons[p].admin_level;
-        return level >= 4 && level <= 9 && admin_relation_ring(data.admin_osm_ids[p]);
-    };
-    const AdminRings parents(rings, num_threads, may_repeat);
-    const auto closer = closest_parent_first(data);
-    // By slot, 1 for the rings of a boundary in no address (rank 0): a
-    // level's are marked after it, so the levels below a boundary are
-    // settled when it looks for its parent. One that repeats its parent and
-    // links a place node of a rank above 3 and below 26 takes that rank and
-    // stays a parent. One whose label member is of a place type of no such
-    // rank (data.unranked_label_boundaries) takes none, whatever its own
-    // place tag, which counts only where nothing links (:1192): it is in no
-    // address, as one that links nothing is.
-    std::vector<uint8_t> out(n);
-    size_t repeating = 0;
-    for (uint8_t level = 5; level <= 10; level++) {
-        std::vector<uint64_t> repeated = parallel_collect<uint64_t>(boundaries.size(),
-            [&](size_t k, std::vector<uint64_t>& found) {
-                const auto [boundary, p] = boundaries[k];
-                if (data.admin_polygons[p].admin_level != level || !admin_relation_ring(data.admin_osm_ids[p])) return;
-                const uint64_t qid = qid_of(boundary);
-                if (qid == 0 || rank_of(p) == 0) return;
-                const uint32_t ring_count = rings.polygons[p].ring_count;
-                if (ring_count == 0) return;
-                // The closest relation round the boundary's point, of a lower
-                // level above 3 and a rank of 1 to 25, Nominatim's ORDER BY
-                // admin_level desc of those covering its centroid.
-                const LatLng at = interior_point(rings.vertices.data(), rings.rings_of(p), ring_count);
-                const PackedLocation inside = point_e7(at.first, at.second);
-                thread_local std::vector<uint32_t> ids;
-                thread_local std::vector<std::pair<uint32_t, uint32_t>> ranked;
-                ids.clear();
-                for_each_admin_candidate(data, admin_link_cell(inside), [&](uint32_t id, const AdminPolygon& poly) {
-                    if (poly.admin_level < level && may_repeat(id & ID_MASK)) ids.push_back(id);
-                });
-                rank_candidates(ids, closer, ranked);
-                uint32_t parent = NO_DATA;
-                for (uint32_t id : ids) {
-                    const uint32_t q = id & ID_MASK;
-                    if (out[q] || rank_of(q) == 0) continue;
-                    if ((id & INTERIOR_FLAG) || parents.covers(q, inside)) {
-                        parent = q;
-                        break;
-                    }
-                }
-                if (parent == NO_DATA) return;
-                const uint64_t parent_boundary = admin_boundary_id(data.admin_osm_ids[parent]);
-                if (qid_of(parent_boundary) != qid) return;
-                if (same_boundary(boundary, parent_boundary)) found.push_back(boundary);
-            }, num_threads);
-        for (uint64_t boundary : repeated) {
-            const auto [first, last] = slots_of(boundary);
-            const bool links = std::binary_search(linking.begin(), linking.end(), boundary) &&
-                               !std::binary_search(unranked.begin(), unranked.end(), boundary);
-            for (auto it = first; it != last; ++it) {
-                AdminPolygon& poly = data.admin_polygons[it->second];
-                if (!links) {
-                    poly.place_type_override = BOUNDARY_REPEATS_PARENT;
-                    out[it->second] = 1;
-                    continue;
-                }
-                // placex_update's parent_address_level stays 3 (:1161).
-                poly.own_place_type = BOUNDARY_REPEATS_PARENT;
-                const uint8_t linked = place_area_rank_address(polygon_country(data, countries, it->second),
-                                                               poly.place_type_override);
-                out[it->second] = linked < 4 || linked > 25;
-            }
-        }
-        repeating += repeated.size();
-    }
-    return repeating;
-}
-
 // Way parent polygon: for each street way, find the smallest admin polygon containing
 // its centroid (server walks the admin chain from a road), and the postcode
 // of the postal area at its middle.
@@ -500,7 +357,7 @@ void compute_way_parent_polygons(ParsedData& data, unsigned int num_threads) {
         const auto& exact = data.admin_exact_rings;
         std::vector<uint32_t> postal_slots;  // ascending, with postal_centroids
         for (uint32_t pid = 0; pid < data.admin_polygons.size(); pid++)
-            if (data.admin_polygons[pid].admin_level == 11) postal_slots.push_back(pid);
+            if (data.admin_polygons[pid].admin_level == POSTAL_AREA_LEVEL) postal_slots.push_back(pid);
         std::vector<LatLng> postal_centroids(postal_slots.size());
         parallel_for(postal_slots.size(), [&](size_t begin, size_t end, unsigned) {
             for (size_t k = begin; k < end; k++) {
@@ -539,17 +396,17 @@ void compute_way_parent_polygons(ParsedData& data, unsigned int num_threads) {
         auto add_postals = [&](S2CellId cell, std::vector<uint32_t>& postals) {
             postals.clear();
             for_each_admin_candidate(data, cell, [&](uint32_t id, const AdminPolygon& p) {
-                if (p.admin_level == 11) postals.push_back(id);
+                if (p.admin_level == POSTAL_AREA_LEVEL) postals.push_back(id);
             });
         };
         walk_items_by_cell<Candidates>(order, num_threads,
             [&](S2CellId cell, Candidates& c) {
-                // Admin levels <= 10 compete for the parent chain, postal
-                // boundaries (11) for the postcode.
+                // The administrative levels compete for the parent chain,
+                // postal boundaries (POSTAL_AREA_LEVEL) for the postcode.
                 c.cell = cell.id();
                 c.admins.clear();
                 for_each_admin_candidate(data, cell, [&](uint32_t id, const AdminPolygon& p) {
-                    if (p.admin_level <= 10) c.admins.push_back(id);
+                    if (p.admin_level <= kMaxBoundaryLevel) c.admins.push_back(id);
                 });
                 add_postals(cell, c.postals);
                 rank_candidates(c.admins, more_specific, c.scratch);
@@ -615,10 +472,11 @@ void compute_way_parent_polygons(ParsedData& data, unsigned int num_threads) {
 
 // POI parent polygons, the smallest containing the POI (area as the
 // specificity proxy, lower = tighter; ties to the first one listed):
-// - parent_postcode_id: the postal boundary's (11) postcode, Nominatim's
-//   placex.postcode chain approximation, of one that names a point of the
-//   POI's country (postal_area_names).
-// - parent_poly_id: the admin polygon (levels 2..10; place-area markers 15
+// - parent_postcode_id: the postal boundary's (POSTAL_AREA_LEVEL) postcode,
+//   Nominatim's placex.postcode chain approximation, of one that names a
+//   point of the POI's country (postal_area_names).
+// - parent_poly_id: the admin polygon of levels 2 to kMaxPoiParentLevel (10;
+//   the blocks and neighbourhoods of 11 and 12 and the place-area markers 15
 //   skipped) the server's chain-containment check walks up from.
 // POIs are walked per admin cell, so each cell's candidates are gathered and
 // ranked once for both.
@@ -647,10 +505,10 @@ void compute_poi_parent_polygons(ParsedData& data, unsigned int num_threads, std
                 c.postal.clear();
                 c.admin.clear();
                 for_each_admin_candidate(data, cell, [&](uint32_t id, const AdminPolygon& p) {
-                    if (p.admin_level == 11) {
+                    if (p.admin_level == POSTAL_AREA_LEVEL) {
                         if (p.place_type_override != POSTAL_AREA_INVALID && p.name_id != NO_DATA) c.postal.push_back(id);
                     }
-                    else if (p.admin_level >= 2 && p.admin_level <= 10) c.admin.push_back(id);
+                    else if (p.admin_level >= 2 && p.admin_level <= kMaxPoiParentLevel) c.admin.push_back(id);
                 });
                 rank_candidates(c.postal, smaller, c.scratch);
                 rank_candidates(c.admin, smaller, c.scratch);

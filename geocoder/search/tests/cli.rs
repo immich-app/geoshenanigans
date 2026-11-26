@@ -49,7 +49,7 @@ fn write_dataset(dir: &Path) {
     cells.dedup();
     let (admin_cells, admin_entries) = cell_pairs::write(&cells, cell_pairs::ADMIN);
     let nodes: Vec<PlaceNode> = towns.iter()
-        .map(|&(name_id, lat, lng)| PlaceNode { lat: lat as f32, lng: lng as f32, name_id, place_type: 1, _pad1: 0, _pad2: 0, parent_poly_id: NO_DATA })
+        .map(|&(name_id, lat, lng)| PlaceNode { lat: lat as f32, lng: lng as f32, name_id, place_type: 1, _pad1: 0, rank_address: 16, parent_poly_id: NO_DATA })
         .collect();
     let (places, _) = place_files::encode(&nodes, DEFAULT_ADMIN_CELL_LEVEL);
     let tiers: Vec<String> =

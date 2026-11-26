@@ -1748,7 +1748,7 @@ mod tests {
     #[test]
     fn template_admin_minimal_takes_its_poi_dir_beside_a_poi_tier() {
         let (v, c) = template();
-        let files = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin",
+        let files = ["admin_cells.bin", "admin_entries.bin", "admin_own_names.bin", "admin_polygons.bin", "admin_rings.bin",
                      "arc_index.bin", "arc_vertices.bin", "attribution.json", "place_cells.bin", "place_hidden.bin", "place_nodes.bin",
                      "postal_cities.bin", "postcode_grid.bin", "strings_core.bin", "strings_layout.json"];
         let minimal: Vec<RegionSelection> = template_selections(&v).into_iter()
@@ -3442,8 +3442,9 @@ mod tests {
         let s = wet("europe", "admin", "simplified", "none", "all");
         let unit = "europe/admin/places.tt.zst";
         for (change, error) in [
-            (Box::new(|u: &mut UnitEntry| u.transport_version = 2) as Box<dyn Fn(&mut UnitEntry)>,
-             format!("transport unit {unit}: a unit of transport version 2: this build reads version {TRANSPORT_VERSION} only")),
+            (Box::new(|u: &mut UnitEntry| u.transport_version = TRANSPORT_VERSION + 1) as Box<dyn Fn(&mut UnitEntry)>,
+             format!("transport unit {unit}: a unit of transport version {}: this build reads version {TRANSPORT_VERSION} only",
+                     TRANSPORT_VERSION + 1)),
             (Box::new(|u: &mut UnitEntry| u.files.push("europe/full/street_ways.bin".into())),
              format!("transport unit {unit}: holds europe/full/street_ways.bin, which the selection doesn't take")),
             (Box::new(|u: &mut UnitEntry| u.files.push("europe/water/all/simplified/admin_cells.bin".into())),

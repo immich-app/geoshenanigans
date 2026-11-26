@@ -42,6 +42,9 @@ pub struct Geo {
     polygons: Vec<(AdminPolygon, Vec<Vec<(f32, f32)>>)>,
     nodes: Vec<PlaceNode>,
     pois: Vec<PoiRecord>,
+    /// admin_own_names.bin: (polygon, own name) of each polygon that goes by its place node's
+    /// English name.
+    own_names: Vec<(u32, u32)>,
 }
 
 impl Geo {
@@ -70,24 +73,34 @@ impl Geo {
 
     /// A rectangular place area ([south, west, north, east]) of place type `place_type`
     /// (query_server::place_type_to_field's), as the builder writes a place=* way or relation
-    /// (admin_level 15); returns its polygon id.
+    /// (admin_level 15) at its type's rank; returns its polygon id.
     pub fn place_area(&mut self, name: &str, place_type: u8, rect: [f32; 4]) -> u32 {
         let id = self.boundary(name, 15, rect);
-        self.polygons[id as usize].0.place_type_override = place_type;
+        let poly = &mut self.polygons[id as usize].0;
+        poly.place_type_override = place_type;
+        poly.rank_address = arc_fixture::default_rank(15, place_type);
         id
     }
 
     /// A place node of PlaceNode type `place_type` (0 city .. 6 quarter); returns its index.
     pub fn place(&mut self, name: &str, place_type: u8, lat: f32, lng: f32) -> u32 {
         let name_id = self.string(name);
-        self.nodes.push(PlaceNode { lat, lng, name_id, place_type, _pad1: 0, _pad2: 0, parent_poly_id: NO_DATA });
+        let rank_address = query_server::PLACE_NODE_RANK[place_type as usize];
+        self.nodes.push(PlaceNode { lat, lng, name_id, place_type, _pad1: 0, rank_address, parent_poly_id: NO_DATA });
         self.nodes.len() as u32 - 1
+    }
+
+    /// Boundary `poly`'s own name, where it goes by the English name of the place node it links.
+    pub fn own_name(&mut self, poly: u32, name: &str) {
+        let name_id = self.string(name);
+        self.own_names.push((poly, name_id));
     }
 
     /// Node `node` hidden as the label of boundary `poly`, as the builder flags a claimed node.
     pub fn claim(&mut self, poly: u32, node: u32) {
         let pn = &mut self.nodes[node as usize];
         pn._pad1 |= PLACE_FLAG_LABEL_OF | PLACE_FLAG_HIDDEN;
+        pn.rank_address = 0;
         pn.parent_poly_id = poly;
     }
 
@@ -101,8 +114,15 @@ impl Geo {
         self.pois.len() as u32 - 1
     }
 
+    /// POI `poi` of `category` and tier `tier`, its flags byte `flags`.
+    pub fn classify_poi(&mut self, poi: u32, category: u8, tier: u8, flags: u8) {
+        let p = &mut self.pois[poi as usize];
+        (p.category, p.tier, p.flags) = (category, tier, flags);
+    }
+
     /// The files as the builder writes them, by name. A boundary is listed in the admin cells of
-    /// a grid of points over its bounding box and of each place node and POI inside the box.
+    /// a grid of points over its bounding box and of each place node and POI inside the box; the
+    /// own names beside the polygons, empty without any.
     fn files(&self) -> Vec<(&'static str, Vec<u8>)> {
         let cell = |lat: f32, lng: f32| cell_id_at_level(lat as f64, lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
         let points: Vec<(f32, f32)> =
@@ -131,9 +151,13 @@ impl Geo {
         let tiers: Vec<String> = (0..STR_TIER_COUNT)
             .map(|t| format!("{{\"start\": {}, \"end\": {end}}}", if t == 0 { 0 } else { end }))
             .collect();
+        let mut own_names = self.own_names.clone();
+        own_names.sort_unstable();
+        let own_names = own_names.iter().flat_map(|&(poly, name)| [poly, name]).flat_map(u32::to_le_bytes).collect();
         let mut files: Vec<(&'static str, Vec<u8>)> = arcs.files().into();
         files.extend([
             ("admin_cells.bin", admin_cells), ("admin_entries.bin", admin_entries),
+            (query_server::ADMIN_OWN_NAMES_FILE, own_names),
             (place_files::CELLS_FILE, places.cells), (place_files::NODES_FILE, places.nodes),
             (place_files::HIDDEN_FILE, places.hidden),
             ("strings_core.bin", strings::encode(&self.strings)),

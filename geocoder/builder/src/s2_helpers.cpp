@@ -270,9 +270,9 @@ void add_admin_polygon(ParsedData& data,
     AdminPolygon poly;
     memset(&poly, 0, sizeof(poly)); // zero ALL bytes including padding
     poly.name_id = data.string_pool.intern(name);
+    poly.own_name_id = NO_DATA;
     poly.admin_level = admin_level;
     poly.place_type_override = place_type_override;
-    poly.of_way = 1;
     // Its one member way runs along the whole ring, however it is rotated.
     std::vector<std::vector<WayRun>> runs;
     if (osm_way_id != 0 && vertices.size() >= 2)
@@ -280,7 +280,7 @@ void add_admin_polygon(ParsedData& data,
     data.admin_exact_rings.append(vertices, {}, runs);
     poly.area = data.admin_exact_rings.area(poly_id);
     poly.country_code = (country_code && country_code[0] && country_code[1])
-        ? pack_country_code(country_code[0], country_code[1])
+        ? pack_tag_country_code(country_code[0], country_code[1])
         : 0;
     data.admin_polygons.push_back(poly);
     // Strategy-2 stable identity, packed like addr/poi: top 8 bits =

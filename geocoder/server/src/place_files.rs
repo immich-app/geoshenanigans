@@ -3,20 +3,51 @@
 //! >> 32, and its first row); place_nodes.bin, the visible nodes in cell order, bit-packed in
 //! blocks of BLOCK_ROWS rows, with a table of the blocks and a footer after them; and
 //! place_hidden.bin, a row per node a boundary hides. A node's id is its row: a visible node's,
-//! or a hidden one's after the visible rows.
+//! or a hidden one's after the visible rows. A visible row's type field holds the place type in
+//! its low bits and, in PROMOTED_BIT, whether the node is promoted: its rank_address is its
+//! type's, PLACE_NODE_PROMOTION more where it is, which only a type of a rank a relation promotes
+//! (PROMOTABLE_RANKS) is: a row promoting another is none the builder writes, which the reader
+//! leaves out and the transport codec refuses.
 
-use crate::{FileBytes, PlaceNode, NO_DATA, PLACE_FLAG_HIDDEN, PLACE_FLAG_LABEL_OF};
+use crate::{FileBytes, PlaceNode, NO_DATA, PLACE_FLAG_HIDDEN, PLACE_FLAG_LABEL_OF, PLACE_NODE_PROMOTION, PLACE_NODE_RANK, PROMOTABLE_RANKS};
 pub const CELLS_FILE: &str = "place_cells.bin";
 pub const NODES_FILE: &str = "place_nodes.bin";
 pub const HIDDEN_FILE: &str = "place_hidden.bin";
-pub(crate) const MAGIC: &[u8; 4] = b"PNL3";
+pub(crate) const MAGIC: &[u8; 4] = b"PNL4";
 pub const BLOCK_ROWS: usize = 64;
 pub(crate) const TABLE_ENTRY_BYTES: usize = 16;
 pub(crate) const FOOTER_BYTES: usize = 8;
 pub(crate) const CELL_ROW_BYTES: usize = 8;
 pub(crate) const HIDDEN_ROW_BYTES: usize = 16;
-pub(crate) const TYPE_BITS: u32 = 3;
+pub(crate) const TYPE_BITS: u32 = 4;
+/// A hidden row's place type bits.
+const HIDDEN_TYPE_BITS: u32 = 3;
+/// The type field's bit of a promoted node.
+const PROMOTED_BIT: u32 = 1 << HIDDEN_TYPE_BITS;
 const HIDDEN_NAME_BITS: u32 = 28;
+
+/// The rank_address of a place type, 0 for one no place node has.
+fn base_rank(place_type: u8) -> u8 {
+    PLACE_NODE_RANK.get(place_type as usize).copied().unwrap_or(0)
+}
+
+/// The rank of a node whose type field promotes it, though a relation promotes no node of that
+/// rank; None for any other field.
+pub(crate) fn refused_promotion(field: u32) -> Option<u8> {
+    let rank = base_rank((field & (PROMOTED_BIT - 1)) as u8);
+    (field & PROMOTED_BIT != 0 && !PROMOTABLE_RANKS.contains(&rank)).then_some(rank)
+}
+
+/// A visible row's place type and rank_address from its type field; None for one that promotes a
+/// node of a rank no relation promotes.
+fn type_and_rank(field: u32) -> Option<(u8, u8)> {
+    if refused_promotion(field).is_some() {
+        return None;
+    }
+    let place_type = (field & (PROMOTED_BIT - 1)) as u8;
+    let promotion = if field & PROMOTED_BIT != 0 { PLACE_NODE_PROMOTION } else { 0 };
+    Some((place_type, base_rank(place_type) + promotion))
+}
 
 #[inline(always)]
 fn u32_at(b: &[u8], at: usize) -> u32 {
@@ -67,7 +98,7 @@ impl PlaceFiles {
     pub fn open(cells: FileBytes, nodes: FileBytes, hidden: FileBytes) -> Result<PlaceFiles, String> {
         let n = nodes.as_slice();
         if n.len() < FOOTER_BYTES || &n[n.len() - 4..] != MAGIC {
-            return Err(format!("{NODES_FILE} has no PNL3 footer"));
+            return Err(format!("{NODES_FILE} has no PNL4 footer"));
         }
         let visible = u32_at(n, n.len() - FOOTER_BYTES);
         let blocks = (visible as usize).div_ceil(BLOCK_ROWS);
@@ -139,7 +170,8 @@ impl PlaceFiles {
     }
 
     /// Calls `f` with each visible row in [first, end) and its node, each block's entry read
-    /// once; a row of a block the table can't place is left out.
+    /// once; a row of a block the table can't place is left out, and so is one promoting a node
+    /// of a rank no relation promotes.
     pub fn for_rows(&self, first: u32, end: u32, mut f: impl FnMut(u32, PlaceNode)) {
         let n = self.nodes.as_slice();
         let end = end.min(self.visible);
@@ -162,15 +194,17 @@ impl PlaceFiles {
                 let (Some(dl), Some(dg), Some(t), Some(name)) = (take(e.wl), take(e.wg), take(TYPE_BITS), take(e.wn)) else {
                     break;
                 };
-                f(row, PlaceNode {
-                    lat: f32::from_bits(from_order_key(e.lat_base.wrapping_add(dl))),
-                    lng: f32::from_bits(from_order_key(e.lng_base.wrapping_add(dg))),
-                    name_id: name,
-                    place_type: t as u8,
-                    _pad1: 0,
-                    _pad2: 0,
-                    parent_poly_id: NO_DATA,
-                });
+                if let Some((place_type, rank_address)) = type_and_rank(t) {
+                    f(row, PlaceNode {
+                        lat: f32::from_bits(from_order_key(e.lat_base.wrapping_add(dl))),
+                        lng: f32::from_bits(from_order_key(e.lng_base.wrapping_add(dg))),
+                        name_id: name,
+                        place_type,
+                        _pad1: 0,
+                        rank_address,
+                        parent_poly_id: NO_DATA,
+                    });
+                }
                 row += 1;
             }
             row = block_end;
@@ -217,9 +251,9 @@ impl PlaceFiles {
             lat: f32::from_bits(u32_at(r, 0)),
             lng: f32::from_bits(u32_at(r, 4)),
             name_id: w & ((1 << HIDDEN_NAME_BITS) - 1),
-            place_type: (w >> HIDDEN_NAME_BITS & ((1 << TYPE_BITS) - 1)) as u8,
+            place_type: (w >> HIDDEN_NAME_BITS & ((1 << HIDDEN_TYPE_BITS) - 1)) as u8,
             _pad1: PLACE_FLAG_HIDDEN | (w >> 31) as u8 * PLACE_FLAG_LABEL_OF,
-            _pad2: 0,
+            rank_address: 0,
             parent_poly_id: u32_at(r, 12),
         })
     }
@@ -319,10 +353,14 @@ pub fn encode_logical(rows: &[(PlaceNode, u32)]) -> PlaceFileBytes {
             }
         };
         for (j, (pn, _)) in chunk.iter().enumerate() {
-            assert!(pn.place_type < 1 << TYPE_BITS);
+            assert!(pn.place_type < 1 << HIDDEN_TYPE_BITS);
+            let base = base_rank(pn.place_type);
+            let promoted = pn.rank_address != base;
+            assert!(!promoted || (pn.rank_address == base + PLACE_NODE_PROMOTION && PROMOTABLE_RANKS.contains(&base)),
+                    "a node of rank {} and type {}", pn.rank_address, pn.place_type);
             put(lk[j] - lb, wl);
             put(gk[j] - gb, wg);
-            put(pn.place_type as u32, TYPE_BITS);
+            put(pn.place_type as u32 | if promoted { PROMOTED_BIT } else { 0 }, TYPE_BITS);
             put(pn.name_id, wn);
         }
         if n > 0 {
@@ -331,7 +369,8 @@ pub fn encode_logical(rows: &[(PlaceNode, u32)]) -> PlaceFileBytes {
     }
     for (pn, key) in &rows[vis.len()..] {
         assert_eq!(*key, NO_DATA);
-        assert!(pn._pad1 & PLACE_FLAG_HIDDEN != 0 && pn.name_id < 1 << HIDDEN_NAME_BITS && pn.place_type < 1 << TYPE_BITS);
+        assert!(pn._pad1 & PLACE_FLAG_HIDDEN != 0 && pn.name_id < 1 << HIDDEN_NAME_BITS && pn.place_type < 1 << HIDDEN_TYPE_BITS);
+        assert_eq!(pn.rank_address, 0, "a hidden node with a rank");
         let label = pn._pad1 & PLACE_FLAG_LABEL_OF != 0;
         assert_eq!(label, pn.parent_poly_id != NO_DATA);
         hidden.extend_from_slice(&pn.lat.to_bits().to_le_bytes());

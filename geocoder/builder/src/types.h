@@ -44,9 +44,8 @@ static_assert(sizeof(InterpWay) == 24, "InterpWay must be 24 bytes");
 static_assert(offsetof(InterpWay, node_count) == 4 && offsetof(InterpWay, street_id) == 8,
               "geocoder-diff reads InterpWay fields at fixed offsets");
 
-// Place type override for admin polygons, derived from either a place/
-// linked_place tag on the boundary itself, or the place type of a
-// label-role member node (Nominatim's find_linked_place flow).
+// Place type override for admin polygons: the type of the place node the
+// polygon links (place_links.h), else of its own place tag.
 // Must stay in sync with geocoder/server/src/main.rs place_type_to_field.
 // Nominatim's get_label_tag (classtypes.py) returns extratags['place']
 // or extratags['linked_place'] verbatim as the JSON field key, so each
@@ -67,19 +66,32 @@ enum class AdminPlaceType : uint8_t {
     BOROUGH = 12,   // place=borough (distinct field from suburb in Nominatim)
     HAMLET = 13,
     MUNICIPALITY = 14,  // place=municipality (e.g. Sydney Council L6)
+    // place=locality: what labels a boundary of a locality (an Australian one linking its
+    // locality node, an Irish townland tagged so) and a named place=locality area as
+    // get_label_tag does, one of rank 25 (address-levels.json), in no street's or house's
+    // address: it answers a point no street, house or POI is near.
+    LOCALITY = 15,
 };
 
-// The place type of a postal area (admin_level 11) whose postcode its
+// Nominatim's administrative levels run 2 to 12 (address-levels.json's
+// administrative2 to 12); a closed way is a boundary from level 5, its
+// import dropping one of level 4 or less (placex_insert,
+// placex_triggers.sql:687-690).
+constexpr uint8_t kMaxBoundaryLevel = 12;
+// The highest admin level of a POI's parent polygon, the jurisdiction a query
+// must lie in for the POI to answer it (the server's poi_chain_contains_query):
+// a city's district at most, not the blocks and neighbourhoods of 11 and 12.
+constexpr uint8_t kMaxPoiParentLevel = 10;
+constexpr uint8_t kMinBoundaryWayLevel = 5;
+
+// The admin_level of a postal area's polygon (boundary=postal_code), above
+// the administrative levels and below the place areas' 15.
+constexpr uint8_t POSTAL_AREA_LEVEL = 13;
+
+// The place type of a postal area (POSTAL_AREA_LEVEL) whose postcode its
 // country's pattern rejects: Nominatim makes no postcode area of it, and it
 // names no street, POI or point.
 constexpr uint8_t POSTAL_AREA_INVALID = 15;
-
-// The place type of a boundary (admin_level 4 to 10) that repeats its
-// parent, the same wikidata and geometry, and links no place node: Nominatim
-// takes it out of addresses (placex_update's is_same), so it names no field.
-// One that links a place node keeps the node's type and has this as its
-// own_place_type: it takes the node's rank back (placex_triggers.sql:1161).
-constexpr uint8_t BOUNDARY_REPEATS_PARENT = 15;
 
 // Vertex encoding tag: picks the bytes-per-vertex / precision tradeoff
 // for this polygon.  Stored as a 1-byte tag in the per-polygon header
@@ -123,59 +135,70 @@ struct AdminPolygon {
     uint32_t name_id;
     uint8_t admin_level;
     uint8_t place_type_override = 0; // AdminPlaceType — overrides admin_level for field mapping
-    // A place area's own place tag (AdminPlaceType) where it links a place
-    // node of another type, whose type is its place_type_override and labels
-    // it (find_linked_place); 0 where its place type is its own.
-    uint8_t own_place_type = 0;
-    // 1 for a closed way's polygon, 0 for a ring of a relation: a place node
-    // is raised two ranks inside a relation of its rank only (osm_type = 'R',
-    // placex_triggers.sql:984-1004), which the server reads from the record.
-    uint8_t of_way = 0;
+    // The polygon's own place tag (PlaceValue, admin_rank_config.h), 0 where
+    // it has none: a place area's (admin_level 15) is its place type. Its
+    // label is place_type_override, the type of a place node it links where
+    // it links one (place_links.h), else of this.
+    uint8_t own_place_value = 0;
+    // Nominatim's rank_address of the polygon (rank_address.h); 0 for a
+    // postal area and a tombstone.
+    uint8_t rank_address = 0;
     float area;                   // of the exact rings, holes subtracted
     uint16_t country_code;
-    uint16_t _pad4 = 0;
+    uint8_t flags = 0;            // ADMIN_FLAG_* bits, which no dir holds
+    uint8_t _pad4 = 0;
+    // Its own name where it goes by the English name of the place node it
+    // links (place_links.h linked_english_name), NO_DATA else: a core
+    // string, which its dirs hold in admin_own_names.bin.
+    uint32_t own_name_id = 0xFFFFFFFFu;
 };
-static_assert(sizeof(AdminPolygon) == 20, "AdminPolygon must be 20 bytes");
+static_assert(sizeof(AdminPolygon) == 24, "AdminPolygon must be 24 bytes");
+
+// AdminPolygon.flags bits.
+// A place area whose boundary tag Nominatim keeps as a category of its own
+// (boundary=historic, ceremonial: relation_import.h is_boundary_category).
+static constexpr uint8_t ADMIN_FLAG_BOUNDARY = 0x02;
 
 // An admin_polygons.bin record. Its ring block runs from its ring_offset to
 // the next record's (the last one's to the end of admin_rings.bin): every
 // record's offset is the running one, a tombstone's included, whose block is
 // empty, as is that of a polygon a tier left without rings. A tombstone's
 // name_id is NO_DATA. level_override is admin_level << 4 | the
-// place_type_override, both under 16, and own_place_type is the polygon's,
-// under 128, with ADMIN_OF_WAY set for a closed way's.
+// place_type_override, both under 16, and rank_address is the polygon's.
 struct AdminPolygonRecord {
     uint32_t ring_offset;
     uint32_t name_id;
     float area;
     uint16_t country_code;
     uint8_t level_override;
-    uint8_t own_place_type = 0;
+    uint8_t rank_address = 0;
 };
 static_assert(sizeof(AdminPolygonRecord) == 16, "AdminPolygonRecord must be 16 bytes");
 
-// The bit of an AdminPolygonRecord's own_place_type that marks a closed way's
-// polygon (AdminPolygon::of_way).
-static constexpr uint8_t ADMIN_OF_WAY = 0x80;
+// An admin_polygons.bin's own names, the file beside it: an AdminOwnName for
+// each polygon of an own name (AdminPolygon::own_name_id), ascending by slot.
+// Nominatim's addr:city crosscheck compares every name of a polygon, its own
+// and its linked node's (results.py:606), and its search finds it by them, so
+// the server's crosscheck and the place search read it beside the name the
+// polygon goes by.
+inline constexpr const char* kAdminOwnNamesFile = "admin_own_names.bin";
+struct AdminOwnName {
+    uint32_t slot;
+    uint32_t name_id;
+};
+static_assert(sizeof(AdminOwnName) == 8, "AdminOwnName must be 8 bytes");
 
 inline AdminPolygonRecord admin_polygon_record(const AdminPolygon& p, uint32_t ring_offset) {
     if (p.admin_level > 15 || p.place_type_override > 15)
         throw std::logic_error("an admin level or place type past 4 bits");
-    if (p.own_place_type & ADMIN_OF_WAY) throw std::logic_error("an own place type past 7 bits");
     AdminPolygonRecord r;
     r.ring_offset = ring_offset;
     r.name_id = p.name_id;
     r.area = p.area;
     r.country_code = p.country_code;
     r.level_override = static_cast<uint8_t>(p.admin_level << 4 | p.place_type_override);
-    r.own_place_type = static_cast<uint8_t>(p.own_place_type | (p.of_way ? ADMIN_OF_WAY : 0));
+    r.rank_address = p.rank_address;
     return r;
-}
-
-// The place type of a place area's own place tag: own_place_type where it
-// links a place node of another type, else place_type_override.
-inline uint8_t own_place_tag(const AdminPolygon& p) {
-    return p.own_place_type ? p.own_place_type : p.place_type_override;
 }
 
 struct NodeCoord {
@@ -432,18 +455,21 @@ struct DeferredInterp {
 // Collected relation data for parallel admin assembly
 struct CollectedRelation {
     int64_t id;
-    int64_t label_node_id = -1;  // role=label place node (Nominatim's primary link target)
+    // Its role=label node members, in relation order (Nominatim's first link
+    // target: the first of them that is a place node).
+    std::vector<int64_t> label_node_ids;
     uint8_t admin_level;
-    // Fallback place-type override from the boundary's own tags
-    // (linked_place / place). Nominatim's find_linked_place tries label
-    // role → wikidata → place-type match → name match; the boundary's
-    // own place tag is only step 3, so we store it as a *fallback*
-    // applied after label / wikidata have been checked.
-    uint8_t fallback_place_type = 0;  // AdminPlaceType
-    // The AdminPlaceType of its place tag alone, which the place-type step
-    // of find_linked_place reads (ParsedData::boundary_place_tags).
-    uint8_t place_tag_type = 0;
+    // Its own place tag (PlaceValue), which labels it where it links no
+    // place node of a type of AdminPlaceType's and ranks it, and whether a
+    // place area's boundary tag is a category of its own
+    // (is_boundary_category).
+    uint8_t own_place_value = 0;
+    bool boundary_category = false;
     std::string name;
+    // Its name and wikidata tags, which it links a place node by
+    // (place_links.h), and whether `name` is its own name:en.
+    std::string name_tag, wikidata;
+    bool name_en = false;
     std::string country_code;
     bool is_postal;
     std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
@@ -454,12 +480,6 @@ struct CollectedRelation {
 enum class PlaceType : uint8_t {
     CITY = 0, TOWN = 1, VILLAGE = 2, SUBURB = 3,
     HAMLET = 4, NEIGHBOURHOOD = 5, QUARTER = 6,
-    // These are only used for the label-role lookup on admin boundaries —
-    // they never end up in place_nodes.bin itself. A label member with
-    // place=state/province/region/etc. lets us honour Nominatim's
-    // get_label_tag() fallthrough to extratags['linked_place'].
-    STATE = 7, PROVINCE = 8, REGION = 9, COUNTY = 10, DISTRICT = 11,
-    BOROUGH = 12,
     UNKNOWN = 255
 };
 
@@ -477,7 +497,12 @@ struct PlaceNode {
     uint32_t name_id;       // into strings.bin
     uint8_t place_type;     // PlaceType
     uint8_t _pad1 = 0;      // PLACE_FLAG_* bits
-    uint16_t _pad2 = 0;
+    // Nominatim's rank_address of the node as a place of its own
+    // (rank_address.h): its type's (place_node_rank), two more where a
+    // relation of that rank holds it. A hidden node's row holds none
+    // (place_files.h), and an unhidden one has it.
+    uint8_t rank_address = 0;
+    uint8_t _pad2 = 0;
     // With PLACE_FLAG_LABEL_OF: the polygon of the boundary that claims
     // the node, which place search labels with it. Else NO_DATA.
     uint32_t parent_poly_id = NO_DATA;
@@ -752,6 +777,22 @@ static constexpr uint8_t POI_FLAG_WIKIDATA  = 0x02;
 // tourism=attraction, rank 30 in nominatim) — both land in our POI index
 // as PoiCategory::ATTRACTION.
 static constexpr uint8_t POI_FLAG_HIGHWAY   = 0x04;
+// A secondary ring of a multi-ring POI, which the place-search index leaves
+// out (server/src/lib.rs POI_FLAG_SECONDARY_RING). No build writes it yet,
+// but no other bit of a file may take it.
+static constexpr uint8_t POI_FLAG_SECONDARY_RING = 0x08;
+// A generic rank-30 feature (PoiCategory::GENERIC_RANK30) of a tag
+// address-levels.json ranks below 30 alone: a natural=* other than tree,
+// spring, cave_entrance, geyser, hot_spring, rock and stone, a waterway=*,
+// leisure=common or historic=neighbourhood. Nominatim makes no rank-30 row
+// of it, so it is no feature near a point (the server's
+// poi_is_reverse_feature), though it stays a POI near one, and one the
+// place-search index names. A file's bit: while the build runs, the water
+// bits hold it (POI_BUILD_BELOW_RANK30).
+static constexpr uint8_t POI_FLAG_BELOW_RANK30 = 0x10;
+static_assert((POI_FLAG_BELOW_RANK30 & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA | POI_FLAG_HIGHWAY |
+                                        POI_FLAG_SECONDARY_RING)) == 0,
+              "a file's POI flags must be bits of their own");
 // While the build runs, a water object that takes its category from a
 // rank-30 tag (poi_classify.h classify_poi) carries its water kind in these
 // bits where the kind ships in a lower tier than the category: the dirs of
@@ -793,6 +834,19 @@ inline uint8_t poi_flags_with_water(uint8_t flags, PoiCategory water) {
         if (kPoiWaterKinds[k] == water)
             return static_cast<uint8_t>((flags & ~POI_FLAG_WATER_MASK) | ((k + 1) << POI_FLAG_WATER_SHIFT));
     throw std::logic_error("poi_flags_with_water: no water kind");
+}
+
+// While the build runs, a generic feature of a lower rank (POI_FLAG_BELOW_RANK30) has every
+// water bit set, a value no water kind takes: a water object that yields to a rank-30 tag is
+// a rank-30 POI, and one that stays water is of its kind (classify_poi), so no record needs
+// both. poi_record_in_tier writes it as POI_FLAG_BELOW_RANK30.
+static constexpr uint8_t POI_BUILD_BELOW_RANK30 = POI_FLAG_WATER_MASK;
+static_assert(std::size(kPoiWaterKinds) < (POI_BUILD_BELOW_RANK30 >> POI_FLAG_WATER_SHIFT),
+              "a water kind's bits must differ from a generic feature of a lower rank's");
+
+// Whether `flags`, as the build holds them, mark a generic feature of a lower rank.
+inline bool poi_build_below_rank30(uint8_t flags) {
+    return (flags & POI_FLAG_WATER_MASK) == POI_BUILD_BELOW_RANK30;
 }
 
 inline const char* poi_category_label(PoiCategory cat) {
@@ -1169,8 +1223,8 @@ struct PoiRecord {
     // NO_DATA if the POI isn't inside any postal
     // boundary.
     uint32_t parent_postcode_id = NO_DATA;
-    // Polygon id of the smallest admin boundary (admin_level <= 10)
-    // containing the POI. The server walks admin_parents from here
+    // Polygon id of the smallest admin boundary (admin_level 2 to
+    // kMaxPoiParentLevel, 10) containing the POI. The server walks admin_parents from here
     // to get the POI's administrative chain — a cheap approximation
     // of Nominatim's parent_place_id walk. Used to demote POIs
     // whose chain doesn't match the query's admin chain (e.g. a
@@ -1199,13 +1253,16 @@ inline uint8_t poi_lowest_tier(const PoiRecord& pr) {
 // kind, of that kind's tier and of `water_importance`, its importance as
 // that kind (ParsedData::poi_water_importance), where the dir ships the kind
 // but not its own category, with the rest of it as it is; without the flags
-// of the build alone (POI_FLAG_BUILD_MASK) in any dir. A reservoir point
+// of the build alone (POI_FLAG_BUILD_MASK) in any dir, a generic feature of
+// a lower rank's (POI_BUILD_BELOW_RANK30) written as POI_FLAG_BELOW_RANK30. A reservoir point
 // there, which stands in for a POI the dir doesn't ship, links no parent
 // street, so that it never takes the primary slot, which the server lets a
 // RESERVOIR point take where it has one.
 inline PoiRecord poi_record_in_tier(PoiRecord pr, uint8_t max_tier, uint8_t water_importance = 0) {
     const PoiCategory water = poi_water_of(pr.flags);
+    const bool below_rank30 = poi_build_below_rank30(pr.flags);
     pr.flags &= static_cast<uint8_t>(~POI_FLAG_BUILD_MASK);
+    if (below_rank30) pr.flags |= POI_FLAG_BELOW_RANK30;
     if (water != PoiCategory::UNKNOWN && pr.tier > max_tier) {
         pr.category = static_cast<uint8_t>(water);
         pr.tier = poi_tier_of(water, pr.flags);

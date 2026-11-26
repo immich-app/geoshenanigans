@@ -31,7 +31,7 @@ fn whalens_court(drexel_m: f64, house: impl FnOnce(&mut TestIndex)) -> Index {
         .boundary("Pennsylvania", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("Delaware County", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
         .boundary("Upper Darby", 8, 0, (-4000.0, -4000.0, 4000.0, 4000.0))
-        .place("Garrettford", 2, 600.0, 900.0)
+        .place("Garrettford", 2, 600.0, 900.0).promoted()
         .place("Addingham", 4, 300.0, -200.0)
         .place("Drexel Hill", 3, drexel_m, 200.0)
         .street("Whalens Court", &[(0.0, -200.0), (0.0, 200.0)])
@@ -121,6 +121,65 @@ fn a_polygon_takes_its_rank_by_its_own_name_or_by_a_place_node_it_links() {
 }
 
 #[test]
+fn a_polygon_named_by_its_node_takes_its_rank_by_its_own_name_too() {
+    // The city area goes by its city node's English name, Yonkers, and keeps its own name, City
+    // of Yonkers (admin_own_names.bin): Nominatim's names of the area hold both, so a house named
+    // either takes the area, which is shown by the name it goes by.
+    let index = |city: Option<&str>| {
+        let mut index = united_states();
+        index
+            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Yonkers", 15, 1, (-1000.0, 100.0, 8000.0, 8000.0))
+            .own_name("City of Yonkers")
+            .linked_place("Yonkers", 0, 4000.0, 4000.0)
+            .street("Riverdale Avenue", &[(0.0, -200.0), (0.0, 200.0)])
+            .address("5", 10.0, 0.0);
+        if let Some(city) = city {
+            index.addr_city(city);
+        }
+        index.load()
+    };
+    for (city, part) in [(None, "Greenburgh"), (Some("Yonkers"), "Yonkers"), (Some("City of Yonkers"), "Yonkers"),
+                         (Some("Greenburgh"), "Greenburgh")] {
+        let (display, address) = answer_at(&index(city), 10.0, 0.0);
+        assert_eq!(display, format!("5 Riverdale Avenue, {part}, United States"), "{city:?}");
+        assert_eq!(address["city"], part, "{city:?}");
+    }
+}
+
+#[test]
+fn a_polygon_takes_its_rank_by_its_own_name_and_not_by_a_namesake_s() {
+    // Two city areas go by the English name Yonkers, one string of the builder's pool, and so
+    // share their boundary's record: the one the street runs through keeps the own name Yonkers
+    // City, or none, and one far off keeps City of Yonkers. Nominatim compares the names of each
+    // place (CrosscheckNames on its placex row), so a house named City of Yonkers takes no area:
+    // the one on its street has no such name.
+    let index = |near_own: Option<&str>, city: &str| {
+        let mut index = united_states();
+        index
+            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Yonkers", 15, 1, (-1000.0, 100.0, 8000.0, 8000.0));
+        if let Some(own) = near_own {
+            index.own_name(own);
+        }
+        let yonkers = index.interned("Yonkers");
+        index.boundary("Yonkers", 15, 1, (20_000.0, 20_000.0, 24_000.0, 24_000.0)).own_name("City of Yonkers");
+        index.polygons.last_mut().unwrap().0.name_id = yonkers;
+        index
+            .street("Riverdale Avenue", &[(0.0, -200.0), (0.0, 200.0)])
+            .address("5", 10.0, 0.0)
+            .addr_city(city);
+        index.load()
+    };
+    for (near_own, city, part) in [(Some("Yonkers City"), "City of Yonkers", "Greenburgh"), (None, "City of Yonkers", "Greenburgh"),
+                                   (Some("Yonkers City"), "Yonkers City", "Yonkers"), (None, "Yonkers", "Yonkers")] {
+        let (display, address) = answer_at(&index(near_own, city), 10.0, 0.0);
+        assert_eq!(display, format!("5 Riverdale Avenue, {part}, United States"), "{near_own:?} {city}");
+        assert_eq!(address["city"], part, "{near_own:?} {city}");
+    }
+}
+
+#[test]
 fn a_place_node_takes_a_rank_a_polygon_holds() {
     // Bywood, a place=neighbourhood area (rank 24), holds the rank, and the neighbourhood node
     // Kirklyn in it is a row of rank 24 that is no part; the house's addr:city makes it the part.
@@ -203,7 +262,7 @@ fn a_field_the_value_s_row_leaves_goes_to_the_finest_part_of_no_field_that_fills
         index
             .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
             .boundary("Hartsdale", 9, 1, (-1000.0, -1000.0, 1000.0, 1000.0))
-            .place("Elmsford", 2, 300.0, 100.0);
+            .place("Elmsford", 2, 300.0, 100.0).promoted();
     };
     let (display, address) = answer_at(&main_street(None, places), 10.0, 0.0);
     assert_eq!(display, "4 Main Street, Hartsdale, Greenburgh, United States");
@@ -264,14 +323,16 @@ fn of_two_polygons_of_the_value_s_name_a_rank_takes_the_one_farther_from_the_str
 
 #[test]
 fn a_larger_boundary_of_the_level_that_holds_the_house_is_a_row_of_its_rank() {
-    // Greenburgh and the larger Mount Pleasant, both of level 8, hold the house: the smaller is
-    // the address's city, and Nominatim's street has a row of rank 16 for each.
+    // Greenburgh and the larger Mount Pleasant, both of level 8 and rank 16, hold the house, and
+    // Nominatim's street has a row of rank 16 for each. Their centres are as near the street, so
+    // the walk accepts the smaller, and Mount Pleasant, holding the house, is the rank's row; a
+    // house's addr:city of either name puts that one first.
     let places = |index: &mut TestIndex| {
         index
             .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
             .boundary("Mount Pleasant", 8, 0, (-6000.0, -6000.0, 6000.0, 6000.0));
     };
-    for (city, part) in [(None, "Greenburgh"), (Some("Mount Pleasant"), "Mount Pleasant"), (Some("Greenburgh"), "Greenburgh")] {
+    for (city, part) in [(None, "Mount Pleasant"), (Some("Mount Pleasant"), "Mount Pleasant"), (Some("Greenburgh"), "Greenburgh")] {
         let (display, address) = answer_at(&main_street(city, places), 10.0, 0.0);
         assert_eq!(display, format!("4 Main Street, {part}, United States"), "{city:?}");
         assert_eq!(address["city"], part, "{city:?}");
@@ -281,13 +342,13 @@ fn a_larger_boundary_of_the_level_that_holds_the_house_is_a_row_of_its_rank() {
 #[test]
 fn a_boundary_that_repeats_its_parent_is_no_row_of_any_rank() {
     // The level 9 Town of Greenburgh repeats the level 8 Greenburgh (the same wikidata and
-    // geometry, BOUNDARY_REPEATS_PARENT): is_same ranks it 0, so it is no area of getNearFeatures'
-    // (placex_triggers.sql:915-932, :1273) and the street has no row of it. A house whose
-    // addr:city names it keeps Greenburgh.
+    // geometry): is_same ranks it 0, as the builder stores it, so it is no area of
+    // getNearFeatures' (placex_triggers.sql:915-932, :1273) and the street has no row of it. A
+    // house whose addr:city names it keeps Greenburgh.
     let places = |index: &mut TestIndex| {
         index
             .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
-            .boundary("Town of Greenburgh", 9, BOUNDARY_REPEATS_PARENT, (-3000.0, -3000.0, 3000.0, 3000.0));
+            .boundary("Town of Greenburgh", 9, 0, (-3000.0, -3000.0, 3000.0, 3000.0)).rank(0);
     };
     for city in [None, Some("Town of Greenburgh")] {
         let (display, address) = answer_at(&main_street(city, places), 10.0, 0.0);
@@ -418,8 +479,8 @@ fn a_polygon_holding_the_house_that_the_street_misses_is_no_row() {
     // rank 16: the house's addr:city makes it the rank's part, which leaves no city.
     let places = |index: &mut TestIndex| {
         index
-            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0)).of_way()
-            .boundary("Springfield", 8, 0, (5.0, -100.0, 4000.0, 100.0)).of_way()
+            .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Springfield", 8, 0, (5.0, -100.0, 4000.0, 100.0))
             .place("Springfield", 1, 100.0, 50.0);
     };
     let (display, address) = answer_at(&main_street(None, places), 10.0, 0.0);
@@ -435,12 +496,13 @@ fn a_boundary_the_street_runs_into_ranks_by_its_own_place_type() {
     // Saw Mill River Road runs east from Greenburgh, of level 8 and rank 16, into Fairview, of
     // level 8 too and tagged place=suburb: placex_update gives a boundary that links no node its
     // place tag's rank where that is above its parent's (placex_triggers.sql:1189-1199), 20, not
-    // Greenburgh's. The house's addr:city makes Fairview the suburb, and Greenburgh stays.
+    // Greenburgh's, as the builder ranks it. The house's addr:city makes Fairview the suburb, and
+    // Greenburgh stays.
     let index = |city: Option<&str>| {
         let mut index = united_states();
         index
             .boundary("Greenburgh", 8, 0, (-3000.0, -3000.0, 3000.0, 3000.0))
-            .boundary("Fairview", 8, 4, (-3000.0, 3000.0, 3000.0, 9000.0))
+            .boundary("Fairview", 8, 4, (-3000.0, 3000.0, 3000.0, 9000.0)).rank(20)
             .street("Saw Mill River Road", &[(0.0, 1500.0), (0.0, 4000.0)])
             .address("9", 10.0, 2900.0);
         if let Some(city) = city {
@@ -462,14 +524,15 @@ fn a_boundary_the_street_runs_into_ranks_under_the_boundaries_round_it() {
     // which holds house 9, into Elmsford, of level 9, which only Westchester County (rank 12)
     // holds. placex_update ranks a boundary under the boundary of the highest level below its own
     // round its centroid (placex_triggers.sql:881-906): Elmsford's is the county, so it keeps its
-    // level's rank, 18, and Fairview, which does not hold it, does not lift it to 22. The house's
-    // addr:city makes Elmsford the city_district, not the neighbourhood.
+    // level's rank, 18, and Fairview, which does not hold it, does not lift it to 22, as the
+    // builder ranks it. The house's addr:city makes Elmsford the city_district, not the
+    // neighbourhood.
     let index = |city: Option<&str>| {
         let mut index = united_states();
         index
             .boundary("Westchester County", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
-            .boundary("Fairview", 8, 4, (-3000.0, -3000.0, 3000.0, 3000.0))
-            .boundary("Elmsford", 9, 0, (-3000.0, 3000.0, 3000.0, 9000.0))
+            .boundary("Fairview", 8, 4, (-3000.0, -3000.0, 3000.0, 3000.0)).rank(20)
+            .boundary("Elmsford", 9, 0, (-3000.0, 3000.0, 3000.0, 9000.0)).rank(18)
             .street("Saw Mill River Road", &[(0.0, 1500.0), (0.0, 4000.0)])
             .address("9", 10.0, 2900.0);
         if let Some(city) = city {
@@ -489,19 +552,22 @@ fn a_boundary_the_street_runs_into_ranks_under_the_boundaries_round_it() {
 fn a_place_node_a_place_area_of_its_name_and_rank_links_is_no_row() {
     // High Wycombe, a place=town area of rank 16, holds the town node of its name, whose rank is
     // its own: find_linked_place's name match, which runs for ways as well as relations, links the
-    // node to the area, and Nominatim's street has no row of it. The house's addr:city names the
-    // area, the rank's part already, and the community board of rank 18 stays. Where the area
-    // links another node, by its label, the town node is a row of rank 18, in the area's rank 16
-    // boundary, and takes the rank; a label of the area's name and type is that one link too.
+    // node to the area, which the builder hides, and Nominatim's street has no row of it. The
+    // house's addr:city names the area, the rank's part already, and the community board of rank
+    // 18 stays. Where the area links another node, by its label, the town node is a row of rank
+    // 18, promoted in the area's rank 16 relation, and takes the rank; a label of the area's
+    // name and type is that one link too.
     let index = |city: Option<&str>, label: Option<&str>| {
         let mut index = united_states();
         index.boundary("High Wycombe", 15, 2, (-3000.0, -3000.0, 3000.0, 3000.0));
         if let Some(label) = label {
             index.linked_place(label, 1, 1500.0, 1500.0);
+            index.place("High Wycombe", 1, 500.0, 800.0).promoted();
+        } else {
+            index.linked_place("High Wycombe", 1, 500.0, 800.0);
         }
         index
             .boundary("High Wycombe Community Board", 9, 0, (-2000.0, -2000.0, 2000.0, 2000.0))
-            .place("High Wycombe", 1, 500.0, 800.0)
             .street("Oakridge Road", &[(0.0, -200.0), (0.0, 200.0)])
             .address("81", 10.0, 0.0);
         if let Some(city) = city {
@@ -538,9 +604,9 @@ fn a_place_area_an_area_round_it_lifts_links_no_place_node_of_its_name() {
         index
             .boundary("Durham", 8, 0, (-10_000.0, -10_000.0, 10_000.0, 10_000.0))
             .boundary("Great Aycliffe", 10, 0, (-4000.0, -4000.0, 4000.0, 4000.0))
-            .boundary("Newton Aycliffe", 15, 2, (-3000.0, -3000.0, 3000.0, 3000.0))
-            .place("Newton Aycliffe", 1, 500.0, 800.0)
-            .place("Aycliffe Village", 1, 475.0, 0.0)
+            .boundary("Newton Aycliffe", 15, 2, (-3000.0, -3000.0, 3000.0, 3000.0)).rank(22)
+            .place("Newton Aycliffe", 1, 500.0, 800.0).promoted()
+            .place("Aycliffe Village", 1, 475.0, 0.0).promoted()
             .street("Stanfield Road", &[(0.0, -200.0), (0.0, 200.0)])
             .address("20", 10.0, 0.0);
         if let Some(city) = city {

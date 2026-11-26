@@ -595,6 +595,11 @@ inline std::optional<PoiClassification> classify_poi(
     // DataLayer.POI filter: class_ NOT IN ('place', 'building'),
     // rank_search==30). Only a wikipedia or wikidata tag lifts
     // one into a POI dir (below).
+    // One of a natural or waterway tag address-levels.json ranks below 30
+    // alone, or of leisure=common or historic=neighbourhood, is no rank-30
+    // row there (POI_FLAG_BELOW_RANK30); a water object that yields or stays
+    // water is none of them.
+    bool below_rank30 = false;
     // A water object a POI main tag of no category of its own makes a
     // rank-30 POI is one too.
     if (cat == PoiCategory::UNKNOWN) {
@@ -603,6 +608,12 @@ inline std::optional<PoiClassification> classify_poi(
             t_natural || t_aeroway || t_railway || t_power ||
             t_shop) {
             cat = PoiCategory::GENERIC_RANK30;
+            auto is = [](const char* v, const char* value) { return v && std::strcmp(v, value) == 0; };
+            const bool natural30 = is(t_natural, "tree") || is(t_natural, "rock") || is(t_natural, "stone");
+            below_rank30 = yielded == PoiCategory::UNKNOWN && kept == PoiCategory::UNKNOWN &&
+                           !(t_amenity || t_tourism || (t_historic && !is(t_historic, "neighbourhood")) ||
+                             (t_leisure && !is(t_leisure, "common")) || t_man_made || t_craft || t_office ||
+                             natural30 || t_aeroway || t_railway || t_power || t_shop);
         }
     }
 
@@ -610,7 +621,7 @@ inline std::optional<PoiClassification> classify_poi(
     if (kept != PoiCategory::UNKNOWN) cat = kept;
     if (cat == PoiCategory::UNKNOWN) return std::optional<PoiClassification>{};
 
-    uint8_t flags = 0;
+    uint8_t flags = below_rank30 ? POI_BUILD_BELOW_RANK30 : 0;
     if (t_wikipedia) flags |= POI_FLAG_WIKIPEDIA;
     if (t_wikidata)  flags |= POI_FLAG_WIKIDATA;
     // Nominatim treats highway=pedestrian/footway/living_street/

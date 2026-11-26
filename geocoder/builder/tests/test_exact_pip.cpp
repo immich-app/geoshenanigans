@@ -1,8 +1,8 @@
 // exact_pip.h: the e7 ray cast against the shared vectors in geocoder/testdata
 // (which the reader is held to as well), its edge index and box against the
-// plain scan, the covers test that takes the edges in, and the exact area and
-// centroid. In the sanitized suite: the products reach 6.5e18 at the poles
-// and the antimeridian.
+// plain scan, the on-edge test against the doubled grid's, the covers test that
+// takes the edges in, and the exact area and centroid. In the sanitized suite:
+// the products reach 6.5e18 at the poles and the antimeridian.
 #include "exact_pip.h"
 
 #include <algorithm>
@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "polygon_relations.h"
 #include "test_framework.h"
 
 namespace {
@@ -158,8 +159,8 @@ TEST(exact_ring_edge_index_matches_the_scans_on_edges_and_vertices) {
         for (const PackedLocation& p : probes(rng, ring, 2000)) {
             const bool want = exact_ring_contains(ring.data(), static_cast<uint32_t>(ring.size()), p);
             CHECK(index.contains(p) == want);
-            const bool touches = exact_ring_touches(ring.data(), static_cast<uint32_t>(ring.size()), p);
-            CHECK(index.touches(p) == touches);
+            const bool touches = exact_ring_on_edge(ring.data(), static_cast<uint32_t>(ring.size()), p);
+            CHECK(index.on_edge(p) == touches);
             inside += want;
             on_edge += touches;
             tested++;
@@ -167,6 +168,32 @@ TEST(exact_ring_edge_index_matches_the_scans_on_edges_and_vertices) {
     }
     CHECK(inside > tested / 20);
     CHECK(on_edge > tested / 20);
+}
+
+TEST(a_point_is_on_an_edge_where_the_half_grid_test_says_so) {
+    // exact_point_on_edge against polygon_relations.h's test on the doubled grid, on the probes
+    // round random rings, whose vertices and edge middles are on their edges: some are, most
+    // aren't.
+    std::mt19937_64 rng(20261124);
+    size_t on = 0, tested = 0;
+    for (int round = 0; round < 40; round++) {
+        const int64_t radius = round % 2 == 0 ? 1000 : 300000000;
+        const auto ring = random_ring(rng, 64 + static_cast<uint32_t>(rng() % 200), 0, 0, radius, round % 4 < 2);
+        for (const PackedLocation& p : probes(rng, ring, 500)) {
+            bool want = false;
+            for (size_t k = 0; k + 1 < ring.size(); k++) {
+                const bool got = exact_point_on_edge(ring[k], ring[k + 1], p);
+                CHECK(got == on_edge_half(ring[k], ring[k + 1], half_point(p)));
+                CHECK(got == exact_point_on_edge(ring[k + 1], ring[k], p));
+                want |= got;
+            }
+            CHECK(exact_ring_on_edge(ring.data(), static_cast<uint32_t>(ring.size()), p) == want);
+            on += want;
+            tested++;
+        }
+    }
+    CHECK(on > tested / 20);
+    CHECK(on < tested / 2);
 }
 
 TEST(exact_ring_box_spans_the_vertices) {

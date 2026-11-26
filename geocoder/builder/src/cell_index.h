@@ -43,6 +43,11 @@ AdminTierCells admin_tier_cells(const AdminArcs& arcs, const AdminExactRings& st
 // carry the tables on from there. data.admin_country_cells gets the country
 // polygons' share of the exact tier's, which the builder's links read too.
 void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads = 0);
+// Its two halves, as the arc stage's (build_full_admin_arcs,
+// build_minimal_admin_arcs): the full set's index and the country cells,
+// from the full set's tiers alone, then admin-minimal's.
+void compute_full_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads = 0);
+void compute_minimal_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads = 0);
 
 // The water layer's cell index (water_layer.h) from its arc stage's tiers
 // (`arcs` of `store`, kWaterArcStage): each polygon's cells over both tiers,
@@ -157,7 +162,8 @@ void write_place_files(const std::string& dir, const std::vector<PlaceNode>& nod
 //   - place_nodes of other types than admin_minimal_keeps_place's (suburbs,
 //     neighbourhoods, quarters)
 //   - the admin polygons admin_minimal_keeps leaves out: L9 borough, L10
-//     quarter-area, L11 admin-postal, and L15 place areas ranked below 16.
+//     quarter-area, L11 and L12, the postal areas, and L15 place areas
+//     whose label type is outside the retained set in admin_minimal_keeps.
 //   - those boundaries' claims on place nodes: a node one of them
 //     claims answers here as a place, since nothing here stands
 //     for it (an L9 or L10 boundary claims Banja Luka, Mildura and

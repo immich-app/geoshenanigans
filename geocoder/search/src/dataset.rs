@@ -22,9 +22,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// The geocoder files an index is derived from: the records its postings point at, the string
-/// tiers of their names and the boundary geometry its label points come from, the boundary tier's
-/// own arcs among it (the records and rings are the same in every tier).
-pub const DATASET_FILES: [&str; 11] = [
+/// tiers of their names (the polygons' own names beside them among them) and the boundary
+/// geometry its label points come from, the boundary tier's own arcs among it (the records and
+/// rings are the same in every tier).
+pub const DATASET_FILES: [&str; 12] = [
+    "admin_own_names.bin",
     "admin_polygons.bin",
     "admin_rings.bin",
     "arc_index.bin",
@@ -1009,7 +1011,7 @@ mod tests {
 
         let after = fingerprint(&ds.0).unwrap();
 
-        for name in std::iter::once("admin_polygons.bin").chain(ADMIN_GEOMETRY_FILES) {
+        for name in ["admin_polygons.bin", query_server::ADMIN_OWN_NAMES_FILE].into_iter().chain(ADMIN_GEOMETRY_FILES) {
             assert!(before.contains_key(name), "{name}");
         }
         assert_ne!(after, before);

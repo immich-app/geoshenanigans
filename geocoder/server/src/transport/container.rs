@@ -8,7 +8,7 @@ use std::path::Path;
 
 pub const MAGIC: [u8; 4] = *b"GTT1";
 /// The stream's layout: a reader refuses a unit of any other version.
-pub const TRANSPORT_VERSION: u32 = 1;
+pub const TRANSPORT_VERSION: u32 = 2;
 /// The most bytes of columns a chunk of more than one unit holds.
 pub const CHUNK_BYTES: usize = 1 << 20;
 /// The most bytes of columns a chunk holds: a unit past CHUNK_BYTES goes alone in its chunk.

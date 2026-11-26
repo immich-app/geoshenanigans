@@ -389,3 +389,39 @@ TEST(the_admin_indexes_over_the_arcs_coverings_are_those_over_the_rings) {
     }
     CHECK(countries > 6000);
 }
+
+TEST(the_full_sets_arcs_and_cells_are_built_before_admin_minimal_is_marked) {
+    // The full set's half of the arc stage and its cell index read no mark of admin-minimal's
+    // polygons, which the links may change before the minimal set's half: on random maps, the
+    // full half's tiers and cells, then the minimal half's with every mark flipped, are those of
+    // the whole stage with the flipped marks.
+    std::mt19937_64 rng(1123);
+    size_t minimal_entries = 0;
+    for (int round = 0; round < 9; round++) {
+        int level = 0;
+        const MapShape shape = random_shape(rng, round, level);
+        const AdminCellLevel cell_level(level);
+        std::mt19937_64 again = rng;
+        Map staged = random_map(rng, shape);
+        Map whole = random_map(again, shape);
+        std::vector<bool> flipped(staged.in_minimal.size());
+        for (size_t p = 0; p < flipped.size(); p++) flipped[p] = !staged.in_minimal[p];
+
+        AdminArcs arcs = build_full_admin_arcs(staged.data.admin_exact_rings, "", 1 + round % 3);
+        compute_full_admin_index_cells(staged.data, arcs, 2);
+        build_minimal_admin_arcs(arcs, staged.data.admin_exact_rings, flipped, "", 1 + round % 3);
+        compute_minimal_admin_index_cells(staged.data, arcs, 3);
+
+        const AdminArcs whole_arcs = build_admin_arcs(whole.data.admin_exact_rings, flipped, "", 2);
+        compute_admin_index_cells(whole.data, whole_arcs, 1);
+        CHECK(table(staged.data.admin_index_cells) == table(whole.data.admin_index_cells));
+        CHECK(table(staged.data.admin_country_cells) == table(whole.data.admin_country_cells));
+        CHECK(table(staged.data.admin_minimal_index_cells) == table(whole.data.admin_minimal_index_cells));
+        for (size_t t = 0; t < kArcTierCount; t++)
+            CHECK(per_ring_tier(arcs, staged.data.admin_exact_rings, t) ==
+                  per_ring_tier(whole_arcs, whole.data.admin_exact_rings, t));
+        CHECK(arcs.nests_exact.empty());
+        minimal_entries += staged.data.admin_minimal_index_cells.size();
+    }
+    CHECK(minimal_entries > 1000);
+}

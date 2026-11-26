@@ -48,7 +48,7 @@ fn fixture_dir() -> TempDir {
             name_id: i * 5,
             place_type: (i % 7) as u8,
             _pad1: if i % 10 == 3 { PLACE_FLAG_HIDDEN } else { 0 },
-            _pad2: 0,
+            rank_address: if i % 10 == 3 { 0 } else { query_server::PLACE_NODE_RANK[(i % 7) as usize] },
             parent_poly_id: NO_DATA,
         })
         .collect();

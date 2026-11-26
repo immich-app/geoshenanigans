@@ -49,27 +49,29 @@ inline bool exact_ring_contains(const PackedLocation* v, uint32_t n, PackedLocat
     return inside;
 }
 
-// Whether p lies on the segment a-b: on its line (exact_edge_crosses' cross
-// product is 0, as exact) and within its box.
-inline bool exact_on_segment(PackedLocation a, PackedLocation b, PackedLocation p) {
-    const int64_t lhs = (int64_t(p.lat_e7) - a.lat_e7) * (int64_t(b.lon_e7) - a.lon_e7);
-    const int64_t rhs = (int64_t(b.lat_e7) - a.lat_e7) * (int64_t(p.lon_e7) - a.lon_e7);
-    return lhs == rhs && std::min(a.lat_e7, b.lat_e7) <= p.lat_e7 && p.lat_e7 <= std::max(a.lat_e7, b.lat_e7) &&
-           std::min(a.lon_e7, b.lon_e7) <= p.lon_e7 && p.lon_e7 <= std::max(a.lon_e7, b.lon_e7);
+// Whether p lies on the edge a-b, its ends included: inside the edge's box,
+// on its line (the cross product 0, its two products compared as
+// exact_edge_crosses compares them).
+inline bool exact_point_on_edge(PackedLocation a, PackedLocation b, PackedLocation p) {
+    if (p.lat_e7 < std::min(a.lat_e7, b.lat_e7) || p.lat_e7 > std::max(a.lat_e7, b.lat_e7) ||
+        p.lon_e7 < std::min(a.lon_e7, b.lon_e7) || p.lon_e7 > std::max(a.lon_e7, b.lon_e7))
+        return false;
+    return (int64_t(p.lat_e7) - a.lat_e7) * (int64_t(b.lon_e7) - a.lon_e7) ==
+           (int64_t(b.lat_e7) - a.lat_e7) * (int64_t(p.lon_e7) - a.lon_e7);
 }
 
 // Whether p lies on an edge of the ring v[0, n), its last vertex joined back
-// to its first.
-inline bool exact_ring_touches(const PackedLocation* v, uint32_t n, PackedLocation p) {
+// to its first: on its border, where exact_ring_contains may say either.
+inline bool exact_ring_on_edge(const PackedLocation* v, uint32_t n, PackedLocation p) {
     for (uint32_t a = 0, b = n - 1; a < n; b = a++)
-        if (exact_on_segment(v[b], v[a], p)) return true;
+        if (exact_point_on_edge(v[b], v[a], p)) return true;
     return false;
 }
 
 // Whether the ring v[0, n) covers p, as PostGIS's ST_Covers: p is inside it
 // or on its edges, which exact_ring_contains leaves to one side or the other.
 inline bool exact_ring_covers(const PackedLocation* v, uint32_t n, PackedLocation p) {
-    return exact_ring_touches(v, n, p) || exact_ring_contains(v, n, p);
+    return exact_ring_on_edge(v, n, p) || exact_ring_contains(v, n, p);
 }
 
 // Whether the polygons (each an outer ring and its holes; a ring of fewer
@@ -78,7 +80,7 @@ inline bool exact_ring_covers(const PackedLocation* v, uint32_t n, PackedLocatio
 // none of its holes.
 inline bool exact_polygons_cover(const std::vector<NestedPolygon<PackedLocation>>& polygons, PackedLocation p) {
     auto touches = [&](const std::vector<PackedLocation>& ring) {
-        return ring.size() >= 3 && exact_ring_touches(ring.data(), static_cast<uint32_t>(ring.size()), p);
+        return ring.size() >= 3 && exact_ring_on_edge(ring.data(), static_cast<uint32_t>(ring.size()), p);
     };
     auto contains = [&](const std::vector<PackedLocation>& ring) {
         return ring.size() >= 3 && exact_ring_contains(ring.data(), static_cast<uint32_t>(ring.size()), p);
@@ -130,12 +132,10 @@ public:
         });
     }
 
-    // exact_ring_touches: p's bucket holds every edge whose longitudes
-    // reach p's.
-    bool touches(PackedLocation p) const {
-        return buckets_.any_edge(p.lon_e7, [&](uint32_t a, uint32_t b) {
-            return exact_on_segment(verts_[b], verts_[a], p);
-        });
+    // exact_ring_on_edge: an edge through p spans p's longitude, so it is in
+    // p's bucket.
+    bool on_edge(PackedLocation p) const {
+        return buckets_.any_edge(p.lon_e7, [&](uint32_t a, uint32_t b) { return exact_point_on_edge(verts_[b], verts_[a], p); });
     }
 
 private:

@@ -1580,7 +1580,11 @@ Files place_files_of(uint32_t visible, uint32_t hidden) {
         n.lng = 8.0f;
         n.name_id = 16 * i;
         n.place_type = 1;
-        if (i >= visible) n._pad1 = PLACE_FLAG_HIDDEN;
+        n.rank_address = 16;
+        if (i >= visible) {
+            n._pad1 = PLACE_FLAG_HIDDEN;
+            n.rank_address = 0;
+        }
         enc.add({n, i < visible ? i / 3 : NO_DATA});
     }
     enc.finish();

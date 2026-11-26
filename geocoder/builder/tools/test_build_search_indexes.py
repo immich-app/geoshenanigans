@@ -310,7 +310,7 @@ def flat(paths):
 
 
 class TemplateTest(unittest.TestCase):
-    MINIMAL_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin",
+    MINIMAL_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_own_names.bin", "admin_polygons.bin", "admin_rings.bin",
                      "arc_index.bin", "arc_vertices.bin", "attribution.json", "place_cells.bin", "place_hidden.bin",
                      "place_nodes.bin", "postal_cities.bin", "postcode_grid.bin", "strings_core.bin", "strings_layout.json"]
 
@@ -341,7 +341,8 @@ class TemplateTest(unittest.TestCase):
                 dir_ = f"planet/quality/{sel['quality']}"
             names = [os.path.basename(p) for p in paths]
 
-            for name in ADMIN_GEOMETRY:
+            # The boundaries' own names are read by slot beside their records.
+            for name in ADMIN_GEOMETRY + ["admin_own_names.bin"]:
                 self.assertEqual([p for p in paths if os.path.basename(p) == name], [f"{dir_}/{name}"], sel)
             bins = [n for n in names if n.endswith(".bin")]
             self.assertEqual(len(bins), len(set(bins)), sel)

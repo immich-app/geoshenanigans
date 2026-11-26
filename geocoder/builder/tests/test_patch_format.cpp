@@ -414,20 +414,21 @@ TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread_or_copies
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v24 = a water dir's cut arcs under file id 39 (v23:
-    // the postal cities' logical stream; v22: the address points' addr:city
-    // side file; v20: the postcode grid's logical stream; v19: the postcode
-    // centroids'). The patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(24));
+    // diff/patch tools. v25 = the polygons' and place nodes' rank_address
+    // (v24: a water dir's cut arcs under file id 39; v23: the postal cities'
+    // logical stream; v22: the address points' addr:city side file; v20: the
+    // postcode grid's logical stream; v19: the postcode centroids'). The
+    // patcher accepts this version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(25));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
 
 TEST(patch_format_fileid_count_and_names_aligned) {
     // The names table must have exactly COUNT entries (one per PatchFileId).
-    CHECK_EQ(static_cast<uint32_t>(PatchFileId::COUNT), uint32_t(40));
+    CHECK_EQ(static_cast<uint32_t>(PatchFileId::COUNT), uint32_t(41));
     const size_t n_names = sizeof(patch_file_names) / sizeof(patch_file_names[0]);
-    CHECK_EQ(n_names, size_t(40));
+    CHECK_EQ(n_names, size_t(41));
     // Spot-check that index lines up with the enum value.
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::STRINGS)]) == "strings.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::POI_RECORDS)]) == "poi_records.bin");
@@ -438,6 +439,7 @@ TEST(patch_format_fileid_count_and_names_aligned) {
     CHECK_EQ(static_cast<uint32_t>(PatchFileId::POSTAL_CITIES), uint32_t(37));
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::ADDR_CITIES)]) == "addr_cities.bin");
     CHECK_EQ(static_cast<uint32_t>(PatchFileId::ADDR_CITIES), uint32_t(38));
+    CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::ADMIN_OWN_NAMES)]) == "admin_own_names.bin");
     // The geo index's two files; its lists by table are no files.
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::GEO_CELLS)]) == "geo_cells.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::GEO_ENTRIES)]) == "geo_entries.bin");
@@ -816,6 +818,7 @@ TEST(patch_format_string_fields_match_the_record_layouts) {
     CHECK(string_field_offsets(PatchFileId::POI_RECORDS) == V({16, 24, 28}));  // not parent_poly_id at 32
     CHECK(string_field_offsets(PatchFileId::PLACE_NODES) == V({8}));  // not parent_poly_id at 16
     CHECK(string_field_offsets(PatchFileId::POSTCODE_CENTROIDS) == V({8}));  // a logical row's postcode_id
+    CHECK(string_field_offsets(PatchFileId::ADMIN_OWN_NAMES) == V({4}));  // not the slot at 0
     CHECK_EQ(POSTCODE_CENTROID_STRIDE, size_t(20));
     bool centroids_scanned = false;
     for (const auto& f : STRING_RECORD_FILES)
@@ -856,7 +859,7 @@ TEST(patch_format_v19_names_no_file_for_ids_24_and_25) {
         for (const PatchFileId f : UNSECTIONED_OLD_FILES) CHECK(uint32_t(f) != id);
     }
     for (const uint32_t id : {0u, 9u, 10u, 11u}) CHECK(names_no_file(id));
-    for (const uint32_t id : {1u, 8u, 18u, 23u, 26u, 35u, 36u, 37u, 38u, 39u}) CHECK(!names_no_file(id));
+    for (const uint32_t id : {1u, 8u, 18u, 23u, 26u, 35u, 36u, 37u, 38u, 39u, 40u}) CHECK(!names_no_file(id));
     CHECK(!names_no_file(uint32_t(PatchFileId::COUNT)));
     CHECK(std::vector<std::string>(std::begin(POSTCODE_SIDE_FILES), std::end(POSTCODE_SIDE_FILES)) ==
           std::vector<std::string>({"postcode_centroid_cells.bin"}));
@@ -886,6 +889,29 @@ TEST(patch_format_v22_sends_the_addr_cities_after_the_other_side_files) {
     CHECK(SPARSE_DELTA_FILES[std::size(SPARSE_DELTA_FILES) - 1].fid == PatchFileId::ADDR_CITIES);
     CHECK(string_field_offsets(PatchFileId::ADDR_CITIES).empty());
     CHECK(!is_hashed_old_file(uint32_t(PatchFileId::ADDR_CITIES)));
+}
+
+// v25: file id 40 names admin_own_names.bin, the own name of each polygon
+// that goes by its place node's English name (types.h AdminOwnName): records
+// of 8 bytes, the polygon's slot and its own name, a string offset at byte 4,
+// which merge as a record file of a string field, after the postal cities
+// (37) and the water cut arcs (39). No sparse or parallel delta carries it,
+// and no replay copies it unread.
+TEST(patch_format_v25_merges_the_admin_own_names_as_records_of_a_string_field) {
+    CHECK(uint32_t(PatchFileId::ADMIN_OWN_NAMES) == 40);
+    CHECK_EQ(std::string(patch_file_names[40]), std::string(kAdminOwnNamesFile));
+    CHECK(uint32_t(PatchFileId::COUNT) == 41);
+    CHECK(!names_no_file(40));
+    CHECK_EQ(ADMIN_OWN_NAME_STRIDE, sizeof(AdminOwnName));
+    CHECK_EQ(ADMIN_OWN_NAME_NAME_ID_OFF, offsetof(AdminOwnName, name_id));
+    size_t stride = 0;
+    for (const auto& f : STRING_RECORD_FILES)
+        if (f.fid == PatchFileId::ADMIN_OWN_NAMES) stride = f.stride;
+    CHECK_EQ(stride, ADMIN_OWN_NAME_STRIDE);
+    CHECK(sparse_delta_file(PatchFileId::ADMIN_OWN_NAMES) == nullptr);
+    CHECK(parallel_delta_file(PatchFileId::ADMIN_OWN_NAMES) == nullptr);
+    CHECK(!is_hashed_old_file(uint32_t(PatchFileId::ADMIN_OWN_NAMES)));
+    CHECK(!is_remapped_record_file(uint32_t(PatchFileId::ADMIN_OWN_NAMES)));
 }
 
 // v14: file ids 7, 26 and 27 name the arc files, of no string field, which

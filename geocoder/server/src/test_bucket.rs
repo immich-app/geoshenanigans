@@ -252,14 +252,19 @@ fn made_up(path: &str) -> Vec<u8> {
 fn dataset(dir: &str) -> BTreeMap<&'static str, Vec<u8>> {
     let mut rng = Rng::of(dir);
     let nodes: Vec<PlaceNode> = (0..100u32)
-        .map(|i| PlaceNode {
-            lat: rng.range(-60.0, 60.0),
-            lng: rng.range(-170.0, 170.0),
-            name_id: rng.below(1 << 20) as u32,
-            place_type: rng.below(7) as u8,
-            _pad1: if i % 9 == 4 { PLACE_FLAG_HIDDEN } else { 0 },
-            _pad2: 0,
-            parent_poly_id: NO_DATA,
+        .map(|i| {
+            let (lat, lng, name_id) = (rng.range(-60.0, 60.0), rng.range(-170.0, 170.0), rng.below(1 << 20) as u32);
+            let place_type = rng.below(7) as u8;
+            let hidden = i % 9 == 4;
+            PlaceNode {
+                lat,
+                lng,
+                name_id,
+                place_type,
+                _pad1: if hidden { PLACE_FLAG_HIDDEN } else { 0 },
+                rank_address: if hidden { 0 } else { crate::PLACE_NODE_RANK[place_type as usize] },
+                parent_poly_id: NO_DATA,
+            }
         })
         .collect();
     let (places, _) = place_files::encode(&nodes, DEFAULT_ADMIN_CELL_LEVEL);

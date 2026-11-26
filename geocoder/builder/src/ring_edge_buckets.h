@@ -67,14 +67,14 @@ public:
             }
     }
 
-    // Whether any edge whose span on this axis reaches coordinate x does as
-    // `test(a, b)` says, for the edge from vertex b to vertex a as above:
-    // the bucket of x holds every one.
+    // Whether test(a, b) holds of an edge whose span on the axis may hold x,
+    // the edges handed as odd_crossings hands them: every edge whose span
+    // holds x is among them.
     template <class Test>
     bool any_edge(double x, Test test) const {
         const uint32_t bucket = bucket_of(x);
         for (uint32_t k = start_[bucket]; k < start_[bucket + 1]; k++) {
-            uint32_t a = edges_[k];
+            const uint32_t a = edges_[k];
             if (test(a, a == 0 ? cnt_ - 1 : a - 1)) return true;
         }
         return false;

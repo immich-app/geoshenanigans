@@ -58,9 +58,42 @@ TEST(place_area_ranks_follow_the_country_levels) {
     CHECK_EQ(place_area_rank_address(gb, pt(AdminPlaceType::PROVINCE)), uint8_t(0));
     CHECK_EQ(place_area_rank_address(0, pt(AdminPlaceType::CITY)), uint8_t(16));
     // A boundary's is its level's.
-    CHECK_EQ(polygon_rank_address(pack_country_code('A', 'U'), 6, pt(AdminPlaceType::MUNICIPALITY)), uint8_t(0));
-    CHECK_EQ(polygon_rank_address(gb, 6, 0), uint8_t(12));
-    CHECK_EQ(polygon_rank_address(ca, 15, pt(AdminPlaceType::COUNTY)), uint8_t(0));
+    CHECK_EQ(polygon_ranks(pack_country_code('A', 'U'), 6, PlaceValue::MUNICIPALITY).address, uint8_t(0));
+    CHECK_EQ(polygon_ranks(gb, 6, PlaceValue::NONE).address, uint8_t(12));
+    CHECK_EQ(polygon_ranks(ca, 15, PlaceValue::COUNTY).address, uint8_t(0));
+}
+
+TEST(place_values_rank_as_address_levels_place_entries) {
+    // Every value of the file's place entries, a country's first, the others by its "" entry.
+    const uint16_t es = pack_country_code('E', 'S'), de = pack_country_code('D', 'E'), fr = pack_country_code('F', 'R');
+    CHECK(place_value_ranks(fr, place_value_of("locality")) == (PlaceRanks{25, 25}));
+    CHECK(place_value_ranks(fr, place_value_of("isolated_dwelling")) == (PlaceRanks{22, 25}));
+    CHECK(place_value_ranks(fr, place_value_of("farm")) == (PlaceRanks{22, 25}));
+    CHECK(place_value_ranks(fr, place_value_of("croft")) == (PlaceRanks{20, 20}));
+    CHECK(place_value_ranks(fr, place_value_of("allotments")) == (PlaceRanks{22, 22}));
+    CHECK(place_value_ranks(fr, place_value_of("island")) == (PlaceRanks{17, 0}));
+    CHECK(place_value_ranks(fr, place_value_of("houses")) == (PlaceRanks{28, 0}));
+    CHECK(place_value_ranks(fr, place_value_of("house")) == (PlaceRanks{30, 30}));
+    CHECK(place_value_ranks(es, place_value_of("civil_parish")) == (PlaceRanks{18, 18}));
+    CHECK(place_value_ranks(fr, place_value_of("civil_parish")) == (PlaceRanks{22, 0}));
+    CHECK(place_value_ranks(de, place_value_of("region")) == (PlaceRanks{10, 0}));
+    CHECK(place_value_ranks(fr, place_value_of("subdistrict")) == (PlaceRanks{22, 0}));
+    CHECK(place_value_of("subdistrict") == PlaceValue::OTHER);
+    CHECK(place_value_of("") == PlaceValue::NONE);
+    CHECK(place_value_of(nullptr) == PlaceValue::NONE);
+    // The 15 that label polygons, and back: a locality's too, whose polygons rank 25.
+    size_t labels = 0;
+    for (int v = 0; v <= static_cast<int>(PlaceValue::CIVIL_PARISH); v++) {
+        const AdminPlaceType t = place_label_of(static_cast<PlaceValue>(v));
+        if (t == AdminPlaceType::NONE) continue;
+        labels++;
+        CHECK(place_value_of(t) == static_cast<PlaceValue>(v));
+        CHECK(place_ranks(fr, pt(t)) == place_value_ranks(fr, static_cast<PlaceValue>(v)));
+    }
+    CHECK_EQ(labels, size_t(15));
+    CHECK(place_label_of(PlaceValue::LOCALITY) == AdminPlaceType::LOCALITY);
+    CHECK(place_ranks(fr, pt(AdminPlaceType::LOCALITY)) == (PlaceRanks{25, 25}));
+    CHECK(!admin_minimal_keeps(15, pt(AdminPlaceType::LOCALITY)));
 }
 
 TEST(place_area_ranks_follow_address_levels) {

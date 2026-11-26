@@ -59,8 +59,8 @@ A complete geocoder index for a given region and configuration consists of files
 | `full/` | 24 files (+6 optional) | Streets + addresses + interpolation + admin + postcodes |
 | `no-addresses/` | 17 files (+4 optional) | Streets + admin + postcodes (no address points) |
 | `admin/` | 9 files (+4 optional) | Admin cell indexes + place nodes + postcodes |
-| `admin-minimal/` | 12 files (+2 optional) | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified to within 37.5 m on an 11 m grid (a ring that grid would collapse keeps the 1.1 m one; takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
-| `admin-minimal-poi/` | 12 files (+2 optional) | The same, on the shared polygon slots and core strings that a POI tier's parent polygons and names point into (a dropped polygon's slot holds a tombstone), with the same arc files. The admin-minimal mode's dir beside a POI tier |
+| `admin-minimal/` | 13 files (+2 optional) | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified to within 37.5 m on an 11 m grid (a ring that grid would collapse keeps the 1.1 m one; takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
+| `admin-minimal-poi/` | 13 files (+2 optional) | The same, on the shared polygon slots and core strings that a POI tier's parent polygons and names point into (a dropped polygon's slot holds a tombstone), with the same arc files. The admin-minimal mode's dir beside a POI tier |
 
 Optional files are written only when the data has them; see `optional_files`
 under configurations.json below. The admin-minimal mode picks its dir by the
@@ -82,14 +82,17 @@ the tier's `poi_attribution.json` beside it where the build has one.
 
 | Quality | Files | Description |
 |---------|-------|-------------|
-| `quality/simplified/` | 4 files | Admin boundaries simplified to within 37.5 m (less for small areas), on a 1.1 m grid |
-| `quality/exact/` | 4 files | Every OSM point of every admin boundary, with nothing simplified, snapped or capped |
+| `quality/simplified/` | 5 files | Admin boundaries simplified to within 37.5 m (less for small areas), on a 1.1 m grid |
+| `quality/exact/` | 5 files | Every OSM point of every admin boundary, with nothing simplified, snapped or capped |
 
-Both hold the admin polygons (postcode areas among them, at level 11) as
+Both hold the admin polygons (postcode areas among them, at level 13) as
 `admin_polygons.bin` and their rings as `admin_rings.bin`: the same bytes in
 both. Each ring is a list of refs to the arcs of `arc_index.bin` and
 `arc_vertices.bin`, the borders the polygons on either side of them share, each
 stored once; those two files are what the tiers differ in.
+`admin_own_names.bin` beside them (and in the admin-minimal dirs) holds the
+own name of each polygon that goes by the English name of the place node it
+links, which the addr:city crosscheck and place search read too.
 
 ### POI directory (optional, pick one)
 

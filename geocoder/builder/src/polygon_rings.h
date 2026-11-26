@@ -108,9 +108,11 @@ inline bool ring_contains_latlng(const std::vector<LatLng>& ring, double lat, do
 // inside stretch of the horizontal line half-way between the vertex
 // latitudes nearest the middle of the latitude range. Falls back to the
 // first vertex when no stretch has width (a degenerate ring). Returns
-// (lat, lng).
+// (lat, lng), and the stretch's width in degrees of longitude, by which GEOS
+// picks the point of a multipolygon: its widest polygon's (0 for the
+// fallback).
 template <class P>
-LatLng interior_point(const P* v, const RingSpan* rings, size_t ring_count) {
+std::pair<LatLng, double> interior_point_and_width(const P* v, const RingSpan* rings, size_t ring_count) {
     const RingSpan& outer = rings[0];
     double lo = std::numeric_limits<double>::infinity(), hi = -lo;
     for (uint32_t k = 0; k < outer.count; k++) {
@@ -150,7 +152,12 @@ LatLng interior_point(const P* v, const RingSpan* rings, size_t ring_count) {
             best = {scan, (crossings[k] + crossings[k + 1]) / 2};
         }
     }
-    return best;
+    return {best, best_width};
+}
+
+template <class P>
+LatLng interior_point(const P* v, const RingSpan* rings, size_t ring_count) {
+    return interior_point_and_width(v, rings, ring_count).first;
 }
 
 template <class P>

@@ -32,6 +32,7 @@
 #include "string_pool.h"
 #include "id_allocator.h"
 #include "place_claims.h"
+#include "place_link_types.h"
 #include "parallel.h"
 #include "postal_cities_build.h"
 #include "postcode_grid_build.h"
@@ -421,6 +422,16 @@ struct ParsedData {
     // polygons, OSM_WAY + way_id for closed-way polygons (stable ids since
     // #105). Strategy-2 IdAllocator keys on this.
     std::vector<uint64_t> admin_osm_ids;
+    // What each boundary and place area links by (its label member, name tag
+    // and wikidata), by boundary id: admin_boundary_id of its polygons'
+    // admin_osm_ids. The link and rank passes read it; the rank pass frees it.
+    std::vector<AdminTags> admin_tags;
+    // Each linking boundary's and place area's link (place_links.h), which
+    // the rank pass reads, then frees.
+    std::vector<AdminLink> admin_links;
+    // The place nodes the boundaries and place areas may link, from the parse
+    // to the link pass, which frees them.
+    LinkCandidates link_candidates;
     // A continent's admin polygons' planet ids, parallel to admin_polygons
     // (NO_DATA for a strategy-2 tombstone); empty for the planet.
     std::vector<uint32_t> admin_planet_ids;
@@ -468,6 +479,10 @@ struct ParsedData {
     std::vector<PlaceNode> place_nodes;
     // Parallel: packed (OSM_NODE, osm_node_id). Strategy-2 IdAllocator uses this.
     std::vector<uint64_t> place_osm_ids;
+    // Parallel: each node's point as OSM has it on the e7 grid, which its f32
+    // coordinates round off by up to a metre: the rank pass tests it against
+    // the boundaries, then frees it.
+    std::vector<PackedLocation> place_points;
     // Each place node's admin cell, for the continent filter's place masks; no
     // dir ships a place cell index (a client derives one from place_nodes.bin).
     std::vector<CellItemPair> sorted_place_cells;
@@ -586,33 +601,15 @@ struct ParsedData {
     static constexpr uint64_t kNoCentroid = UINT64_MAX;
     std::vector<HouseCentroid> house_centroids;
 
-    // Boundaries' label/wikidata claims on place nodes (build-time only,
-    // consumed by link_places_by_name to hide the nodes like Nominatim's
-    // linked_place_id and name their claimant); filled from parallel
-    // relation workers under the mutex.
+    // Each linked place node's claimant, the boundary of its last link (the
+    // link pass's), by which the node is hidden like Nominatim's
+    // linked_place_id and names its claimant once the polygons have their
+    // order.
     std::vector<PlaceClaim> place_claims;
-    // The place nodes of each boundary's wikidata that it covers (build-time
-    // only), which link_wikidata_places links once every input's boundaries
-    // are in; filled from parallel relation workers under the mutex too.
-    std::vector<WikidataCandidate> wikidata_candidates;
-    std::unique_ptr<std::mutex> linked_pn_mutex = std::make_unique<std::mutex>();
-    // The wikidata of the boundaries (admin levels 2 to 10), as (their
-    // relation_boundary_id or way_boundary_id, its Q number) sorted at use,
-    // and of the place nodes (parallel to place_nodes, 0 for none), which the
-    // name step compares; the boundaries that link a place node (a label
-    // member, a node of their wikidata or name), and of those the ones whose
-    // label member is of a place type of no rank_address between 4 and 25,
-    // for take_out_repeated_boundaries (build-time only).
-    std::vector<std::pair<uint64_t, uint64_t>> boundary_wikidata;
-    std::vector<uint32_t> place_qids;
-    // The AdminPlaceType of the place tag of the boundaries of admin levels
-    // 8 to 10 that have one, as (boundary id, type) sorted at use: the type
-    // find_linked_place's place-type step asks for (extratags 'place'), which
-    // a linked_place tag, though it stands for a place type too, is not
-    // (build-time only).
-    std::vector<std::pair<uint64_t, uint8_t>> boundary_place_tags;
-    std::vector<uint64_t> linking_boundaries;
-    std::vector<uint64_t> unranked_label_boundaries;
+    // Every boundary that links each place node, whichever one the node
+    // names: no boundary promotes a node it stands for (rank_address.h),
+    // which reads it, then frees it.
+    PlaceNodeLinks place_node_links;
 
     // Post-canonical-sort: strings partitioned into per-consumer tiers.
     // Global offset space is contiguous: tier N occupies
@@ -752,7 +749,10 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
                 for (size_t i = b; i < e; i++) mark_one(i);
             }, threads);
         };
-        mark_each(data.admin_polygons.size(), [&](size_t i) { mark(data.admin_polygons[i].name_id, STR_TIER_BIT_CORE); });
+        mark_each(data.admin_polygons.size(), [&](size_t i) {
+            mark(data.admin_polygons[i].name_id, STR_TIER_BIT_CORE);
+            mark(data.admin_polygons[i].own_name_id, STR_TIER_BIT_CORE);
+        });
         mark_each(data.place_nodes.size(), [&](size_t i) { mark(data.place_nodes[i].name_id, STR_TIER_BIT_CORE); });
 
         mark_each(data.ways.size(), [&](size_t i) { mark(data.ways[i].name_id, STR_TIER_BIT_STREET); });
@@ -908,6 +908,7 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
     });
     remap_each(data.admin_polygons.size(), [&](size_t i) {
         data.admin_polygons[i].name_id = new_offset(data.admin_polygons[i].name_id);
+        data.admin_polygons[i].own_name_id = new_offset(data.admin_polygons[i].own_name_id);
     });
     remap_each(data.poi_records.size(), [&](size_t i) {
         auto& pr = data.poi_records[i];

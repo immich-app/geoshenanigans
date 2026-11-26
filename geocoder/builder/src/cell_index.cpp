@@ -802,7 +802,7 @@ void collect_postcode_grid(ParsedData& data) {
     const auto& rings = data.admin_exact_rings;
     for (size_t i = 0; i < data.admin_polygons.size() && i < rings.polygons.size(); i++) {
         const AdminPolygon& area = data.admin_polygons[i];
-        if (area.admin_level != 11 || area.place_type_override == POSTAL_AREA_INVALID || area.name_id == NO_DATA ||
+        if (area.admin_level != POSTAL_AREA_LEVEL || area.place_type_override == POSTAL_AREA_INVALID || area.name_id == NO_DATA ||
             !grid_country(area.country_code) || rings.polygons[i].ring_count == 0)
             continue;
         std::optional<std::string> code = grid_postcode(area.country_code, data.get_string(area.name_id));
@@ -1276,15 +1276,20 @@ std::vector<CellItemPair> union_of_tiers(std::vector<std::vector<CellItemPair>> 
 
 }  // namespace
 
-void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads) {
+namespace {
+
+// The cell index over the tiers of `set` (union_of_tiers), logged; the full set's exact tier's
+// country polygons' share into data.admin_country_cells.
+std::vector<CellItemPair> set_index_cells(ParsedData& data, const AdminArcs& arcs, ArcSet set, unsigned threads) {
     if (threads == 0) threads = parallel_threads();
     const AdminExactRings& store = data.admin_exact_rings;
     auto clock = std::chrono::steady_clock::now();
     auto cpu = CpuTicks::now();
     std::ostringstream counts;
-    std::vector<std::vector<CellItemPair>> sets[2];
+    std::vector<std::vector<CellItemPair>> tiers;
     for (size_t t = 0; t < kArcTierCount; t++) {
         const ArcTier& tier = kArcTiers[t];
+        if (tier.set != set) continue;
         AdminTierCells covered = admin_tier_cells(arcs, store, t, threads, [&](const char* step) {
             log_phase((std::string("      Admin cells: ") + tier.dir + " " + step).c_str(), clock, cpu);
         });
@@ -1305,21 +1310,32 @@ void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned
                 threads);
             parallel_sort(data.admin_country_cells.begin(), data.admin_country_cells.end(), cell_item_less, threads);
         }
-        sets[static_cast<size_t>(tier.set)].push_back(std::move(covered.cells));
+        tiers.push_back(std::move(covered.cells));
     }
-    data.admin_index_cells = union_of_tiers(std::move(sets[static_cast<size_t>(ArcSet::Full)]), threads);
-    data.admin_minimal_index_cells = union_of_tiers(std::move(sets[static_cast<size_t>(ArcSet::Minimal)]), threads);
+    std::vector<CellItemPair> cells = union_of_tiers(std::move(tiers), threads);
     log_phase("      Admin cells: unions", clock, cpu);
     std::cerr << counts.str();
+    const size_t interior =
+        parallel_count(cells.size(), [&](size_t k) { return (cells[k].item_id & INTERIOR_FLAG) != 0; }, threads);
+    std::cerr << "Admin index cells " << (set == ArcSet::Full ? "over the full set's tiers" : "of admin-minimal") << ": "
+              << count_cells(cells) << " cells, " << cells.size() << " entries (" << interior << " interior)"
+              << std::endl;
+    return cells;
+}
 
-    auto interior = [&](const std::vector<CellItemPair>& pairs) {
-        return parallel_count(pairs.size(), [&](size_t k) { return (pairs[k].item_id & INTERIOR_FLAG) != 0; }, threads);
-    };
-    std::cerr << "Admin index cells: " << count_cells(data.admin_index_cells) << " cells, "
-              << data.admin_index_cells.size() << " entries (" << interior(data.admin_index_cells)
-              << " interior) over the full set's tiers; admin-minimal " << count_cells(data.admin_minimal_index_cells)
-              << " cells, " << data.admin_minimal_index_cells.size() << " entries ("
-              << interior(data.admin_minimal_index_cells) << " interior)" << std::endl;
+}  // namespace
+
+void compute_full_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads) {
+    data.admin_index_cells = set_index_cells(data, arcs, ArcSet::Full, threads);
+}
+
+void compute_minimal_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads) {
+    data.admin_minimal_index_cells = set_index_cells(data, arcs, ArcSet::Minimal, threads);
+}
+
+void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads) {
+    compute_full_admin_index_cells(data, arcs, threads);
+    compute_minimal_admin_index_cells(data, arcs, threads);
 }
 
 std::vector<CellItemPair> compute_water_index_cells(const AdminArcs& arcs, const AdminExactRings& store,
@@ -1439,8 +1455,8 @@ struct AdminMinimalStrings {
     uint32_t name(uint32_t shared) const { return subset ? subset->offset_of(shared) : shared; }
 };
 
-// The core strings admin-minimal's records name: its polygons' and its place
-// nodes', in the order of the shared core.
+// The core strings admin-minimal's records name: its polygons' (their own
+// names among them) and its place nodes', in the order of the shared core.
 static StringSubset admin_minimal_names(const ParsedData& data, const std::vector<uint32_t>& kept) {
     const std::vector<char>& core = data.strings_tiers[0];
     std::vector<std::atomic<uint64_t>> used(core.size() / 64 + 1);
@@ -1452,7 +1468,10 @@ static StringSubset admin_minimal_names(const ParsedData& data, const std::vecto
         mark_bit(used, name);
     };
     parallel_for(kept.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t k = b; k < e; k++) use(data.admin_polygons[kept[k]].name_id);
+        for (size_t k = b; k < e; k++) {
+            use(data.admin_polygons[kept[k]].name_id);
+            use(data.admin_polygons[kept[k]].own_name_id);
+        }
     });
     parallel_for(data.place_nodes.size(), [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++)
@@ -1478,7 +1497,12 @@ void write_place_files(const std::string& dir, const std::vector<PlaceNode>& nod
     std::vector<uint8_t> cells, blocks, hidden;
     auto into = [](std::vector<uint8_t>& v) { return [&v](const uint8_t* p, size_t n) { v.insert(v.end(), p, p + n); }; };
     place_files::Encoder enc(into(cells), into(blocks), into(hidden));
-    for (const uint32_t i : order) enc.add({nodes[i], keys[i]});
+    for (const uint32_t i : order) {
+        // A hidden node's row holds no rank.
+        PlaceNode node = nodes[i];
+        if (!place_files::is_visible(node)) node.rank_address = 0;
+        enc.add({node, keys[i]});
+    }
     enc.finish();
     for (const auto& entry : enc.table()) blocks.insert(blocks.end(), entry.begin(), entry.end());
     const auto footer = enc.footer();
@@ -1491,7 +1515,8 @@ void write_place_files(const std::string& dir, const std::vector<PlaceNode>& nod
 namespace {
 
 // A dir's records over `slots`: polygon i at slot slots.slot_of[i] (none at
-// NO_DATA), named name(its shared name), and a tombstone at every other slot.
+// NO_DATA), named name(its shared name) and of the own name name(its shared
+// own name), and a tombstone at every other slot.
 template <class Name>
 SlotRecords records_at(const ParsedData& data, const AdminMinimalSlots& slots, Name name) {
     SlotRecords out{std::vector<AdminPolygon>(slots.count, admin_polygon_tombstone()),
@@ -1501,6 +1526,8 @@ SlotRecords records_at(const ParsedData& data, const AdminMinimalSlots& slots, N
         if (slot == NO_DATA) continue;
         out.at_slot[slot] = data.admin_polygons[i];
         out.at_slot[slot].name_id = name(data.admin_polygons[i].name_id);
+        if (data.admin_polygons[i].own_name_id != NO_DATA)
+            out.at_slot[slot].own_name_id = name(data.admin_polygons[i].own_name_id);
         out.polygon_of[slot] = static_cast<uint32_t>(i);
     }
     return out;

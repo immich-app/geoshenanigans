@@ -88,6 +88,8 @@ add_executable(build-index
     src/continent_boundaries.cpp
     src/cell_index.cpp
     src/interpolation.cpp
+    src/rank_address.cpp
+    src/place_links.cpp
     src/water_layer.cpp
     src/water_names_s2.cpp
 )
@@ -197,6 +199,8 @@ add_executable(geocoder-tests
     src/ring_assembly.cpp
     src/interpolation.cpp
     src/pbf_reader.cpp
+    src/rank_address.cpp
+    src/place_links.cpp
 )
 target_include_directories(geocoder-tests PRIVATE src tools tests)
 target_compile_definitions(geocoder-tests PRIVATE

@@ -29,7 +29,7 @@ fn a_place_node_finer_than_the_boundary_of_its_label_takes_the_label() {
         .boundary("Pennsylvania", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("Allegheny County", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
         .boundary("Pine Township", 8, 2, (-6000.0, -6000.0, 6000.0, 6000.0))
-        .place("Wexford", 1, 2000.0, -1500.0)
+        .place("Wexford", 1, 2000.0, -1500.0).promoted()
         .street("Wynstone Drive", &[(0.0, -200.0), (0.0, 200.0)])
         .address("416", 10.0, 0.0)
         .addr_postcode("15090");
@@ -45,7 +45,7 @@ fn a_place_node_finer_than_the_boundary_of_its_label_takes_the_label() {
         .boundary("New York", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("Suffolk County", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
         .boundary("Town of Islip", 8, 2, (-8000.0, -8000.0, 8000.0, 8000.0))
-        .place("Brentwood", 1, 1500.0, -1000.0)
+        .place("Brentwood", 1, 1500.0, -1000.0).promoted()
         .place("East Brentwood", 4, 500.0, 300.0)
         .street("Lexington Avenue", &[(0.0, -200.0), (0.0, 200.0)])
         .address("13", 10.0, 0.0)
@@ -68,8 +68,8 @@ fn a_boundary_finer_than_a_place_node_of_its_label_takes_the_label() {
         .boundary("Hampshire", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
         .boundary("Test Valley", 8, 0, (-8000.0, -8000.0, 8000.0, 8000.0))
         .boundary("Vernhams Dean", 10, 3, (-3000.0, -3000.0, 3000.0, 3000.0))
-        .place("Vernham Street", 2, -1200.0, 800.0)
-        .place("Vernham Row", 4, 600.0, -300.0)
+        .place("Vernham Street", 2, -1200.0, 800.0).promoted()
+        .place("Vernham Row", 4, 600.0, -300.0).promoted()
         .street("Hatch Lane", &[(0.0, -200.0), (0.0, 200.0)])
         .centroid("SP11 0LB", 50.0, 0.0);
     let (display, address) = answer_at(&index.load(), 0.0, 0.0);
@@ -91,7 +91,7 @@ fn of_two_areas_holding_the_point_at_a_rank_the_one_the_walk_does_not_accept_sho
         .boundary("Leinster", 5, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("County Dublin", 6, 0, (-10_000.0, -20_000.0, 30_000.0, 20_000.0))
         .boundary("Dublin 4", 15, 11, (-1000.0, -3000.0, 5000.0, 3000.0))
-        .boundary("Dublin", 7, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Dublin", 7, 1, (-5000.0, -5000.0, 5000.0, 5000.0)).rank(16)
         .boundary("Pembroke West C ED", 9, 0, (-500.0, -500.0, 500.0, 500.0))
         .street("Mespil Road", &[(0.0, -200.0), (0.0, 200.0)])
         .address("40", 10.0, 0.0);
@@ -107,7 +107,7 @@ fn of_two_areas_holding_the_point_at_a_rank_the_one_the_walk_does_not_accept_sho
     index
         .boundary("Northern Ireland", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("County Antrim", 15, 10, (-30_000.0, -30_000.0, 30_000.0, 30_000.0))
-        .boundary("Belfast City District", 7, 1, (-3000.0, -3000.0, 3000.0, 3000.0))
+        .boundary("Belfast City District", 7, 1, (-3000.0, -3000.0, 3000.0, 3000.0)).rank(16)
         .boundary("County Borough of Belfast", 15, 1, (-2500.0, -2000.0, 4300.0, 3500.0))
         .street("Donegall Square North", &[(0.0, -100.0), (0.0, 100.0)]);
     let (display, address) = answer_at(&index.load(), 0.0, 0.0);
@@ -193,7 +193,7 @@ fn a_rank_whose_place_nodes_all_fail_the_fuzzy_area_shows_the_farthest() {
         .boundary("Pennsylvania", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("Allegheny County", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
         .boundary("West Deer Township", 8, 2, (-6000.0, -6000.0, 6000.0, 6000.0))
-        .place("Bairdford", 2, 1500.0, 0.0)
+        .place("Bairdford", 2, 1500.0, 0.0).promoted()
         .place("Curtisville", 4, -800.0, 0.0)
         .street("Kaufman Road", &[(0.0, -200.0), (0.0, 200.0)])
         .address("141", 10.0, 0.0)
@@ -250,8 +250,8 @@ fn the_farthest_node_shows_only_at_a_rank_where_the_walk_accepts_none() {
     index
         .boundary("Nederland", 3, 0, (-50_000.0, -50_000.0, 50_000.0, 50_000.0))
         .boundary("Zuid-Holland", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
-        .boundary("Den Haag", 8, 0, (-10_000.0, -10_000.0, 10_000.0, 10_000.0))
-        .boundary("Den Haag", 10, 0, (-8000.0, -8000.0, 8000.0, 8000.0))
+        .boundary("Den Haag", 8, 0, (-10_000.0, -10_000.0, 10_000.0, 10_000.0)).rank(14)
+        .boundary("Den Haag", 10, 0, (-8000.0, -8000.0, 8000.0, 8000.0)).rank(16)
         .boundary("Laak", 15, 4, (-2000.0, -2000.0, 2000.0, 2000.0))
         .place("Binckhorst", 6, 900.0, 0.0)
         .place("Laakkwartier-Oost", 5, -220.0, 0.0)
@@ -277,7 +277,7 @@ fn a_house_s_addr_city_takes_its_rank_from_the_farthest_node() {
             .boundary("Sachsen", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
             .boundary("Sächsische Schweiz-Osterzgebirge", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
             .boundary("Wilsdruff", 8, 2, (-6000.0, -6000.0, 6000.0, 6000.0))
-            .place("Kaufbach", 2, 1800.0, 0.0)
+            .place("Kaufbach", 2, 1800.0, 0.0).promoted()
             .place("Kesselsdorf", 3, -400.0, 0.0)
             .place("Oberhermsdorf", 3, -700.0, 100.0)
             .place("Braunsdorf", 3, -1300.0, -100.0)
@@ -326,9 +326,9 @@ fn a_node_outside_its_boundary_or_its_fuzzy_area_s_reach_or_at_a_rank_an_area_ho
         let mut index = country("United States", b"US");
         index
             .boundary("California", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
-            .boundary("San Francisco", 6, 1, (-10_000.0, -10_000.0, 10_000.0, 10_000.0));
+            .boundary("San Francisco", 6, 1, (-10_000.0, -10_000.0, 10_000.0, 10_000.0)).rank(16);
         if south_of_market {
-            index.boundary("South of Market", 15, 5, (-300.0, -300.0, 2000.0, 2000.0)).of_way();
+            index.boundary("South of Market", 15, 5, (-300.0, -300.0, 2000.0, 2000.0));
         }
         index
             .place("Mission", 3, 1500.0, 0.0)
@@ -378,8 +378,8 @@ fn a_boundary_repeating_the_outline_of_the_one_before_it_holds_no_rank() {
     index
         .boundary("Brussels-Capital", 4, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
         .boundary("Brussels", 8, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
-        .boundary("Bruxelles - Brussel", 9, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
-        .place("Laeken", 1, 1500.0, 0.0)
+        .boundary("Bruxelles - Brussel", 9, 1, (-5000.0, -5000.0, 5000.0, 5000.0)).rank(0)
+        .place("Laeken", 1, 1500.0, 0.0).promoted()
         .street("Rue Melsens - Melsensstraat", &[(0.0, -100.0), (0.0, 100.0)]);
     let (display, address) = answer_at(&index.load(), 0.0, 0.0);
     assert_eq!(display, "Rue Melsens - Melsensstraat, Laeken, Brussels, Brussels-Capital, Belgium");
@@ -398,7 +398,7 @@ fn the_walk_weighs_the_distance_of_a_rank_16_area_by_its_search_rank() {
     index
         .boundary("Northern Ireland", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("County Antrim", 15, 10, (-30_000.0, -30_000.0, 30_000.0, 30_000.0))
-        .boundary("Belfast City District", 7, 1, (-3000.0, -3000.0, 5000.0, 3000.0))
+        .boundary("Belfast City District", 7, 1, (-3000.0, -3000.0, 5000.0, 3000.0)).rank(16)
         .boundary("County Borough of Belfast", 15, 1, (-3000.0, -2000.0, 6000.0, 3500.0))
         .street("Malone Road", &[(0.0, -100.0), (0.0, 100.0)]);
     let (display, address) = answer_at(&index.load(), 0.0, 0.0);
@@ -494,7 +494,7 @@ fn a_linked_boundary_s_centre_is_the_place_node_it_links() {
     index
         .boundary("Northern Ireland", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
         .boundary("County Antrim", 15, 10, (-30_000.0, -30_000.0, 30_000.0, 30_000.0))
-        .boundary("Belfast City District", 7, 1, (-3000.0, -3000.0, 9000.0, 3000.0))
+        .boundary("Belfast City District", 7, 1, (-3000.0, -3000.0, 9000.0, 3000.0)).rank(16)
         .linked_place("Belfast", 0, 100.0, 0.0)
         .boundary("County Borough of Belfast", 15, 1, (-2500.0, -2000.0, 4300.0, 3500.0))
         .street("Donegall Square North", &[(0.0, -100.0), (0.0, 100.0)]);

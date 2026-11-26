@@ -8,9 +8,7 @@ use crate::varint;
 pub const POI_BIT: u32 = 1 << 31;
 
 pub const PLACE_NODE_TYPES: [&str; 7] = ["city", "town", "village", "suburb", "hamlet", "neighbourhood", "quarter"];
-pub use query_server::PLACE_FLAG_LABEL_OF;
-/// PoiRecord.flags bit: a secondary ring of a multi-ring POI (not searchable on its own).
-pub const POI_FLAG_SECONDARY_RING: u8 = 0x08;
+pub use query_server::{PLACE_FLAG_LABEL_OF, POI_FLAG_SECONDARY_RING};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {

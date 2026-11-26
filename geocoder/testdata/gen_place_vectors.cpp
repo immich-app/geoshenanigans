@@ -34,22 +34,24 @@ static void row(const char* what, const std::vector<LogicalPlace>& rows) {
     blocks.insert(blocks.end(), footer.begin(), footer.end());
     std::string logical;
     for (const LogicalPlace& p : rows) {
-        char b[96];
-        snprintf(b, sizeof b, "%s%08x,%08x,%u,%u,%u,%u,%u", logical.empty() ? "" : ";", place_files::bits_of(p.node.lat),
+        char b[112];
+        snprintf(b, sizeof b, "%s%08x,%08x,%u,%u,%u,%u,%u,%u", logical.empty() ? "" : ";", place_files::bits_of(p.node.lat),
                  place_files::bits_of(p.node.lng), p.node.name_id, unsigned(p.node.place_type), unsigned(p.node._pad1),
-                 p.node.parent_poly_id, p.cell_key);
+                 p.node.parent_poly_id, p.cell_key, unsigned(p.node.rank_address));
         logical += b;
     }
     printf("%s\t%s\t%s\t%s\t%s\n", what, logical.c_str(), hex(cells).c_str(), hex(blocks).c_str(), hex(hidden).c_str());
 }
 
-static LogicalPlace visible(float lat, float lng, uint32_t name, uint8_t type, uint32_t key) {
+// A visible node of its type's rank, two more where `promoted`.
+static LogicalPlace visible(float lat, float lng, uint32_t name, uint8_t type, uint32_t key, bool promoted = false) {
     LogicalPlace p;
     p.node = PlaceNode{};
     p.node.lat = lat;
     p.node.lng = lng;
     p.node.name_id = name;
     p.node.place_type = type;
+    p.node.rank_address = uint8_t(place_node_rank(type) + (promoted ? PLACE_NODE_PROMOTION : 0));
     p.cell_key = key;
     return p;
 }
@@ -57,6 +59,7 @@ static LogicalPlace visible(float lat, float lng, uint32_t name, uint8_t type, u
 static LogicalPlace hidden(float lat, float lng, uint32_t name, uint8_t type, uint32_t parent) {
     LogicalPlace p = visible(lat, lng, name, type, NO_DATA);
     p.node._pad1 = PLACE_FLAG_HIDDEN | (parent == NO_DATA ? 0 : PLACE_FLAG_LABEL_OF);
+    p.node.rank_address = 0;
     p.node.parent_poly_id = parent;
     return p;
 }
@@ -64,14 +67,20 @@ static LogicalPlace hidden(float lat, float lng, uint32_t name, uint8_t type, ui
 int main() {
     printf("# Place files as the builder's encoder writes them (builder/src/place_files.h): what the case\n");
     printf("# covers, the logical rows (lat and lng f32 bits in hex, name_id, place_type, flags,\n");
-    printf("# parent_poly_id, cell key; ...), and place_cells.bin, place_nodes.bin and place_hidden.bin as\n");
-    printf("# hex. The builder's tests encode the rows to the files and decode them back; the server's read\n");
-    printf("# the rows from the files and its test encoder (place_files.rs) must write the same files.\n");
+    printf("# parent_poly_id, cell key, rank_address; ...), and place_cells.bin, place_nodes.bin and\n");
+    printf("# place_hidden.bin as hex. The builder's tests encode the rows to the files and decode them\n");
+    printf("# back; the server's read the rows from the files and its test encoder (place_files.rs) must\n");
+    printf("# write the same files.\n");
     printf("# Regenerate with geocoder/testdata/gen_place_vectors.cpp.\n");
     printf("case\trows\tcells\tnodes\thidden\n");
     row("no nodes", {});
     row("one visible node", {visible(52.37f, 4.89f, 7, 2, 0x47c60000)});
     row("one hidden label", {hidden(52.37f, 4.89f, 7, 0, 12)});
+    row("promoted nodes of every promotable type",
+        {visible(52.37f, 4.89f, 3, 0, 0x47c60000, true), visible(52.371f, 4.891f, 4, 1, 0x47c60000, true),
+         visible(52.372f, 4.892f, 5, 2, 0x47c60000, true), visible(52.373f, 4.893f, 6, 3, 0x47c60000, true),
+         visible(52.374f, 4.894f, 7, 4, 0x47c60000, true), visible(52.375f, 4.895f, 8, 6, 0x47c60000, true),
+         visible(52.376f, 4.896f, 9, 5, 0x47c60000), visible(52.377f, 4.897f, 10, 1, 0x47c60000)});
     row("two cells, a label and a hidden node",
         {visible(52.37f, 4.89f, 3, 1, 0x47c60000), visible(52.38f, 4.90f, 900, 2, 0x47c60000),
          visible(-33.87f, 151.21f, 0, 6, 0x6b120000), hidden(52.37f, 4.89f, 12, 0, 5), hidden(0.0f, -0.0f, 1, 4, NO_DATA)});
@@ -91,7 +100,8 @@ int main() {
             const uint32_t name = uint32_t(rng() % 4000000);
             const uint32_t shift = uint32_t(rng() % 22);
             const uint8_t type = uint8_t(rng() % 7);
-            rows.push_back(visible(lat, lng, name >> shift, type, key));
+            const bool promoted = rng() % 4 == 0 && place_node_promotable(place_node_rank(type));
+            rows.push_back(visible(lat, lng, name >> shift, type, key, promoted));
         }
         for (size_t i = 0; i < n / 7; i++) {
             const uint32_t name = uint32_t(rng() % (1u << 28));

@@ -1305,6 +1305,7 @@ static constexpr MergedFile MERGED_FILES[] = {
     {PatchFileId::ARC_VERTICES, 1},
     {PatchFileId::ADMIN_POLYGONS, ADMIN_POLYGON_STRIDE},
     {PatchFileId::ADMIN_RINGS, 1},
+    {PatchFileId::ADMIN_OWN_NAMES, ADMIN_OWN_NAME_STRIDE},
 };
 
 static int run(int argc, char* argv[]) {
@@ -2211,7 +2212,30 @@ static int run(int argc, char* argv[]) {
         log_rss("admin");
     });
 
+    // Group 8: the own names beside the admin polygons, records of a slot and
+    // a string: a record whose string only moved MATCHes, one of a new
+    // polygon or name is an INSERT. No id remap: no file holds their rows.
+    FileMergeResult res_own;
+    std::thread t_own([&]() {
+        double gs = now_ms();
+        const char* name = patch_file_names[static_cast<uint32_t>(PatchFileId::ADMIN_OWN_NAMES)];
+        auto old_data = mmap_file_rw(old_dir + "/" + name);
+        auto new_data = mmap_file(new_dir + "/" + name);
+        const size_t stride = ADMIN_OWN_NAME_STRIDE;
+        const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
+        if (old_data.size > 0) remap_string_fields(old_data.data, old_data.size, PatchFileId::ADMIN_OWN_NAMES, stride, str_remap);
+        auto seq = unchanged || (old_data.size == 0 && new_data.size == 0)
+                       ? match_all(old_data.size / stride)
+                       : build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, stride);
+        res_own = {PatchFileId::ADMIN_OWN_NAMES, name, stride, old_data.size, new_data.size, std::move(seq), {}};
+        log_merge(res_own);
+        if (old_data.data) unmap_file(old_data);
+        if (new_data.data) unmap_file(new_data);
+        log_time("  group:own names", gs);
+    });
+
     t_addr.join(); t_street.join(); t_interp.join(); t_poi.join(); t_place.join(); t_postcode.join(); t_grid.join(); t_postal.join(); t_cells.join(); t_admin.join();
+    t_own.join();
     log_time("All merge sequences + cell changes built", merge_start);
     // str_remap is kept alive for emit_sparse_delta below — it consumes
     // the map directly to decide which addr_postcodes / way_postcodes
@@ -2302,19 +2326,21 @@ static int run(int argc, char* argv[]) {
     // dirs hold no admin polygon) goes as a full replacement of nothing, 36
     // bytes against an empty merge's 56, as emit_raw sent it: COPY_OLD never
     // stands for an empty file (try_emit_copy_old).
-    for (size_t f = 0; f < res_slots.size(); f++)
-        for (FileMergeResult* r : {&res_slots[f], &res_blocks[f]}) {
-            struct stat st;
-            if (stat((new_dir + "/" + r->name).c_str(), &st) == 0) {
-                if (st.st_size == 0) {
-                    write_full_replacement_head(patch, static_cast<uint32_t>(r->id), r->old_size, 0);
-                    std::cerr << "  " << r->name << ": full replace 0 bytes" << std::endl;
-                } else {
-                    serialize_merge(patch, *r, old_dir, new_dir, patcher_strings, offset_fixup_limits);
-                }
+    std::vector<FileMergeResult*> admin_files;
+    for (size_t f = 0; f < res_slots.size(); f++) admin_files.insert(admin_files.end(), {&res_slots[f], &res_blocks[f]});
+    admin_files.push_back(&res_own);  // the own names beside them, the same way
+    for (FileMergeResult* r : admin_files) {
+        struct stat st;
+        if (stat((new_dir + "/" + r->name).c_str(), &st) == 0) {
+            if (st.st_size == 0) {
+                write_full_replacement_head(patch, static_cast<uint32_t>(r->id), r->old_size, 0);
+                std::cerr << "  " << r->name << ": full replace 0 bytes" << std::endl;
+            } else {
+                serialize_merge(patch, *r, old_dir, new_dir, patcher_strings, offset_fixup_limits);
             }
-            std::vector<char>().swap(r->seq.data);
         }
+        std::vector<char>().swap(r->seq.data);
+    }
     malloc_trim(0); // return freed heap to OS
     log_rss("serialize");
     // The record families' logical files are read no more: removed beside
