@@ -1,6 +1,6 @@
 {
   "description": "The marine areas every nightly build takes (build-index --marine): a version Update Marine Areas (.github/workflows/geocoder-marine.yml) published under geocoder/marine/<version>/ in the bucket, by the sha256 of its marine_areas.bin.zst (its run's summary and manifest.json give the three values). null: the water dirs hold OSM's water alone.",
-  "version": null,
-  "path": null,
-  "sha256": null
+  "version": "20261126",
+  "path": "marine/20261126/marine_areas.bin.zst",
+  "sha256": "81df97b8d2f8eebf224b1f0606ac42fd14fd69f65afca2c3570af396fef915df"
 }
