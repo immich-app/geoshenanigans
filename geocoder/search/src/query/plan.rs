@@ -9,12 +9,14 @@ use crate::index::terms::Term;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TermId(pub u32);
 
-/// What a lookup reads of an entity: the words of its names, or of its address (Nominatim's
-/// `name_vector` and `nameaddress_vector`).
+/// What a lookup reads of an entity: the words of its names, of its address (Nominatim's
+/// `name_vector` and `nameaddress_vector`), or of both together, as the postcode search reads a
+/// postcode's parent (db_searches/postcode_search.py:83-88).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Field {
     Name,
     Address,
+    NameAndAddress,
 }
 
 /// How a lookup's terms match (search/db_search_lookups.py).
