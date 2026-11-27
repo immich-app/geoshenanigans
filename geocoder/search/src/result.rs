@@ -11,7 +11,7 @@ pub enum ResultKind {
     Poi,
     /// A way of a street.
     Street,
-    /// An address point found by its number on its street.
+    /// An address point found by its number: on its street, or on its place.
     House,
     /// A number of an OSM interpolation line.
     Interpolation,
@@ -69,8 +69,8 @@ impl ResultKind {
 /// What a result is, by the records it is read from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Target {
-    /// An entity found by its names or its own number: a place, area, POI, named address or
-    /// postcode.
+    /// An entity found by its names or its own number: a place, area, POI, address point that is
+    /// an entity (one numbered on a place among them) or postcode.
     Entity(EntityRef),
     /// Way `way` (street_ways.bin) of street `street`.
     Way { street: EntityRef, way: u32 },

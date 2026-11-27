@@ -16,7 +16,8 @@ pub enum EntityKind {
     /// A street of the index's street table: named ways of one name, class and type, rank,
     /// area and postcode, whose words it holds once.
     Street = 3,
-    /// A named address (addr_points.bin).
+    /// An address point (addr_points.bin) that is found by its own words: one with a name, or one
+    /// numbered on a place (addr:place) rather than a street, whose number is a name of its own.
     Address = 4,
     /// A postcode centroid (postcode_centroids.bin).
     Postcode = 5,
