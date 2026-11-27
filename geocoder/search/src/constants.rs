@@ -151,3 +151,7 @@ pub const MAX_PENDING_CANDIDATES: usize = 4 * MAX_CONTEXT_CHECKS;
 /// than len / DIFFLIB_POPULAR_PER + 1 of its positions is popular and starts no match.
 pub const DIFFLIB_AUTOJUNK_MIN_LEN: usize = 200;
 pub const DIFFLIB_POPULAR_PER: usize = 100;
+/// A house number with a run of this many letters keeps its spaces as they are ("12 abcd").
+pub const HOUSENUMBER_NAMED_PART_LETTERS: usize = 4;
+/// A house number with more digit-letter boundaries than this gets no optional spaces.
+pub const HOUSENUMBER_MAX_OPTIONAL_SPACES: usize = 4;

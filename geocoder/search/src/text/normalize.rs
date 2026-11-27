@@ -292,6 +292,13 @@ pub fn normalized(s: &str) -> String {
 /// are single. Other scripts stay as they are written (Nominatim spells every script in Latin
 /// letters).
 pub fn transliterated(norm: &str) -> String {
+    spaced_token(norm).trim_matches(' ').to_string()
+}
+
+/// The token as Nominatim's rules leave it before Python strips it: with one space at either end
+/// where the text had space or dropped characters there. House numbers keep it (Nominatim's
+/// house-number analysis does not strip).
+pub(super) fn spaced_token(norm: &str) -> String {
     let mut out = String::with_capacity(norm.len());
     let mut space = false;
     let mut buf = [0u8; 4];
@@ -310,12 +317,15 @@ pub fn transliterated(norm: &str) -> String {
             push(&mut out, c.encode_utf8(&mut buf), &mut space);
         }
     }
+    if space {
+        out.push(' ');
+    }
     out.nfc().collect()
 }
 
 /// Appends `s` to a token, after one space when spaces came before it.
 fn push(out: &mut String, s: &str, space: &mut bool) {
-    if *space && !out.is_empty() {
+    if *space {
         out.push(' ');
     }
     *space = false;
