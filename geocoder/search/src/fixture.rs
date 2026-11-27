@@ -296,7 +296,7 @@ impl Geo {
         admin.sort_unstable();
         admin.dedup();
         let (admin_cells, admin_entries) = cell_pairs::write_pairs(admin, cell_pairs::ADMIN);
-        let (places, _) = place_files::encode(&self.nodes, DEFAULT_ADMIN_CELL_LEVEL);
+        let (places, place_rows) = place_files::encode(&self.nodes, DEFAULT_ADMIN_CELL_LEVEL);
         let end = self.strings.len();
         let tiers: Vec<String> = (0..STR_TIER_COUNT)
             .map(|t| format!("{{\"start\": {}, \"end\": {end}}}", if t == 0 { 0 } else { end }))
@@ -347,7 +347,10 @@ impl Geo {
         for (&side, set) in &self.sides {
             let mut values = vec![NO_DATA; self.records_beside(side)];
             for &(record, value) in set {
-                values[record as usize] = value;
+                // The place files order their nodes by cell (place_files::encode); every other
+                // file keeps its records in the order they were added.
+                let row = if side == Side::PlaceTags { place_rows[record as usize] } else { record };
+                values[row as usize] = value;
             }
             files.push((side.file(), side_blocks::encode(&values)));
         }
@@ -545,9 +548,34 @@ mod tests {
             let offset = side.get(record).unwrap();
             (offset != NO_DATA).then(|| TagBundle::parse(geo.get_string(offset).into_owned()).unwrap().get(key).unwrap().to_string())
         };
-        assert_eq!(tag(PLACE_TAGS_FILE, city, "name:it").as_deref(), Some("Monaco di Baviera"));
-        assert_eq!(tag(PLACE_TAGS_FILE, 1, "name"), None);
+        let place_row = |name: &str| (0..geo.place_node_count()).find(|&row| geo.get_string(geo.place_node_record(row).unwrap().name_id) == name).unwrap();
+        assert_eq!(tag(PLACE_TAGS_FILE, place_row("Munich"), "name:it").as_deref(), Some("Monaco di Baviera"));
+        assert_eq!(tag(PLACE_TAGS_FILE, place_row("Garching"), "name"), None);
         assert_eq!(tag(ADMIN_TAGS_FILE, land, "ISO3166-2").as_deref(), Some("DE-BY"));
         assert_eq!(tag(POI_TAGS_FILE, cafe, "amenity").as_deref(), Some("cafe"));
+    }
+
+    #[test]
+    fn a_place_tag_bundle_sits_beside_its_places_row() {
+        // A hidden node goes after the visible ones, so the first place added is the last row.
+        let mut g = Geo::default();
+        let land = g.boundary("Bayern", 4, [47.0, 9.0, 50.0, 14.0]);
+        let label = g.place("Bayern label", 3, 48.9, 11.4);
+        g.claim(land, label);
+        let city = g.place("Munich", 0, 48.137, 11.575);
+        g.place_tags(label, &[("name", "Bayern label")]);
+        g.place_tags(city, &[("name", "Munich")]);
+        let dir = TempDir::new("fixture-place-rows");
+
+        let geo = g.load(&dir.0);
+
+        let side = SideBlocks::open(FileBytes::Owned(std::fs::read(dir.0.join(PLACE_TAGS_FILE)).unwrap()), PLACE_TAGS_FILE).unwrap();
+        let rows: Vec<(String, String)> = (0..geo.place_node_count())
+            .map(|row| {
+                let bundle = TagBundle::parse(geo.get_string(side.get(row).unwrap()).into_owned()).unwrap();
+                (geo.get_string(geo.place_node_record(row).unwrap().name_id).into_owned(), bundle.get("name").unwrap().to_string())
+            })
+            .collect();
+        assert_eq!(rows, [("Munich".into(), "Munich".into()), ("Bayern label".into(), "Bayern label".into())]);
     }
 }
