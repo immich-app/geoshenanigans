@@ -191,6 +191,11 @@ impl Geo {
         self.side(Side::WayParents, way, poly);
     }
 
+    /// Boundary `poly` as the country `code` (ISO 3166-1 alpha-2, either case).
+    pub fn country(&mut self, poly: u32, code: [u8; 2]) {
+        self.polygons[poly as usize].0.country_code = packed_country(code);
+    }
+
     /// The postcode of street `way`.
     pub fn way_postcode(&mut self, way: u32, postcode: &str) {
         let postcode_id = self.string(postcode);
@@ -233,10 +238,10 @@ impl Geo {
         self.side(Side::InterpPostcodes, interp, postcode_id);
     }
 
-    /// A postcode centroid of `country` (ISO 3166-1 alpha-2, lower case) at (`lat`, `lng`).
+    /// A postcode centroid of `country` (ISO 3166-1 alpha-2, either case) at (`lat`, `lng`).
     pub fn postcode_centroid(&mut self, postcode: &str, country: [u8; 2], lat: f32, lng: f32) {
         let postcode_id = self.string(postcode);
-        self.centroids.push(postcode_files::Centroid { lat, lng, postcode_id, country_code: u16::from_be_bytes(country) });
+        self.centroids.push(postcode_files::Centroid { lat, lng, postcode_id, country_code: packed_country(country) });
     }
 
     /// The tags of place node `node`, as the bundle place_tags.bin points at.
@@ -446,6 +451,11 @@ pub fn build_search(geo: &Index, out: &Path, extras: Option<&Path>) {
     build_all(geo, &held_subs(geo, SUB_INDEXES), out, &opts, || Ok(meta)).unwrap();
 }
 
+/// A country code as the builder packs it: upper case, the first letter the high byte.
+fn packed_country(code: [u8; 2]) -> u16 {
+    u16::from_be_bytes(code.map(|b| b.to_ascii_uppercase()))
+}
+
 /// A ring of (lat, lng) degrees on the e7 grid.
 fn e7_ring(ring: &[(f32, f32)]) -> Vec<PointE7> {
     ring.iter().map(|&(lat, lng)| arc_fixture::e7(lat as f64, lng as f64)).collect()
@@ -526,7 +536,21 @@ mod tests {
         let centroids = geo.postcode_centroids.as_ref().unwrap();
         let mut rows = Vec::new();
         centroids.rows_of(0, 1, |row, c| rows.push((row, geo.get_string(c.postcode_id).into_owned(), c.country_code.to_be_bytes())));
-        assert_eq!((centroids.rows(), rows), (1, vec![(0, "78746".to_string(), *b"us")]));
+        assert_eq!((centroids.rows(), rows), (1, vec![(0, "78746".to_string(), *b"US")]));
+    }
+
+    #[test]
+    fn a_postcode_centroid_answers_a_reverse_lookup_in_its_country() {
+        let mut g = Geo::default();
+        let us = g.boundary("United States", 2, [25.0, -106.0, 36.0, -93.0]);
+        g.country(us, *b"us");
+        g.postcode_centroid("78746", *b"us", 30.3, -97.8);
+        let dir = TempDir::new("fixture-centroid-country");
+
+        let geo = g.load(&dir.0);
+
+        let answer = serde_json::to_string(&geo.query(30.3, -97.8)).unwrap();
+        assert!(answer.contains(r#""postcode":"78746""#), "{answer}");
     }
 
     #[test]
