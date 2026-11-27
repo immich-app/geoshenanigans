@@ -179,3 +179,32 @@ pub const POI_TAGS_FILE: &str = "poi_tags.bin";
 // ---- entities (index/entities.rs)
 /// Bits of an entity's record in an index row; the kind takes the 3 above them.
 pub const ENTITY_RECORD_BITS: u32 = 29;
+
+// ---- text: Nominatim's tokenizer and the Python it measures with
+/// difflib's autojunk: in a second sequence of at least this many elements, an element on more
+/// than len / DIFFLIB_POPULAR_PER + 1 of its positions is popular and starts no match.
+pub const DIFFLIB_AUTOJUNK_MIN_LEN: usize = 200;
+pub const DIFFLIB_POPULAR_PER: usize = 100;
+/// A house number with a run of this many letters keeps its spaces as they are ("12 abcd").
+pub const HOUSENUMBER_NAMED_PART_LETTERS: usize = 4;
+/// A house number with more digit-letter boundaries than this gets no optional spaces.
+pub const HOUSENUMBER_MAX_OPTIONAL_SPACES: usize = 4;
+/// The languages whose name variants Nominatim makes (its tag-analyzer-by-language whitelist).
+pub const NAME_LANGUAGES: [&str; 30] = [
+    "bg", "ca", "cs", "da", "de", "el", "en", "es", "et", "eu", "fi", "fr", "gl", "hu", "it", "ja", "mg", "ms", "nl", "no",
+    "pl", "pt", "ro", "ru", "sk", "sl", "sv", "tr", "uk", "vi",
+];
+/// Name key suffixes that are no language: the name takes its country's languages.
+pub const NAME_SUFFIXES_WITHOUT_LANGUAGE: [&str; 2] = ["left", "right"];
+/// A name whose rules would make more variants than this keeps only itself.
+pub const VARIANT_MAX_PARTIALS: usize = 128;
+/// A house number with a run of this many characters between list delimiters is a name.
+pub const HOUSENUMBER_AS_NAME_RUN: usize = 15;
+/// A house number with a list part of this many characters and no digit is a name.
+pub const HOUSENUMBER_AS_NAME_WORD: usize = 3;
+/// An interpolated house-number range of fewer numbers than this becomes each of them.
+pub const INTERPOLATION_EXPAND_BELOW: u128 = 10;
+/// What stands between the names of a multilingual `name` ("Bruxelles - Brussel").
+pub const MULTILINGUAL_DELIMITERS: [char; 3] = ['/', '-', ' '];
+/// A ref longer than this is no name.
+pub const REF_MAX_CHARS: usize = 40;

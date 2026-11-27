@@ -1,0 +1,1001 @@
+# CPython 3.14.10 difflib.SequenceMatcher(None, a, b).get_opcodes(), seed 7
+ab aa ab a aaabbaaa ba aa   a  baaa abba a b  aa   aba  a a ab  bbb bbbaa aa b bb bb aa bababba a  bb b b baabb  aa  b   bb b babba abaaba abbbaabb bab b bb baaaaaa aab abbaab b  ba      ab  bbbbab baaaabaab aaa a ab aaa ba bb bbaabbbbbaaa b bb a aa ba  a b a b baba   b a aab aa bb	ab aa ab a aaabbaaa ba aa   a  baaa abba a b  aa   aba  a a ab  bbb bbbaa aa b bb bb aa bababba a  bb b b baabb  aa  b   bb b babba abaaba abbbaabb bab b bb baaaaaa aab abbaab b  ba      ab  bbbbab baaaabaab aaa a ab aaa ba bb bbaabbbbbaaa b bb a aa ba  a b a b baba   b a aab aa bb	e0,282,0,282
+4qm-öw2wxfogo4mvn4	4qç-ö2wwxfogmo4mévn4	e0,2,0,2 r2,3,2,3 e3,5,3,5 i5,5,5,6 e5,6,6,7 d6,7,7,7 e7,12,7,12 i12,12,12,13 e12,15,13,16 i15,15,16,17 e15,18,17,20
+ßvfz3zfkkibjä3éjüö4çwj99ibaé	kibjäéjüö4çwj99ibavfz3zfs	d0,8,0,0 e8,13,0,5 d13,14,5,5 e14,27,5,18 r27,28,18,25
+uq80idw3çä706i8j76b2löajlj4üh9duñ7794g	pmr	r0,38,0,3
+g62	6ug	i0,0,0,2 e0,1,2,3 d1,3,3,3
+q9m2i0hz2ueçp1ençthjéçxjqi3ogz5kço	i3ogz5kçoq9m2i0hz2uefp1ençmhjéçxjq	i0,0,0,9 e0,11,9,20 r11,12,20,21 e12,17,21,26 r17,18,26,27 e18,25,27,34 d25,34,34,34
+bv932byv7üs6ehogfqrclri1	v7rs6jhogfqrclri1bv932lby	d0,7,0,0 e7,9,0,2 r9,10,2,3 e10,12,3,5 r12,13,5,6 e13,24,6,17 i24,24,17,25
+erbßfqföoeqh3av90rüic7phkqdl	erbßfqföoeqh3a69nrüic7phkqdl	e0,14,0,14 r14,15,14,15 e15,16,15,16 r16,17,16,17 e17,28,17,28
+rwbqcab69m64	rwbqcab6m96é4	e0,8,0,8 i8,8,8,9 e8,9,9,10 d9,10,10,10 e10,11,10,11 i11,11,11,12 e11,12,12,13
+6t-novmßizwdiaeßq1kdfçy6çs	dvaeaq1kdfçy6çs63-nomßizw	r0,5,0,1 e5,6,1,2 d6,13,2,2 e13,15,2,4 r15,16,4,5 e16,26,5,15 i26,26,15,25
+ctnwlavyf4r6émp6	ctnwlavyf4r6émp6	e0,16,0,16
+fjzäczbttßofä7jçö	fjzäccbttßofä7jçö	e0,5,0,5 r5,6,5,6 e6,17,6,17
+ß1-6i76 bñäñ-éofbcißxgy29dßbß8ñp5	ß1-6i76 bñäñ-éofcbißxgy29dßbß8ñp8e5	e0,16,0,16 i16,16,16,17 e16,17,17,18 d17,18,18,18 e18,32,18,32 i32,32,32,34 e32,33,34,35
+qpnoé	ye4	r0,5,0,3
+cüßémeöjvqé-tü ia4d	qvét-ü ia4dcüßméeñöj	r0,3,0,2 e3,4,2,3 r4,11,3,4 e11,12,4,5 d12,13,5,5 e13,19,5,11 i19,19,11,20
+mtf4bs3e62rynneäfj7qxiöß6rhxo55zbka5	mtf4bs3e60rynneäfj7qxaiößurhxo55zbka5	e0,9,0,9 r9,10,9,10 e10,21,10,21 i21,21,21,22 e21,24,22,25 r24,25,25,26 e25,36,26,37
+vzhmasqxezyäex1rdrgdç	vzhmasqxzyäex1rdrgdç	e0,8,0,8 d8,9,8,8 e9,21,8,20
+6umx1bßz99nfd02üiés5d9ik40vs	6um1xbßz9nfé02üié5sdik40vs	e0,3,0,3 i3,3,3,4 e3,4,4,5 d4,5,5,5 e5,9,5,9 d9,10,9,9 e10,12,9,11 r12,13,11,12 e13,18,12,17 i18,18,17,18 e18,19,18,19 d19,20,19,19 e20,21,19,20 d21,22,20,20 e22,28,20,26
+en659o2v21i	env659o2v21i	e0,2,0,2 i2,2,2,3 e2,11,3,12
+fupxq mb0y07nyrvd5r xiñ67ßnfrpyzé21t	iñ67ßnfrypzé2z1ftupxq mbc0y07nyrvd5r x	i0,0,0,6 e0,1,6,7 i1,1,7,17 e1,8,17,24 i8,8,24,25 e8,21,25,38 d21,36,38,38
+aaaa  a   ba aaaa a  ba b  b aaab  abba aa bbbb ab a aab  baaab  baba bbaba b bb baab  aababaababba b aabb a abaaa aba aabb b aaabaa   bab  bbbbaaaababba abbbbaa bab babb ba ba bababaaba a bbbb ab   bbba   aaaab bbbbbabaa b a abbbb a abaaba ab  babaab aaabb baaabb  a   abbb bbb babaaaaab ababba  a a baaababbabaaaa  aab ab b aa    baabbaaaba   aabb ba baaab babab  a  a ab bbb bbab  bbbab ab baababa	 a bbbb ab   bbba   aaaab bbbbbabaa b a abbbb a abaaba ab  babaab aabb baaabb  a   abbb bbb babaaaaab ababba  a a baaababbabaaaa  aab ab b aa    baabbaaaba   aabb ba baaab babab  a  a ab bbb bbab  bbbab ab baababaaaaa  a   ba aaaa a  ba b  b aaab  abba aa bbbb ab a aab  baaab  baba bbaba b bb baab  aababaababba b aabb a abaaa aba aabb b aaabaa   bab  bbbbaaaababba abbbbaa bab babb ba ba babaababa	r0,400,0,399
+d	7	r0,1,0,1
+egy5mtic4ud	eyg5mtic4	e0,1,0,1 i1,1,1,2 e1,2,2,3 d2,3,3,3 e3,9,3,9 d9,11,9,9
+4l ncz7kywhjp	mc9ñcçuhyö39ß	r0,4,0,1 e4,5,1,2 r5,8,2,8 e8,9,8,9 r9,13,9,13
+é0täp1yçx262lbaü53p2	2é0itäpy1çx262x6laü53p	i0,0,0,1 e0,2,1,3 i2,2,3,4 e2,5,4,7 i5,5,7,8 e5,6,8,9 d6,7,9,9 e7,12,9,14 i12,12,14,16 e12,13,16,17 d13,14,17,17 e14,19,17,22 d19,20,22,22
+cßi	ßii-	d0,1,0,0 e1,3,0,2 i3,3,2,4
+skñoewüqkuür3jq64näqü6puxcmlzkßr	skñßoewüqkuür3jq6näqü6puxcml9kßr	e0,3,0,3 i3,3,3,4 e3,16,4,17 d16,17,17,17 e17,28,17,28 r28,29,28,29 e29,32,29,32
+ä-gq8ßzxqyx jxvf2olüds7qtßäçuacojs	ä-gi8ßzxqyx jxfv2olüds7qtßäçuacosj	e0,3,0,3 r3,4,3,4 e4,14,4,14 i14,14,14,15 e14,15,15,16 d15,16,16,16 e16,32,16,32 i32,32,32,33 e32,33,33,34 d33,34,34,34
+écbda wtg7w8o0ätäinxü4kiapj2geßjçrzqadé9	éä2ö75pkacd8bzlpkdgaü9çmj0m7öé6éé0ül6t	e0,1,0,1 i1,1,1,9 e1,2,9,10 i2,2,10,12 e2,3,12,13 i3,3,13,17 e3,4,17,18 i4,4,18,19 e4,5,19,20 r5,7,20,37 e7,8,37,38 d8,40,38,38
+tßd48	vdé48	r0,2,0,1 e2,3,1,2 i3,3,2,3 e3,5,3,5
+drß9ñ1ñ7qsénf6akq	kumyvö	d0,15,0,0 e15,16,0,1 r16,17,1,6
+yß-ç8447-ab1o tn	yß-çw8j447-ab1o tn	e0,4,0,4 i4,4,4,5 e4,5,5,6 i5,5,6,7 e5,16,7,18
+ci	äige	r0,1,0,1 e1,2,1,2 i2,2,2,4
+hccßfßßs4gigén	hccßßqfßs4gigén	e0,4,0,4 i4,4,4,6 e4,5,6,7 d5,6,7,7 e6,14,7,15
+dxuö64süb0b17gw4d8 	dauö6s4üb0b17w4gm8s 	e0,1,0,1 r1,2,1,2 e2,5,2,5 i5,5,5,6 e5,6,6,7 d6,7,7,7 e7,13,7,13 d13,14,13,13 e14,16,13,15 r16,17,15,17 e17,18,17,18 i18,18,18,19 e18,19,19,20
+äw6q ksn-o5khßf5-9gßuwgzzf1ébxnt	hßf5-9ßguwgzfz1ébxntäw6q ksn-o5k	i0,0,0,20 e0,12,20,32 d12,32,32,32
+äu7j2ç9uk32-qäoiv3é-p6m	2ç9ukçpqqäoiv3é-p6mä77j	d0,4,0,0 e4,9,0,5 r9,12,5,8 e12,23,8,19 i23,23,19,23
+myjjtt1	myjjtt1	e0,7,0,7
+rny3caz	-o6ßs3	r0,3,0,5 e3,4,5,6 d4,7,6,6
+jq	jp	e0,1,0,1 r1,2,1,2
+a abbbb  abab   abbbba b   a babbaab aa a ba b a b a b bb ba ab a  b abbbbaaabb   b baab b abbaaaa ab   aab  bbb  abbab b bb aba bba bbbbb  a babbaa ba b  a aaa bb a aaabbaab a   a   bab a a b a abbaabb abba baba   aabb  b bbbbb aa b  aa a  ba bbaaa b aba bbb  abbbbb abbbbbb b ba babab ba  aab  b  abbaaaab  a   b a      aaa  b aa aaba abab  bbababab   ab  aab  bbaa b   a	 b bb ba ab a  b abbbbaaabb   b baab b abbaaaa ab   aab  bbb  abbab b bb aba ba bbbbb  a babbaa ba b  a aaa bb a aaabbaab a   a   bab a a b a abbaabb abba baba   aabb  b bbbbb aa b  aa a  ba bbaaa b aba bbb  abbbbb abbbbbb b ba babab ba  aab  b  abbaaaab  a   b a      aaa  b aa aaba abab  bbababab   ab  aab  bbaa b   aa abbbb b abab   abbbba b   a babbaab aa a ba b a b a	r0,373,0,373
+1	n 	r0,1,0,2
+-jfsß953çqdcadaéñüfyttök	ödux 24ñkjhxékß	r0,1,0,9 e1,2,9,10 r2,4,10,14 e4,5,14,15 d5,24,15,15
+4y2r vsrdüéövöajötä1pyyñyöo	4y2r vsrdüqéököajötä1pyyñyöo	e0,10,0,10 i10,10,10,11 e10,12,11,13 r12,13,13,14 e13,27,14,28
+csj jr9ñ5w8f895ymotödñz3nqäay38f8weozä	dñz3nqäay38f8weozäcsj jr9ñ5w8f89y5motö	d0,20,0,0 e20,38,0,18 i38,38,18,38
+mmnmfl-sx  wz7jpc5xgxß3fjuöbwr7öbgcn 5	mmnmfl-sx  wz7jpc1xgxß3fjuöbwr7öbgcn 5	e0,17,0,17 r17,18,17,18 e18,38,18,38
+2äöiqcv	2öäiqcv	e0,1,0,1 i1,1,1,2 e1,2,2,3 d2,3,3,3 e3,7,3,7
+dc	dußcz	e0,1,0,1 i1,1,1,3 e1,2,3,4 i2,2,4,5
+2kxpolcqwd9b	2kxpolcqwd9b	e0,12,0,12
+6é4dgjuamñtää2ég4	6é4gdjuamñtää2éy4	e0,3,0,3 i3,3,3,4 e3,4,4,5 d4,5,5,5 e5,15,5,15 r15,16,15,16 e16,17,16,17
+i2gyb	2pjña3mckoe	d0,1,0,0 e1,2,0,1 r2,5,1,11
+2vuo4	vo4	d0,1,0,0 e1,2,0,1 d2,3,1,1 e3,5,1,3
+29j2jr00pjbr	29j2r00pjbr	e0,4,0,4 d4,5,4,4 e5,12,4,11
+gu34hj6dßçn94shqmx1qppgys0kdsjßb	gu34hj6dßçn94shqmxl1qppgys0cdjßb	e0,18,0,18 i18,18,18,19 e18,26,19,27 r26,27,27,28 e27,28,28,29 d28,29,29,29 e29,32,29,32
+nr lil7olmöffö5rlniüçßmätma	ö5lrniüçßßätm4anrw lil7olmöff	i0,0,0,15 e0,2,15,17 i2,2,17,18 e2,13,18,29 d13,27,29,29
+çrpl xck-	çwrpl7xc-k	e0,1,0,1 i1,1,1,2 e1,4,2,5 r4,5,5,6 e5,7,6,8 i7,7,8,9 e7,8,9,10 d8,9,10,10
+ dsg526b78ibpfoülkgtq9bbg	mqböß 37p-2gwglcrh35ä6r	i0,0,0,5 e0,1,5,6 r1,3,6,11 e3,4,11,12 i4,4,12,19 e4,5,19,20 r5,6,20,21 e6,7,21,22 r7,25,22,23
+hhzi8äoo	hzi8äoo	d0,1,0,0 e1,8,0,7
+dxvzpv1 uz9du7jñwp1çßaxg7l	dxvzpv1i uz9ud7jñp1çßaxg7l	e0,7,0,7 i7,7,7,8 e7,11,8,12 i11,11,12,13 e11,12,13,14 d12,13,14,14 e13,16,14,17 d16,17,17,17 e17,26,17,26
+ßcccéürñürß8cügqh7a1pcshtwékhd	7a1pcshtwékhdß3ciéürñürß8cügqh	i0,0,0,13 e0,1,13,14 i1,1,14,15 e1,2,15,16 r2,4,16,17 e4,17,17,30 d17,30,30,30
+b bba a  bb   a ba  bb b bbbaabaa  b babaab bbbbabaaa a bb a bbb a a  abb ba a  b a  bb    abaab  abb abb  abb bb bbbb   b ba bbbba bab b aabb ababaaab bb b  b    bbbba  bba a aabb b   aabbbb  b   aabbbab aa b b b a b a abaa   ab    a baab   abba a aaab  b   a ab aaa  aaaaa 	b bb bbbb   b ba bbbba bab b aabb ababaaab bb b  b    bbbba  bba a aabb b   aabbbb  b   aabbbab aa b b b a b a abaa    ab    a baab   abba a aaab  b   a ab aaa  aaaaa b bba a  bb   a ba  bb b bbbaabaa  b babaab bbbbabaaa a bb a bbb a a  abb ba a  b a  bb    abaab  abb abb  ab	e0,4,0,4 r4,275,4,276
+pwrkcrßgäe	oßgäepwrkrc	i0,0,0,5 e0,4,5,9 i4,4,9,10 e4,5,10,11 d5,10,11,11
+2dü	2ädü	e0,1,0,1 i1,1,1,2 e1,3,2,4
+ua3t0öq5epñy	uaft0ö5epñy	e0,2,0,2 r2,3,2,3 e3,6,3,6 d6,7,6,6 e7,12,6,11
+ylasz9xhv8yvzéeh1w9pym3	yalsz9xhv8yvzéeh1w9pym3	e0,1,0,1 i1,1,1,2 e1,2,2,3 d2,3,3,3 e3,23,3,23
+çbvjpifmr8i923pkxw	çbvjpifmri923pkxw	e0,9,0,9 d9,10,9,9 e10,18,9,17
+o2ñiqö2äx8pzö6	o2ñitqçäyx8f6pzö6	e0,4,0,4 i4,4,4,5 e4,5,5,6 r5,7,6,7 e7,8,7,8 i8,8,8,9 e8,10,9,11 i10,10,11,13 e10,14,13,17
+e9x6tme	e9x6tme	e0,7,0,7
+sizswz3ßßirlbxñ	sizswsz3ößßirblbñ	e0,5,0,5 i5,5,5,6 e5,7,6,8 i7,7,8,9 e7,11,9,13 i11,11,13,14 e11,13,14,16 d13,14,16,16 e14,15,16,17
+ñczcök1mtjyc9tß	mtjyc9tßñczcök1	d0,7,0,0 e7,15,0,8 i15,15,8,15
+57q1çñ wahéscäö-dpñhcunwf0-züor7fw12v	ahésc1äö-dpñchunwf0-züor7wf12v57q1çqñ w	d0,8,0,0 e8,13,0,5 i13,13,5,6 e13,19,6,12 i19,19,12,13 e19,20,13,14 d20,21,14,14 e21,32,14,25 i32,32,25,26 e32,33,26,27 d33,34,27,27 e34,37,27,30 i37,37,30,39
+8kßp8qpdkww0	ki8pqpdkw0w	i0,0,0,2 e0,1,2,3 d1,3,3,3 e3,4,3,4 d4,5,4,4 e5,10,4,9 i10,10,9,10 e10,11,10,11 d11,12,11,11
+iéw-tijä pvßh91kñçjö3znh-sax5	iéw-tijä pvßh91kñçjö3znh-sax5	e0,29,0,29
+tmh-t2hku23 xsk9ec	3 xks9ectm-ét2khu2	d0,10,0,0 e10,13,0,3 i13,13,3,4 e13,14,4,5 d14,15,5,5 e15,18,5,8 i18,18,8,18
+w	ß	r0,1,0,1
+é-qépfibbzjsxlß7ñkgtüuyléwuoxi9xqpdcg ßz	515ktöäßfj-ok	r0,1,0,10 e1,2,10,11 r2,17,11,12 e17,18,12,13 d18,40,13,13
+2ßzfc24mn	2ßzfc24mn	e0,9,0,9
+ü61	ü61	e0,3,0,3
+60ve	6ve	e0,1,0,1 d1,2,1,1 e2,4,1,3
+8u7318	jzöüfd	r0,6,0,6
+ b  b  bbb  abb  aaa  b aa  b  bb a bbbaaaa  aab aa  b ba ba   a    ab aba    a   ab b aa baab abaabaa  abba aba a a bab b  abaab   b ba bab b aa abba ba baabaabaa b  ba b  bbaabab baaaa    bba bba  abb aba  aaab bb bbbbab bbaaab a a  abbba bb    a a aab   abbaa abb b  ab  bba b bb baabaaaa bbbb ba aab bb    baa a ab bbb b abbabb aa ba aaabba b  aaa aa aaa b aaab  a baabb a bb  baab	 b  b  bbb  abb  aaa  b aa  b  bb a bbbaaaa  aab aa  b ba ba   a    ab aba    a   ab b aa baab abaabaa  abba aba a a bab b  abaab   b ba bab b aa abba ba baabaabaa b  ba b  bbaabab baaaa    bba bba  abb aba  aaab bb bbbbab bbaaab a a  abbba bb    a a aab   abbaa abb b  ab  bba b bb baabaaaa bbbb ba aab bb    baa a ab bbb b abbabb aa ba aaabba b  aaa aa aaa b aaab  a baabb a bb  baab	e0,385,0,385
+v5özq3abu éud0üvkfbjnj7fwx1w8ñä9jçö voüq	3abu éud0üvkfbéjnj7fwx1w8ñä9jçö voüqv5özq	d0,5,0,0 e5,19,0,14 i19,19,14,15 e19,40,15,36 i40,40,36,41
+77riqa94géxjßozfbüihd86n	77riqa94géxjßozfbüixd86n	e0,19,0,19 r19,20,19,20 e20,24,20,24
+lk7bwp25nß	3nubgç	r0,3,0,3 e3,4,3,4 r4,10,4,6
+e	o	r0,1,0,1
+bqbq1pownu1ért5	bqvqtpownu1ért5p	e0,2,0,2 r2,3,2,3 e3,4,3,4 r4,5,4,5 e5,15,5,15 i15,15,15,16
+uñüö2nädnxc	uñaü2nädxb	e0,2,0,2 i2,2,2,3 e2,3,3,4 d3,4,4,4 e4,8,4,8 d8,9,8,8 e9,10,8,9 r10,11,9,10
+gk3ñzf0véçzvcäpmß-aci6ö	gk35ñzf0véçezvcäpmß-aci6öb	e0,3,0,3 i3,3,3,4 e3,10,4,11 i10,10,11,12 e10,23,12,25 i23,23,25,26
+71aloñ8jß	7a1oloñ8jwß	e0,1,0,1 i1,1,1,2 e1,2,2,3 r2,3,3,4 e3,8,4,9 i8,8,9,10 e8,9,10,11
+q	q	e0,1,0,1
+6d09xrau-cé38	6d09xr1u-cé38	e0,6,0,6 r6,7,6,7 e7,13,7,13
+80yjyy0jßapö6q-üypmçh	apö6q-üypmçh8z yjyy0jß	d0,9,0,0 e9,21,0,12 i21,21,12,22
+4	z	r0,1,0,1
+ß8çoü	ß8çoä	e0,4,0,4 r4,5,4,5
+ oje7x7n7kxpñljç3lßécuyx1h0j-qy	écuyxh10j-qy oje7x7n7kxpñljç3lß	i0,0,0,12 e0,19,12,31 d19,31,31,31
+zs2-h2ß4l7jañix57ç	jañix57çsz2-h2ß4l7	i0,0,0,9 e0,1,9,10 d1,2,10,10 e2,10,10,18 d10,18,18,18
+9m	9mu	e0,2,0,2 i2,2,2,3
+pq2f7ß5fmi1süxc2y	q2f7ß5fmi1sü1cyyp	d0,1,0,0 e1,13,0,12 r13,14,12,13 e14,15,13,14 d15,16,14,14 e16,17,14,15 i17,17,15,17
+xeçnvef2yz705ébgä 33-104le2z5i6açomz8c	9vy3hfoe ag5fn 3dñ	r0,1,0,7 e1,2,7,8 r2,3,8,13 e3,4,13,14 d4,17,14,14 e17,19,14,16 r19,38,16,18
+v4d9-0äi0dßju	v48d9y-0ä90dßju	e0,2,0,2 i2,2,2,3 e2,4,3,5 i4,4,5,6 e4,7,6,9 r7,8,9,10 e8,13,10,15
+ab aa  aa b abbabb bbaaaa  bb b  abbab   a ba ab bababba a  bb baaaab aaaa ba   aba    ba aa a abaaaaba b b baa aaabba b   abbb aa ababba ba   aaba abb baaba a   abbbabaabbb  aaaabba ba  aabaa baabbbbab baaba  ba  aa bbaaa  ab  ab baab   aba aba bbabaaaaabb  abbaa  a bbabb aaa   aaaaab  a  aaaababb  	 b abbabb bbaaaa  bb b  abbab   a ba ab bababba a  bb baaaab aaaa baa   aba    ba aa a abaaaaba b b baa aaabba b   abbb aa ababba ba   aaba abb baaba a   abbbabaabbb   aaabba ba  aabaa baabbbbab baaba  ba  aa bbaaa  ab  ab bab   aba aba bbabaaaaabb  abbaa  a bbabb aaa   aaaaab  a  aaaababb  ab aa  aa	r0,301,0,301
+älau00cfpj6ñkjwinmoñvea4c57veö	älau00cfpj6ñkjwinmoñvea4c57xveö	e0,27,0,27 i27,27,27,28 e27,30,28,31
+féwäk5ñ5iq-td3ñäk1yß6tä8éßh	ä8oßhféwäk55çiq-td3äñk1yß6t	i0,0,0,5 e0,6,5,11 d6,7,11,11 e7,8,11,12 i8,8,12,13 e8,14,13,19 i14,14,19,20 e14,15,20,21 d15,16,21,21 e16,22,21,27 d22,27,27,27
+ßñvyzfoéñvçö1tat5öbh400öt3	ñyzfoéñvçöf3at5öbh400öt3ß	d0,1,0,0 e1,2,0,1 d2,3,1,1 e3,12,1,10 r12,14,10,12 e14,26,12,24 i26,26,24,25
+l-20ç8phnñßcylyrvj	l-20ç8phnñßctlyrvj	e0,12,0,12 r12,13,12,13 e13,18,13,18
+u6ömkz7aalgp3 çqwñg96çyiqç0e6üv2	u6ökmz7aalgp3 çqwñgç6çyiqç0e6üv2	e0,3,0,3 i3,3,3,4 e3,4,4,5 d4,5,5,5 e5,19,5,19 r19,20,19,20 e20,32,20,32
+5x-bdñh9y2t6jö3cu4iarjmä 6czläér	50-bdñh9y2t6jö3cu4iarjmä 6czläér	e0,1,0,1 r1,2,1,2 e2,32,2,32
+0éfñßy5x-ruk 5d8wim7dkt7kñtdätyx-lrt	müu2zgñqxzuy4rhnü260ßkucjr84ç9	i0,0,0,19 e0,1,19,20 d1,4,20,20 e4,5,20,21 r5,9,21,25 e9,10,25,26 d10,15,26,26 e15,16,26,27 r16,36,27,30
+erzxz7sßhq2ac8- twöxqpe9göñ	erzxz7sßhkq2zc8- twöxqp9zñgö	e0,9,0,9 i9,9,9,10 e9,11,10,12 r11,12,12,13 e12,22,13,23 d22,23,23,23 e23,24,23,24 i24,24,24,26 e24,26,26,28 d26,27,28,28
+wlj870çsinvñe0e6a çp 1	wlj870çincvñe0e6açp i	e0,7,0,7 d7,8,7,7 e8,10,7,9 i10,10,9,10 e10,17,10,17 d17,18,17,17 e18,21,17,20 r21,22,20,21
+siéyüreöö6rönotgxñ fxb-7e	iéyüreöö6rönotgxñ fx-b7e	d0,1,0,0 e1,21,0,20 i21,21,20,21 e21,22,21,22 d22,23,22,22 e23,25,22,24
+2r6d2ä9öc	dv9öc26r	d0,3,0,0 e3,4,0,1 r4,6,1,2 e6,9,2,5 i9,9,5,8
+ 8bolb6r1xeßrfähzy6	oçdx8vçqeé4 i	i0,0,0,11 e0,1,11,12 r1,19,12,13
+3ñü3mvümhzksme7b2mmqm9-sbübe	qm9-sbüébe3ñü3mvümhzksme7b2mm	i0,0,0,10 e0,19,10,29 d19,28,29,29
+ ßuwtgcl-w0	3gvgjx45fvu	r0,2,0,10 e2,3,10,11 d3,11,11,11
+ig7 q6ynwqçbmr71yk1iiahnä8ybaf3	q6ynwqçbmr71yk1iiahnä8ybaf3ig7 	d0,4,0,0 e4,31,0,27 i31,31,27,31
+vü935ßnapnwyggäim23 ä	2e d4kzéñpé4-4öjh5öye	r0,4,0,17 e4,5,17,18 r5,11,18,19 e11,12,19,20 r12,21,20,21
+oaz oßécpgmac3dz	oaz oßécpgmacq3dz	e0,13,0,13 i13,13,13,14 e13,16,14,17
+j3b	j3b	e0,3,0,3
+lj7kü6u	ç99jl7kü6u	i0,0,0,4 e0,1,4,5 d1,2,5,5 e2,7,5,10
+ bbb a  aaa baa   a ba a  b aa aaabbbbbab  baaaaaa   a bbb   a aaa  a  abaa bbb abbbabbaaba  b bbaab aba bbaaba aaabb bba abaa a   ab   a aaba bb aa b  a  bbabbaa a b     a a a bbaa a aabaa a b   bbaabbbb  ab abbbaabaaab bb aaaaa   b baaabaabb a  aaabababb  aab bbba  aaabbaa aabba bbaaa bbababbbaab  bababbaabbaaaabbbbab aa ab a  baab aa 	 bbb a  aaa baa   a ba a  b aa aaabbbbab  baaaaaa a a bbb   a aaa  a  abaa bbb abbbabbaaba  b bbaab aba bbaaba aaabb bba abaa a   ab   a aaba bb aa b  a  bbabbaa a b     a a a bbaa a aabaa a b   bbaabbbb  ab abbbaabaaab bb aaaaa   b baaabaabb ba  aaabababb  aab bbba  aaabbaa aabba bbaaa bbababbbaab  bababbaabbaaaabbbbab a aab a  baab aa 	e0,38,0,38 r38,339,38,339
+çxeh44ql6aßé6bé4ñc	çxeh44ql6aßé6bé4ñc	e0,18,0,18
+jyucxçél-obö3f2ncs2imtuä	jyucxçél-obö3f2ncs2imtuä	e0,24,0,24
+bñkax4oe4x65ñnünm4mt3rouc0	bñkaöx4o4x65ñnünm4xmt3rouc0	e0,4,0,4 i4,4,4,5 e4,7,5,8 d7,8,8,8 e8,18,8,18 i18,18,18,19 e18,26,19,27
+ö3499yiqp9hr0ji7i	ipq9hr0j7i2ö3499yo	i0,0,0,11 e0,6,11,17 r6,17,17,18
+gd1gbsesli0e7ytçé6äh2p5ç7äñ	ñgd1gbsesil0e7ytçé6äh2p5ç7ä	i0,0,0,1 e0,8,1,9 i8,8,9,10 e8,9,10,11 d9,10,11,11 e10,26,11,27 d26,27,27,27
+-qép0x7qñe-d	2qép07xqñed	r0,1,0,1 e1,5,1,5 i5,5,5,6 e5,6,6,7 d6,7,7,7 e7,10,7,10 d10,11,10,10 e11,12,10,11
+3uo1fn80ziox	3uo1fn80zixo	e0,10,0,10 i10,10,10,11 e10,11,11,12 d11,12,12,12
+ioßnrhc6izü0ée4ä3v 8ww1u	ioßßrhc6izü0e4ä3v 8wñw1u	e0,3,0,3 r3,4,3,4 e4,12,4,12 d12,13,12,12 e13,21,12,20 i21,21,20,21 e21,24,21,24
+9énßpämxtéqkeö3çäcm	809rbealf-palolqpbb	i0,0,0,2 e0,1,2,3 r1,4,3,10 e4,5,10,11 r5,10,11,15 e10,11,15,16 r11,19,16,19
+ffmj4ve7	ffmj4de7	e0,5,0,5 r5,6,5,6 e6,8,6,8
+qkqfeü	qk6feü	e0,2,0,2 r2,3,2,3 e3,6,3,6
+jmö9dj-1ysbote4geäjm23oüfç4 1iam	gß3pq6178vdbo	r0,4,0,10 e4,5,10,11 d5,10,11,11 e10,12,11,13 d12,32,13,13
+o6	3k	r0,2,0,2
+ñ-tzu7tdöufsdu6pjlßp3b	ñ-tzu7tdöufsdu6pjlßp3b	e0,22,0,22
+7xñ47tegçeüy14eqç6o2u40x82uüdg3fß	c9ie3ñüc	r0,2,0,5 e2,3,5,6 d3,10,6,6 e10,11,6,7 r11,33,7,8
+çeçv17fjz-gdcsçi7g-e	eçeçv1fjz-ghcçi7g-	i0,0,0,1 e0,5,1,6 d5,6,6,6 e6,11,6,11 r11,12,11,12 e12,13,12,13 d13,14,13,13 e14,19,13,18 d19,20,18,18
+hfqy4olös3zmim5g6vpbq64-jüuulvñmç0da	waqöccuourxtxüwzyshoañ0ß pédkjtq6éuy	i0,0,0,18 e0,1,18,19 d1,5,19,19 e5,6,19,20 r6,18,20,25 e18,19,25,26 r19,20,26,31 e20,22,31,33 r22,26,33,34 e26,27,34,35 r27,36,35,36
+tip8vçdwluiñ8éd93v43nvxpeghu	boxeüe5dm3ßzt4ytßß 4uwtw göä	i0,0,0,12 e0,1,12,13 r1,7,13,21 e7,8,21,22 r8,25,22,25 e25,26,25,26 r26,28,26,28
+e420açonnx8xç-hé c3ä 1bi1fl7s6wgoö	e420açonnx8xç-hé c3ä 1bi1flks6wgoö	e0,27,0,27 r27,28,27,28 e28,34,28,34
+  ababbb  ab  a a b aaa  a baaa a   a ba aaa baba  b baba  baaab a a ba aa aa   a b   abb ababaa  babba a bb aaaabb bbba abaaa ba babbb bbbb ab  a aaab babab bbb  b ab  aa bb    bb ba     a a b bb   aba  b abaaa bbbbbb ab  b babbb   babbab  abbbba baaaaa aabaaabba  aa  aabaa b bba  a abaaaaaaab  	  ababbb  ab  a a b aaa  a baaa a   a ba aaa baba  b baba  baaab a a ba aa aa   a b   abb ababaa  babba a bb aaaabb bbba abaaa ba babbb bbbb ab  a aaab babab bbb  b ab  aa bb    bb ba     a a b bb   aba  b abaaa bbbbbb ab  b babbb   babbab  abbbba baaaaa aabaaabba  aa  aabaa b bba  a abaaaaaaab  	e0,297,0,297
+kglmöwñmxh1uz0q2o4bñlkljwßéd27	kglmöwñmxh1uz0q2o4bñlkljwßéd27	e0,30,0,30
+9 a22bößvçz6jd97j5l-yk-éa6-6a	9 a22bößvçz6jd97j5-yké-a6-6a	e0,18,0,18 d18,19,18,18 e19,22,18,21 i22,22,21,22 e22,23,22,23 d23,24,23,23 e24,29,23,28
+ç0v4äükuymrnçüaä-uué9qüvk	ç0v4äükumyrnçacä-u0ué9qüvk	e0,8,0,8 i8,8,8,9 e8,9,9,10 d9,10,10,10 e10,13,10,13 d13,14,13,13 e14,15,13,14 i15,15,14,15 e15,18,15,18 i18,18,18,19 e18,25,19,26
+ä61afäigyrhö12qf2éx	ä61afäegxrhö12qféx	e0,6,0,6 r6,7,6,7 e7,8,7,8 r8,9,8,9 e9,16,9,16 d16,17,16,16 e17,19,16,18
+71 -ér3éuzñ-4hcjñsdö8iwßypq6c24bf	éuzñ-43hcjñsdö8iwßypq6c24bf71 -é3	d0,7,0,0 e7,13,0,6 i13,13,6,7 e13,33,7,27 i33,33,27,33
+vkko4oqqdoküteßy8	vyk4oqqdoküteßy8	e0,1,0,1 i1,1,1,2 e1,2,2,3 d2,4,3,3 e4,17,3,16
+é347mqk7ñh9uzki	5r xg95ävkvgxyh	r0,6,0,9 e6,7,9,10 r7,9,10,14 e9,10,14,15 d10,15,15,15
+5äsvy 9lu	5äsv3y 9u	e0,4,0,4 i4,4,4,5 e4,7,5,8 d7,8,8,8 e8,9,8,9
+ ñ-x4ßm8ççlxmömtspäe0an9	an9 ñ-ñx4ßm8ççlxmömtspsäe0p	i0,0,0,3 e0,3,3,6 i3,3,6,7 e3,18,7,22 i18,18,22,23 e18,21,23,26 r21,24,26,27
+hnrä6uñyzjbeö-1çdard1fru -a60wä8la mlog	çard1fru -a60wä8la mlognhrä6uñyz-beö-1	d0,15,0,0 e15,16,0,1 d16,17,1,1 e17,39,1,23 i39,39,23,38
+xx9iwxq8jkk	xx9iwxq8jkk	e0,11,0,11
+hkt6  g95038adp1ipapwpf4äy1v4coçd26pcö	eqfvfvéf1te6	r0,2,0,9 e2,3,9,10 i3,3,10,11 e3,4,11,12 d4,38,12,12
+pñjlt1ug61käc5hékßds6cvdg7m6z	pñjtl1u3g61kächékßds6co3dg7m6z	e0,3,0,3 i3,3,3,4 e3,4,4,5 d4,5,5,5 e5,7,5,7 i7,7,7,8 e7,13,8,14 d13,14,14,14 e14,22,14,22 r22,23,22,24 e23,29,24,30
+0f8ñsxvprççvo	80fñsxvprççvo	i0,0,0,1 e0,2,1,3 d2,3,3,3 e3,13,3,13
+qßgy6ñ5qmgç5 	qßy6ñ5qm4gç5 	e0,2,0,2 d2,3,2,2 e3,9,2,8 i9,9,8,9 e9,13,9,13
+41içñ	41içñ	e0,5,0,5
+ehu	ueh	i0,0,0,1 e0,2,1,3 d2,3,3,3
+k-x0rk22laif81pßjçqhhyf	k-x0rk22laif81pßjçqhhyf	e0,23,0,23
+cwftäu9ä2é	wtäu9äéc	d0,1,0,0 e1,2,0,1 d2,3,1,1 e3,8,1,6 d8,9,6,6 e9,10,6,7 i10,10,7,8
+ a b  a abb  aa bba  bb ba   b bbb abbb  a bb bbbab  aab   b b ab abbbab   babbba   abababba abbbbbaba a abba abaaabbaab aabb b babbaba babba a  aaa    abaa aab  baa b   a baaabbbbaaabba bab ab a  bbb bbaa bba  a b baab babba aaaaababb bb b b aa  babb aabbb    bba  bab   bab ababababaa a  bbbbaa bab aabab b ab ba aa a ab  a  a  bb  a b  aabb	aa a ab  a  a  bb  a b  aabb a b  a abb  aa bba  bb ba   b bbb abbb  a bb bbbab  aab   b b ab abbbab   babbba   abababba abbbbbaba a abba abaaabbaab aabb b babbaba babba a  aaa    abaa aab  baa b   a baaabbbbaaabba bab ab a  bbb bbaa bba  a b baab babba aaaaababb bb b b aa  babb aabbb    bba  bab   bab ababababaa a  bbbbaa bab aabab b ab ba 	r0,343,0,343
+oç2u ix529kdégfüücä-6jrel7bbüo2f-38pl	oüik2u ix529kdégftücä-6jrel7bbüo2f-38pl	e0,1,0,1 r1,2,1,4 e2,15,4,17 r15,16,17,18 e16,37,18,39
+n2ör9a	ntrö99a	e0,1,0,1 r1,2,1,3 e2,3,3,4 r3,4,4,5 e4,6,5,7
+orr6pi-tzcogn	orrp6-65wcong	e0,3,0,3 i3,3,3,4 e3,4,4,5 d4,6,5,5 e6,7,5,6 r7,9,6,9 e9,11,9,11 i11,11,11,12 e11,12,12,13 d12,13,13,13
+k7j1l46nmépw gqrwßh4syäänu	k7j1l46nmépw gqrwßh4syäänu	e0,26,0,26
+qi99ö ßi-ksñgñ131ñ1m	qi99öß i-ksñgñ131ñ1m	e0,5,0,5 i5,5,5,6 e5,6,6,7 d6,7,7,7 e7,20,7,20
+juoé1yrjgl mk4ä8m2é65gbm2cé g81nt	juoéy1rjgl k4ä8m2é6gbmgcé g81nt	e0,4,0,4 i4,4,4,5 e4,5,5,6 d5,6,6,6 e6,11,6,11 d11,12,11,11 e12,20,11,19 d20,21,19,19 e21,24,19,22 r24,25,22,23 e25,33,23,31
+q9gd dmpnf	q9gad3dpnf	e0,3,0,3 i3,3,3,4 e3,4,4,5 r4,5,5,6 e5,6,6,7 d6,7,7,7 e7,10,7,10
+vg2-5bon	novg2-5b	i0,0,0,2 e0,6,2,8 d6,8,8,8
+t0eü62ñ1ä74rl00	t0eü62ñ1ä74rl00	e0,15,0,15
+n3 p96hfñx1aaqß5ßkm4it1ßnjézçaçsby2u	n3 pi6hfñx1aaqß5ßkm4it1ßnjézçaçsby2u	e0,4,0,4 r4,5,4,5 e5,36,5,36
+çfsc	éfscç	r0,1,0,1 e1,4,1,4 i4,4,4,5
+tbxlü	tbx23ü	e0,3,0,3 r3,4,3,5 e4,5,5,6
+oymu4éyz79rhäcé2qmj2yürxjö7k	oym4éyz79rhäcé2qmj2yürxjö7k	e0,3,0,3 d3,4,3,3 e4,28,3,27
+fcü2çtä2eggzt6byxi4fbbj6oßf	ü2çtä2eggt6byx4ibbj6oßffc	d0,2,0,0 e2,11,0,9 d11,12,9,9 e12,17,9,14 i17,17,14,15 e17,18,15,16 d18,20,16,16 e20,27,16,23 i27,27,23,25
+äpud g8ç0tödhg1e 	tödh1s äpud g8ç03	i0,0,0,7 e0,9,7,16 r9,17,16,17
+9rßé6fg75voxhu66stxp	g7v5oxh66stxö9rßé6f	i0,0,0,13 e0,6,13,19 d6,20,19,19
+9éi9afqlx	9é49içaflx	e0,2,0,2 i2,2,2,4 e2,3,4,5 r3,4,5,6 e4,6,6,8 d6,7,8,8 e7,9,8,10
+ñ0cmzzñ1mxç-9észç z6zmyj6v93cfpñe9	r34vtöxl8çlkfj 7n4vg7jj	r0,9,0,6 e9,10,6,7 i10,10,7,9 e10,11,9,10 r11,17,10,14 e17,18,14,15 r18,23,15,21 e23,24,21,22 r24,34,22,23
+ovstfrnza1oy3a2ßyagozqpbäg30äç6fp2sn	 chäbßä-59jzj83rwzkmf ç	r0,4,0,20 e4,5,20,21 r5,29,21,22 e29,30,22,23 d30,36,23,23
+b bab  ba b aabb   b bb bbbb ba  aaa    aaaab bab bba aaabaabaab b abaaa babb bbba  aba baabaaaabb bba b bab bb ab  babab ab b  aa  bba b  b abab bbab   abb a b  abb    a  bb  a b aab  aaa aba ba     b  aaab bbaba bba bbaaaab   abbaabab  a ab abaaabaaabaab  baab  b a  bbb  aa baa  a aababba b b abaabbaaaaaa baaab ab baabbaa b bb b ababbbb aabbbba bbb aaba bb	b bab  ba b aabb   b bb bbbb ba  aaa    aaaab bab bb aaaabaabaab b abaaa babb bbba  aba baabaaaabb bba b bab bb ab  babab ab b  aa  bba b  b abab bbab   abb a b  abb    a  bb  a b aab  aaa aba ba     b  aaab bbaba bba bbaaaab   abbaabab  a ab abaaabaaabaab baab  b a  bbb  aa baa  a aababba b b abaabbaaaaaa baaab ab baabbaa b bb b ababbbb aabbbba bbb aaba bb	e0,52,0,52 r52,360,52,359
+61ma4yvyéh9	61maçvy3é9	e0,4,0,4 r4,6,4,5 e6,8,5,7 i8,8,7,8 e8,9,8,9 d9,10,9,9 e10,11,9,10
+ä4üüilqß6b0br85xn1b	ä4üilqtß6b0br85xn1b	e0,2,0,2 d2,3,2,2 e3,7,2,6 i7,7,6,7 e7,19,7,19
+x çñ3ß1xygoet7hä20çw 0ßkpßä	x çñ3ß1xygoet7h 220çw 0ßkpßä	e0,15,0,15 r15,16,15,17 e16,27,17,28
+nçdkdwtfnp5t2808ecelçn-fyj7txej9u	nçfdkdwtfnp5t2808ecelçn-fyj7txej9u	e0,2,0,2 i2,2,2,3 e2,33,3,34
+uczßrx2orl3lk3wiöéz9emtxñr8pßg9v	aczßrx2orl3lk3iöéz5emtxñr8ßpg9v	r0,1,0,1 e1,14,1,14 d14,15,14,14 e15,19,14,18 r19,20,18,19 e20,27,19,26 i27,27,26,27 e27,28,27,28 d28,29,28,28 e29,32,28,31
+nßw94 w-yfa bä8-yßéu	unßw94 w-yfa bän-yßé	i0,0,0,1 e0,14,1,15 r14,15,15,16 e15,19,16,20 d19,20,20,20
+4a-qsç-iß2üçns85ölmtz	4a-qsç-iß2üçns85ölmtz	e0,21,0,21
+wm jl0shxäjgtq60ré3	ñ-9vqçaov	r0,13,0,4 e13,14,4,5 r14,19,5,9
+um1qvbétsa6rinx	um16vbétsa6rix	e0,3,0,3 r3,4,3,4 e4,13,4,13 d13,14,13,13 e14,15,13,14
+fä25tx77cv0üq9l45	fä25tx77v0üq9l45	e0,8,0,8 d8,9,8,8 e9,17,8,16
+-gpppcm-7pi8ñ5w5xçdmçßo174mcvcfrwh5j67l	7üjyit	d0,8,0,0 e8,9,0,1 r9,10,1,4 e10,11,4,5 r11,39,5,6
+äv4f4vznwb55mm	äv4f4vznwb55mm	e0,14,0,14
+oögvjgm9éuxñf0g8ctßy34rvt8bm5l	oögvjg9méuxñf0g8ctßy3ärvt8bm5lç	e0,6,0,6 i6,6,6,7 e6,7,7,8 d7,8,8,8 e8,21,8,21 r21,22,21,22 e22,30,22,30 i30,30,30,31
+öçqrb0 r7cri3nnpjbßçñäri50xa1	öçqrb0 r7cri3nnpjbßçñäri50xa1	e0,29,0,29
+g5äcz-i55lj6zi60rrfph3éx g686l7ni	g5äcz-i5lj6zi60rrfp3éx g686l7ni	e0,7,0,7 d7,8,7,7 e8,20,7,19 d20,21,19,19 e21,33,19,31
+0lcf	ç-n	r0,4,0,3
+tßnj9ñö34kcw9nvhn2ghvé77ä9j	déräa5 0 div1ß0e1p97	r0,1,0,13 e1,2,13,14 r2,4,14,18 e4,5,18,19 d5,22,19,19 e22,23,19,20 d23,27,20,20
+7zj1qxtöf2buhz52lähxcp a	7zj1qxtöf2buhz52lähxcp a	e0,24,0,24
+3ñudpçp2q-42yholxhw	hw3ñudçpp2q-42ynçholx	i0,0,0,2 e0,4,2,6 i4,4,6,7 e4,5,7,8 d5,6,8,8 e6,13,8,15 i13,13,15,17 e13,17,17,21 d17,19,21,21
+  abba   a abba bab a   b ab aabb a  babab aab  a bb  bb abb ba a abaa babbbbbabab ba b abbaab b   aaa b  ba   baabaaab bb abbb   a     a aaa b a  baab bbabbab b b a a    bbbb aaaa bb a bbba a    ba a aab  ba  b baabaa baa aa	  abba   a abba bab a   b ab aabb a  babab aab  a bb  bb abb ba a abaa babbbbbabab ba b abbaab b   aaa b  ba   baabaaab bb abbb  a     a aaa b a  baab bbabbab b b a a    bbbb aaaa bb a bbba a    ba a aaab  ba  b baabaa baa aa	e0,129,0,129 r129,225,129,225
+éj8çsuli2k2zlityi9u9pzxf7vö	g89ß h qügjvu0b8ggl0qudjr-h	r0,1,0,10 e1,2,10,11 i2,2,11,15 e2,3,15,16 r3,5,16,21 e5,6,21,22 r6,27,22,27
+wvéj33écvtu6gudw-7zñw99ä	wvj33écvtu6gudw-7zñwf9ä	e0,2,0,2 d2,3,2,2 e3,21,2,20 r21,22,20,21 e22,24,21,23
+ç1cc7s98l098f	ç1cc7s98l0i98f	e0,10,0,10 i10,10,10,11 e10,13,11,14
+éü-apdoapjy8jk7 z4raoñut95cx1	ü2i öç7véa599jav4zx b	i0,0,0,8 e0,1,8,9 d1,3,9,9 e3,4,9,10 r4,7,10,14 e7,8,14,15 r8,15,15,19 e15,16,19,20 r16,29,20,21
+ch4ef zuoqé2éf2892ät7ö8w5n1e0h6w	zh4ef zuoqé2é292ät7ö8w5n1e0h6w	r0,1,0,1 e1,13,1,13 d13,14,13,13 e14,15,13,14 d15,16,14,14 e16,32,14,30
+sda70tñ9yöt -ßk433	cg3üulß6b5lo	r0,13,0,6 e13,14,6,7 r14,18,7,12
+xüöhvaäwwyöhvvvtjl	xüöhvaäwwyöhvvvtjl	e0,18,0,18
+e38uo6gaxn08qvq8be8q-9éxe 9y qbw0bsqbx	e38uo6gaxn08qvq8be8q-9éxe 9y qbw0bsqbx	e0,38,0,38
+97é3göve8-qwgje3	97é3göve-qwgje3	e0,8,0,8 d8,9,8,8 e9,16,8,15
+v4çq0ü9 mfb88 dj2vl00äs1mañf8iiq2ä	aböxubd1qpp	r0,3,0,8 e3,4,8,9 r4,34,9,11
+g2neß-ogoog2ähu1u4kz4-kuy2l8gñßg295gep	8gñßg295gepg2neßogoog2ähu1u4kz4-kuy2l	i0,0,0,11 e0,5,11,16 d5,6,16,16 e6,27,16,37 d27,38,37,37
+4yñiü15l3s9gö9kvxoößpp2-z6518éj	4yñie1543s9gö9kvxoößpp2-z6518éj	e0,4,0,4 r4,5,4,5 e5,7,5,7 r7,8,7,8 e8,31,8,31
+3ßç3azeäc71m	azuc71m3ßç	d0,4,0,0 e4,6,0,2 r6,8,2,3 e8,12,3,7 i12,12,7,10
+qmapu6dcçtaügby702wbßü-2jäckñß3u r8	qmap2u6dcçtaügby702wbßüb2jäckñß3u r8	e0,4,0,4 i4,4,4,5 e4,22,5,23 r22,23,23,24 e23,35,24,36
+7	7	e0,1,0,1
+fhrayf8ß7pzohñuöa-70- äk7ßßaflo	fhrayf8ß7pzohñuöa-70- äk7dßçflo	e0,25,0,25 i25,25,25,26 e25,26,26,27 r26,28,27,28 e28,31,28,31
+65m-t7amv	2-o	r0,3,0,1 e3,4,1,2 r4,9,2,3
+cvy o0 yefggt8h5df-ü	cvy o0 yefggt8h5df-ü	e0,20,0,20
+ü7oü 0zpr	7noü0 zlrü	d0,1,0,0 e1,2,0,1 i2,2,1,2 e2,4,2,4 i4,4,4,5 e4,5,5,6 d5,6,6,6 e6,7,6,7 r7,8,7,8 e8,9,8,9 i9,9,9,10
+b      b a   aaaa   aaabaa bbbabab ababbbbbaa b  b a aabb abaa b aaba   a   b a aa baaabbaa bbabb a babbbab aaaba   a  ab aaaaababb b  aaa  aa a   aaba b bb b b   a    abaaa bbabba  abbb b bb b  b abbb a ba bbabbaaabbbb b bb aba  abbabbb bb aaaababbba b   a   ab a a   a bbb bbb bab aabbab  aabab   baaabbababbbabaaa a b aa	   aaba b bb b b   a    abaaa bbabba  abbb b bb b  b abbb a ba bbabbaaabbbb b bb aba  abbabbb bb aaaababbba b   a   ab a a   a bbb bbb bab aabbab  aabab   baaabbababbbabaaa a b aab      b a   aaaa   aaabaa bbbabab ababbbbbaa b  b a aabbb abaa b aaba   a   b a aa baaabbaa bbabb a babbbab aaaba   a   b aaaaababb b  aaa  aa a	r0,323,0,324
+södqßkp	ßkpsöndq	d0,4,0,0 e4,7,0,3 i7,7,3,8
+sdu3eoyq2jqhip6n2kgu	2kgusdu3yoq2jqhia6n	i0,0,0,4 e0,4,4,8 r4,5,8,9 e5,6,9,10 d6,7,10,10 e7,13,10,16 r13,14,16,17 e14,16,17,19 d16,20,19,19
+ef1kogo	ogoeyf1k	i0,0,0,3 e0,1,3,4 i1,1,4,5 e1,4,5,8 d4,7,8,8
+-c7i86g	-zc7d8-g6	e0,1,0,1 i1,1,1,2 e1,3,2,4 r3,4,4,5 e4,5,5,6 i5,5,6,8 e5,6,8,9 d6,7,9,9
+ß9dvwhß4pö5hnn-iaüiü-aaelq qnhgvp9öalöm	iü-aaelq qnhgvp9öalögmßg9dvhß4py5hnn-iaü	d0,18,0,0 e18,38,0,20 i38,38,20,21 e38,39,21,22 i39,39,22,40
+4cäpe 2dxñ13 yöß1ldäuä4	4cäpe 2dxñ13 yößq1ldäuä4	e0,16,0,16 i16,16,16,17 e16,23,17,24
+8ö53ßfshqi6b8oy5pwvqi	8ö53ßfstqi6b8oy5pwß2qti	e0,7,0,7 r7,8,7,8 e8,18,8,18 r18,19,18,20 e19,20,20,21 i20,20,21,22 e20,21,22,23
+ñtkyxofñ3äghn7qct	ñ3äghnq7tcñtkyxof	i0,0,0,10 e0,7,10,17 d7,17,17,17
+c3d5zauwmfüb694wpkf	c3d5zauwmfüb694wpkf6	e0,19,0,19 i19,19,19,20
+cy2	cy2	e0,3,0,3
+jcwhñf8kméfr30vñjläwahe9ü2gö ulvj3cçénj	jcwhñf8kméfr30vñjläwahe9ü2gö ulvj3cçénj	e0,39,0,39
+8yx5ful8j58uqçto3 r0t8okks4xçyer4drßtg	8yx5ful8j58uqçto3 r08okks4x4çyer4rßtg	e0,20,0,20 d20,21,20,20 e21,28,20,27 i28,28,27,28 e28,33,28,33 d33,34,33,33 e34,38,33,37
+le-4içtsh 635iy9ébñwycq6eéxk5ps2héköér	h 63ñ5i09ébñwycq6eéxk5ps2héköé9le-4içt1	d0,8,0,0 e8,12,0,4 i12,12,4,5 e12,14,5,7 r14,15,7,8 e15,37,8,30 r37,38,30,39
+edweñj8d5çqoçdvbü-vrö6mggwse8	dedweñj8d5çqçdvbü-vrö6mggwse	i0,0,0,1 e0,11,1,12 d11,12,12,12 e12,28,12,28 d28,29,28,28
+eñ-ény1töx7x8una	-éyn1töx7x8naeñ	d0,2,0,0 e2,4,0,2 i4,4,2,3 e4,5,3,4 d5,6,4,4 e6,13,4,11 d13,14,11,11 e14,16,11,13 i16,16,13,15
+m	m9	e0,1,0,1 i1,1,1,2
+7kixiwm93ßç9lveu4ms48ddd3ueälwyxe	eu4ms48ddd3uelywxe7kixiwm93ßç9lv	i0,0,0,18 e0,14,18,32 d14,33,32,32
+z1cd0i	cé9jq	d0,2,0,0 e2,3,0,1 r3,6,1,5
+0g310uz7rd6mi9wmwcwñxlt1nu88hrç50	t1nu88hrç500g310uz7rd6mi93mwcwñxl	i0,0,0,11 e0,14,11,25 r14,15,25,26 e15,22,26,33 d22,33,33,33
+  bbabababa a baaaaba    baa bb   b abbba aababbb baaaa  abbabaaabb b bbab a  bbaabb  b  baaa a baaab  aba baaaa aa a  bba bbb  ab   ab  baba b a  a aa a  abaaa  a  b aabbaabaaaba  baa bab b a b bb abb    abbaaab a b  bbbb   aaaab a aaa aaab b a b  a bbaba  a b a bbba a    ab bababaab   abbbbbabbabb bb  baabb baaaaabaa aa b ba bab a aa  a  a bb   a  abaa  aa babb   a ba bbba   aab	  bbabababa a baaaaba    baa bb   b abbba aababbb baaaa  abbabaaabb b bbab a  bbaabb  b  baaa a baaab  aba baaaa aa a  bba bbb  ab   ab  baba b a  a aa a  abaaa   a  b aabbaabaaaba  baa bab b a b bb abb    abbaaab a b  bbbb   aaaab a aaa aaab b a b  a bbaba  a b a bbba a    ab bababaab   abbbbbabbabb bb  baabb baaaaabaa aa b ba bab a aa  a  a bb   a  abaa  aa babb   a ba bbba   aab	e0,162,0,162 r162,383,162,384
+9cimec-dkmqa-hnwuf64iw2h	5c -dkqa-hnwuf64iw2h9cime	r0,1,0,1 e1,2,1,2 r2,6,2,3 e6,9,3,6 d9,10,6,6 e10,24,6,20 i24,24,20,25
+homvübuex xfxs6wßp-zä	x xfxs6wßpa-zäjomvobue	d0,8,0,0 e8,18,0,10 i18,18,10,11 e18,21,11,14 i21,21,14,22
+649e6jqä-q5nko3üxarr9aßh754çs69	649e6jqä-q5nko3üxarr9aßh754çs69	e0,31,0,31
+5itqhzbeqpc	tqhbzqpc5i	d0,2,0,0 e2,5,0,3 i5,5,3,4 e5,6,4,5 d6,8,5,5 e8,11,5,8 i11,11,8,10
+768nq5kv-r-e6ß lç7a2s1nw3desq3jc	q3jc768nq5kvr--e6ß lç7a2s1n3wdes	i0,0,0,4 e0,8,4,12 i8,8,12,13 e8,9,13,14 d9,10,14,14 e10,23,14,27 i23,23,27,28 e23,24,28,29 d24,25,29,29 e25,28,29,32 d28,32,32,32
+wñahfaq0gep9éñmu7ecfäp-voiu2 lifp4f	wñahfaq0gep9éñmu7ecfäp-voiu2 lifp4f	e0,35,0,35
+2çiriwu8	2çiriwu8	e0,8,0,8
+8y6öqstç0ué-hlñä6gsöxwñeg4r özu3i8äñ2ssr	h8bpixb8ust5epn6aöq4 ñjh6vfih-göcö5péüth	i0,0,0,1 e0,1,1,2 r1,2,2,15 e2,3,15,16 i3,3,16,17 e3,5,17,19 r5,6,19,38 e6,7,38,39 d7,12,39,39 e12,13,39,40 d13,40,40,40
+f4chxoi-cäg1éjçsñ5oz4nyßé-	f4chxoi-cäüg1éjçsñ5oz4nyßé-	e0,10,0,10 i10,10,10,11 e10,26,11,27
+näö598qrn7n3az7çjn76ään36-3a7acñ1	näö598qrn7n3az7çjn76ääd36-3a7acñ1	e0,22,0,22 r22,23,22,23 e23,33,23,33
+s3ptx8-6ukßsy7hu-j4ö02wx30z6xlxi	s3ptx8-6ukßsy7hu-j4ö0lwx30z6xlxi	e0,21,0,21 r21,22,21,22 e22,32,22,32
+5iéç0opuñaurbnsqp-zjaéb9odfs1ßj	5iéçopuñaurbnmkqp-zjaéb9odfs91ßj	e0,4,0,4 d4,5,4,4 e5,14,4,13 r14,15,13,15 e15,28,15,28 i28,28,28,29 e28,31,29,32
+cfsjekçifyüt	c9fsjeçsfycn	e0,1,0,1 i1,1,1,2 e1,5,2,6 d5,6,6,6 e6,7,6,7 r7,8,7,8 e8,10,8,10 r10,12,10,12
+jicä3qk8	jicqä3qai	e0,3,0,3 i3,3,3,4 e3,6,4,7 r6,8,7,9
+é735cm950nvzbotnñ3o6if7ngy2	nñ3o6if7ngyh2é735clm9j0nvzbto	d0,15,0,0 e15,26,0,11 i26,26,11,12 e26,27,12,13 i27,27,13,29
+ äöijä öimfqçöq5tßzftdaßu8es0çfe6ähß	v7njlo0jw9ly1çaf0dbhilht 7u7pb7hmñ	i0,0,0,24 e0,1,24,25 r1,9,25,32 e9,10,32,33 r10,36,33,34
+zcfä4xdölfeä9	zcfä4xdölfeä9	e0,13,0,13
+hp86wqbö3q1t79yd zf0igz6 r	3q1td79ydzf0igz6 mrhp86wqb	d0,8,0,0 e8,12,0,4 i12,12,4,5 e12,16,5,9 d16,17,9,9 e17,25,9,17 i25,25,17,18 e25,26,18,19 i26,26,19,26
+hbfgwüeö2bcmééuujafa7zö	hbfgwüqö2bmééuujaa7zö	e0,6,0,6 r6,7,6,7 e7,10,7,10 d10,11,10,10 e11,18,10,17 d18,19,17,17 e19,23,17,21
+ bbb aaa babb b   bbaa baab bbb  a bb a  babbb b a aa b aaab abba ba aa ba   abbba bb bbab aabbbbabaa bab   b baa b  a ababbbaabbb baaab baa  aabbaaabab   aabaa baaba bab b  a ab aabaa  abaa ba  bbbabba  a    a a baaa  bbbaa abbbbb    bbb babbabb  aaaa babba  b  ababb b  a  baa    abbaaaaa b aa babab ab   b a a baaabbb  ba a ab   a b    bbb  aba  bbbbbb  baba a ababb  aba bbaaa b aaabab b 	 bbb aaa babb b   bbaa baab bbb  a bb a  babbb b a aa b aaab abba ba aa ba   abbba bb bbab aabbbbabaa bab   b baa b  a ababbbaabbb baaab baa  aabbaaabab   aabaa baaba bab b  a ab aabaa  abaa ba  bbbabba  a    a a baaa  bbbaa abbbbb    bbb babbabb  aaaa babba  b  ababb b  a  baa    abbaaaaa b aa babab ab   b a a baaab b  ba a ab   a b    bbb  aba  bbbbbb  baba a ababb  aba bbaaa b aaabab b 	e0,318,0,318 r318,392,318,392
+0ç48ty	0543ç8yt	e0,1,0,1 i1,1,1,4 e1,2,4,5 d2,3,5,5 e3,4,5,6 i4,4,6,7 e4,5,7,8 d5,6,8,8
+ßvdsrzüs4se cx	ßvsdrzüs4se cx	e0,2,0,2 i2,2,2,3 e2,3,3,4 d3,4,4,4 e4,14,4,14
+oyk62säñ7eñbbh1t4ij1ox3ñ	-éi4üjbsikj-c	r0,2,0,9 e2,3,9,10 d3,18,10,10 e18,19,10,11 r19,24,11,13
+üsbgt	ssbgtü	r0,1,0,1 e1,5,1,5 i5,5,5,6
+xävozxom1ä24tj4ogzq	j4ogzqxäv3ozxom1ätj	i0,0,0,6 e0,3,6,9 i3,3,9,10 e3,10,10,17 d10,12,17,17 e12,14,17,19 d14,19,19,19
+bxaññv5fj -49k15u4 	5fjy 4-9k15u4ö xaññv	d0,6,0,0 e6,9,0,3 i9,9,3,4 e9,10,4,5 i10,10,5,6 e10,11,6,7 d11,12,7,7 e12,18,7,13 i18,18,13,14 e18,19,14,15 i19,19,15,20
+c8s7e nxzc20ühm8jnö536x5315ßplpcyüö é	ühm8jnö536x5315ßplpcyüö éc8s7e äxzc20	d0,12,0,0 e12,37,0,25 i37,37,25,37
+roatb7e	roatbjs	e0,5,0,5 r5,7,5,7
+lf96	l9f	e0,1,0,1 i1,1,1,2 e1,2,2,3 d2,4,3,3
+h7é62ßçlaw rld8du	ld8duh79é62ßléaw r	d0,12,0,0 e12,17,0,5 i17,17,5,18
+ñ1a70ü 0wp0ölaük0 i4ntmqgcgtru7ñl2se	0ü 0wp01dlaük0 i4ntçqgcgtru7ñl2señ1a7	d0,4,0,0 e4,11,0,7 r11,12,7,9 e12,22,9,19 r22,23,19,20 e23,36,20,33 i36,36,33,37
+çverj-gkz0dfwcß3äu66é	tz ñ8wwv1znf	r0,1,0,7 e1,2,7,8 r2,8,8,9 e8,9,9,10 r9,11,10,11 e11,12,11,12 d12,21,12,12
+mé4oshäöphü5émpéßño4o9t	z3m3ß5fz	i0,0,0,2 e0,1,2,3 r1,11,3,5 e11,12,5,6 r12,23,6,8
+m-t75ädm-ß6z5q5qsödp5xe9ehögñ430gü	ädm-ß65zq5qsödp5xe9ehögñ430g6m-t75ç	d0,5,0,0 e5,11,0,6 i11,11,6,7 e11,12,7,8 d12,13,8,8 e13,33,8,28 r33,34,28,35
+bom2kfh9öhnüädevkñßyobgil8u3v36a7qxfda	bgil8u3v6a7qxfdabom2kfhöhnüädevkñßyo	i0,0,0,16 e0,7,16,23 d7,8,23,23 e8,21,23,36 d21,38,36,36
+efiéñ4jö9hv1c65iydqgcqn6iktnwço-f17gxssj	efiéñ4jö9hv1c65iydxqgcqn6iktnwço-f17gxsj	e0,18,0,18 i18,18,18,19 e18,38,19,39 d38,39,39,39 e39,40,39,40
+hu9sgy9-h2éb-zlmgzet8guy0n1b	bhu9sgy9-h2éb-zlmgzet8guy0n1	i0,0,0,1 e0,27,1,28 d27,28,28,28
+bçt	bkü5	e0,1,0,1 r1,3,1,4
+63dt4 tm88cocé1hjéwkyaze268hñöf chçxm3ñ	63dt4 tm88cocé1hjéwkyaze268hñöñ chçxm3ñ	e0,30,0,30 r30,31,30,31 e31,39,31,39
+ b  a bb abaa ba b ab aab aa   aa   b a bb  abba b  baa b bbbbababbabaabbb   ab  a a  baba abba   baababb bb aabbaab  ab  ba a bbb  bba   a  aa  ab b  a   bbbb bbaaab aaabaa  bb     abbaa baa abb ba abbbbbb  bab  a ab b b bba  aabbaaabaaaaba aaa babbbab  ab bb  abb   aaab aabb abaa aabaa  ab a babaa  bbbb    ababb    b ba  bb abbabb  b bbb abab  bbbbaaa bbb   abb  baaaaa b b bbbab  aabaaabab bbaa a b babb ab	 b  a bb abaa ba b ab aab aa   aa   b a bb  abba b  baa b bbbbababbabaabbb   ab  a a  baba abba   baababb bb aabbaab  ab  ba a bbb  bba   a  aa  ab b  a   bbbb bbaaab aaabaa  bb     abbaa baa abb ba abbbbbb  bab  a ab b b bba  aabbaaabaaaaba aaa babbbab  ab bb  abb   aaab aabb abaa aabaa  ab a babaa  bbbb    ababb    b ba  bb abbabb  b bbb abab  bbbbaaa bbb   abb  baaaaa b b bbbab  aabaaabab bbaa a b babb ab	e0,411,0,411
+zßgcéiñhn0çuqc7wwñ90zxwpü-2v	wxñ90zxwpü-2vzßgcéiñhn0çxq7	i0,0,0,13 e0,11,13,24 r11,12,24,25 e12,13,25,26 d13,14,26,26 e14,15,26,27 d15,28,27,27
+k yvm9f-oo züiiféßééct1o7ux6ñh-dy	k yvm9f-oo züiiféßééct1o7ux6ñh-dy	e0,33,0,33
+çñ1ö6tcxnwöß31ib4zq1öüwsöñz	çñ1ö6tcxnwöß31ib4zq1öüwsöñz	e0,27,0,27
+a243ß2sbg	bg2a43ß2su	i0,0,0,3 e0,1,3,4 d1,2,4,4 e2,7,4,9 r7,9,9,10
+étßp1fsg1sonbñr	é3wtpß1sfg1sonbñr	e0,1,0,1 i1,1,1,3 e1,2,3,4 i2,2,4,5 e2,3,5,6 d3,4,6,6 e4,5,6,7 i5,5,7,8 e5,6,8,9 d6,7,9,9 e7,15,9,17
+54ölñf3ébalz03i63ñ81v	z03i6ñ881v54ölñ3cébal	i0,0,0,10 e0,5,10,15 d5,6,15,15 e6,7,15,16 i7,7,16,17 e7,11,17,21 d11,21,21,21
+-o02h3g	-o02hog	e0,5,0,5 r5,6,5,6 e6,7,6,7
+qhä2pm2hm-	2pm2hm-qärhoäy	d0,3,0,0 e3,10,0,7 i10,10,7,14
+ps d3çßñ6h3wycit817jé5l5ysq1nns0ß	ps d3çßñ6h3wycit817jé5lsysq17np00	e0,23,0,23 r23,24,23,24 e24,28,24,28 i28,28,28,29 e28,29,29,30 r29,31,30,31 e31,32,31,32 r32,33,32,33
+7pñq8zpez0wul83éhö1roj6072it2gt78cév	72it2gt78cév7pñq8zpez0wul83éhö1ro6j0	i0,0,0,12 e0,21,12,33 i21,21,33,34 e21,22,34,35 d22,23,35,35 e23,24,35,36 d24,36,36,36
+ -ymjux2ua3374mbe9i 8c261um00v71xn3ß7	6w85äo03 ç97g ñpoqçsrö7	i0,0,0,8 e0,1,8,9 r1,12,9,11 e12,13,11,12 r13,19,12,13 e19,20,13,14 r20,30,14,22 e30,31,22,23 d31,37,23,23
+bp7	b67	e0,1,0,1 r1,2,1,2 e2,3,2,3
+loßwz	oßwzl	d0,1,0,0 e1,5,0,4 i5,5,4,5
+1öoétpçpia	k6ç4nonü	r0,2,0,5 e2,3,5,6 r3,10,6,8
+g-9ñçnu1go7w5m8pl52jspb-b	g-9ñçnu1go7w5m8pl52jsp-bb	e0,22,0,22 d22,23,22,22 e23,25,22,24 i25,25,24,25
+qz44njbguxs1xz8oie0-r0omdo	nbjuxs1xz8oie0-r0obdoqz44	d0,4,0,0 e4,5,0,1 i5,5,1,2 e5,6,2,3 d6,8,3,3 e8,23,3,18 r23,24,18,19 e24,26,19,21 i26,26,21,25
+ßklçk813d	ßklçk81xd	e0,7,0,7 r7,8,7,8 e8,9,8,9
+ c	c1 	i0,0,0,2 e0,1,2,3 d1,2,3,3
+bjwopk93ib	9kibjowpk	i0,0,0,3 e0,2,3,5 i2,2,5,6 e2,3,6,7 d3,4,7,7 e4,6,7,9 d6,10,9,9
+a  ababba a    aabb baabbbab  b aa   bbba  bab   ab ab  a  aabba  b  bb baa   bb bba b a b  bb a  b ba ab  a a bab  ababaa  b aa ab b b bbb    bbbbbbaab  ab aa  b a  aaabb a a bbabbaaa  b  bba aba abb bbbbbabb baa bbba a bbab b b b bb abaab a bbab aa  aa baabb a babbaab	a  ababba a    aabb baabbbab  b aa   bbba  bab   ab ab  a  aabba  b  bb baa   bb bba ba b  bb a b  ba ab  a a bab  ababaa  b aa ab b b bbb    bbbbbbaab  ab aa  b  a  aaabb a a bbabbaaa  b  bba aba abb bbbbbabb bbaa bbba a bbab b b b bb abaab a bbab aa  aa baabb a babbaab	e0,86,0,86 r86,270,86,271
+vay-g7nöru8öyj 0véuxñ1	-g7nöru8oyj 0véuxñ11vay	d0,3,0,0 e3,11,0,8 r11,12,8,9 e12,22,9,19 i22,22,19,23
+9ckvs	9ckvs	e0,5,0,5
+80579 za94ç7é6öwgl-nifes	l-nifes80759 za94ç7é6öwg	i0,0,0,7 e0,2,7,9 i2,2,9,10 e2,3,10,11 d3,4,11,11 e4,17,11,24 d17,24,24,24
+üb1tñüh9qiyxoxcç2hq	üb1tñüh9qixyotxç2hq	e0,10,0,10 i10,10,10,11 e10,11,11,12 i11,11,12,14 e11,12,14,15 d12,15,15,15 e15,19,15,19
+fonua7rüüjkgprwä0z9ek	9ekfonua7rüüjkgprwä0z	i0,0,0,3 e0,18,3,21 d18,21,21,21
+6äöa	6äöa	e0,4,0,4
+äüvñ51nvfßq3ß97eä4çx45çöptw	äüvñ51nvlq3ß9eäçx54çöptw	e0,8,0,8 r8,10,8,9 e10,14,9,13 d14,15,13,13 e15,17,13,15 d17,18,15,15 e18,20,15,17 i20,20,17,18 e20,21,18,19 d21,22,19,19 e22,27,19,24
+fgçmpdck4cñ60bäeöcid6 w 2-qvi7é-özvfv	gfçmpndck4cñ60bäöecid6 w k-qvi7é-övzfv	i0,0,0,1 e0,1,1,2 d1,2,2,2 e2,5,2,5 i5,5,5,6 e5,15,6,16 i15,15,16,17 e15,16,17,18 d16,17,18,18 e17,24,18,25 r24,25,25,26 e25,33,26,34 i33,33,34,35 e33,34,35,36 d34,35,36,36 e35,37,36,38
+fzsz4vbck7yqlco	zsvz4vck7clof	d0,1,0,0 e1,3,0,2 i3,3,2,3 e3,6,3,6 d6,7,6,6 e7,10,6,9 r10,12,9,10 e12,13,10,11 d13,14,11,11 e14,15,11,12 i15,15,12,13
+q4-jaßhohty6muyw1695	q4-ajneoh6y6muyw1695	e0,3,0,3 i3,3,3,4 e3,4,4,5 r4,7,5,7 e7,9,7,9 r9,10,9,10 e10,20,10,20
+és6u6kß	ésuw6ß	e0,2,0,2 i2,2,2,4 e2,3,4,5 d3,6,5,5 e6,7,5,6
+pkp1äel7mn5heo4äa6pz	elmn5hlo4äa6ptzpkp1ä	d0,5,0,0 e5,7,0,2 d7,8,2,2 e8,12,2,6 r12,13,6,7 e13,19,7,13 i19,19,13,14 e19,20,14,15 i20,20,15,20
+7i4-uocm2 -gäfvvpy1rñéwt1l8ö	 -gäfvvpy1rñéwt1l8ö7i4u-ocm2	d0,9,0,0 e9,28,0,19 i28,28,19,28
+32ä sit7fsñ76zzéoaryßrcv1bzjd75brg	si7s7ñ6zzéoaryßrvc1bzjd75brg32ä 	d0,4,0,0 e4,6,0,2 d6,7,2,2 e7,8,2,3 d8,9,3,3 e9,10,3,4 i10,10,4,5 e10,11,5,6 d11,12,6,6 e12,22,6,16 i22,22,16,17 e22,23,17,18 d23,24,18,18 e24,34,18,28 i34,34,28,32
+hé0jgm3énß4p0özéyän3ns	özéyän3nshé0gm3énß4p0	i0,0,0,9 e0,3,9,12 d3,4,12,12 e4,13,12,21 d13,22,21,21
+qzyözç1v3zooñj34oß6g4hl9ö6wqç	ooñjn34oß64ghl9ö6wqçqzyözç1v3z	i0,0,0,20 e0,10,20,30 d10,29,30,30
+ä02x18çñ8	ç8ñä02x18	i0,0,0,3 e0,6,3,9 d6,9,9,9
+ 2ha4zs kf7ç-6754çü0noa -8	 2ha4zskfç7-6754çü0noa -8v	e0,7,0,7 d7,8,7,7 e8,10,7,9 i10,10,9,10 e10,11,10,11 d11,12,11,11 e12,26,11,25 i26,26,25,26
+rz 	rz 	e0,3,0,3
+    bbbbbabaa  ab ba aab ab  aa abab babbbbabbb  a  a  bb a  aab  a  aabbb aaaabb a bbaaa  ba bababbb  bbb  a ab  baa  abaaaaab  b bb bba ba aab ba bab aa ab bb b ba  bba bb  abbab aaaaab aa  abb  b aa  b     aaba aaaa abba a      bb	aab ba bab aa ab bb b ba  bba bb  abbab aaaaab aa  abb  b aa  b     aaba aaaa abba a      bb    bbbbbabaa  ab ba aab ab  aa abab babbbbabbb  a  a  bbb a  aab  a  aabbb aaaab ba bbaaa  ba bababbb  bbb  a ab  baa  abaaaaab  b bb bba ba 	r0,233,0,234
+çrk 1xdj3ooqvef	bjkvétsi1äp	r0,2,0,2 e2,3,2,3 r3,4,3,8 e4,5,8,9 r5,15,9,11
+o-0pj1üüpn1lñxxn	1lñxxno-0j1üüp	d0,10,0,0 e10,16,0,6 i16,16,6,14
+écinäi 5	écinäxi 5	e0,5,0,5 i5,5,5,6 e5,8,6,9
+fri6-	fri8-	e0,3,0,3 r3,4,3,4 e4,5,4,5
+58t4im3öhv33ßqx8ép5éae05pzyoibp1ñk-1	58t4im3öhv3ß31x8ép5éaüe5pzyobpeñk-1	e0,11,0,11 i11,11,11,12 e11,12,12,13 r12,14,13,14 e14,21,14,21 i21,21,21,22 e21,22,22,23 d22,23,23,23 e23,28,23,28 d28,29,28,28 e29,31,28,30 r31,32,30,31 e32,36,31,35
+gß7kw36tgvw 6nfa6yyä-iöß5ffjat70l	w36tgvwj6nf6ayyä-iöß5ffjat70lgß7k	d0,4,0,0 e4,11,0,7 r11,12,7,8 e12,15,8,11 i15,15,11,12 e15,16,12,13 d16,17,13,13 e17,33,13,29 i33,33,29,33
+fçj4u	dçjr4u	r0,1,0,1 e1,3,1,3 i3,3,3,4 e3,5,4,6
+üzjßmh5jmqçä6vkaç7h856rzéßiükdübbtüé	ßh	d0,3,0,0 e3,4,0,1 d4,5,1,1 e5,6,1,2 d6,36,2,2
+bf9	bf9	e0,3,0,3
+én22qh0wmä01i	én22qh2 0w0mäa1i	e0,6,0,6 i6,6,6,8 e6,8,8,10 i8,8,10,11 e8,10,11,13 r10,11,13,14 e11,13,14,16
+7j 6aööln2ms4z6	7j 6aööln2msz6	e0,12,0,12 d12,13,12,12 e13,15,12,14
+jtlçßug-dß9m7vqwcxtdpl4zm-vviäro1eo	jtlçßug-dß9m7vq wcxtdpl4zm-vviäro1eo	e0,15,0,15 i15,15,15,16 e15,35,16,36
+çd62y-mbçawleé0dps	çd62y-mbçawleé0dp	e0,17,0,17 d17,18,17,17
+kqrwçké5öxi8 7ölqf	kqrwçk5éö39i8z 7öcqf	e0,6,0,6 i6,6,6,7 e6,7,7,8 d7,8,8,8 e8,9,8,9 r9,10,9,11 e10,12,11,13 i12,12,13,14 e12,15,14,17 r15,16,17,18 e16,18,18,20
+gécd-9lvößcbn05améeiäi82d9kmx4jv	vßlq	r0,6,0,2 e6,7,2,3 r7,32,3,4
+is	i 	e0,1,0,1 r1,2,1,2
+qñvn22tñaoüçäzdgjéhhñeçsäö8kupöf9h9z s 	qñvn22tñaoüçäzdgjmhhñeçsäö8kupöf9h9z s 	e0,17,0,17 r17,18,17,18 e18,39,18,39
+3eronéa5bäwße	3eronéa5bäwße	e0,13,0,13
+xwf-n7fvcjthpc	5fvcjthp2xhf-n	r0,6,0,1 e6,13,1,8 r13,14,8,14
+baa     bab bbb b b    a bbabaa a b bbb aa ab ba abb  babbabba ba  baaaa a aa ab   abaaabbab   baabba abbaaa abaabbaaa bbab bb  b abaa bbba a a      aaa bbbab bbaa  abaabbab bbaaa b b ba     a ba  abbbbababaaaaabbbb bbabb aabb b bb aa  bbbab  bba  a   a abbbbbbbabaaaa a babaa b  ab  baaa  baab baa aaa   aa a aaabaab aabbbbaabababaa babba  bb b b abaaa abbba aaa b b   bbbabaa	baa     bab bbb b b    a bbabaa a b bbb aa ab ba abb  babbabba ba  baaaa a aa ab   abaaabbab  baabba abbaaa abaabbaaa bbab bb  b abaa bbba a a      aaa bbbab bbaa  abaabbab bbaaa b b ba     a ba  abbbbababaaaaabbbb bbabb aabb b bb aa  bbbab  bba  a   a abbbbbbbabaaaa a babaa b  ab  baaa  baab baa aaa   aa a aaabaab aabbbbaabababaa babba  bb b b abaaa abbba aaa b b   bbbabaa	e0,94,0,94 r94,377,94,376
+q4oc2plokpcö3r1f0éro-dybn88üipñzrlörpw4	q4oc2plokpcö3r1f0éro-dybn88üipñzrlröpw4	e0,34,0,34 i34,34,34,35 e34,35,35,36 d35,36,36,36 e36,39,36,39
+o68lü3m6no wxt2-y-5267üy	ñ9-py3yqnr8	r0,2,0,10 e2,3,10,11 d3,24,11,11
+q	q	e0,1,0,1
+ofyäzüe12rwtoñyz99osrça	jqsgjmay5ä jyjrc 6	r0,2,0,7 e2,3,7,8 i3,3,8,9 e3,4,9,10 r4,9,10,14 e9,10,14,15 r10,23,15,18
+çrñßöyutgvaq	brñßñyugvaq	r0,1,0,1 e1,4,1,4 r4,5,4,5 e5,7,5,7 d7,8,7,7 e8,12,7,11
+ç3z ñ88ñlüqpñhnh8vntsbtlgö	öç3v ñ882lqpñhnha8vntsbtlg	i0,0,0,1 e0,2,1,3 r2,3,3,4 e3,7,4,8 r7,8,8,9 e8,9,9,10 d9,10,10,10 e10,16,10,16 i16,16,16,17 e16,25,17,26 d25,26,26,26
+df3bö9g2mjlenf9p9dt	dfbög2ömjlenf9p9t	e0,2,0,2 d2,3,2,2 e3,5,2,4 d5,6,4,4 e6,8,4,6 i8,8,6,7 e8,17,7,16 d17,18,16,16 e18,19,16,17
+vfk5y8säat	vfk5y8säat	e0,10,0,10
+9ikñv2éçö9mñvfgwmcéwök7mg6nu6a		d0,30,0,0
+1mmtkgä4v9m-vml6öj6ghihhqpxu04çm1jäq0y	1mmtkgä4v9m-vml6öj6ghihhpxu04çm1jäq0y	e0,24,0,24 d24,25,24,24 e25,38,24,37
+ññf2a0mp9äñzy8l50s0	ññf2a0mp9ñäyz8l0s0	e0,9,0,9 i9,9,9,10 e9,10,10,11 r10,11,11,12 e11,12,12,13 d12,13,13,13 e13,15,13,15 d15,16,15,15 e16,19,15,18
+ a83ß3anjk54étcdufwgiöiom8rfa5x	fa5x a83ß3anjk54étdufwgiiöom8r	i0,0,0,4 e0,14,4,18 d14,15,18,18 e15,21,18,24 i21,21,24,25 e21,22,25,26 d22,23,26,26 e23,27,26,30 d27,31,30,30
+5dnwñ89k5daßcfäo2	5dnwñ89k5daßcfäo2	e0,17,0,17
+sr53hpäy äñt7büknç3cpuä3 péxüä5u0	yätñ7büknç3cpuä36péxüä5u0sr53wpä	r0,6,0,1 e6,7,1,2 r7,10,2,3 e10,11,3,4 d11,12,4,4 e12,24,4,16 r24,25,16,17 e25,33,17,25 i33,33,25,32
+bg1ßi8iq	bg1oß6ciq	e0,3,0,3 i3,3,3,4 e3,4,4,5 r4,6,5,7 e6,8,7,9
+-yvjfn7ññuqnvivxyz3pvçsn4czusc3ö	-yvjfn7ññuqvixyze0vçsn4zeusc3ö	e0,11,0,11 d11,12,11,11 e12,14,11,13 d14,15,13,13 e15,18,13,16 r18,20,16,18 e20,25,18,23 d25,26,23,23 e26,27,23,24 i27,27,24,25 e27,32,25,30
+3		d0,1,0,0
+rkn6906qkj3e2yälayh8miu7mm49wc7-whhp4	 ößeéd72öv91o7wlézz70o	r0,4,0,10 e4,5,10,11 i5,5,11,20 e5,6,20,21 r6,37,21,22
+ß54qadçn -q37rhe02uyhööjwzjhn6ßui1	s9zaw2éjöoéçß8oö	i0,0,0,12 e0,1,12,13 r1,21,13,15 e21,22,15,16 d22,34,16,16
+ b a ba abbba  bbb  aabaa ba bba ba  bba aaaba a aabab   bbb bba ab  aab aabb aa   aaaaaab ba  aaaaba bbbbaaa  b aa    babb a   b b a aba a aaa a aa b  ab a ba b  bab  b  abbaabab a bbabb b aa b abb ab ba b ab ba  b ba  ba     bba ab bbbb aaa b b    b a b  a a a ba a bbabb b  aab baaab abbbabb aba baa abab  abbbba  a aaba     abbb a aabab aa  ab  ab aaab aaaa a b 	 b aabaa bba a b bb bb a bbbb aaabb aa    aabaaabaaaa  aa b ab  a  babaa aa bab b   b ba bbb  bbabab a  bb abbabb     bbb  aaa baa   aaaaa  bbabaababb babb bbaa a  a   aaabab a bba  bb b aa  	e0,2,0,2 d2,19,2,2 e19,27,2,10 d27,44,10,10 e44,49,10,15 d49,53,15,15 e53,55,15,17 d55,58,17,17 e58,63,17,22 i63,63,22,23 e63,65,23,25 r65,66,25,28 e66,68,28,30 d68,69,30,30 e69,70,30,31 d70,73,31,31 e73,83,31,41 i83,83,41,49 e83,87,49,53 i87,87,53,55 e87,88,55,56 i88,88,56,77 e88,92,77,81 i92,92,81,87 e92,93,87,88 i93,93,88,131 e93,99,131,137 d99,108,137,137 e108,112,137,141 r112,113,141,144 e113,115,144,146 r115,118,146,150 e118,124,150,156 d124,128,156,156 e128,129,156,157 d129,130,157,157 e130,131,157,158 d131,141,158,158 e141,146,158,163 r146,147,163,164 e147,149,164,166 d149,150,166,166 e150,153,166,169 d153,174,169,169 e174,185,169,180 i185,185,180,182 e185,193,182,190 d193,194,190,190 e194,195,190,191 d195,366,191,191
+ymh-wat	1	r0,7,0,1
+ñ761jd1kz36bl	z3-6blñ7416jd1k	i0,0,0,6 e0,2,6,8 i2,2,8,10 e2,3,10,11 d3,4,11,11 e4,8,11,15 d8,13,15,15
+d4kik13ja5	ik1j5a4d4k	i0,0,0,7 e0,3,7,10 d3,10,10,10
+v59vulhkgng8ef	v59vulhkgng8wf	e0,12,0,12 r12,13,12,13 e13,14,13,14
+xpj4ol2qöj69uäwu097kjufoz	xpj4lo2qöj6uäwu097kjufzo	e0,4,0,4 i4,4,4,5 e4,5,5,6 d5,6,6,6 e6,11,6,11 d11,12,11,11 e12,23,11,22 i23,23,22,23 e23,24,23,24 d24,25,24,24
+5ynujxäxb6qté83ßhc91	y5nujxäxb6qté83çhc91	i0,0,0,1 e0,1,1,2 d1,2,2,2 e2,15,2,15 r15,16,15,16 e16,20,16,20
+ov6q1ébßnhevdn9é l7j8u4w1rmf8ä1épdüfl8si	ñr3mkzöä5rdwñ5zc	r0,12,0,10 e12,13,10,11 d13,23,11,11 e23,24,11,12 r24,40,12,16
+äyüricét7q1bß6tkrh9ßçß3tw4	çß3ätw4äyüricét71bß6tkrhiß	i0,0,0,7 e0,9,7,16 d9,10,16,16 e10,18,16,24 r18,19,24,25 e19,20,25,26 d20,26,26,26
+pgsr14ä9cbhemoüfxk2çkpßä5fg7c	gsr14ä97cbhemo7fxu2çkpßä5fg7cp	d0,1,0,0 e1,8,0,7 i8,8,7,8 e8,14,8,14 r14,15,14,15 e15,17,15,17 r17,18,17,18 e18,29,18,29 i29,29,29,30
+g6zm1w6xkscßolümpepçhdi7ññegjédßböbä	g6zm1w6xkscßolümpepçhdi7ññegjédßböbä	e0,36,0,36
+5	5	e0,1,0,1
+dumlögcßxjédim8r2jçb9ñhçñ1ä	et88vpbyäö5y	r0,4,0,9 e4,5,9,10 r5,27,10,12
+e-334ijañdi	e-334ijañdi	e0,11,0,11
+äsgñdn6ol06öm ärpjä	äsgñdn6ol06öm ärpjä	e0,19,0,19
+ zä39mn	znä9mn	d0,1,0,0 e1,2,0,1 i2,2,1,2 e2,3,2,3 d3,4,3,3 e4,7,3,6
+mßy2kltütexßu8g4üné1c2çiäo0édtln	xßu8g4üné1cç2iäo0édtlnmßykvl2tüte	d0,10,0,0 e10,21,0,11 i21,21,11,12 e21,22,12,13 d22,23,13,13 e23,32,13,22 i32,32,22,33
+3üp340qloçktwx7z5xiizp	i340lqoçktwxñ5zxiizp3ü	r0,3,0,1 e3,6,1,4 i6,6,4,5 e6,7,5,6 d7,8,6,6 e8,14,6,12 r14,15,12,14 e15,16,14,15 d16,17,15,15 e17,22,15,20 i22,22,20,22
+bçg1	bç4g1p	e0,2,0,2 i2,2,2,3 e2,4,3,5 i4,4,5,6
+-crk5t-4inxsümfr5mé9sö9kövytpçcñö	ücrk5t-4inxsümfr5mé9sö9kövytpçcñö	r0,1,0,1 e1,33,1,33
+ababb   abba ba bbaabaabba aaa bb aabaa aba aab aaaaaba abab a baa abbab ab  aa  b b   ab ab b a  aa bb b a aaba a bb bb b abb  aaab b abaab bbb  b b bba   ba aab a  bbba  a a aa ab aaabba babb b a abbbbabababaaaabaababba  a a    babaaaa  b abab   aab  babab  a     aab  aabbabb   a aabba aabb   b aa aabb   aaaa bb  abbbbb a  b     baab  b   a bb   a a  baaabb  bb  abaabaa a b b a abbbabbbbb a b abbbaba bba	ababb   abba ba bbaabaabba aaa  b aabaa aba aab aaaaaba abab a baa abbab ab  aa  b b   ab ab b a b aa bb b a aaba a bbabb b abb  aaa b abaab bbb  b b bba   ba aab a  bbba  a a aa ab aaabba babb  a abbbbabababaaaabaababba  aba    babaaaa  b abab   aab  babab  a     aab  aabbabb   a aabba aabb   b aa aabb   aaaa bb  abbbbb a  b     baab  b   a bb   a a  baaabb  bb  abaabaa a b b a abbbabbbbb a b abbbaba bba	e0,31,0,31 r31,409,31,408
+2unwöp4	ö4bfp	d0,4,0,0 e4,5,0,1 i5,5,1,4 e5,6,4,5 d6,7,5,5
+pçmüuhtoä-m26qät7250d4i ttjjokäçbñl	7250d4ijetjjokäçbñlpçmüuhtoäm26qät	d0,16,0,0 e16,23,0,7 r23,25,7,9 e25,35,9,19 i35,35,19,34
+vöuü-1-2j2juécßç	vöuü-1-22juécßç	e0,8,0,8 d8,9,8,8 e9,16,8,15
+fozfglä ö5iwxo2bsj5rm61ryxictxßßacvt	fozfglä ö5iwxo2bsj5rm61ryxictxßßacvt	e0,36,0,36
+j	j	e0,1,0,1
+ü-91ürsqfçqnü3ç5y-ä1	ürsqfçqnü3çöy-äü-91	d0,4,0,0 e4,15,0,11 r15,16,11,12 e16,19,12,15 i19,19,15,18 e19,20,18,19
+8nc 5okxcxnnsr dpcaö1a7v-iv138jñm1üzlj6	nnsr3 dpcaö1a7v-ilvw38jñmü1zlj68nc 5okexcx	d0,10,0,0 e10,14,0,4 i14,14,4,5 e14,26,5,17 i26,26,17,18 e26,27,18,19 r27,28,19,20 e28,33,20,25 i33,33,25,26 e33,34,26,27 d34,35,27,27 e35,39,27,31 i39,39,31,42
+üi4xuuiä6	cixu81	r0,1,0,1 e1,2,1,2 d2,3,2,2 e3,5,2,4 r5,9,4,6
+däpdoiw	cäpdoiw	r0,1,0,1 e1,7,1,7
+jrçol	jrçol	e0,5,0,5
+ou3doz-éümwvñwjö38fffçç	ou3doz-éümwvñwjö38sffçç	e0,18,0,18 r18,19,18,19 e19,23,19,23
+857l9xtzls lsjjfuf-ßdq3wxeci3xsl	uff-ßdq3xeci3xsl87l9xtzls lsjj	i0,0,0,16 e0,1,16,17 d1,2,17,17 e2,15,17,30 d15,32,30,30
+üñ2-yfçhwdal55z9üpäqbz2tßz	üdñ2-yfçwdal55z9üpäqbz2xz	e0,1,0,1 i1,1,1,2 e1,7,2,8 d7,8,8,8 e8,23,8,23 r23,25,23,24 e25,26,24,25
+eußoy9öçduk19	eußo9yöçduk19	e0,4,0,4 i4,4,4,5 e4,5,5,6 d5,6,6,6 e6,13,6,13
+ge9to	togp9	d0,3,0,0 e3,5,0,2 i5,5,2,5
+8s	8q0	e0,1,0,1 r1,2,1,3
+91vftgc7a8düps0f0xcm-8éç	ç91vftc7a8düps0f0xcm-é8	i0,0,0,1 e0,5,1,6 d5,6,6,6 e6,21,6,21 i21,21,21,22 e21,22,22,23 d22,24,23,23
+z0ä 0n6tfms1vlesu1zh	z40ä 0n6tims1lvesuz1h	e0,1,0,1 i1,1,1,2 e1,8,2,9 r8,9,9,10 e9,12,10,13 i12,12,13,14 e12,13,14,15 d13,14,15,15 e14,17,15,18 i17,17,18,19 e17,18,19,20 d18,19,20,20 e19,20,20,21
+eöoä74vd2uba3	2uab3eöoä47vd	i0,0,0,5 e0,4,5,9 i4,4,9,10 e4,5,10,11 d5,6,11,11 e6,8,11,13 d8,13,13,13
+b  aaa  b   a a aaabba  babaab  bbbb    ab abababaa   ba  a baa bbb aaa   aabaa aabbababbbbb b ab   baabb aaa bababb aa aa b aabb b ab  bb bba  aa aaa baaaaba bbab a bbab aabaaa  aaaaab bbb  aba a aa bbbab	aaa bababb aa aa b aabb b ab  bb bba  aa aaa baaaba bbab a bbab aabaaa  aaaab bbb  aba a aa bbbabb  aaa   b  a a aaabba  babaab  bbbb    ab abababaa   ba  a baa bbb aaa   aabaa aabbababbbbb b ab   baabb 	r0,205,0,203
+ao	8ao	i0,0,0,1 e0,2,1,3
+zomñy42m2azs owszzhéeifwmyön3y-s39y	zhéeifwmyön3y-s39yzomñyl42m2azs wsz	d0,17,0,0 e17,35,0,18 i35,35,18,35
+r05alä	r05alä	e0,6,0,6
+33éç7v-oy7ñygtl5pnqsññp	3éçv-oycñuygtl5pnqsññp	d0,1,0,0 e1,4,0,3 d4,5,3,3 e5,9,3,7 r9,10,7,8 e10,11,8,9 i11,11,9,10 e11,23,10,22
+ñ7 0jäp-9çoowüütyn-mhkßuz4aodbrasoah-8ä	7 0jäp-9çoowüütyn-mhkßuz4aodbrasoah-ä	d0,1,0,0 e1,37,0,36 d37,38,36,36 e38,39,36,37
+6z9u8c-xöqg6mgw00mft3w3u6pwns	mçgw0 0mft3w3u6pwns6z9u8c-xöqg6	d0,12,0,0 e12,13,0,1 i13,13,1,2 e13,16,2,5 i16,16,5,6 e16,29,6,19 i29,29,19,31
+znffé2	znfé2	e0,3,0,3 d3,4,3,3 e4,6,3,5
+8éjuoo0dmvcxachb8u355dfsj-tüp5w11us3	8éjuoo0dmvcxachb8u355dfsj-tüp5w11us3	e0,36,0,36
+éßlygñün8h7agvl7loé48mh2ä82ß	ii-29mçmr3j00yüöp6güéwö	i0,0,0,20 e0,1,20,21 r1,28,21,23
+sznöpvn	sznöcvn	e0,4,0,4 r4,5,4,5 e5,7,5,7
+qfmy42ötgoi5beyk0ql	ötwgoi5beykqö0qlfmy42	d0,6,0,0 e6,8,0,2 i8,8,2,3 e8,16,3,11 i16,16,11,13 e16,19,13,16 i19,19,16,21
+3m8iqtnuidd4djwswb	tnuid4ddjwswb3r8iñ	d0,5,0,0 e5,10,0,5 i10,10,5,6 e10,11,6,7 d11,12,7,7 e12,18,7,13 i18,18,13,18
+y5-fmeä60ta5oléph28dt8xg3wbtovxj	y5f-meä60ta5oléph28t8xg3wbtovxj	e0,2,0,2 i2,2,2,3 e2,3,3,4 d3,4,4,4 e4,19,4,19 d19,20,19,19 e20,32,19,31
+fä7oqfpock0x28öe9p	yä7oqfpokc0x2ö8e9p	r0,1,0,1 e1,8,1,8 i8,8,8,9 e8,9,9,10 d9,10,10,10 e10,13,10,13 i13,13,13,14 e13,14,14,15 d14,15,15,15 e15,18,15,18
+tx9ißvñr03fxäbqy040éw5tfdéd	tx9ißvñr03f3äbqy040éw5tfdéd	e0,11,0,11 r11,12,11,12 e12,27,12,27
+qrg0jx3ga202rtquöh81iz yyzbzwh8ak	qjg0jx3ga202rtquöh81iz yyzbzßhak	e0,1,0,1 r1,2,1,2 e2,28,2,28 r28,29,28,29 e29,30,29,30 d30,31,30,30 e31,33,30,32
+ü11	18-1	d0,1,0,0 e1,2,0,1 i2,2,1,3 e2,3,3,4
+5t7rck9çö8q1hs8qk7b6 di8ñ uzl5ñ	5t7rck9çö8q1hs8qk7b6 di8ñ uzl5ñ	e0,31,0,31
+t1kñ-7-gb7-céptl5gg819i	l5gg819it1kb-78-zbt-écpt	d0,15,0,0 e15,23,0,8 i23,23,8,24
+bb b ab aaa  b ba  abb aaabbb  a baaa b b bab aab bbabbbaa bba  baba b aa ba aabb  ba b a b a baabbaaabaabaa ba   ab baa b  ab   bbabb baa baaaabbaba  a  ab a aaaaa babbbba baab   bab  abbbabb   a aaa ba  a ab baaa ba aaaaa aab   a baaababbabb    bbba  b abb     a  b bb a aaabb b aa  aabaabb a baba aba b b aabbbabaa baaabba  b a aa     a  	bb b ab aaa  b ba  abb aaabbb  a baaa b b bab aab bbabbbaa bba  baba b aa ba aabb  ba b a b a baabbaaabaabaa a   ab baa b  ab   bbabb baa baaaabbaba  a  ab a aaaaa babbbba baab   bab  abbbabb   a aaa ba  a ab baaa ba aaaaa aab   a baaababbabb    bbba   abb     a  b bb a aaabb b aa  aabaabb a baba aba b b aabbbabaa baaabba  b a aa     a  	e0,109,0,109 r109,341,109,339
+q	q	e0,1,0,1
+nj4ä7vbsxsücçr0	nj7vbsxñsücçr0	e0,2,0,2 d2,4,2,2 e4,9,2,7 i9,9,7,8 e9,15,8,14
+rlu0mky4qhöyovröf ßü0	rluä0my4qhyvoöf uü0	e0,3,0,3 i3,3,3,4 e3,5,4,6 d5,6,6,6 e6,10,6,10 d10,11,10,10 e11,12,10,11 i12,12,11,12 e12,13,12,13 d13,15,13,13 e15,18,13,16 r18,19,16,17 e19,21,17,19
+mßä9wßç2éex33ghag4ñcqü	mßäl9wçß2éex33ghag4ñct6ü	e0,3,0,3 i3,3,3,4 e3,5,4,6 i5,5,6,7 e5,6,7,8 d6,7,8,8 e7,20,8,21 r20,21,21,23 e21,22,23,24
+848 um ipewüaoöh2lihryvz	88 um ipewüaoh2lihyrvz	e0,1,0,1 d1,2,1,1 e2,14,1,13 d14,15,13,13 e15,20,13,18 i20,20,18,19 e20,21,19,20 d21,22,20,20 e22,24,20,22
+urslnbb10lql0töx77q5zß-lñxl2ßedt ö1	urslnbb10lql0töx77q5zß-lñxl2ßedt ö1	e0,35,0,35
+ ij1auxeuhbßocrñxe2b 8	 ij1auxeuhbßocrñxe2b 8	e0,22,0,22
+h4ojbo06oädcj8épmßn79ww56a	h4ojbo0o6ädcj8épmßn79ww5a6	e0,7,0,7 i7,7,7,8 e7,8,8,9 d8,9,9,9 e9,24,9,24 i24,24,24,25 e24,25,25,26 d25,26,26,26
+5lsz9dtpj8	slz19dtpj85	r0,1,0,1 e1,2,1,2 d2,3,2,2 e3,4,2,3 i4,4,3,4 e4,10,4,10 i10,10,10,11
+md-débo1lcüoydwjgyç	md-débo1lcüoydwjgyç	e0,19,0,19
+v9öépi6uhçi2oyouc	h8ly4	d0,8,0,0 e8,9,0,1 r9,13,1,3 e13,14,3,4 r14,17,4,5
+rnijcc1ibig-éjw6cx0ddéj4yw3ewéä 	cx0ddéj4yw3ewéäq rrn7jcc1ibig-éjw6	d0,16,0,0 e16,31,0,15 i31,31,15,16 e31,32,16,17 i32,32,17,34
+05pu8l--l66000v74ikhl5kbp1i6myxwqüßrß6	05pu8l--l66000v74ikah5kbp1i6myxwqüßrß6	e0,19,0,19 i19,19,19,20 e19,20,20,21 d20,21,21,21 e21,38,21,38
+ö6	ö6	e0,2,0,2
+f18-oä87ig3y2mbbçöiäö7yyçx7b0	f183-oä87ig3y2mbçöiäö7yyex7bn0	e0,3,0,3 i3,3,3,4 e3,15,4,16 d15,16,16,16 e16,24,16,24 r24,25,24,25 e25,28,25,28 i28,28,28,29 e28,29,29,30
+ñfgzj32zisgn	ñfgzj32zisgn	e0,12,0,12
+wkoüyz5aulm4ßkwiñ	koüy6a07um4ßkwiñw	d0,1,0,0 e1,5,0,4 r5,7,4,5 e7,8,5,6 i8,8,6,8 e8,9,8,9 d9,10,9,9 e10,17,9,16 i17,17,16,17
+xv-tüoöaväx6qufñllß9 4	xv-tüoöaväx6qufñllß9 4	e0,22,0,22
+4-1técotst	4-téoctst	e0,2,0,2 d2,3,2,2 e3,5,2,4 i5,5,4,5 e5,6,5,6 d6,7,6,6 e7,10,6,9
+ababb b babbbb   a  ab   b b abab a  a  ab     b bb b b       b   abba  abbbbba bb  bb     baa aa  ba ab a abbb b ba ba   ba a bbab aba b  bbbb  b b   bba bb aaaa b aaaa b  bbabbb b b abb bab abbb  abbabb a  b ab  aa aaab bab  bababa b  bbbb aba bbbaa  b   aaaa     aa aabb aabbbababa a  bbaa  bb bbb b a aa baa bbab ab a aa  a    a babab  baaba bb baba  abbaababaa  b b aa aa aabaaababababbbb ab b  bab	ababb b babbbb   a  ab   b b abab a  a  ab     b bb b b       b   abba  abbbbba bb  bb     baa aa  ba ab a abbb b ba ba   ba a bbabaaba b  bbbb  b b   bba bbb aaaa b aaaa b bbabbb b b abb bab abbb  abbbb a  b ab  aa aaab bab  bababa b  bbbb aba bbbaa  b   aaaa     aa aabb aabbbababa a  bbaa  bb bbb b a aa baa bbab a b a aa  a    a babab  baaba bb baba  abbaababaa  b b aa aa aabaaababababbbb ab b  bab	e0,131,0,131 r131,403,131,403
+6jçvüöri6fßçzplp8ßg97afßpy51pü9i5ñññw2	afßpy51p9i5ñññw26jçvülri6fßçzptpl8ßg97	i0,0,0,16 e0,5,16,21 r5,6,21,22 e6,14,22,30 i14,14,30,32 e14,15,32,33 d15,16,33,33 e16,21,33,38 d21,38,38,38
+l3f9h9-ßohçvwrl9m	lf39h9-ßoçhwvr9m	e0,1,0,1 i1,1,1,2 e1,2,2,3 d2,3,3,3 e3,9,3,9 i9,9,9,10 e9,10,10,11 r10,11,11,12 e11,12,12,13 d12,13,13,13 e13,14,13,14 d14,15,14,14 e15,17,14,16
+pqiéç5301gst0cdf0hhñ	pqiéç5031gt0cdf0hhñ	e0,6,0,6 i6,6,6,7 e6,7,7,8 d7,8,8,8 e8,10,8,10 d10,11,10,10 e11,20,10,19
+o03y81u4ö6k9ñuabu	xu4ö69ñuabuo03y8	r0,6,0,1 e6,10,1,5 d10,11,5,5 e11,17,5,11 i17,17,11,16
+jed7a6ußgçj4t 6p1kwcs9h1ctoçw66 o08 89	6p1kwcs9h1ckoçw66 o08 89jed7a6ußgçj4t 	i0,0,0,24 e0,14,24,38 d14,38,38,38
+ä3y7lbe cpisc6hmyäh4oñöß2vd0ü6 0cit31cxg	ä3y7lbe cpisc6hmyäh4oñöß25d0ü6 0ctä31cxg	e0,25,0,25 r25,26,25,26 e26,33,26,33 d33,34,33,33 e34,35,33,34 i35,35,34,35 e35,40,35,40
+-3wr137ic8k78l7w-y	-3-wr137icak7l7wy-	e0,2,0,2 i2,2,2,3 e2,9,3,10 r9,10,10,11 e10,12,11,13 d12,13,13,13 e13,16,13,16 i16,16,16,17 e16,17,17,18 d17,18,18,18
+nrzsñm3rozj5mek8dbzenw	rnzlsñm3rozj5mek8dbz enw	i0,0,0,1 e0,1,1,2 d1,2,2,2 e2,3,2,3 i3,3,3,4 e3,19,4,20 i19,19,20,21 e19,22,21,24
+äjß1éöqb11g4pz3tun1cs5é 7	z3tun1cs5é 7äjßç1öqb11g4p	d0,13,0,0 e13,25,0,12 i25,25,12,25
+hyäçrhñpbttq	0otßkhui8öé2nie jla omük7w08gßjurlç4bñ	i0,0,0,5 e0,1,5,6 r1,3,6,34 e3,4,34,35 r4,6,35,37 e6,7,37,38 d7,12,38,38
+6xid	id6ix	d0,2,0,0 e2,4,0,2 i4,4,2,5
+lp	9l5po	i0,0,0,1 e0,1,1,2 i1,1,2,3 e1,2,3,4 i2,2,4,5
+ yfñf5i1t1-ßria9lloqyx	 yfñf5i1t1-ßria9lloqyx	e0,22,0,22
+lvtä-yä7nu	nulatä-yä	i0,0,0,2 e0,1,2,3 r1,2,3,4 e2,7,4,9 d7,10,9,9
+fñbßkk5hio58z6nx7	fñg3bßkk5hoi598z6nx7	e0,2,0,2 i2,2,2,4 e2,8,4,10 i8,8,10,11 e8,9,11,12 d9,10,12,12 e10,11,12,13 i11,11,13,14 e11,17,14,20
+ökd62ry0kpiöv64qvmdec84ßüiimk	ökd62ry0kpiöv64qvmdec84ßüiimk	e0,29,0,29
+vks0u-9ßet7e-xygö-y ü-3140ööxvñ9gy-kämar	-kä	d0,34,0,0 e34,37,0,3 d37,40,3,3
+ñtü5ué7xawpg-zñbn7rßcl79j9xf	zñbn7rjcl79j9xfñqü5ué7xawpg-	i0,0,0,1 e0,1,1,2 r1,2,2,17 e2,13,17,28 d13,28,28,28
+q3a810m	a810mq3	d0,2,0,0 e2,7,0,5 i7,7,5,7
+b baba    b bb aa a abaaa   ab bab    a a  aababaaa  bbb aab  ab aaa bbba  abaaaa   a b  a bbb babbbbb  a    bab  abb ab aabaa bbab b a a bbba a  abb babbbaaaabbaa aaaa  baaabb baba aaa   ba  b   a  ab ababbbaa a abbbbbbbbaaba  baababbaa bb  aaaab  bba baba bb b b abbababbb ba b  aa abbab a  b b aaa bbb a b     b  aa  aabbababa 	aa abb a   b a   aabba ba  b  aaab  ba  aab aab a abababbbaaa aba abba baabbb  a b a   aaa a abababba aa 	i0,0,0,5 e0,2,5,7 d2,3,7,7 e3,4,7,8 d4,7,8,8 e7,12,8,13 i12,12,13,75 e12,15,75,78 i15,15,78,88 e15,23,88,96 d23,31,96,96 e31,33,96,98 d33,139,98,98 e139,144,98,103 d144,162,103,103 e162,164,103,105 d164,330,105,105
+pm	k	r0,2,0,1
+xv1ßjoruinxudm-	aöhx8w8qlap	i0,0,0,3 e0,1,3,4 r1,15,4,11
+3p-vhlrpeçé9w	6öq8jaä	r0,13,0,7
+i1çäñtvüxe6	i1çäñtvüxe6	e0,11,0,11
+lc58wd3mkkli0uv5hw5lc7säuü-çü3c	cl58wd3mkkli0u35hwllc7säuüç-üc3	i0,0,0,1 e0,1,1,2 d1,2,2,2 e2,14,2,14 r14,15,14,15 e15,18,15,18 r18,19,18,19 e19,26,19,26 i26,26,26,27 e26,27,27,28 d27,28,28,28 e28,29,28,29 i29,29,29,30 e29,30,30,31 d30,31,31,31
+ks qs98ßv1lm2ebtt4ns49iäof8crv	q6 1üvl8 bötn1fß4a4	r0,2,0,2 e2,3,2,3 r3,6,3,7 e6,7,7,8 i7,7,8,15 e7,8,15,16 d8,17,16,16 e17,18,16,17 r18,20,17,18 e20,21,18,19 d21,30,19,19
+ng7041to24ñnceüaae6q2 a7t5lñ	34k-ituzojuwbc34jbds-	r0,4,0,1 e4,5,1,2 r5,6,2,5 e6,7,5,6 i7,7,6,8 e7,8,8,9 r8,9,9,15 e9,10,15,16 r10,28,16,21
+öysää4-çf-hçoi6ç57	75öysä4f-çf-hçki6ç	i0,0,0,2 e0,4,2,6 d4,5,6,6 e5,6,6,7 i6,6,7,8 e6,12,8,14 r12,13,14,15 e13,16,15,18 d16,18,18,18
+5äqt4	yt64ä	r0,1,0,4 e1,2,4,5 d2,5,5,5
+t8q84çüw0	çüw0teq8	d0,5,0,0 e5,9,0,4 i9,9,4,8
+uwuul6i8q8ßm7ulbrwz0iatñub-ß09kuézz2xñ	ézzexñuwuul6i8q8ßm7ulbrwz0iatb-ß 9ku	i0,0,0,6 e0,23,6,29 d23,25,29,29 e25,28,29,32 r28,29,32,33 e29,32,33,36 d32,38,36,36
+gmçüçbthidr4qf8um	gm6çüçbthidr4qf8um	e0,2,0,2 i2,2,2,3 e2,17,3,18
+xñjöecotuç1j5ßñ3qäfs9moß9eu8	qäfs9mo9eu8xñjöecotuç1j5ßñ3	i0,0,0,11 e0,16,11,27 d16,28,27,27
+ßw7yoxgcytqnyyfwñ ñ8éqgtn3sét	wñ ñ8éqgtn3sétßw7ykoxgcytqnyyf	d0,15,0,0 e15,29,0,14 i29,29,14,30
+çe74j7tñosncy	çeç4j7tñosncy	e0,2,0,2 r2,3,2,3 e3,13,3,13
+täuuükdéxwzä15-nj4zlnfv	uükdéxwzä5n-jz4lnfvtu	d0,3,0,0 e3,12,0,9 d12,13,9,9 e13,14,9,10 i14,14,10,11 e14,15,11,12 d15,16,12,12 e16,17,12,13 i17,17,13,14 e17,18,14,15 d18,19,15,15 e19,23,15,19 i23,23,19,21
+ßu6	äv	r0,3,0,2
+7bm3	h	r0,4,0,1
+t5ñh7	5ph7y	d0,1,0,0 e1,2,0,1 r2,3,1,2 e3,5,2,4 i5,5,4,5
+    aba ba b  bb b abbabbaaab b b  ba aab  b baaa a   a bba b    a  aaa babb aa ab a bbb ba baba aa bbbbab bbaaa a aba  bbbbaba bba baabaabaab   a a bbabbab  aa abb  bbb bb a b bbaabbbbb  aa bba a b  b ba a bb     a baab aaaaaab  baaab a bbbabbaaabbba abbaabbb babba b   ba baab a b a ba bbaa b aaaaba aababa   ba baaaa bb   b  bbb aabba aa  bbaaaa  aba  bbbaab   aaaaaaaaaaba  b a	 a bb     a baab aaaaaab  baaab a bbbabbaaabba abbaabbb babba b   ba baab a b a ba bbaa b aaaaba aababa   ba baaaa bb   b  bbb aabba aa  bbaaa  aba  bbbaab   aaaaaaaaaaba  b a    aba ba b  bb b abbabbaaab b b  ba aab  b baaa a   a bba b    a  aaa babb aa ab a bbb ba bba a bbbbab bbaaa a aba  bbbbaba bba baabaabaab   a a bbabbab  aa abb  bbb bb a b bbaabbbbb  aa bba a b  b ba	e0,1,0,1 r1,381,1,377
+fkeß68xüluyomos	fkeß68lxuy-omo	e0,6,0,6 i6,6,6,7 e6,7,7,8 d7,9,8,8 e9,11,8,10 i11,11,10,11 e11,14,11,14 d14,15,14,14
+lnñanwze2tähç4qzwx8wfqdpfxäpwnsnuo	lnñanwze2tähç4qzwx8fqdpfxäpwnsnuo	e0,19,0,19 d19,20,19,19 e20,34,19,33
+09 6hh75feek0ü9ß	ß096hh75feekü9	i0,0,0,1 e0,2,1,3 d2,3,3,3 e3,12,3,12 d12,13,12,12 e13,15,12,14 d15,16,14,14
+uirüçtr3ñsétnndnüraz3hsf4b00bw	uirüçtr3ñsétnndnüraz3thsf4b0bw	e0,21,0,21 i21,21,21,22 e21,27,22,28 d27,28,28,28 e28,30,28,30
+ño0iokwj5lé-b97ü1dncz8y18uowqhé6bgyñ9mk	kwj5l-égb97ü1dncz8y18uowqhéb6gyñ9kmño0io	d0,5,0,0 e5,10,0,5 i10,10,5,6 e10,11,6,7 r11,12,7,8 e12,31,8,27 i31,31,27,28 e31,32,28,29 d32,33,29,29 e33,37,29,33 i37,37,33,34 e37,38,34,35 r38,39,35,40
+j0x878bcozfç	0x88bcozfç	d0,1,0,0 e1,4,0,3 d4,5,3,3 e5,12,3,10
+ßé7yñv2u3um1ö	u3lm1ößéyñv2	i0,0,0,6 e0,2,6,8 d2,3,8,8 e3,7,8,12 d7,13,12,12
+rhñmn557s8aätél	rhñmn557s8aätél	e0,15,0,15
+ñß3ç1wi5pçü32gwbße	ñß3ç1wi5pçü32wgsbße	e0,13,0,13 i13,13,13,14 e13,14,14,15 r14,15,15,16 e15,18,16,19
+1l8erdñççßñeñn	yñta5ic81	i0,0,0,8 e0,1,8,9 d1,14,9,9
+z-h3q8 p laz6ñ39vwzfl	z-h38q  plaz6ñ39vwzfl	e0,4,0,4 i4,4,4,5 e4,5,5,6 r5,6,6,7 e6,8,7,9 d8,9,9,9 e9,21,9,21
+qö1-ö	n	r0,5,0,1
+ßrä1pg9ç8çxax5552gb1wqß329uk	ßä1pg9ç8xax5552gb1wqß329uq	e0,1,0,1 d1,2,1,1 e2,9,1,8 d9,10,8,8 e10,27,8,25 r27,28,25,26
+xrñgoyxeäsuzé	xrgyxeäsugé	e0,2,0,2 d2,3,2,2 e3,4,2,3 d4,5,3,3 e5,11,3,9 r11,12,9,10 e12,13,10,11
+ßgevusb82x7cq4nöh7offç-9kwrel763nu 7ß	ßgevusb8x7cq4nh7offç-9kwrel763nu 7ß	e0,8,0,8 d8,9,8,8 e9,15,8,14 d15,16,14,14 e16,37,14,35
+u-ooysquño721üf9z2xditjçlwey9dé	oysquüo721üf9z2xditjçlwey9déu-o	d0,3,0,0 e3,8,0,5 r8,9,5,6 e9,31,6,28 i31,31,28,31
+mmjephkßk1	mmemhqk61	e0,2,0,2 d2,3,2,2 e3,4,2,3 r4,5,3,4 e5,6,4,5 i6,6,5,6 e6,7,6,7 r7,9,7,8 e9,10,8,9
+4w3ü2kqt20vht	qt2z0vht4w3ç2k	d0,6,0,0 e6,9,0,3 i9,9,3,4 e9,13,4,8 i13,13,8,14
+c8mc4np5y	y5cmc4np	i0,0,0,2 e0,1,2,3 d1,2,3,3 e2,7,3,8 d7,9,8,8
+b ab  bbba a b    a baab  bb a  aabaaa ab a   bb bbbbbb bababab bbbbabbb bb aaaba b b b   aa a bb a    aaaa a a ba   abb b bba  b   baa bab  a   ba  abab a    abaabbaba  b ba b bbbbaabb aabaaabbbaaa a bbaa     a a  abbaaa bbaba bbbbbb   ab b	b ab  bbba a b    a baab  bb a  aabaaa ab aa   bb bbbbbb bababab bbbbabbb bb aaaba b b b   aa a bb a    aaaa a a ba   abb b bba  b   baa bab  a   ba  abab a    abaabbaba  b ba b bbbbaabb aabaaabbbaaa a bbaa     a a  abbaaa bbabba bbbbbb   ab b	e0,43,0,43 r43,241,43,243
+b3ék7oüypz2hngß2éñdvßt5	b3ék7oüyoz2hgnß2éñdvßt5	e0,8,0,8 r8,9,8,9 e9,12,9,12 i12,12,12,13 e12,13,13,14 d13,14,14,14 e14,23,14,23
+alo7uumvf04xñöfbé0ñ58py	o7uumcvf0x4ñöfbé0ñl8pyal	d0,2,0,0 e2,7,0,5 i7,7,5,6 e7,10,6,9 i10,10,9,10 e10,11,10,11 d11,12,11,11 e12,19,11,18 r19,20,18,19 e20,23,19,22 i23,23,22,24
+bdzbpl5imvndtkw-ñeü5xy-jm1sco7vväü95	vvüä95bdbzp6limvndtk5-ñeü5xy-jm1sco7	i0,0,0,6 e0,2,6,8 i2,2,8,9 e2,3,9,10 d3,4,10,10 e4,5,10,11 i5,5,11,12 e5,6,12,13 d6,7,13,13 e7,14,13,20 r14,15,20,21 e15,30,21,36 d30,36,36,36
+w-çöx7l8ywgpç1q2g3höoxßqçb8yub	w-çöx7l8ywgpç1q2g3höoxßqçb8yub	e0,30,0,30
+t	t	e0,1,0,1
+ß4x0ll83itpüçp20lça5ß9ü4ac61ék	lça5ß9ü4ac1ékß4x0l8l3itpüçp20	d0,16,0,0 e16,26,0,10 d26,27,10,10 e27,30,10,13 i30,30,13,29
+äläd3a0ä9a7brb8vydqüj	74ñhé2äfmßäpnuöd-höé	i0,0,0,6 e0,1,6,7 r1,2,7,10 e2,3,10,11 i3,3,11,15 e3,4,15,16 r4,21,16,20
+hgérzkqk8aucß4yäcqe8	cf1-hl4ysbßqhß5a9	i0,0,0,4 e0,1,4,5 r1,13,5,6 e13,15,6,8 r15,17,8,11 e17,18,11,12 r18,20,12,17
+8sloqtéprzknqcic7zx9oç8aoho4ü33h806	h8068slox6qté-przkncqic7zx9oç8aoho4ü33	i0,0,0,4 e0,4,4,8 i4,4,8,10 e4,7,10,13 i7,7,13,14 e7,12,14,19 i12,12,19,20 e12,13,20,21 d13,14,21,21 e14,31,21,38 d31,35,38,38
+y8l2éñfs48	s48x2léñf	r0,1,0,2 e1,2,2,3 i2,2,3,5 e2,3,5,6 d3,4,6,6 e4,7,6,9 d7,10,9,9
+ünvl0üö8nj0iäevr-yç	v-ryçünvl0üö8j0iäe	i0,0,0,5 e0,8,5,13 d8,9,13,13 e9,14,13,18 d14,19,18,18
+wvßf8jz6ññu	vßf8cjz6ññuw	d0,1,0,0 e1,5,0,4 i5,5,4,5 e5,11,5,11 i11,11,11,12
+9u1kc	9u1kc	e0,5,0,5
+-a2üüa6	2öj6a-a	i0,0,0,5 e0,2,5,7 d2,7,7,7
+0ücxßvaw1y -ñvzpaä6ß-utç	ßxvaw1y -ñvzpaä6ßyutç0üc	r0,3,0,1 e3,4,1,2 d4,5,2,2 e5,20,2,17 r20,21,17,18 e21,24,18,21 i24,24,21,24
+kdö50ngän2jñ5el1a1vh82v5rz97üy51öeä	kdö5wngän2j5ñel1a1vh82v5rz97üy51öeä	e0,4,0,4 r4,5,4,5 e5,11,5,11 i11,11,11,12 e11,12,12,13 d12,13,13,13 e13,35,13,35
+2öñb-gmkük8rt	2öñbgmkük8rt	e0,4,0,4 d4,5,4,4 e5,13,4,12
+-ünwh bq5fs-767ßüß9y6hftqñb hnyñé27	-ünwh zd5fs-767ßüß9y6hftqñb hnyñé2ß	e0,6,0,6 r6,8,6,8 e8,34,8,34 r34,35,34,35
+7jßwa 	7jßwa 	e0,6,0,6
+ba bb  aabb bbaa aa baba abab  b  b baaab a  aa   bba bbaaa  abbab baaabb a  babab b baaaaaaaaa   aab  bb  abb b b aa a b bbb babb  a b  aaba a     bb bbb abb aabbaa    b bb b bb aab  aaba aabb    bbaabb a aa  a aaab abba b  aabbbb  b abbaa bbaa bbaaa a   a bbbaa ab bbbbaabaaa   a abbba b a	ba aabb    bbaabb a aa  a aaab abba b  aabbbb  b abbaa bbaa bbaaa a   a bbbaa ab bbbbaabaaa   a abbba b aba bb  aabb bbaa aa baba abab  b  b baaab a  aa   bba bbaaa  abbaba baaabb a  babab b baaaaaaaaa   aab  bb  abb bb  aa  b bbb babb  a b  aaba a     bb bbb abb aabbaa    b bb b bb aab  aa	e0,3,0,3 r3,291,3,291
+ö4ü6aquñ3e2yf91p4lñ74nfh	nfhö46üauqñ3ey2f91z4lñ7ü4	i0,0,0,3 e0,2,3,5 i2,2,5,6 e2,3,6,7 d3,4,7,7 e4,5,7,8 i5,5,8,9 e5,6,9,10 d6,7,10,10 e7,10,10,13 i10,10,13,14 e10,11,14,15 d11,12,15,15 e12,15,15,18 r15,16,18,19 e16,20,19,23 i20,20,23,24 e20,21,24,25 d21,24,25,25
+jpész0t äl326soaqo7e	kfr20	r0,5,0,4 e5,6,4,5 d6,20,5,5
+öwnq eöxdy7höql0y9	öwnq eöxdyh7qöl0y9	e0,10,0,10 i10,10,10,11 e10,11,11,12 r11,12,12,13 e12,13,13,14 d13,14,14,14 e14,18,14,18
+3iqz01skñjs	3iqz01skñjs	e0,11,0,11
+ylebße-tig1ef-lhnhpnk xr-h-ö1s	ylbeße-tig1ef-lhnhpnk xr-h-ö1s	e0,2,0,2 i2,2,2,3 e2,3,3,4 d3,4,4,4 e4,30,4,30
+ws9e 1	 9se 1	r0,1,0,2 e1,2,2,3 d2,3,3,3 e3,6,3,6
+nt5kfi3x1mcdt v6ßäotwrjhr	nt5kfi3x1cmdt v6ßotwrjrh	e0,9,0,9 i9,9,9,10 e9,10,10,11 d10,11,11,11 e11,17,11,17 d17,18,17,17 e18,23,17,22 i23,23,22,23 e23,24,23,24 d24,25,24,24
+hv 6üjsä2ik9yviiñé4eümi7 2x z4w9xh9dzw-	hv 6üjsä2ik9yviiñé4eümi7 2x z4w9xh9dzw-	e0,39,0,39
+nalnçyncfby7m8v	nlanççö-yncfby7m8	e0,1,0,1 i1,1,1,2 e1,2,2,3 d2,3,3,3 e3,5,3,5 i5,5,5,8 e5,14,8,17 d14,15,17,17
+2ghysä6d	nj	r0,8,0,2
+ßy9ph5x9e3rezo	we3ezroyß9ph5x	i0,0,0,8 e0,1,8,9 d1,2,9,9 e2,7,9,14 d7,14,14,14
+j2k ß d5-7wä4ts84tölt1dçvs3üv8dsugp3wa	j2k ß d5-7wä4st84töltdçvs3üv8dsup3ga	e0,13,0,13 i13,13,13,14 e13,14,14,15 d14,15,15,15 e15,21,15,21 d21,22,21,21 e22,33,21,32 d33,34,32,32 e34,36,32,34 r36,37,34,35 e37,38,35,36
+7kßqç617ité0bjjvsñäjfnnoçi3	bjvsñäjfnnçoi37kßqç61i7té0	d0,12,0,0 e12,13,0,1 d13,14,1,1 e14,23,1,10 i23,23,10,11 e23,24,11,12 d24,25,12,12 e25,27,12,14 i27,27,14,26
+h4w0çgvñ6lubjbu-m-od71ejcéç9w	h4w0çgvñ6lubjbu-m-od71ejcéç9w	e0,29,0,29
+3ññ-ßéiö-hßäpwüßqkçf4ésew	ç78n8béb9dgek5ühßvpc4édfñ	r0,5,0,6 e5,6,6,7 r6,9,7,15 e9,11,15,17 r11,12,17,18 e12,13,18,19 r13,20,19,20 e20,22,20,22 r22,25,22,25
+npxñb9z1q	xñb9zb1ünw	d0,2,0,0 e2,7,0,5 i7,7,5,6 e7,8,6,7 r8,9,7,10
+1ß9-oishelg9ç	1ß9-oiwshleg9ç	e0,6,0,6 i6,6,6,7 e6,8,7,9 i8,8,9,10 e8,9,10,11 d9,10,11,11 e10,13,11,14
+48lxe	rj2	r0,5,0,3
+tx7ozic-	icç-tüx7uoz	i0,0,0,4 e0,1,4,5 i1,1,5,6 e1,3,6,8 i3,3,8,9 e3,5,9,11 d5,8,11,11
+ aba aaaaabb abaaabb b a a a  b a ba a bb aaabba aa  b b   a  a baa a a bba a  ab  ababb  bbbbb  aaa aa aabbb a    abaab bbbb abbaaba bb   bab aabbb ba   baab a b bab  aaaababaa bba   ba  aaaba  baba b b abb  a   ab bab b a bbba  b a a  aaba bb abaaaa aaabbbaba aba    aa   b abaabab  bb a bab ab bb b b a a b abbbbabab a abbbbb ab bb a bbabbaa a  aaab      bb ababababa bb  aa   abab a  baaa bba   ab   aabb 	 aba aaaaabb abaaabb b a a a  b a ba a bb aaabba aa  b b   a  a baa a a bba a  ab  ababb  bbbbb  aaa aa aabbb a    abaab bbbb abbaaba bb   bab aabbb ba   baab a b bab  aaaababaa bba   ba  aaaba  baba b b abb  a   ab bab b a bbba  b a a  aaba bb abaaaa aaabbbaba aab    aa   b abaabab  bb a bab ab bb b b a a b abbbbabab a abbbbb ab bb a bbabbaa a  aaab      bb ababababa bb  aa   abab a  baaa bba   ab   aabb 	e0,263,0,263 r263,409,263,409
+zv26	ñ	r0,4,0,1
+ßqb4gzfhzbkkcbrwf3ky3e9uç	fhzbkkcbrwf3ky3e9uçwqb4gz	d0,6,0,0 e6,25,0,19 i25,25,19,25
+4ms24lhw 2é3a1mzcér8ajk0qaññaßb	4ms24lhw 2é3a1mzcér8ajk0qaññaßb	e0,31,0,31
+éy4bçgsvßs4özplhß déöbn3	éy4bçgsvßs4özplhß déöbnö	e0,23,0,23 r23,24,23,24
+ytfe6zd4472iew	ytfe6zd4f472eiw	e0,8,0,8 i8,8,8,9 e8,11,9,12 i11,11,12,13 e11,12,13,14 d12,13,14,14 e13,14,14,15
+p-e0éo82ivij4lc7	ps0éo82ivij4l57	e0,1,0,1 r1,3,1,2 e3,14,2,13 r14,15,13,14 e15,16,14,15
+pxiyb0sñ4l4äh-9bä ö8go9ñsoiqm8rlüñ05bü	pxiyböusñ4h4äh-9bä ö8go9ñsoiqm8rlüñ0bü	e0,5,0,5 r5,6,5,7 e6,9,7,10 r9,10,10,11 e10,35,11,36 d35,36,36,36 e36,38,36,38
+y49mewd87g8çççx-23n1hü5ñthu00 z	y49mewd87ggs9ççx-ö23n1h5ñthu00 z	e0,10,0,10 r10,12,10,13 e12,16,13,17 i16,16,17,18 e16,21,18,23 d21,22,23,23 e22,31,23,32
+4juälgcsgxhvd	4lulgcsgähvd	e0,1,0,1 r1,2,1,2 e2,3,2,3 d3,4,3,3 e4,9,3,8 r9,10,8,9 e10,13,9,12
+o b	uoßu2uñdzçdñ0ñff8vfr	i0,0,0,1 e0,1,1,2 r1,3,2,20
+wu7vßilhrrpswgfu9üj72qw-zgiäéy2uhç3cel 	wu7vßilhrrpswgfu9üj72qw-zgiäéy2uhç3cel 	e0,39,0,39
+sg8r7urnhöqszcjwä8ttb4ñn8	jä8tb4ñn8sgr7urnhöqszc	i0,0,0,9 e0,2,9,11 d2,3,11,11 e3,14,11,22 d14,25,22,22
+ 6l5ñ6ao	85qo	r0,3,0,1 e3,4,1,2 r4,7,2,3 e7,8,3,4
+06shqibäkä1autx1a2o	06shiqbäkä1autx1a2o	e0,4,0,4 i4,4,4,5 e4,5,5,6 d5,6,6,6 e6,19,6,19
+yneosda6mr69l9tk4d2ñ9yuçß	5ußçyneosda6mr69lt9kd2ñ9y	i0,0,0,4 e0,13,4,17 i13,13,17,18 e13,14,18,19 d14,15,19,19 e15,16,19,20 d16,17,20,20 e17,22,20,25 d22,25,25,25
+ajrsö0zc -épeaiajdü3ßm xs1ht	ajrsö0zc -épeaiaj3ü3ßm xsht	e0,17,0,17 r17,18,17,18 e18,25,18,25 d25,26,25,25 e26,28,25,27
+0é1ä8aoä2h1bi04pla1ksd	0é1ä8aoä2h1ib0z4pla1ktd	e0,11,0,11 i11,11,11,12 e11,12,12,13 d12,13,13,13 e13,14,13,14 i14,14,14,15 e14,20,15,21 r20,21,21,22 e21,22,22,23
+kcä0éurybdcy9beäkrçp é9o äb-u7	-7kcä0éu8ybdcy9beäkrçp é1o äb	i0,0,0,2 e0,6,2,8 r6,7,8,9 e7,22,9,24 r22,23,24,25 e23,27,25,29 d27,30,29,29
+q7säz	k vhä	r0,3,0,4 e3,4,4,5 d4,5,5,5
+ abaab bab  a ab    a   a a a  ab abaaa aaabbabba  a ba baa baabbbbbbb  ba  b abba ab  abbaabba  a b ab a  aa  aab  aaaa babba  a    aab ba b  ba  bbbaabbaabb  bbaaaaaaba  aa  ba aa aa bbbbba   aabbaba  a  a abbaababb aaa b b bbbaabbab  aa babbaaa   b b b  aaaa  bbaa abbaa  bb b a aa  b  abbbb abaab baa abbaa babab  a abbab ababbbbbb aa a a bababb	 abaab bab  a ab    a   a a a  ab abaa aaabbabba  a ba baa baabbbbbbb  ba  b abba ab  abbaabba  a b ab a  aa  aab  aaaa babba  a    aab ba b  ba  b bbaabbaabb  bbaaaaaaba  aa  ba aaa a bbbbba   aabbaba  a  a abbaababb aaa b b bbbaabbab  aa babbaaa   b b b  aaaa  bbaa abbaa  bb b a aa  b  abbbb abaab baa abbaa babab  a abbab ababbbbbb aa a a bababb	e0,38,0,38 r38,349,38,349
+3ñ8sjclwalhcm90f 	3ojsclalhc90f 	e0,1,0,1 r1,3,1,3 e3,4,3,4 d4,5,4,4 e5,7,4,6 d7,8,6,6 e8,12,6,10 d12,13,10,10 e13,17,10,14
+wpw7402kköa5mev	köa5mevpww7402k	d0,8,0,0 e8,15,0,7 i15,15,7,15
+0u6gtzu1i7pnbüñ3äévp öjturuor b9	jturuol b90u6gzñ15i7npbüñ3äévp ö	i0,0,0,10 e0,4,10,14 d4,5,14,14 e5,6,14,15 r6,7,15,16 e7,8,16,17 i8,8,17,18 e8,10,18,20 i10,10,20,21 e10,11,21,22 d11,12,22,22 e12,22,22,32 d22,32,32,32
+3	3	e0,1,0,1
+2dpj	pj2	d0,2,0,0 e2,4,0,2 i4,4,2,3
+ayiu0ñ6mf7n4é ßdräg90ééñ9f ub	dräg9qiééñ9f ubayiu0ñ6m7fn4é ß	i0,0,0,15 e0,8,15,23 i8,8,23,24 e8,9,24,25 d9,10,25,25 e10,15,25,30 d15,29,30,30
+jmr1kl m4hu -w-cknw9zö9p5had	jmr1kl m4h -w-cknw9zö9p5hda	e0,10,0,10 d10,11,10,10 e11,26,10,25 i26,26,25,26 e26,27,26,27 d27,28,27,27
+-pvs-b6h8gmbeve3 3gv86ädoä3 tüw	4k	r0,31,0,2
+nñ-rf5n7n4t	4ñ9rfn5n4t	r0,1,0,1 e1,2,1,2 r2,3,2,3 e3,5,3,5 i5,5,5,6 e5,6,6,7 d6,8,7,7 e8,11,7,10
+23jü4wi	éjüw 2	r0,2,0,1 e2,4,1,3 d4,5,3,3 e5,6,3,4 r6,7,4,6
+c tq-jaem25io9géé8j5ühcp	c t-qjaem25io9géé8j5ühcp	e0,3,0,3 i3,3,3,4 e3,4,4,5 d4,5,5,5 e5,24,5,24
+u9u88j8ñ	u98u8j8ñ9	e0,2,0,2 i2,2,2,3 e2,3,3,4 d3,4,4,4 e4,8,4,8 i8,8,8,9
+1l1g65ç2ja9y0-n7ejm- -gfnfß6tömev	- -gffß6tämev1l1g65ç2ja90-n7ajm	i0,0,0,13 e0,11,13,24 d11,12,24,24 e12,16,24,28 r16,17,28,29 e17,19,29,31 d19,33,31,31
+dpyicb3	27çönsr	r0,7,0,7
+üöz0367xvö1tsn3v3c05366zñtmiñe2	üöz0367xvö1tsan3v3c053ß6-ñtmiñe2	e0,13,0,13 i13,13,13,14 e13,21,14,22 i21,21,22,23 e21,22,23,24 r22,24,24,25 e24,31,25,32
+b8ezxßcmübdaf4äüjda	b8ezxßmcübdaf4cäüjdra	e0,6,0,6 i6,6,6,7 e6,7,7,8 d7,8,8,8 e8,14,8,14 i14,14,14,15 e14,18,15,19 i18,18,19,20 e18,19,20,21
+ñgtq w65sçy2b7ñc782ü1k-21syñf4svçewo66i	82ü1-21syñf4sv6çewo66iñgtq w65sçl2b7ñc7	i0,0,0,22 e0,10,22,32 r10,11,32,33 e11,17,33,39 d17,39,39,39
+h1u zvl4spl5bbwmhzänljib4-u9ñan7uu	h1u zvlñspl5bb7wmhzänlj1b4-u9ñan7uu	e0,7,0,7 r7,8,7,8 e8,14,8,14 i14,14,14,15 e14,22,15,23 r22,23,23,24 e23,34,24,35
+hoqwpcß69w2ßh3juoy2vtx3u3	hoqwpcß69w2ßh3juoy2vtx3u3	e0,25,0,25
+b aaab baa a abbbbaaab bbb  bb aaabaaabb aaab bbbbbbb  b  a aab abbab baa  babaabaa  a b a bbbbba aab  a b baa b    bb aabba  a  aa ba abbbabaa bab ba bab  a ababba abb  ab   aaaaa b aaaabba a b ababbb bb ba  a  b  a   a baa aa	 b b babbbb   bab abaa abba  ba b b  a   bab a ba aa ba b ab  baabb a b  ba aba a aaabb aaa     ba  bb a aa b a aabb  	i0,0,0,16 e0,3,16,19 d3,7,19,19 e7,12,19,24 d12,16,24,24 e16,19,24,27 i19,19,27,30 e19,20,30,31 i20,20,31,42 e20,23,42,45 i23,23,45,47 e23,24,47,48 i24,24,48,53 e24,25,53,54 i25,25,54,59 e25,29,59,63 i29,29,63,66 e29,32,66,69 i32,32,69,74 e32,33,74,75 i33,33,75,76 e33,35,76,78 i35,35,78,82 e35,44,82,91 i44,44,91,96 e44,45,96,97 i45,45,97,99 e45,48,99,102 d48,53,102,102 e53,54,102,103 i54,54,103,107 e54,56,107,109 d56,57,109,109 e57,63,109,115 d63,100,115,115 e100,103,115,118 d103,227,118,118
+nbm90bq-cnjfñoö0yäyk8ojñé69	nbm90bq-cnjfñoö0yäyk8ojñé69	e0,27,0,27
+ic9qpäuñ8äjékp	ic9qpäñ8uäjékp	e0,6,0,6 d6,7,6,6 e7,9,6,8 i9,9,8,9 e9,14,9,14
+ptjl	ptjl	e0,4,0,4
+7n6wtçqrkéoejsñk3-	kéoejsñhf3-76wtçsr	d0,8,0,0 e8,15,0,7 r15,16,7,9 e16,18,9,11 i18,18,11,18
+2axh4çbyoyü4	2axh4çyny4ü	e0,6,0,6 d6,7,6,6 e7,8,6,7 r8,9,7,8 e9,10,8,9 i10,10,9,10 e10,11,10,11 d11,12,11,11
+9jk110süü0dwa9cijwüofch69übb9çßé	üü0dwa9cijñwüofch696bb9çßé9xk110s	d0,7,0,0 e7,17,0,10 i17,17,10,11 e17,25,11,19 r25,26,19,20 e26,32,20,26 i32,32,26,33
+47avb8	-i9	r0,6,0,3
+xtg3b2rrql3üdgñq480sn496reäm9ob	xtg3b2rrql3üdgñq480sn496r8äm9ob	e0,25,0,25 r25,26,25,26 e26,31,26,31
+ß65utqgc29e--dvvz-olutz-6ipksq5dxmrn	ß65utqgc29e--dvvz-olutz-6ipksq5dxmrn	e0,36,0,36
+h4oghüöf4yq5wpjz37swiw50ñz7hlb1k	50ñz7hhlb1kh4oghüöf4yq5wpjñz37swiw	i0,0,0,11 e0,15,11,26 i15,15,26,27 e15,22,27,34 d22,32,34,34
+uñßekhepnjhikü1uxé2nßgß-ääöoedßaöou7	uñßekheptnjikü1uxé2nßgß-ääöodßaöou7	e0,8,0,8 i8,8,8,9 e8,10,9,11 d10,11,11,11 e11,28,11,28 d28,29,28,28 e29,36,28,35
+üid5w1 ñp026üßa81dsuß	üid5wt14 ñp026üßa8dsßu	e0,5,0,5 i5,5,5,6 e5,6,6,7 i6,6,7,8 e6,16,8,18 d16,17,18,18 e17,19,18,20 i19,19,20,21 e19,20,21,22 d20,21,22,22
+h03a-l6gvçm2écéfifk	h03a-l6gvçm2écéfifk	e0,19,0,19
+3äbçügmizh-üwäqmw4xffrel	3äbçgümiz4-üwäqwxffrel	e0,4,0,4 i4,4,4,5 e4,5,5,6 d5,6,6,6 e6,9,6,9 r9,10,9,10 e10,15,10,15 d15,16,15,15 e16,17,15,16 d17,18,16,16 e18,24,16,22
+sbinw0ñaçn2äéwgçff ü7 i6üh432vuü4äxw-ñ89	sbinf0ñaçn2äéwgçff n7 i6üh432kvuü4äxw-ñ89	e0,4,0,4 r4,5,4,5 e5,19,5,19 r19,20,19,20 e20,29,20,29 i29,29,29,30 e29,40,30,41
+bdägützeö5s8jbv2	6ö5s8jvb2bdägte	r0,8,0,1 e8,13,1,6 i13,13,6,7 e13,14,7,8 d14,15,8,8 e15,16,8,9 i16,16,9,15
+v-9110ikfmßéc5l4cyaz	v-9110ikfmßéc5l4cyaz3	e0,20,0,20 i20,20,20,21
+cnpñ8 fpç0synf8möq	cnp8ñ fpç0synnf8möq	e0,3,0,3 i3,3,3,4 e3,4,4,5 d4,5,5,5 e5,13,5,13 i13,13,13,14 e13,18,14,19
+y8hbö1röb7	vxr9p39n	r0,6,0,2 e6,7,2,3 r7,10,3,8
+  bb    aabb bababaaaabb  aa aabba  aaabaa   ab aaabaabbbbbbb b aa   baaa  abaaa aa aaaa    b a b bbab b abaab ababb b b     abaaba  baabbbab	aa bab babbb a abb aa baa aaabaa a  aaabbbab  a  b b babbbb a bb ba a aa    b babbbaab abba baba  b abbbb   b a b abb bbb a aabbabbaabbbaaa  bb ab aba baa  a b   aa   abbbaabaaaa b   a  abba a ab bba  abbabb bababa babaab b a    a b 	r0,141,0,233
+rmb6h5mlk1b3772	rmb6uh5mlk1b3772	e0,4,0,4 i4,4,4,5 e4,15,5,16
+4zhüqwñha8ßc4xjupñg1w6mç75kmñ9cx0 6lükñ	4zhüqwñha8ßc4xjupñg1w6mç75kmñ9cx0 6lükñ	e0,39,0,39
+é6krl73bysñtfhéögm7vñw	ñtfhéögm7vñwé6krc73bys	d0,10,0,0 e10,22,0,12 i22,22,12,22
+oyüaösß 6uzw2mr06oen	mr06oenoyüaösß 6uzw2	i0,0,0,7 e0,13,7,20 d13,20,20,20
+éuéjuß5drkhñ7ü	éuéjuß5drkhñ7	e0,13,0,13 d13,14,13,13
+z8ö5ä s cö5t3	s cö5t3z8ö5ßä 	d0,6,0,0 e6,13,0,7 i13,13,7,14
+sqz1fc98tça7og0ao2öwzi64uéüny0äpj	og0ar2öwzi64uéünby0äpjsq1zfc98tça7	d0,12,0,0 e12,16,0,4 r16,17,4,5 e17,28,5,16 i28,28,16,17 e28,33,17,22 i33,33,22,34
+74 l5o6pb8 aefuuf63ömli 0	aß9u01zñb8vüa7uh54-t3çcw	r0,8,0,8 e8,10,8,10 r10,11,10,12 e11,12,12,13 r12,14,13,14 e14,15,14,15 r15,18,15,20 e18,19,20,21 r19,25,21,24
+1däw	1d6w	e0,2,0,2 r2,3,2,3 e3,4,3,4
+9üqjf31qöcnw9l 6ñß12ieféyvçvtps0wñöim	ß12ieféyvtçvtps0wñöim9üqjfy1qöcnw9 l6ñ	d0,17,0,0 e17,26,0,9 i26,26,9,10 e26,37,10,21 i37,37,21,38
+kvv	kvvt	e0,3,0,3 i3,3,3,4
+äönpdcöe9n-mä007yudl	nomä007yudläönpdcöe9	i0,0,0,11 e0,9,11,20 d9,20,20,20
+6-tmüe7-5mv9ex6çnñçawvarö0sk8g	6-tmüe7-5mv9ex6çñnçauvarö0sk8g	e0,16,0,16 i16,16,16,17 e16,17,17,18 d17,18,18,18 e18,20,18,20 r20,21,20,21 e21,30,21,30
+äw-1nüyñ8g3rx 1 b1	ycpi7ßégb2	d0,6,0,0 e6,7,0,1 r7,9,1,7 e9,10,7,8 d10,16,8,8 e16,17,8,9 r17,18,9,10
+ß8rdmnf2lxü1ue	f2lxüe1ueß8rdm	i0,0,0,9 e0,5,9,14 d5,14,14,14
+ fbqccbämfükd-wbñ4öu	 fbqccbämfükd-wbñ4öu	e0,20,0,20
+aüçec40péznükrwbñfä43izxjü3äeft3quäüyc	aüçe4c0péznükrwbñféä43izxjü3äeft3tuäqyc	e0,4,0,4 i4,4,4,5 e4,5,5,6 d5,6,6,6 e6,18,6,18 i18,18,18,19 e18,32,19,33 r32,33,33,34 e33,35,34,36 r35,36,36,37 e36,38,37,39
+ä3qfly	3ñqflt	d0,1,0,0 e1,2,0,1 i2,2,1,2 e2,5,2,5 r5,6,5,6
+añf	aqüf	e0,1,0,1 r1,2,1,3 e2,3,3,4
+a   bbb babb b b  ba b a bb  aba bba b  ab  b ba   babaa aa bab aaba a  aaaaaaba b  b  a  bb bba abab  aab abaababba bbab    aaaab aa a bba bab aba aa ba b a   a  a  a bbb    bbbbbaa a bbb   ba babab b  bbaaababba abbabab a baaabaabaaab b   aaabb bbab   b  b  aaaa	 abbaa   aaaaaaba b  b  a  bb bba abab  aab abaababba bbab    aaaab aa a bba bab ab a aa ba b a   a  a  a bbb    bbbbbaa a bbb   ba babab b  bbaaababba abbabab a baaabaabaaab b   aaabb bbab   b  b  aaaaa   bbb babb b b  ba b a bb  aba bba b  ab  b ba   babaa aa bab	r0,264,0,265
+ium	igum	e0,1,0,1 i1,1,1,2 e1,3,2,4
+t9s17n5u0ß2hf92rérj2fyqwrs64qä5oz34p3wö	t9s17n5u0ß2hf92rérj2fyqwrs64qä5oz34p3wö	e0,39,0,39
+78j6dkgpjml6ñt9 n fuhe8q4kexol2lfq9b	a5érjf00auq19cbñz3	r0,2,0,4 e2,3,4,5 r3,12,5,15 e12,13,15,16 r13,36,16,18
+n-fpzb2vqsjzr3öbcät4gk	n281eu7h	e0,1,0,1 d1,6,1,1 e6,7,1,2 r7,22,2,8
+vqeoyu5mngcup5xr64	r4vqeoyu5mngcup53x6p	i0,0,0,2 e0,14,2,16 i14,14,16,17 e14,15,17,18 d15,16,18,18 e16,17,18,19 r17,18,19,20
+éñ	t	r0,2,0,1
+qj 1ai-vmd6hdf8q	 1ai-tvmd6hd8qqj	d0,2,0,0 e2,7,0,5 i7,7,5,6 e7,13,6,12 d13,14,12,12 e14,16,12,14 i16,16,14,16
+x5f7jrdkñg50ür189o1mx6vxäöjd-3	g50ür18fo1mx6vxäöjd-35xf7jrkdö	d0,9,0,0 e9,16,0,7 r16,17,7,8 e17,30,8,21 i30,30,21,30
+ -h5mrnqägaßpynvéimöño5rc1ñ03ñ0kz	ä6	d0,8,0,0 e8,9,0,1 r9,33,1,2
+y1k-äßßtoß-ävc4çfh05w6wvex0éw väñé	ä-vc4çfh05w6wvuex0éwm väñéy1k-äßßtoß	r0,3,0,1 e3,4,1,2 d4,12,2,2 e12,24,2,14 i24,24,14,15 e24,29,15,20 i29,29,20,21 e29,34,21,26 i34,34,26,36
+rdßrhö9ä9bbhr10xb0k81zf14ah4k0pa	0xb0k81züf14ah4k0pardßrhö9ä9bbhr1	i0,0,0,19 e0,14,19,33 d14,32,33,33
+ñrrk7ç7opsmäex	ñrrk7ç7opsmäex	e0,14,0,14
+q		d0,1,0,0
+y6y4ßß 31x21bwçgowréxhkj	y4ßß 31x2bçwgowréxjky6	d0,2,0,0 e2,11,0,9 d11,12,9,9 e12,13,9,10 i13,13,10,11 e13,14,11,12 d14,15,12,12 e15,21,12,18 r21,22,18,19 e22,23,19,20 r23,24,20,22
+ufññe3f1 k9étwwn1ß7ü9jm9o3çüpyéo	ufññe3f1 k9étwwn1ß7ü9jm9o3üçpyéo	e0,26,0,26 i26,26,26,27 e26,27,27,28 d27,28,28,28 e28,32,28,32
+ée7tbribhb	tbrihbbe7	d0,3,0,0 e3,7,0,4 d7,8,4,4 e8,10,4,6 i10,10,6,9
+k7ñn4 7öj8ßt3adyße55y4siä2ivdßpgj289	k7ñn4 7öj8ßt3adyße55y4siä2ivdßpgj289	e0,36,0,36
+mje9ßeö 2	me9ßeö 2	e0,1,0,1 d1,2,1,1 e2,9,1,8
+3ou0l2gç8lvaç8yç7-r-lçzn4ä2qp	kq -ßp9ih8r2cqxß605wm4uiç	r0,2,0,22 e2,3,22,23 r3,7,23,24 e7,8,24,25 d8,29,25,25
+a  bbaa aaa ab b  b ababbbaa ba   b  bab b ababb baab    a aa baa aa     ab a  aa  abbb ab   aaa  abbabaabaaba  a abbab  a bab  baa bbba aa a aa a  aa   abba bababa a bab  ab  baa  b bbb  abb aa a b  aba ba bab  a bbb   aba  bb bbbbb aab abaa ab a bbbbb b bbbab  abbb bab  b   ba a aabbbb b a bb  abba   baaab aabaab baa       bbbb ab  b   ab a a b	aa a  aa   abba bababa a bab  ab  baa  b bbb  abb aa a b  aba ba bab  a bbb   aba  bb bbbbb aab abaa ab a bbbbb b bbbab  abbb bab  b   ba a aabbbb b a bb  abba   baaab aabaab baa       bbbb ab  b   ab a a ba  bbaa aaa ab b  b ababbbaa ba   b  bab b ababb baab    a aa baa aa     ab a  aa  abbb ab   aaa  abbabaabaaba  a abbab  a bab  baa bbba aa a 	e0,1,0,1 r1,348,1,348
+jüw4ze8géç4aqbüz14zycgta6yw9j	4zycgta6yw9jjüw4ze8géç4aqbüz1	i0,0,0,12 e0,17,12,29 d17,29,29,29
+bmc1öseuéh2uñeqk5su	bmc1öseuéh2uñeqk5su	e0,19,0,19
+0xoi5chij 3lz8s5bedyemañvxq-vwh	5chij 3lz8s5bedyekmñavxq-vwhq0xoi	d0,4,0,0 e4,21,0,17 i21,21,17,18 e21,22,18,19 i22,22,19,20 e22,23,20,21 d23,24,21,21 e24,31,21,28 i31,31,28,33
+ç0dey6ß1jbnprqui9ö780u10ralytvrao	äñkrso0ä2p3ülßeaeñ	r0,1,0,6 e1,2,6,7 r2,3,7,14 e3,4,14,15 d4,25,15,15 e25,26,15,16 r26,33,16,18
+42	pä	r0,2,0,2
+zéhm8rt5qü1mbrßßlüd	zeéhm8rt5qü1mbrßßlüd	e0,1,0,1 i1,1,1,2 e1,19,2,20
+4a7öañ1g	4a7aöñg	e0,3,0,3 i3,3,3,4 e3,4,4,5 d4,5,5,5 e5,6,5,6 d6,7,6,6 e7,8,6,7
+8oäöu57wy	8oäöu57wy	e0,9,0,9
+tl4qkq6spjmñnqaf4kukñ2u1jhyypüüzirfykwl	v8äwößñxtt3çcxunr5n05o	i0,0,0,8 e0,1,8,9 r1,12,9,15 e12,13,15,16 d13,33,16,16 e33,34,16,17 r34,39,17,22
+moçb9f	moçb9f	e0,6,0,6
+ md ixfdñ7dävüzçw9jv	fb--wdfv3ö-os7byd	r0,2,0,5 e2,3,5,6 d3,6,6,6 e6,7,6,7 i7,7,7,16 e7,8,16,17 d8,20,17,17
+qu4g ñeéçx498éd	qu4 ñeéyx498éd	e0,3,0,3 d3,4,3,3 e4,8,3,7 r8,9,7,8 e9,15,8,14
+1g6vünñuç7ñvk3vcxbék2añqä8v idsb9	1g6vünñu7ñvkucxbék2añqä8v idsb9	e0,8,0,8 d8,9,8,8 e9,13,8,12 r13,15,12,13 e15,33,13,31
+z6ökqgoä1jpé0vßk4ßn00r2äfäçe165 onaçb	naçbz6ökqgoä1yjpé0vßä4ßn00r2äfäçe165 o	i0,0,0,4 e0,9,4,13 i9,9,13,14 e9,15,14,20 r15,16,20,21 e16,33,21,38 d33,37,38,38
+ßkñs1x-sgçfa8z0tpßzef-b-k9öçr6-f	ßñkslxvsgçfaz0tpßzef-b-k9öçr-b	e0,1,0,1 i1,1,1,2 e1,2,2,3 d2,3,3,3 e3,4,3,4 r4,5,4,5 e5,6,5,6 r6,7,6,7 e7,12,7,12 d12,13,12,12 e13,29,12,28 d29,30,28,28 e30,31,28,29 r31,32,29,30
+ky	-	r0,2,0,1
+fqla7wnnäeäsz5xw 3tazaçuu8vö 7ßv-bzjtk w	fqla7wnnäeäsz5x 3tazaçuu8ö 7ßv-bzjtk w	e0,15,0,15 d15,16,15,15 e16,26,15,25 d26,27,25,25 e27,40,25,38
+bp2öbq9aglycg8	bp2cöbq9agylocg8	e0,3,0,3 i3,3,3,4 e3,9,4,10 i9,9,10,11 e9,10,11,12 r10,11,12,13 e11,14,13,16
+2eop1öeñç9nkä4x0ärü5	n9ekä4x0ärü52ep1öñç	r0,1,0,2 e1,2,2,3 d2,11,3,3 e11,20,3,12 i20,20,12,19
+a bbbbaa  b  aba b ba aaaaaa a b aaabb    b abb aaaa a aba a  aaaabbabbbb a b  bab  bbb  aab baa a    aaa  b aa abb a abbb       bb   baaaabbaaa a a bb  bb ab abbab  a ba aa a   aab  aa b baa bb bb b bbbb  abb baaa	  b abb aaaa a aba a  aaaabbabbbb a b  bab  bbb  aab baa a   aaa  b aa abb a abbb       bb   baaaabbaaa a a bb  bb ab abbab  a ba aa a   aab  aa b baa bb bb b bbbb  abb baaaa bbbbaa  b  aba b ba aaaaa a b aaabb  	r0,214,0,212
+l5u0lxögouüp3alfdu	dul5u0lxögoudüp3alf	i0,0,0,2 e0,10,2,12 i10,10,12,13 e10,16,13,19 d16,18,19,19
+au036éie7fvwfiyebvböuizdéçü9qßny	iyeblvböuizdéçü9ßqndyaeu063éie7fvwf	d0,13,0,0 e13,17,0,4 i17,17,4,5 e17,28,5,16 i28,28,16,17 e28,29,17,18 d29,30,18,18 e30,31,18,19 i31,31,19,20 e31,32,20,21 i32,32,21,35
+2d9y43hx2x xazärvzfxpinç7p26wén4çiéxx	y43hx2x azärvzfxpinç7p26wésnç4iéxx2d9	d0,3,0,0 e3,11,0,8 d11,12,8,8 e12,30,8,26 i30,30,26,27 e30,31,27,28 i31,31,28,29 e31,32,29,30 d32,33,30,30 e33,37,30,34 i37,37,34,37
+q-c	k-c	r0,1,0,1 e1,3,1,3
+wçldh94f3ä9rüw0r-9uuyéßhzo2bn	wçldh4f3ä9rüw0r-9uuyéßhzo2b	e0,5,0,5 d5,6,5,5 e6,28,5,27 d28,29,27,27
+usj4bf8üatyl9rcuoiz27e64aaüacékzwr0z	j4bf8üatyl9rcuiz27e64aaüacékzwr0zus	d0,2,0,0 e2,16,0,14 d16,17,14,14 e17,36,14,33 i36,36,33,35
+y0uen4üd	yuuen4üd	e0,1,0,1 r1,2,1,2 e2,8,2,8
+çpbh8j6äoççtckhvg-l6äzñ zfß2um6e8x5nt	c0l 9w m-qpöao tl4ldqotovmßtb5 kopy	r0,1,0,10 e1,2,10,11 i2,2,11,28 e2,3,28,29 r3,8,29,32 e8,9,32,33 r9,37,33,35
+ßwürjefñ9h0jzvb546xjmüä2	o	r0,24,0,1
+libäplßñykgnqaua9sf3h2oñfoññßggñüü6d	libäplßñykgciaua9sf3h2oñflññßggñüüod	e0,11,0,11 r11,13,11,13 e13,25,13,25 r25,26,25,26 e26,34,26,34 r34,35,34,35 e35,36,35,36
+tsk	ts1k	e0,2,0,2 i2,2,2,3 e2,3,3,4
+ßwav2qi2clbñl0çd42   1qé	qßwav2qi2clblñ0çd42   1x	i0,0,0,1 e0,11,1,12 i11,11,12,13 e11,12,13,14 d12,13,14,14 e13,22,14,23 r22,24,23,24
+äop-j y6mpr7pv5dd8öeé8ph	pr7pvd2dg8öeé8phävp-j y6m	i0,0,0,16 e0,1,16,17 r1,2,17,18 e2,9,18,25 d9,24,25,25
+éßspg çiüu9f5é 	séßspg çiüu9f5é 	i0,0,0,1 e0,15,1,16
+8xlté	té8xl	i0,0,0,2 e0,3,2,5 d3,5,5,5
+g78j0	k807g	i0,0,0,4 e0,1,4,5 d1,5,5,5
+özkyi3w zcl9425ärs4dçsñoms	özky3w zl945ärs4dç ñomçs	e0,4,0,4 d4,5,4,4 e5,9,4,8 d9,10,8,8 e10,13,8,11 d13,14,11,11 e14,21,11,18 r21,22,18,19 e22,25,19,22 i25,25,22,23 e25,26,23,24
+vdß9égiña8gw1fut032owdö	vdß99giña8gw1üut032wodö	e0,4,0,4 r4,5,4,5 e5,13,5,13 r13,14,13,14 e14,19,14,19 i19,19,19,20 e19,20,20,21 d20,21,21,21 e21,23,21,23
+ääöj a-ä	 7	d0,4,0,0 e4,5,0,1 r5,8,1,2
+babab b ab    baa  bbbbbbab  bbbaaaaabbbabbb baa   b  aa bab   a b a  bbaaa aba  bb  aabaab bb ab  aaababbb aa b b a abbbaab  a baa a baaa aabb    a   b ab bababb  bab ab b b ba bba  a aaaa aba bba   ab ab b b ababa a a a a bbb bb   a   b b  a abb a a  ba  a  bbaaaa   ab aaa ab baa aaaa  b b aaabaa bba   ba abbb bb bb ab abaa bbbabb  bb  abb baabab      bb   ba ba   bbbba  b a  babab	a  babaaab bb b   bbab baaabaaa  b  aba aba  a aaabbb aaa   bbaabba bab aba b b  b   aabb b a  b  b ba bb ba abba  ab abbbaa  a ba bb baaab baa ba aab bbb aabba  aa baa a  aa aabb b b  aa  babbabbb babbb baabbbb baaabbaaaa a	r0,386,0,224
+1äö2xfçeinäl2br5kpt	1äöx2fçeinäl2r5pt	e0,3,0,3 i3,3,3,4 e3,4,4,5 d4,5,5,5 e5,13,5,13 d13,14,13,13 e14,16,13,15 d16,17,15,15 e17,19,15,17
+ñé03p2o639üö	639üöñé03p2o	i0,0,0,5 e0,7,5,12 d7,12,12,12
+5fcsbm7yßß ramp54i4yßr-iéih36sh	ßß ramp54ti4yßr-iéih3sh5fcsbm7y	d0,8,0,0 e8,17,0,9 i17,17,9,10 e17,28,10,21 d28,29,21,21 e29,31,21,23 i31,31,23,31
+06h	60hn	i0,0,0,1 e0,1,1,2 d1,2,2,2 e2,3,2,3 i3,3,3,4
+qu r0éßfç6z13basßw	qu r06éßfç6z13bsw	e0,5,0,5 i5,5,5,6 e5,14,6,15 d14,15,15,15 e15,16,15,16 d16,17,16,16 e17,18,16,17
+ä55n	ä5nqf	e0,2,0,2 d2,3,2,2 e3,4,2,3 i4,4,3,5
+üä-gäa2m8xrk9991z	a2m8x9k991züägä	d0,5,0,0 e5,10,0,5 r10,11,5,6 e11,12,6,7 d12,13,7,7 e13,17,7,11 i17,17,11,15
+y	y	e0,1,0,1
+ewjnxf70cwñ4gjon2	wjnxfh04wñ4gjon2	d0,1,0,0 e1,6,0,5 r6,7,5,6 e7,8,6,7 r8,9,7,8 e9,17,8,16
+wrütbsk	rütbk4zw	d0,1,0,0 e1,5,0,4 d5,6,4,4 e6,7,4,5 i7,7,5,8
+ysu-cmfaxéhcöyoizééi8438gqü9ek 5ekh9j9ab	y6-cfaxéhcöyoizééi8438gqü9ek5ekh9j9ab	e0,1,0,1 r1,3,1,2 e3,5,2,4 d5,6,4,4 e6,30,4,28 d30,31,28,28 e31,40,28,37
+sqrx121añasoo4jfgd-76b	wkrx121añasoo4fgd-7b6	r0,2,0,2 e2,14,2,14 d14,15,14,14 e15,20,14,19 i20,20,19,20 e20,21,20,21 d21,22,21,21
+xü4xixäx35xdb70jß32tß2eüsg fä	vfü-zbürñbth8öy1-	r0,1,0,2 e1,2,2,3 r2,12,3,5 e12,13,5,6 r13,19,6,10 e19,20,10,11 r20,29,11,17
+r1é v-4360çkxlbwfäah-6qñpvvl5muqur-2dü-	60çkxlbwfäah-6qñpvvl5muqur-2dü-r19wé v4-3	d0,8,0,0 e8,39,0,31 i39,39,31,41
+-ßr kgsepßuufqqg0ßhqtx1hs0öön	-xr kgsepßuufrqqg0ßhqtxmhs0öön	e0,1,0,1 r1,2,1,2 e2,13,2,13 i13,13,13,14 e13,22,14,23 r22,23,23,24 e23,29,24,30
+nzö49g osgbä0ñvckbn7gr-nyü-3e	nzö49g osgbä0ñvckbn7gr-nyü-3e	e0,29,0,29
+4c-pmñsx7üjxs3lzumqo7fejröüvbwf-c-3o	mqo7fejröüvbwf-c-3o4c-pmñsyx7üjxs3lzu	d0,17,0,0 e17,36,0,19 i36,36,19,37
+voyhz51	z51voyh	i0,0,0,3 e0,4,3,7 d4,7,7,7
+höwhcdeu1äc58x3b5i70gq	u1äc58xbp5i70gqhöwhcede	d0,7,0,0 e7,14,0,7 d14,15,7,7 e15,16,7,8 i16,16,8,9 e16,22,9,15 i22,22,15,23
+a a  abaa  a baa aaaa b abaa baaabaa b ababaaaa bbabab    baba aaa  a aaba  a aa    abbba a abb  a a   aa a abb  a bb b aaa    a aa b  a bbbbb b a bb a aabaa  a aab bb  abaaa abb   aaaaab  ba b  b a bbababbbaba a bbabbaaa b b aababba a	a a  abaa  a baa aaaa b abaa baaabaa b ababaaaa bbabab    baba aaa  a aaba  a aa    abbba a abb  a a   aa a abb  a bb b aaa    a aa b  a bbbbb b a bb a aabaa  a aab bb abaaa abb   aaaaab  ba b  b a bbababbbaba a bbabbaaa b b aababba a	e0,168,0,168 r168,235,168,234
+w5xqhñ0tömf ywf6y zjny-gimtla70ee7ä	w5xqhñ0tömf ywf6y zjny-gimtla70ee7ä	e0,35,0,35
+xß6551-ecgcx54mh0gqßn	xß6551-egccx54mhg0qßn	e0,8,0,8 i8,8,8,9 e8,9,9,10 d9,10,10,10 e10,16,10,16 i16,16,16,17 e16,17,17,18 d17,18,18,18 e18,21,18,21
+ud6	iv u	i0,0,0,3 e0,1,3,4 d1,3,4,4
+oña 5ésä9oéfäf2-dt8kpe7tñpflü xlwlow4ln	dt8pket7ñpflü xlwlow4lnoña 5ésä9oéfäf25-	i0,0,0,23 e0,15,23,38 i15,15,38,39 e15,16,39,40 d16,39,40,40
+15pfl63ßguud-izugyßghdwz0 x02n	fl63ßgu7rd-iuzgyßghdwz0 x02n15p1	d0,3,0,0 e3,10,0,7 r10,11,7,9 e11,14,9,12 i14,14,12,13 e14,15,13,14 d15,16,14,14 e16,30,14,28 i30,30,28,32
+gv-hlßhißv3uqßkvß2onéläapwñfjqmñyéä	ßv3uqßkvß2onéläapwfñjqañyéäav-hlßhi	d0,8,0,0 e8,26,0,18 i26,26,18,19 e26,27,19,20 d27,28,20,20 e28,30,20,22 r30,31,22,23 e31,35,23,27 i35,35,27,35
+d74hwüp1ä2ßaöb7 odök	d74hwüp1ä2ßaöb7 odök	e0,20,0,20
+fjgéö13ñh-4viçhé	éfjgéö13ñh-4viçh	i0,0,0,1 e0,15,1,16 d15,16,16,16
+cnçç1é7dvbic y01oz 27ñohö9 ü4sjym	cnçç1é7dvbic y01oz 27ñohö9 n4sjym	e0,27,0,27 r27,28,27,28 e28,33,28,33
+vmqynyd5añ 9	vmqynyd5añ 9	e0,12,0,12
+änäj2	änä2j	e0,3,0,3 i3,3,3,4 e3,4,4,5 d4,5,5,5
+zz6a38väh16cöñ3e	zza38väh1qcöñ3	e0,2,0,2 d2,3,2,2 e3,10,2,9 r10,11,9,10 e11,15,10,14 d15,16,14,14
+j héç53fb5	 héç53f5bj	d0,1,0,0 e1,8,0,7 i8,8,7,8 e8,9,8,9 r9,10,9,10
+spa	psa	i0,0,0,1 e0,1,1,2 d1,2,2,2 e2,3,2,3
+7e05agih	7e05agih	e0,8,0,8
+-uya8-ztüoç5r8iyi797	-uya8-ztüoç5r8iyi797	e0,20,0,20
+j0özöihwx0wnsnküaejsg4zs-eé5hatöcçwt äg	j0özöihw0wnsnkxejsg4zs-eé5hatucfçwt äbg	e0,8,0,8 d8,9,8,8 e9,15,8,14 r15,17,14,15 e17,31,15,29 r31,32,29,30 e32,33,30,31 i33,33,31,32 e33,38,32,37 i38,38,37,38 e38,39,38,39
+5rü0pöögs	ü50pöös	i0,0,0,1 e0,1,1,2 d1,3,2,2 e3,7,2,6 d7,8,6,6 e8,9,6,7
+pçä5mh33ké2y4vfhqöwé	h33ké2y4vfhqéöwpçä4ym	d0,5,0,0 e5,17,0,12 i17,17,12,13 e17,19,13,15 r19,20,15,21
+    b baaaaaa a aabba  babaa  b a   aaabaaba bb bb b bbabbab bbb ab  a aaab b bbbaab  b b b     b abb aaba    b    b b   ba  a b   abbabbaaa aba  bb  a a bbbba aaa  b   b  aaa    aaab  b a a  aa b  aababab b  bb b aa   bba bb aab  bbbbbb aab abbabbaa aaa a	    b abaaaaa a aabba  babaa  b a   aaabaaba bb bb b bbabbab bbb ab  a aaab b bbbaab  b b b     b abb aaba    b    b b   ba   b   abbabbaa aba  bb  a a bbbba aaab  b   b  aaa    aaab  b a    aa b  aababab b  bb b aa   bba bb aab  bbbbbb aab abbabbaa aaa a	e0,6,0,6 r6,256,6,255
+ç		d0,1,0,0
+v	va9	e0,1,0,1 i1,1,1,3
+7zgdéa25kügghfuqn8dnx üauaçjzlécçp	7zgdaé2ökügghfuqn8dnx üauajzlcçp	e0,4,0,4 i4,4,4,5 e4,5,5,6 d5,6,6,6 e6,7,6,7 r7,8,7,8 e8,26,8,26 d26,27,26,26 e27,30,26,29 d30,31,29,29 e31,34,29,32
+33f	3ç36	e0,1,0,1 i1,1,1,2 e1,2,2,3 r2,3,3,4
+ß6mökdäbb8tleuü68rñhnq-vs	5ßd2ßv2ß	i0,0,0,1 e0,1,1,2 d1,5,2,2 e5,6,2,3 r6,23,3,5 e23,24,5,6 r24,25,6,8
+hytñ23shzx	a	r0,10,0,1
+v-vci4ö0 ssovlwpöéy	ovlwpöéyv-vci4ö0 ss	i0,0,0,8 e0,11,8,19 d11,19,19,19
+çasyüznäj2güääe7590o5ésm	çasyüznäj2güääe7590o5ésm	e0,24,0,24
+ at0çlüjé6ei	 at0lçüjé6ei	e0,4,0,4 i4,4,4,5 e4,5,5,6 d5,6,6,6 e6,12,6,12
+ç83ücdj1zdçß443ßsyröidfgg3zzpovrrr	bv1 spkiäqlc28çvgpo3çñl4ces3fvq	i0,0,0,14 e0,1,14,15 r1,23,15,16 e23,24,16,17 d24,28,17,17 e28,30,17,19 i30,30,19,29 e30,31,29,30 r31,34,30,31
+u6k	u6fk	e0,2,0,2 i2,2,2,3 e2,3,3,4
+7cä5w72fo3cçfwbßq0-uv6zpr gyçbpñq	7cä5w2fo3cçfbwßq0lvu6zprgyçbpñq	e0,5,0,5 d5,6,5,5 e6,13,5,12 i13,13,12,13 e13,14,13,14 d14,15,14,14 e15,18,14,17 r18,19,17,19 e19,20,19,20 d20,21,20,20 e21,25,20,24 d25,26,24,24 e26,33,24,31
+qwßß1kkä5rt6h615nqg7	rt6h615nqg7qwßß1kkä5	d0,9,0,0 e9,20,0,11 i20,20,11,20
+ehßf6özfl86e	aüf-wnzzv5	r0,3,0,2 e3,4,2,3 r4,6,3,6 e6,7,6,7 r7,12,7,10
+öté3ä	äöt-3	i0,0,0,1 e0,2,1,3 r2,3,3,4 e3,4,4,5 d4,5,5,5
+0m7äl5injpém-	007ä5lijpém-	e0,1,0,1 r1,2,1,2 e2,4,2,4 i4,4,4,5 e4,5,5,6 d5,6,6,6 e6,7,6,7 d7,8,7,7 e8,13,7,12
+5nmñär	ü8ñ0ñö	r0,3,0,2 e3,4,2,3 r4,6,3,6
+zup  o949c95ñnj68e0z4qnédeü7sc03mrk20u	ktuhjzbçlndhgnüü-boneavzü	i0,0,0,5 e0,1,5,6 r1,5,6,18 e5,6,18,19 d6,13,19,19 e13,14,19,20 d14,17,20,20 e17,18,20,21 r18,19,21,23 e19,20,23,24 d20,26,24,24 e26,27,24,25 d27,38,25,25
+xäqvfeßßxuéçrb7i	xäqvfeßßxuéçrb7i	e0,16,0,16
+a aaaaa bbaaaaaa   b  a abb a baab abababbbbab  a abaa b b ab   b b aaa abbaaba aaaaba   b aa  a aa aabbab bbbababba  abb       a b a b aba aaaa   abaa b baba a bbabbb  a    a b ab baaaabb aa babbb bba  babbaaaaabb b ab aab     bbaaab a b ba   b b  b  aba a aaaa ab bababababa abbbaa b aba b  ab  aaa  b ba    bb abb a  b bbbaaabbba a  a  a  a aa aababab b   baaa	a aaaaa bbaaaaaa   b  a abb a baab abababbbbab  a abaa b b ab   b b aaa abbaaba aaaaba   b aa  a aa aabbab bbbababba  abb       a b a b aba aaaa   abaa b baba a bbabbb  a    a b ab baaaabb aa babbb bba  babbaaaaabb b ab aab     bbaaab a b ba   b b  b  aba a aaaa ab bababababa abbbaa b aba b  ab  aaa  b ba    bb abb a  b bbbaaabbba a  a  a  a aa aababab b   baaa	e0,363,0,363
+üäm7ub6iljoéhuzö390u9us7é ht0gzyöta	üäm7ub6iljoéhuzö390u9us7é ht0gzyöta	e0,35,0,35
+kxnd4	4ñkn	i0,0,0,2 e0,1,2,3 d1,2,3,3 e2,3,3,4 d3,5,4,4
+éyqötlw7otic 2ykaämitmh04wü6xixñ	thku5yñkofddl	r0,1,0,5 e1,2,5,6 r2,5,6,12 e5,6,12,13 d6,32,13,13
+çé2mjjlçüsbç97é4tt 	ç2émjlçüsbç97é4t 	e0,1,0,1 i1,1,1,2 e1,2,2,3 d2,3,3,3 e3,4,3,4 d4,5,4,4 e5,17,4,16 d17,18,16,16 e18,19,16,17
+geeogf8a8rzt89l	j4th8p-h6-z	r0,6,0,4 e6,7,4,5 r7,10,5,10 e10,11,10,11 d11,15,11,11
+ß70vj7oé--cip-b	äy	r0,15,0,2
+56ß	i56	i0,0,0,1 e0,2,1,3 d2,3,3,3
+k32et6üxäéq8s9tl7z-ezqruq6m2fd1llç2a23y	k32et6üxäéq8ästl57z-ezqruq6m2fd1llç2a32y	e0,12,0,12 i12,12,12,13 e12,13,13,14 d13,14,14,14 e14,16,14,16 i16,16,16,17 e16,36,17,37 i36,36,37,38 e36,37,38,39 d37,38,39,39 e38,39,39,40
+kgbi8dx4u--jjd29n8cd158ñgü445o	wqpia20iönr1t	r0,3,0,3 e3,4,3,4 r4,14,4,5 e14,15,5,6 r15,16,6,9 e16,17,9,10 r17,20,10,11 e20,21,11,12 r21,30,12,13
+wmz	yegñ	r0,3,0,4
+0o6é 7äé-jpçeßsq6dv3og1x54uo76somoñf	15x4uo76som-f0o6é 7äé-jpçeßsq6dv3og	i0,0,0,13 e0,22,13,35 d22,36,35,35
+eç8uf	eçu	e0,2,0,2 d2,3,2,2 e3,4,2,3 d4,5,3,3
+gvcçq-651	gvcç-ü651	e0,4,0,4 d4,5,4,4 e5,6,4,5 i6,6,5,6 e6,9,6,9
+h3mñlßtp0eß1vtz69çqüpñ6yüqorphjlj1äj	9çqüpñ6yüqorphjlj1äjh3mñlßtp0eß1vtz67	d0,16,0,0 e16,36,0,20 i36,36,20,37
+vpz8ichzmßm99c ue 	ue 5vpzichz6ß9m9c 	i0,0,0,4 e0,3,4,7 d3,4,7,7 e4,8,7,11 i8,8,11,14 e8,9,14,15 d9,12,15,15 e12,15,15,18 d15,18,18,18
+7rvyfxn2	7ryfxn26	e0,2,0,2 d2,3,2,2 e3,8,2,7 i8,8,7,8
+2veg56rpkt0n-	pkt0ön-2veg56r	i0,0,0,7 e0,7,7,14 d7,13,14,14
+dfs6ed	hdds6	i0,0,0,1 e0,1,1,2 r1,2,2,3 e2,4,3,5 d4,6,5,5
+whratelf pdä-rqv8  -608lxooççfüüjsx	8  -60l8xooççfüüjsxwhratelf pdä-rqv	i0,0,0,19 e0,16,19,35 d16,35,35,35
+b  bb baabb ba b    a a baa aababaaa babaaa a a ab aaa   bbbab a aba  babba bbabbbbbab     abbbab bbb b a  b   aa  abababbaabab  aaab a aabbbabb  ab   abba    bbaaba abaaaaa bbbabaaaaa   aabb a abbaaaaaaa a b bab    b ba a ba  baabaaab bb b aaaab  abb b a    b ab b baa b  b abbbb  ba  bb ab b bab aba aaaa ab abba a a  bba aa aaa b bb b	bbab a aba  babba bbabbbbbab     abbbab bbb b a  b   aa  abababbaabab  aaab a aabbbabb  ab   abba    bbaaba abaaaaa bbbabaaaaa   aabb a abbaaaaaaa a b bab    b ba a ba  baabaaab bb b aaaab  abb b a    b ab b baa b  b abbbb  ba  bb ab b bab aba aaaa ab abba a a  bba aa aaa b bb bb  bb baabb ba b    a a baa aababaaa babaaa a a ab aaa   b	e0,1,0,1 r1,337,1,337
+k-éaü4i	éf4ik-	i0,0,0,4 e0,2,4,6 d2,7,6,6
+ ñgdbivélä9ötgp387günxf1üh-q	lä9ötgp387günxf1h-q ñgdbvé	d0,8,0,0 e8,24,0,16 d24,25,16,16 e25,28,16,19 i28,28,19,26
+86emqucç0h9kéßabßyné7ñé s1y-ñlqu- 3l e8	8semqucç0h9kéßabßyn7ñd s1y-lqu- 3l e8	e0,1,0,1 r1,2,1,2 e2,19,2,19 d19,20,19,19 e20,22,19,21 r22,23,21,22 e23,28,22,27 d28,29,27,27 e29,39,27,37
+tyü6	ytüm	i0,0,0,1 e0,1,1,2 d1,2,2,2 e2,3,2,3 r3,4,3,4
+bkrog8tmmhi4üvéücj61j018nmrq049kéga9kßé	ücj16j01n8mrq049kég9akßébkrog8tmmhi4üév	i0,0,0,24 e0,13,24,37 i13,13,37,38 e13,14,38,39 d14,39,39,39
+-j9v3wp4ecnflñß5j6ç	-9jv3wp4ceflñ5ß6jç	e0,1,0,1 i1,1,1,2 e1,2,2,3 d2,3,3,3 e3,8,3,8 i8,8,8,9 e8,9,9,10 d9,11,10,10 e11,14,10,13 i14,14,13,14 e14,15,14,15 r15,16,15,16 e16,17,16,17 d17,18,17,17 e18,19,17,18
+cf7wlqeqä9du	cf7wlqexä9du	e0,7,0,7 r7,8,7,8 e8,12,8,12
+c-b876rzy0ç	zy0fçvc-bf76r	i0,0,0,6 e0,3,6,9 r3,4,9,10 e4,7,10,13 d7,11,13,13
+ü-r-ävvserhçi4méß85ñwclwäzyx	-ävvserhçi4méß85ñwclwäzyxü-r	d0,3,0,0 e3,28,0,25 i28,28,25,28
+b1onqnfzuçfisq3p08v6ü7ñe-c	8ehñp8	r0,15,0,4 e15,16,4,5 d16,17,5,5 e17,18,5,6 d18,26,6,6
+yr7çpzsqnvu9jz4edçjußs4yz9diñi	odiñiyr7çpzsqnvu9jz4edç3bußs4yz9	i0,0,0,5 e0,18,5,23 r18,19,23,25 e19,26,25,32 d26,30,32,32
+nxrwcsöguogäo-fuvf22p	nxur7wcs9öguogäo-fuvf22p	e0,2,0,2 i2,2,2,3 e2,3,3,4 i3,3,4,5 e3,6,5,8 i6,6,8,9 e6,21,9,24
+6üé	6éöt	e0,1,0,1 d1,2,1,1 e2,3,1,2 i3,3,2,4
+d äy5wuy-uj2szjcöodjpwv54vç56ßsn3üñ2ñ2pd	d än5wuy-uj2szjcöodjpwv5x4vç56ßnsü3ñ2ñ2pd	e0,3,0,3 r3,4,3,4 e4,24,4,24 i24,24,24,25 e24,30,25,31 i30,30,31,32 e30,31,32,33 r31,32,33,34 e32,33,34,35 d33,34,35,35 e34,40,35,41
+73n4x3hv4xhß 	8déñ2axévp	r0,4,0,6 e4,5,6,7 r5,7,7,8 e7,8,8,9 r8,13,9,10
+eujbyrlvéñß97ayd6eovu	eujbyrlvéñß97ayd6eovu	e0,21,0,21
+ñdlr a4ßiivtsbäz1y7duh7ajüq k7eün lt8	ñdlr a4ßiivtsbäz1y7duha7jüq küen lt8	e0,22,0,22 i22,22,22,23 e22,23,23,24 d23,24,24,24 e24,29,24,29 r29,30,29,30 e30,31,30,31 d31,32,31,31 e32,37,31,36
+wra43çéféfwymdtnq5xy	wra43çéféfwymdtnq5xy	e0,20,0,20
+lq3p-	oqp	r0,1,0,1 e1,2,1,2 d2,3,2,2 e3,4,2,3 d4,5,3,3
+aabbabbaba baa ba  baba  aabbb   b bb  bbaba aaa  aa  abbbaaababa  ab  aba b abaa ab a aabab  ba   babbaa bbab b  aaaa  aaa   aabbaaaab abba  abbaaab  babba b a baab  aa  bab b a a   baaa baabb aaa   bbbbaa 	b a   aaaaa  ba bb   b   a a baabaaaabb b abb  b a aba bbabaabab ab bbbba  bab babb babbba aab  aba  ba abbbbbabba bb    babb b aba ab a babbba ab b babb b ba	i0,0,0,35 e0,4,35,39 i4,4,39,42 e4,5,42,43 i5,5,43,55 e5,10,55,60 i10,10,60,67 e10,12,67,69 r12,15,69,71 e15,22,71,78 d22,23,78,78 e23,24,78,79 r24,26,79,80 e26,29,80,83 d29,32,83,83 e32,34,83,85 d34,54,85,85 e54,59,85,90 i59,59,90,91 e59,60,91,92 d60,67,92,92 e67,75,92,100 i75,75,100,126 e75,79,126,130 d79,80,130,130 e80,87,130,137 d87,89,137,137 e89,92,137,140 r92,94,140,141 e94,97,141,144 i97,97,144,146 e97,98,146,147 i98,98,147,148 e98,103,148,153 d103,105,153,153 e105,106,153,154 d106,109,154,154 e109,112,154,157 d112,114,157,157 e114,115,157,158 d115,207,158,158
+npäxgascw5 7mtd-füp-lyn	npäxgascw5 7mtd-füp-lyn	e0,23,0,23
+geqculzv1ö	geqckzl3v1ö	e0,4,0,4 r4,5,4,6 e5,6,6,7 r6,7,7,8 e7,10,8,11
+süoyhkqçuüßh	7c fgg2a3	r0,12,0,9
+v8x18ipyä pvqj-2réür5amyén	v-4x18ipyä pvqj-2rür5amyén	e0,1,0,1 r1,2,1,3 e2,17,3,18 d17,18,18,18 e18,26,18,26
+ñlö8d ß3srccö9mñkroczjllgväñ20-yzpaö04v	ñlö8d ß3srccö9mñkroczjllgävñ20-yzpaö04v	e0,25,0,25 i25,25,25,26 e25,26,26,27 d26,27,27,27 e27,39,27,39
+uafüémügü1ñj8kç92-	uaüfémü4gü1ñj8kç92-	e0,2,0,2 i2,2,2,3 e2,3,3,4 d3,4,4,4 e4,7,4,7 i7,7,7,8 e7,18,8,19
+a4z94ßhvpq7d3i41oña-r8mhäép2emvzyrntphda	a4z94ßhvpq79d3i41oña-r8mh0ép2emvzyrntphda	e0,11,0,11 i11,11,11,12 e11,24,12,25 r24,25,25,26 e25,40,26,41
+-j2oi4mu5l   ssxm5-evaw	5l  ssxm5-evaw-j2oi4mu	d0,8,0,0 e8,10,0,2 d10,11,2,2 e11,23,2,14 i23,23,14,22
+hüjaa6e9uktlayçöroñçept2würçlejye-	j6e-hüjaa6euktlayçöroñeçpt2würçle	i0,0,0,4 e0,7,4,11 d7,8,11,11 e8,19,11,22 i19,19,22,23 e19,20,23,24 d20,21,24,24 e21,30,24,33 d30,34,33,33
+ksfäügn3ötkvaie69rbçx7mnuöf9tl9ßmö	l9ßmöksfçügn37tkvaie69rbçx7mnuöf9t	i0,0,0,5 e0,3,5,8 r3,4,8,9 e4,8,9,13 r8,9,13,14 e9,29,14,34 d29,34,34,34
+-sd134 nwü3	-sd134 nwü3	e0,11,0,11
+p61l üñoq3xuo	p1lüoq3xuo6	e0,1,0,1 d1,2,1,1 e2,4,1,3 d4,5,3,3 e5,6,3,4 d6,7,4,4 e7,13,4,10 i13,13,10,11
+q81yw3zhuv8szlñok6qqüs	q81wyz3huv8szlñok6qqüs	e0,3,0,3 i3,3,3,4 e3,4,4,5 r4,5,5,6 e5,6,6,7 d6,7,7,7 e7,22,7,22
+ewchbh06ööiz6ßi1oña3xöäm2v85xdn8bu871	2v85edn8bu81ewchbh06ööizlßi1oñz3xöäm	i0,0,0,12 e0,12,12,24 r12,13,24,25 e13,18,25,30 r18,19,30,31 e19,24,31,36 d24,37,36,36
+3tv2çodxsws	3vt2çodgows	e0,1,0,1 i1,1,1,2 e1,2,2,3 d2,3,3,3 e3,7,3,7 r7,9,7,9 e9,11,9,11
+hoeljtç a16ncéu	hoeljt a16ncéu	e0,6,0,6 d6,7,6,6 e7,15,6,14
+66kcçkqmüm	66kcçkqmümh	e0,10,0,10 i10,10,10,11
+t7tsbq4böj4wüst51çwcelgynéwx7tuvtvah30b	t7tsbq4böj4wüst51çwcelgynéwx7tuvtvah30b	e0,39,0,39
+q-aag87lql2élß1	q-aag7lql2élß1	e0,5,0,5 d5,6,5,5 e6,15,5,14
+  a bab b ba b b baa bbb b a b bb ba baaa     abab aaaa a a  a   bb  bbb    bab  bbaab b  a b b  bb b   bbaba a  aaa  a a  a aaa    bbbbabaa bbabaaaab  a  aaa aba aa ba aa  aa a babbaa  b aabb b aa a aaaa  bbb  babaaaa a aa bba  ba bab   ab a    a aa aaabbb babb baaab abbbabab a   aa   aaabba  baa b a a  bab   baa a aa bb  a aab ba ba ab  baab bbb ab   aaaaabb  baa  a  babb  babaabbaaab  abaabb  ba baaba	  a bab b ba b b baa bbb b a b bb ba baaa     abab aaaa a a  a   bb  bbb    bab  bbaab b  a b b  bb b   bbaba a  aaa  a a  a aaa    bbbbabaa bbabaaaab  a  aaa aba aa ba aa  aa a babbaa  b aabb b aa a aaaa  bbb  babaaaa a aa bba  ba bab   ab a    a aa aaabbb babb baaab abbbabab a   aa   aaabba  baa b a a a bab   baa a aa bb  a aab ba ba ab  baab bbb ab   aaaaabb  baa  a  babb  babaabbaaab  abaabb  ba baaba	e0,305,0,305 r305,407,305,408
+uçhfem58epew733tikv 8gl	uçhfem58eep1ew73t3ikv 8gl	e0,9,0,9 i9,9,9,10 e9,10,10,11 i10,10,11,12 e10,14,12,16 i14,14,16,17 e14,15,17,18 d15,16,18,18 e16,23,18,25
+çq9-pw3v	vçq9-pw3	i0,0,0,1 e0,7,1,8 d7,8,8,8
+0zncwça3ü3v3ql96fxhzg98bz	3ql96fxhzg98bz0zncwaç3ü3v	d0,11,0,0 e11,25,0,14 i25,25,14,25
+wsuxiqoeyhxdgj2qöiß6ß3ähwu0	wsuxiqoeyhxdgj2qöiß6ß3ähwu0	e0,27,0,27
+w4ihq	u90	r0,5,0,3
+mp766os9dyétß57 rfzçf5ef3qkothjzp	mp76s6os9dyétß57 rfzçf5ef3qkotbjzp	e0,4,0,4 i4,4,4,5 e4,29,5,30 r29,30,30,31 e30,33,31,34
+1pviv1v5lç2ahluß83cgj	1pviv1v50ç2aluß83cgj	e0,8,0,8 r8,9,8,9 e9,12,9,12 d12,13,12,12 e13,21,12,20
+mb8v5taböbñoz0jbtü	mb8v5taöbñoz0jbtü	e0,7,0,7 d7,8,7,7 e8,18,7,17
+ßféazizh9o93mfvtöt-a mhzsöbüüw1rüm	ßféfzh9o9r3mfvtöt-a mhzsöbüüw1rün	e0,3,0,3 r3,6,3,4 e6,11,4,9 i11,11,9,10 e11,33,10,32 r33,34,32,33
+sdr2h12f2qfe1abhyäjpñ7nöaa6vn	sdr2hk12f2qge1abhyäjpñ7nöaa6vn	e0,5,0,5 i5,5,5,6 e5,10,6,11 r10,11,11,12 e11,29,12,30
+rédzyä5ofa3ößdçç3	rédxzyäbofa3ößçç3	e0,3,0,3 i3,3,3,4 e3,6,4,7 r6,7,7,8 e7,13,8,14 d13,14,14,14 e14,17,14,17
+öll3fiäviß v lxlcc9p0gf1m4-laéf5çv92cñ	92cñöll3fiäviß v lxlcc9p0gf1m-4-laé15çv	i0,0,0,4 e0,25,4,29 i25,25,29,30 e25,30,30,35 r30,31,35,36 e31,34,36,39 d34,38,39,39
+c0l-rgvxqcjmüij1u0hp899 vüw-00höe7e33c	p899 vüw-00hcöe7e3c3c0l-rgvxqcjmüi6j1u0h	i0,0,0,20 e0,14,20,34 i14,14,34,35 e14,19,35,40 d19,38,40,40
+o	o	e0,1,0,1
+3kvä5 ün2t4öo	 ün2t4ö3ovyä5	d0,5,0,0 e5,12,0,7 i12,12,7,8 e12,13,8,9 i13,13,9,13
+xñqmv	xqñmvs	e0,1,0,1 i1,1,1,2 e1,2,2,3 d2,3,3,3 e3,5,3,5 i5,5,5,6
+5ña5pxxi	ña5pxxi5	d0,1,0,0 e1,8,0,7 i8,8,7,8
+f66-gqä70jfxlxöou	f66-gqä70jfxlxöou	e0,17,0,17
+bmress7vñi-ßu5vbw1u3çälk50éu7vljpgkiñspß	bmressä7üñi-u5vbw1u3çäl0kéu7vlsjpgkiñspß	e0,6,0,6 i6,6,6,7 e6,7,7,8 r7,8,8,9 e8,11,9,12 d11,12,12,12 e12,23,12,23 i23,23,23,24 e23,24,24,25 d24,26,25,25 e26,31,25,30 i31,31,30,31 e31,40,31,40
+a babba bbabaaaab baa aaaaaba b  aab  a bbababbbbab b   bbb ba  bba aba ba baa b baabb ab  b  b b bbaababba  a aa  a  ab ba ab   aa bbbb a  abba   aaaaa aabb    ba aaaa   baaabbba  ab bb  ba  bb b a ababaa aaabbbaaa abba a 	a    ba b  b b aabb aabb aab  a b ababbaa a aa  abbaa  b   aa  bbbbb ab abbaa babbbaaaaaa b   b  baa babaaa  ab ba b abbab	e0,2,0,2 d2,7,2,2 e7,8,2,3 d8,17,3,3 e17,18,3,4 d18,21,4,4 e21,22,4,5 d22,27,5,5 e27,32,5,10 i32,32,10,24 e32,41,24,33 d41,51,33,33 e51,52,33,34 d52,101,34,34 e101,107,34,40 r107,108,40,41 e108,115,41,48 i115,115,48,106 e115,124,106,115 d124,125,115,115 e125,126,115,116 d126,139,116,116 e139,144,116,121 d144,155,121,121 e155,156,121,122 d156,223,122,122
+b-2lm6übçag26qi2ñx8	çag26qi26x89-b2lm6üb	d0,8,0,0 e8,16,0,8 r16,17,8,9 e17,19,9,11 i19,19,11,20
+8f bdwwao näd2-qsßsh7020ßñln ñfa	näd2-qsßsh75020ßñln ñfa38f bdwwao 	d0,10,0,0 e10,21,0,11 i21,21,11,12 e21,32,12,23 i32,32,23,34
+7xö1ç29öb ux	29 u ux7cxö1ç	i0,0,0,7 e0,1,7,8 i1,1,8,9 e1,5,9,13 d5,12,13,13
+xcñfyr1mf	 xcñfyr1mm	i0,0,0,1 e0,8,1,9 r8,9,9,10
+1-	a1-	i0,0,0,1 e0,2,1,3
+u6u2ü4s xj8l-ühtaxxden8üvßk0vs	axxden8üvßk0svu76u2ü4s xj8lüht	d0,16,0,0 e16,28,0,12 i28,28,12,13 e28,29,13,14 i29,29,14,21 e29,30,21,22 i30,30,22,30
+il9d8i ö7wk33üéaö 3vaçtk0io	il9d8i ö7wk33üéaöc 3vaçtk0io	e0,17,0,17 i17,17,17,18 e17,27,18,28
+-eä- 7müqb-gm	-eä- 7müqbg-m	e0,10,0,10 i10,10,10,11 e10,11,11,12 d11,12,12,12 e12,13,12,13
+o	o	e0,1,0,1
+-rgu0go	-rgugon	e0,4,0,4 d4,5,4,4 e5,7,4,6 i7,7,6,7
+y1rs47j rä27güüçß0481uß	1w- 2k9y xoj52	i0,0,0,7 e0,1,7,8 r1,6,8,11 e6,7,11,12 r7,10,12,13 e10,11,13,14 d11,23,14,14
+üßolgpçar-veäv8oéx-rä 	üßolgpçar-veäv8éox-rä 	e0,15,0,15 i15,15,15,16 e15,16,16,17 d16,17,17,17 e17,22,17,22
+ßñg-pc-o	ßñg-pc-o	e0,8,0,8
+2özu b1ö7ßomr36unéçj571çz2ßcw316raöeö	2özu b1ö7oßm36unéçj571çz2ßc3w16raöeö	e0,9,0,9 i9,9,9,10 e9,10,10,11 d10,11,11,11 e11,12,11,12 d12,13,12,12 e13,28,12,27 i28,28,27,28 e28,29,28,29 d29,30,29,29 e30,37,29,36
+uo0fgm	uo0fgm	e0,6,0,6
+snnktçbinép1jl7e6e2 9äwygo7	inépjl7e6e2 wäwygo7snnktb	d0,7,0,0 e7,11,0,4 d11,12,4,4 e12,20,4,12 r20,21,12,13 e21,27,13,19 i27,27,19,25
+çs-my5h990jys87çcac9pk25ll-mñj	içs-my5h990pjys8çxcac9pk25ll-mñj	i0,0,0,1 e0,10,1,11 i10,10,11,12 e10,14,12,16 d14,15,16,16 e15,16,16,17 i16,16,17,18 e16,30,18,32
+me4öurwz9	em4öudrwz9	i0,0,0,1 e0,1,1,2 d1,2,2,2 e2,5,2,5 i5,5,5,6 e5,9,6,10
+hw bco6gçs8b9ñf çü	co6nçs8b9ñft ç9üéhw b	d0,4,0,0 e4,7,0,3 r7,8,3,4 e8,15,4,11 i15,15,11,12 e15,17,12,14 i17,17,14,15 e17,18,15,16 i18,18,16,21
+baa  aabbb   ba   b b aaab  bb aa  b  aabb a  aa aa b bb bbab baa     b babbaa bbab aba   babaaabb  aa aba b  aaa aab baaba b aa babaa a bbbaaaabb b bbaaaaa baba babb ba  aa b aa b abab   aa ba  bba aba aaa  a ababb b  ba   a babaaabababba aaab ab b baabaa b   baaa baba ba aabab  b a bbabb aab b    b baabb ba ba 	baa  aabbb   ba   b b aaab  bb aa  b  aabb a  aa aa b bb bbab baa     b babbaa bbab aba   babaaabb  aa aba b  aaa aab baaba b aa babaa a bbbaaaabb b bbaaaaa baba babb ba  aa b aa b abab   aa ba  bba aba aaa  a ababb b  ba   a babaaabababba aaab ab b baabaa b   baaa baba ba aabab  b a bbabb aab b    b baabb ba ba 	e0,314,0,314
+é2sjuz83äv7pöfjñq	é2sjuz83äv7pöfjñq	e0,17,0,17
+ac8géçögee09eösoepjasgn4bb08üpqxçw	yasg7n4bb08üpqxçwac8géçpgee09eöoepj	r0,19,0,1 e19,22,1,4 i22,22,4,5 e22,34,5,17 i34,34,17,35
+f		d0,1,0,0
+0o5éxxrdkov9äö5pjdß4 7	ov9äö5pjßd4 70o5éxxrdk-	i0,0,0,13 e0,9,13,22 r9,22,22,23
+ä68oñx2orr	ßä68goñ2xorr	i0,0,0,1 e0,3,1,4 i3,3,4,5 e3,5,5,7 i5,5,7,8 e5,6,8,9 d6,7,9,9 e7,10,9,12
+dö2--kü5pj5q9t ñ vowmké	dö2--kü5pj5q9t ñ vowmké	e0,23,0,23
+aßséctd1hmkp 	ßsét1dhmkpd	d0,1,0,0 e1,4,0,3 d4,5,3,3 e5,6,3,4 i6,6,4,5 e6,7,5,6 d7,8,6,6 e8,12,6,10 r12,13,10,11
+bç71125nßdonv2a	bç71125nßöonv2a	e0,9,0,9 r9,10,9,10 e10,15,10,15
+s421ç90nfzrßn	90nfzrßns21ñç	d0,5,0,0 e5,13,0,8 i13,13,8,13
+rr	u	r0,2,0,1
+1vcjyybüt-tj0üzßljßtywc2ä0f	xj	r0,3,0,1 e3,4,1,2 d4,27,2,2
+q1öcsxcq	ßq1öjségxq	i0,0,0,1 e0,3,1,4 r3,4,4,5 e4,5,5,6 i5,5,6,8 e5,6,8,9 d6,7,9,9 e7,8,9,10
+f34fsd-b8	4f5d-bkk3	d0,2,0,0 e2,4,0,2 r4,5,2,3 e5,8,3,6 r8,9,6,9
+dws9i7lz-ze27mcax-ué90c	dws9i7lz-ze27mcax-ué90c	e0,23,0,23
+njrv1ñ	u6-ö3	r0,6,0,5
+8 rkocx7qegp1ü6ä9m0mic ct	qegp1ü69äm0-mic ct8 rkocx7	i0,0,0,18 e0,8,18,26 d8,25,26,26
+yyg9mtiççiyj 3qüqttç0iabßy	ttç0iabßyyygm9tiççiyj 3qtq	i0,0,0,9 e0,3,9,12 i3,3,12,13 e3,4,13,14 d4,5,14,14 e5,15,14,24 r15,16,24,25 e16,17,25,26 d17,26,26,26
+ülç13lkhçk4mvéq3hhvßqßlüb	ülç1-3lkhç4kdméq3hhvßqßélüb	e0,4,0,4 i4,4,4,5 e4,9,5,10 i9,9,10,11 e9,10,11,12 r10,11,12,13 e11,12,13,14 d12,13,14,14 e13,22,14,23 i22,22,23,24 e22,25,24,27
+k6	k6	e0,2,0,2
+ b abbaa bbbb a aa bb  ab  bbaaaab bb bbb abb aaabbb  a ab  bb aaaa babbb ab baab   b baab  a   aaaba     a aa  aa abb bbbbab bbab  ab bbbbabababbbba babbabba bbab  ababbbbabaab bab ba     a bba   b  aaabb  ba b baa  abbbaba ba aaa bbbbaabaa b  ba  aaabbaaa  a a a    aba aaaaba bb bababb aa  bb ba aaabbb bbaa bb aa b bba  aa abab   b b    a bbba  a abbaa     b a b  a ababaa a aabbaab b  a    a bb  b    	 bbbbaabaa b  ba  aaabbaaa  a a a    aba aaaaba bb bababb aa  bb ba aaabbb bbba bb aa b bba  aa abab   b b    a bbba  a abbaa     b a b  a ababaa a aabbaab b  a    a bb  b     b abbaa bbbb a aa bb  ab  bbaaaab bb bbb abb aaabbb  a ab  bb aaaa babbb ab baab   b baab  a   aaaba     a aa  aa abb bbbbab bbab  ab bbbbabababbbba bbababba bbab  ababbbbabaab bab ba     a bba   b  aaabb  ba b baa  abbbaba ba aaa	e0,2,0,2 r2,406,2,406
+74äesh4fa9fee2s8o5çéi8äq00-ozilec	74äesh4fa9fee2s8o5çéi8äq00-ozilec	e0,33,0,33
+pu0pevßq	pu0pevßq	e0,8,0,8
+srcs7kqöik xöz9et3q73hz0löc84aasérm6ßys0	yxuxq5djñ3zenq-1	r0,6,0,4 e6,7,4,5 r7,13,5,10 e13,14,10,11 d14,15,11,11 e15,16,11,12 r16,18,12,13 e18,19,13,14 r19,40,14,16
+ñxhcsfbhöoz1çb4elipxqçéeh-hñvb653üöw8fö7	ñmxhcsfbhöoz1çb4elipxqçéeh-hñvb653üöw8fö7	e0,1,0,1 i1,1,1,2 e1,40,2,41
+lb1w-ß5vçdü-mßqyimb7pö8cñ5nyvl2mtff	dü-mßqyimb7p8cñ5nkvl2mtfflb1w-ß5vç	d0,9,0,0 e9,21,0,12 d21,22,12,12 e22,27,12,17 r27,28,17,18 e28,35,18,25 i35,35,25,34
+éxessücä3xägév7s--c2ij517çs vñß7ek	xe6äscä3xägév7s--c2ij51çs ävñß7eké	d0,1,0,0 e1,3,0,2 i3,3,2,4 e3,4,4,5 d4,6,5,5 e6,24,5,23 d24,25,23,23 e25,28,23,26 i28,28,26,27 e28,34,27,33 i34,34,33,34
+fqöc4mz6kqér6292lrfoküflxvl8tä	fqöc4mz6kqér6922lrfoküflxvlz8tä	e0,13,0,13 i13,13,13,14 e13,14,14,15 d14,15,15,15 e15,27,15,27 i27,27,27,28 e27,30,28,31
+gu7	rwju	r0,1,0,3 e1,2,3,4 d2,3,4,4
+wä	wä	e0,2,0,2
+éäqöwéxb9dçxbma0iy	txn1ßvca	r0,6,0,1 e6,7,1,2 r7,14,2,7 e14,15,7,8 d15,18,8,8
+03yv-j5kv -ñ	p4ñ5iü8	r0,6,0,3 e6,7,3,4 r7,12,4,7
+ä2hsi6y0pk iljüßrt	ä2hsi6y0phk ilhjüßrt	e0,9,0,9 i9,9,9,10 e9,13,10,14 i13,13,14,15 e13,18,15,20
+snñ4w89hogöñoi6tumbätfifl122ñejsußv	ejsußvsnñw89hogöñoi6tumbätfifl122ñ	i0,0,0,6 e0,3,6,9 d3,4,9,9 e4,29,9,34 d29,35,34,34
+suq1señ3b8kubl42xrn7h5e88ñ11o	 ñb8ss5z	r0,6,0,1 e6,7,1,2 d7,8,2,2 e8,10,2,4 r10,21,4,6 e21,22,6,7 r22,29,7,8
+hü34ç3 tä4rççbvlfqmc29owb4	hü34ç3 tä4rççbvlfqmc29owb4	e0,26,0,26
+w180c4	-wö80c4	i0,0,0,1 e0,1,1,2 r1,2,2,3 e2,6,3,7
+éfyä	oéw-y5	i0,0,0,1 e0,1,1,2 r1,2,2,4 e2,3,4,5 r3,4,5,6
+kmüginhu08ä3p2çhqf8gha	kmüginhu08ä3p2çhqf8gha	e0,22,0,22
+wow2çç4z3fvbqo8çk5qßrävwouogen6	ogen6wowaçç4z3fvbqo8k5qßräv2wou	i0,0,0,5 e0,3,5,8 r3,4,8,9 e4,15,9,20 d15,16,20,20 e16,23,20,27 i23,23,27,28 e23,26,28,31 d26,31,31,31
+bb b b bb b a abbba baaab    babba bb baaa baaa      aa ab bb  aba babb aa abbbabaa a aaba  baabba ab b b baaaa   aa b    bb b ba bb bbbbaa ba a a   a bbbb   b  ab a b a bbaa baa  abb  a  b bbbbbbaaa baaabbbb ab ba  bbb   bb   ab a a  b a aabb   a  aaabb baaaabb  ab b ba aa   b aa baaa abbbbaa aa	a bbaa baa  abb  a  b bbbbbbaaa baaabbbb ab ba  bbb   bb   ab a a  b a aabb   a  aaabb baaaabb  ab b ba aa   b aab aaa abbbbaa aabb b b bb b a abbba baaab    babba bb baaa baaa      aa ab bb  aba babb aa abbbabaa a aaba  baabba ab b b baaaa   aa b    bb b ba bb bbbbaa ba a a   a bbbb   b  ab a b 	r0,297,0,297
+m96tké9qf19öäßbzheyd9umö031üi17	eyd9umö031üi17m96t8ké9qf19köäßbzh	d0,17,0,0 e17,31,0,14 i31,31,14,33
+3bey1e7xd3apöw7lés9kviu	e7xd3apöw7lés9kviubey1	d0,5,0,0 e5,23,0,18 i23,23,18,22
+yyöhjçetmpphhjññxoñç5hobcqöu	yyöhjiçetmpphhjññxoñç5hobcqöu	e0,5,0,5 i5,5,5,6 e5,28,6,29
+hç qgö2é1üzfwtödsçuc83cdx 0aüvfjgj	83cdx 0aüvfpjgjhç qgöé1üéztödsçuc	d0,20,0,0 e20,31,0,11 i31,31,11,12 e31,34,12,15 i34,34,15,33
+cüzgj80oomi0ü-1-dlrñk5ué1dwh-mä6	v6cüzgj80oomi07-1-drñk5ué1dwh-mä	i0,0,0,2 e0,12,2,14 r12,13,14,15 e13,17,15,19 d17,18,19,19 e18,31,19,32 d31,32,32,32
+63-hvvhxz9öäglc7 377gldaç	5fzw	r0,8,0,2 e8,9,2,3 r9,25,3,4
+07däe2tküé2bagk7mgnh4f4gxa wih	e2gtküé2bagk7mgnh4f4-gxa wih07dä	d0,4,0,0 e4,6,0,2 i6,6,2,3 e6,23,3,20 i23,23,20,21 e23,30,21,28 i30,30,28,32
+fxq5	fxq5	e0,4,0,4
+zbdoéqh44s0ow7swk--yibnhp	7swk--yibng9pzbdéoéqh440sw	d0,13,0,0 e13,23,0,10 i23,23,10,20 e23,24,20,21 r24,25,21,26
+6lb7ñh4wüwf	6lb7ñh4wüfw	e0,9,0,9 i9,9,9,10 e9,10,10,11 d10,11,11,11
+37ñécif4eß-ißni4oxä5udvbkyrd	37ñécif4eß-iß6ni4oxä5udvbkydr	e0,13,0,13 i13,13,13,14 e13,26,14,27 i26,26,27,28 e26,27,28,29 d27,28,29,29
+xiija301ñsr 48t3jééßüm2mjqñ	ö	r0,27,0,1
+güe1ßktdéükégq	üe1ßktdéjügéxqg	d0,1,0,0 e1,9,0,8 i9,9,8,9 e9,10,9,10 r10,11,10,11 e11,12,11,12 i12,12,12,14 e12,13,14,15 d13,14,15,15
+gmdgmhcñ- yñ39u	gmdgmhcñ- yñ39u	e0,15,0,15
+ety0cdxé6jg2zé5iqbdöpäs276xvppñödßnksm9a	9aety0cdxé6jg2zéiubdöpät276xvppñödßnks	i0,0,0,2 e0,14,2,16 d14,15,16,16 e15,16,16,17 r16,17,17,18 e17,22,18,23 r22,23,23,24 e23,37,24,38 d37,40,38,38
+8c0j0ühjc9-e 0vbyo	-e v0byo8c0p0ü4jc9	i0,0,0,8 e0,3,8,11 r3,4,11,12 e4,6,12,14 r6,7,14,15 e7,10,15,18 d10,18,18,18
+pmrc7avr	c7avrmr	d0,3,0,0 e3,8,0,5 i8,8,5,7
+uvqüswg	6q9	r0,2,0,1 e2,3,1,2 r3,7,2,3
+hpc29xjüzgj0ca8ßoxt	6z	r0,8,0,1 e8,9,1,2 d9,19,2,2
+bb a aaba aaabab a  ba b aab b aa  bb ab  aab     abb bbab  ba aabba  aaab aab bb b  bbba bbb  a  a ab abbab   b baa aa baaba aaababaa  baba a b a a   aaaaab b b   bab abba aab  a aabbabbbababbab aab a a abaa  aaa  bb aababa   abba  aa aa aa a abbbb aaabbbb aa b bbaa b  abaab ab aaabb baabaaaa aa b bbabb  bbbab abba  ab baab aaa  aa   bab aba aba   a ab  aa babbb  ba ab  	bb a aaba aaabab a  ba b aab b aa  bb ab  aab     abb bbab  ba aabba  aaab aab bb b  bbba bbb  a  a ab abbab   b baa aa baaba aaababaa  baba a b a a   aaaaab b b   bab abba aab  a aabbabbbababbab aab a a abaa  aaa  bb aababa   abba  aa aa aa a abbbb aaabbbb aa b bbaa b  abaab ab aaabb baabaaaa aa b bbabb  bbbab abba  ab baab aaa  aa   bab aba ab a  a ab  aa babb   ba ab  	e0,347,0,347 r347,374,347,374
+beib89ffg023 7çsçkj2ß-kd91yiiu7d0eß	beib89ffg023 7çsçkj2ß-kd91yiiu7d0eß	e0,35,0,35
+éé	éé	e0,2,0,2
+q35räf8j	äf8jqb35rd	d0,4,0,0 e4,8,0,4 i8,8,4,10
+ñ4äü	4ü-9	d0,1,0,0 e1,2,0,1 d2,3,1,1 e3,4,1,2 i4,4,2,4
+kü5hlçevcößv8xah14üo6 z3 käö hs	zttb-igañl4y8l0 algrlé	r0,4,0,9 e4,5,9,10 r5,12,10,12 e12,13,12,13 r13,14,13,16 e14,15,16,17 r15,31,17,22
+7o2x844p07lhüs-1äc1l bß03 uç6ßpd	7o2x844p07lhüs-1äcl1 bß03 uç6ßpd	e0,18,0,18 i18,18,18,19 e18,19,19,20 d19,20,20,20 e20,32,20,32
+s	s	e0,1,0,1
+mj4mö2ösc6nu6ñößvqüdö0s1acj ä2qol	u6ñößvqüd0s1acj ä2qolmj4mö2ösc6n	d0,11,0,0 e11,20,0,9 d20,21,9,9 e21,33,9,21 i33,33,21,32
+6ugöñéuti98k0ldviij22k-äz1423	ji22k-äz1423ü6ugöñéuti98k0l-vii	i0,0,0,13 e0,14,13,27 r14,15,27,28 e15,18,28,31 d18,29,31,31
+pöto-m7ç3dñgöéül9i2ä	pöto-m7ç3dñgöéül9iä	e0,18,0,18 d18,19,18,18 e19,20,18,19
+gö y	yg	i0,0,0,1 e0,1,1,2 d1,4,2,2
+n4äte27ymtr8cösj6-	n4äte27ymtrö8cöjs6-	e0,11,0,11 i11,11,11,12 e11,14,12,15 i14,14,15,16 e14,15,16,17 d15,16,17,17 e16,18,17,19
+8q		d0,2,0,0
+3qrnx2syßjbelyn23wßa7y938vzetni	-ceqxxo7z7çsvrnleguhnçñ2lvtqñ6	r0,1,0,3 e1,2,3,4 i2,2,4,13 e2,4,13,15 r4,5,15,23 e5,6,23,24 d6,12,24,24 e12,13,24,25 d13,25,25,25 e25,26,25,26 d26,28,26,26 e28,29,26,27 r29,31,27,30
+s0	09s	i0,0,0,2 e0,1,2,3 d1,2,3,3
+qñ9bclds24dzivéco9-9szñlfz	qss24dzivéc4o9-9szñlfzqñ9bcl	e0,1,0,1 r1,7,1,2 e7,16,2,11 i16,16,11,12 e16,26,12,22 i26,26,22,28
+3 2tñfäs-hgho ekul-z238röf9v0w6sui87	3 2tñfäs-hgho ekul-z238röf9v0w6sui87	e0,36,0,36
+bdob1koxjhcg0ü6rl1gc1maér3jkn0lüwj3	0ü6rl1gc1amr3kjn0löwcj3bdob1koxjhcg	i0,0,0,23 e0,12,23,35 d12,35,35,35
+utté	u jta	e0,1,0,1 i1,1,1,3 e1,2,3,4 r2,4,4,5
+ abbaab bb b  bbaa  a ba   bb aaa    abbbabbb  a aa  ba b  aaa    abbba a b a  a  a b aa aaabb a bb  babb aabababb a  aab bb aba aa      baabba bbbbbba aaaabaa ab aaaaa      aaa abbb babab a    aa ba  ab  abaabaa a bb baabbab bbbbb aaab  babb   aaaabaaaaabbb ba  bb babbb bbbabbba baaa a a b bb  a baaa b b abb ab ba abb  b ab  bb  ab  abb ab b  bbabb  bb a a b a	aabbb ba  bb babbb bbbabbba baaa a a b bb  a baaa b b abb ab ba abb  b ab  bb  ab  abb ab b  bbabb  bb a a b a abbaab bb b  bbaa  a ba   bb aaa    abbbabbb  a aa  ba b  aaa    abbba a b a  a  a b aa aaabb a bb  babb aabababb a  aab bb aba aa      baabba bbbbbbaa aaabaa ab aaaaa      aaa abbb babab a    aa ba  ab  abaabaa a bb baabbab bbbbb aaab  bbb   aaaabaaa	r0,363,0,362
+fiövxlfp08bnäc6lpñlu	tföivxlfp08bnäc6lpñlu	i0,0,0,1 e0,1,1,2 i1,1,2,3 e1,2,3,4 d2,3,4,4 e3,20,4,21
+do erwq8ttzñxx yñbäççaz952tzl2tz0lov	zñx yñbäççaz952tzl2tz0laovdo erwq8tt	d0,10,0,0 e10,12,0,2 d12,13,2,2 e13,34,2,23 i34,34,23,24 e34,36,24,26 i36,36,26,36
+wq1wç1onçä-7r-jj3r6rxzf--5 -j3rcojnl	ä-omm2jk	d0,9,0,0 e9,11,0,2 r11,14,2,6 e14,15,6,7 r15,36,7,8
+x	x-	e0,1,0,1 i1,1,1,2
+jf0yyiovuy-gcçpqüäññcutfnm5-ygköm-9-ép	öl228y9-viraosksußo3fpxjét7	r0,3,0,5 e3,4,5,6 d4,34,6,6 e34,36,6,8 i36,36,8,24 e36,37,24,25 r37,38,25,27
+c 		d0,2,0,0
+kñtxdhmcñl	ktñxhdmñcl	e0,1,0,1 i1,1,1,2 e1,2,2,3 d2,3,3,3 e3,4,3,4 i4,4,4,5 e4,5,5,6 d5,6,6,6 e6,7,6,7 i7,7,7,8 e7,8,8,9 d8,9,9,9 e9,10,9,10
+jsyr	jsyr	e0,4,0,4
+zd0k5 zvgém5naaäp6z78zpe-ñrm-l7	7zd0k5 zvé5naaä3p6z78zpe-ñrm-l	i0,0,0,1 e0,8,1,9 d8,9,9,9 e9,10,9,10 d10,11,10,10 e11,16,10,15 i16,16,15,16 e16,30,16,30 d30,31,30,30
+éyhb3		d0,5,0,0
+e-fçwihçni6-pp	-fçwwhnçi6-ppe	d0,1,0,0 e1,5,0,4 r5,6,4,5 e6,7,5,6 i7,7,6,7 e7,8,7,8 d8,9,8,8 e9,14,8,13 i14,14,13,14
+j43keñt26érckr161r1zrém2dqän4xbv7 m1965	j43keñt26érckr161r1zrém2dqän4xbv7 m1965	e0,39,0,39
+107uälc-m6fügotäenrbyc8 ñdölw8nkq	107uälc-m6fügotäenrbyc8 ñdölwnv8nkq	e0,29,0,29 i29,29,29,31 e29,33,31,35
+70797pfüolmidiüzñßd-yzhñe4cuß68cvjy7	70797pfüolmidiüzñßd-yzhñe4cuß68cvjy7	e0,36,0,36
+rhhlnz2ö4d2z	rhhlnz2ö4d2z	e0,12,0,12
+xakx7ß3sdzöl	sdzölxakx7ß3	i0,0,0,5 e0,7,5,12 d7,12,12,12
+b7ßhe1kñuçxv9u1e1réaqy0g-nyqän4gufz8öñ-	b7ßhe1kñuçv9u1e1réaqy0g-nyqän4gufz8öñ-	e0,10,0,10 d10,11,10,10 e11,39,10,38
+eowsbpd8co4i jbmftö9z6çcçfv1kqcmm5	eowsbpd8co4i jbmftö9z6çcçfv1kqcmm5	e0,34,0,34
+tr1fc7 oj88nizis6äh	6ähtr1fc7 oj88nizis	i0,0,0,3 e0,16,3,19 d16,19,19,19
+aabaabaab b aaaabaabaaabaa a babbaaaa  babb aa a  bb a bab aaaa bab aaaa bbbaa a  ba aa aaba bbb aaaabaa  ba  aab b   ab  ab ab baabbbba  b  a  b b babaa  aaaba ab  b  a    abb a a  b bbabb  babbb  aabbbb   a  baa  b b b  b abbba ab  b aaa 	aabaabaab b aaaabaabaaabaa a babbaaaa  babb aa a  bb a bab aaaa bab aaaa bbbaa a  ba aa aaba bbb aaaabaa  ba  aab b   ab  ab ab baabbbba  b  a  b b babaa  aaaba ab  b  a    abb a a  b bbabb  babbb  abbbb   a  baa  b b b  b abbba ab  baaa 	e0,199,0,199 r199,240,199,238
+uzcon3	uzco3	e0,4,0,4 d4,5,4,4 e5,6,4,5
+lnirç	irçln	d0,2,0,0 e2,5,0,3 i5,5,3,5
+d o9z7bkaeo1nuiz0pwv7züb	d o9z7baeounuzi0pwv7züb	e0,7,0,7 d7,8,7,7 e8,11,7,10 r11,12,10,11 e12,14,11,13 i14,14,13,14 e14,15,14,15 d15,16,15,15 e16,24,15,23
+8ss0mquééñq	8ss0imquééqñ	e0,4,0,4 i4,4,4,5 e4,9,5,10 i9,9,10,11 e9,10,11,12 d10,11,12,12
+-tv8ñbn	8ñb n-vt	d0,3,0,0 e3,6,0,3 i6,6,3,4 e6,7,4,5 i7,7,5,8
+göxä89w d8fbök0	göxä89 w d8fbök0	e0,6,0,6 i6,6,6,7 e6,15,7,16
+t	t	e0,1,0,1
+äfsy6l4ös	äfsy6l4ös	e0,9,0,9
+çbäj7sltpöä3hodrö4ñpñ 3tws14mgbßtnußr9	çbäj7sltpöä3hdorö4ñpñ 3tws14mgbßtnußr9	e0,13,0,13 i13,13,13,14 e13,14,14,15 d14,15,15,15 e15,38,15,38
+mxxzm80çotöñ1qk6hzoxn1475ä1zg	töñ1qkö6hzoxn1475ä1zgmxxzm8qço	d0,9,0,0 e9,15,0,6 i15,15,6,7 e15,29,7,21 i29,29,21,30
+ö677ßäcnuu4mpt2oägioço0ßbñ	nuum4pt2oägioço0ßbö677cäc	d0,7,0,0 e7,10,0,3 i10,10,3,4 e10,11,4,5 d11,12,5,5 e12,25,5,18 r25,26,18,25
+ämüb	müb	d0,1,0,0 e1,4,0,3
+88m7kqv8b8méñncx2ß9t1v	88m7kqv8b8méñncx2ß9t1v	e0,22,0,22
+8wf7enshçx6524-23zqqräsyßéç3-é1ük1k	äsyß3ç3-é1ük1k8qf7 enshçx6524-23zr	i0,0,0,14 e0,1,14,15 r1,2,15,16 e2,4,16,18 i4,4,18,19 e4,18,19,33 d18,20,33,33 e20,21,33,34 d21,35,34,34
+5r é1çm ds--s	hucöv	r0,13,0,5
+xdögvqhnq0uçzv kl0f6hçeçwül8q9ñäß14ßv m	w8-u k	r0,10,0,3 e10,11,3,4 d11,14,4,4 e14,16,4,6 d16,39,6,6
+d		d0,1,0,0
+pl16lb	uké	r0,6,0,3
+hiç	h1i3	e0,1,0,1 i1,1,1,2 e1,2,2,3 r2,3,3,4
+ab aa baa a baa   aa bababa aaabaabb  aaabbbba a ab  aba  b a babbaa  a  a b b b a baabb aba b babbbabaaababbabb    aaaabbaa  ba aabbbbbb b a  ab bbbbb bb bbba aa bbabbba b     ab b bbb  aaaa bb aa  b b a a  aaaaa  ba bba  ba a aa aaabaab baa aaabab b abbb aaa bbbbaa aaa  aabbbbabbab abaa aba  b a  abbb a aababaa abbbabaaab baa  aba 	ab aa baa a baa   aa bababa aaabaabb  aaabbbba a ab  aba  b a babbaa  a  a b b b a baabb aba b babbbabaaababbabb    aaaabbaa  ba aabbbbbb b a  ab bbbbb bb bbba aa bbabbba b     ab b bbb  aaaa bb aa  b b a a  aaaaa  ba bba  ba a aa aaabaab baa aaabab b abbb aaa bbbbaa aaa  aabbbbabbab abaa aba  b a  abbb a aababaa abbbabaaab baa  aba 	e0,335,0,335
+pépcçä62öç20péoüñ4o6zf7ps51ejöjñqv	çä62öç20péoüñ4o6zf7ps51ejöjñqvpépc	d0,4,0,0 e4,34,0,30 i34,34,30,34
+ ytñobl3ükme68pqf-qwyrßycdq7äqhñmhü9f	 ytñobl3ükme68pqf-qwyrßycdq7äqhñm hü9f	e0,33,0,33 i33,33,33,34 e33,37,34,38
+47290lü36164im28	472t90lü36614im28	e0,3,0,3 i3,3,3,4 e3,9,4,10 i9,9,10,11 e9,10,11,12 d10,11,12,12 e11,16,12,17
+g6p24ßvo	6gp24ßvo	i0,0,0,1 e0,1,1,2 d1,2,2,2 e2,8,2,8
+8h4rrfä6çc43mänoat8ñ55arcegzec19	9bußpmé5ñfnbu3r4	r0,2,0,15 e2,3,15,16 d3,32,16,16
+xjnyöcy801ööctj1ü w4çsnn	xjnyöcy801ööctj1ü w4çsnn	e0,24,0,24
+öo3ik6y7lz0ß12g3äy0ßlrçbctöçx	ßlrçbctöçxöo3ik6y7lz0ß12g3äy0	i0,0,0,10 e0,19,10,29 d19,29,29,29
+85äéäe-fxgfgymvfxpobxi1ß4v	obbi1ß4v85äéäe-fxgfgymvfxp	i0,0,0,8 e0,18,8,26 d18,26,26,26
+qbkn02ñj98lx3qç3tßzßnxsjö	ç	d0,14,0,0 e14,15,0,1 d15,25,1,1
+7gvd86tvh-6-bç5uptqu	7gvd6t8vh-6-bçuptqu	e0,4,0,4 d4,5,4,4 e5,7,4,6 i7,7,6,7 e7,14,7,14 d14,15,14,14 e15,20,14,19
+-h7ñpydxçr562bljçäß hu	zh7ñypdxçr562bljçäß hu	r0,1,0,1 e1,4,1,4 i4,4,4,5 e4,5,5,6 d5,6,6,6 e6,22,6,22
+6	si	r0,1,0,2
+ywjj-äz1züö613t63 7éñnñömbaéi80ßéebäxi	t7poñ-g	r0,4,0,5 e4,5,5,6 r5,38,6,7
+n8we8ça	8eça	d0,1,0,0 e1,2,0,1 d2,3,1,1 e3,4,1,2 d4,5,2,2 e5,7,2,4
+tjdcv2ékélbm58ljkb1fßß8	ä5nobç77iü3ß	r0,10,0,4 e10,11,4,5 r11,20,5,11 e20,21,11,12 d21,23,12,12
+ßibqz2	2ßxüliqz	i0,0,0,1 e0,1,1,2 i1,1,2,5 e1,2,5,6 d2,3,6,6 e3,5,6,8 d5,6,8,8
+lhbcqgrdbtlrb	5ifc3if2hpqä	r0,1,0,8 e1,2,8,9 r2,4,9,10 e4,5,10,11 r5,13,11,12
+dtanjdlhr2gjnfipzs5eqok6j5f6h8pä	dtanjdlhr2gjnfipzs5eqok6j5f6h8pä	e0,32,0,32
+oda cßj-o2wfc	cda cßjö-o2wf	r0,1,0,1 e1,7,1,7 i7,7,7,8 e7,12,8,13 d12,13,13,13
+ bb   aa bba babbbbabaabb b b  b bab ba a a baab bbbab  bab   b bbbbaaa    aaa ba aa  a bababa b aaaaaaa abb aba bba    bba ba a  a a aba  aa abb abb  ab b    aa    ab bb aba bbaaab bab  bb b  bbaab b bbbb bab b bbba  aab abba  a  aaa abb  a    b ba ab aaa  bbbb a b bbaab bb aaaa b  abab b b abbaa a ba  aabbbbb aaba bbbbbba b ba baabb a b bb ba      b a aabbab b a abb a babb abbaab ba  abba a a   a  ba baabab 	 b bab ba a a baab bbbab  bab   b bbbbaaa    aaa ba aa  a bababa b aaaaaaa abb aba bba    bba ba a  a a aba  aa abb abb  ab b    aa    ab bb aba bbaaab  bab  bb b  bbaab b bbbb bab b bbba  aaba bba  a  aaa abb  a    b ba ab aaa  bbbb a b bbaab bb aaaa b  abab b b abbaa a ba  aabbbbb aaba bbbbbba b ba baabb a b bb ba      b a aabbab b a abb a babb abbaab ba  abba a a   a  ba baabab b b   aa bba babbbbabaabb b b	e0,2,0,2 r2,413,2,413
+änhü	änvh	e0,2,0,2 i2,2,2,3 e2,3,3,4 d3,4,4,4
+q9wmn fediä24k0by5krve-yg-63döa	q9wmn fediä24k0by5krve-yg-63döa	e0,31,0,31
+foytt21übu810zvuqudk3	foytta1ü9u81z0vuqud3k	e0,5,0,5 r5,6,5,6 e6,8,6,8 r8,9,8,9 e9,12,9,12 i12,12,12,13 e12,13,13,14 d13,14,14,14 e14,19,14,19 i19,19,19,20 e19,20,20,21 d20,21,21,21
+ñ2o4dn-5	ñ2u4dn-5	e0,2,0,2 r2,3,2,3 e3,8,3,8
+frorfvüfjfausöiräxiäri	frorfvüfjftausöiräxiärüi	e0,10,0,10 i10,10,10,11 e10,21,11,22 i21,21,22,23 e21,22,23,24
+xäéjif5g4çdm2ç8qv7dñlé	ñvee0fxwdw7a3yñ4	i0,0,0,6 e0,1,6,7 r1,8,7,15 e8,9,15,16 d9,22,16,16
+k qdvpio6e2pxm 7çfk3siehañk5fu	é qdvpj6e2pxm ä7çfk3siehañk5fu	r0,1,0,1 e1,6,1,6 r6,8,6,7 e8,15,7,14 i15,15,14,15 e15,30,15,30
+9séépä uao	épä uao9sé	d0,3,0,0 e3,10,0,7 i10,10,7,10
+ç4qruñ6kvws7anboecw h	4qruñ6kvws7anboecw h	d0,1,0,0 e1,21,0,20
+373-mä7xzkßdvöécnüxn7hium	373-äm7xzkßdvöéncüxn7hium	e0,4,0,4 i4,4,4,5 e4,5,5,6 d5,6,6,6 e6,15,6,15 i15,15,15,16 e15,16,16,17 d16,17,17,17 e17,25,17,25
+éyzäj4ß07t81xllß1 jé	1jéyézäj4ß07t81xllß	i0,0,0,2 e0,2,2,4 i2,2,4,5 e2,16,5,19 d16,20,19,19
+qb6j9	q66y	e0,1,0,1 d1,2,1,1 e2,3,1,2 r3,5,2,4
+véyzvxcwür9v2o7 i4ewñ82da	ewñ82davéyzvxcwür9v2o7 i4	i0,0,0,7 e0,18,7,25 d18,25,25,25
+hc 	hcié s	e0,2,0,2 i2,2,2,4 e2,3,4,5 i3,3,5,6
+éxedñu3tyf pzq2ü35k6ümäßhlü	zq2ü35k6ümäßhlüéxedñu3tyf p	d0,12,0,0 e12,27,0,15 i27,27,15,27
+125tca3qçe3çiwßkcöz2poc9m26wüpr	z25tca3qçe3çißkcöz2poc9m26üpr	r0,1,0,1 e1,13,1,13 d13,14,13,13 e14,27,13,26 d27,28,26,26 e28,31,26,29
+b		d0,1,0,0
+öcbn1ug4k-ac685lhskwb e1çyi-i4t	öcbn1gu4k-ac685lhpkwb e1ßyi-it	e0,5,0,5 i5,5,5,6 e5,6,6,7 d6,7,7,7 e7,17,7,17 r17,18,17,18 e18,24,18,24 r24,25,24,25 e25,29,25,29 d29,30,29,29 e30,31,29,30
+mç5çv0kyü0jjüdmvjzkg3dl61zsçél72 qu2	mç5öçv0kyü0jjüdm-jzkg3dl6z1sçéjl72 çqu2	e0,3,0,3 i3,3,3,4 e3,15,4,16 r15,16,16,17 e16,24,17,25 i24,24,25,26 e24,25,26,27 d25,26,27,27 e26,29,27,30 i29,29,30,31 e29,33,31,35 i33,33,35,36 e33,36,36,39

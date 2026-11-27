@@ -7,7 +7,7 @@ pub mod plan;
 use crate::build::prefix_text;
 use crate::constants::*;
 use crate::model::*;
-use crate::normalize::{is_ideographic, join, normalize, tokens, Token};
+use crate::text::normalize::{is_ideographic, join, normalize, tokens, Token};
 use crate::entities::{cc_of, polygon_raw, Entities};
 use crate::reader::{SearchIndex, SubIndex};
 use query_server::{cell_id_at_level, polygon_field, AdminPoint, AdminPolygon, Index, ID_MASK, INTERIOR_FLAG, NO_DATA};

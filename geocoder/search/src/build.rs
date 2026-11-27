@@ -11,7 +11,7 @@ use crate::constants::*;
 use crate::entities::*;
 use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI};
 use crate::model::*;
-use crate::normalize::{join, tokens, transliterate};
+use crate::text::normalize::{join, tokens, transliterate};
 use memmap2::Mmap;
 use query_server::{Index, PlaceNode, NO_DATA};
 use serde_json::json;
@@ -369,7 +369,7 @@ impl Source<'_> {
 fn keys_of(geo: &Index, e: &EntityBuf, out: &mut Vec<(String, u8, bool, u8)>) {
     out.clear();
     let mut cc: Option<String> = None;
-    let mut by_class: Vec<(u8, u8, Vec<crate::normalize::Token>)> = Vec::with_capacity(e.names.len() + 1);
+    let mut by_class: Vec<(u8, u8, Vec<crate::text::normalize::Token>)> = Vec::with_capacity(e.names.len() + 1);
     for (class, ord, tr, name) in &e.names {
         let t = tokens(name);
         if !t.is_empty() {
