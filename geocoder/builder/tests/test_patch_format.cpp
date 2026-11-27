@@ -3727,6 +3727,20 @@ TEST(patch_format_parallel_delta_files_follow_their_parent) {
     CHECK(parallel_delta_file(PatchFileId::POI_RECORDS) == nullptr);
 }
 
+// A side file can follow the merge of any record file the diff keeps until
+// the side files are sent: the street ways, the addresses, the
+// interpolations, the POI records and the place nodes; never a child stream,
+// a file merged by slot or another side file.
+TEST(patch_format_parallel_delta_files_follow_any_kept_record_merge) {
+    for (const PatchFileId fid : {PatchFileId::STREET_WAYS, PatchFileId::ADDR_POINTS, PatchFileId::INTERP_WAYS,
+                                  PatchFileId::POI_RECORDS, PatchFileId::PLACE_NODES})
+        CHECK(is_parallel_delta_parent(fid));
+    for (const PatchFileId fid : {PatchFileId::STREET_NODES, PatchFileId::INTERP_NODES, PatchFileId::ADDR_VERTICES,
+                                  PatchFileId::POI_VERTICES, PatchFileId::ADMIN_POLYGONS, PatchFileId::ARC_INDEX,
+                                  PatchFileId::POSTCODE_CENTROIDS, PatchFileId::WAY_PARENTS})
+        CHECK(!is_parallel_delta_parent(fid));
+}
+
 // --- geo entry list deltas ---
 
 TEST(patch_format_geo_list_delta_round_trip) {

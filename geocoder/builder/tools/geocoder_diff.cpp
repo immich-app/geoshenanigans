@@ -2416,10 +2416,10 @@ static int run(int argc, char* argv[]) {
     // new lists.
     double t1 = now_ms();
 
-    // Free merge sequences (already serialized to patch)
+    // Free merge sequences (already serialized to patch), but those of
+    // PARALLEL_DELTA_PARENTS, which the side files follow.
     { std::vector<char>().swap(res_nodes.seq.data); std::vector<char>().swap(res_interp_n.seq.data);
-      std::vector<char>().swap(res_poi_r.seq.data); std::vector<char>().swap(res_poi_v.seq.data);
-      std::vector<char>().swap(res_place_n.seq.data); std::vector<char>().swap(res_postcodes.seq.data);
+      std::vector<char>().swap(res_poi_v.seq.data); std::vector<char>().swap(res_postcodes.seq.data);
       std::vector<char>().swap(res_grid.seq.data); std::vector<char>().swap(res_postal.seq.data); }
 
     {
@@ -2706,6 +2706,11 @@ static int run(int argc, char* argv[]) {
     // delta when the parent wasn't merged, and with it to a full replacement
     // of the values of a file the old dir lacks. A file the new dir lacks
     // gets no section.
+    // The merge of each of PARALLEL_DELTA_PARENTS, kept until the side files are sent.
+    const std::map<PatchFileId, FileMergeResult*> parent_merges = {
+        {PatchFileId::STREET_WAYS, &res_ways}, {PatchFileId::ADDR_POINTS, &res_addr},
+        {PatchFileId::INTERP_WAYS, &res_interp_w}, {PatchFileId::POI_RECORDS, &res_poi_r},
+        {PatchFileId::PLACE_NODES, &res_place_n}};
     auto emit_parallel_delta = [&](const ParallelDeltaFile& f) {
         const char* fname = patch_file_names[(uint32_t)f.fid];
         struct stat nst, ost;
@@ -2715,8 +2720,7 @@ static int run(int argc, char* argv[]) {
         if (stat(new_path.c_str(), &nst) != 0) throw std::runtime_error("Cannot read " + new_path);
         uint64_t new_size = (uint64_t)nst.st_size;
         uint64_t old_size = stat(old_path.c_str(), &ost) == 0 ? (uint64_t)ost.st_size : 0;
-        const FileMergeResult& parent = f.parent == PatchFileId::STREET_WAYS ? res_ways
-                                      : f.parent == PatchFileId::ADDR_POINTS ? res_addr : res_interp_w;
+        const FileMergeResult& parent = *parent_merges.at(f.parent);
         const size_t ps = parent.stride;
         const size_t p_old = ps ? parent.old_size / ps : 0, p_new = ps ? parent.new_size / ps : 0;
         if (ps == 0 || p_old == 0 || old_size != p_old * f.value_stride || new_size != p_new * f.value_stride) {
@@ -2776,8 +2780,7 @@ static int run(int argc, char* argv[]) {
         if (const ParallelDeltaFile* pf = parallel_delta_file(f.fid)) emit_parallel_delta(*pf);
         else emit_sparse_delta(f.fid, patch_file_names[(uint32_t)f.fid], f.value_stride, f.remap_kind);
     }
-    { std::vector<char>().swap(res_addr.seq.data); std::vector<char>().swap(res_ways.seq.data);
-      std::vector<char>().swap(res_interp_w.seq.data); }
+    for (const auto& parent : parent_merges) std::vector<char>().swap(parent.second->seq.data);
     // ADDR_VERTICES was already serialized as a byte-merge just after
     // res_addr when a day has address points. Only fall back to
     // FULL_REPLACE here for a dir without them on both
