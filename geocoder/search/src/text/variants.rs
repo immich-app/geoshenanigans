@@ -56,14 +56,15 @@ pub struct Term {
     pub lookup: String,
 }
 
-/// The rule lines of a rule file, by the language of their section.
+/// The rule lines of a rule file, by the language of their section, without YAML comments (a '#'
+/// that starts a line or follows white space, to the line's end).
 fn rule_lines(file: &str) -> Vec<(&str, &str)> {
     let mut lang = "";
     let mut out = Vec::new();
     for line in file.lines() {
-        let line = line.trim_end();
-        let body = line.trim_start();
-        if body.is_empty() || body.starts_with('#') {
+        let comment = line.char_indices().find(|&(i, c)| c == '#' && line[..i].chars().next_back().is_none_or(char::is_whitespace));
+        let body = line[..comment.map_or(line.len(), |(i, _)| i)].trim();
+        if body.is_empty() {
             continue;
         }
         if let Some(l) = body.strip_prefix("- lang:") {
@@ -431,6 +432,12 @@ mod tests {
     fn variants_go_from_the_full_word_to_its_abbreviation_only() {
         assert!(!tokens("X Dr", Some("en")).iter().any(|t| t.contains("drive")));
         assert!(tokens("X Drive", Some("en")).contains(&"x dr".to_string()));
+    }
+
+    #[test]
+    fn a_comment_after_a_rule_is_no_part_of_it() {
+        assert!(rule_lines("    -  Drive-In => Drive-In # prevent abbreviation here").contains(&("", "Drive-In => Drive-In")));
+        assert_eq!(tokens("Drive-In Road", Some("en")), ["drive in rd"]);
     }
 
     #[test]
