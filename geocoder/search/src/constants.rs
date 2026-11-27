@@ -159,6 +159,12 @@ pub const DEDUPE_EXTRA_MAX: usize = 10;
 pub const BIAS_ZOOM_DEFAULT: u8 = 12;
 pub const BIAS_SCALE_DEFAULT: f64 = 0.4;
 
+// ---- search plans (query/plan.rs): searches of one penalty run in this order, least first
+// (db_searches/country_search.py:23, place_search.py:36, address_search.py:135, base.py:96)
+pub const SEARCH_PRIO_COUNTRY: u8 = 0;
+pub const SEARCH_PRIO_NAME: u8 = 1;
+pub const SEARCH_PRIO_OTHER: u8 = 2;
+
 // ---- tag bundles (tags.rs)
 /// Ends a key in a bundle; TAG_PAIR_SEP joins its pairs. No OSM key or value holds either: XML
 /// 1.0, which the OSM API speaks, allows neither.
