@@ -11,6 +11,7 @@
 //! place-search ctxbench <set dir> <index dir> < "lat lng" lines   (reverse-lookup cost per point)
 use place_search::build::{build_all, held_subs, BuildOpts};
 use place_search::constants::SUB_INDEXES;
+use place_search::profile::Profile;
 use place_search::reader::SearchIndex;
 use place_search::query::Searcher;
 use query_server::{Index, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
@@ -109,7 +110,7 @@ fn answer_lines(input: impl BufRead, out: &mut impl Write,
 
 fn cmd_query(args: &[String]) {
     let (set, dir) = (&args[2], Path::new(&args[3]));
-    let limit: usize = opt(args, "--limit").map(|v| v.parse().unwrap()).unwrap_or(place_search::constants::DEFAULT_LIMIT);
+    let limit: usize = opt(args, "--limit").map(|v| v.parse().unwrap()).unwrap_or(Profile::Immich.policy().default_limit);
     let t = Instant::now();
     let geo = load_geo(set);
     let extras = opt(args, "--extras");

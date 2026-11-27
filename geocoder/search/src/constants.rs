@@ -137,7 +137,6 @@ pub const DEDUPE_KM: f64 = 25.0;
 /// Area entities yield to a same-named settlement in their state among the first AREA_CHECK_TOP.
 pub const AREA_TYPES: [&str; 5] = ["country", "state", "province", "region", "county"];
 pub const AREA_CHECK_TOP: usize = 40;
-pub const DEFAULT_LIMIT: usize = 20;
 /// Context checks run while a candidate can still beat the (limit x this)-th best score.
 pub const CONTEXT_CUTOFF_FACTOR: usize = 2;
 /// At most this many context checks per query (candidates past it count as misses).
@@ -145,6 +144,41 @@ pub const MAX_CONTEXT_CHECKS: usize = 2_000;
 /// Candidates waiting for a context check are cut back to the best 2 x MAX_CONTEXT_CHECKS
 /// whenever they pass 4 x (bounds per-query memory).
 pub const MAX_PENDING_CANDIDATES: usize = 4 * MAX_CONTEXT_CHECKS;
+
+// ---- search requests and profiles (profile.rs)
+/// Results a request asks for without a limit: the immich profile's, as before profiles, and
+/// Nominatim's (v1/server_glue.py:352) for the full profile.
+pub const IMMICH_DEFAULT_LIMIT: usize = 20;
+pub const FULL_DEFAULT_LIMIT: usize = 10;
+/// The most results a request asks for (v1/server_glue.py:352).
+pub const SEARCH_LIMIT_MAX: usize = 50;
+/// A search that deduplicates as Nominatim does fetches limit + min(this, limit) results for its
+/// dedupe to drop from (v1/server_glue.py:353-354).
+pub const DEDUPE_EXTRA_MAX: usize = 10;
+/// Photon's location bias without a zoom or a scale (SearchRequestBase.java:11-12).
+pub const BIAS_ZOOM_DEFAULT: u8 = 12;
+pub const BIAS_SCALE_DEFAULT: f64 = 0.4;
+
+// ---- search plans (query/plan.rs): searches of one penalty run in this order, least first
+// (db_searches/country_search.py:23, place_search.py:36, address_search.py:135, base.py:96)
+pub const SEARCH_PRIO_COUNTRY: u8 = 0;
+pub const SEARCH_PRIO_NAME: u8 = 1;
+pub const SEARCH_PRIO_OTHER: u8 = 2;
+
+// ---- tag bundles (tags.rs)
+/// Ends a key in a bundle; TAG_PAIR_SEP joins its pairs. No OSM key or value holds either: XML
+/// 1.0, which the OSM API speaks, allows neither.
+pub const TAG_KEY_SEP: char = '\u{1F}';
+pub const TAG_PAIR_SEP: char = '\u{1E}';
+/// The tag files of a dataset dir: a bundle's string offset for each place row, admin polygon
+/// and POI row (side_blocks.rs), NO_DATA for a record with nothing beyond its name.
+pub const PLACE_TAGS_FILE: &str = "place_tags.bin";
+pub const ADMIN_TAGS_FILE: &str = "admin_tags.bin";
+pub const POI_TAGS_FILE: &str = "poi_tags.bin";
+
+// ---- entities (index/entities.rs)
+/// Bits of an entity's record in an index row; the kind takes the 3 above them.
+pub const ENTITY_RECORD_BITS: u32 = 29;
 
 // ---- text: Nominatim's tokenizer and the Python it measures with
 /// difflib's autojunk: in a second sequence of at least this many elements, an element on more

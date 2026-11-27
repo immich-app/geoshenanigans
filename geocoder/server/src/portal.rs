@@ -49,6 +49,7 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 
 use crate::{auth, handlers};
+use place_search::profile::{Profile, SearchRequest};
 use query_server::{MultiIndex, WaterLayer, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
 
 /// The build version of the files this server reads, the build.version of
@@ -78,9 +79,6 @@ pub const SEARCHES_AT_ONCE: usize = 4;
 /// each on one thread: 4 build the planet build's 12 in ~156 s, the
 /// longest alone ~135 s.
 pub const SEARCH_JOBS: usize = 4;
-
-/// The most results a /search answers (limit=); DEFAULT_LIMIT without one.
-pub const SEARCH_LIMIT_MAX: usize = 50;
 
 /// The most bytes of a /search's q, its spaces at either end left out.
 pub const SEARCH_QUERY_MAX: usize = 256;
@@ -666,8 +664,9 @@ struct SearchParams {
 }
 
 /// /search of a dataset: the places and POIs whose names match q, best
-/// first, at most limit (1 to SEARCH_LIMIT_MAX, DEFAULT_LIMIT without one),
-/// as the node binding's searchPlaces answers them (query::results_json),
+/// first, at most limit (1 to the immich profile's max_limit, its
+/// default_limit without one), a request of the immich profile, as the node
+/// binding's searchPlaces answers them (query::results_json),
 /// or with debug=1 as `place-search query` prints them, with what the
 /// search did and how long it took (query::debug_line). q goes to the
 /// search as given; with its spaces at either end left out it is 1 to
@@ -716,9 +715,10 @@ async fn search_places(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectIn
     if q.trim().len() > SEARCH_QUERY_MAX {
         return (StatusCode::BAD_REQUEST, format!("q must be at most {SEARCH_QUERY_MAX} bytes")).into_response();
     }
-    let limit = p.limit.unwrap_or(place_search::constants::DEFAULT_LIMIT);
-    if !(1..=SEARCH_LIMIT_MAX).contains(&limit) {
-        return (StatusCode::BAD_REQUEST, format!("limit must be 1 to {SEARCH_LIMIT_MAX}")).into_response();
+    let policy = Profile::Immich.policy();
+    let limit = p.limit.unwrap_or(policy.default_limit);
+    if !(1..=policy.max_limit).contains(&limit) {
+        return (StatusCode::BAD_REQUEST, format!("limit must be 1 to {}", policy.max_limit)).into_response();
     }
     let debug = match p.debug.as_deref() {
         None => false,
@@ -729,11 +729,15 @@ async fn search_places(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectIn
     if let Err(msg) = auth::check_rate(&app.limiter, &rate_key, rps, rpd) {
         return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
     }
+    let req = SearchRequest { limit, ..SearchRequest::new(q, Profile::Immich) };
     let mut resp = held(&app.portal.searches, &served, at, move || {
         let started = std::time::Instant::now();
-        let (found, stats) = searcher.search(&q, limit);
+        let (found, stats) = match searcher.search(&req) {
+            Ok(answer) => answer,
+            Err(refused) => return (StatusCode::BAD_REQUEST, refused.to_string()).into_response(),
+        };
         let body = if debug {
-            place_search::query::debug_line(&q, started.elapsed().as_secs_f64() * 1e6, &found, &stats).to_string()
+            place_search::query::debug_line(&req.q, started.elapsed().as_secs_f64() * 1e6, &found, &stats).to_string()
         } else {
             place_search::query::results_json(&found)
         };
