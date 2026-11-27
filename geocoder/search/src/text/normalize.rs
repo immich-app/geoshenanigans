@@ -1,5 +1,8 @@
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
+use super::latin_ascii::{LATIN_ASCII, LATIN_SCRIPT};
+use super::unicode::{DECIMAL_ZEROS, MODIFIER_LETTER, NONSPACING_MARK_OR_FORMAT, PUNCTUATION_OR_SYMBOL, SPACING_VIRAMA};
+
 /// One query or name token: `folded` is what the index stores, `raw` the token before the
 /// abbreviation folding (a prefix search also tries `raw`, so "fort" still reaches "fortaleza").
 #[derive(Clone, Debug, PartialEq)]
@@ -178,16 +181,266 @@ pub fn transliterate(s: &str, cc: impl FnOnce() -> String) -> Option<String> {
 fn normalize_marks_lower(s: &str) -> String {
     s.nfc()
         .flat_map(|c| c.to_lowercase())
-        .map(|c| match c {
-            'ά' => 'α', 'έ' => 'ε', 'ή' => 'η', 'ί' | 'ϊ' | 'ΐ' => 'ι', 'ό' => 'ο', 'ύ' | 'ϋ' | 'ΰ' => 'υ', 'ώ' => 'ω',
-            x => x,
-        })
+        .map(without_tonos)
         .collect()
+}
+
+fn in_table(c: char, table: &[(u32, u32)]) -> bool {
+    let u = c as u32;
+    let i = table.partition_point(|&(_, hi)| hi < u);
+    table.get(i).is_some_and(|&(lo, _)| lo <= u)
+}
+
+/// The ASCII digit of a decimal digit of any script.
+fn ascii_digit(c: char) -> Option<char> {
+    let u = c as u32;
+    let i = DECIMAL_ZEROS.partition_point(|&zero| zero <= u);
+    let zero = DECIMAL_ZEROS[..i].last()?;
+    (u - zero < 10).then(|| char::from(b'0' + (u - zero) as u8))
+}
+
+/// The Han numerals Nominatim's normaliser writes as digits.
+fn han_numeral(c: char) -> Option<&'static str> {
+    Some(match c {
+        '零' => "0",
+        '一' => "1",
+        '二' => "2",
+        '三' => "3",
+        '四' => "4",
+        '五' => "5",
+        '六' => "6",
+        '七' => "7",
+        '八' => "8",
+        '九' => "9",
+        '十' => "10",
+        _ => return None,
+    })
+}
+
+/// A character the normaliser turns into a '-' (a run of them into one): punctuation, symbols
+/// and the apostrophe letter U+02BC, but not '-' and ':' themselves.
+fn becomes_dash(c: char) -> bool {
+    c == '\u{02BC}' || (c != '-' && c != ':' && in_table(c, PUNCTUATION_OR_SYMBOL))
+}
+
+/// The characters the normaliser keeps: letters, decimal digits, viramas, white space, '-' and ':'.
+fn kept(c: char) -> bool {
+    c.is_alphabetic() || ascii_digit(c).is_some() || in_table(c, SPACING_VIRAMA) || c.is_whitespace() || c == '-' || c == ':'
+}
+
+/// Nominatim's normaliser (its ICU `normalization` rules): the form a name's lookup word is in
+/// and a query is read in. NFKC and lower case; every decimal digit (and a Han numeral) ASCII;
+/// "n°" "no"; a run of punctuation and symbols one '-'; ß "ss"; other characters that are no
+/// letter, digit, space, '-' or ':' dropped, and modifier letters, non-spacing marks and format
+/// characters with them; white space, with a '-' or ':' on either side, one space. Accented
+/// letters stay as they are. Simplified Han stays simplified (Nominatim writes it traditional).
+pub fn normalized(s: &str) -> String {
+    let lower: Vec<char> = s.nfkc().collect::<String>().to_lowercase().chars().collect();
+    let mut first: Vec<char> = Vec::with_capacity(lower.len());
+    let mut i = 0;
+    while i < lower.len() {
+        let c = lower[i];
+        i += 1;
+        if let Some(d) = ascii_digit(c) {
+            first.push(d);
+        } else if let Some(n) = han_numeral(c) {
+            first.extend(n.chars());
+        } else if c == 'n' && lower.get(i) == Some(&'°') {
+            first.extend(['n', 'o']);
+            i += 1;
+        } else if becomes_dash(c) {
+            while lower.get(i).is_some_and(|&c| becomes_dash(c)) {
+                i += 1;
+            }
+            first.push('-');
+        } else if c == 'ß' {
+            first.extend(['s', 's']);
+        } else if kept(c) && !in_table(c, MODIFIER_LETTER) {
+            first.push(c);
+        }
+    }
+    let mut out = String::with_capacity(first.len());
+    let mut i = 0;
+    while i < first.len() {
+        let c = first[i];
+        if in_table(c, NONSPACING_MARK_OR_FORMAT) {
+            i += 1;
+            continue;
+        }
+        let space = i + usize::from(matches!(c, '-' | ':'));
+        if first.get(space).is_some_and(|c| c.is_whitespace()) {
+            i = space;
+            while first.get(i).is_some_and(|c| c.is_whitespace()) {
+                i += 1;
+            }
+            if first.get(i).is_some_and(|c| matches!(c, '-' | ':')) {
+                i += 1;
+            }
+            out.push(' ');
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Nominatim's transliteration (its ICU `transliteration` rules) of a normalised string: the
+/// token the index keys and a query word is looked up by. '-' and ':' are spaces; Cyrillic and
+/// Greek are spelt in Latin letters; a Latin letter is spelt in ASCII as Nominatim spells it,
+/// or dropped where it has no spelling; what is no letter, digit or space is dropped, and spaces
+/// are single. Other scripts stay as they are written (Nominatim spells every script in Latin
+/// letters).
+pub fn transliterated(norm: &str) -> String {
+    let mut out = String::with_capacity(norm.len());
+    let mut space = false;
+    let mut buf = [0u8; 4];
+    for c in latin(norm).chars() {
+        if c.is_whitespace() || c == '-' || c == ':' {
+            space = true;
+        } else if c.is_ascii() {
+            if c.is_ascii_alphanumeric() {
+                push(&mut out, c.to_ascii_lowercase().encode_utf8(&mut buf), &mut space);
+            }
+        } else if in_table(c, LATIN_SCRIPT) {
+            if let Some(spelt) = ascii_spelling(c) {
+                push(&mut out, &spelt, &mut space);
+            }
+        } else if c.is_alphanumeric() || is_combining_mark(c) {
+            push(&mut out, c.encode_utf8(&mut buf), &mut space);
+        }
+    }
+    out.nfc().collect()
+}
+
+/// Appends `s` to a token, after one space when spaces came before it.
+fn push(out: &mut String, s: &str, space: &mut bool) {
+    if *space && !out.is_empty() {
+        out.push(' ');
+    }
+    *space = false;
+    out.push_str(s);
+}
+
+/// How Nominatim spells a Latin letter in ASCII: by its table, else as NFKD leaves it without
+/// marks when that is ASCII letters and digits; None for a letter it drops.
+fn ascii_spelling(c: char) -> Option<String> {
+    if let Ok(i) = LATIN_ASCII.binary_search_by_key(&c, |&(l, _)| l) {
+        return Some(LATIN_ASCII[i].1.to_string());
+    }
+    let fold: String = c.nfkd().filter(|&m| !is_combining_mark(m)).flat_map(char::to_lowercase).collect();
+    (!fold.is_empty() && fold.chars().all(|f| f.is_ascii_alphanumeric())).then_some(fold)
+}
+
+/// The Cyrillic and Greek letters of a lower-case string in Latin letters, by the letter values
+/// no country of its own changes; a letter with a mark the tables do not name is its base
+/// letter's.
+fn latin(lower: &str) -> String {
+    let chars: Vec<char> = lower.chars().map(without_tonos).collect();
+    let mut out = String::with_capacity(lower.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        if c == '\u{0629}' {
+            // Arabic teh marbuta, which Nominatim spells as heh
+            out.push('\u{0647}');
+        } else if c == 'ο' && chars.get(i) == Some(&'υ') {
+            out.push_str("ou");
+            i += 1;
+        } else if let Some(l) = cyrillic(c, "").or_else(|| greek(c)) {
+            out.push_str(l);
+        } else if let Some(l) = c.to_string().nfd().next().and_then(|b| cyrillic(b, "").or_else(|| greek(b))) {
+            out.push_str(l);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn without_tonos(c: char) -> char {
+    match c {
+        'ά' => 'α', 'έ' => 'ε', 'ή' => 'η', 'ί' | 'ϊ' | 'ΐ' => 'ι', 'ό' => 'ο', 'ύ' | 'ϋ' | 'ΰ' => 'υ', 'ώ' => 'ω',
+        c => c,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nominatim's own normaliser and transliteration (ICU 74, the oracle's rules) over a sample
+    /// of the oracle's names and edge cases: input, normalised form, token, script class.
+    const ORACLE_FORMS: &str = include_str!("../../testdata/normalizer.tsv");
+
+    fn oracle_forms() -> impl Iterator<Item = [&'static str; 4]> {
+        ORACLE_FORMS.lines().map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            [f[0], f[1], f[2], f[3]]
+        })
+    }
+
+    #[test]
+    fn normalised_forms() {
+        for (name, norm) in [
+            ("Frankfurt (Oder)", "frankfurt oder-"),
+            ("a - b", "a  b"),
+            ("n° 5", "no 5"),
+            ("١٢٣ ٤", "123 4"),
+            ("十二", "102"),
+            ("Hawaiʻi", "hawaii"),
+            ("Rue de l’Église", "rue de l-église"),
+            ("İstanbul", "istanbul"),
+            ("ラーメン", "ラメン"),
+            ("½", "1-2"),
+            ("a\u{00AD}b", "ab"),
+            ("  Straße  ", "strasse"),
+            ("München", "münchen"),
+        ] {
+            assert_eq!(normalized(name), norm, "{name}");
+        }
+    }
+
+    #[test]
+    fn transliterated_forms() {
+        for (norm, token) in [
+            ("münchen", "munchen"),
+            ("frankfurt oder-", "frankfurt oder"),
+            ("a  b", "a b"),
+            ("rue de l-église", "rue de l eglise"),
+            ("gəncə", "gnc"),
+            ("łódź", "lodz"),
+            ("ŋ ɛ ɔ", "n e o"),
+            ("ǀai-ǀais", "ai ais"),
+            ("αθήνα", "athina"),
+            ("москва", "moskva"),
+            ("东京", "东京"),
+            ("서울", "서울"),
+        ] {
+            assert_eq!(transliterated(norm), token, "{norm}");
+        }
+    }
+
+    #[test]
+    fn normalises_as_nominatims_normaliser() {
+        let wrong: Vec<String> = oracle_forms()
+            .filter(|[_, _, _, class]| *class != "han")
+            .filter(|[input, norm, _, _]| normalized(input) != *norm)
+            .map(|[input, norm, _, _]| format!("{input:?}: {:?} not {norm:?}", normalized(input)))
+            .collect();
+        assert!(wrong.is_empty(), "{} of {}:\n{}", wrong.len(), ORACLE_FORMS.lines().count(), wrong.join("\n"));
+    }
+
+    #[test]
+    fn transliterates_latin_as_nominatim() {
+        let wrong: Vec<String> = oracle_forms()
+            .filter(|[_, _, _, class]| *class == "latin")
+            .filter(|[_, norm, token, _]| transliterated(norm) != *token)
+            .map(|[input, norm, token, _]| format!("{input:?} {norm:?}: {:?} not {token:?}", transliterated(norm)))
+            .collect();
+        assert!(wrong.is_empty(), "{} of {}:\n{}", wrong.len(), ORACLE_FORMS.lines().count(), wrong.join("\n"));
+    }
 
     #[test]
     fn transliterates_cyrillic_and_greek() {
