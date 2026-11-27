@@ -170,6 +170,11 @@ pub const SEARCH_PRIO_OTHER: u8 = 2;
 /// 1.0, which the OSM API speaks, allows neither.
 pub const TAG_KEY_SEP: char = '\u{1F}';
 pub const TAG_PAIR_SEP: char = '\u{1E}';
+/// The tag files of a dataset dir: a bundle's string offset for each place row, admin polygon
+/// and POI row (side_blocks.rs), NO_DATA for a record with nothing beyond its name.
+pub const PLACE_TAGS_FILE: &str = "place_tags.bin";
+pub const ADMIN_TAGS_FILE: &str = "admin_tags.bin";
+pub const POI_TAGS_FILE: &str = "poi_tags.bin";
 
 // ---- entities (index/entities.rs)
 /// Bits of an entity's record in an index row; the kind takes the 3 above them.
