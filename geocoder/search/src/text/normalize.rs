@@ -240,6 +240,12 @@ fn kept(c: char) -> bool {
 /// characters with them; white space, with a '-' or ':' on either side, one space. Accented
 /// letters stay as they are. Simplified Han stays simplified (Nominatim writes it traditional).
 pub fn normalized(s: &str) -> String {
+    rules_normalized(s).trim().to_string()
+}
+
+/// The normalised form as Nominatim's rules leave it before Python strips it, with any space at
+/// either end. House numbers keep it (Nominatim's house-number analysis does not strip).
+pub(super) fn rules_normalized(s: &str) -> String {
     let lower: Vec<char> = s.nfkc().collect::<String>().to_lowercase().chars().collect();
     let mut first: Vec<char> = Vec::with_capacity(lower.len());
     let mut i = 0;
@@ -287,7 +293,7 @@ pub fn normalized(s: &str) -> String {
             i += 1;
         }
     }
-    out.trim().to_string()
+    out
 }
 
 /// Nominatim's transliteration (its ICU `transliteration` rules) of a normalised string: the

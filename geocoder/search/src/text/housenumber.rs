@@ -1,7 +1,7 @@
 //! House numbers as Nominatim's house-number analysis gives them: a canonical form that marks
 //! where a space between digits and letters is optional, and its spellings with and without each.
 
-use super::normalize::{normalized, spaced_token};
+use super::normalize::{rules_normalized, spaced_token};
 use crate::constants::{HOUSENUMBER_MAX_OPTIONAL_SPACES, HOUSENUMBER_NAMED_PART_LETTERS};
 
 /// Where the canonical form of a house number allows a space or none.
@@ -11,12 +11,13 @@ pub const OPTIONAL_SPACE: char = '␣';
 /// otherwise its token form, with an optional space at each boundary between digits and other
 /// characters ("8a", "8 a" -> "8␣a"), unless it has a run of letters long enough to be a word
 /// ("12 abcd") or would get more boundaries than that. A space Nominatim's rules leave at either end
-/// stays, as it does in Nominatim ("2221 (131)" -> "2221 131 "). None when nothing is left.
+/// stays, as it does in Nominatim ("2221 (131)" -> "2221 131 ", "* 12" -> " 12"). None when nothing
+/// is left.
 pub fn canonical(value: &str) -> Option<String> {
     if value.bytes().all(|b| b.is_ascii_digit()) {
         return (!value.is_empty()).then(|| value.to_string());
     }
-    let token = spaced_token(&normalized(value));
+    let token = spaced_token(&rules_normalized(value));
     if token.is_empty() {
         return None;
     }
@@ -124,6 +125,14 @@ mod tests {
         assert_eq!(canonical(""), None);
         assert_eq!(canonical("ʻ"), None);
         assert_eq!(canonical("-").as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn spaces_at_either_end_stay() {
+        assert_eq!(canonical("12 *").as_deref(), Some("12 "));
+        assert_eq!(canonical("* 12").as_deref(), Some(" 12"));
+        assert_eq!(canonical("(12)").as_deref(), Some(" 12 "));
+        assert_eq!(variants(&canonical("12a *").unwrap()), ["12 a ", "12a "]);
     }
 
     #[test]
