@@ -51,7 +51,7 @@ const MUTATIONS: [(&str, char, &str); 3] = [("de", 'ä', "ae"), ("de", 'ö', "oe
 /// The token (transliterated) a name or variant is indexed by and the normalised form it was
 /// spelt from, which a query's match is measured against.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Term {
+pub struct Spelling {
     pub token: String,
     pub lookup: String,
 }
@@ -308,12 +308,12 @@ impl Variants {
         }
     }
 
-    /// The terms of a normalised name. With no language, the name itself; with one, only the
+    /// The spellings of a normalised name. With no language, the name itself; with one, only the
     /// variants its rules and spellings make that differ from it, as Nominatim's analyses do.
-    pub fn terms(&self, norm: &str, language: Option<&str>) -> Vec<Term> {
+    pub fn spellings(&self, norm: &str, language: Option<&str>) -> Vec<Spelling> {
         let Some(lang) = language else {
             let token = transliterated(norm);
-            return if token.is_empty() { Vec::new() } else { vec![Term { token, lookup: norm.to_string() }] };
+            return if token.is_empty() { Vec::new() } else { vec![Spelling { token, lookup: norm.to_string() }] };
         };
         let mut spelt = match self.rules.get(lang) {
             Some(rules) => rules.vary(norm),
@@ -329,13 +329,13 @@ impl Variants {
             }
             spelt = spelt.iter().flat_map(|v| mutated(v, letter, spelling)).collect();
         }
-        let mut out: Vec<Term> = spelt
+        let mut out: Vec<Spelling> = spelt
             .into_iter()
             .map(|v| v.trim().to_string())
             .filter(|v| v != norm)
             .filter_map(|lookup| {
                 let token = transliterated(&lookup);
-                (!token.is_empty()).then_some(Term { token, lookup })
+                (!token.is_empty()).then_some(Spelling { token, lookup })
             })
             .collect();
         out.sort_unstable();
@@ -376,13 +376,13 @@ mod tests {
     /// letter values rather than by ICU's.
     const OWN_SPELLING: [&str; 4] = ["bg", "el", "ru", "uk"];
 
-    fn written(terms: &[Term]) -> String {
+    fn written(terms: &[Spelling]) -> String {
         let parts: Vec<String> = terms.iter().map(|t| format!("{}={}", t.token, t.lookup)).collect();
         parts.join("|")
     }
 
     fn tokens(name: &str, lang: Option<&str>) -> Vec<String> {
-        Variants::get().terms(&normalized(name), lang).into_iter().map(|t| t.token).collect()
+        Variants::get().spellings(&normalized(name), lang).into_iter().map(|t| t.token).collect()
     }
 
     #[test]
@@ -391,7 +391,7 @@ mod tests {
         let mut wrong = Vec::new();
         for line in ORACLE.lines() {
             let f: Vec<&str> = line.split('\t').collect();
-            let terms = variants.terms(&normalized(f[1]), Some(f[0]));
+            let terms = variants.spellings(&normalized(f[1]), Some(f[0]));
             let same = if OWN_SPELLING.contains(&f[0]) {
                 let mut ours: Vec<&str> = terms.iter().map(|t| t.lookup.as_str()).collect();
                 let mut theirs: Vec<&str> = f[2].split('|').filter_map(|p| p.split_once('=')).map(|(_, l)| l).collect();
@@ -423,8 +423,8 @@ mod tests {
 
     #[test]
     fn a_variant_keeps_its_own_spelling_as_lookup_word() {
-        let terms = Variants::get().terms("liberty park drive", Some("en"));
-        assert!(terms.contains(&Term { token: "liberty park dr".into(), lookup: "liberty park dr".into() }), "{terms:?}");
+        let terms = Variants::get().spellings("liberty park drive", Some("en"));
+        assert!(terms.contains(&Spelling { token: "liberty park dr".into(), lookup: "liberty park dr".into() }), "{terms:?}");
         assert!(!terms.iter().any(|t| t.lookup == "liberty park drive"), "the name itself is no variant");
     }
 
@@ -458,7 +458,7 @@ mod tests {
     #[test]
     fn too_many_umlauts_stay_as_they_are() {
         let name = "ä".repeat(40);
-        assert_eq!(Variants::get().terms(&name, Some("de")), Vec::<Term>::new());
+        assert_eq!(Variants::get().spellings(&name, Some("de")), Vec::<Spelling>::new());
         let some = tokens("Bärenhöhle", Some("de"));
         assert!(["baerenhoehle", "baerenhohle", "barenhoehle"].iter().all(|t| some.contains(&t.to_string())), "{some:?}");
     }
