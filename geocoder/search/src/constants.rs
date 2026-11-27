@@ -145,3 +145,9 @@ pub const MAX_CONTEXT_CHECKS: usize = 2_000;
 /// Candidates waiting for a context check are cut back to the best 2 x MAX_CONTEXT_CHECKS
 /// whenever they pass 4 x (bounds per-query memory).
 pub const MAX_PENDING_CANDIDATES: usize = 4 * MAX_CONTEXT_CHECKS;
+
+// ---- tag bundles (tags.rs)
+/// Ends a key in a bundle; TAG_PAIR_SEP joins its pairs. No OSM key or value holds either: XML
+/// 1.0, which the OSM API speaks, allows neither.
+pub const TAG_KEY_SEP: char = '\u{1F}';
+pub const TAG_PAIR_SEP: char = '\u{1E}';
