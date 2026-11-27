@@ -1,5 +1,6 @@
 //! What a format-3 index holds, as the search reads it: its entities, and the records they are.
 pub mod entities;
+pub mod terms;
 
 /// The sub-indexes of an index, and the posting set over the core's entities that only the full
 /// profile reads.
