@@ -13,6 +13,7 @@ pub mod index;
 pub mod keys;
 pub mod model;
 pub mod normalize;
+pub mod profile;
 pub mod query;
 pub mod reader;
 pub mod result;

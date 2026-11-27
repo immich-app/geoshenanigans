@@ -1399,6 +1399,7 @@ pub fn check_retained_names(out: &Path, building: &[&str], with_extras: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture::new_request;
 
     /// xorshift: deterministic test values without a dependency.
     struct Rng(u64);
@@ -2076,7 +2077,7 @@ mod tests {
         let s = Searcher::new(&idx);
 
         for q in ["Prüfstadt", "Ville-Essai"] {
-            let (found, _) = s.search(q, 5);
+            let (found, _) = s.search(&new_request(q, 5));
 
             // The boundary is entity n_place_nodes (1) + its polygon (0); its node is not its own.
             let got: Vec<(u32, &str)> = found.iter().map(|f| (f.hit.entity, f.name.as_str())).collect();
@@ -2113,17 +2114,17 @@ mod tests {
 
         // The boundaries are entities n_place_nodes (4) + their polygons.
         for (q, entity) in [("Sosnovka", 4), ("Сосновка", 4), ("Kirsanovka", 5), ("Кирсановка", 5)] {
-            let (found, _) = s.search(q, 5);
+            let (found, _) = s.search(&new_request(q, 5));
 
             assert!(!found.is_empty(), "{q}");
             assert_eq!((found[0].hit.entity, found[0].name.as_str()), (entity, q), "{q}");
         }
         // Either name places a mill in its boundary, before the city and the other boundary's
         // mill; without a context the city comes first.
-        let (found, _) = s.search("Mill", 5);
+        let (found, _) = s.search(&new_request("Mill", 5));
         assert_eq!(found.first().map(|f| f.lat), Some(12.1));
         for (q, lat) in [("Mill, Sosnovka", 10.05), ("Mill, Сосновка", 10.05), ("Mill, Kirsanovka", 11.1), ("Mill, Кирсановка", 11.1)] {
-            let (found, _) = s.search(q, 5);
+            let (found, _) = s.search(&new_request(q, 5));
 
             assert!(!found.is_empty(), "{q}");
             assert_eq!((found[0].name.as_str(), found[0].lat), ("Mill", lat), "{q}");
@@ -2156,7 +2157,7 @@ mod tests {
         let s = Searcher::new(&idx);
 
         for (q, poly) in [("Hookcounty", hook), ("Ringcounty", ring)] {
-            let (found, _) = s.search(q, 5);
+            let (found, _) = s.search(&new_request(q, 5));
 
             // No place nodes: the boundary is entity 0 + its polygon.
             let f = &found[0];
@@ -2205,7 +2206,7 @@ mod tests {
         let changed: Vec<_> = before.iter().filter(|e| !after.contains(e)).chain(after.iter().filter(|e| !before.contains(e))).map(|e| &e.1).collect();
         assert!(changed.is_empty(), "changed: {changed:?}");
         let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
-        let (found, _) = Searcher::new(&idx).search("Testburg", 5);
+        let (found, _) = Searcher::new(&idx).search(&new_request("Testburg", 5));
         assert_eq!(found.iter().map(|f| f.hit.entity).collect::<Vec<_>>(), [0]);
     }
 
@@ -2473,7 +2474,7 @@ mod tests {
         build_search(&geo, &out, None);
         let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
         let s = Searcher::new(&idx);
-        let found = |q: &str| s.search(q, 5).0.iter().map(|f| f.hit.entity).collect::<Vec<_>>();
+        let found = |q: &str| s.search(&new_request(q, 5)).0.iter().map(|f| f.hit.entity).collect::<Vec<_>>();
 
         assert_eq!(found("Hartley Brook"), [brook | POI_BIT]);
         assert_eq!(found("Quenby Mere"), [0u32; 0]);

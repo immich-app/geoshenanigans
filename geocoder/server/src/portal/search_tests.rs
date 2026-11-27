@@ -9,8 +9,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Condvar;
 
 use super::*;
-use place_search::constants::{DEFAULT_LIMIT, META_FILE};
+use place_search::constants::META_FILE;
 use place_search::dataset::{Origin, PlaceSearch, Stamps, DATASET_FILES};
+use place_search::profile::{Profile, SearchRequest};
 use place_search::query::{debug_line, results_json};
 
 /// A gate the opens of a test wait at (Gate::waiting) until the test opens
@@ -266,8 +267,8 @@ async fn a_search_answers_byte_for_byte_what_the_binding_answers_from_its_index(
         assert_eq!(origin, Origin::Current, "{dataset}");
         for q in ["testville", "Testville", "testvile", "testland", "testv", "testville, testland", "nowhere at all", "  testville "] {
             for limit in [None, Some(1), Some(5), Some(50)] {
-                let wanted = limit.unwrap_or(DEFAULT_LIMIT);
-                let (results, stats) = theirs.search(q, wanted);
+                let wanted = limit.unwrap_or(Profile::Immich.policy().default_limit);
+                let (results, stats) = theirs.search(&SearchRequest { limit: wanted, ..SearchRequest::new(q, Profile::Immich) }).unwrap();
                 let encoded: String = q.bytes().map(|b| format!("%{b:02X}")).collect();
                 let at = format!("{url}/search?q={encoded}&dataset={dataset}&key=test{}", limit.map(|l| format!("&limit={l}")).unwrap_or_default());
 

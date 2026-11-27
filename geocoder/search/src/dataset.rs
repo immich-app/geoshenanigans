@@ -10,6 +10,7 @@ use crate::build::{
     Contended, HeldIndexDir,
 };
 use crate::constants::*;
+use crate::profile::{Profile, RequestError, SearchRequest};
 use crate::query::{Found, QueryStats, Searcher};
 use crate::reader::SearchIndex;
 use query_server::{lower_hex, FileStamp, Index, WATER_DIR, WATER_FILES};
@@ -324,10 +325,15 @@ impl PlaceSearch {
         Ok((PlaceSearch { searcher: Searcher::new(index_ref), _index: opened, _geo: geo }, origin))
     }
 
-    /// `Searcher::search`: the results for `q`, best first, and the work they took. They borrow
-    /// this search, which they can't outlive.
-    pub fn search(&self, q: &str, limit: usize) -> (Vec<Found<'_>>, QueryStats) {
-        self.searcher.search(q, limit)
+    /// `Searcher::search` of a request of the immich profile, the one this index holds: the
+    /// results, best first, and the work they took. They borrow this search, which they can't
+    /// outlive.
+    pub fn search(&self, req: &SearchRequest) -> Result<(Vec<Found<'_>>, QueryStats), RequestError> {
+        if req.profile != Profile::Immich {
+            return Err(RequestError::ProfileNotBuilt(req.profile));
+        }
+
+        Ok(self.searcher.search(req))
     }
 }
 
@@ -335,7 +341,7 @@ impl PlaceSearch {
 mod tests {
     use super::*;
     use crate::build::build_all;
-    use crate::fixture::{Geo, TempDir};
+    use crate::fixture::{new_request, Geo, TempDir};
     use query_server::{AdminPoint, ADMIN_GEOMETRY_FILES, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
     use std::path::PathBuf;
 
@@ -364,7 +370,7 @@ mod tests {
 
     /// Where the index `idx` has Hookcounty's label point.
     fn label_point(idx: &SearchIndex) -> AdminPoint {
-        let found = Searcher::new(idx).search("Hookcounty", 5).0;
+        let found = Searcher::new(idx).search(&new_request("Hookcounty", 5)).0;
         assert_eq!(found.len(), 1);
         AdminPoint::new(found[0].lat as f64, found[0].lng as f64)
     }
@@ -398,7 +404,7 @@ mod tests {
 
     /// The names `idx` finds for `q`.
     fn names(idx: &SearchIndex, q: &str) -> Vec<String> {
-        Searcher::new(idx).search(q, 5).0.into_iter().map(|f| f.name).collect()
+        Searcher::new(idx).search(&new_request(q, 5)).0.into_iter().map(|f| f.name).collect()
     }
 
     /// The index files in `dir` (not its META_FILE, which holds build times, nor the hash cache).
@@ -862,9 +868,21 @@ mod tests {
         assert_eq!(origin, Origin::Built);
         let geo = load_dataset(&ds.0).0;
         let idx = SearchIndex::open(&geo, &index, None, None).unwrap();
-        let (found, _) = search.search("otherton", 5);
-        assert_eq!(crate::query::results_json(&found), crate::query::results_json(&Searcher::new(&idx).search("otherton", 5).0));
+        let (found, _) = search.search(&new_request("otherton", 5)).unwrap();
+        assert_eq!(crate::query::results_json(&found), crate::query::results_json(&Searcher::new(&idx).search(&new_request("otherton", 5)).0));
         assert_eq!(found.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Otherton"]);
+    }
+
+    #[test]
+    fn a_place_search_refuses_a_profile_its_index_holds_no_data_of() {
+        let ds = TempDir::new("place-search-full");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let (geo, stamps) = load_dataset(&ds.0);
+        let (search, _) = PlaceSearch::open(Arc::new(geo), &stamps, &ds.0, &ds.0.join("search"), &BuildOnDevice::default()).unwrap();
+
+        let refused = search.search(&SearchRequest::new("otherton", Profile::Full));
+
+        assert_eq!(refused.map(drop), Err(RequestError::ProfileNotBuilt(Profile::Full)));
     }
 
     #[test]

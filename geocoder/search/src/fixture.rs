@@ -4,6 +4,7 @@
 use crate::build::{build_all, held_subs, index_meta, BuildOpts};
 use crate::constants::SUB_INDEXES;
 use crate::model::PLACE_FLAG_LABEL_OF;
+use crate::profile::{Profile, SearchRequest};
 use query_server::arc_fixture::{self, ArcFixture};
 use query_server::{
     cell_id_at_level, cell_pairs, place_files, poi_files, strings, AdminPolygon, Index, PlaceNode, PointE7, PoiRecord, DEFAULT_ADMIN_CELL_LEVEL,
@@ -209,3 +210,8 @@ fn e7_ring(ring: &[(f32, f32)]) -> Vec<PointE7> {
 }
 
 
+
+/// A request of the immich profile for `q`, at most `limit` results.
+pub fn new_request(q: &str, limit: usize) -> SearchRequest {
+    SearchRequest { limit, ..SearchRequest::new(q, Profile::Immich) }
+}
