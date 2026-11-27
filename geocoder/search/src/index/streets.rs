@@ -46,13 +46,16 @@ pub enum RangeSource {
     Tiger,
 }
 
-/// A range of house numbers on a way of a street: start to end, every step-th.
+/// A range of house numbers on a way of a street, every step-th from start to end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct InterpolationRow {
-    /// Its row in interp_ways.bin.
+    /// Its row in interp_ways.bin, whose nodes are the range's line: as Nominatim's osmline rows
+    /// (interpolation.sql:196-367), an OSM line split at its numbered nodes is a row a section,
+    /// so a row places its numbers on its own line alone.
     pub interpolation: u32,
     pub way: u32,
     pub source: RangeSource,
+    /// start <= end, its line running from start's end to end's.
     pub start: u32,
     pub end: u32,
     pub step: u32,
