@@ -124,10 +124,21 @@ impl Search {
     }
 }
 
-/// What a query's reading hands its execution: the terms its lookups found, and its searches.
+/// A point the query's text named, and the radius in degrees around it results lie within:
+/// Nominatim's `near` and `near_radius` from coordinates in the query (v1/server_glue.py:303-330).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NearPoint {
+    pub lat: f64,
+    pub lon: f64,
+    pub radius: f64,
+}
+
+/// What a query's reading hands its execution: the terms its lookups found, the point its text
+/// named, and its searches.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SearchPlan {
     pub terms: Vec<Term>,
+    pub near: Option<NearPoint>,
     pub searches: Vec<Search>,
 }
 
