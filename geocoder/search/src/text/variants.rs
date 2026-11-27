@@ -319,6 +319,13 @@ impl Variants {
             None => vec![norm.to_string()],
         };
         for &(_, letter, spelling) in MUTATIONS.iter().filter(|(l, ..)| *l == lang) {
+            // Nominatim spells every combination however many there are; past
+            // VARIANT_MAX_PARTIALS a name keeps the spellings it has, so no name can blow the
+            // index build up.
+            let combinations = spelt.iter().map(|v| 1usize.checked_shl(v.matches(letter).count() as u32).unwrap_or(usize::MAX));
+            if combinations.fold(0usize, usize::saturating_add) > VARIANT_MAX_PARTIALS {
+                break;
+            }
             spelt = spelt.iter().flat_map(|v| mutated(v, letter, spelling)).collect();
         }
         let mut out: Vec<Term> = spelt
@@ -439,6 +446,14 @@ mod tests {
         assert_eq!(tokens("München", Some("de")), ["muenchen"]);
         assert_eq!(tokens("München", None), ["munchen"]);
         assert_eq!(tokens("München", Some("en")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn too_many_umlauts_stay_as_they_are() {
+        let name = "ä".repeat(40);
+        assert_eq!(Variants::get().terms(&name, Some("de")), Vec::<Term>::new());
+        let some = tokens("Bärenhöhle", Some("de"));
+        assert!(["baerenhoehle", "baerenhohle", "barenhoehle"].iter().all(|t| some.contains(&t.to_string())), "{some:?}");
     }
 
     #[test]

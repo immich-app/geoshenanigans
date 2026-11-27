@@ -169,7 +169,7 @@ pub const HOUSENUMBER_AS_NAME_RUN: usize = 15;
 /// A house number with a list part of this many characters and no digit is a name.
 pub const HOUSENUMBER_AS_NAME_WORD: usize = 3;
 /// An interpolated house-number range of fewer numbers than this becomes each of them.
-pub const INTERPOLATION_EXPAND_BELOW: u64 = 10;
+pub const INTERPOLATION_EXPAND_BELOW: u128 = 10;
 /// What stands between the names of a multilingual `name` ("Bruxelles - Brussel").
 pub const MULTILINGUAL_DELIMITERS: [char; 3] = ['/', '-', ' '];
 /// A ref longer than this is no name.

@@ -252,7 +252,7 @@ impl Place {
 
 #[derive(Clone, Copy)]
 enum Step {
-    Every(u64),
+    Every(u128),
     Odd,
     Even,
 }
@@ -262,16 +262,16 @@ fn has_url(value: &str) -> bool {
 }
 
 /// The value of a string of decimal digits of any script.
-fn decimal(s: &str) -> Option<u64> {
+fn decimal(s: &str) -> Option<u128> {
     if s.is_empty() {
         return None;
     }
-    s.chars().try_fold(0u64, |n, c| n.checked_mul(10)?.checked_add(u64::from(decimal_digit(c)?)))
+    s.chars().try_fold(0u128, |n, c| n.checked_mul(10)?.checked_add(u128::from(decimal_digit(c)?)))
 }
 
 /// The numbers of an interpolated "first-last" range, when it has fewer than
 /// INTERPOLATION_EXPAND_BELOW; None otherwise (the value then stays as it is).
-fn expand_range(step: Step, value: &str) -> Option<Vec<u64>> {
+fn expand_range(step: Step, value: &str) -> Option<Vec<u128>> {
     let (first, last) = value.split_once('-')?;
     let (mut first, last) = (decimal(first)?, decimal(last)?);
     let step = match step {
@@ -279,12 +279,12 @@ fn expand_range(step: Step, value: &str) -> Option<Vec<u64>> {
         Step::Every(n) => n,
         Step::Odd | Step::Even => {
             if matches!(step, Step::Even) == (first % 2 == 1) {
-                first += 1;
+                first = first.checked_add(1)?;
             }
             2
         }
     };
-    if last < first || (last + 1 - first) as f64 / step as f64 >= INTERPOLATION_EXPAND_BELOW as f64 {
+    if last < first || last - first >= INTERPOLATION_EXPAND_BELOW * step - 1 {
         return None;
     }
     Some((first..=last).step_by(step as usize).collect())
@@ -500,6 +500,10 @@ mod tests {
         assert_eq!(numbers("1-10", "all"), ["1-10"]);
         assert_eq!(numbers("12-2", "even"), ["12-2"]);
         assert_eq!(numbers("2-8", "0"), ["2-8"]);
+        assert_eq!(numbers("18446744073709551616-18446744073709551616", "all"), ["18446744073709551616"]);
+        let huge = "340282366920938463463374607431768211455";
+        let place = sanitized(&[("addr:housenumber", &format!("{huge}-{huge}")), ("addr:interpolation", "even")], "");
+        assert_eq!(values(&place.names), [format!("{huge}-{huge}")]);
     }
 
     #[test]

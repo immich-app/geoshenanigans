@@ -241,7 +241,7 @@ impl PostcodeParser {
         let mut start = 0;
         while start < slots {
             let mut end = start + 1;
-            while !matches!(nodes[end].btype, Break::End | Break::Phrase | Break::SoftPhrase) {
+            while end < slots && !matches!(nodes[end].btype, Break::End | Break::Phrase | Break::SoftPhrase) {
                 end += 1;
             }
             let mut word: Vec<char> = vec![Break::Phrase.char()];
@@ -285,7 +285,8 @@ impl PostcodeParser {
         for (pattern, outputs) in &self.patterns {
             let Some(m) = pattern.match_prefix(rest) else { continue };
             let matched = &rest[..m.end];
-            let end = breaks[cc_breaks + matched.iter().filter(|c| NODE_BREAKS.contains(c)).count()];
+            // A node's word holds no break character, so every one in the match is a node's break.
+            let Some(&end) = breaks.get(cc_breaks + matched.iter().filter(|c| NODE_BREAKS.contains(c)).count()) else { continue };
             for (output, ccs) in outputs {
                 if cc.as_ref().is_some_and(|cc| !ccs.contains(cc)) {
                     continue;
@@ -550,6 +551,15 @@ mod tests {
         assert_eq!(codes(&parser, "<lv|-1044|>"), "0,2,LV-1044");
         // "VL" reads as a country code, which no pattern of "T1117" belongs to.
         assert_eq!(codes(&parser, "<valletta| vlt1117|>"), "");
+    }
+
+    #[test]
+    fn nodes_out_of_shape_do_not_panic() {
+        let parser = PostcodeParser::default();
+        assert_eq!(codes(&parser, "<1044"), "");
+        let spaced = [Node { btype: Break::Start, word: "2361 ab" }, Node { btype: Break::End, word: "" }];
+        assert!(parser.parse(&spaced).iter().all(|p| p.end <= 1));
+        assert!(parser.parse(&[]).is_empty());
     }
 
     #[test]
