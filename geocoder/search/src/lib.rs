@@ -15,5 +15,6 @@ pub mod model;
 pub mod normalize;
 pub mod query;
 pub mod reader;
+pub mod result;
 pub mod tags;
 pub mod varint;
