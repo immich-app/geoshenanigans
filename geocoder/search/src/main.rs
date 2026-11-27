@@ -11,7 +11,7 @@
 //! place-search ctxbench <set dir> <index dir> < "lat lng" lines   (reverse-lookup cost per point)
 use place_search::build::{build_all, held_subs, BuildOpts};
 use place_search::constants::SUB_INDEXES;
-use place_search::profile::{Profile, SearchRequest};
+use place_search::profile::Profile;
 use place_search::reader::SearchIndex;
 use place_search::query::Searcher;
 use query_server::{Index, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
@@ -111,7 +111,6 @@ fn answer_lines(input: impl BufRead, out: &mut impl Write,
 fn cmd_query(args: &[String]) {
     let (set, dir) = (&args[2], Path::new(&args[3]));
     let limit: usize = opt(args, "--limit").map(|v| v.parse().unwrap()).unwrap_or(Profile::Immich.policy().default_limit);
-    let request = |q: &str| SearchRequest { limit, ..SearchRequest::new(q, Profile::Immich) };
     let t = Instant::now();
     let geo = load_geo(set);
     let extras = opt(args, "--extras");
@@ -124,19 +123,18 @@ fn cmd_query(args: &[String]) {
         let queries: Vec<String> = std::io::stdin().lock().lines().collect::<Result<Vec<_>, _>>()
             .expect("read queries").into_iter().filter(|l| !l.is_empty()).collect();
         if queries.is_empty() { eprintln!("no queries on stdin"); std::process::exit(2); }
-        let requests: Vec<SearchRequest> = queries.iter().map(|q| request(q)).collect();
         if !flag(args, "--no-warmup") {
-            for req in &requests {
-                std::hint::black_box(s.search(req));
+            for q in &queries {
+                std::hint::black_box(s.search(q, limit));
             }
         }
         let mut lat: Vec<f64> = Vec::with_capacity(queries.len() * rep);
         let mut lookups = 0usize;
         let t_all = Instant::now();
         for _ in 0..rep {
-            for req in &requests {
+            for q in &queries {
                 let t = Instant::now();
-                let (r, st) = s.search(req);
+                let (r, st) = s.search(q, limit);
                 std::hint::black_box(r);
                 lat.push(t.elapsed().as_secs_f64() * 1e6);
                 lookups += st.reverse_lookups;
@@ -161,7 +159,7 @@ fn cmd_query(args: &[String]) {
     let mut out = out.lock();
     answer_lines(std::io::stdin().lock(), &mut out, |q| {
         let t = Instant::now();
-        let (found, st) = s.search(&request(q));
+        let (found, st) = s.search(q, limit);
         place_search::query::debug_line(q, t.elapsed().as_secs_f64() * 1e6, &found, &st)
     }).expect("query input/output");
     eprintln!("after queries: memory {}", mem_json());

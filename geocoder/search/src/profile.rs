@@ -281,6 +281,8 @@ pub enum RequestError {
     UnknownLayer(String),
     /// The index holds no data of the profile.
     ProfileNotBuilt(Profile),
+    /// The index answers no request that sets this option.
+    UnsupportedOption(&'static str),
 }
 
 impl fmt::Display for RequestError {
@@ -290,6 +292,7 @@ impl fmt::Display for RequestError {
             RequestError::UnknownMode(s) => write!(f, "Unknown match mode: {s}"),
             RequestError::UnknownLayer(s) => write!(f, "Unknown layer: {s}"),
             RequestError::ProfileNotBuilt(p) => write!(f, "Profile not built: {}", p.as_str()),
+            RequestError::UnsupportedOption(option) => write!(f, "Option not supported: {option}"),
         }
     }
 }
@@ -406,5 +409,6 @@ mod tests {
     fn a_refusal_says_what_was_refused() {
         assert_eq!(RequestError::UnknownProfile("hosted".into()).to_string(), "Unknown profile: hosted");
         assert_eq!(RequestError::ProfileNotBuilt(Profile::Full).to_string(), "Profile not built: full");
+        assert_eq!(RequestError::UnsupportedOption("viewbox").to_string(), "Option not supported: viewbox");
     }
 }

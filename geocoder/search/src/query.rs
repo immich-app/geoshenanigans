@@ -8,7 +8,6 @@ use crate::build::prefix_text;
 use crate::constants::*;
 use crate::model::*;
 use crate::normalize::{is_ideographic, join, normalize, tokens, Token};
-use crate::profile::SearchRequest;
 use crate::entities::{cc_of, polygon_raw, Entities};
 use crate::reader::{SearchIndex, SubIndex};
 use query_server::{cell_id_at_level, polygon_field, AdminPoint, AdminPolygon, Index, ID_MASK, INTERIOR_FLAG, NO_DATA};
@@ -749,10 +748,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
         *read = cands.len();
     }
 
-    /// The results for `req`, best first, and the work they took: the request's query and limit
-    /// read as before requests named a profile and a match mode, the immich profile's answers.
-    pub fn search(&self, req: &SearchRequest) -> (Vec<Found<'g>>, QueryStats) {
-        let (q, limit) = (req.q.as_str(), req.limit);
+    pub fn search(&self, q: &str, limit: usize) -> (Vec<Found<'g>>, QueryStats) {
         if limit == 0 { return (Vec::new(), QueryStats::default()); }
         let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
         // An entity can be nowhere: its record or its slot does not read (a damaged file). A
@@ -943,7 +939,6 @@ impl<'a, 'g> Searcher<'a, 'g> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::new_request;
 
     #[test]
     fn damerau_one_edit() {
@@ -1045,7 +1040,7 @@ mod tests {
         let area = |poly: u32| 1 + poly;
 
         for (q, want) in [("Foxton", [area(foxton), poi]), ("Barham", [village, area(barham)])] {
-            let (found, _) = s.search(&new_request(q, 5));
+            let (found, _) = s.search(q, 5);
 
             assert_eq!(found.iter().map(|f| f.hit.entity).collect::<Vec<_>>(), want, "{q}");
         }
@@ -1067,7 +1062,7 @@ mod tests {
         let idx = SearchIndex::open(&geo, &dir.0.join("idx"), None, None).unwrap();
         assert_eq!(geo.find_admin(10.3, 20.3).name("district"), Some("Northdistrict"));
 
-        let (found, _) = Searcher::new(&idx).search(&new_request("testville", 5));
+        let (found, _) = Searcher::new(&idx).search("testville", 5);
 
         assert_eq!(found[0].name, "Testville");
         assert_eq!((&*found[0].ctx.county, &*found[0].ctx.district), ("Southcounty", "Northdistrict"));
@@ -1089,7 +1084,7 @@ mod tests {
         build_search(&geo, &dir.0.join("idx"), None);
         let idx = SearchIndex::open(&geo, &dir.0.join("idx"), None, None).unwrap();
 
-        let (found, stats) = Searcher::new(&idx).search(&new_request("testville", 5));
+        let (found, stats) = Searcher::new(&idx).search("testville", 5);
 
         assert_eq!(
             results_json(&found),
@@ -1132,7 +1127,7 @@ mod tests {
         build_search(&geo, &out, None);
         let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
 
-        let (found, _) = Searcher::new(&idx).search(&new_request("abcd", 3));
+        let (found, _) = Searcher::new(&idx).search("abcd", 3);
 
         let got: Vec<(u32, &str)> = found.iter().map(|f| (f.hit.entity, f.name.as_str())).collect();
         assert_eq!(got, [(first, "Abcdx"), (second[0], "Abcdy"), (second[1], "Abcdy")]);
@@ -1188,7 +1183,7 @@ mod tests {
             let idx = SearchIndex::open(geo, &out, None, None).unwrap();
             let s = Searcher::new(&idx);
             queries.map(|(q, limit)| {
-                let (found, st) = s.search(&new_request(q, limit));
+                let (found, st) = s.search(q, limit);
                 (found.iter().map(|f| f.hit.entity).collect::<Vec<_>>(), st.postings_read)
             })
         };
@@ -1230,7 +1225,7 @@ mod tests {
                 let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
                 s.search_once::<true>(&mut st, "old mill, b", 2).unwrap()
             } else {
-                s.search(&new_request("old mill, b", 2)).0
+                s.search("old mill, b", 2).0
             };
             found.iter().map(|f| f.hit.entity).collect::<Vec<_>>()
         };
@@ -1403,7 +1398,7 @@ mod tests {
     fn both_answers(s: &Searcher, q: &str, limit: usize) -> [Answer; 2] {
         let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
         let read_first = s.search_once::<true>(&mut st, q, limit).unwrap();
-        [answer(&s.search(&new_request(q, limit)).0), answer(&read_first)]
+        [answer(&s.search(q, limit).0), answer(&read_first)]
     }
 
     #[test]
@@ -1781,14 +1776,14 @@ mod tests {
                     for _ in 0..16 {
                         let q = random_query(&mut rng, &phrases, &areas);
                         for limit in [1 + rng.below(2), 3 + rng.below(6)] {
-                            let got = answer(&s.search(&new_request(&q, limit)).0);
+                            let got = answer(&s.search(&q, limit).0);
                             let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
                             let read_first = answer(&s.search_once::<true>(&mut st, &q, limit).unwrap());
                             let mut once = State { ctx: HashMap::new(), stats: QueryStats::default() };
                             let ran_once = s.search_once::<false>(&mut once, &q, limit).is_some();
                             cases += 1;
                             again += !ran_once as usize;
-                            damaged += (got != answer(&as_built.search(&new_request(&q, limit)).0)) as usize;
+                            damaged += (got != answer(&as_built.search(&q, limit).0)) as usize;
                             let case = format!("seed {seed} damage {damage} ({n} rows, {m} slots) {limits:?} {q:?} limit {limit}");
                             if got != read_first {
                                 failed.push(format!("{case}:\n  {got:?}\n  {read_first:?}"));

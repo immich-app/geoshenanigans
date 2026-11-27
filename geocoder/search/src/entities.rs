@@ -335,7 +335,7 @@ impl<'a> Entities<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::fixture::{build_search, new_request, Geo, TempDir};
+    use crate::fixture::{build_search, Geo, TempDir};
     use crate::model::Kind;
     use crate::query::Searcher;
     use crate::reader::SearchIndex;
@@ -353,7 +353,7 @@ mod tests {
         build_search(&geo, &out, None);
         let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
 
-        let (found, _) = Searcher::new(&idx).search(&new_request("Testville", 5));
+        let (found, _) = Searcher::new(&idx).search("Testville", 5);
 
         // The boundary is entity n_place_nodes (1) + its polygon; its node is not its own.
         let got: Vec<_> = found.iter().map(|f| (f.hit.entity, f.kind, f.typ.as_str())).collect();

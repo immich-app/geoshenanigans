@@ -208,7 +208,7 @@ impl<'g> SearchIndex<'g> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::{build_search, new_request, Geo, TempDir};
+    use crate::fixture::{build_search, Geo, TempDir};
     use crate::query::Searcher;
 
     #[test]
@@ -230,7 +230,7 @@ mod tests {
         let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
 
         assert!(idx.poi.is_some());
-        let (found, _) = Searcher::new(&idx).search(&new_request("alpha", 5));
+        let (found, _) = Searcher::new(&idx).search("alpha", 5);
         assert_eq!(found.iter().map(|f| (f.hit.entity, f.name.as_str())).collect::<Vec<_>>(), [(0, "Alpha")]);
     }
 
@@ -287,7 +287,7 @@ mod tests {
             assert_eq!(at, sub.post.len() as u64, "sub-index {i}");
             assert!(keys > 3, "sub-index {i}: {keys} keys");
         }
-        let names = |q: &str| Searcher::new(&idx).search(&new_request(q, 5)).0.into_iter().map(|f| f.name).collect::<Vec<_>>();
+        let names = |q: &str| Searcher::new(&idx).search(q, 5).0.into_iter().map(|f| f.name).collect::<Vec<_>>();
         assert_eq!(names("old mill"), ["Old Mill"; 3]);
         assert_eq!(names("test hall"), ["Test Hall"]);
     }
@@ -309,7 +309,7 @@ mod tests {
         let (lat, lng) = (f32::from_bits(u32_at(12)), f32::from_bits(u32_at(16)));
         assert!((0.0..60.0).contains(&lat) && (0.0..60.0).contains(&lng), "{lat} {lng}");
         let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
-        let found = Searcher::new(&idx).search(&new_request("testville", 5)).0;
+        let found = Searcher::new(&idx).search("testville", 5).0;
         assert_eq!(found.iter().map(|f| (f.hit.entity, f.lat, f.lng)).collect::<Vec<_>>(), [(geo.place_node_count() + 1, 10.1, 20.1)]);
     }
 
@@ -368,7 +368,7 @@ mod tests {
                 }
             }
             for q in ["testville", "testland", "test", "alpha", "testland, testland", "alpha, testland"] {
-                let found = panic_of(|| Searcher::new(&idx).search(&new_request(q, 5)).0.iter().map(|f| (f.lat, f.lng)).collect::<Vec<_>>());
+                let found = panic_of(|| Searcher::new(&idx).search(q, 5).0.iter().map(|f| (f.lat, f.lng)).collect::<Vec<_>>());
                 match found {
                     Err(p) => failed.push(format!("{case}: {q}: {p}")),
                     Ok(points) if !points.iter().all(|&(lat, lng)| query_server::coords_in_range(lat as f64, lng as f64)) => {
@@ -476,7 +476,7 @@ mod tests {
                     return Err(format!("{none:?} reads as {v}"));
                 }
                 for q in ["alpha", "a", "ab", "al", "alp", "alpah", "alpha hill", "testville", "alpha, testland", "ab, testland"] {
-                    Searcher::new(&idx).search(&new_request(q, 5));
+                    Searcher::new(&idx).search(q, 5);
                 }
                 Ok(())
             });
@@ -504,7 +504,7 @@ mod tests {
                 };
                 // A prefix of no edit, of one and of two.
                 for q in ["aaa", "aaaaaa", "aaaaaaaaaa"] {
-                    Searcher::new(&idx).search(&new_request(q, 5));
+                    Searcher::new(&idx).search(q, 5);
                 }
             });
             assert!(ended.is_ok(), "{case}: {ended:?}");
@@ -612,7 +612,7 @@ mod tests {
             let found = panic_of(|| {
                 let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
                 let hits = idx.sub((sub == "poi") as u8).prefix_hits("al").map(|h| h.iter().map(|h| h.entity).collect::<Vec<_>>());
-                (hits, ["a", "al", "ol", "o", "t", "te", "alpha", "old mill"].map(|q| Searcher::new(&idx).search(&new_request(q, 5)).0.iter().map(|f| f.hit.entity).collect::<Vec<_>>()))
+                (hits, ["a", "al", "ol", "o", "t", "te", "alpha", "old mill"].map(|q| Searcher::new(&idx).search(q, 5).0.iter().map(|f| f.hit.entity).collect::<Vec<_>>()))
             });
             // The entity as a result would carry it; the list's hits read up to it, the first alone.
             let tag = if sub == "poi" { POI_BIT } else { 0 };
@@ -734,7 +734,7 @@ mod tests {
                 let s = Searcher::new(&idx);
                 for q in FUZZ_QUERIES {
                     for limit in [1, 5] {
-                        for f in s.search(&new_request(q, limit)).0 {
+                        for f in s.search(q, limit).0 {
                             std::hint::black_box((f.to_json(), s.display_name(&f.hit, q)));
                         }
                     }
