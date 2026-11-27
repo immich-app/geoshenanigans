@@ -267,7 +267,7 @@ impl SearchRequest {
     /// limit) where it deduplicates as Nominatim does (v1/server_glue.py:352-354), else the limit.
     pub fn fetch_limit(&self) -> usize {
         match (self.dedupe, self.policy().dedupe) {
-            (true, Dedupe::Nominatim) => self.limit + self.limit.min(DEDUPE_EXTRA_MAX),
+            (true, Dedupe::Nominatim) => self.limit.saturating_add(self.limit.min(DEDUPE_EXTRA_MAX)),
             _ => self.limit,
         }
     }
@@ -392,6 +392,7 @@ mod tests {
             (Profile::Full, 3, true, 6),
             (Profile::Full, 50, true, 60),
             (Profile::Full, 10, false, 10),
+            (Profile::Full, usize::MAX, true, usize::MAX),
             (Profile::Immich, 20, true, 20),
         ] {
             let req = SearchRequest { limit, dedupe, ..SearchRequest::new("x", profile) };
