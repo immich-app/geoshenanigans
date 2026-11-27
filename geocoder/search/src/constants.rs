@@ -155,3 +155,12 @@ pub const DIFFLIB_POPULAR_PER: usize = 100;
 pub const HOUSENUMBER_NAMED_PART_LETTERS: usize = 4;
 /// A house number with more digit-letter boundaries than this gets no optional spaces.
 pub const HOUSENUMBER_MAX_OPTIONAL_SPACES: usize = 4;
+/// The languages whose name variants Nominatim makes (its tag-analyzer-by-language whitelist).
+pub const NAME_LANGUAGES: [&str; 30] = [
+    "bg", "ca", "cs", "da", "de", "el", "en", "es", "et", "eu", "fi", "fr", "gl", "hu", "it", "ja", "mg", "ms", "nl", "no",
+    "pl", "pt", "ro", "ru", "sk", "sl", "sv", "tr", "uk", "vi",
+];
+/// Name key suffixes that are no language: the name takes its country's languages.
+pub const NAME_SUFFIXES_WITHOUT_LANGUAGE: [&str; 2] = ["left", "right"];
+/// A name whose rules would make more variants than this keeps only itself.
+pub const VARIANT_MAX_PARTIALS: usize = 128;

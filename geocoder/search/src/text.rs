@@ -8,6 +8,7 @@ mod latin_ascii;
 pub mod normalize;
 pub mod postcode;
 mod unicode;
+pub mod variants;
 
 /// The break before a query node, as Nominatim's query nodes carry it, with the character it
 /// writes it as.
