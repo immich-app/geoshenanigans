@@ -7,6 +7,7 @@ pub mod housenumber;
 mod latin_ascii;
 pub mod normalize;
 pub mod postcode;
+pub mod sanitize;
 mod unicode;
 pub mod variants;
 

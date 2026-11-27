@@ -191,12 +191,17 @@ fn in_table(c: char, table: &[(u32, u32)]) -> bool {
     table.get(i).is_some_and(|&(lo, _)| lo <= u)
 }
 
-/// The ASCII digit of a decimal digit of any script.
-fn ascii_digit(c: char) -> Option<char> {
+/// The value of a decimal digit of any script.
+pub(super) fn decimal_digit(c: char) -> Option<u32> {
     let u = c as u32;
     let i = DECIMAL_ZEROS.partition_point(|&zero| zero <= u);
     let zero = DECIMAL_ZEROS[..i].last()?;
-    (u - zero < 10).then(|| char::from(b'0' + (u - zero) as u8))
+    (u - zero < 10).then(|| u - zero)
+}
+
+/// The ASCII digit of a decimal digit of any script.
+fn ascii_digit(c: char) -> Option<char> {
+    decimal_digit(c).map(|d| char::from(b'0' + d as u8))
 }
 
 /// The Han numerals Nominatim's normaliser writes as digits.
