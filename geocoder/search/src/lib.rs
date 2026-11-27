@@ -11,7 +11,7 @@ pub mod extras;
 mod fixture;
 pub mod keys;
 pub mod model;
-pub mod normalize;
 pub mod query;
 pub mod reader;
+pub mod text;
 pub mod varint;
