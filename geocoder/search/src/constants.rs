@@ -151,3 +151,7 @@ pub const MAX_PENDING_CANDIDATES: usize = 4 * MAX_CONTEXT_CHECKS;
 /// 1.0, which the OSM API speaks, allows neither.
 pub const TAG_KEY_SEP: char = '\u{1F}';
 pub const TAG_PAIR_SEP: char = '\u{1E}';
+
+// ---- entities (index/entities.rs)
+/// Bits of an entity's record in an index row; the kind takes the 3 above them.
+pub const ENTITY_RECORD_BITS: u32 = 29;
