@@ -57,7 +57,7 @@ pub struct Term {
 }
 
 /// The rule lines of a rule file, by the language of their section.
-pub fn rule_lines(file: &str) -> Vec<(&str, &str)> {
+fn rule_lines(file: &str) -> Vec<(&str, &str)> {
     let mut lang = "";
     let mut out = Vec::new();
     for line in file.lines() {
@@ -80,7 +80,7 @@ pub fn rule_lines(file: &str) -> Vec<(&str, &str)> {
 /// and end marks (`^`) that say where in a name it applies. `~x` matches a word that ends in x,
 /// `x~` one that starts with it, either also as a word of its own beside the rest (unless the
 /// arrow is `|->` or `|=>`); `^x` only at the name's start, `x$` only at its end.
-pub fn rule_pairs(rule: &str) -> Result<Vec<(String, String)>, String> {
+fn rule_pairs(rule: &str) -> Result<Vec<(String, String)>, String> {
     let arrow = [rule.find("->"), rule.find("=>")].into_iter().flatten().min().ok_or_else(|| format!("no arrow in {rule:?}"))?;
     if rule[arrow + 2..].contains("->") || rule[arrow + 2..].contains("=>") {
         return Err(format!("two arrows in {rule:?}"));

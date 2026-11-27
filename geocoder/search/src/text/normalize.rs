@@ -228,9 +228,9 @@ fn becomes_dash(c: char) -> bool {
     c == '\u{02BC}' || (c != '-' && c != ':' && in_table(c, PUNCTUATION_OR_SYMBOL))
 }
 
-/// The characters the normaliser keeps: letters, decimal digits, viramas, white space, '-' and ':'.
+/// The characters other than digits the normaliser keeps: letters, viramas, white space, '-' and ':'.
 fn kept(c: char) -> bool {
-    c.is_alphabetic() || ascii_digit(c).is_some() || in_table(c, SPACING_VIRAMA) || c.is_whitespace() || c == '-' || c == ':'
+    c.is_alphabetic() || in_table(c, SPACING_VIRAMA) || c.is_whitespace() || c == '-' || c == ':'
 }
 
 /// Nominatim's normaliser (its ICU `normalization` rules): the form a name's lookup word is in
