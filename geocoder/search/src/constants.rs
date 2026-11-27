@@ -145,3 +145,9 @@ pub const MAX_CONTEXT_CHECKS: usize = 2_000;
 /// Candidates waiting for a context check are cut back to the best 2 x MAX_CONTEXT_CHECKS
 /// whenever they pass 4 x (bounds per-query memory).
 pub const MAX_PENDING_CANDIDATES: usize = 4 * MAX_CONTEXT_CHECKS;
+
+// ---- text: Nominatim's tokenizer and the Python it measures with
+/// difflib's autojunk: in a second sequence of at least this many elements, an element on more
+/// than len / DIFFLIB_POPULAR_PER + 1 of its positions is popular and starts no match.
+pub const DIFFLIB_AUTOJUNK_MIN_LEN: usize = 200;
+pub const DIFFLIB_POPULAR_PER: usize = 100;
