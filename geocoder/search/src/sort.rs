@@ -289,7 +289,7 @@ fn run_error(path: &Path, e: std::io::Error) -> std::io::Error {
 /// last runs as it takes to leave MERGE_FAN_IN. Returns the runs left and the bytes rewritten.
 fn reduce_runs<R: SortRecord>(mut files: RunFiles, dir: &Path, tag: &str) -> std::io::Result<(RunFiles, u64)> {
     let mut rewritten = 0u64;
-    let mut pass = 0;
+    let mut suffix = 0;
     let mut key = Vec::new();
     let mut scratch = vec![0; R::BYTES];
     while files.0.len() > MERGE_FAN_IN {
@@ -299,15 +299,21 @@ fn reduce_runs<R: SortRecord>(mut files: RunFiles, dir: &Path, tag: &str) -> std
         // The runs left as they are, then each group's merged run; `files` holds those not merged
         // yet, so every run has one holder until its group's merge has removed it.
         let mut next = files.take_first(n - merged);
-        let mut i = 0;
         while !files.0.is_empty() {
             let mut group = files.take_first(MERGE_FAN_IN.min(files.0.len()));
             if group.0.len() == 1 {
                 next.0.append(&mut group.0);
                 continue;
             }
-            let path = dir.join(format!("{tag}-m{pass}-{i}.run"));
-            let file = File::create(&path)?;
+            let (path, file) = loop {
+                let path = dir.join(format!("{tag}-{suffix}.merge"));
+                suffix += 1;
+                match File::create_new(&path) {
+                    Ok(file) => break (path, file),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e),
+                }
+            };
             next.0.push(path);
             let mut w = BufWriter::with_capacity(WRITE_BUFFER, file);
             let mut m = Merged::<R>::open(group)?;
@@ -315,10 +321,8 @@ fn reduce_runs<R: SortRecord>(mut files: RunFiles, dir: &Path, tag: &str) -> std
                 rewritten += write_entry(&mut w, &key, &rec, &mut scratch)?;
             }
             w.flush()?;
-            i += 1;
         }
         files = next;
-        pass += 1;
     }
     Ok((files, rewritten))
 }
@@ -721,6 +725,48 @@ mod tests {
             let left: Vec<_> = std::fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name()).collect();
             assert!(left.is_empty(), "read {read}: {left:?}");
         }
+    }
+
+    #[test]
+    fn a_merge_preserves_runs_from_a_sort_with_an_overlapping_tag() {
+        let dir = TempDir::new("sort-names");
+        let mut sut = ExternalSort::with_arena_limit(1 << 20, 4, &dir.0, "m-m0".into()).unwrap();
+        let entries: Vec<Entry> = (0..=MERGE_FAN_IN as u32).rev().map(|k| (k.to_be_bytes().to_vec(), Rec(k, 0))).collect();
+        for (k, r) in &entries {
+            sut.push(k, *r).unwrap();
+        }
+        let runs = sut.finish().unwrap();
+        assert_eq!(runs.len(), MERGE_FAN_IN + 1);
+
+        let got = read_all(runs.merge(&dir.0, "m"));
+
+        assert_eq!(got, in_memory(entries));
+    }
+
+    #[test]
+    fn a_merge_leaves_an_existing_output_file_alone() {
+        let dir = TempDir::new("sort-existing-output");
+        let (files, all) = random_runs(&dir.0, MERGE_FAN_IN + 1, &mut Rng(7));
+        let occupied = dir.0.join("m-0.merge");
+        std::fs::write(&occupied, b"other merge").unwrap();
+
+        let merged = runs_of(files).merge(&dir.0, "m").unwrap();
+
+        assert_eq!(merged.files.0.last().unwrap(), &dir.0.join("m-1.merge"));
+        assert_eq!(read_all(Ok(merged)), all);
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"other merge");
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_merge_removes_input_runs_if_its_output_cannot_be_created() {
+        let dir = TempDir::new("sort-output-error");
+        let (files, _) = random_runs(&dir.0, MERGE_FAN_IN + 1, &mut Rng(7));
+
+        let err = runs_of(files).merge(&dir.0.join("missing"), "m").err().unwrap();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
     }
 
     #[test]
