@@ -428,8 +428,7 @@ fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<Te
     let mut prefixes = (0..2 * PREFIX_TABLE_MAX_CHARS).map(|i| Prefix::new(tmp, i)).collect::<io::Result<Vec<_>>>()?;
     let mut fst = FstWriter::new(writer(&out.join("core.fst"))?)?;
     let mut post = writer(&out.join("core.post"))?;
-    let (mut key, mut prev, mut top, mut pos, mut terms, mut postings) =
-        (Vec::new(), Vec::new(), Vec::new(), 0u64, 0u64, 0u64);
+    let (mut prev, mut top, mut pos, mut terms, mut postings) = (Vec::new(), Vec::new(), 0u64, 0u64, 0u64);
     let mut flush = |k: &[u8], list: &mut ListWriter| -> io::Result<()> {
         if k.is_empty() {
             return Ok(());
@@ -454,18 +453,34 @@ fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<Te
         }
         Ok(())
     };
-    while let Some(row) = rows.next(&mut key)? {
-        if key != prev {
-            flush(&prev, &mut list)?;
-            prev.clone_from(&key)
+    // A bounded batch separates the final merge time from the writer without reading
+    // the clock for every occurrence or materializing another sorted run.
+    let mut batch: [(Vec<u8>, Occurrence); TERM_MERGE_BATCH] = Default::default();
+    let mut final_read = std::time::Duration::ZERO;
+    loop {
+        let read_start = Instant::now();
+        let mut count = 0;
+        for (key, occurrence) in &mut batch {
+            let Some(row) = rows.next(key)? else { break };
+            *occurrence = row;
+            count += 1;
         }
-        list.add(row)?;
+        final_read += read_start.elapsed();
+        for (key, row) in &batch[..count] {
+            if *key != prev {
+                flush(&prev, &mut list)?;
+                prev.clone_from(key);
+            }
+            list.add(*row)?;
+        }
+        if count < batch.len() { break; }
     }
     flush(&prev, &mut list)?;
     fst.finish()?;
     post.flush()?;
     drop(rows);
-    stats.fst_s = start.elapsed().as_secs_f64();
+    stats.fst_s = (start.elapsed() - final_read).as_secs_f64();
+    stats.merge_s += final_read.as_secs_f64();
     let start = Instant::now();
     prefix_files(prefixes, out)?;
     stats.prefix_s = start.elapsed().as_secs_f64();

@@ -400,6 +400,8 @@ pub const CORE_KINDS: [crate::index::entities::EntityKind; 3] = [
 /// Odd FST values carry singleton entity ids. Even values address the posting file.
 pub const INLINE_POSTING: u64 = 1;
 pub const SKIP_BYTES: usize = 2 * size_of::<u32>();
+/// Sixteen u16-length keys take at most one MiB alongside the final merge.
+pub const TERM_MERGE_BATCH: usize = 16;
 pub const POSTING_BUFFER_BYTES: usize = WRITE_BUFFER;
 pub const CHAIN_CACHE_CELLS: usize = 64;
 pub const PHOTON_MAX_EDITS: u8 = 2;
