@@ -215,6 +215,7 @@ target_compile_definitions(geocoder-tests PRIVATE
     GEOCODER_PATCH_BIN="$<TARGET_FILE:geocoder-patch>"
     GEOCODER_NAMECENSUS_BIN="$<TARGET_FILE:namecensus>"
     _FILE_OFFSET_BITS=64)
+# tests/test_patch_roundtrip.cpp, test_patch_lowmem.cpp and test_namecensus.cpp run the tools.
 add_dependencies(geocoder-tests geocoder-diff geocoder-patch namecensus)
 target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate EXPAT::EXPAT Threads::Threads)
 # As geocoder-patch compiles the codecs.
