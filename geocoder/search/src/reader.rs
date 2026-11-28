@@ -11,7 +11,7 @@ use crate::entities::{Boundaries, Entities};
 use crate::extras::Extras;
 use crate::keys::Keys;
 use crate::model::*;
-use crate::normalize::normalize;
+use crate::text::normalize::normalize;
 use memmap2::Mmap;
 use query_server::Index;
 use std::collections::HashMap;

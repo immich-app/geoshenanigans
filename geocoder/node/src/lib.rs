@@ -8,8 +8,9 @@
 use napi::bindgen_prelude::*;
 use napi::Env;
 use napi_derive::napi;
-use place_search::constants::{DATASET_SEARCH_DIR, DEFAULT_LIMIT};
+use place_search::constants::DATASET_SEARCH_DIR;
 use place_search::dataset::{self, BuildOnDevice, Origin, PlaceSearch, Stamps};
+use place_search::profile::{Profile, SearchRequest};
 use place_search::query::results_json;
 use query_server::transport::{self, ChunkReader, Expected};
 use query_server::Index;
@@ -49,8 +50,7 @@ impl Task for QueryTask {
 
 pub struct SearchTask {
     search: Arc<PlaceSearch>,
-    query: String,
-    limit: usize,
+    request: SearchRequest,
 }
 
 impl Task for SearchTask {
@@ -58,7 +58,7 @@ impl Task for SearchTask {
     type JsValue = String;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        let (found, _) = self.search.search(&self.query, self.limit);
+        let (found, _) = self.search.search(&self.request).map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(results_json(&found))
     }
 
@@ -74,6 +74,8 @@ pub struct PlaceSearchOptions {
     /// Sort memory of a build on this device in MiB (default 16: the build's own memory then fits
     /// a 32 MiB limit; the dataset's mapped files count apart, as `load` says).
     pub build_memory_mb: Option<u32>,
+    /// The search profile; 'immich' (the default) is the one the binding offers.
+    pub profile: Option<String>,
 }
 
 #[napi]
@@ -113,10 +115,12 @@ impl Geocoder {
     /// device first, on a thread of its own (seconds to minutes, its sort within
     /// `buildMemoryMb`). After a patch, load the patched dataset and open place search on that
     /// geocoder: this one rejects files replaced since it loaded them. Resolves to "current" or
-    /// "built".
+    /// "built". A profile other than 'immich' is refused.
     #[napi(ts_return_type = "Promise<'current' | 'built'>")]
     pub fn open_place_search<'env>(&self, env: &'env Env, options: Option<PlaceSearchOptions>) -> Result<Object<'env>> {
-        let PlaceSearchOptions { index_dir, build_memory_mb } = options.unwrap_or(PlaceSearchOptions { index_dir: None, build_memory_mb: None });
+        let PlaceSearchOptions { index_dir, build_memory_mb, profile } =
+            options.unwrap_or(PlaceSearchOptions { index_dir: None, build_memory_mb: None, profile: None });
+        require_immich(profile.as_deref())?;
         let geo = self.single_region()?;
         let dataset = self.dir.clone();
         let loaded = self.loaded.clone();
@@ -144,7 +148,8 @@ impl Geocoder {
     #[napi(ts_return_type = "Promise<string>")]
     pub fn search_places(&self, query: String, limit: Option<u32>) -> Result<AsyncTask<SearchTask>> {
         let search = self.search.read().unwrap().clone().ok_or_else(|| Error::from_reason("Place search is not open"))?;
-        Ok(AsyncTask::new(SearchTask { search, query, limit: limit.map_or(DEFAULT_LIMIT, |l| l as usize) }))
+        let limit = limit.map_or(Profile::Immich.policy().default_limit, |l| l as usize);
+        Ok(AsyncTask::new(SearchTask { search, request: SearchRequest { limit, ..SearchRequest::new(query, Profile::Immich) } }))
     }
 
     /// The index of a dataset of one region (a flat dir): place search reads one region's files.
@@ -153,6 +158,19 @@ impl Geocoder {
             [slot] if slot.continent.is_none() => slot.index.load_full().ok_or_else(|| Error::from_reason("Dataset not loaded")),
             _ => Err(Error::from_reason("Place search needs the dataset of one region")),
         }
+    }
+}
+
+/// Fails unless `profile` is none or the immich profile: the full profile's data never ships, so
+/// the binding searches with Immich's alone.
+fn require_immich(profile: Option<&str>) -> Result<()> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+
+    match profile.parse::<Profile>().map_err(|e| Error::from_reason(e.to_string()))? {
+        Profile::Immich => Ok(()),
+        other => Err(Error::from_reason(format!("Profile not offered: {}", other.as_str()))),
     }
 }
 
