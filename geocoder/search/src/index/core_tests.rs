@@ -405,6 +405,10 @@ fn full_core_is_independent_of_worker_count_and_immich_ignores_host_files() {
     f.place("Town", 1, 0.5, 0.5);
     f.boundary("Region", 6, [0., 0., 1., 1.]);
     f.place_area("Town", 1, [0.2, 0.2, 0.8, 0.8]);
+    // Sixty-four rows fill all sixteen term workers, with one posting split across them.
+    for _ in 3..64 {
+        f.poi("Town Park", 0.5, 0.5, 0);
+    }
     let geo = f.load(&set);
     let build = |profile, threads| {
         let dir = tmp.0.join(format!("{}-{threads}", Profile::as_str(profile)));
@@ -481,4 +485,44 @@ fn a_build_cleans_its_default_scratch_and_preserves_shared_scratch() {
     run(&shared);
     assert!(other.is_dir());
     assert_eq!(fs::read_dir(shared).unwrap().count(), 1);
+}
+
+#[test]
+fn an_indexed_record_uses_its_ranked_country_and_recovers_a_missing_country() {
+    let tmp = TempDir::new("chain-country");
+    let set = tmp.0.join("set");
+    let mut f = Geo::default();
+    let country = f.boundary("Testland", 2, [0., 0., 2., 2.]);
+    f.country(country, *b"DE");
+    let city = f.boundary("Town", 8, [0.2, 0.2, 1.5, 1.5]);
+    let other = f.boundary("Neighbor", 2, [2., 2., 3., 3.]);
+    f.country(other, *b"FR");
+    let unranked = f.boundary("Country way", 2, [2., 2., 3., 3.]);
+    f.country(unranked, *b"FR");
+    f.area_rank(unranked, 0);
+    f.poi("Inside", 1., 1., 0);
+    f.poi("Outside", 4., 4., 0);
+    let geo = f.load(&set);
+    let out = tmp.0.join("core");
+    let stamps = crate::dataset::Stamps::of(&set).unwrap();
+    build_core(&geo, &stamps, &set, &out, Profile::Immich, &BuildOpts::new(tmp.0.join("runs"))).unwrap();
+    let core = CoreIndex::open(&out).unwrap();
+    let records = CoreRecords::open(&geo, &set).unwrap();
+    for id in 0..core.entities.len() {
+        let entity = core.entities.get(id).unwrap();
+        let direct = records.read(entity).unwrap();
+        assert_eq!(core.record(id, &records), Some(direct.clone()));
+        for outer in [None, Some(city), Some(unranked), Some(u32::MAX)] {
+            assert_eq!(records.read_in_chain(entity, outer), Some(direct.clone()));
+        }
+        if entity.kind() == EntityKind::Area && entity.record() == city {
+            // An area's parent chain may cross a border away from its label point.
+            assert_eq!(records.read_in_chain(entity, Some(other)), Some(direct.clone()));
+        }
+        if &*direct.name == "Inside" {
+            assert_eq!(core.chains.outer_slot(id), Some(country));
+            assert_eq!(direct.country_code, Some(*b"de"));
+        }
+    }
+    assert!(core.record(core.entities.len(), &records).is_none());
 }

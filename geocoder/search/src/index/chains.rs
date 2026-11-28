@@ -9,7 +9,7 @@ impl ChainTable {
         }
         Ok(Self(table))
     }
-    pub fn of_entity(&self, id: u32) -> Option<Vec<u32>> {
+    fn slots(&self, id: u32) -> Option<&[u8]> {
         let t = &self.0;
         let (mut lo, mut hi) = (0, t.rows);
         while lo < hi {
@@ -23,7 +23,13 @@ impl ChainTable {
         if id >= t.field(lo, 0)? {
             return None;
         }
-        let b = t.slice(lo.checked_sub(1)?)?;
+        t.slice(lo.checked_sub(1)?)
+    }
+    pub(crate) fn outer_slot(&self, id: u32) -> Option<u32> {
+        small(self.slots(id)?, &mut 0)
+    }
+    pub fn of_entity(&self, id: u32) -> Option<Vec<u32>> {
+        let b = self.slots(id)?;
         let mut at = 0;
         let mut slots = Vec::new();
         while at < b.len() {

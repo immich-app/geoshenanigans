@@ -89,6 +89,10 @@ impl CoreIndex {
         })
     }
 
+    pub fn record<'a>(&self, id: u32, records: &'a impl entities::Entities) -> Option<entities::EntityRecord<'a>> {
+        records.read_in_chain(self.entities.get(id)?, self.chains.outer_slot(id))
+    }
+
     /// The most important readable matches of a posting after the caller's filters.
     pub fn best(
         &self,
@@ -99,7 +103,7 @@ impl CoreIndex {
     ) -> Vec<u32> {
         let Some(list) = self.terms.posting(posting) else { return Vec::new() };
         list.best(limit, |id| {
-            let row = records.read(self.entities.get(id)?)?;
+            let row = self.record(id, records)?;
             accept(id, &row).then(|| (row.importance / crate::constants::IMP_UNIT).round() as u32)
         })
     }

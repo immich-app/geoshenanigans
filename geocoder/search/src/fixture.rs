@@ -210,6 +210,10 @@ impl Geo {
         self.polygons[poly as usize].0.country_code = packed_country(code);
     }
 
+    pub fn area_rank(&mut self, poly: u32, rank: u8) {
+        self.polygons[poly as usize].0.rank_address = rank;
+    }
+
     /// The postcode of street `way`.
     pub fn way_postcode(&mut self, way: u32, postcode: &str) {
         let postcode_id = self.string(postcode);

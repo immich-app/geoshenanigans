@@ -133,6 +133,11 @@ pub trait Entities {
     /// The record of `e`; None for one that does not read (a damaged file, or a record past the
     /// end of its file): a search leaves such an entity out.
     fn read(&self, e: EntityRef) -> Option<EntityRecord<'_>>;
+
+    /// The first polygon in the point's stored chain can supply the country of a dataset row.
+    fn read_in_chain(&self, e: EntityRef, _outer_slot: Option<u32>) -> Option<EntityRecord<'_>> {
+        self.read(e)
+    }
 }
 
 /// Chain-sorted four-byte entity references in the published core.
