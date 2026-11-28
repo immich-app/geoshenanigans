@@ -23,6 +23,18 @@ const GRID: u32 = 32;
 /// The step in degrees between the points along a way's edge whose street cells list the way.
 const EDGE_STEP_DEG: f32 = 1e-4;
 
+/// xorshift: deterministic test values without a dependency.
+pub struct Rng(pub u64);
+
+impl Rng {
+    pub fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
 /// A fresh directory under the temp dir, removed on drop.
 pub struct TempDir(pub PathBuf);
 

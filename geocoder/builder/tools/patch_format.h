@@ -752,9 +752,9 @@ inline void require_copy_old_sizes(const std::string& name, uint64_t old_size, u
 }
 
 // Stride sentinel (v8): a per-record side file (one value per record of a
-// parent file: way_parents / way_postcodes per street way, addr_postcodes and
-// (v22) addr_cities per address, interp_postcodes per interpolation) rebuilt
-// along the parent's
+// parent file, any of PARALLEL_DELTA_PARENTS: way_parents / way_postcodes per
+// street way, addr_postcodes and (v22) addr_cities per address,
+// interp_postcodes per interpolation) rebuilt along the parent's
 // merge sequence: MATCH and REPLACE copy the old record's value (remapped like
 // the sparse delta's remap_kind), INSERT takes the next inline value, DELETE
 // skips one; then (pos, value) pairs at new positions overwrite the values
@@ -806,6 +806,29 @@ static constexpr ParallelDeltaFile PARALLEL_DELTA_FILES[] = {
     {PatchFileId::INTERP_POSTCODES, PatchFileId::INTERP_WAYS, 4, 2},
     {PatchFileId::ADDR_CITIES, PatchFileId::ADDR_POINTS, 4, 2},
 };
+// The record files whose merge a side file can follow: the diff keeps each one's merge until the
+// side files are sent, and the patcher replays a side file along whichever its section names.
+static constexpr PatchFileId PARALLEL_DELTA_PARENTS[] = {PatchFileId::STREET_WAYS, PatchFileId::ADDR_POINTS,
+                                                         PatchFileId::INTERP_WAYS, PatchFileId::POI_RECORDS,
+                                                         PatchFileId::PLACE_NODES};
+constexpr bool is_parallel_delta_parent(PatchFileId fid) {
+    for (const PatchFileId parent : PARALLEL_DELTA_PARENTS)
+        if (parent == fid) return true;
+    return false;
+}
+static_assert(
+    [] {
+        for (const auto& f : PARALLEL_DELTA_FILES)
+            if (!is_parallel_delta_parent(f.parent)) return false;
+        return true;
+    }(),
+    "a side file follows a record merge the diff keeps");
+// Whether a row of PARALLEL_DELTA_FILES follows parent's merge.
+constexpr bool has_side_files(PatchFileId parent) {
+    for (const auto& f : PARALLEL_DELTA_FILES)
+        if (f.parent == parent) return true;
+    return false;
+}
 inline const ParallelDeltaFile* parallel_delta_file(PatchFileId fid) {
     for (const auto& f : PARALLEL_DELTA_FILES)
         if (f.fid == fid) return &f;

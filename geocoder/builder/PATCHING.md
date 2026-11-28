@@ -909,7 +909,13 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     MATCH / REPLACE copy the old value (remapped as the patcher remaps:
     without the moved strings past the pairs' cap, v12), INSERT takes the next
     inserted value, DELETE skips one; then the changes overwrite positions
-    of the new file. A parent sent unchanged counts as one MATCH.
+    of the new file. A parent sent unchanged counts as one MATCH. The parent
+    is any record file whose merge the diff keeps for the side files
+    (`PARALLEL_DELTA_PARENTS`): street_ways, addr_points, interp_ways,
+    poi_records, and place_nodes a value per logical row (the visible nodes
+    in cell order, then the hidden ones). A side file goes as a sparse delta
+    instead when its parent has no record on the old day, or when it does
+    not hold one value per parent record on both days.
   stride=0xFB: none since v19 (to v18 a cell list delta of the postcode
     centroid index): the patcher refuses it as a record stride ("Malformed
     record stride: <file>"), with 0xFE and 0xFF
