@@ -94,10 +94,10 @@ pub const REFUSED: &str = "refused.json";
 pub const LATEST_OVERRIDE: &str = "latest.override";
 /// The room a sync wants free beyond its files'.
 pub const FREE_MARGIN: u64 = 2 << 30;
-/// The room a build's place search indexes take as they are built: the
-/// indexes and the sort runs they spill, 6.6 GiB at the peak for the
-/// planet build's 12, 4 or 6 at once (0.9 GiB once built and linked).
-pub const SEARCH_ROOM: u64 = 7 << 30;
+/// Space for indexes and their sort runs. The 2026-11-28 planet publication
+/// peaked at 7.75 GiB under search/ with 20 groups and four concurrent builds.
+/// Round up to a whole GiB. The linked files occupied 0.87 GiB.
+pub const SEARCH_ROOM: u64 = 8 << 30;
 
 /// A build refused by a server of build version `version`: the build of
 /// `date` as it was published, its configurations.json of sha256

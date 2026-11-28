@@ -2204,7 +2204,7 @@ async fn a_sync_without_room_for_the_build_fetches_nothing_and_says_what_it_need
     let failed = p.round(true).await.unwrap_err();
 
     assert!(failed.starts_with(&format!(
-        "1.00 GiB free in {}, 9.00 GiB needed to fetch build {DATE}: its files' 0.00 GiB, its place search indexes' 7.00 GiB and a margin of 2.00 GiB",
+        "1.00 GiB free in {}, 10.00 GiB needed to fetch build {DATE}: its files' 0.00 GiB, its place search indexes' 8.00 GiB and a margin of 2.00 GiB",
         data.path().display()
     )), "{failed}");
     assert_eq!(bucket.requests().len(), 0);
