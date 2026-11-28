@@ -28,9 +28,9 @@ const char* const NAME = "way_postcodes.bin";
 
 std::vector<uint8_t> encode(const std::vector<uint32_t>& values) { return sb::encode(NAME, values.data(), values.size()); }
 
-std::vector<uint32_t> decode(const std::vector<uint8_t>& file) {
+std::vector<uint32_t> decode(const std::vector<uint8_t>& file, std::string_view name = NAME) {
     std::vector<uint32_t> out;
-    sb::decode(NAME, file.data(), file.size(), [&](const uint32_t* v, size_t n) { out.insert(out.end(), v, v + n); });
+    sb::decode(name, file.data(), file.size(), [&](const uint32_t* v, size_t n) { out.insert(out.end(), v, v + n); });
     return out;
 }
 
@@ -564,8 +564,9 @@ TEST(search_offset_and_importance_columns_use_the_side_block_codec) {
             CHECK(registered == 1);
             const std::vector<uint32_t> values(sb::BLOCK_VALUES, suffix == "_imp.bin" ? 0 : NONE);
             const auto bytes = sb::encode(name, values.data(), values.size());
-            CHECK(decode(bytes) == values);
-            CHECK(bytes.size() == sb::FOR_HEAD_BYTES + sb::TABLE_ENTRY_BYTES + sb::FOOTER_BYTES);
+            CHECK(decode(bytes, name) == values);
+            const size_t body = suffix == "_imp.bin" ? sb::FOR_HEAD_BYTES : 0;
+            CHECK(bytes.size() == body + sb::TABLE_ENTRY_BYTES + sb::FOOTER_BYTES);
         }
     }
 }
@@ -579,7 +580,11 @@ TEST(tag_blocks_omit_absent_values_and_empty_blocks) {
     auto footer = sb::read_footer(file, bytes.data() + bytes.size() - sb::FOOTER_BYTES, bytes.size());
     CHECK(sb::get32(bytes.data() + footer.table_at) == 0);
     CHECK(sb::get32(bytes.data() + footer.table_at + sb::TABLE_ENTRY_BYTES) == 0);
-    std::vector<uint32_t> decoded;
-    sb::decode(file, bytes.data(), bytes.size(), [&](const uint32_t* p, size_t n) { decoded.insert(decoded.end(), p, p + n); });
-    CHECK(decoded == values);
+    CHECK(decode(bytes, file) == values);
+    REQUIRE(bytes.front() == sb::MODE_PRESENT);
+    for (uint8_t invalid : {0, 7, 8}) {
+        auto bad = bytes;
+        bad[1] = invalid;
+        CHECK(refusal_of([&] { decode(bad, file); }).find("invalid presence") != std::string::npos);
+    }
 }
