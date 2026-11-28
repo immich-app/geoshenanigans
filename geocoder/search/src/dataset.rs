@@ -10,6 +10,7 @@ use crate::build::{
     Contended, HeldIndexDir,
 };
 use crate::constants::*;
+use crate::profile::{MatchMode, Profile, RequestError, SearchRequest};
 use crate::query::{Found, QueryStats, Searcher};
 use crate::reader::SearchIndex;
 use query_server::{lower_hex, FileStamp, Index, WATER_DIR, WATER_FILES};
@@ -324,10 +325,35 @@ impl PlaceSearch {
         Ok((PlaceSearch { searcher: Searcher::new(index_ref), _index: opened, _geo: geo }, origin))
     }
 
-    /// `Searcher::search`: the results for `q`, best first, and the work they took. They borrow
-    /// this search, which they can't outlive.
-    pub fn search(&self, q: &str, limit: usize) -> (Vec<Found<'_>>, QueryStats) {
-        self.searcher.search(q, limit)
+    /// `Searcher::search` of the request's query and limit: the results, best first, and the work
+    /// they took. They borrow this search, which they can't outlive. A request it can't honour
+    /// (`require_supported`) is refused.
+    pub fn search(&self, req: &SearchRequest) -> Result<(Vec<Found<'_>>, QueryStats), RequestError> {
+        require_supported(req)?;
+        Ok(self.searcher.search(&req.q, req.limit))
+    }
+}
+
+/// Fails for a request this index can't honour: it answers the immich profile in photon mode,
+/// deduplicated, from the query and the limit alone.
+fn require_supported(req: &SearchRequest) -> Result<(), RequestError> {
+    if req.profile != Profile::Immich {
+        return Err(RequestError::ProfileNotBuilt(req.profile));
+    }
+
+    let options = [
+        ("mode", req.mode != MatchMode::Photon),
+        ("langs", !req.langs.is_empty()),
+        ("bias", req.bias.is_some()),
+        ("viewbox", req.viewbox.is_some()),
+        ("countries", !req.countries.is_empty()),
+        ("layers", req.layers.is_some()),
+        ("categories", !req.categories.is_empty()),
+        ("dedupe", !req.dedupe),
+    ];
+    match options.into_iter().find(|&(_, set)| set) {
+        Some((option, _)) => Err(RequestError::UnsupportedOption(option)),
+        None => Ok(()),
     }
 }
 
@@ -335,7 +361,9 @@ impl PlaceSearch {
 mod tests {
     use super::*;
     use crate::build::build_all;
-    use crate::fixture::{Geo, TempDir};
+    use crate::fixture::{new_request, Geo, TempDir};
+    use crate::index::entities::{BBox, Category};
+    use crate::profile::{Bias, Layer, Viewbox};
     use query_server::{AdminPoint, ADMIN_GEOMETRY_FILES, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
     use std::path::PathBuf;
 
@@ -862,9 +890,45 @@ mod tests {
         assert_eq!(origin, Origin::Built);
         let geo = load_dataset(&ds.0).0;
         let idx = SearchIndex::open(&geo, &index, None, None).unwrap();
-        let (found, _) = search.search("otherton", 5);
+        let (found, _) = search.search(&new_request("otherton", 5)).unwrap();
         assert_eq!(crate::query::results_json(&found), crate::query::results_json(&Searcher::new(&idx).search("otherton", 5).0));
         assert_eq!(found.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Otherton"]);
+    }
+
+    #[test]
+    fn a_place_search_refuses_a_profile_its_index_holds_no_data_of() {
+        let ds = TempDir::new("place-search-full");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let (geo, stamps) = load_dataset(&ds.0);
+        let (search, _) = PlaceSearch::open(Arc::new(geo), &stamps, &ds.0, &ds.0.join("search"), &BuildOnDevice::default()).unwrap();
+
+        let refused = search.search(&SearchRequest::new("otherton", Profile::Full));
+
+        assert_eq!(refused.map(drop), Err(RequestError::ProfileNotBuilt(Profile::Full)));
+    }
+
+    #[test]
+    fn a_place_search_refuses_an_option_its_index_cannot_honour() {
+        let ds = TempDir::new("place-search-options");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let (geo, stamps) = load_dataset(&ds.0);
+        let (search, _) = PlaceSearch::open(Arc::new(geo), &stamps, &ds.0, &ds.0.join("search"), &BuildOnDevice::default()).unwrap();
+        let immich = || new_request("otherton", 5);
+        let bbox = BBox { min_lat: 10.0, min_lon: 20.0, max_lat: 11.0, max_lon: 21.0 };
+
+        for (req, option) in [
+            (SearchRequest { mode: MatchMode::Nominatim, ..immich() }, "mode"),
+            (SearchRequest { langs: vec!["de".into()], ..immich() }, "langs"),
+            (SearchRequest { bias: Some(Bias::at(10.5, 20.5)), ..immich() }, "bias"),
+            (SearchRequest { viewbox: Some(Viewbox::Bounded(bbox)), ..immich() }, "viewbox"),
+            (SearchRequest { countries: [*b"de"].into(), ..immich() }, "countries"),
+            (SearchRequest { layers: Some([Layer::Address].into()), ..immich() }, "layers"),
+            (SearchRequest { categories: [Category { class: "place".into(), typ: "city".into() }].into(), ..immich() }, "categories"),
+            (SearchRequest { dedupe: false, ..immich() }, "dedupe"),
+        ] {
+            assert_eq!(search.search(&req).map(drop), Err(RequestError::UnsupportedOption(option)), "{option}");
+        }
+        assert_eq!(search.search(&immich()).map(|(found, _)| found.len()), Ok(1));
     }
 
     #[test]

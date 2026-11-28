@@ -392,6 +392,16 @@ test('files replaced under a loaded geocoder are refused', async () => {
   assert.deepEqual(await names(patched, 'nestville'), ['Nestville']);
 });
 
+test('place search opens the immich profile alone', async () => {
+  const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));
+
+  assert.throws(() => geocoder.openPlaceSearch({ profile: 'full' }), /Profile not offered: full/);
+  assert.throws(() => geocoder.openPlaceSearch({ profile: 'hosted' }), /Unknown profile: hosted/);
+  assert.equal(await geocoder.openPlaceSearch({ profile: 'immich' }), 'built');
+
+  assert.deepEqual(await names(geocoder, 'testville'), ['Testville']);
+});
+
 test('search before opening is refused', () => {
   const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));
 

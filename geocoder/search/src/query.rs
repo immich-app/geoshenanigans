@@ -2,10 +2,12 @@
 //! context, importance ranking, de-duplication, settlements before same-named areas) over the
 //! mapped index. Context is not stored: a candidate's country / state / county / city come from
 //! reverse geocoding its point with the geocoder itself, only for the candidates that need it.
+pub mod plan;
+
 use crate::build::prefix_text;
 use crate::constants::*;
 use crate::model::*;
-use crate::normalize::{is_ideographic, join, normalize, tokens, Token};
+use crate::text::normalize::{is_ideographic, join, normalize, tokens, Token};
 use crate::entities::{cc_of, polygon_raw, Entities};
 use crate::reader::{SearchIndex, SubIndex};
 use query_server::{cell_id_at_level, polygon_field, AdminPoint, AdminPolygon, Index, ID_MASK, INTERIOR_FLAG, NO_DATA};
@@ -1369,9 +1371,9 @@ mod tests {
             CUT_BACK_LOOKS.set(0);
             let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
             let found = if read_first {
-                s.search_once::<true>(&mut st, "olde mill, b", DEFAULT_LIMIT)
+                s.search_once::<true>(&mut st, "olde mill, b", IMMICH_DEFAULT_LIMIT)
             } else {
-                s.search_once::<false>(&mut st, "olde mill, b", DEFAULT_LIMIT)
+                s.search_once::<false>(&mut st, "olde mill, b", IMMICH_DEFAULT_LIMIT)
             };
             (answer(&found.unwrap()), CUT_BACK_LOOKS.get())
         };
@@ -1422,11 +1424,11 @@ mod tests {
 
         // "old mill" as a search's only split, and as its first, before a split with the
         // context word "mill".
-        let answers = ["old mill,", "old mill"].map(|q| both_answers(&s, q, DEFAULT_LIMIT));
+        let answers = ["old mill,", "old mill"].map(|q| both_answers(&s, q, IMMICH_DEFAULT_LIMIT));
 
         // Without the first, the pool has room for the last of them, and the "Old Mills" evicts
         // the second: the results go on from the third.
-        let want: Vec<u32> = [top, mills].into_iter().chain(tied[2..DEFAULT_LIMIT].iter().copied()).collect();
+        let want: Vec<u32> = [top, mills].into_iter().chain(tied[2..IMMICH_DEFAULT_LIMIT].iter().copied()).collect();
         for [got, read_first] in answers {
             assert_eq!(got.iter().map(|r| r.0).collect::<Vec<_>>(), want);
             assert_eq!(got, read_first);
@@ -1443,7 +1445,7 @@ mod tests {
         // boundaries "B" and "C". All far apart.
         g.boundary("B", 8, [10.0, 20.0, 14.0, 24.0]);
         g.boundary("C", 8, [10.0, 20.0, 14.0, 24.0]);
-        let reach = DEFAULT_LIMIT * CONTEXT_CUTOFF_FACTOR;
+        let reach = IMMICH_DEFAULT_LIMIT * CONTEXT_CUTOFF_FACTOR;
         let whole: Vec<u32> = (0..reach as u32).map(|k| g.poi("A B C", -60.0 + k as f32, -60.0, 127) | POI_BIT).collect();
         for k in 0..MAX_CONTEXT_CHECKS as u32 + 10 {
             g.poi("A B", -1.0 - (k / 100) as f32, -170.0 + (k % 100) as f32 * 3.4, 15);
@@ -1459,13 +1461,13 @@ mod tests {
         let damaged = with_unreadable_pois(&set, &[whole[0] & !POI_BIT]);
         let idx = SearchIndex::open(&damaged, &out, None, None).unwrap();
 
-        let [got, read_first] = both_answers(&Searcher::new(&idx), "a b c", DEFAULT_LIMIT);
+        let [got, read_first] = both_answers(&Searcher::new(&idx), "a b c", IMMICH_DEFAULT_LIMIT);
 
         // Without the first "A B C" the "A B" are above the cut-off and take every context
         // check, the "A" miss the context, and the other "A B C" are the results. With it in the
         // pool, the "A B" would be below the cut-off, and the "A" would take the checks and rank
         // above every "A B C".
-        assert_eq!(got.iter().map(|r| r.0).collect::<Vec<_>>(), whole[1..=DEFAULT_LIMIT]);
+        assert_eq!(got.iter().map(|r| r.0).collect::<Vec<_>>(), whole[1..=IMMICH_DEFAULT_LIMIT]);
         assert_eq!(got, read_first);
     }
 

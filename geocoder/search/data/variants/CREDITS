@@ -1,0 +1,17 @@
+The abbreviation variants of names (by-lang-*.yaml) and the default language of each country
+(language-defaults-per-country.yaml) are Photon's, copied unchanged from
+https://github.com/komoot/photon, src/main/resources, commit 69293f73 (2026-11-23), under the
+Apache License 2.0 (LICENSE in this directory). Copyright komoot and the Photon contributors.
+
+Photon names the sources of the variant lists in each file:
+- the OpenStreetMap wiki, "Name finder:Abbreviations"
+  (https://wiki.openstreetmap.org/wiki/Name_finder:Abbreviations), CC BY-SA 2.0;
+- USPS Publication 28, appendix C (https://pe.usps.com/text/pub28/28apc_002.htm), for English;
+- plantarium.ru and dic.academic.ru, for Russian.
+
+The German spellings ae, oe and ue of ä, ö and ü follow Photon's analyzer.yaml.
+
+Photon's Croatian list is not copied: neither Photon's analyzer nor Nominatim applies it.
+
+country-languages.tsv is ours: the official languages of the countries with more than one, and
+of the few others Photon's list leaves out, after the Unicode CLDR's territory information.

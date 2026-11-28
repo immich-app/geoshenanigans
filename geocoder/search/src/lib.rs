@@ -9,9 +9,13 @@ pub mod entities;
 pub mod extras;
 #[cfg(test)]
 mod fixture;
+pub mod index;
 pub mod keys;
 pub mod model;
-pub mod normalize;
+pub mod profile;
 pub mod query;
 pub mod reader;
+pub mod result;
+pub mod tags;
+pub mod text;
 pub mod varint;

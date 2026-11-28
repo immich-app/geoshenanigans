@@ -1,4 +1,5 @@
 use place_search::dataset::{Origin, PlaceSearch, Stamps};
+use place_search::profile::{Profile, SearchRequest};
 use place_search::query::{debug_line, results_json};
 use query_server::{
     arc_fixture, cell_id_at_level, cell_pairs, place_files, strings, AdminPolygon, Index, PlaceNode, PointE7,
@@ -107,7 +108,7 @@ fn the_cli_answers_as_the_binding_and_the_portal_do() {
         let timeless = |line: &str| line[..line.rfind(",\"us\":").unwrap()].to_string();
         let mut found = 0;
         for (q, line) in queries.into_iter().zip(lines) {
-            let (results, stats) = search.search(q, limit);
+            let (results, stats) = search.search(&SearchRequest { limit, ..SearchRequest::new(q, Profile::Immich) }).unwrap();
 
             assert_eq!(timeless(line), timeless(&debug_line(q, 0.0, &results, &stats).to_string()), "{q}");
             let mut answer = serde_json::from_str::<serde_json::Value>(line).unwrap()["results"].clone();
