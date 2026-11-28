@@ -87,7 +87,7 @@ impl Span {
         self.start >= other.end
     }
 
-    pub fn len(self) -> usize {
+    fn len(self) -> usize {
         self.end - self.start
     }
 }
@@ -328,7 +328,7 @@ impl QueryGraph {
             TokenType::Qualifier if full_phrase => {}
             _ => match node.starting.iter_mut().find(|l| l.end == span.end && l.ttype == ttype) {
                 Some(list) if !list.tokens.contains(&token) => list.tokens.push(token),
-                Some(_) => {},
+                Some(_) => {}
                 None => node.starting.push(TokenList { end: span.end, ttype, tokens: vec![token] }),
             },
         }
@@ -344,7 +344,7 @@ impl QueryGraph {
         let numeric = last_word.chars().all(|c| decimal_digit(c).is_some());
         // A numeric prefix may finish a word boundary or a suffix, but 1044 must never find 10440.
         let allowed = |prefix: &str, term: &Term| {
-            !numeric || !term.token.strip_prefix(prefix).and_then(|s| s.chars().next()).is_some_and(|c| decimal_digit(c).is_some())
+            !numeric || term.token.strip_prefix(prefix).and_then(|s| s.chars().next()).is_none_or(|c| decimal_digit(c).is_none())
         };
         for (word, spans) in words {
             let at_end: Vec<Span> = spans.iter().copied().filter(|s| s.end == slots).collect();
@@ -422,10 +422,13 @@ impl QueryGraph {
             info: TermInfo::None,
             postings: union.iter().flat_map(|t| t.postings.iter().copied()).collect(),
         };
-        let mut members: Vec<_> = union.into_iter().map(|member| {
-            let id = self.intern(member);
-            Token { term: id, penalty: match_penalty(&self.term(id).lookup_word, &term.lookup_word) }
-        }).collect();
+        let mut members: Vec<_> = union
+            .into_iter()
+            .map(|member| {
+                let id = self.intern(member);
+                Token { term: id, penalty: match_penalty(&self.term(id).lookup_word, &term.lookup_word) }
+            })
+            .collect();
         let best = members.iter().map(|m| m.penalty).fold(f64::INFINITY, f64::min);
         for member in &mut members {
             member.penalty -= best;
@@ -883,6 +886,18 @@ mod tests {
     }
 
     #[test]
+    fn only_the_last_occurrence_adds_prefixes_to_its_typo_matches() {
+        let mut terms = typing();
+        terms.insert(TermKind::Partial, "austintown", ("", ""), (42, 1), TermInfo::None);
+        let g = graph("austi austi", &terms, Lookup::Typo);
+        let matched = |i: usize| {
+            g.partial_matches[&g.partial(i).unwrap().term].iter().map(|m| g.term(m.term).token.as_str()).collect::<Vec<_>>()
+        };
+        assert_eq!(matched(0), ["austin"]);
+        assert_eq!(matched(1), ["austin", "austintown"]);
+    }
+
+    #[test]
     fn an_exact_partial_and_its_completions_keep_their_own_match_costs() {
         use crate::profile::{Profile, SearchRequest};
         use crate::query::plan::{read, Pass};
@@ -896,8 +911,10 @@ mod tests {
 
     #[test]
     fn completing_a_number_does_not_extend_its_digits() {
-        let g = graph("1044", &typing(), Lookup::Prefix);
-        assert_eq!(of_type(&g, 'H'), ["0-1 1044 1044 0.000"]);
+        let mut terms = typing();
+        terms.insert(TermKind::HouseNumber, "1044a", ("", ""), (5, 1), TermInfo::None);
+        let g = graph("1044", &terms, Lookup::Prefix);
+        assert_eq!(of_type(&g, 'H'), ["0-1 1044 1044 0.000", "0-1 1044a 1044a 0.500"]);
         assert_eq!(g.term(g.partial(0).unwrap().term).count, 39);
     }
 
