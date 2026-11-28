@@ -50,6 +50,23 @@ impl SourceRow {
     pub(super) fn is_country(self) -> bool {
         matches!(self,Self::Area(a) if a.admin_level==COUNTRY_LEVEL)
     }
+    pub(super) fn max_rank(self, geo: &Index, point: (f64, f64)) -> u8 {
+        let rank = match self {
+            Self::Place(p) if p.rank_address == 0 => query_server::PLACE_NODE_SEARCH_RANK[p.place_type as usize],
+            Self::Place(p) => p.rank_address,
+            Self::Area(a) if a.rank_address == 0 => {
+                // Approximate geometry_to_rank by rank_search. Even a country outside
+                // the address hierarchy can supply the country's search rank rules.
+                let country = self.country().or_else(|| geo.find_admin(point.0, point.1).country_code)
+                    .unwrap_or_default().map(|b| b.to_ascii_uppercase());
+                query_server::area_search_rank(&a, std::str::from_utf8(&country).unwrap_or(""))
+            }
+            Self::Area(a) => a.rank_address,
+            Self::Poi(_) => MAX_ADDRESS_RANK,
+        };
+        rank.min(MAX_ADDRESS_RANK)
+    }
+
     fn ranks(self, cc: &str) -> (u8, u8) {
         match self {
             Self::Place(p) => (query_server::PLACE_NODE_SEARCH_RANK[p.place_type as usize], p.rank_address),

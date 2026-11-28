@@ -632,3 +632,24 @@ fn core_stats_account_for_the_term_build() {
     assert_eq!(stats["sort_runs"], 1);
     assert_eq!(stats["merge_passes"], 1);
 }
+
+#[test]
+fn an_unranked_area_uses_its_label_points_country_for_its_search_rank() {
+    let tmp = TempDir::new("unranked-country");
+    let set = tmp.0.join("set");
+    let mut f = Geo::default();
+    let country = f.boundary("Country way", 2, [0., 0., 2., 2.]);
+    f.area_rank(country, 0);
+    f.country(country, *b"DE");
+    let county = f.boundary("County", 6, [0.2, 0.2, 1.8, 1.8]);
+    let region = f.place_area("Region", 9, [0.4, 0.4, 1.6, 1.6]);
+    f.area_rank(region, 0);
+    let geo = f.load(&set);
+    let stamps = crate::dataset::core_stamps(&set).unwrap();
+    build_core(&geo, &stamps, &set, &tmp.0, Profile::Immich, &BuildOpts::new(tmp.0.join("tmp"))).unwrap();
+    let core = CoreIndex::open(&tmp.0).unwrap();
+    let records = CoreRecords::open(&geo, &set).unwrap();
+    let id = (0..core.entities.len()).find(|&id| core.entities.get(id).unwrap().record() == region).unwrap();
+    assert_eq!(core.record(id, &records).unwrap().rank_search, 10);
+    assert!(!core.areas.ranges(county).any(|r| r.contains(&id)));
+}

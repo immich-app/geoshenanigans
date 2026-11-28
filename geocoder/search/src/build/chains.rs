@@ -144,13 +144,7 @@ pub(super) fn build(
                     key.extend_from_slice(&field.to_be_bytes())
                 }
             }
-            let rank = match row {
-                SourceRow::Place(p) if p.rank_address == 0 => query_server::PLACE_NODE_SEARCH_RANK[p.place_type as usize],
-                SourceRow::Place(p) => p.rank_address,
-                SourceRow::Area(a) => a.rank_address,
-                SourceRow::Poi(_) => MAX_ADDRESS_RANK,
-            };
-            sort.push(&key, [e.packed(), u32::from(rank.min(MAX_ADDRESS_RANK))])?;
+            sort.push(&key, [e.packed(), u32::from(row.max_rank(records.geo, (lat, lon)))])?;
         }
     }
     let mut input = sort.finish()?.merge(tmp, "chain-merge")?;
@@ -202,15 +196,7 @@ pub(super) fn build(
             prev.get_or_insert_with(Vec::new).clone_from(&key);
         }
         let e = EntityRef::unpack(packed).unwrap();
-        let max_rank = if rank == 0 && e.kind() == EntityKind::Area {
-            // Without the original geometry_to_rank inputs, use the country's search rank.
-            let poly = records.geo.admin_polygon(e.record()).ok_or_else(|| invalid("missing area record"))?;
-            let country = query_server::country_code_bytes(poly.country_code)
-                .or_else(|| query_server::country_code_bytes(cc as u16)).unwrap_or_default().map(|b| b.to_ascii_uppercase());
-            query_server::area_search_rank(&poly, std::str::from_utf8(&country).unwrap_or("")).min(MAX_ADDRESS_RANK)
-        } else {
-            rank as u8
-        };
+        let max_rank = rank as u8;
         if previous_rank != max_rank {
             transition(&mut parents, max_rank, n, &mut ranges)?;
             previous_rank = max_rank;
