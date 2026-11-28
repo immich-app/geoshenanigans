@@ -112,25 +112,16 @@ pub(super) fn build(
         }
         for i in 0..n {
             let e = EntityRef::new(kind, i).ok_or_else(|| invalid("record exceeds entity row"))?;
+            let Some(row) = records.row(e) else { continue };
+            if matches!(row, SourceRow::Poi(p) if p.tier > opts.poi_max_tier) {
+                continue;
+            }
+            let Some((lat, lon)) = row.point(records.geo) else { continue };
             key.clear();
             if let Some(ids) = &ids {
-                let id = ids.get(i).ok_or_else(|| invalid("bad record chain id"))?;
-                if id == NO_DATA {
-                    continue;
-                }
-                if kind == EntityKind::Poi
-                    && opts.poi_max_tier < crate::constants::MAX_CORE_POI_TIER
-                    && records.geo.poi_record(i).is_none_or(|p| p.tier > opts.poi_max_tier)
-                {
-                    continue;
-                }
+                let id = ids.get(i).filter(|&id| id != NO_DATA).ok_or_else(|| invalid("incomplete shipped chain files"))?;
                 key.extend_from_slice(&id.to_be_bytes());
             } else {
-                let Some(row) = records.row(e) else { continue };
-                if matches!(row,SourceRow::Poi(p) if p.tier>opts.poi_max_tier) {
-                    continue;
-                }
-                let Some((lat, lon)) = row.point(records.geo) else { continue };
                 for field in points.get(lat, lon) {
                     key.extend_from_slice(&field.to_be_bytes())
                 }

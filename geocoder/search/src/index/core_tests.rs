@@ -160,6 +160,10 @@ fn a_shipped_chain_dictionary_is_read_in_id_order_and_partial_inputs_fail() {
     f.country(poly, *b"MX");
     f.poi("Palace", 1.5, 1.5, 0);
     f.poi("Outside", 0., 0., 0);
+    let label = f.place("Label", 1, 1.5, 1.5);
+    f.claim(poly, label);
+    let ring = f.poi("Second ring", 1.5, 1.5, 0);
+    f.classify_poi(ring, 1, 1, query_server::POI_FLAG_SECONDARY_RING);
     let geo = f.load(&set);
     let opts = BuildOpts::new(tmp.0.join("sort"));
     let build = |dir: &str| {
@@ -170,7 +174,8 @@ fn a_shipped_chain_dictionary_is_read_in_id_order_and_partial_inputs_fail() {
     assert!(build("side").is_err());
     fs::write(set.join("search_chains.bin"), [0, 1, 0]).unwrap();
     assert!(build("side").is_err());
-    fs::write(set.join("poi_chains.bin"), query_server::side_blocks::encode(&[1, 0])).unwrap();
+    fs::write(set.join("place_chains.bin"), query_server::side_blocks::encode(&[1])).unwrap();
+    fs::write(set.join("poi_chains.bin"), query_server::side_blocks::encode(&[1, 0, 1])).unwrap();
     build("side").unwrap();
     for file in crate::constants::CORE_FILES {
         assert_eq!(
@@ -179,6 +184,9 @@ fn a_shipped_chain_dictionary_is_read_in_id_order_and_partial_inputs_fail() {
             "{file}"
         );
     }
+    fs::write(set.join("poi_chains.bin"), query_server::side_blocks::encode(&[query_server::NO_DATA, 0, 1])).unwrap();
+    assert!(build("side").unwrap_err().contains("incomplete shipped chain files"));
+    fs::write(set.join("poi_chains.bin"), query_server::side_blocks::encode(&[1, 0, 1])).unwrap();
     fs::write(set.join("search_chains.bin"), [0, 1]).unwrap();
     assert!(build("side").is_err());
 }
