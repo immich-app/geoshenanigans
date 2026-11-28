@@ -385,13 +385,13 @@ impl Geo {
                 // The place files order their nodes by cell (place_files::encode); every other
                 // file keeps its records in the order they were added.
                 let row = if side == Side::PlaceTags { place_rows[record as usize] } else { record };
-                values[row as usize] = value + match side {
-                    Side::PlaceTags | Side::AdminTags => end as u32,
-                    Side::PoiTags => (end + self.tag_strings[0].len()) as u32,
-                    _ => 0,
-                };
+                values[row as usize] = value;
             }
-            files.push((side.file(), side_blocks::encode(&values)));
+            let bytes = match side {
+                Side::PlaceTags | Side::AdminTags | Side::PoiTags => side_blocks::encode_tags(&values),
+                _ => side_blocks::encode(&values),
+            };
+            files.push((side.file(), bytes));
         }
         files
     }

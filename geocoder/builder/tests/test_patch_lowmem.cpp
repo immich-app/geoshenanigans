@@ -2582,11 +2582,25 @@ TEST(patch_lowmem_rebuilds_a_string_tier_in_any_order) {
     new_d["strings_poi.bin"].assign(new_pool.begin(), new_pool.end());
     old_d["strings_tags_poi.bin"] = {'a', TAG_KEY_SEP, 'b', 0};
     new_d["strings_tags_poi.bin"] = {'a', TAG_KEY_SEP, 'c', 0, 'a', TAG_KEY_SEP, 'b', 0};
-    for (uint32_t off : {14u, NO_DATA, 14u}) append(old_d["poi_tags.bin"], off);
-    for (uint32_t off : {22u, NO_DATA, 22u, 18u}) append(new_d["poi_tags.bin"], off);
+    for (uint32_t off : {0u, NO_DATA, 0u}) append(old_d["poi_tags.bin"], off);
+    for (uint32_t off : {4u, NO_DATA, 4u, 0u}) append(new_d["poi_tags.bin"], off);
     const LowMemCase c{dir.path(), "strings"};
     REQUIRE(prepare(c, old_d, new_d).empty());
 
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+TEST(patch_lowmem_rebuilds_a_name_tier_without_its_parent_rows) {
+    ScratchDir dir("names-only");
+    BuildDir old_d, new_d;
+    old_d["strings_tags_core.bin"] = {'a', TAG_KEY_SEP, 'b', 0};
+    new_d["strings_tags_core.bin"] = {'a', TAG_KEY_SEP, 'c', 0, 'a', TAG_KEY_SEP, 'b', 0};
+    for (uint32_t off : {NO_DATA, 0u, NO_DATA, 0u}) append(old_d["place_tags.bin"], off);
+    for (uint32_t off : {NO_DATA, 4u, 0u, NO_DATA}) append(new_d["place_tags.bin"], off);
+    for (uint32_t off : {NO_DATA, NO_DATA}) append(old_d["admin_tags.bin"], off);
+    for (uint32_t off : {NO_DATA, 4u}) append(new_d["admin_tags.bin"], off);
+    const LowMemCase c{dir.path(), "name-tier"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 

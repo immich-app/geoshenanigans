@@ -63,7 +63,8 @@ void write_side_blocks(std::string_view file, const Values& values, Put put, uns
     uint64_t written = 0;
     encode_slices((n + slice - 1) / slice, [&](size_t k) {
         Slice out;
-        side_blocks::Encoder enc([&out](const uint8_t* p, size_t len) { out.blocks.insert(out.blocks.end(), p, p + len); });
+        side_blocks::Encoder enc([&out](const uint8_t* p, size_t len) { out.blocks.insert(out.blocks.end(), p, p + len); },
+                                 side_blocks::is_tag_column(file));
         for (size_t i = k * slice, end = std::min(n, i + slice); i < end; i++) enc.add(values[i]);
         enc.finish();
         out.starts = enc.table();
@@ -74,7 +75,7 @@ void write_side_blocks(std::string_view file, const Values& values, Put put, uns
             side_blocks::write_table_entry(file, written + start, entry);
             table.insert(table.end(), entry, entry + side_blocks::TABLE_ENTRY_BYTES);
         }
-        put(s.blocks.data(), s.blocks.size());
+        if (!s.blocks.empty()) put(s.blocks.data(), s.blocks.size());
         written += s.blocks.size();
     }, threads);
     if (!table.empty()) put(table.data(), table.size());

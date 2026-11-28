@@ -1157,14 +1157,10 @@ TEST(search_tags_follow_the_pbf_records_and_host_data_is_optional) {
             const auto place_count = place_files::read_footer(np + nodes.size() - place_files::FOOTER_BYTES, nodes.size()).rows;
             CHECK(side_blocks::read_footer("place_tags.bin", rp + rows.size() - side_blocks::FOOTER_BYTES, rows.size()).values == place_count);
             if (dir == minimal) {
-                std::string core;
-                const auto core_bytes = file_bytes(dir + "strings_core.bin");
-                string_files::decode(reinterpret_cast<const uint8_t*>(core_bytes.data()), core_bytes.size(),
-                                     [&](const char* p, size_t n) { core.append(p, n); });
                 side_blocks::decode("place_tags.bin", rp, rows.size(), [&](const uint32_t* p, size_t n) {
                     for (size_t i = 0; i < n; ++i) if (p[i] != NO_DATA) {
-                        REQUIRE(p[i] >= core.size() && p[i] - core.size() < pool.size());
-                        const size_t off = p[i] - core.size();
+                        const size_t off = p[i];
+                        REQUIRE(off < pool.size());
                         CHECK(off == 0 || pool[off - 1] == 0);
                         CHECK(std::strchr(pool.c_str() + off, TAG_KEY_SEP) != nullptr);
                     }

@@ -1323,7 +1323,7 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
     };
     for (const auto& f : STRING_RECORD_FILES) scan(f.fid, f.stride, string_field_offsets(f.fid));
     for (const auto& f : SPARSE_DELTA_FILES)
-        if (f.remap_kind == 2) scan(f.fid, f.value_stride, {0});
+        if (f.remap_kind == 2 && tag_tier_of(f.fid) < 0) scan(f.fid, f.value_stride, {0});
     return mask;
 }
 
@@ -1618,6 +1618,12 @@ static int run(int argc, char* argv[]) {
         unsent_string_pairs.swap(stats.unsent_pairs);
     }
     const PatcherStringRemap patcher_strings(str_remap, std::move(unsent_string_pairs), string_fixup_limits);
+    std::array<StringTierPlace, STRING_TIER_COUNT> side_tiers{};
+    for (int t = STR_TIER_TAGS_CORE; t < STRING_TIER_COUNT; ++t)
+        side_tiers[t] = {old_tier_bases[t], new_tier_bases[t], static_cast<uint32_t>(new_tier_maps[t].size)};
+    auto remap_side = [&](PatchFileId id, uint32_t value, uint32_t kind) {
+        return remap_side_value(id, value, kind, side_tiers, [&](uint32_t v) { return patcher_strings.map(v); });
+    };
     for (int t = 0; t < STRING_TIER_COUNT; t++) {
         unmap_file(old_tier_maps[t]);
         unmap_file(new_tier_maps[t]);
@@ -2709,7 +2715,7 @@ static int run(int argc, char* argv[]) {
             uint32_t new_val; memcpy(&new_val, new_m.data + pos * 4, 4);
             if (pos >= old_n) return true;
             uint32_t old_val; memcpy(&old_val, old_m.data + pos * 4, 4);
-            const uint32_t remapped = old_val != NO_DATA && remap_kind == 2 ? patcher_strings.map(old_val) : old_val;
+            const uint32_t remapped = remap_side(fid, old_val, remap_kind);
             return remapped != new_val;
         };
         for (size_t pos : parallel_filter<size_t>(new_n, changed)) {
@@ -2788,8 +2794,7 @@ static int run(int argc, char* argv[]) {
         auto new_m = mmap_file(new_path);
         auto val = [](const MappedFile& m, size_t i) { uint32_t v; memcpy(&v, m.data + i * 4, 4); return v; };
         auto remap_value = [&](uint32_t v) -> uint32_t {
-            if (v != NO_DATA && f.remap_kind == 2) return patcher_strings.map(v);
-            return v;
+            return remap_side(f.fid, v, f.remap_kind);
         };
         std::vector<uint32_t> ins;
         std::vector<char> changes;

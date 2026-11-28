@@ -307,7 +307,7 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // a hidden node). File id 40 names admin_own_names.bin, the own name of each
 // polygon that goes by its place node's English name, which merges as a
 // record file of a string field after the admin geometry.
-static constexpr uint32_t GCPATCH_VERSION = 26;
+static constexpr uint32_t GCPATCH_VERSION = 27;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -2634,7 +2634,7 @@ inline ShippedStringTiers shipped_string_tiers(const std::string& old_dir, const
 }
 
 // The section id of a string tier file.
-inline PatchFileId string_tier_file_id(int t) {
+constexpr PatchFileId string_tier_file_id(int t) {
     constexpr PatchFileId ids[] = {PatchFileId::STRINGS_CORE, PatchFileId::STRINGS_STREET, PatchFileId::STRINGS_ADDR,
         PatchFileId::STRINGS_POSTCODE, PatchFileId::STRINGS_POI, PatchFileId::STRINGS_TAGS_CORE,
         PatchFileId::STRINGS_TAGS_POI, PatchFileId::STRINGS_POI_EVERYTHING};
@@ -2771,6 +2771,34 @@ struct SentStringRuns {
 struct StringTierPlace {
     uint32_t old_base = 0, new_base = 0, new_size = 0;
 };
+
+// Tag column offsets are local to their own pool. The string edit works in
+// global space, including when a tag-only dir ships one tier on its own.
+constexpr int string_tier_index(PatchFileId id) {
+    for (int t = 0; t < STRING_TIER_COUNT; ++t)
+        if (string_tier_file_id(t) == id) return t;
+    return -1;
+}
+
+inline int tag_tier_of(PatchFileId id) {
+    if (id == PatchFileId::PLACE_TAGS || id == PatchFileId::ADMIN_TAGS)
+        return string_tier_index(PatchFileId::STRINGS_TAGS_CORE);
+    if (id == PatchFileId::POI_TAGS) return string_tier_index(PatchFileId::STRINGS_TAGS_POI);
+    return -1;
+}
+
+template <class Map>
+uint32_t remap_side_value(PatchFileId id, uint32_t value, uint32_t kind,
+                         const std::array<StringTierPlace, STRING_TIER_COUNT>& tiers, Map map) {
+    constexpr uint32_t missing = UINT32_MAX;
+    if (kind != 2 || value == missing) return value;
+    const int tag = tag_tier_of(id);
+    if (tag < 0) return map(value);
+    const auto& tier = tiers[tag];
+    if (value >= missing - tier.old_base) return missing;
+    const auto local = map(value + tier.old_base) - tier.new_base;
+    return local < tier.new_size ? local : missing;
+}
 
 struct StringsSection {
     // Tier t sits at old offsets [old_base[t], old_base[t + 1]); new likewise.

@@ -752,7 +752,12 @@ build 23's unit of the old rows with their cells and entries files, and take
 257,858,727 B (245.91 MiB), and with-addresses and max-quality, whose full
 dir holds the same two files, 0.14 MiB more than above too.
 
-## Patch Format (.gcpatch, version 25)
+## Patch Format (.gcpatch, version 27)
+
+Tag row files (`place_tags.bin`, `admin_tags.bin` and `poi_tags.bin`, ids 44–46)
+use STG1 in the dataset and the existing u32 logical rows in the patch.
+An absent row has no stored value. Offsets address the corresponding tag pool
+(ids 41–42), and the patch remaps those offsets within that pool.
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd

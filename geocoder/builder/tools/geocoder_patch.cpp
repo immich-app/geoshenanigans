@@ -710,6 +710,7 @@ static int run(int argc, char* argv[]) {
     // sends the runs of the tiers it doesn't ship but references. The runs
     // spill to the scratch dir.
     StringRemap str_remap(tmpdir);
+    std::array<StringTierPlace, STRING_TIER_COUNT> side_tiers{};
     {
         // The section is read front to back, by its parse and then by the
         // tiers' walks, each of which reads its old pool once.
@@ -718,6 +719,7 @@ static int run(int argc, char* argv[]) {
         PagesBehind patch_behind(P);
         const StringsSection strings = parse_strings_section(P, patch_size, pos);
         require_shipped_tiers_listed(strings.shipped, listed);
+        for (int t = 0; t < STRING_TIER_COUNT; ++t) side_tiers[t] = strings.place(t);
         uint32_t total_added = 0, total_deleted = 0;
         uint64_t buckets_copied = 0, buckets_decoded = 0;
         load_string_remap(strings, str_remap, [&](int t) {
@@ -1123,8 +1125,7 @@ static int run(int argc, char* argv[]) {
             const char* changes = patch.take_items(n_changes, 8, "parallel changes");
             constexpr uint32_t NO_DATA_VAL = 0xFFFFFFFFu;
             auto remap_value = [&](uint32_t v) -> uint32_t {
-                if (v != NO_DATA_VAL && remap_kind == 2) return str_remap_lookup(v);
-                return v;
+                return remap_side_value(static_cast<PatchFileId>(file_id), v, remap_kind, side_tiers, str_remap_lookup);
             };
             SequentialFileReader old(cur_dir + "/" + std::string(fname));
             FILE* out = open_out(fname);
@@ -1205,10 +1206,9 @@ static int run(int argc, char* argv[]) {
             // memory for planet addr_postcodes.
             SequentialFileReader old(cur_dir + "/" + std::string(fname));
             const size_t copy_n = std::min<uint64_t>({old_size, new_size, old.size()});
-            constexpr uint32_t NO_DATA_VAL = 0xFFFFFFFFu;
-            auto remap_value = [&](uint32_t v) -> uint32_t { return v == NO_DATA_VAL ? v : str_remap_lookup(v); };
-            // The values the remap applies to: a file of string offsets.
-            const bool remapped = remap_kind == 2 && !str_remap.empty();
+            const auto id = static_cast<PatchFileId>(file_id);
+            auto remap_value = [&](uint32_t v) { return remap_side_value(id, v, remap_kind, side_tiers, str_remap_lookup); };
+            const bool remapped = remap_kind == 2 && (!str_remap.empty() || tag_tier_of(id) >= 0);
 
             FILE* out = open_out(fname);
             constexpr size_t CHUNK = 64 << 10;  // a multiple of the value stride

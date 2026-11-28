@@ -17,6 +17,9 @@ const BLOCK_MAX_BYTES: usize = FOR_HEAD_BYTES + BLOCK_VALUES * 4;
 const MODE_FOR: u8 = 0;
 const MODE_DICTIONARY: u8 = 1;
 const MAGIC: &[u8; 4] = b"SDB1";
+const TAG_MAGIC: &[u8; 4] = b"STG1";
+const MODE_PRESENT: u8 = 2;
+const PRESENCE_BYTES: usize = 1 + std::mem::size_of::<u64>();
 
 #[inline(always)]
 fn u32_at(b: &[u8], at: usize) -> Option<u32> {
@@ -28,6 +31,7 @@ pub struct SideBlocks {
     bytes: FileBytes,
     count: u32,
     table_at: usize,
+    tags: bool,
 }
 
 impl SideBlocks {
@@ -35,19 +39,32 @@ impl SideBlocks {
     /// footer, a table past the file, blocks of a size no blocks of that many values have), which
     /// a block's bytes are not checked for.
     pub fn open(bytes: FileBytes, name: &str) -> Result<SideBlocks, String> {
+        Self::open_column(bytes, name, false)
+    }
+
+    pub fn open_tags(bytes: FileBytes, name: &str) -> Result<Self, String> {
+        Self::open_column(bytes, name, true)
+    }
+
+    fn open_column(bytes: FileBytes, name: &str, tags: bool) -> Result<Self, String> {
         let b = bytes.as_slice();
-        let no_footer = || format!("{name} has no SDB1 footer");
+        let (magic, min_block, max_block) = if tags {
+            (TAG_MAGIC, 0, BLOCK_MAX_BYTES + PRESENCE_BYTES)
+        } else {
+            (MAGIC, FOR_HEAD_BYTES, BLOCK_MAX_BYTES)
+        };
+        let no_footer = || format!("{name} has no {} footer", if tags { "STG1" } else { "SDB1" });
         let footer_at = b.len().checked_sub(FOOTER_BYTES).ok_or_else(no_footer)?;
-        let count = u32_at(b, footer_at).filter(|_| &b[footer_at + 4..] == MAGIC).ok_or_else(no_footer)?;
+        let count = u32_at(b, footer_at).filter(|_| &b[footer_at + 4..] == magic).ok_or_else(no_footer)?;
         let blocks = (count as usize).div_ceil(BLOCK_VALUES);
         let table_at = footer_at
             .checked_sub(blocks * TABLE_ENTRY_BYTES)
             .ok_or_else(|| format!("{name} is shorter than its block table"))?;
         // A block is its FOR head at the least. 2^26 blocks of 262 bytes pass 32 bits.
-        if table_at < blocks * FOR_HEAD_BYTES || table_at as u64 > blocks as u64 * BLOCK_MAX_BYTES as u64 {
+        if table_at < blocks * min_block || table_at as u64 > blocks as u64 * max_block as u64 {
             return Err(format!("{name} has blocks of a size its values cannot take"));
         }
-        Ok(SideBlocks { bytes, count, table_at })
+        Ok(SideBlocks { bytes, count, table_at, tags })
     }
 
     /// The values: ids below this.
@@ -75,7 +92,20 @@ impl SideBlocks {
             return None;
         }
         // The blocks end where the table starts: a block is none of the table's bytes.
-        let block = file.get(..self.table_at)?.get(at..end)?;
+        let mut block = file.get(..self.table_at)?.get(at..end)?;
+        let (mut at, mut c, mut j) = (at, c, j);
+        if self.tags && *block.first()? == MODE_PRESENT {
+            let mask = u64::from_le_bytes(*block.get(1..)?.first_chunk::<8>()?);
+            let below = (1u64 << j) - 1;
+            let present = mask.count_ones() as usize;
+            if present >= c || (c < BLOCK_VALUES && mask >> c != 0) || mask & (1u64 << j) == 0 {
+                return None;
+            }
+            j = (mask & below).count_ones() as usize;
+            c = present;
+            at += PRESENCE_BYTES;
+            block = block.get(PRESENCE_BYTES..)?;
+        }
         // Field j of the block's c fields of w bits, which start `head` bytes into it and end
         // where it does: one 8-byte load, which the bytes after the block (blocks, the table,
         // the footer) leave room for. None for a block of other bytes than its head and its
@@ -86,7 +116,7 @@ impl SideBlocks {
             }
             bits_at(file.get(at + head..)?, j * w as usize, w)
         };
-        match *block.first()? {
+        let value = match *block.first()? {
             MODE_FOR => {
                 let w = *block.get(FOR_HEAD_BYTES - 1)? as u32;
                 u32_at(block, 1)?.checked_add(field(FOR_HEAD_BYTES, w)?)
@@ -109,17 +139,45 @@ impl SideBlocks {
                 u32_at(block, 2 + 4 * x)
             }
             _ => None,
-        }
+        }?;
+        (!self.tags || value != crate::NO_DATA).then_some(value)
     }
 }
 
 /// The file's bytes for `values` (fixtures and tests), the builder's encoding.
 #[cfg(any(test, feature = "fixtures"))]
 pub fn encode(values: &[u32]) -> Vec<u8> {
+    encode_column(values, false)
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+pub fn encode_tags(values: &[u32]) -> Vec<u8> {
+    encode_column(values, true)
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+fn encode_column(values: &[u32], tags: bool) -> Vec<u8> {
     use crate::coord_keys::BitWriter;
     let (mut blocks, mut table) = (Vec::new(), Vec::new());
     for chunk in values.chunks(BLOCK_VALUES) {
         table.extend((blocks.len() as u32).to_le_bytes());
+        let packed;
+        let chunk = if tags {
+            let mut mask = 0u64;
+            packed = chunk.iter().copied().enumerate().filter_map(|(i, v)| {
+                (v != crate::NO_DATA).then(|| { mask |= 1 << i; v })
+            }).collect::<Vec<_>>();
+            if packed.is_empty() {
+                continue;
+            }
+            if packed.len() != chunk.len() {
+                blocks.push(MODE_PRESENT);
+                blocks.extend(mask.to_le_bytes());
+            }
+            packed.as_slice()
+        } else {
+            chunk
+        };
         let least = *chunk.iter().min().unwrap();
         let wf = bit_length(chunk.iter().max().unwrap() - least);
         // The distinct values in the order they first come, and each value's index among them.
@@ -159,7 +217,7 @@ pub fn encode(values: &[u32]) -> Vec<u8> {
     }
     blocks.extend(table);
     blocks.extend((values.len() as u32).to_le_bytes());
-    blocks.extend(MAGIC);
+    blocks.extend(if tags { TAG_MAGIC } else { MAGIC });
     blocks
 }
 

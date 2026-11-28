@@ -58,7 +58,7 @@ use query_server::{MultiIndex, WaterLayer, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEA
 /// configurations.template.json (a test here and
 /// builder/tools/test_build_search_indexes.py hold it to that): it syncs and
 /// serves builds of this version only.
-pub const BUILD_VERSION: u32 = 25;
+pub const BUILD_VERSION: u32 = 26;
 
 /// Where the builds are published: latest.json and each build's files
 /// under builds/.

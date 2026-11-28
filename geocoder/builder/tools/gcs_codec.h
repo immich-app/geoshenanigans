@@ -361,7 +361,8 @@ struct Dec : Decoder {
     std::string file;
     std::unique_ptr<Reader> B, T;  // the blocks, and their table
     side_blocks::Footer f;
-    uint64_t b = 0, at = 0;
+    uint64_t b = 0, at = 0, start = 0;
+    const bool tags = side_blocks::is_tag_column(file);
     Dec(const std::string& src, const std::string& family) : Decoder(family, {family + ".bin"}), file(family + ".bin") {
         const std::string path = src + "/" + file;
         struct stat st;
@@ -374,6 +375,7 @@ struct Dec : Decoder {
         }
         B.reset(new Reader(path, BLOCKS_BUF, 0, f.table_at));
         T.reset(new Reader(path, TABLE_BUF, f.table_at, size - side_blocks::FOOTER_BYTES));
+        start = side_blocks::get32(T->take(side_blocks::TABLE_ENTRY_BYTES));
     }
     uint64_t decoded_size(int) const override { return f.logical_bytes(); }
     // After the last block: how the file ends.
@@ -384,13 +386,22 @@ struct Dec : Decoder {
     }
     bool step() override {
         if (!B) return false;
-        if (side_blocks::get32(T->take(side_blocks::TABLE_ENTRY_BYTES)) != at)
+        if (start != at)
             side_blocks::malformed(file, "block " + std::to_string(b) + " is not where the blocks before it end");
-        const size_t count = f.values_of(b), avail = size_t(std::min<uint64_t>(B->left(), side_blocks::BLOCK_MAX_BYTES));
-        // Decoded into u32s of their own: the queue's bytes sit at any address.
+        start = b + 1 < f.blocks ? side_blocks::get32(T->take(side_blocks::TABLE_ENTRY_BYTES)) : f.table_at;
+        const size_t count = f.values_of(b);
         std::array<uint32_t, side_blocks::BLOCK_VALUES> values;
-        const size_t bytes = side_blocks::decode_block(file, b, avail ? B->need(avail) : nullptr, avail, count, values.data());
-        B->skip(bytes);
+        size_t bytes;
+        if (tags) {
+            if (start < at || start > f.table_at || start - at > side_blocks::TAG_BLOCK_MAX_BYTES)
+                side_blocks::malformed(file, "invalid tag block extent");
+            const size_t avail = start - at;
+            bytes = side_blocks::decode_tag_block(file, b, avail ? B->need(avail) : nullptr, avail, count, values.data());
+        } else {
+            const size_t avail = std::min<uint64_t>(B->left(), side_blocks::BLOCK_MAX_BYTES);
+            bytes = side_blocks::decode_block(file, b, avail ? B->need(avail) : nullptr, avail, count, values.data());
+        }
+        if (bytes) B->skip(bytes);
         emit(0, values.data(), 4 * count);
         at += bytes;
         if (++b == f.blocks) end();
@@ -415,7 +426,7 @@ struct Enc : Encoder {
           tpath(od + "/." + family + ".table"),
           BW(new Writer(od + "/" + file, BLOCKS_BUF)),
           TW(new Writer(tpath, TABLE_BUF, true)),
-          blocks(BlockSink{BW.get()}) {}
+          blocks(BlockSink{BW.get()}, side_blocks::is_tag_column(file)) {}
     void add(uint32_t v) {
         blocks.add(v);
         if (!blocks.table().empty()) spill();

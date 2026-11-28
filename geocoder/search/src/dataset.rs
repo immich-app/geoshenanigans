@@ -34,7 +34,7 @@ pub(crate) fn core_stamps(dir: &Path) -> std::io::Result<Stamps> {
 /// Search-only files. Opening reverse data never reads a bundle or importance column.
 #[derive(Default)]
 pub struct SearchFiles {
-    tiers: [Option<(u32, query_server::strings::Tier)>; 2],
+    tiers: [Option<query_server::strings::Tier>; 2],
     tags: [Option<query_server::side_blocks::SideBlocks>; 3],
     wiki: [Option<query_server::side_blocks::SideBlocks>; 3],
 }
@@ -48,29 +48,19 @@ impl SearchFiles {
             if !path.try_exists().map_err(|e| e.to_string())? { return Ok(None); }
             query_server::mmap_file(path.to_str().ok_or("invalid dataset path")?).map(Some)
         };
+        use query_server::side_blocks::SideBlocks;
         for (i, name) in [PLACE_TAGS_FILE, ADMIN_TAGS_FILE, POI_TAGS_FILE].into_iter().enumerate() {
-            for (file, col) in [(name, &mut files.tags[i]), (IMPORTANCE_FILES[i], &mut files.wiki[i])] {
-                if let Some(bytes) = optional(file)? {
-                    let side = query_server::side_blocks::SideBlocks::open(bytes, file)?;
-                    if side.count() != counts[i] { return Err(format!("{file} has {} rows, expected {}", side.count(), counts[i])); }
-                    *col = Some(side);
+            files.tags[i] = optional(name)?.map(|bytes| SideBlocks::open_tags(bytes, name)).transpose()?;
+            let wiki = IMPORTANCE_FILES[i];
+            files.wiki[i] = optional(wiki)?.map(|bytes| SideBlocks::open(bytes, wiki)).transpose()?;
+            for (name, column) in [(name, &files.tags[i]), (wiki, &files.wiki[i])] {
+                if let Some(side) = column {
+                    if side.count() != counts[i] { return Err(format!("{name} has {} rows, expected {}", side.count(), counts[i])); }
                 }
             }
         }
         for (i, name) in TAG_TIERS.into_iter().enumerate() {
-            if let Some(bytes) = optional(name)? {
-                let layout: Value = serde_json::from_reader(File::open(dir.join("strings_layout.json")).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-                let entry = layout["tiers"].as_array().and_then(|ts| ts.iter().find(|t| t["file"] == name))
-                    .ok_or_else(|| format!("missing layout for {name}"))?;
-                let bounds = |field: &str| entry[field].as_u64().and_then(|u| u32::try_from(u).ok()).ok_or_else(|| format!("bad {field} for {name}"));
-                let tier = query_server::strings::Tier::open(bytes)?;
-                let base = bounds("start")?;
-                if tier.len() > bounds("end")?.checked_sub(base).ok_or("reversed tier bounds")? {
-                    return Err(format!("{name} exceeds its layout"));
-                }
-                files.tiers[i] = Some((base, tier));
-            }
+            files.tiers[i] = optional(name)?.map(query_server::strings::Tier::open).transpose()?;
         }
         Ok(files)
     }
@@ -79,8 +69,8 @@ impl SearchFiles {
     pub fn bundle(&self, kind: crate::model::Kind, row: u32) -> Option<crate::tags::TagBundle<'_>> {
         let k = Self::column(kind);
         let offset = self.tags[k].as_ref()?.get(row)?;
-        let (base, tier) = self.tiers[usize::from(k == 2)].as_ref()?;
-        crate::tags::TagBundle::parse(tier.get(offset.checked_sub(*base)?))
+        let tier = self.tiers[usize::from(k == 2)].as_ref()?;
+        crate::tags::TagBundle::parse(tier.get(offset))
     }
 
     pub fn wiki_importance(&self, kind: crate::model::Kind, row: u32) -> Option<u32> {

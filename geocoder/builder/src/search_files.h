@@ -44,22 +44,21 @@ inline LaidOutTier poi(const ParsedData& d) {
 }
 
 template <class Index>
-void write_rows(const std::string& dir, const std::string& kind, const LaidOutTier& tier, uint32_t base,
+void write_rows(const std::string& dir, const std::string& kind, const LaidOutTier& tier,
                 size_t count, Index index) {
     std::vector<uint32_t> rows(count);
     for (size_t i = 0; i < count; ++i) {
-        const uint32_t off = tier.offsets[index(i)];
-        rows[i] = off == NO_DATA ? NO_DATA : base + off;
+        rows[i] = tier.offsets[index(i)];
     }
     write_side_file(dir, kind + "_tags.bin", rows, kind, count);
     std::fill(rows.begin(), rows.end(), 0);
     write_side_file(dir, kind + "_imp.bin", rows, kind, count);
 }
 
-inline void write_core(const std::string& dir, const LaidOutTier& tier, uint32_t base, size_t places) {
+inline void write_core(const std::string& dir, const LaidOutTier& tier, size_t places) {
     string_files::write_file(dir + "/" + STR_TIER_FILENAMES[STR_TIER_TAGS_CORE], tier.bytes.data(), tier.bytes.size());
-    write_rows(dir, "place", tier, base, places, [](size_t i) { return i; });
-    write_rows(dir, "admin", tier, base, tier.offsets.size() - places, [&](size_t i) { return places + i; });
+    write_rows(dir, "place", tier, places, [](size_t i) { return i; });
+    write_rows(dir, "admin", tier, tier.offsets.size() - places, [&](size_t i) { return places + i; });
 }
 
 // A block's offsets fit u32 even when the complete planet address blob exceeds 4 GiB.

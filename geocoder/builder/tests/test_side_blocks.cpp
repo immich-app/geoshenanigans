@@ -569,3 +569,17 @@ TEST(search_offset_and_importance_columns_use_the_side_block_codec) {
         }
     }
 }
+
+TEST(tag_blocks_omit_absent_values_and_empty_blocks) {
+    const char* file = "place_tags.bin";
+    std::vector<uint32_t> values(sb::BLOCK_VALUES + 3, UINT32_MAX);
+    values[sb::BLOCK_VALUES + 1] = 0;
+    auto bytes = sb::encode(file, values.data(), values.size());
+    CHECK(bytes.size() < sb::encode("dense.bin", values.data(), values.size()).size());
+    auto footer = sb::read_footer(file, bytes.data() + bytes.size() - sb::FOOTER_BYTES, bytes.size());
+    CHECK(sb::get32(bytes.data() + footer.table_at) == 0);
+    CHECK(sb::get32(bytes.data() + footer.table_at + sb::TABLE_ENTRY_BYTES) == 0);
+    std::vector<uint32_t> decoded;
+    sb::decode(file, bytes.data(), bytes.size(), [&](const uint32_t* p, size_t n) { decoded.insert(decoded.end(), p, p + n); });
+    CHECK(decoded == values);
+}

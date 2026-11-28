@@ -1605,7 +1605,7 @@ void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, con
         bases[STR_TIER_TAGS_POI] = search_files::tier_end(bases[STR_TIER_TAGS_CORE], tags.bytes.size());
         bases.back() = bases[STR_TIER_TAGS_POI];
     }
-    search_files::write_core(dir, tags, bases[STR_TIER_TAGS_CORE], places.size());
+    search_files::write_core(dir, tags, places.size());
     if (data.search_tags->host) {
         std::vector<uint64_t> ids;
         for (size_t i = 0; i < order.size(); ++i) ids.push_back(search_files::object(data.place_osm_ids, place(i)));

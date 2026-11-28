@@ -193,7 +193,7 @@ fn search_opens_the_tag_tier_and_rejects_a_column_of_another_size() {
     tiers.push(serde_json::json!({"file":"strings_tags_poi.bin", "start":end, "end":end}));
     std::fs::write(&layout, json.to_string()).unwrap();
     std::fs::write(dir.join("strings_tags_core.bin"), strings::encode(pool)).unwrap();
-    std::fs::write(dir.join("admin_tags.bin"), query_server::side_blocks::encode(&[base])).unwrap();
+    std::fs::write(dir.join("admin_tags.bin"), query_server::side_blocks::encode_tags(&[0])).unwrap();
     std::fs::write(dir.join("admin_imp.bin"), query_server::side_blocks::encode(&[7])).unwrap();
     let geo = || Index::load(dir.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
     let index = geo();

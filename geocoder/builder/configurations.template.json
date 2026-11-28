@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "build": {
-    "version": 25,
-    "patch_version": 26
+    "version": 26,
+    "patch_version": 27
   },
   "attribution": [
     {

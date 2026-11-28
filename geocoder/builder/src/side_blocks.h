@@ -24,6 +24,10 @@
 //     is filled with zero bits. A block is BLOCK_MAX_BYTES at most;
 //   the block table: the offset of each block's first byte (u32);
 //   footer, FOOTER_BYTES: the values (u32), "SDB1".
+// Tag columns use STG1. An empty block has no body and shares its offset
+// with the next block. A mixed block starts with MODE_PRESENT and a u64
+// presence mask, then encodes only its present values. A full block uses
+// the ordinary encoding. The table and row count still index record order.
 // A file of no values is the footer alone. Value i is in block i /
 // BLOCK_VALUES, and a bit reader's 8-byte loads past the last block's bits
 // land in the table and the footer.
@@ -48,6 +52,15 @@ inline constexpr size_t BLOCK_VALUES = 64, TABLE_ENTRY_BYTES = 4, FOOTER_BYTES =
 inline constexpr size_t BLOCK_MAX_BYTES = FOR_HEAD_BYTES + BLOCK_VALUES * 4;
 inline constexpr uint8_t MODE_FOR = 0, MODE_DICTIONARY = 1;
 inline constexpr char MAGIC[4] = {'S', 'D', 'B', '1'};
+inline constexpr char TAG_MAGIC[4] = {'S', 'T', 'G', '1'};
+inline constexpr uint8_t MODE_PRESENT = 2;
+inline constexpr size_t PRESENCE_BYTES = 1 + sizeof(uint64_t);
+inline constexpr size_t TAG_BLOCK_MAX_BYTES = PRESENCE_BYTES + BLOCK_MAX_BYTES;
+inline constexpr uint32_t ABSENT = UINT32_MAX;
+
+inline bool is_tag_column(std::string_view file) {
+    return file == "place_tags.bin" || file == "admin_tags.bin" || file == "poi_tags.bin";
+}
 
 // The files written in this format, each by its family: its name without
 // ".bin".
@@ -153,7 +166,7 @@ inline size_t encode_block(const uint32_t* v, size_t c, uint8_t* out) {
 template <class Sink>
 class Encoder {
 public:
-    explicit Encoder(Sink blocks) : blocks_(blocks) {}
+    explicit Encoder(Sink blocks, bool tags = false) : blocks_(blocks), tags_(tags) {}
 
     void add(uint32_t v) {
         block_[held_++] = v;
@@ -176,8 +189,23 @@ public:
 private:
     void flush_block() {
         if (!held_) return;
-        const size_t bytes = encode_block(block_.data(), held_, bytes_.data());
-        blocks_(static_cast<const uint8_t*>(bytes_.data()), bytes);
+        size_t prefix = 0, present = held_;
+        if (tags_) {
+            uint64_t mask = 0;
+            present = 0;
+            for (size_t i = 0; i < held_; ++i) {
+                if (block_[i] == ABSENT) continue;
+                mask |= uint64_t{1} << i;
+                block_[present++] = block_[i];
+            }
+            if (present && present != held_) {
+                prefix = PRESENCE_BYTES;
+                bytes_[0] = MODE_PRESENT;
+                std::memcpy(bytes_.data() + 1, &mask, sizeof(mask));
+            }
+        }
+        const size_t bytes = present ? prefix + encode_block(block_.data(), present, bytes_.data() + prefix) : 0;
+        if (bytes) blocks_(static_cast<const uint8_t*>(bytes_.data()), bytes);
         table_.push_back(offset_);
         offset_ += bytes;
         values_ += held_;
@@ -185,8 +213,9 @@ private:
     }
 
     Sink blocks_;
+    bool tags_;
     std::array<uint32_t, BLOCK_VALUES> block_;
-    std::array<uint8_t, BLOCK_MAX_BYTES + 8> bytes_;
+    std::array<uint8_t, TAG_BLOCK_MAX_BYTES + 8> bytes_;
     std::vector<uint64_t> table_;
     uint64_t offset_ = 0, values_ = 0;
     size_t held_ = 0;
@@ -204,14 +233,14 @@ inline std::array<uint8_t, FOOTER_BYTES> footer(std::string_view file, uint64_t 
     if (values > UINT32_MAX) malformed(file, "more than 2^32 - 1 values");
     std::array<uint8_t, FOOTER_BYTES> f;
     put32(f.data(), uint32_t(values));
-    std::memcpy(f.data() + 4, MAGIC, 4);
+    std::memcpy(f.data() + 4, is_tag_column(file) ? TAG_MAGIC : MAGIC, 4);
     return f;
 }
 
 // The whole file of n values, in memory.
 inline std::vector<uint8_t> encode(std::string_view file, const uint32_t* values, size_t n) {
     std::vector<uint8_t> out;
-    Encoder enc([&out](const uint8_t* p, size_t len) { out.insert(out.end(), p, p + len); });
+    Encoder enc([&out](const uint8_t* p, size_t len) { out.insert(out.end(), p, p + len); }, is_tag_column(file));
     enc.add(values, n);
     enc.finish();
     for (uint64_t offset : enc.table()) {
@@ -237,7 +266,9 @@ struct Footer {
 // footer is the file's last FOOTER_BYTES (not read of a shorter file).
 inline Footer read_footer(std::string_view file, const uint8_t* footer, uint64_t size) {
     if (size < FOOTER_BYTES) malformed(file, "shorter than its footer");
-    if (std::memcmp(footer + 4, MAGIC, 4) != 0) malformed(file, "no SDB1 in its footer");
+    const bool tags = is_tag_column(file);
+    if (std::memcmp(footer + 4, tags ? TAG_MAGIC : MAGIC, 4) != 0)
+        malformed(file, tags ? "no STG1 in its footer" : "no SDB1 in its footer");
     Footer f;
     f.values = get32(footer);
     f.blocks = (uint64_t(f.values) + BLOCK_VALUES - 1) / BLOCK_VALUES;
@@ -315,6 +346,33 @@ inline size_t decode_block(std::string_view file, uint64_t b, const uint8_t* p, 
     return bytes;
 }
 
+inline size_t decode_tag_block(std::string_view file, uint64_t b, const uint8_t* p, size_t bytes, size_t count,
+                               uint32_t* values) {
+    if (!bytes) {
+        std::fill_n(values, count, ABSENT);
+        return 0;
+    }
+    auto refuse = [&] { malformed(file, "invalid presence or size of block " + std::to_string(b)); };
+    uint64_t mask = UINT64_MAX >> (BLOCK_VALUES - count);
+    size_t present = count, prefix = 0;
+    if (p[0] == MODE_PRESENT) {
+        prefix = PRESENCE_BYTES;
+        if (bytes <= prefix) refuse();
+        std::memcpy(&mask, p + 1, sizeof(mask));
+        present = __builtin_popcountll(mask);
+        if (present == 0 || present >= count || (count < BLOCK_VALUES && (mask >> count))) refuse();
+    }
+    std::array<uint32_t, BLOCK_VALUES> packed;
+    if (decode_block(file, b, p + prefix, bytes - prefix, present, packed.data()) != bytes - prefix) refuse();
+    size_t j = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const bool has_value = (mask >> i) & 1;
+        values[i] = has_value ? packed[j++] : ABSENT;
+        if (has_value && values[i] == ABSENT) refuse();
+    }
+    return bytes;
+}
+
 // The values of a file (whole, in memory), block by block to
 // put(const uint32_t* values, size_t count). Refuses a file the encoder would
 // not write.
@@ -327,7 +385,13 @@ void decode(std::string_view file, const uint8_t* bytes, size_t size, Put put) {
         if (get32(bytes + f.table_at + b * TABLE_ENTRY_BYTES) != at)
             malformed(file, "block " + std::to_string(b) + " is not where the blocks before it end");
         const size_t count = f.values_of(b);
-        at += decode_block(file, b, bytes + at, size_t(f.table_at - at), count, values.data());
+        if (is_tag_column(file)) {
+            const uint64_t end = b + 1 < f.blocks ? get32(bytes + f.table_at + (b + 1) * TABLE_ENTRY_BYTES) : f.table_at;
+            if (end < at || end > f.table_at || end - at > TAG_BLOCK_MAX_BYTES) malformed(file, "invalid tag block extent");
+            at += decode_tag_block(file, b, bytes + at, size_t(end - at), count, values.data());
+        } else {
+            at += decode_block(file, b, bytes + at, size_t(f.table_at - at), count, values.data());
+        }
         put(static_cast<const uint32_t*>(values.data()), count);
     }
     if (at != f.table_at) malformed(file, "bytes between its blocks and its table");

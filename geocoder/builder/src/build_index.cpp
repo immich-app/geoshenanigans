@@ -1186,7 +1186,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         layout.back() = search_files::tier_end(layout[STR_TIER_TAGS_POI], poi_tags.bytes.size());
         auto mode_files = [&](const std::string& dir, IndexMode selected) {
             write_index(d, dir, selected, &layout);
-            search_files::write_core(dir, core_tags, layout[STR_TIER_TAGS_CORE], place_order.size());
+            search_files::write_core(dir, core_tags, place_order.size());
             if (d.search_tags->host) {
                 std::vector<uint64_t> ids;
                 for (uint32_t i : place_order) ids.push_back(search_files::object(d.place_osm_ids, i));
@@ -1365,7 +1365,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                     }
                     string_files::write_file(poi_dir + "/" + STR_TIER_FILENAMES[STR_TIER_TAGS_POI], poi_tags.bytes.data(),
                                              poi_tags.group_ends[tier_var.max_tier]);
-                    search_files::write_rows(poi_dir, "poi", poi_tags, layout[STR_TIER_TAGS_POI], selected.size(),
+                    search_files::write_rows(poi_dir, "poi", poi_tags, selected.size(),
                                              [&](size_t i) { return selected[i]; });
                     if (d.search_tags->host) search_files::write_host_poi(d, poi_dir, selected);
                     write_strings_layout(poi_dir, layout);

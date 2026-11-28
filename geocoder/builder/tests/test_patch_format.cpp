@@ -420,7 +420,7 @@ TEST(patch_format_magic_and_version) {
     // logical stream; v22: the address points' addr:city side file; v20: the
     // postcode grid's logical stream; v19: the postcode centroids'). The
     // patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(26));
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(27));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
