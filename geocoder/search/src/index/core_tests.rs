@@ -416,7 +416,20 @@ fn full_records_read_outline_bounds_and_optional_host_object_ids() {
     bytes.extend(42u64.to_le_bytes());
     fs::write(tmp.0.join("admin_polygons.osm_ids"), &bytes).unwrap();
     let e = EntityRef::new(EntityKind::Area, poly).unwrap();
-    let full = CoreRecords::for_profile(&geo, &tmp.0, Profile::Full).unwrap();
+    let out = tmp.0.join("full-index");
+    let stamps = crate::dataset::load(&tmp.0, || Ok(())).unwrap().1;
+    build_core(&geo, &stamps, &tmp.0, &out, Profile::Full, &BuildOpts::new(out.join("tmp"))).unwrap();
+    let core = CoreIndex::open(&out).unwrap();
+    let mut expected = BBox { min_lat: f64::INFINITY, min_lon: f64::INFINITY, max_lat: f64::NEG_INFINITY, max_lon: f64::NEG_INFINITY };
+    geo.admin_geometry.for_each_vertex(&geo.admin_polygon(poly).unwrap(), |v| {
+        let (lat, lon) = v.degrees();
+        expected.min_lat = expected.min_lat.min(lat);
+        expected.max_lat = expected.max_lat.max(lat);
+        expected.min_lon = expected.min_lon.min(lon);
+        expected.max_lon = expected.max_lon.max(lon);
+    }).unwrap();
+    assert_eq!(core.areas.bbox(poly), Some(expected));
+    let full = CoreRecords::for_index(&geo, &tmp.0, &core).unwrap();
     let r = full.read(e).unwrap();
     assert_eq!(r.osm, Some(OsmRef { kind: OsmKind::Relation, id: 42 }));
     assert_eq!(r.bbox, Some(BBox { min_lat: 1., min_lon: 2., max_lat: 3., max_lon: 4. }));
@@ -424,10 +437,10 @@ fn full_records_read_outline_bounds_and_optional_host_object_ids() {
     drop(full);
     bytes[13] = 1;
     fs::write(tmp.0.join("admin_polygons.osm_ids"), &bytes).unwrap();
-    assert_eq!(CoreRecords::for_profile(&geo, &tmp.0, Profile::Full).unwrap().read(e).unwrap().osm, None);
+    assert_eq!(CoreRecords::for_index(&geo, &tmp.0, &core).unwrap().read(e).unwrap().osm, None);
     bytes.pop();
     fs::write(tmp.0.join("admin_polygons.osm_ids"), bytes).unwrap();
-    assert!(CoreRecords::for_profile(&geo, &tmp.0, Profile::Full).is_err());
+    assert!(CoreRecords::for_index(&geo, &tmp.0, &core).is_err());
     assert_eq!(CoreRecords::open(&geo, &tmp.0).unwrap().read(e).unwrap().osm, None);
 }
 

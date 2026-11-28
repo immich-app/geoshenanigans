@@ -167,6 +167,12 @@ pub(super) fn build(
     let mut n = 0u32;
     let mut cc = 0;
     let mut blob = Vec::new();
+    // Ring chunk boxes omit the southern edge. Keep the exact extrema from the vertex pass.
+    let mut bounds = if profile == Profile::Full {
+        let file = std::fs::File::options().read(true).write(true).create_new(true).open(tmp.join("bounds"))?;
+        file.set_len(u64::from(records.geo.admin_polygon_count()) * BBOX_BYTES as u64)?;
+        Some(file)
+    } else { None };
     while let Some([packed, rank]) = input.next(&mut key)? {
         if prev.as_ref() != Some(&key) {
             transition(&mut parents, 0, n, &mut ranges)?;
@@ -212,16 +218,21 @@ pub(super) fn build(
         ents.write_all(&packed.to_le_bytes())?;
         by_record.push(&[], [packed, n, cc])?;
         let end = n.checked_add(1).ok_or_else(|| invalid("too many entities"))?;
-        if profile == Profile::Full {
+        if let Some(file) = &mut bounds {
             if e.kind() == EntityKind::Area {
                 let poly =
                     records.geo.admin_polygon(e.record()).ok_or_else(|| invalid("missing polygon of shipped chain"))?;
+                let mut bbox = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
                 let mut last = Vec::new();
                 let mut added = Ok(());
                 let read = records.geo.admin_geometry.for_each_vertex(&poly, |v| {
                     if added.is_err() {
                         return;
                     }
+                    bbox[0] = bbox[0].min(v.lat as i32);
+                    bbox[1] = bbox[1].min(v.lng as i32);
+                    bbox[2] = bbox[2].max(v.lat as i32);
+                    bbox[3] = bbox[3].max(v.lng as i32);
                     let (lat, lon) = v.degrees();
                     let parents = points.get(lat, lon);
                     if parents != last {
@@ -239,6 +250,12 @@ pub(super) fn build(
                 });
                 added?;
                 read.ok_or_else(|| invalid("unreadable area outline"))?;
+                file.seek(SeekFrom::Start(u64::from(e.record()) * BBOX_BYTES as u64))?;
+                let mut row = [0; BBOX_BYTES];
+                for (dst, coord) in row.chunks_exact_mut(size_of::<i32>()).zip(bbox) {
+                    dst.copy_from_slice(&coord.to_le_bytes());
+                }
+                file.write_all(&row)?;
             }
         }
         n = end;
@@ -249,7 +266,7 @@ pub(super) fn build(
     ents.flush()?;
     chains.finish(&[n], &tmp.join("core.chn.blob"))?;
     let runs = by_record.finish()?;
-    counts::write(ranges, out, tmp, records.geo.admin_polygon_count())?;
+    counts::write(ranges, out, tmp, records.geo.admin_polygon_count(), bounds)?;
     let mut rows = runs.merge(tmp, "record-merge")?;
     let mut sorted = writer(&tmp.join("records"))?;
     while let Some(row) = rows.next(&mut key)? {

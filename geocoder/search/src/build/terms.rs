@@ -374,9 +374,9 @@ fn prefix_files(prefixes: Vec<Prefix>, out: &Path) -> io::Result<()> {
     fst.finish()?;
     data.flush()
 }
-pub(super) fn build(records: CoreRecords, out: &Path, tmp: &Path, opts: &BuildOpts, n: u32) -> io::Result<(u64, u64)> {
+pub(super) fn build(records: CoreRecords, out: &Path, tmp: &Path, opts: &BuildOpts, n: u32, profile: crate::profile::Profile) -> io::Result<(u64, u64)> {
     let rows = map(&tmp.join("records"))?;
-    let areas = AreaRanges::open(out, n)?;
+    let areas = AreaRanges::open(out, n, profile)?;
     let budget = crate::sort::run_budget(opts.mem_mb, opts.threads).map_err(invalid)?;
     let mut names = SortedRuns::default();
     std::thread::scope(|scope| -> io::Result<()> {

@@ -98,23 +98,28 @@ pub struct CoreRecords<'a> {
     pub(super) geo: &'a Index,
     files: crate::dataset::SearchFiles,
     pub(super) sizes: [u32; 3],
-    profile: crate::profile::Profile,
+    areas: Option<&'a crate::index::areas::AreaRanges>,
     osm: [Option<OsmRows>; 3],
 }
 impl<'a> CoreRecords<'a> {
     pub fn open(geo: &'a Index, set: &Path) -> io::Result<Self> {
-        Self::for_profile(geo, set, crate::profile::Profile::Immich)
+        Self::with_areas(geo, set, None)
     }
-    pub fn for_profile(geo: &'a Index, set: &Path, profile: crate::profile::Profile) -> io::Result<Self> {
+    /// A resolver for the same generation as the index's entities and outline bounds.
+    pub fn for_index(geo: &'a Index, set: &Path, core: &'a crate::index::CoreIndex) -> io::Result<Self> {
+        Self::with_areas(geo, set, (core.areas.profile == crate::profile::Profile::Full).then_some(&core.areas))
+    }
+
+    fn with_areas(geo: &'a Index, set: &Path, areas: Option<&'a crate::index::areas::AreaRanges>) -> io::Result<Self> {
         let sizes =
             [geo.place_node_count(), geo.admin_polygon_count(), geo.poi_records.as_ref().map_or(0, |p| p.len())];
         let mut osm = [None, None, None];
-        if profile == crate::profile::Profile::Full {
+        if areas.is_some() {
             for ((map, file), n) in osm.iter_mut().zip(OSM_ID_FILES).zip(sizes) {
                 *map = OsmRows::open(&set.join(file), n)?;
             }
         }
-        Ok(Self { geo, files: crate::dataset::SearchFiles::open(set, geo).map_err(invalid)?, sizes, profile, osm })
+        Ok(Self { geo, files: crate::dataset::SearchFiles::open(set, geo).map_err(invalid)?, sizes, areas, osm })
     }
     pub(super) fn row(&self, e: EntityRef) -> Option<SourceRow> {
         let i = e.record();
@@ -202,20 +207,9 @@ impl Entities for CoreRecords<'_> {
         if name.is_empty() {
             return None;
         }
-        let bbox = if let (crate::profile::Profile::Full, SourceRow::Area(area)) = (self.profile, row) {
-            let mut bounds = BBox { min_lat: point.0, min_lon: point.1, max_lat: point.0, max_lon: point.1 };
-            self.geo
-                .admin_geometry
-                .for_each_vertex(&area, |v| {
-                    let (lat, lon) = v.degrees();
-                    bounds.min_lat = bounds.min_lat.min(lat);
-                    bounds.max_lat = bounds.max_lat.max(lat);
-                    bounds.min_lon = bounds.min_lon.min(lon);
-                    bounds.max_lon = bounds.max_lon.max(lon);
-                })
-                .map(|()| bounds)
-        } else {
-            None
+        let bbox = match row {
+            SourceRow::Area(_) => self.areas.and_then(|areas| areas.bbox(e.record())),
+            _ => None,
         };
         let osm = self.osm[e.kind() as usize].as_ref().and_then(|map| map.get(e.record()));
         Some(EntityRecord {

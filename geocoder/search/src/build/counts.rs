@@ -1,6 +1,7 @@
 use super::write::TableWriter;
 use crate::{index::invalid, sort::ExternalSort, varint};
-use std::{io, ops::Range, path::Path};
+use crate::constants::{BBOX_BYTES, BBOX_COORDS};
+use std::{fs::File, io::{self, BufReader, Seek, Read}, ops::Range, path::Path};
 
 /// The input intervals arrive in start order. Only their rightmost covered point
 /// is needed to count the union, even for a word shared by nested polygons.
@@ -15,14 +16,24 @@ impl Coverage {
         self.end = self.end.max(end);
     }
 }
-pub(super) fn write(sort: ExternalSort<[u32; 3]>, out: &Path, tmp: &Path, slots: u32) -> io::Result<()> {
+pub(super) fn write(sort: ExternalSort<[u32; 3]>, out: &Path, tmp: &Path, slots: u32, mut bounds: Option<File>) -> io::Result<()> {
     let mut rows = sort.finish()?.merge(tmp, "area-merge")?;
     let mut key = Vec::new();
     let mut next = rows.next(&mut key)?;
     let mut table = TableWriter::new(out, "core.area", tmp)?;
     let mut bytes = Vec::new();
+    if let Some(file) = &mut bounds { file.rewind()?; }
+    let mut bounds = bounds.map(BufReader::new);
+    let mut fields = vec![0; if bounds.is_some() { BBOX_COORDS } else { 0 }];
     for slot in 0..slots {
-        table.begin(&[])?;
+        if let Some(bounds) = &mut bounds {
+            let mut row = [0; BBOX_BYTES];
+            bounds.read_exact(&mut row)?;
+            for (field, b) in fields.iter_mut().zip(row.chunks_exact(size_of::<u32>())) {
+                *field = u32::from_le_bytes(b.try_into().unwrap());
+            }
+        }
+        table.begin(&fields)?;
         let mut active: Option<Range<u32>> = None;
         let mut last = 0;
         let mut flush = |r: Range<u32>| -> io::Result<()> {
@@ -53,5 +64,5 @@ pub(super) fn write(sort: ExternalSort<[u32; 3]>, out: &Path, tmp: &Path, slots:
     if next.is_some() {
         return Err(invalid("chain contains an unknown polygon"));
     }
-    table.finish(&[], &tmp.join("core.area.blob"))
+    table.finish(&fields, &tmp.join("core.area.blob"))
 }

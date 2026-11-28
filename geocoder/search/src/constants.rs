@@ -378,6 +378,8 @@ pub const INDEX_FORMAT: u64 = 3;
 pub const SUB_INDEXES: &[&str] = &["core", "addr"];
 pub const CORE_FILES: &[&str] =
     &["core.ent", "core.chn", "core.area", "core.fst", "core.post", "core.pfx.fst", "core.pfx"];
+pub const BBOX_COORDS: usize = 4;
+pub const BBOX_BYTES: usize = BBOX_COORDS * size_of::<i32>();
 pub const ENTITY_MAGIC: &[u8; 4] = b"PSE3";
 pub const SKIP_EVERY: u32 = 128;
 pub const TOPK_MIN_DF: u32 = 1024;
