@@ -33,6 +33,8 @@ pub mod feedback;
 pub mod immich;
 #[path = "portal/search.rs"]
 pub mod search;
+#[path = "portal/search_params.rs"]
+mod search_params;
 #[path = "portal/sync.rs"]
 pub mod sync;
 
@@ -42,14 +44,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use axum::extract::{ConnectInfo, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 
 use crate::{auth, handlers};
-use place_search::profile::{Profile, SearchRequest};
+use self::search_params::SearchParams;
 use query_server::{MultiIndex, WaterLayer, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
 
 /// The build version of the files this server reads, the build.version of
@@ -75,15 +77,10 @@ pub const LOOKUPS_AT_ONCE: usize = 8;
 /// A search takes 1-35 ms warm.
 pub const SEARCHES_AT_ONCE: usize = 4;
 
-/// The place search indexes a sync builds at once (PORTAL_SEARCH_JOBS),
-/// each on one thread: 4 build the planet build's 12 in ~156 s, the
-/// longest alone ~135 s.
+/// The place search indexes a sync builds at once (PORTAL_SEARCH_JOBS), one thread per build.
 pub const SEARCH_JOBS: usize = 4;
 
-/// The most bytes of a /search's q, its spaces at either end left out.
-pub const SEARCH_QUERY_MAX: usize = 256;
-
-/// How a dataset's dir loads: into a MultiIndex of one slot.
+/// How a dataset's dir loads into a MultiIndex.
 pub type Loader = Arc<dyn Fn(&Path) -> Result<MultiIndex, String> + Send + Sync>;
 
 /// How a water dir's dir of links loads: into its water layer.
@@ -93,6 +90,8 @@ pub type WaterLoader = Arc<dyn Fn(&Path) -> Result<WaterLayer, String> + Send + 
 pub struct Config {
     /// The bucket (BASE_URL).
     pub base_url: String,
+    /// The regions of each published build to serve.
+    pub regions: Vec<String>,
     /// The time between two sync rounds.
     pub interval: Duration,
     /// The time after a round that failed before the next.
@@ -132,6 +131,9 @@ impl Config {
         let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
         Config {
             base_url: std::env::var("PORTAL_BASE_URL").unwrap_or_else(|_| BASE_URL.to_string()),
+            regions: std::env::var("PORTAL_REGIONS").ok().map_or_else(catalog::default_regions, |value| {
+                value.split(',').map(str::trim).filter(|name| !name.is_empty()).map(str::to_string).collect()
+            }),
             interval: Duration::from_secs(seconds),
             retry_after: Duration::from_secs(seconds.min(600)),
             retry_delays: [5, 30, 120].map(Duration::from_secs).to_vec(),
@@ -158,12 +160,12 @@ pub fn search_jobs(wanted: Option<&str>, cpus: usize) -> usize {
 }
 
 /// The dataset in the dir `dir` (the links to one selection's files), as a
-/// query-server serving that dir loads it: a MultiIndex of one "world"
-/// slot. An error where it doesn't load, or holds no admin_cells.bin.
+/// query-server serving that dir loads it. An error where it has no
+/// loaded regions.
 pub fn load_dataset(dir: &Path) -> Result<MultiIndex, String> {
     let at = dir.to_str().ok_or_else(|| format!("{} is no UTF-8 path", dir.display()))?;
     let index = MultiIndex::load(at, DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE)?;
-    if index.continents.len() != 1 || index.loaded_count() != 1 {
+    if index.loaded_count() == 0 {
         return Err(format!("{at} holds no admin_cells.bin"));
     }
     Ok(index)
@@ -654,31 +656,13 @@ async fn polygons(State(app): State<Arc<App>>, Query(p): Query<Params>) -> Respo
     lookup(&app.portal, served, at, move |index| handlers::polygons_answer(index, p.lat, p.lon)).await
 }
 
-#[derive(Deserialize)]
-struct SearchParams {
-    q: Option<String>,
-    limit: Option<usize>,
-    key: Option<String>,
-    debug: Option<String>,
-    dataset: Option<String>,
-}
-
-/// /search of a dataset: the places and POIs whose names match q, best
-/// first, at most limit (1 to the immich profile's max_limit, its
-/// default_limit without one), a request of the immich profile, as the node
-/// binding's searchPlaces answers them (query::results_json),
-/// or with debug=1 as `place-search query` prints them, with what the
-/// search did and how long it took (query::debug_line). q goes to the
-/// search as given; with its spaces at either end left out it is 1 to
-/// SEARCH_QUERY_MAX bytes. A search runs as a lookup does, on a place of
-/// the portal's searches (Portal::searches), and is named by the headers a
-/// lookup's are, and X-Geocoder-Search-Index (its dataset's group, which
-/// datasets of the same index share). The dataset and its place search are
-/// found first: a search the portal can't answer (no build served, a
-/// dataset it doesn't offer, one whose index isn't open: 503 with its
-/// state, as /health tells it) takes nothing of its key's rate; then the
-/// key (401), the query (400) and the key's rate, /reverse's (429).
-async fn search_places(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, Query(p): Query<SearchParams>) -> Response {
+/// Searches an open dataset on a blocking worker after validation and rate checking.
+async fn search_places(
+    State(app): State<Arc<App>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(p): Query<SearchParams>,
+) -> Response {
     if is_immich(&app.portal, p.dataset.as_deref()) {
         return immich_lacks("place search");
     }
@@ -709,27 +693,17 @@ async fn search_places(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectIn
         Ok(key) => key,
         Err(resp) => return resp,
     };
-    let Some(q) = p.q.filter(|q| !q.trim().is_empty()) else {
-        return (StatusCode::BAD_REQUEST, "q must name what to search for").into_response();
+    let (req, debug) = match p.into_request(&headers) {
+        Ok(parsed) => parsed,
+        Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
     };
-    if q.trim().len() > SEARCH_QUERY_MAX {
-        return (StatusCode::BAD_REQUEST, format!("q must be at most {SEARCH_QUERY_MAX} bytes")).into_response();
+    if let Err(why) = searcher.require_supported(&req) {
+        return (StatusCode::BAD_REQUEST, why.to_string()).into_response();
     }
-    let policy = Profile::Immich.policy();
-    let limit = p.limit.unwrap_or(policy.default_limit);
-    if !(1..=policy.max_limit).contains(&limit) {
-        return (StatusCode::BAD_REQUEST, format!("limit must be 1 to {}", policy.max_limit)).into_response();
-    }
-    let debug = match p.debug.as_deref() {
-        None => false,
-        Some("1") => true,
-        Some(_) => return (StatusCode::BAD_REQUEST, "debug must be 1").into_response(),
-    };
     let rate_key = if by_ip { format!("{login}:{}", peer.ip()) } else { login };
     if let Err(msg) = auth::check_rate(&app.limiter, &rate_key, rps, rpd) {
         return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
     }
-    let req = SearchRequest { limit, ..SearchRequest::new(q, Profile::Immich) };
     let mut resp = held(&app.portal.searches, &served, at, move || {
         let started = std::time::Instant::now();
         let (found, stats) = match searcher.search(&req) {
@@ -780,7 +754,12 @@ pub async fn main() {
             std::process::exit(1);
         }
     };
-    let portal = Arc::new(Portal::new(data, Config::from_env()));
+    let config = Config::from_env();
+    if let Err(why) = catalog::validate_regions(&config.regions) {
+        eprintln!("Error: PORTAL_REGIONS: {why}");
+        std::process::exit(1);
+    }
+    let portal = Arc::new(Portal::new(data, config));
     // The Immich column's geodata loads at start, beside the build's, so
     // that its first lookup doesn't wait for it.
     let loading = portal.clone();

@@ -192,7 +192,7 @@ fn in_table(c: char, table: &[(u32, u32)]) -> bool {
 }
 
 /// The value of a decimal digit of any script.
-pub(super) fn decimal_digit(c: char) -> Option<u32> {
+pub(crate) fn decimal_digit(c: char) -> Option<u32> {
     let u = c as u32;
     let i = DECIMAL_ZEROS.partition_point(|&zero| zero <= u);
     let zero = DECIMAL_ZEROS[..i].last()?;
@@ -241,6 +241,26 @@ fn kept(c: char) -> bool {
 /// letters stay as they are. Simplified Han stays simplified (Nominatim writes it traditional).
 pub fn normalized(s: &str) -> String {
     rules_normalized(s).trim().to_string()
+}
+
+/// The normalised form of a name as Nominatim's import makes it, the word its terms are made
+/// from: the query's normalised form, with each run of white space, '-' and ':' one space
+/// (nominatim_db/tokenizer/icu_tokenizer/token_analysis.py:27-28).
+pub fn name_normalized(s: &str) -> String {
+    let mut out = String::new();
+    let mut gap = false;
+    for c in rules_normalized(s).chars() {
+        if c.is_whitespace() || c == '-' || c == ':' {
+            gap = true;
+            continue;
+        }
+        if gap && !out.is_empty() {
+            out.push(' ');
+        }
+        gap = false;
+        out.push(c);
+    }
+    out
 }
 
 /// The normalised form as Nominatim's rules leave it before Python strips it, with any space at
@@ -309,7 +329,7 @@ pub fn transliterated(norm: &str) -> String {
 /// The token as Nominatim's rules leave it before Python strips it: with one space at either end
 /// where the text had space or dropped characters there. House numbers keep it (Nominatim's
 /// house-number analysis does not strip).
-pub(super) fn spaced_token(norm: &str) -> String {
+pub(crate) fn spaced_token(norm: &str) -> String {
     let mut out = String::with_capacity(norm.len());
     let mut space = false;
     let mut buf = [0u8; 4];
@@ -420,6 +440,20 @@ mod tests {
             ("München", "münchen"),
         ] {
             assert_eq!(normalized(name), norm, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_names_normalised_form_has_no_breaks_but_spaces() {
+        for (name, norm) in [
+            ("Do-it-yourself", "do it yourself"),
+            ("U-Bahn-Station", "u bahn station"),
+            ("Café's", "café s"),
+            ("a : b", "a b"),
+            (" -München- ", "münchen"),
+            ("Frankfurt (Oder)", "frankfurt oder"),
+        ] {
+            assert_eq!(name_normalized(name), norm, "{name}");
         }
     }
 

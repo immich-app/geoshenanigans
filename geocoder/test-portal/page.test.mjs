@@ -209,13 +209,15 @@ test('the link names a dataset per column, the points and the build', () => {
     build: '2026-11-19',
     q: '',
     water: null,
+    profile: null,
+    mode: null,
   });
   assert.equal(
     linkSearch({ datasets: ['with-addresses', 'europe/full.simplified.all'], point: { lat: 48.8584, lng: 2.2945 }, build: '2026-11-20' }),
     '?d=with-addresses&d=europe/full.simplified.all&at=48.8584,2.2945&b=2026-11-20',
   );
   assert.deepEqual(plain(parseLink(linkSearch({ datasets: ['smallest'], point: { lat: 1.000000123, lng: -2.5 }, build: null }))),
-    { datasets: ['smallest'], points: [{ lat: 1.000000123, lng: -2.5 }], build: null, q: '', water: null });
+    { datasets: ['smallest'], points: [{ lat: 1.000000123, lng: -2.5 }], build: null, q: '', water: null, profile: null, mode: null });
   assert.equal(linkSearch({ datasets: [], point: null, build: null }), '');
   assert.equal(parseLink(`?d=smallest&b=${AGAIN}`).build, AGAIN);
   assert.equal(linkSearch({ datasets: ['smallest'], point: null, build: AGAIN }), `?d=smallest&b=${AGAIN}`);
@@ -1144,6 +1146,32 @@ test('a search asks /search for 10 results of a dataset, with how each was found
   assert.equal(url, '/search?q=paris%2C%20texas%20%26%20%235&dataset=full.simplified.all&limit=10&key=test&debug=1');
   assert.equal(new URL(url, 'http://portal').searchParams.get('q'), 'paris, texas & #5');
   assert.equal(searchUrl('x', 'a"b'), '/search?q=x&dataset=a%22b&limit=10&key=test&debug=1');
+});
+
+test('search links restore profile and mode and requests carry the search controls', () => {
+  const { parseLink, linkSearch, searchUrl } = core();
+  const link = parseLink(linkSearch({ q: 'Berlin', profile: 'full', mode: 'nominatim' }));
+  assert.equal(link.profile, 'full');
+  assert.equal(link.mode, 'nominatim');
+  assert.equal(parseLink('?p=unknown&m=other').profile, null);
+  assert.equal(parseLink('?p=unknown&m=other').mode, null);
+  const options = { profile: link.profile, mode: link.mode, bias: { lat: 52.5, lon: 13.4, zoom: 11 }, lang: 'de-AT,de;q=0.8', countrycodes: 'de,at', layer: 'address,poi' };
+  const params = new URL(searchUrl('Berlin', 'europe/full.simplified.all', 10, options), 'http://portal').searchParams;
+  assert.deepEqual(Object.fromEntries(params), {
+    q: 'Berlin', dataset: 'europe/full.simplified.all', limit: '10', key: 'test', debug: '1',
+    profile: 'full', mode: 'nominatim', lat: '52.5', lon: '13.4', zoom: '11',
+    lang: 'de-AT,de;q=0.8', countrycodes: 'de,at', layer: 'address,poi',
+  });
+});
+
+test('address result kinds have labels and stay distinct from other results', () => {
+  const { SEARCH_KINDS, searchRows } = core();
+  for (const [kind, label] of Object.entries({ S: 'street', H: 'house', I: 'interpolation', T: 'TIGER', Z: 'postcode', N: 'named address' })) {
+    assert.equal(SEARCH_KINDS[kind].label, label);
+    const result = hit('1044', 30.25, -97.8, { kind });
+    assert.equal(searchRows([[result], [result]]).length, 1);
+    assert.equal(searchRows([[result], [hit('1044', 30.25, -97.8)]]).length, 2);
+  }
 });
 
 test('a search answer keeps its results and timings, or the state of the index, or why it has none', () => {

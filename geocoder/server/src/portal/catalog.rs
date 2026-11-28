@@ -1,5 +1,5 @@
 // The datasets of a build the portal serves, from its configurations.json:
-// each selection of a region it serves (REGIONS) that the manifest's
+// each selection of a region it serves that the manifest's
 // constraints allow, the files of each as a client downloads them
 // (downloader::resolve_files), the objects one sync fetches for all of them,
 // the groups of datasets whose place search is one index (Group), the water
@@ -23,8 +23,13 @@ use query_server::WATER_DIR;
 use place_search::dataset::DATASET_FILES;
 use query_server::ADMIN_GEOMETRY_FILES;
 
-/// The regions whose selections the portal serves.
-pub const REGIONS: [&str; 1] = ["planet"];
+const PLANET_REGION: &str = "planet";
+const FULL_MODE: &str = "full";
+
+/// A region list must be explicit before the portal downloads continental packs.
+pub fn default_regions() -> Vec<String> {
+    vec![PLANET_REGION.to_string()]
+}
 
 /// The preset a /reverse or /polygons without dataset= answers: the
 /// dataset :3002 served before the portal had more than one.
@@ -131,7 +136,7 @@ const AXES: [&str; 3] = ["mode", "quality", "poi_tier"];
 /// `<region>/` where the region isn't planet.
 pub fn dataset_id(sel: &RegionSelection) -> String {
     let id = format!("{}.{}.{}", sel.mode, sel.quality, sel.poi_tier);
-    if sel.region == "planet" {
+    if sel.region == PLANET_REGION {
         id
     } else {
         format!("{}/{}", sel.region, id)
@@ -165,9 +170,9 @@ pub struct Dataset {
     pub group: usize,
 }
 
-/// The datasets whose place search is one index: those whose dirs hold the
-/// files an index is made of (place_search::dataset::DATASET_FILES) of the
-/// same bytes each, by the manifest's sha256, and lack the same of them. An
+/// A full-coverage dataset has its own index for its address data. Other
+/// datasets in one region share an index when the search inputs
+/// (place_search::dataset::DATASET_FILES) have the same hashes. An
 /// index answers right only beside the files it was built from, so each
 /// dataset of a group searches its index with its own geocoder index, whose
 /// admin files give the context.
@@ -334,11 +339,27 @@ fn broken<'a>(manifest: &'a Manifest, sel: &RegionSelection) -> Option<&'a Const
     manifest.constraints.iter().find(|c| has(&c.when) && !has(&c.requires))
 }
 
+pub fn validate_regions(regions: &[String]) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    if regions.is_empty() {
+        return Err("No regions selected".to_string());
+    }
+
+    for region in regions {
+        if region != PLANET_REGION && !query_server::continents().iter().any(|c| c.name == region) {
+            return Err(format!("Unknown region: {region}"));
+        }
+        if !seen.insert(region) {
+            return Err(format!("Duplicate region: {region}"));
+        }
+    }
+    Ok(())
+}
+
 /// The plan of the build `cfg` and `manifest` describe (one
-/// configurations.json): every selection of REGIONS, each axis's values in
+/// configurations.json): every selection of the configured regions, each axis's values in
 /// their order, the constraints rule out or the portal serves. An error,
-/// why, where an axis value or a dataset's id is no plain name (the id names
-/// the dataset's dir), one it serves doesn't resolve
+/// why, where an axis value is no plain name or a dataset doesn't resolve
 /// (downloader::resolve_files), lacks a file the manifest must have or
 /// takes a file, a unit or a unit's member at a path the sync can't keep in
 /// a build dir (check_path), a constraint names an axis or a value the
@@ -346,17 +367,18 @@ fn broken<'a>(manifest: &'a Manifest, sel: &RegionSelection) -> Option<&'a Const
 /// selection it doesn't serve or has another such preset's id or a
 /// selection's, or no preset is DEFAULT_PRESET: the build can't be served
 /// as the portal serves one.
-pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
+pub fn plan(cfg: &Configurations, manifest: &Manifest, regions: &[String]) -> Result<Plan, String> {
+    validate_regions(regions)?;
     let mut axes = Vec::new();
     for name in std::iter::once("region").chain(AXES) {
         let mut axis = manifest.axes.get(name).ok_or_else(|| format!("the manifest has no axis {name}"))?.clone();
         if name == "region" {
-            for region in REGIONS {
+            for region in regions {
                 if !axis.values.contains_key(region) {
                     return Err(format!("the manifest's region axis has no {region}"));
                 }
             }
-            axis.values.retain(|v, _| REGIONS.contains(&v.as_str()));
+            axis.values.retain(|v, _| regions.contains(v));
         }
         axes.push((name.to_string(), axis));
     }
@@ -382,7 +404,7 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
     }
     let (mut datasets, mut excluded) = (Vec::new(), Vec::new());
     let mut objects: BTreeMap<String, Object> = BTreeMap::new();
-    for region in REGIONS {
+    for region in regions {
         for (mode, mode_value) in &modes {
             for (quality, quality_value) in &qualities {
                 for (tier, tier_value) in &tiers {
@@ -394,7 +416,7 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
                         water: NO_WATER.to_string(),
                     };
                     let id = dataset_id(&sel);
-                    if !plain_name(&id) {
+                    if !id.split('/').all(plain_name) {
                         return Err(format!("the dataset id {id:?} is not a plain name"));
                     }
                     if let Some(c) = broken(manifest, &sel) {
@@ -408,7 +430,13 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
                     let mut dataset = Dataset {
                         id,
                         selection: sel,
-                        label: [mode_value, quality_value, tier_value].map(|v| v.label.as_str()).join(" · "),
+                        label: {
+                            let mut labels = [mode_value, quality_value, tier_value].map(|v| v.label.as_str()).to_vec();
+                            if region != PLANET_REGION {
+                                labels.insert(0, &manifest.axes["region"].values[region].label);
+                            }
+                            labels.join(" · ")
+                        },
                         description: None,
                         preset: None,
                         size_disk: 0,
@@ -423,11 +451,11 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
         }
     }
 
-    let (water_axis, water) = water(cfg, manifest, &datasets, &mut objects)?;
+    let (water_axis, water) = water(cfg, manifest, regions, &datasets, &mut objects)?;
 
     let mut presets = Vec::new();
     for preset in &manifest.presets {
-        if !preset.selections.get("region").is_some_and(|r| REGIONS.contains(&r.as_str())) {
+        if !preset.selections.get("region").is_some_and(|r| regions.contains(r)) {
             continue;
         }
         if preset.selections.get("water").is_some_and(|w| w != NO_WATER) {
@@ -458,8 +486,17 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
             return Err(format!("preset {} has the id of a selection, which dataset= names as such", preset.id));
         }
     }
-    let default = presets.iter().find(|(p, _)| p.id == DEFAULT_PRESET).map(|(_, at)| *at)
+    let default_preset = manifest.presets.iter().find(|p| p.id == DEFAULT_PRESET)
         .ok_or_else(|| format!("the manifest has no preset {DEFAULT_PRESET}, which the portal answers without dataset="))?;
+    let default = presets.iter().find(|(p, _)| p.id == DEFAULT_PRESET).map(|(_, at)| *at)
+        .or_else(|| {
+            let selected = default_preset.selections.get("region").is_some_and(|region| regions.contains(region));
+            if selected || default_preset.selections.get("water").is_some_and(|water| water != NO_WATER) {
+                return None;
+            }
+            datasets.iter().position(|d| AXES.iter().all(|axis| default_preset.selections.get(*axis).map(String::as_str) == d.selection.axis(axis)))
+        })
+        .ok_or_else(|| format!("the selected regions have no dataset matching {DEFAULT_PRESET}"))?;
 
     let groups = groups(cfg, manifest, &mut datasets);
 
@@ -551,13 +588,14 @@ fn taken(
 fn water(
     cfg: &Configurations,
     manifest: &Manifest,
+    regions: &[String],
     datasets: &[Dataset],
     objects: &mut BTreeMap<String, Object>,
 ) -> Result<(Option<Axis>, Vec<Water>), String> {
     let Some(axis) = manifest.axes.get(WATER_AXIS) else { return Ok((None, Vec::new())) };
     let mut served = Vec::new();
-    for region in REGIONS {
-        let Some(base) = datasets.iter().find(|d| d.selection.region == region) else { continue };
+    for region in regions {
+        let Some(base) = datasets.iter().find(|d| d.selection.region == *region) else { continue };
         for (value, v) in values(manifest, WATER_AXIS)? {
             if value == NO_WATER {
                 continue;
@@ -596,7 +634,7 @@ fn water(
 /// group.
 fn groups(cfg: &Configurations, manifest: &Manifest, datasets: &mut [Dataset]) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
-    let mut by_files: HashMap<Vec<Option<String>>, usize> = HashMap::new();
+    let mut by_files = HashMap::new();
     for (at, dataset) in datasets.iter_mut().enumerate() {
         let links = dataset.links();
         let file = |name: &str| links.get(name).map(|path| &cfg.files[path]);
@@ -604,7 +642,8 @@ fn groups(cfg: &Configurations, manifest: &Manifest, datasets: &mut [Dataset]) -
         let size = |geometry: bool| -> u64 {
             DATASET_FILES.iter().filter(|name| ADMIN_GEOMETRY_FILES.contains(*name) == geometry).filter_map(|name| file(name)).map(|f| f.size_raw).sum()
         };
-        dataset.group = *by_files.entry(sha256).or_insert_with(|| {
+        let full = (dataset.selection.mode == FULL_MODE).then(|| dataset.id.clone());
+        dataset.group = *by_files.entry((dataset.selection.region.clone(), full, sha256)).or_insert_with(|| {
             groups.push(Group { name: dataset.id.clone(), datasets: Vec::new(), cost: (size(false), size(true)), shipped: None });
             groups.len() - 1
         });
@@ -757,7 +796,7 @@ impl Water {
     /// dataset's).
     pub fn set(&self) -> String {
         let set = format!("{WATER_DIR}/{}", self.id);
-        if self.region == "planet" {
+        if self.region == PLANET_REGION {
             set
         } else {
             format!("{}/{set}", self.region)

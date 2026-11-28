@@ -233,18 +233,38 @@ is not the default), shows each column's water under its answer and
 compares it in a Water row of the field table; the Immich column has none. The page asks `/datasets` anew
 once `/health` names another publication ID, and cancels a polygon
 request once a newer one or a clear supersedes it.
-Its `/search` takes `dataset=` too, `q=` (what to search for, 1 to 256
-bytes but the spaces at its ends, given to the search as it is), `limit=`
-(1 to 50, 20 without one), `key=` and `debug=1`. It answers what the node
-binding's `searchPlaces` answers from that selection's files, byte for byte:
-a JSON array of `{name, latitude, longitude, admin1name, admin2name, country,
-country_code, type}`, best first; with `debug=1` the line `place-search
-query` prints instead (the query, `us` the time it took, what it read, and
-each result with how it was found). It names the dataset and build as the
-lookups do, and the index it searched in `X-Geocoder-Search-Index`.
-Datasets whose dirs hold the files an index is made of alike share one, a
-group named by its first dataset (12 for the 28: `admin`, `full` and
-`no-addresses` of a precision and a POI tier share one); `/datasets` names
+The portal's `/search` takes `dataset`, `q`, `limit`, `key` and `debug=1`.
+The query must be 1 to 256 bytes after trimming, and the search receives
+the original text. The limit is 1 to 50 and defaults to 10 for `full` or
+20 for `immich`. The defaults are
+`profile=full` and `mode=photon`. Use `mode=nominatim` for exact matching.
+
+- `lang` takes weighted language preferences in Accept-Language syntax.
+  If omitted, the portal uses the `accept-language` parameter or header,
+  in that order.
+- `lat` and `lon` together request location bias. Optional `zoom` is 0 to
+  18 (default 12), and `location_bias_scale` is 0 to 1 (default 0.4).
+- `bbox` is a filter in minLon, minLat, maxLon, maxLat order.
+  `countrycodes` takes comma-separated ISO alpha-2 codes. `layer` takes
+  comma-separated layer names (`address`, `poi`, `railway`, `natural`,
+  `manmade`). `dedupe` is 0 or 1 (default 1).
+
+Malformed parameters return HTTP 400. On v2, request `profile=immich`
+with `mode=photon`. v2 returns 400 for `full`, `nominatim`, a language
+preference, location bias, any of the filters, or `dedupe=0`. An explicit
+empty `lang=` clears the browser's language preference for an Immich
+request. The v2 response matches the Node binding's `searchPlaces` bytes
+for the same dataset and query. It is a JSON array of
+`{name, latitude, longitude, admin1name, admin2name, country, country_code, type}`,
+best first. With `debug=1` it returns the same format as the
+`place-search query` debug line, including `us`, query statistics and
+result scores. It names the dataset and build as the lookups do and the
+index it searched in `X-Geocoder-Search-Index`.
+
+The planet's 28 datasets use 20 groups. Each `full` dataset has its own
+group. `admin` and `no-addresses` of the same precision and POI tier share
+a group when their search input hashes match. Each `admin-minimal` dataset
+has its own group. A group is named by its first dataset. `/datasets` names
 each dataset's (`search.index`, and `search.shipped` where the build
 publishes it), and `/health`'s `search` tells each group's datasets, its
 state (`queued`, `building`, `ready` or `failed` with its `reason`) and
@@ -354,26 +374,35 @@ their turn.
 (`PORTAL_SYNC_SECONDS`), and 10 minutes after a round that failed (or
 `PORTAL_SYNC_SECONDS`, where that is less). A round that finds latest.json
 and the build's manifest naming the build it serves fetches nothing else.
-It fetches a new build into a dir of its own in the volume, each file
-checked against the build's manifest (~11.2 GiB a build, ~9 GiB to
-download): each dataset's dir holds hard links of the build's files, files
-the build holds twice byte for byte are fetched once and hard-linked, and
-no file is shared between the dirs of two builds. Once the build loads, and
-before it switches to it, it builds the build's 12 place search indexes in
-the build's dir, as a device builds its own (`search/<group>/`, ~0.9 GiB
-once the files they hold alike are hard-linked, ~7 GiB at the peak while
-they build): 4 at once (`PORTAL_SEARCH_JOBS`, at most the CPUs it may run
-on), each on one thread at the lowest priority, the costliest first, ~156 s
-and ~10 CPU-minutes for the planet build. A group that fails doesn't hold
-the build back: it is switched to all the same, and the next round tries
-the group again. At start it serves the build at once and opens its
-indexes after, building those its dir lacks. An index is used again while
-its search_meta.json names the files beside it and the index format the
-image builds: an image of another index builder of the same format keeps
-the indexes the build holds until the next build. It fetches only with room
-free for the files still to fetch, 7 GiB for the indexes and 2 GiB besides,
-so a volume that holds the build served and the one before needs ~20 GiB
-more free to fetch a third, ~45 GiB in all. A sync killed part way resumes in its dir: it reads
+`PORTAL_REGIONS` is a comma-separated list of regions to serve, defaulting
+to `planet`. For example, `europe,north-america` serves datasets such as
+`europe/full.simplified.all` and `north-america/full.simplified.all` in one
+process. The first selected region's with-addresses dataset is the default
+when the planet preset is absent.
+
+The portal fetches a new build into a dir of its own in the volume and checks
+each file against its manifest. Dataset dirs hold hard links of the build's
+files. Identical files are fetched once, and each build has its own files.
+The earlier planet measurement was about 11.2 GiB on disk and 9 GiB to
+download. The 2026-11-28 publication used 12.97 GiB on disk and 8.80 GiB
+to download.
+
+Once the build loads, the portal opens its place search indexes in
+`search/<group>/` before switching to it. Builds use one thread each at the
+lowest priority, costliest first, with up to 4 running at once
+(`PORTAL_SEARCH_JOBS`, capped at available CPUs). With four jobs, opening
+the 20 groups for the 2026-11-28 planet publication and hard-linking
+identical indexes took 268 seconds and 16.8 CPU-minutes. The search tree
+peaked at 7.75 GiB, including sort runs, and held 0.87 GiB after linking.
+
+If an index fails to open, the portal serves the build and retries the index
+in the next sync round. At start it serves the build at once and opens its
+indexes after, building those its dir lacks. It reuses an index while
+`search_meta.json` names the dataset files beside it and the index format
+still matches. The portal reserves 8 GiB for the indexes and a 2 GiB margin
+in addition to the files still to fetch. The sync needs about 23 GiB free
+for another publication of this size. A sync killed part way resumes in its
+dir: it reads
 the files of the objects its ledger names against their sha256 and removes
 those that fail and the files the ledger doesn't name before it weighs the
 room. It switches to a build only once every file of it holds its

@@ -8,12 +8,12 @@
 use napi::bindgen_prelude::*;
 use napi::Env;
 use napi_derive::napi;
-use place_search::constants::DATASET_SEARCH_DIR;
-use place_search::dataset::{self, BuildOnDevice, Origin, PlaceSearch, Stamps};
+use place_search::dataset::{self, BuildOnDevice, Origin};
+use place_search::multi::MultiSearch;
 use place_search::profile::{Profile, SearchRequest};
 use place_search::query::results_json;
+use place_search::request_params::{self, LanguageInput};
 use query_server::transport::{self, ChunkReader, Expected};
-use query_server::Index;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -23,10 +23,7 @@ use std::thread::JoinHandle;
 #[napi]
 pub struct Geocoder {
     inner: Arc<query_server::MultiIndex>,
-    dir: PathBuf,
-    /// The stamps of the dataset files `inner` was loaded from.
-    loaded: Stamps,
-    search: Arc<RwLock<Option<Arc<PlaceSearch>>>>,
+    search: Arc<RwLock<Option<Arc<MultiSearch>>>>,
 }
 
 pub struct QueryTask {
@@ -49,7 +46,7 @@ impl Task for QueryTask {
 }
 
 pub struct SearchTask {
-    search: Arc<PlaceSearch>,
+    search: Arc<MultiSearch>,
     request: SearchRequest,
 }
 
@@ -67,15 +64,49 @@ impl Task for SearchTask {
     }
 }
 
+#[derive(Default)]
 #[napi(object)]
 pub struct PlaceSearchOptions {
-    /// Where the index lives; default `<dataset dir>/search`, where packs that ship one put it.
+    /// Override the default `search` directory beside each region's dataset files. An
+    /// override for a continental layout holds subdirectories named by region.
     pub index_dir: Option<String>,
     /// Sort memory of a build on this device in MiB (default 16: the build's own memory then fits
     /// a 32 MiB limit; the dataset's mapped files count apart, as `load` says).
     pub build_memory_mb: Option<u32>,
+    /// Build threads, one by default.
+    pub threads: Option<f64>,
     /// The search profile; 'immich' (the default) is the one the binding offers.
     pub profile: Option<String>,
+}
+
+#[derive(Default)]
+#[napi(object)]
+pub struct SearchPlacesOptions {
+    pub lang: Option<String>,
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
+    pub zoom: Option<f64>,
+    /// A box in minLon, minLat, maxLon, maxLat order.
+    pub bbox: Option<Vec<f64>>,
+    /// Comma-separated ISO alpha-2 country codes.
+    pub countrycodes: Option<String>,
+    /// Comma-separated layer names.
+    pub layer: Option<String>,
+}
+
+impl SearchPlacesOptions {
+    fn into_request(self, query: String, limit: Option<u32>) -> Result<SearchRequest> {
+        let mut req = SearchRequest::new(query, Profile::Immich);
+        if let Some(limit) = limit {
+            req.limit = limit as usize;
+        }
+        req.langs = request_params::languages(self.lang.as_deref().unwrap_or_default(), LanguageInput::Explicit).map_err(Error::from_reason)?;
+        req.bias = request_params::bias(self.lat, self.lon, self.zoom, None).map_err(Error::from_reason)?;
+        req.viewbox = self.bbox.as_deref().map(request_params::bbox).transpose().map_err(Error::from_reason)?;
+        req.countries = request_params::countries(self.countrycodes.as_deref().unwrap_or_default()).map_err(Error::from_reason)?;
+        req.layers = request_params::layers(self.layer.as_deref().unwrap_or_default()).map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(req)
+    }
 }
 
 #[napi]
@@ -88,7 +119,7 @@ impl Geocoder {
     /// 12,265 lookups; `full` with `all` stayed within it.
     #[napi(factory)]
     pub fn load(dir: String) -> Result<Geocoder> {
-        let (idx, loaded) = dataset::load(Path::new(&dir), || {
+        let (idx, _) = dataset::load(Path::new(&dir), || {
             query_server::MultiIndex::load(
                 &dir,
                 query_server::DEFAULT_STREET_CELL_LEVEL,
@@ -97,7 +128,7 @@ impl Geocoder {
             )
         })
         .map_err(Error::from_reason)?;
-        Ok(Geocoder { inner: Arc::new(idx), dir: PathBuf::from(dir), loaded, search: Arc::default() })
+        Ok(Geocoder { inner: Arc::new(idx), search: Arc::default() })
     }
 
     /// Lookup on the libuv worker pool — cold-cache page faults never
@@ -114,23 +145,28 @@ impl Geocoder {
     /// files (the one a pack ships, or one built here before), else builds it there on this
     /// device first, on a thread of its own (seconds to minutes, its sort within
     /// `buildMemoryMb`). After a patch, load the patched dataset and open place search on that
-    /// geocoder: this one rejects files replaced since it loaded them. Resolves to "current" or
-    /// "built". A profile other than 'immich' is refused.
+    /// geocoder: this one rejects files replaced since it loaded them. Resolves to "built" if
+    /// any region needed a build, or "current" if all were reused. The binding offers 'immich'.
     #[napi(ts_return_type = "Promise<'current' | 'built'>")]
     pub fn open_place_search<'env>(&self, env: &'env Env, options: Option<PlaceSearchOptions>) -> Result<Object<'env>> {
-        let PlaceSearchOptions { index_dir, build_memory_mb, profile } =
-            options.unwrap_or(PlaceSearchOptions { index_dir: None, build_memory_mb: None, profile: None });
+        let PlaceSearchOptions { index_dir, build_memory_mb, threads, profile } = options.unwrap_or_default();
         require_immich(profile.as_deref())?;
-        let geo = self.single_region()?;
-        let dataset = self.dir.clone();
-        let loaded = self.loaded.clone();
-        let index_dir = index_dir.map(PathBuf::from).unwrap_or_else(|| dataset.join(DATASET_SEARCH_DIR));
-        let defaults = BuildOnDevice::default();
-        let on_device = BuildOnDevice { mem_mb: build_memory_mb.map_or(defaults.mem_mb, |m| m as usize), ..defaults };
+        let mut on_device = BuildOnDevice::default();
+        if let Some(threads) = threads {
+            if !(1.0..=f64::from(u32::MAX)).contains(&threads) || threads.fract() != 0.0 {
+                return Err(Error::from_reason("Invalid threads"));
+            }
+            on_device.threads = threads as usize;
+        }
+        if let Some(mem_mb) = build_memory_mb {
+            on_device.mem_mb = mem_mb as usize;
+        }
+        let dataset = self.inner.clone();
+        let index_dir = index_dir.map(PathBuf::from);
         let slot = self.search.clone();
         let (deferred, promise) = env.create_deferred()?;
         std::thread::spawn(move || {
-            let opened = PlaceSearch::open(geo, &loaded, &dataset, &index_dir, &on_device).map(|(search, origin)| {
+            let opened = MultiSearch::open(&dataset, index_dir.as_deref(), &on_device).map(|(search, origin)| {
                 *slot.write().unwrap() = Some(Arc::new(search));
                 origin
             });
@@ -146,18 +182,10 @@ impl Geocoder {
     /// array of { name, latitude, longitude, admin1name, admin2name, country, country_code, type },
     /// best first, at most `limit` of them (1 to 50, 20 without one; another limit rejects).
     #[napi(ts_return_type = "Promise<string>")]
-    pub fn search_places(&self, query: String, limit: Option<u32>) -> Result<AsyncTask<SearchTask>> {
+    pub fn search_places(&self, query: String, limit: Option<u32>, options: Option<SearchPlacesOptions>) -> Result<AsyncTask<SearchTask>> {
         let search = self.search.read().unwrap().clone().ok_or_else(|| Error::from_reason("Place search is not open"))?;
-        let limit = limit.map_or(Profile::Immich.policy().default_limit, |l| l as usize);
-        Ok(AsyncTask::new(SearchTask { search, request: SearchRequest { limit, ..SearchRequest::new(query, Profile::Immich) } }))
-    }
-
-    /// The index of a dataset of one region (a flat dir): place search reads one region's files.
-    fn single_region(&self) -> Result<Arc<Index>> {
-        match self.inner.continents.as_slice() {
-            [slot] if slot.continent.is_none() => slot.index.load_full().ok_or_else(|| Error::from_reason("Dataset not loaded")),
-            _ => Err(Error::from_reason("Place search needs the dataset of one region")),
-        }
+        let request = options.unwrap_or_default().into_request(query, limit)?;
+        Ok(AsyncTask::new(SearchTask { search, request }))
     }
 }
 

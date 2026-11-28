@@ -6,6 +6,12 @@ use crate::arc_blocks::{ARC_GROUP, BASE_WIDTH_SHIFT, HAS_BOX, SECOND_ORDER};
 use crate::exact_pip::{to_e7, PointE7};
 use crate::{AdminPolygon, NO_DATA};
 
+/// Runs once on this thread, after the next dataset has been mapped and before its file stamps
+/// are checked.
+pub fn after_next_index_mapping(hook: impl FnOnce() + 'static) {
+    crate::AFTER_INDEX_MAPPING.set(Some(Box::new(hook)));
+}
+
 /// An arc block of this many vertices or more carries its box (builder kArcBboxMinVertices).
 pub const ARC_BBOX_MIN_VERTICES: usize = 16;
 /// A ring of at most this many refs is one chunk without a box (builder kChunkBoxMinRefs).

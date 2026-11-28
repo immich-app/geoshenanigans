@@ -442,6 +442,13 @@
     font-size: 13px;
   }
   .search-input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  .search-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 6px 10px; margin: 6px 0; }
+  .search-controls label { display: grid; gap: 2px; color: var(--text-dim); font-size: 11px; }
+  .search-controls label:last-child { display: flex; align-items: center; align-self: center; }
+  .search-controls select, .search-controls input:not([type="checkbox"]) {
+    width: 9rem; max-width: 100%; padding: 4px; border: 1px solid var(--border); border-radius: 4px;
+    background: var(--surface2); color: var(--text); font: inherit;
+  }
   .search-heads { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; font-size: 11px; color: var(--text-dim); }
   .search-head { border-left: 3px solid var(--accent); padding-left: 6px; overflow-wrap: anywhere; }
   .search-none { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
@@ -566,6 +573,18 @@
     <section class="search-section" id="searchSection" hidden>
       <h3>Search</h3>
       <input id="searchInput" class="search-input" type="search" placeholder="A place or a POI: searched as you type, Enter searches at once" autocomplete="off" spellcheck="false" />
+      <div class="search-controls" id="searchControls">
+        <label>Profile
+          <select id="searchProfile"><option value="immich">Immich</option><option value="full">Full</option></select>
+        </label>
+        <label>Mode
+          <select id="searchMode"><option value="photon">Photon</option><option value="nominatim">Nominatim</option></select>
+        </label>
+        <label>Languages <input id="searchLanguage" type="text" placeholder="de-AT, en" /></label>
+        <label>Country codes <input id="searchCountries" type="text" placeholder="de, at" /></label>
+        <label>Layers <input id="searchLayers" type="text" placeholder="address, poi" /></label>
+        <label><input id="searchBias" type="checkbox" /> Bias to map view</label>
+      </div>
       <div id="searchOut"></div>
     </section>
 
@@ -698,7 +717,11 @@ function buildOrder(a, b) {
 // at=<lat>,<lon> for each point to look up, b=<build>, the build the
 // answers came from (its publication ID; a date alone still opens),
 // q=<text>, the search box's text as it was typed, and w=<water>, the water
-// the columns answer with where it is not the build's default.
+// the columns answer with where it is not the build's default, plus p= and m= for search.
+const SEARCH_PROFILE = 'immich';
+const SEARCH_MODE = 'photon';
+const SEARCH_ZOOM_MAX = 18;
+
 function parseLink(search) {
   const params = new URLSearchParams(search);
   const points = [];
@@ -711,6 +734,8 @@ function parseLink(search) {
   return {
     datasets: params.getAll('d').filter((d) => d).slice(0, MAX_COLUMNS), points, build: params.get('b') || null, q: params.get('q') || '',
     water: params.get('w') || null,
+    profile: [SEARCH_PROFILE, 'full'].includes(params.get('p')) ? params.get('p') : null,
+    mode: [SEARCH_MODE, 'nominatim'].includes(params.get('m')) ? params.get('m') : null,
   };
 }
 
@@ -725,12 +750,14 @@ function linkBuild(answers, keys, served) {
   return builds.find((build) => !served || !sameBuild(build, served)) || builds[0] || served;
 }
 
-function linkSearch({ datasets = [], point = null, build = null, q = '', water = null }) {
+function linkSearch({ datasets = [], point = null, build = null, q = '', water = null, profile = null, mode = null }) {
   const parts = datasets.map((d) => `d=${encodeURIComponent(d).replace(/%2F/g, '/')}`);
   if (water) parts.push(`w=${encodeURIComponent(water)}`);
   if (point) parts.push(`at=${point.lat},${point.lng}`);
   if (build) parts.push(`b=${encodeURIComponent(build)}`);
   if (q) parts.push(`q=${encodeURIComponent(q)}`);
+  if (profile) parts.push(`p=${encodeURIComponent(profile)}`);
+  if (mode) parts.push(`m=${encodeURIComponent(mode)}`);
   return parts.length ? `?${parts.join('&')}` : '';
 }
 
@@ -1357,8 +1384,8 @@ const SEARCH_LIMIT = 10;
 const SEARCH_DEBOUNCE = 250;
 // The rows of the matrix shown until every one is asked for.
 const SEARCH_ROWS = 5;
-// The results of two columns are one where their names are equal, both or
-// neither is a POI (poiOrNot), and their points at most this many metres
+// The results of two columns are one where their names are equal,
+// both have compatible kinds (sameSearchKind), and their points at most this many metres
 // apart; within AREA_MATCH_METRES where one is a boundary without a label
 // node, whose point is one on its ring's surface, which moves with the
 // boundary's precision.
@@ -1373,17 +1400,20 @@ const SEARCH_KINDS = {
   B: { label: 'boundary', title: 'a boundary, at its label node' },
   A: { label: 'boundary', title: 'a boundary without a label node, at a point on its surface' },
   O: { label: 'POI', title: 'a point of interest' },
+  S: { label: 'street', title: 'a street way' },
+  H: { label: 'house', title: 'a house matched by its number' },
+  I: { label: 'interpolation', title: 'a number from an OpenStreetMap interpolation' },
+  T: { label: 'TIGER', title: 'a number from a TIGER range' },
+  Z: { label: 'postcode', title: 'a postcode centroid or area' },
+  N: { label: 'named address', title: 'an address matched by name' },
 };
 // A dot's slice of a column that lacks its result or has no answer.
 const DOT_ABSENT = '#555566';
 
-// Whether results of the kinds `a` and `b` can be one: a POI with a POI
-// only, however near a place or boundary of its name (a dataset without
-// POIs gives the town where another gives a memorial of the town's name).
-// A place and a boundary can: a dataset gives a place node where another
-// gives the boundary it labels.
-function poiOrNot(a, b) {
-  return (a === 'O') === (b === 'O');
+// The same settlement may appear as a place node or a boundary in different columns.
+const SETTLEMENT_KINDS = new Set(['P', 'M', 'B', 'A']);
+function sameSearchKind(a, b) {
+  return a === b || (SETTLEMENT_KINDS.has(a) && SETTLEMENT_KINDS.has(b));
 }
 
 // Whether the server searches: a portal whose /datasets names each
@@ -1394,8 +1424,12 @@ function searchOffered(mode, catalog) {
 }
 
 // The search of `q` in `dataset`, its results with how each was found.
-function searchUrl(q, dataset, limit = SEARCH_LIMIT) {
-  return `/search?q=${encodeURIComponent(q)}&dataset=${encodeURIComponent(dataset)}&limit=${limit}&key=test&debug=1`;
+function searchUrl(q, dataset, limit = SEARCH_LIMIT, options = {}) {
+  const { profile, mode, bias, lang, countrycodes, layer } = options;
+  const parts = { q, dataset, limit, key: 'test', debug: 1, profile, mode, ...bias, lang, countrycodes, layer };
+  const encoded = Object.entries(parts).filter(([, value]) => value != null)
+    .map(([key, value]) => `${key}=${encodeURIComponent(value)}`);
+  return `/search?${encoded.join('&')}`;
 }
 
 // A search answer as the page keeps it, from a response of the server: its
@@ -1436,7 +1470,7 @@ function formatMetres(m) {
 
 // The matrix's rows from each column's results (`lists`: null for a column
 // without an answer, which lacks none). A result joins the row of an earlier
-// column's result of its name and a kind it can be one with (poiOrNot)
+// column's result of its name and a kind it can be one with (sameSearchKind)
 // within MATCH_METRES of it, the closest pairs first, each row and each
 // result once; else it makes a row of its own. A column's own results
 // never share one. Each row has the name, kind, type
@@ -1454,7 +1488,7 @@ function searchRows(lists) {
     const before = rows.slice();
     const pairs = [];
     list.forEach((r, i) => before.forEach((row, n) => {
-      if (row.name !== r.name || !poiOrNot(row.kind, r.kind)) return;
+      if (row.name !== r.name || !sameSearchKind(row.kind, r.kind)) return;
       const m = metres(row.lat, row.lng, r.latitude, r.longitude);
       if (m <= (row.kind === 'A' || r.kind === 'A' ? AREA_MATCH_METRES : MATCH_METRES)) pairs.push({ m, i, n });
     }));
@@ -1528,9 +1562,9 @@ function searchSource(q, row, labels) {
 // change, setTimer(fn, ms) and clearTimer(id) as setTimeout and
 // clearTimeout.
 class PlaceSearch {
-  constructor({ request, datasets, changed = () => {}, setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = (id) => clearTimeout(id),
+  constructor({ request, datasets, options = () => ({}), changed = () => {}, setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = (id) => clearTimeout(id),
                 debounce = SEARCH_DEBOUNCE, limit = SEARCH_LIMIT }) {
-    Object.assign(this, { request, datasets, changed, setTimer, clearTimer, debounce, limit });
+    Object.assign(this, { request, datasets, options, changed, setTimer, clearTimer, debounce, limit });
     this.q = '';
     this.answers = {};
     this.timer = null;
@@ -1573,6 +1607,7 @@ class PlaceSearch {
     this.retries.clear();
     this.answers = {};
     this.q = text.trim() ? text : '';
+    this.params = this.q ? this.options() : {};
     this.cancelling = this.q ? new AbortController() : null;
     this.ask();
     this.changed();
@@ -1595,7 +1630,7 @@ class PlaceSearch {
     }
     let answer;
     try {
-      const got = await this.request(searchUrl(this.q, dataset, this.limit), cancelling.signal);
+      const got = await this.request(searchUrl(this.q, dataset, this.limit, this.params), cancelling.signal);
       answer = searchAnswerOf(got.status, got.header, got.body, got.ms);
     } catch (e) {
       if (cancelling.signal.aborted) return;
@@ -2824,6 +2859,8 @@ function updateLink() {
     point: entry ? { lat: entry.lat, lng: entry.lng } : null,
     build: entry ? linkBuild(entry.answers, keys, served) : served,
     q: mode === 'single' || !searchBox.value.trim() ? '' : searchBox.value,
+    profile: searchProfile.value === SEARCH_PROFILE ? null : searchProfile.value,
+    mode: searchMode.value === SEARCH_MODE ? null : searchMode.value,
   });
   history.replaceState(null, '', location.pathname + search + location.hash);
 }
@@ -2844,9 +2881,32 @@ function copyLink(btn) {
 const searchSection = document.getElementById('searchSection');
 const searchBox = document.getElementById('searchInput');
 const searchOut = document.getElementById('searchOut');
+const searchProfile = document.getElementById('searchProfile');
+const searchMode = document.getElementById('searchMode');
+const searchLanguage = document.getElementById('searchLanguage');
+const searchCountries = document.getElementById('searchCountries');
+const searchLayers = document.getElementById('searchLayers');
+const searchBias = document.getElementById('searchBias');
+searchProfile.value = link.profile || SEARCH_PROFILE;
+searchMode.value = link.mode || SEARCH_MODE;
+
+function searchOptions() {
+  const centre = searchBias.checked ? map.getCenter().wrap() : null;
+  return {
+    profile: searchProfile.value,
+    mode: searchMode.value,
+    // A browser always sends its language header, even when testing stored names.
+    lang: searchLanguage.value || (searchProfile.value === SEARCH_PROFILE ? '' : null),
+    countrycodes: searchCountries.value || null,
+    layer: searchLayers.value || null,
+    bias: centre ? { lat: centre.lat, lon: centre.lng, zoom: Math.max(0, Math.min(SEARCH_ZOOM_MAX, Math.round(map.getZoom()))) } : null,
+  };
+}
+
 const placeSearch = new PlaceSearch({
   request: (url, signal) => pacer.request(url, 'search', signal),
   datasets: () => searchDatasets(columns),
+  options: searchOptions,
   changed: searchChanged,
 });
 searchBox.value = link.q;
@@ -2944,6 +3004,10 @@ function pickSearchRow(n) {
   if (row) reverseGeocode(row.lat, row.lng, searchSource(placeSearch.q, row, columns.map(columnLabel)));
 }
 
+document.getElementById('searchControls').addEventListener('change', () => {
+  placeSearch.submit(searchBox.value);
+  updateLink();
+});
 searchBox.addEventListener('input', () => placeSearch.typed(searchBox.value));
 searchBox.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {

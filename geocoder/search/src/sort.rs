@@ -121,18 +121,23 @@ pub struct ExternalSort<R: SortRecord> {
 }
 
 impl<R: SortRecord> ExternalSort<R> {
-    /// A sort in `budget` bytes, whose runs go to `dir` as `<tag>-<n>.run`.
+    /// A sort in `budget` bytes of run buffers, whose runs go to `dir` as `<tag>-<n>.run`.
+    /// An error if the budget cannot hold one entry.
     pub fn new(budget: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
         Self::with_arena_limit(budget, MAX_RUN_ARENA_BYTES, dir, tag)
     }
 
     /// `new` with at most `arena_limit` key bytes per run.
     fn with_arena_limit(budget: usize, arena_limit: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
-        // Fixed capacities: a run spills when either fills, so memory never exceeds the budget.
         let (arena_cap, items_cap) = run_capacities::<R>(budget, arena_limit);
+        if items_cap == 0 {
+            let e = format!("a sort budget of {budget} bytes holds no entry");
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e));
+        }
+
         Ok(ExternalSort {
             arena: MapVec::with_capacity(arena_cap)?,
-            items: MapVec::with_capacity(items_cap.max(MIN_RUN_ENTRIES))?,
+            items: MapVec::with_capacity(items_cap)?,
             runs: SortedRuns::default(),
             dir: dir.to_path_buf(),
             tag,
@@ -237,22 +242,23 @@ pub struct Merged<R> {
     heap: BinaryHeap<Head<R>>,
     files: RunFiles,
     rewritten: u64,
+    error: Option<(usize, std::io::Error)>,
 }
 
 impl<R: SortRecord> Merged<R> {
     fn open(files: RunFiles) -> std::io::Result<Self> {
         let mut readers = Vec::with_capacity(files.0.len());
         for f in &files.0 {
-            readers.push(RunReader::open(f).map_err(|e| run_error(f, e))?);
+            readers.push(RunReader::open(f).map_err(|e| run_error(f, &e))?);
         }
         let mut heap = BinaryHeap::with_capacity(readers.len());
         for (run, r) in readers.iter_mut().enumerate() {
             let mut key = Vec::new();
-            if let Some(rec) = r.read_into(&mut key).map_err(|e| run_error(&files.0[run], e))? {
+            if let Some(rec) = r.read_into(&mut key).map_err(|e| run_error(&files.0[run], &e))? {
                 heap.push(Head { key, rec, run });
             }
         }
-        Ok(Merged { readers, heap, files, rewritten: 0 })
+        Ok(Merged { readers, heap, files, rewritten: 0, error: None })
     }
 
     /// Bytes the runs over MERGE_FAN_IN were merged into longer runs as.
@@ -260,18 +266,28 @@ impl<R: SortRecord> Merged<R> {
         self.rewritten
     }
 
-    /// The next entry's record, its key copied into `key`; None after the last, an error for a
-    /// run that fails to read or is cut short.
+    /// The next entry's record and its key in `key`, or None at the end. A run read failure
+    /// returns the same error on this and all subsequent calls.
     pub fn next(&mut self, key: &mut Vec<u8>) -> std::io::Result<Option<R>> {
+        if let Some((run, e)) = &self.error {
+            return Err(run_error(&self.files.0[*run], e));
+        }
+
         let Some(mut top) = self.heap.peek_mut() else { return Ok(None) };
         key.clear();
         key.extend_from_slice(&top.key);
         let rec = top.rec;
         let run = top.run;
-        match self.readers[run].read_into(&mut top.key).map_err(|e| run_error(&self.files.0[run], e))? {
-            Some(next) => top.rec = next,
-            None => {
+        match self.readers[run].read_into(&mut top.key) {
+            Ok(Some(next)) => top.rec = next,
+            Ok(None) => {
                 std::collections::binary_heap::PeekMut::pop(top);
+            }
+            Err(e) => {
+                // The read can replace part of the head's key before it fails.
+                let err = run_error(&self.files.0[run], &e);
+                self.error = Some((run, e));
+                return Err(err);
             }
         }
         Ok(Some(rec))
@@ -279,7 +295,7 @@ impl<R: SortRecord> Merged<R> {
 }
 
 /// A sort run's open or read error, naming the run.
-fn run_error(path: &Path, e: std::io::Error) -> std::io::Error {
+fn run_error(path: &Path, e: &std::io::Error) -> std::io::Error {
     std::io::Error::new(e.kind(), format!("sort run {}: {e}", path.display()))
 }
 
@@ -289,7 +305,7 @@ fn run_error(path: &Path, e: std::io::Error) -> std::io::Error {
 /// last runs as it takes to leave MERGE_FAN_IN. Returns the runs left and the bytes rewritten.
 fn reduce_runs<R: SortRecord>(mut files: RunFiles, dir: &Path, tag: &str) -> std::io::Result<(RunFiles, u64)> {
     let mut rewritten = 0u64;
-    let mut pass = 0;
+    let mut suffix = 0;
     let mut key = Vec::new();
     let mut scratch = vec![0; R::BYTES];
     while files.0.len() > MERGE_FAN_IN {
@@ -299,15 +315,21 @@ fn reduce_runs<R: SortRecord>(mut files: RunFiles, dir: &Path, tag: &str) -> std
         // The runs left as they are, then each group's merged run; `files` holds those not merged
         // yet, so every run has one holder until its group's merge has removed it.
         let mut next = files.take_first(n - merged);
-        let mut i = 0;
         while !files.0.is_empty() {
             let mut group = files.take_first(MERGE_FAN_IN.min(files.0.len()));
             if group.0.len() == 1 {
                 next.0.append(&mut group.0);
                 continue;
             }
-            let path = dir.join(format!("{tag}-m{pass}-{i}.run"));
-            let file = File::create(&path)?;
+            let (path, file) = loop {
+                let path = dir.join(format!("{tag}-{suffix}.merge"));
+                suffix += 1;
+                match File::create_new(&path) {
+                    Ok(file) => break (path, file),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e),
+                }
+            };
             next.0.push(path);
             let mut w = BufWriter::with_capacity(WRITE_BUFFER, file);
             let mut m = Merged::<R>::open(group)?;
@@ -315,10 +337,8 @@ fn reduce_runs<R: SortRecord>(mut files: RunFiles, dir: &Path, tag: &str) -> std
                 rewritten += write_entry(&mut w, &key, &rec, &mut scratch)?;
             }
             w.flush()?;
-            i += 1;
         }
         files = next;
-        pass += 1;
     }
     Ok((files, rewritten))
 }
@@ -396,11 +416,13 @@ pub fn run_budget(mem_mb: usize, threads: usize) -> Result<usize, String> {
     Ok(budget)
 }
 
-/// (key bytes, entries) one sort run of `budget` bytes holds: RUN_ARENA_PERCENT of the budget for
-/// keys, at most `arena_limit` of it, and the rest for entries.
+/// (key bytes, entries) one sort run of `budget` bytes holds. The arena takes up to
+/// RUN_ARENA_PERCENT of the budget, leaving room for at least one entry if it fits.
 fn run_capacities<R>(budget: usize, arena_limit: usize) -> (usize, usize) {
-    let arena_share = budget * RUN_ARENA_PERCENT / 100;
-    (arena_share.min(arena_limit), (budget - arena_share) / std::mem::size_of::<Item<R>>())
+    let item_bytes = std::mem::size_of::<Item<R>>();
+    let arena_share = (budget as u128 * RUN_ARENA_PERCENT as u128 / 100) as usize;
+    let arena_cap = arena_share.min(arena_limit).min(budget.saturating_sub(item_bytes));
+    (arena_cap, (budget - arena_cap) / item_bytes)
 }
 
 #[cfg(test)]
@@ -426,6 +448,25 @@ mod tests {
 
         fn order(&self, other: &Self) -> Ordering {
             self.cmp(other)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Wide([u8; Wide::BYTES]);
+
+    impl SortRecord for Wide {
+        const BYTES: usize = 1024;
+
+        fn put(&self, out: &mut [u8]) {
+            out.copy_from_slice(&self.0);
+        }
+
+        fn get(b: &[u8]) -> Self {
+            Wide(b.try_into().unwrap())
+        }
+
+        fn order(&self, other: &Self) -> Ordering {
+            self.0.cmp(&other.0)
         }
     }
 
@@ -542,11 +583,10 @@ mod tests {
     #[test]
     fn run_keys_stay_addressable_at_any_budget() {
         // An entry addresses its key by a u32 offset into the run's arena.
-        for mem_mb in [DEFAULT_RUN_BUDGET_MB, 6_826, 6_827, 6_828, 1 << 20] {
-            let budget = run_budget(mem_mb, 1).unwrap();
+        for budget in [DEFAULT_RUN_BUDGET_MB << 20, MAX_RUN_ARENA_BYTES, MAX_RUN_ARENA_BYTES.saturating_mul(2), usize::MAX] {
             let (arena, items) = run_capacities::<Rec>(budget, MAX_RUN_ARENA_BYTES);
-            assert!(arena <= u32::MAX as usize, "{mem_mb} MiB: {arena} key bytes");
-            assert_eq!(items, (budget - budget * RUN_ARENA_PERCENT / 100) / std::mem::size_of::<Item<Rec>>());
+            assert!(arena <= u32::MAX as usize, "{budget} bytes: {arena} key bytes");
+            assert_eq!(items, (budget - arena) / std::mem::size_of::<Item<Rec>>());
         }
     }
 
@@ -568,9 +608,61 @@ mod tests {
         assert_eq!(read_all(runs.merge(&dir.0, "m")).into_iter().map(|(k, _)| k).collect::<Vec<_>>(), want);
     }
 
+    /// Bytes a sort's run buffers take.
+    fn run_bytes<R: SortRecord>(sut: &ExternalSort<R>) -> usize {
+        sut.arena.capacity() + sut.items.capacity() * std::mem::size_of::<Item<R>>()
+    }
+
+    #[test]
+    fn a_sort_run_fits_its_budget_whatever_its_record() {
+        let dir = TempDir::new("sort-run-bytes");
+        for budget in [MIN_RUN_BUDGET_BYTES, 1 << 20] {
+            let narrow = ExternalSort::<Rec>::new(budget, &dir.0, "n".into()).unwrap();
+            let wide = ExternalSort::<Wide>::new(budget, &dir.0, "w".into()).unwrap();
+
+            assert!(run_bytes(&narrow) <= budget, "{budget} bytes: narrow runs take {}", run_bytes(&narrow));
+            assert!(run_bytes(&wide) <= budget, "{budget} bytes: wide runs take {}", run_bytes(&wide));
+        }
+    }
+
+    #[test]
+    fn a_sort_refuses_a_budget_that_holds_no_entry() {
+        let dir = TempDir::new("sort-no-entry");
+        for budget in [0, std::mem::size_of::<Item<Wide>>() - 1] {
+            let err = ExternalSort::<Wide>::new(budget, &dir.0, "t".into()).err().map(|e| (e.kind(), e.to_string()));
+
+            assert_eq!(err, Some((std::io::ErrorKind::InvalidInput, format!("a sort budget of {budget} bytes holds no entry"))));
+        }
+    }
+
+    #[test]
+    fn a_sort_spills_when_the_budget_holds_only_one_entry() {
+        for key in [&b""[..], b"x"] {
+            let dir = TempDir::new("sort-one-entry");
+            let budget = std::mem::size_of::<Item<Wide>>() + key.len();
+            let mut sut = ExternalSort::<Wide>::new(budget, &dir.0, "t".into()).unwrap();
+            assert!(run_bytes(&sut) <= budget);
+            let high = Wide([2; Wide::BYTES]);
+            let low = Wide([1; Wide::BYTES]);
+            sut.push(key, high).unwrap();
+            sut.push(key, low).unwrap();
+
+            let runs = sut.finish().unwrap();
+
+            assert_eq!(runs.len(), 2);
+            let mut merged = runs.merge(&dir.0, "m").unwrap();
+            let mut got_key = Vec::new();
+            assert_eq!(merged.next(&mut got_key).unwrap().unwrap().0, low.0);
+            assert_eq!(got_key, key);
+            assert_eq!(merged.next(&mut got_key).unwrap().unwrap().0, high.0);
+            assert_eq!(got_key, key);
+            assert!(merged.next(&mut got_key).unwrap().is_none());
+        }
+    }
+
     #[test]
     fn a_sort_refuses_a_key_it_cannot_hold() {
-        for (budget, key_len) in [(0, 1), (MIN_RUN_BUDGET_BYTES - 1, MAX_KEY_BYTES), (2 * MIN_RUN_BUDGET_BYTES, MAX_KEY_BYTES + 1)] {
+        for (budget, key_len) in [(MIN_RUN_BUDGET_BYTES - 1, MAX_KEY_BYTES), (2 * MIN_RUN_BUDGET_BYTES, MAX_KEY_BYTES + 1)] {
             let dir = TempDir::new("sort-refuse");
             let mut sut = ExternalSort::new(budget, &dir.0, "t".into()).unwrap();
 
@@ -721,6 +813,75 @@ mod tests {
             let left: Vec<_> = std::fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name()).collect();
             assert!(left.is_empty(), "read {read}: {left:?}");
         }
+    }
+
+    #[test]
+    fn a_merge_preserves_runs_from_a_sort_with_an_overlapping_tag() {
+        let dir = TempDir::new("sort-names");
+        let mut sut = ExternalSort::with_arena_limit(1 << 20, 4, &dir.0, "m-m0".into()).unwrap();
+        let entries: Vec<Entry> = (0..=MERGE_FAN_IN as u32).rev().map(|k| (k.to_be_bytes().to_vec(), Rec(k, 0))).collect();
+        for (k, r) in &entries {
+            sut.push(k, *r).unwrap();
+        }
+        let runs = sut.finish().unwrap();
+        assert_eq!(runs.len(), MERGE_FAN_IN + 1);
+
+        let got = read_all(runs.merge(&dir.0, "m"));
+
+        assert_eq!(got, in_memory(entries));
+    }
+
+    #[test]
+    fn a_merge_leaves_an_existing_output_file_alone() {
+        let dir = TempDir::new("sort-existing-output");
+        let (files, all) = random_runs(&dir.0, MERGE_FAN_IN + 1, &mut Rng(7));
+        let occupied = dir.0.join("m-0.merge");
+        std::fs::write(&occupied, b"other merge").unwrap();
+
+        let merged = runs_of(files).merge(&dir.0, "m").unwrap();
+
+        assert_eq!(merged.files.0.last().unwrap(), &dir.0.join("m-1.merge"));
+        assert_eq!(read_all(Ok(merged)), all);
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"other merge");
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_merge_removes_input_runs_if_its_output_cannot_be_created() {
+        let dir = TempDir::new("sort-output-error");
+        let (files, _) = random_runs(&dir.0, MERGE_FAN_IN + 1, &mut Rng(7));
+
+        let err = runs_of(files).merge(&dir.0.join("missing"), "m").err().unwrap();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_merge_fails_every_read_after_a_run_cut_short() {
+        // The first run is cut inside its second key, which the first read reaches.
+        let dir = TempDir::new("sort-merge-cut");
+        let mut bytes = Vec::new();
+        for (k, r) in [(&b"a"[..], Rec(1, 0)), (b"ab", Rec(3, 0))] {
+            write_entry(&mut bytes, k, &r, &mut Vec::new()).unwrap();
+        }
+        bytes.truncate(bytes.len() - Rec::BYTES - 1);
+        let cut = dir.0.join("cut.run");
+        std::fs::write(&cut, &bytes).unwrap();
+        let whole = write_run(&dir.0, "whole.run", &[(b"b".to_vec(), Rec(2, 0))]);
+        let mut sut = runs_of(vec![cut.clone(), whole]).merge(&dir.0, "m").unwrap();
+        let run_name = cut.display().to_string();
+        let mut key = Vec::new();
+
+        let got: Vec<_> = (0..3)
+            .map(|_| {
+                let next = sut.next(&mut key);
+                next.map(|rec| rec.map(|rec| (key.clone(), rec))).map_err(|e| (e.kind(), e.to_string()))
+            })
+            .collect();
+
+        assert!(got.iter().all(|r| matches!(r, Err((std::io::ErrorKind::UnexpectedEof, message)) if message.contains(&run_name))), "{got:?}");
+        assert!(got.windows(2).all(|pair| pair[0] == pair[1]), "{got:?}");
     }
 
     #[test]
