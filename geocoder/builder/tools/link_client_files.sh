@@ -11,5 +11,5 @@ set -euo pipefail
 src=$(readlink -f "$1")
 dst=$2
 mkdir "$dst"
-find "$src" -maxdepth 1 -type f ! -name '.*' ! -name '*.osm_ids' ! -name '*.gcpatch' ! -name '*.zst' -printf '%f\n' \
+find "$src" -maxdepth 1 -type f ! -name '.*' ! -name '*.osm_ids' ! -name '*.host' ! -name '*.gcpatch' ! -name '*.zst' -printf '%f\n' \
   | while IFS= read -r name; do ln -s "$src/$name" "$dst/$name"; done

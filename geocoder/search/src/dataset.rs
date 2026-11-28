@@ -87,6 +87,11 @@ impl SearchFiles {
     }
 }
 
+/// Opens a host column only for the full profile that consumes it.
+pub fn host_tags(path: &Path) -> Result<crate::tags::TagBlob, String> {
+    crate::tags::TagBlob::open(query_server::mmap_file(path.to_str().ok_or("invalid host file path")?)?)
+}
+
 /// The sha256 (hex) of each dataset file present, by name.
 pub type Fingerprint = BTreeMap<String, String>;
 
@@ -302,6 +307,7 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
     let held = HeldIndexDir::take(index, Contended::Wait)?;
     let cache = index.join(HASH_CACHE_FILE);
     let mut hashes = HashCache::load(&cache);
+    let search_files = SearchFiles::open(dir, geo)?;
     let have = fingerprint_loaded(dir, loaded, &mut hashes)?;
 
     // Held, so an unfinished publish is a dead build's: some files there may be its own and some
@@ -331,7 +337,8 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
     // Only saves a later open the hashing; a read-only index dir is fine.
     let _ = hashes.save(&cache);
     // Mapped while held: files a later build moves in are new ones, these stay as mapped.
-    let opened = SearchIndex::open(geo, index, None, None)?;
+    let mut opened = SearchIndex::open(geo, index, None, None)?;
+    opened.search_files = search_files;
     drop(held);
     Ok((opened, origin))
 }

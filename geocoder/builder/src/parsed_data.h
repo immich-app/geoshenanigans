@@ -29,6 +29,7 @@
 #include "packed_location.h"
 #include "polygon_rings.h"
 #include "types.h"
+#include "tag_bundles.h"
 #include "string_pool.h"
 #include "id_allocator.h"
 #include "place_claims.h"
@@ -238,16 +239,17 @@ constexpr uint8_t STR_TIER_BIT_WAY_ORIG_NAME = 1 << 5;
 // addr:street value the parent street replaced: it isn't written.
 constexpr uint8_t STR_TIER_NONE = 0xFF;
 
-constexpr size_t STR_TIER_COUNT = 5;
+constexpr size_t STR_TIER_COUNT = 7;
 constexpr const char* STR_TIER_FILENAMES[STR_TIER_COUNT] = {
     "strings_core.bin",
     "strings_street.bin",
     "strings_addr.bin",
     "strings_postcode.bin",
     "strings_poi.bin",
+    "strings_tags_core.bin", "strings_tags_poi.bin",
 };
 constexpr const char* STR_TIER_NAMES[STR_TIER_COUNT] = {
-    "core", "street", "addr", "postcode", "poi"
+    "core", "street", "addr", "postcode", "poi", "tags_core", "tags_poi"
 };
 // The POI names' tier, the one tier not in alphabetical order (see
 // order_poi_strings_by_record).
@@ -374,6 +376,7 @@ struct AdminExactRings {
 };
 
 struct ParsedData {
+    std::shared_ptr<tag_bundles::SearchTags> search_tags = std::make_shared<tag_bundles::SearchTags>();
     StringPool string_pool;
     std::vector<WayHeader> ways;
     // Stable identity per way, parallel to `ways`. The IdAllocator

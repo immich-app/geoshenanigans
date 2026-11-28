@@ -85,6 +85,8 @@ public:
         return locs_[rank(id)];
     }
 
+    bool contains(uint64_t id) const { return id < capacity_ && is_marked(id); }
+
     size_t marked() const { return marked_; }
     // set() calls dropped for ids past capacity: DATA LOSS, ways referencing
     // those nodes resolve them as missing.

@@ -49,6 +49,26 @@ inline constexpr size_t BLOCK_MAX_BYTES = FOR_HEAD_BYTES + BLOCK_VALUES * 4;
 inline constexpr uint8_t MODE_FOR = 0, MODE_DICTIONARY = 1;
 inline constexpr char MAGIC[4] = {'S', 'D', 'B', '1'};
 
+// The files written in this format, each by its family: its name without
+// ".bin".
+struct SideFile {
+    const char* family;
+    const char* file;
+};
+inline constexpr SideFile SIDE_FILES[] = {
+    {"way_parents", "way_parents.bin"},
+    {"way_postcodes", "way_postcodes.bin"},
+    {"interp_postcodes", "interp_postcodes.bin"},
+    {"addr_postcodes", "addr_postcodes.bin"},
+    {"addr_cities", "addr_cities.bin"},
+    {"place_tags", "place_tags.bin"},
+    {"admin_tags", "admin_tags.bin"},
+    {"poi_tags", "poi_tags.bin"},
+    {"place_imp", "place_imp.bin"},
+    {"admin_imp", "admin_imp.bin"},
+    {"poi_imp", "poi_imp.bin"},
+};
+
 // Every refusal names the file it is of.
 [[noreturn]] inline void malformed(std::string_view file, const std::string& what) {
     throw std::runtime_error("Malformed " + std::string(file) + ": " + what);

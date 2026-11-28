@@ -223,6 +223,11 @@ pub const REF_MAX_CHARS: usize = 40;
 /// (the clean-postcodes default-pattern of Nominatim's settings/sanitizers.yaml).
 pub const POSTCODE_DEFAULT_PATTERN: &str = "[A-Z0-9- ]{3,12}";
 
+/// Host TagBlob block geometry, shared with the builder's search_files.h.
+pub const TAG_BLOB_BLOCK_ROWS: usize = 4096;
+pub const TAG_TIERS: [&str; 2] = ["strings_tags_core.bin", "strings_tags_poi.bin"];
+pub const IMPORTANCE_FILES: [&str; 3] = ["place_imp.bin", "admin_imp.bin", "poi_imp.bin"];
+
 // ---- reading a query (query/): Nominatim's penalties, thresholds and limits, each named after
 // the line of Nominatim's search/ that sets it
 /// A query is split into phrases at this character (core.py:280).

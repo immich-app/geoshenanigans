@@ -9,7 +9,7 @@ new_dir=$1
 got_dir=$2
 
 client_files() {
-  find "$1" -maxdepth 1 -type f ! -name '.*' ! -name '*.osm_ids' ! -name '*.gcpatch' ! -name '*.zst' -printf '%f\n' \
+  find "$1" -maxdepth 1 -type f ! -name '.*' ! -name '*.osm_ids' ! -name '*.host' ! -name '*.gcpatch' ! -name '*.zst' -printf '%f\n' \
     | LC_ALL=C sort
 }
 

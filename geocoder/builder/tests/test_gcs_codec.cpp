@@ -360,8 +360,6 @@ void write_one_address(const std::string& dir, const std::vector<uint8_t>& blob,
     out.write(reinterpret_cast<const char*>(vertices_footer.data()), std::streamsize(vertices_footer.size()));
 }
 
-// The families of the four side files, each <family>.bin.
-const char* const SIDE_FAMILIES[] = {"way_parents", "way_postcodes", "interp_postcodes", "addr_postcodes", "addr_cities"};
 
 // n side values in stretches of 100, which cut the blocks of 64 anywhere: one
 // value, a few values in turn with NO_DATA among them (a dictionary), a
@@ -490,12 +488,12 @@ TEST(gcs_side_blocks_round_trip_in_odd_pieces_and_equal_the_builders_encoder) {
     // footer alone), one, a block less one, a block, a block and one, and
     // many blocks of every kind. The table's scratch file is gone from the
     // dir. The decoder gives the values back, and the decoded size is the
-    // footer's without a decoder. Each of the four side files in turn.
+    // footer's without a decoder. Each side file in turn.
     std::mt19937 rng(20261114);
     size_t k = 0;
     for (const size_t n : {size_t(0), size_t(1), size_t(63), size_t(64), size_t(65), size_t(5000)})
         for (const size_t max_piece : {size_t(7), size_t(5000)}) {
-            const std::string family = SIDE_FAMILIES[k++ % std::size(SIDE_FAMILIES)];
+            const std::string family = side_blocks::SIDE_FILES[k++ % std::size(side_blocks::SIDE_FILES)].family;
             const std::vector<uint32_t> values = side_values(n, rng);
             ScratchDir dir("gcs-test");
             side::Enc enc(dir.path(), family);

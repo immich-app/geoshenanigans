@@ -175,3 +175,32 @@ fn profiled_queries_require_the_matching_dataset_and_profile() {
     std::fs::remove_file(set.join("place_nodes.bin")).unwrap();
     assert!(!invoke("query", "immich").status.success());
 }
+
+#[test]
+fn search_opens_the_tag_tier_and_rejects_a_column_of_another_size() {
+    use place_search::dataset::SearchFiles;
+    use place_search::model::Kind;
+    let tmp = TempDir::new("tags");
+    let dir = &tmp.0;
+    write_dataset(dir);
+    let base = b"Testland\0Testville\0Testerby\0".len() as u32;
+    let pool = b"name\x1fTestland\x1ename:de\x1fTestlandia\0";
+    let end = base + pool.len() as u32;
+    let layout = dir.join("strings_layout.json");
+    let mut json: serde_json::Value = serde_json::from_reader(std::fs::File::open(&layout).unwrap()).unwrap();
+    let tiers = json["tiers"].as_array_mut().unwrap();
+    tiers.push(serde_json::json!({"file":"strings_tags_core.bin", "start":base, "end":end}));
+    tiers.push(serde_json::json!({"file":"strings_tags_poi.bin", "start":end, "end":end}));
+    std::fs::write(&layout, json.to_string()).unwrap();
+    std::fs::write(dir.join("strings_tags_core.bin"), strings::encode(pool)).unwrap();
+    std::fs::write(dir.join("admin_tags.bin"), query_server::side_blocks::encode(&[base])).unwrap();
+    std::fs::write(dir.join("admin_imp.bin"), query_server::side_blocks::encode(&[7])).unwrap();
+    let geo = || Index::load(dir.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+    let index = geo();
+    let search = SearchFiles::open(dir, &index).unwrap();
+    assert_eq!(search.bundle(Kind::Area, 0).unwrap().name_for(&["de"]), "Testlandia");
+    assert_eq!(search.wiki_importance(Kind::Area, 0), Some(7));
+    assert!(search.bundle(Kind::Place, 0).is_none());
+    std::fs::write(dir.join("admin_imp.bin"), query_server::side_blocks::encode(&[])).unwrap();
+    assert!(SearchFiles::open(dir, &geo()).err().unwrap().contains("admin_imp.bin has 0 rows"));
+}

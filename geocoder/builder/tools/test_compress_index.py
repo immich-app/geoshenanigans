@@ -1085,7 +1085,8 @@ class TemplateAttributionTest(unittest.TestCase):
         # by a name of its own: downloads land flat by name, beside the mode dir's attribution.json.
         for tier in ("major", "notable", "all"):
             comp = self.components["poi_tier." + tier]
-            self.assertEqual(comp.get("optional_files"), ["{region}/poi/%s/poi_attribution.json" % tier], tier)
+            self.assertEqual([f for f in comp["optional_files"] if f.endswith("attribution.json")],
+                             ["{region}/poi/%s/poi_attribution.json" % tier], tier)
             self.assertEqual([f for f in comp["files"] if f.endswith("attribution.json")], [], tier)
         self.assertEqual(self.components["poi_tier.none"].get("optional_files", []), [])
 

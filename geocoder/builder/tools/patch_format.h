@@ -307,7 +307,7 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // a hidden node). File id 40 names admin_own_names.bin, the own name of each
 // polygon that goes by its place node's English name, which merges as a
 // record file of a string field after the admin geometry.
-static constexpr uint32_t GCPATCH_VERSION = 25;
+static constexpr uint32_t GCPATCH_VERSION = 26;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -376,7 +376,16 @@ enum class PatchFileId : uint32_t {
     // Beside admin_polygons.bin: (slot, own name) of each polygon that goes
     // by its place node's English name (v25).
     ADMIN_OWN_NAMES = 40,
-    COUNT = 41
+    STRINGS_TAGS_CORE = 41,
+    STRINGS_TAGS_POI = 42,
+    STRINGS_POI_EVERYTHING = 43,
+    PLACE_TAGS = 44,
+    ADMIN_TAGS = 45,
+    POI_TAGS = 46,
+    PLACE_IMP = 47,
+    ADMIN_IMP = 48,
+    POI_IMP = 49,
+    COUNT = 50
 };
 
 static const char* patch_file_names[] = {
@@ -398,7 +407,8 @@ static const char* patch_file_names[] = {
     "postal_cities.bin",
     "addr_cities.bin",
     "water_cut_arcs.bin",
-    "admin_own_names.bin"
+    "admin_own_names.bin", "strings_tags_core.bin", "strings_tags_poi.bin", "strings_poi_everything.bin",
+    "place_tags.bin", "admin_tags.bin", "poi_tags.bin", "place_imp.bin", "admin_imp.bin", "poi_imp.bin"
 };
 
 // The string offset fields of a record file the patch merges, as byte
@@ -435,6 +445,12 @@ static constexpr SparseDeltaFile SPARSE_DELTA_FILES[] = {
     {PatchFileId::INTERP_POSTCODES, 4, 2},
     {PatchFileId::WATER_CUT_ARCS, 4, 0},
     {PatchFileId::ADDR_CITIES, 4, 2},
+    {PatchFileId::PLACE_TAGS, 4, 2},
+    {PatchFileId::ADMIN_TAGS, 4, 2},
+    {PatchFileId::POI_TAGS, 4, 2},
+    {PatchFileId::PLACE_IMP, 4, 0},
+    {PatchFileId::ADMIN_IMP, 4, 0},
+    {PatchFileId::POI_IMP, 4, 0},
 };
 
 inline const SparseDeltaFile* sparse_delta_file(PatchFileId fid) {
@@ -543,7 +559,7 @@ inline bool is_geo_list_id(uint32_t id) {
 // which named no file in v22, is the postal cities' from v23.
 inline bool names_no_file(uint32_t id) {
     return id == uint32_t(PatchFileId::STRINGS) || is_geo_list_id(id) || id == uint32_t(PatchFileId::POSTCODE_CENTROID_CELLS) ||
-           id == uint32_t(PatchFileId::POSTCODE_CENTROID_ENTRIES);
+           id == uint32_t(PatchFileId::POSTCODE_CENTROID_ENTRIES) || id == uint32_t(PatchFileId::STRINGS_POI_EVERYTHING);
 }
 
 // Secondary ID remap marker: 0xFFFFFFF6
@@ -572,8 +588,9 @@ inline bool is_remapped_record_file(uint32_t fid) {
 // (UNSECTIONED_OLD_FILES). Its marker shares 0xFFFFFFF6 with
 // SECONDARY_REMAP_MARKER: position, not value, tells them apart.
 //   marker STRINGS_TIERED_MARKER,
-//   5 × {old_size u32, new_size u32}: every tier of the build, so global
-//     offsets (tier t at the sum of the sizes before it) need no tier file,
+//   STRING_TIER_COUNT × {old_size, new_size, old_gap, new_gap}, all u32:
+//     size counts decoded bytes, gap the omitted tail. Their sum places
+//     the next tier even when the selection ships only a prefix.
 //   shipped u32: bit t = the dir ships tier t and rebuilds it from its own
 //     old file (a tier the old dir lacked is unshipped here and its client
 //     file comes whole in a per-file section),
@@ -805,6 +822,10 @@ static constexpr ParallelDeltaFile PARALLEL_DELTA_FILES[] = {
     {PatchFileId::WAY_POSTCODES, PatchFileId::STREET_WAYS, 4, 2},
     {PatchFileId::INTERP_POSTCODES, PatchFileId::INTERP_WAYS, 4, 2},
     {PatchFileId::ADDR_CITIES, PatchFileId::ADDR_POINTS, 4, 2},
+    {PatchFileId::PLACE_TAGS, PatchFileId::PLACE_NODES, 4, 2},
+    {PatchFileId::POI_TAGS, PatchFileId::POI_RECORDS, 4, 2},
+    {PatchFileId::PLACE_IMP, PatchFileId::PLACE_NODES, 4, 0},
+    {PatchFileId::POI_IMP, PatchFileId::POI_RECORDS, 4, 0},
 };
 // The record files whose merge a side file can follow: the diff keeps each one's merge until the
 // side files are sent, and the patcher replays a side file along whichever its section names.
@@ -1044,7 +1065,7 @@ inline bool has_suffix(const std::string& s, const char* suffix) {
 
 inline bool is_client_file(const std::string& name) {
     if (name.empty() || name[0] == '.' || name.find('/') != std::string::npos) return false;
-    return !has_suffix(name, ".osm_ids") && !has_suffix(name, ".gcpatch") && !has_suffix(name, ".zst");
+    return !has_suffix(name, ".host") && !has_suffix(name, ".osm_ids") && !has_suffix(name, ".gcpatch") && !has_suffix(name, ".zst");
 }
 
 inline bool is_inline_client_file(const std::string& name) { return !has_suffix(name, ".bin"); }
@@ -2216,10 +2237,10 @@ private:
 // The string tier files, in global offset order: tier t's strings sit at
 // [sum of the sizes of tiers < t, + its own size). Same as the builder's
 // STR_TIER_FILENAMES.
-static constexpr int STRING_TIER_COUNT = 5;
+static constexpr int STRING_TIER_COUNT = 7;
 static constexpr const char* STRING_TIER_FILES[STRING_TIER_COUNT] = {
     "strings_core.bin", "strings_street.bin", "strings_addr.bin",
-    "strings_postcode.bin", "strings_poi.bin"
+    "strings_postcode.bin", "strings_poi.bin", "strings_tags_core.bin", "strings_tags_poi.bin"
 };
 
 // A tier's edit between two days: the strings both pools hold that keep
@@ -2614,7 +2635,10 @@ inline ShippedStringTiers shipped_string_tiers(const std::string& old_dir, const
 
 // The section id of a string tier file.
 inline PatchFileId string_tier_file_id(int t) {
-    return static_cast<PatchFileId>(static_cast<uint32_t>(PatchFileId::STRINGS_CORE) + t);
+    constexpr PatchFileId ids[] = {PatchFileId::STRINGS_CORE, PatchFileId::STRINGS_STREET, PatchFileId::STRINGS_ADDR,
+        PatchFileId::STRINGS_POSTCODE, PatchFileId::STRINGS_POI, PatchFileId::STRINGS_TAGS_CORE,
+        PatchFileId::STRINGS_TAGS_POI, PatchFileId::STRINGS_POI_EVERYTHING};
+    return ids[t];
 }
 
 // One tier's old and new pool as the diff loaded them (the dir's own, or
@@ -2626,6 +2650,7 @@ struct StringTierPools {
     const char* new_data = nullptr;
     size_t new_size = 0;
     uint64_t old_hash = 0, new_hash = 0;
+    uint32_t old_gap = 0, new_gap = 0;  // the unshipped tail before the next tier
 };
 
 // What append_strings_section wrote, for the diff's log, and the moved
@@ -2633,6 +2658,7 @@ struct StringTierPools {
 // records that hold them carry their new values as string fixups.
 struct StringsSectionStats {
     uint32_t sent = 0, n_pairs = 0;
+    std::array<size_t, STRING_TIER_COUNT> edit_bytes{};
     std::array<uint32_t, STRING_TIER_COUNT> n_added{}, n_deleted{}, n_runs{}, runs_bytes{};
     std::vector<std::pair<uint32_t, uint32_t>> unsent_pairs;
 };
@@ -2662,8 +2688,8 @@ StringsSectionStats append_strings_section(std::vector<char>& out,
     auto put = [&](const void* p, size_t n) { out.insert(out.end(), (const char*)p, (const char*)p + n); };
     std::array<uint32_t, STRING_TIER_COUNT + 1> old_base{}, new_base{};
     for (int t = 0; t < STRING_TIER_COUNT; t++) {
-        old_base[t + 1] = old_base[t] + static_cast<uint32_t>(tiers[t].old_size);
-        new_base[t + 1] = new_base[t] + static_cast<uint32_t>(tiers[t].new_size);
+        old_base[t + 1] = old_base[t] + static_cast<uint32_t>(tiers[t].old_size) + tiers[t].old_gap;
+        new_base[t + 1] = new_base[t] + static_cast<uint32_t>(tiers[t].new_size) + tiers[t].new_gap;
     }
     StringsSectionStats stats;
     stats.sent = referenced & unshipped_string_tiers(tiers, shipped);
@@ -2691,6 +2717,7 @@ StringsSectionStats append_strings_section(std::vector<char>& out,
         uint32_t old_size = static_cast<uint32_t>(tiers[t].old_size);
         uint32_t new_size = static_cast<uint32_t>(tiers[t].new_size);
         put(&old_size, 4); put(&new_size, 4);
+        put(&tiers[t].old_gap, 4); put(&tiers[t].new_gap, 4);
     }
     put(&shipped, 4); put(&stats.sent, 4);
     for (int t = 0; t < STRING_TIER_COUNT; t++) {
@@ -2715,7 +2742,9 @@ StringsSectionStats append_strings_section(std::vector<char>& out,
         }
         if (!(shipped >> t & 1)) continue;
         const StringTierDiff d = string_tier_diff(p.old_data, p.old_size, p.new_data, p.new_size, kept, p.old_hash, p.new_hash);
+        const size_t before = out.size();
         append_string_tier_diff(out, d);
+        stats.edit_bytes[t] = out.size() - before;
         stats.n_added[t] = static_cast<uint32_t>(d.added.size());
         stats.n_deleted[t] = static_cast<uint32_t>(d.deleted.size());
     }
@@ -2724,7 +2753,10 @@ StringsSectionStats append_strings_section(std::vector<char>& out,
     if (pairs.size() > pairs_max) stats.unsent_pairs.swap(pairs);
     stats.n_pairs = static_cast<uint32_t>(pairs.size());
     put(&stats.n_pairs, 4);
-    for (const auto& [og, ng] : pairs) { put(&og, 4); put(&ng, 4); }
+    for (const auto& [og, ng] : pairs) {
+        put(&og, 4); put(&ng, 4);
+        stats.edit_bytes[tier_of(og, old_base)] += sizeof(og) + sizeof(ng);
+    }
     return stats;
 }
 
@@ -2743,12 +2775,13 @@ struct StringTierPlace {
 struct StringsSection {
     // Tier t sits at old offsets [old_base[t], old_base[t + 1]); new likewise.
     std::array<uint32_t, STRING_TIER_COUNT + 1> old_base{}, new_base{};
+    std::array<uint32_t, STRING_TIER_COUNT> old_sizes{}, new_sizes{};
     uint32_t shipped = 0, sent = 0;
     std::array<StringTierEdit, STRING_TIER_COUNT> edits;  // shipped tiers
     std::array<SentStringRuns, STRING_TIER_COUNT> runs;   // sent tiers
     SortedTable<RemapPair> pairs;                         // moved strings, by old offset
-    uint32_t old_size(int t) const { return old_base[t + 1] - old_base[t]; }
-    uint32_t new_size(int t) const { return new_base[t + 1] - new_base[t]; }
+    uint32_t old_size(int t) const { return old_sizes[t]; }
+    uint32_t new_size(int t) const { return new_sizes[t]; }
     StringTierPlace place(int t) const { return {old_base[t], new_base[t], new_size(t)}; }
 };
 
@@ -2759,10 +2792,13 @@ inline StringsSection parse_strings_section(const char* data, size_t size, size_
     StringsSection s;
     for (int t = 0; t < STRING_TIER_COUNT; t++) {
         const uint32_t old_size = in.u32(), new_size = in.u32();
-        if ((uint64_t)s.old_base[t] + old_size > UINT32_MAX || (uint64_t)s.new_base[t] + new_size > UINT32_MAX)
+        s.old_sizes[t] = old_size;
+        s.new_sizes[t] = new_size;
+        const auto old_gap = in.u32(), new_gap = in.u32();
+        if ((uint64_t)s.old_base[t] + old_size + old_gap > UINT32_MAX || (uint64_t)s.new_base[t] + new_size + new_gap > UINT32_MAX)
             in.malformed();
-        s.old_base[t + 1] = s.old_base[t] + old_size;
-        s.new_base[t + 1] = s.new_base[t] + new_size;
+        s.old_base[t + 1] = s.old_base[t] + old_size + old_gap;
+        s.new_base[t + 1] = s.new_base[t] + new_size + new_gap;
     }
     s.shipped = in.u32();
     s.sent = in.u32();

@@ -276,7 +276,7 @@ TEST(order_poi_strings_puts_names_no_record_uses_last) {
     ParsedData d;
     const std::string bytes("a\0b\0c\0", 6);
     d.strings_tiers[STR_TIER_POI].assign(bytes.begin(), bytes.end());
-    d.strings_tier_bases = {0, 0, 0, 0, 0, 6};
+    d.strings_tier_bases = {0, 0, 0, 0, 0, 6, 6, 6};
     d.string_pool.mutable_data().assign(bytes.begin(), bytes.end());
     PoiRecord pr{};
     pr.name_id = 4;  // "c"

@@ -1195,6 +1195,7 @@ struct PoiClassification {
     // rank-30 tag instead (poi_classify.h classify_poi), UNKNOWN for any
     // other.
     PoiCategory water = PoiCategory::UNKNOWN;
+    const char* class_key = nullptr;
 };
 
 struct PoiRecord {
@@ -1293,3 +1294,9 @@ struct CollectedPoiRelation {
     std::string addr_city;
     std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
 };
+
+// Search tag files share these wire constants with place-search.
+inline constexpr char TAG_KEY_SEP = '\x1f', TAG_PAIR_SEP = '\x1e';
+inline constexpr size_t TAG_ARENA_BLOCK_BYTES = size_t(1) << 20;
+inline constexpr uint32_t TAG_BLOB_BLOCK_ROWS = 4096;
+inline constexpr size_t STR_TIER_TAGS_CORE = 5, STR_TIER_TAGS_POI = 6;

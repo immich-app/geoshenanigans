@@ -2580,6 +2580,10 @@ TEST(patch_lowmem_rebuilds_a_string_tier_in_any_order) {
     put_pois(new_d, pois, new_names);
     old_d["strings_poi.bin"].assign(old_pool.begin(), old_pool.end());
     new_d["strings_poi.bin"].assign(new_pool.begin(), new_pool.end());
+    old_d["strings_tags_poi.bin"] = {'a', TAG_KEY_SEP, 'b', 0};
+    new_d["strings_tags_poi.bin"] = {'a', TAG_KEY_SEP, 'c', 0, 'a', TAG_KEY_SEP, 'b', 0};
+    for (uint32_t off : {14u, NO_DATA, 14u}) append(old_d["poi_tags.bin"], off);
+    for (uint32_t off : {22u, NO_DATA, 22u, 18u}) append(new_d["poi_tags.bin"], off);
     const LowMemCase c{dir.path(), "strings"};
     REQUIRE(prepare(c, old_d, new_d).empty());
 

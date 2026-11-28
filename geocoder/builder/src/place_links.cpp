@@ -153,17 +153,7 @@ private:
 
 }  // namespace
 
-bool english_only_country(uint16_t cc) {
-    // country_settings.yaml's countries of `languages: en` alone.
-    static constexpr char kCodes[][3] = {
-        "AG", "AI", "AU", "BB", "BM", "BS", "BZ", "DM", "FJ", "FK", "FM", "GB", "GD", "GG", "GH", "GI", "GM", "GS", "GY",
-        "IM", "IO", "JE", "JM", "KI", "KN", "KY", "LC", "LR", "MS", "NG", "SB", "SH", "SL", "SS", "TC", "TO", "TT", "TV",
-        "US", "VC", "VG", "ZM",
-    };
-    for (const char* code : kCodes)
-        if (pack_country_code(code[0], code[1]) == cc) return true;
-    return false;
-}
+bool english_only_country(uint16_t cc) { return country_language(cc) == "en"; }
 
 std::string_view linked_english_name(bool own_name_en, uint16_t polygon_country, std::string_view node_name_en,
                                      std::string_view node_name, uint16_t node_country) {
@@ -409,6 +399,7 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
     data.admin_links.clear();
     data.place_claims.clear();
     data.place_node_links.clear();
+    std::vector<std::pair<uint64_t, std::string>> linked_names;
     for (size_t k = 0; k < objects.size(); k++) {
         const AdminObject& o = objects[k];
         const PlaceLink& link = links[k];
@@ -434,6 +425,9 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
             }
             // Every copy of the node, as two overlapping extracts list it twice.
             const uint64_t node_id = pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, c.node);
+            const auto& tags = *data.search_tags;
+            linked_names.emplace_back(o.id, tag_bundles::merge_linked(tags.get(tag_bundles::Use::Core, o.id),
+                tags.get(tag_bundles::Use::Core, node_id), country_language(node_country[link.candidate])));
             for (auto p = std::lower_bound(place_at.begin(), place_at.end(), std::make_pair(node_id, uint32_t(0)));
                  p != place_at.end() && p->first == node_id; ++p)
                 data.place_node_links.push_back({p->second, o.id});
@@ -447,6 +441,7 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
         data.place_claims.push_back({pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, nodes[i].node), objects[claimant[i]].id});
         stats.claimed++;
     }
+    data.search_tags->stores[size_t(tag_bundles::Use::Core)].replace(linked_names, threads);
     sort_place_node_links(data.place_node_links);
     candidates = LinkCandidates{};
     return stats;

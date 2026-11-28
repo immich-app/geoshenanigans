@@ -352,7 +352,14 @@ async fn serve_with(components: serde_json::Value, tamper: impl Fn(&str, &mut Ve
     for c in components.as_object().unwrap().values() {
         for f in ["files", "optional_files"].iter().filter_map(|k| c[*k].as_array()).flatten() {
             for region in &regions {
-                paths.insert(f.as_str().unwrap().replace("{region}", region));
+                // The injected geographic datasets have their own rows. This
+                // bucket exercises a build without the optional search columns.
+                let path = f.as_str().unwrap();
+                let name = path.rsplit('/').next().unwrap();
+                if name.starts_with("strings_tags_") || name.ends_with("_tags.bin") || name.ends_with("_imp.bin") {
+                    continue;
+                }
+                paths.insert(path.replace("{region}", region));
             }
         }
     }

@@ -414,21 +414,22 @@ TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread_or_copies
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v25 = the polygons' and place nodes' rank_address
+    // diff/patch tools. v26 adds the tag tiers and search columns.
+    // v25 introduced the polygons' and place nodes' rank_address
     // (v24: a water dir's cut arcs under file id 39; v23: the postal cities'
     // logical stream; v22: the address points' addr:city side file; v20: the
     // postcode grid's logical stream; v19: the postcode centroids'). The
     // patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(25));
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(26));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
 
 TEST(patch_format_fileid_count_and_names_aligned) {
     // The names table must have exactly COUNT entries (one per PatchFileId).
-    CHECK_EQ(static_cast<uint32_t>(PatchFileId::COUNT), uint32_t(41));
+    CHECK_EQ(static_cast<uint32_t>(PatchFileId::COUNT), uint32_t(50));
     const size_t n_names = sizeof(patch_file_names) / sizeof(patch_file_names[0]);
-    CHECK_EQ(n_names, size_t(41));
+    CHECK_EQ(n_names, size_t(50));
     // Spot-check that index lines up with the enum value.
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::STRINGS)]) == "strings.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::POI_RECORDS)]) == "poi_records.bin");
@@ -518,6 +519,7 @@ TEST(patch_format_client_file_names) {
         {"poi_meta.json", true, true},
         {"attribution.json", true, true},
         {"street_ways.osm_ids", false, false},
+        {"poi_addr.host", false, false},
         {"patch.gcpatch", false, false},
         {"street_ways.bin.zst", false, false},
         {".hidden.bin", false, false},
@@ -839,8 +841,9 @@ TEST(patch_format_string_fields_match_the_record_layouts) {
         (f.remap_kind == 2 ? strings : raw).push_back(name);
     }
     CHECK(strings == std::vector<std::string>({"addr_postcodes.bin", "way_postcodes.bin", "interp_postcodes.bin",
-                                               "addr_cities.bin"}));
-    CHECK(raw == std::vector<std::string>({"admin_parents.bin", "way_parents.bin", "water_cut_arcs.bin"}));
+                                               "addr_cities.bin", "place_tags.bin", "admin_tags.bin", "poi_tags.bin"}));
+    CHECK(raw == std::vector<std::string>({"admin_parents.bin", "way_parents.bin", "water_cut_arcs.bin",
+                                           "place_imp.bin", "admin_imp.bin", "poi_imp.bin"}));
 }
 
 // v19: the postcode centroids merge under file id 23 as their logical rows,
@@ -886,7 +889,7 @@ TEST(patch_format_v22_sends_the_addr_cities_after_the_other_side_files) {
     const SparseDeltaFile* sparse = sparse_delta_file(PatchFileId::ADDR_CITIES);
     REQUIRE(sparse != nullptr);
     CHECK(sparse->value_stride == 4 && sparse->remap_kind == 2);
-    CHECK(SPARSE_DELTA_FILES[std::size(SPARSE_DELTA_FILES) - 1].fid == PatchFileId::ADDR_CITIES);
+    CHECK(sparse_delta_file(PatchFileId::WATER_CUT_ARCS) < sparse);
     CHECK(string_field_offsets(PatchFileId::ADDR_CITIES).empty());
     CHECK(!is_hashed_old_file(uint32_t(PatchFileId::ADDR_CITIES)));
 }
@@ -900,7 +903,8 @@ TEST(patch_format_v22_sends_the_addr_cities_after_the_other_side_files) {
 TEST(patch_format_v25_merges_the_admin_own_names_as_records_of_a_string_field) {
     CHECK(uint32_t(PatchFileId::ADMIN_OWN_NAMES) == 40);
     CHECK_EQ(std::string(patch_file_names[40]), std::string(kAdminOwnNamesFile));
-    CHECK(uint32_t(PatchFileId::COUNT) == 41);
+    CHECK_EQ(uint32_t(string_tier_file_id(5)), 41u);
+    CHECK_EQ(uint32_t(string_tier_file_id(6)), 42u);
     CHECK(!names_no_file(40));
     CHECK_EQ(ADMIN_OWN_NAME_STRIDE, sizeof(AdminOwnName));
     CHECK_EQ(ADMIN_OWN_NAME_NAME_ID_OFF, offsetof(AdminOwnName, name_id));
@@ -2866,7 +2870,7 @@ TEST(patch_format_string_remap_maps_shipped_and_sent_tiers_and_tier_moves) {
 TEST(patch_format_referenced_string_tiers_reads_the_listed_fields) {
     // Tiers: core [0, 10), street [10, 30), addr empty, postcode [30, 40),
     // poi [40, 50). Records of stride 12 with string fields at 4 and 8.
-    const uint32_t ends[STRING_TIER_COUNT] = {10, 30, 30, 40, 50};
+    const uint32_t ends[STRING_TIER_COUNT] = {10, 30, 30, 40, 50, 50, 50};
     auto records = [](std::vector<std::array<uint32_t, 3>> recs) {
         std::vector<char> out(recs.size() * 12);
         if (!out.empty()) memcpy(out.data(), recs.data(), out.size());
@@ -2998,7 +3002,7 @@ size_t check_strings_section_round_trip(uint64_t seed, PoolOrder order) {
     size_t order_moves = 0;
     for (int round = 0; round < 400; round++) {
         const RandomTiers r = random_tiers(rnd, order);
-        const uint32_t shipped = rnd(32), referenced = rnd(32);
+        const uint32_t shipped = rnd(1u << STRING_TIER_COUNT), referenced = rnd(1u << STRING_TIER_COUNT);
         std::vector<char> buf;
         const auto stats = append_strings_section(buf, r.pools(), shipped, referenced, r.moved);
         DecodedStrings dec;
@@ -3378,7 +3382,7 @@ TEST(patch_format_sorted_tier_sends_no_indices) {
     const std::vector<std::pair<uint32_t, uint32_t>> moved = {{0, 2}, {4, 6}};
     std::vector<char> buf;
     append_strings_section(buf, tiers, 1, 0, moved);
-    const size_t header = 4 + STRING_TIER_COUNT * 8 + 8, tier = 16 + 12 + (2 * 3) + 4, pairs = 4;
+    const size_t header = 4 + STRING_TIER_COUNT * 16 + 8, tier = 16 + 12 + (2 * 3) + 4, pairs = 4;
     CHECK_EQ(buf.size(), header + tier + pairs);
     size_t pos = 0;
     const StringsSection s = parse_strings_section(buf.data(), buf.size(), pos);
@@ -3388,6 +3392,23 @@ TEST(patch_format_sorted_tier_sends_no_indices) {
     const std::string u = pool_in_order({"g", "b", "a", "c", "f"});
     CHECK(!string_pool_sorted(u.data(), u.size()));
     CHECK(!tier_edit(o, u).diff.sorted);
+}
+
+TEST(a_tag_tier_follows_the_global_extent_of_a_poi_prefix) {
+    const auto old = pool_in_order({"a", "z"}), next = pool_in_order({"z", "a"});
+    std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
+    tiers[STR_TIER_TAGS_CORE].old_gap = 7;
+    tiers[STR_TIER_TAGS_CORE].new_gap = 9;
+    tiers[STR_TIER_TAGS_POI] = pools_of(old, next);
+    const std::vector<std::pair<uint32_t, uint32_t>> moved{{7, 11}, {9, 9}};
+    std::vector<char> bytes;
+    const auto stats = append_strings_section(bytes, tiers, 1u << STR_TIER_TAGS_POI, 0, moved);
+    size_t pos = 0;
+    const auto section = parse_strings_section(bytes.data(), bytes.size(), pos);
+    CHECK(section.old_size(STR_TIER_TAGS_CORE) == 0);
+    CHECK(section.old_base[STR_TIER_TAGS_POI] == 7 && section.new_base[STR_TIER_TAGS_POI] == 9);
+    CHECK(stats.n_pairs == 1);
+    CHECK(stats.edit_bytes[STR_TIER_TAGS_POI] == bytes.size() - (4 + STRING_TIER_COUNT * 16 + 8 + 4));
 }
 
 TEST(patch_format_strings_section_refuses_indices_out_of_order) {
@@ -3530,7 +3551,7 @@ TEST(patch_format_strings_section_rejects_bad_masks) {
     std::vector<char> buf;
     std::array<StringTierPools, STRING_TIER_COUNT> none{};
     append_strings_section(buf, none, 0, 0, std::vector<std::pair<uint32_t, uint32_t>>());
-    const size_t shipped_at = 4 + STRING_TIER_COUNT * 8;
+    const size_t shipped_at = 4 + STRING_TIER_COUNT * 16;
     auto with_masks = [&](uint32_t shipped, uint32_t sent) {
         std::vector<char> b = buf;
         memcpy(b.data() + shipped_at, &shipped, 4);
@@ -3742,13 +3763,14 @@ TEST(patch_format_parallel_delta_files_follow_any_kept_record_merge) {
 }
 
 // The diff keeps a parent's merge for the side files only while a row of
-// PARALLEL_DELTA_FILES follows it: none follows the POI records or the place
-// nodes yet.
-TEST(patch_format_side_files_follow_the_street_ways_addresses_and_interpolations) {
+// PARALLEL_DELTA_FILES follows it.
+TEST(patch_format_side_files_follow_every_record_family_with_parallel_columns) {
     for (const PatchFileId fid : {PatchFileId::STREET_WAYS, PatchFileId::ADDR_POINTS, PatchFileId::INTERP_WAYS})
         CHECK(has_side_files(fid));
-    for (const PatchFileId fid : {PatchFileId::POI_RECORDS, PatchFileId::PLACE_NODES, PatchFileId::STREET_NODES})
-        CHECK(!has_side_files(fid));
+    for (const PatchFileId fid : {PatchFileId::POI_RECORDS, PatchFileId::PLACE_NODES})
+        CHECK(has_side_files(fid));
+    CHECK(!has_side_files(PatchFileId::STREET_NODES));
+    CHECK(names_no_file(uint32_t(string_tier_file_id(7))));
 }
 
 // --- geo entry list deltas ---

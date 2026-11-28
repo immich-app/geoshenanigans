@@ -286,7 +286,7 @@ TEST(admin_minimal_ships_only_the_core_strings_its_records_name) {
           (std::vector<std::string>{"Atlantis", "Ford", "Hafen", "Harbour", "Mill", "Northern State"}));
     const uint32_t size = static_cast<uint32_t>(pool_bytes(r.own_dir + "/strings_core.bin").size());
     CHECK(layout_of(r.own_dir) == (std::vector<std::pair<uint32_t, uint32_t>>{
-                                  {0, size}, {size, size}, {size, size}, {size, size}, {size, size}}));
+                                  {0, size}, {size, size}, {size, size}, {size, size}, {size, size}, {size, size}, {size, size}}));
 
     // Every name reads as the shared strings name it: the polygons in their
     // own slots (a fresh build numbers them in id order).

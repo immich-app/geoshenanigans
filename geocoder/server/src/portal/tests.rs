@@ -1790,12 +1790,9 @@ async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_excl
     assert_eq!(dataset("admin.exact.notable")["selection"],
                serde_json::json!({ "region": "planet", "mode": "admin", "quality": "exact", "poi_tier": "notable" }));
     let sets = data.path().join(BUILDS).join(format!("{DATE}-1")).join(SETS);
-    let mut sharing_a_name = 0;
     for (s, _) in template_selections().into_iter().filter(|(_, allowed)| *allowed) {
         let files: Vec<String> = resolve_files(&cfg, &s).unwrap().paths.into_iter().filter(|p| cfg.files.contains_key(p)).collect();
-        if files.iter().map(|f| basename(f)).collect::<BTreeSet<_>>().len() < files.len() {
-            sharing_a_name += 1;
-        }
+        assert_eq!(files.iter().map(|f| basename(f)).collect::<BTreeSet<_>>().len(), files.len(), "{s:?}");
         let units: BTreeSet<&String> = files.iter().filter_map(|f| cfg.files[f].unit.as_ref()).collect();
         let id = catalog::dataset_id(&s);
         let disk: u64 = std::fs::read_dir(sets.join(&id)).unwrap().map(|e| std::fs::metadata(e.unwrap().path()).unwrap().len()).sum();
@@ -1803,7 +1800,6 @@ async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_excl
         let d = dataset(&id);
         assert_eq!((d["size_disk"].as_u64(), d["size_download"].as_u64()), (Some(disk), Some(download)), "{s:?}");
     }
-    assert!(sharing_a_name > 0, "no selection has two files of one name");
 
     let constraint = &t["constraints"][0];
     let excluded: Vec<serde_json::Value> = template_selections().into_iter().filter(|(_, allowed)| !*allowed)
