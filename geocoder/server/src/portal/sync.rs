@@ -612,7 +612,7 @@ impl Portal {
         if let Some(refused) = self.refusal(&manifest.build.date, &sha256) {
             return Err(format!("it was refused: {}", refused.reason));
         }
-        let plan = catalog::plan(&cfg, &manifest)?;
+        let plan = catalog::plan(&cfg, &manifest, &self.config.regions)?;
         self.checked(name, &cfg, &plan).await?;
         self.running(format!("loading build {name}"));
         self.load(name, plan, sha256).await
@@ -832,7 +832,7 @@ impl Portal {
         if manifest.build.version != BUILD_VERSION {
             return self.refuse(&date, &sha256, &format!("it is of build version {}; this server reads build version {BUILD_VERSION}", manifest.build.version));
         }
-        let plan = match catalog::plan(&cfg, &manifest) {
+        let plan = match catalog::plan(&cfg, &manifest, &self.config.regions) {
             Ok(plan) => plan,
             Err(why) => return self.refuse(&date, &sha256, &why),
         };

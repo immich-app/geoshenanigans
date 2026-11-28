@@ -149,6 +149,8 @@ pub const MAX_CONTEXT_CHECKS: usize = 2_000;
 pub const MAX_PENDING_CANDIDATES: usize = 4 * MAX_CONTEXT_CHECKS;
 
 // ---- search requests and profiles (profile.rs)
+/// The most bytes of a native HTTP search query after trimming.
+pub const SEARCH_QUERY_MAX: usize = 256;
 /// Results a request asks for without a limit: the immich profile's, as before profiles, and
 /// Nominatim's (v1/server_glue.py:352) for the full profile.
 pub const IMMICH_DEFAULT_LIMIT: usize = 20;
@@ -161,6 +163,9 @@ pub const DEDUPE_EXTRA_MAX: usize = 10;
 /// Photon's location bias without a zoom or a scale (SearchRequestBase.java:11-12).
 pub const BIAS_ZOOM_DEFAULT: u8 = 12;
 pub const BIAS_SCALE_DEFAULT: f64 = 0.4;
+pub const BIAS_ZOOM_MAX: u8 = 18;
+pub const BIAS_SCALE_MAX: f64 = 1.0;
+pub const LANG_WEIGHT_DEFAULT: f64 = 1.0;
 
 // ---- search plans (query/plan.rs): searches of one penalty run in this order, least first
 // (db_searches/country_search.py:23, place_search.py:36, address_search.py:135, base.py:96)

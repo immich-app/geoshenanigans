@@ -24,6 +24,7 @@ use std::time::{Instant, SystemTime};
 use place_search::build::sub_index_files;
 use place_search::constants::{BOUNDARY_FILE, SUB_INDEXES};
 use place_search::dataset::{Origin, PlaceSearch, Stamps};
+use place_search::multi::MultiSearch;
 use query_server::{Index, MultiIndex};
 
 use super::catalog::{self, Plan, Shipped};
@@ -58,7 +59,7 @@ enum State {
     /// Being opened, and built where it must be, since then.
     Building { since: String },
     /// Open: a search for each dataset of the group, in its order.
-    Ready { searches: Vec<Arc<PlaceSearch>>, origin: Origin, seconds: f64, since: String, shipped: Option<ShippedCheck> },
+    Ready { searches: Vec<Arc<MultiSearch>>, origin: Origin, seconds: f64, since: String, shipped: Option<ShippedCheck> },
     /// Its open failed, then, and why.
     Failed { since: String, reason: String },
 }
@@ -176,7 +177,7 @@ impl Searches {
     }
 
     /// The search of the dataset `at`, or why there is none yet.
-    pub fn search(&self, at: usize) -> Result<Arc<PlaceSearch>, Unready> {
+    pub fn search(&self, at: usize) -> Result<Arc<MultiSearch>, Unready> {
         let (g, i) = self.of[at];
         match &*self.state(g) {
             State::Ready { searches, .. } => Ok(searches[i].clone()),
@@ -237,18 +238,25 @@ impl Searches {
         let dir = self.root.join(&group.name);
         self.set(g, State::Building { since: now() });
         let started = Instant::now();
-        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(Vec<Arc<PlaceSearch>>, Origin), String> {
+        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(Vec<Arc<MultiSearch>>, Origin), String> {
             std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-            let (mut searches, mut origin) = (Vec::new(), None);
+            let mut searches = Vec::new();
+            let mut origin = Origin::Current;
             for &d in &group.datasets {
                 let dataset = &self.datasets[d];
-                let geo = dataset.index.continents.first().and_then(|slot| slot.index.load_full())
-                    .ok_or_else(|| format!("dataset {}: not loaded", dataset.id))?;
-                let (search, opened) = open(geo, &dataset.stamps, &dataset.dir, &dir).map_err(|e| format!("dataset {}: {e}", dataset.id))?;
-                origin.get_or_insert(opened);
+                let opened = if let [slot] = dataset.index.continents.as_slice() {
+                    let geo = slot.index.load_full().ok_or("Dataset not loaded")?;
+                    open(geo, &dataset.stamps, &dataset.dir, &dir).map(|(search, origin)| (MultiSearch::single(search), origin))
+                } else {
+                    MultiSearch::open_with(&dataset.index, Some(&dir), &**open)
+                };
+                let (search, opened) = opened.map_err(|e| format!("dataset {}: {e}", dataset.id))?;
+                if opened == Origin::Built {
+                    origin = Origin::Built;
+                }
                 searches.push(Arc::new(search));
             }
-            Ok((searches, origin.unwrap_or(Origin::Current)))
+            Ok((searches, origin))
         }));
         let seconds = started.elapsed().as_secs_f64();
         let state = match opened {

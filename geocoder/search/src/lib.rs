@@ -16,6 +16,7 @@ pub mod multi;
 pub mod profile;
 pub mod query;
 pub mod reader;
+pub mod request_params;
 pub mod result;
 pub mod sort;
 pub mod tags;

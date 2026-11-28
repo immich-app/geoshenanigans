@@ -354,19 +354,22 @@ their turn.
 (`PORTAL_SYNC_SECONDS`), and 10 minutes after a round that failed (or
 `PORTAL_SYNC_SECONDS`, where that is less). A round that finds latest.json
 and the build's manifest naming the build it serves fetches nothing else.
-It fetches a new build into a dir of its own in the volume, each file
-checked against the build's manifest (~11.2 GiB a build, ~9 GiB to
-download): each dataset's dir holds hard links of the build's files, files
-the build holds twice byte for byte are fetched once and hard-linked, and
-no file is shared between the dirs of two builds. Once the build loads, and
-before it switches to it, it builds the build's 12 place search indexes in
-the build's dir, as a device builds its own (`search/<group>/`, ~0.9 GiB
-once the files they hold alike are hard-linked, ~7 GiB at the peak while
-they build): 4 at once (`PORTAL_SEARCH_JOBS`, at most the CPUs it may run
-on), each on one thread at the lowest priority, the costliest first, ~156 s
-and ~10 CPU-minutes for the planet build. A group that fails doesn't hold
-the build back: it is switched to all the same, and the next round tries
-the group again. At start it serves the build at once and opens its
+`PORTAL_REGIONS` is a comma-separated list of regions to serve, defaulting
+to `planet`. For example, `europe,north-america` serves datasets such as
+`europe/full.simplified.all` and `north-america/full.simplified.all` in one
+process. The first selected region's with-addresses dataset is the default
+when the planet preset is absent.
+
+The portal fetches a new build into a dir of its own in the volume and checks
+each file against its manifest. Dataset dirs hold hard links of the build's
+files. Identical files are fetched once, and each build has its own files.
+Once the build loads, the portal opens its place search indexes in
+`search/<group>/` before switching to it. Full-coverage datasets have their
+own groups. Other datasets in a region can share an index when their inputs
+match. Builds use one thread each at the lowest priority, costliest first,
+with up to 4 running at once (`PORTAL_SEARCH_JOBS`, capped at available CPUs).
+If an index fails to open, the portal serves the build and retries the index
+in the next sync round. At start it serves the build at once and opens its
 indexes after, building those its dir lacks. An index is used again while
 its search_meta.json names the files beside it and the index format the
 image builds: an image of another index builder of the same format keeps

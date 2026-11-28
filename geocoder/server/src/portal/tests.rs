@@ -126,6 +126,7 @@ fn config(bucket: &TestBucket, load: Loader) -> Config {
 fn config_at(url: &str, load: Loader) -> Config {
     Config {
         base_url: url.to_string(),
+        regions: catalog::default_regions(),
         interval: Duration::from_millis(20),
         retry_after: Duration::from_millis(20),
         retry_delays: Vec::new(),
@@ -207,7 +208,7 @@ async fn manifest_of(bucket: &TestBucket) -> (Configurations, catalog::Manifest)
 /// links.
 async fn fetched(bucket: &TestBucket) -> Vec<Object> {
     let (cfg, manifest) = manifest_of(bucket).await;
-    catalog::plan(&cfg, &manifest).unwrap().objects.into_iter().filter(|o| o.link.is_none()).collect()
+    catalog::plan(&cfg, &manifest, &catalog::default_regions()).unwrap().objects.into_iter().filter(|o| o.link.is_none()).collect()
 }
 
 /// The path the bucket serves `object` at, under its build's date.
@@ -303,7 +304,7 @@ fn flip(path: &Path) {
 async fn checking(bucket: &TestBucket, load: Loader) -> Loader {
     let (cfg, manifest) = manifest_of(bucket).await;
     let links: BTreeMap<String, BTreeMap<String, String>> =
-        catalog::plan(&cfg, &manifest).unwrap().datasets.into_iter().map(|d| (d.id.clone(), d.links())).collect();
+        catalog::plan(&cfg, &manifest, &catalog::default_regions()).unwrap().datasets.into_iter().map(|d| (d.id.clone(), d.links())).collect();
     let bytes: BTreeMap<String, Vec<u8>> = cfg.files.keys().map(|f| (f.clone(), bucket.file(f).to_vec())).collect();
     Arc::new(move |set: &Path| {
         let id = set.file_name().unwrap().to_str().unwrap();
@@ -413,7 +414,7 @@ async fn a_dataset_answers_byte_for_byte_what_query_server_answers_from_its_file
 async fn a_builds_objects_cover_every_selection_it_serves_and_its_sync_fetches_each_once() {
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
     let (cfg, manifest) = manifest_of(&bucket).await;
-    let plan = catalog::plan(&cfg, &manifest).unwrap();
+    let plan = catalog::plan(&cfg, &manifest, &catalog::default_regions()).unwrap();
     let mut held: BTreeMap<&str, &Object> = BTreeMap::new();
     for o in &plan.objects {
         for f in &o.files {
@@ -548,7 +549,7 @@ async fn a_water_dir_answers_as_a_dataset_whose_water_dir_holds_its_files() {
 async fn water_is_none_or_a_water_dir_of_the_build_and_all_by_default() {
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
     let (cfg, manifest) = manifest_of(&bucket).await;
-    let plan = catalog::plan(&cfg, &manifest).unwrap();
+    let plan = catalog::plan(&cfg, &manifest, &catalog::default_regions()).unwrap();
     let data = ScratchDir::new();
     let (_fixtures, load) = fixtures();
     let p = portal(data.path(), config(&bucket, load));
@@ -754,7 +755,7 @@ async fn plan_edited(bucket: &TestBucket, edit: impl FnOnce(&mut serde_json::Val
     let mut m: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     edit(&mut m);
     let (cfg, manifest) = sync::parse_manifest(m.to_string().as_bytes()).unwrap();
-    catalog::plan(&cfg, &manifest)
+    catalog::plan(&cfg, &manifest, &catalog::default_regions())
 }
 
 // The sync writes only in a build dir, at names of the build's own: a
@@ -1029,7 +1030,7 @@ async fn a_start_serves_no_build_before_its_files_check_out() {
     portal(source.path(), config(&bucket, load.clone())).round(true).await.unwrap();
     let made = source.path().join(BUILDS).join(format!("{DATE}-1"));
     let (cfg, manifest) = manifest_of(&bucket).await;
-    let plan = catalog::plan(&cfg, &manifest).unwrap();
+    let plan = catalog::plan(&cfg, &manifest, &catalog::default_regions()).unwrap();
     let damaged = "planet/full/admin_cells.bin";
     // A copy of the build as NEXT's, a byte of the file flipped in a copy
     // of its own (the build's dirs share it by hard links), which its
@@ -1104,7 +1105,7 @@ async fn a_start_serves_no_build_whose_dataset_dirs_hold_other_than_its_files() 
     let (_fixtures, load) = fixtures();
     portal(made.path(), config(&bucket, load.clone())).round(true).await.unwrap();
     let (cfg, manifest) = manifest_of(&bucket).await;
-    let dataset = catalog::plan(&cfg, &manifest).unwrap().datasets.remove(0);
+    let dataset = catalog::plan(&cfg, &manifest, &catalog::default_regions()).unwrap().datasets.remove(0);
     let (name, path) = dataset.links().into_iter().next().unwrap();
     let entry = format!("{SETS}/{}/{name}", dataset.id);
     let stray = format!("{SETS}/{}/stray.bin", dataset.id);
@@ -1182,7 +1183,7 @@ async fn a_sync_killed_part_way_resumes_in_its_dir_fetching_only_what_had_not_co
     want.sort();
     assert_eq!(resumed, want);
     let (cfg, manifest) = manifest_of(&bucket).await;
-    for f in catalog::plan(&cfg, &manifest).unwrap().objects.iter().flat_map(|o| &o.files) {
+    for f in catalog::plan(&cfg, &manifest, &catalog::default_regions()).unwrap().objects.iter().flat_map(|o| &o.files) {
         assert!(std::fs::read(root.join(f)).unwrap() == bucket.file(f), "{f}");
     }
 }

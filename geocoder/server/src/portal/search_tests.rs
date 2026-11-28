@@ -98,20 +98,15 @@ async fn sharing() -> TestBucket {
 /// The groups of the plan of the bucket's build: their names.
 async fn group_names(bucket: &TestBucket) -> Vec<String> {
     let (cfg, manifest) = manifest_of(bucket).await;
-    catalog::plan(&cfg, &manifest).unwrap().groups.into_iter().map(|g| g.name).collect()
+    catalog::plan(&cfg, &manifest, &catalog::default_regions()).unwrap().groups.into_iter().map(|g| g.name).collect()
 }
 
-// The datasets whose dirs hold the files an index is made of alike are one
-// group, named by its first dataset: two are of one group exactly where
-// each of those files is of one sha256 in both, or lacking in both. Where
-// the modes full, no-addresses and admin hold the same place files and core
-// strings, as the planet build's do, the 28 make 12: a quality and a POI
-// tier of those three share one, and each of admin-minimal's is its own.
+// Core-only datasets in a region share an index if their input files are identical.
 #[tokio::test]
 async fn datasets_whose_index_files_are_alike_are_one_group() {
     for bucket in [test_bucket::serve(test_bucket::template_components()).await, sharing().await] {
         let (cfg, manifest) = manifest_of(&bucket).await;
-        let plan = catalog::plan(&cfg, &manifest).unwrap();
+        let plan = catalog::plan(&cfg, &manifest, &catalog::default_regions()).unwrap();
         let files = |d: &catalog::Dataset| -> Vec<Option<String>> {
             let links = d.links();
             DATASET_FILES.iter().map(|name| links.get(*name).map(|path| cfg.files[path].sha256.clone())).collect()
@@ -122,20 +117,27 @@ async fn datasets_whose_index_files_are_alike_are_one_group() {
         }
         for a in &plan.datasets {
             for b in &plan.datasets {
-                assert_eq!(a.group == b.group, files(a) == files(b), "{} {}", a.id, b.id);
+                let core = a.selection.mode != "full" && b.selection.mode != "full";
+                assert_eq!(a.group == b.group, a.id == b.id || (core && files(a) == files(b)), "{} {}", a.id, b.id);
             }
         }
     }
 
     let (cfg, manifest) = manifest_of(&sharing().await).await;
-    let plan = catalog::plan(&cfg, &manifest).unwrap();
+    let plan = catalog::plan(&cfg, &manifest, &catalog::default_regions()).unwrap();
     let got: Vec<(String, Vec<String>)> = plan.groups.iter()
         .map(|g| (g.name.clone(), g.datasets.iter().map(|&d| plan.datasets[d].id.clone()).collect()))
         .collect();
     let mut want = Vec::new();
     for quality in template_values("quality") {
         for tier in template_values("poi_tier") {
-            let ids = ["full", "no-addresses", "admin"].map(|mode| format!("{mode}.{quality}.{tier}")).to_vec();
+            let id = format!("full.{quality}.{tier}");
+            want.push((id.clone(), vec![id]));
+        }
+    }
+    for quality in template_values("quality") {
+        for tier in template_values("poi_tier") {
+            let ids = ["no-addresses", "admin"].map(|mode| format!("{mode}.{quality}.{tier}")).to_vec();
             want.push((ids[0].clone(), ids));
         }
     }
@@ -153,7 +155,7 @@ async fn datasets_whose_index_files_are_alike_are_one_group() {
 async fn a_groups_cost_is_the_bytes_of_its_records_then_of_its_geometry() {
     let bucket = sharing().await;
     let (cfg, manifest) = manifest_of(&bucket).await;
-    let plan = catalog::plan(&cfg, &manifest).unwrap();
+    let plan = catalog::plan(&cfg, &manifest, &catalog::default_regions()).unwrap();
     let geometry = ["admin_rings.bin", "arc_index.bin", "arc_vertices.bin"];
 
     for group in &plan.groups {
@@ -259,7 +261,7 @@ async fn a_search_answers_byte_for_byte_what_the_binding_answers_from_its_index(
     let build = format!("{DATE}-1");
 
     let mut found = 0;
-    for (dataset, group) in [("with-addresses", "full.simplified.all"), ("admin.exact.major", "full.exact.major"), ("smallest", "admin-minimal.simplified.none")] {
+    for (dataset, group) in [("with-addresses", "full.simplified.all"), ("admin.exact.major", "no-addresses.exact.major"), ("smallest", "admin-minimal.simplified.none")] {
         let id = p.served().unwrap().plan.datasets[p.served().unwrap().plan.find(dataset).unwrap()].id.clone();
         let set = data.path().join(BUILDS).join(&build).join(SETS).join(&id);
         let geo = load(&set).unwrap().continents[0].index.load_full().unwrap();
@@ -270,7 +272,7 @@ async fn a_search_answers_byte_for_byte_what_the_binding_answers_from_its_index(
                 let wanted = limit.unwrap_or(Profile::Immich.policy().default_limit);
                 let (results, stats) = theirs.search(&SearchRequest { limit: wanted, ..SearchRequest::new(q, Profile::Immich) }).unwrap();
                 let encoded: String = q.bytes().map(|b| format!("%{b:02X}")).collect();
-                let at = format!("{url}/search?q={encoded}&dataset={dataset}&key=test{}", limit.map(|l| format!("&limit={l}")).unwrap_or_default());
+                let at = format!("{url}/search?profile=immich&q={encoded}&dataset={dataset}&key=test{}", limit.map(|l| format!("&limit={l}")).unwrap_or_default());
 
                 let got = fetch(&at).await;
                 assert_eq!((got.status, got.content_type.as_deref()), (200, Some("application/json")), "{at}: {}", got.body);
@@ -303,7 +305,7 @@ async fn a_search_names_its_dataset_as_a_lookup_does() {
     let (data, files) = (ScratchDir::new(), ScratchDir::new());
     let p = portal(data.path(), config(&bucket, testland(&files)));
     let url = serve(router(p.clone(), db())).await;
-    let search = |dataset: &str| format!("{url}/search?q=testville&key=test{dataset}");
+    let search = |dataset: &str| format!("{url}/search?profile=immich&q=testville&key=test{dataset}");
 
     let none = fetch(&search("")).await;
     assert_eq!(none.status, 503);
@@ -349,7 +351,7 @@ async fn a_search_checks_its_key_query_limit_and_rate() {
         "tokens": { "test": "test", "daily": "daily" },
     });
     let url = serve(router(p.clone(), Arc::new(RwLock::new(serde_json::from_value(db).unwrap())))).await;
-    assert_eq!(fetch(&format!("{url}/search?q=testville&key=daily")).await.status, 503);
+    assert_eq!(fetch(&format!("{url}/search?profile=immich&q=testville&key=daily")).await.status, 503);
     // The volume's build, served at start: its groups open after, one of
     // them held.
     portal(data.path(), config(&bucket, testland(&files))).round(true).await.unwrap();
@@ -380,22 +382,24 @@ async fn a_search_checks_its_key_query_limit_and_rate() {
         ("q=testville&key=test&debug=2", 400, "debug must be 1"),
     ];
     for (query, status, body) in cases {
-        let got = fetch(&format!("{url}/search?{query}")).await;
+        let got = fetch(&format!("{url}/search?profile=immich&{query}")).await;
         assert_eq!((got.status, got.body.as_str()), (status, body), "{query}");
     }
-    assert_eq!(fetch(&format!("{url}/search?q=testville&key=test&limit=many")).await.status, 400);
+    assert_eq!(fetch(&format!("{url}/search?profile=immich&q=testville&key=test&limit=many")).await.status, 400);
     let longest = "a".repeat(256);
-    assert_eq!(fetch(&format!("{url}/search?q=%20{longest}%20&key=test")).await.status, 200);
-    let over = fetch(&format!("{url}/search?q={longest}a&key=test")).await;
+    assert_eq!(fetch(&format!("{url}/search?profile=immich&q=%20{longest}%20&key=test")).await.status, 200);
+    let over = fetch(&format!("{url}/search?profile=immich&q={longest}a&key=test")).await;
     assert_eq!((over.status, over.body.as_str()), (400, "q must be at most 256 bytes"));
-    assert_eq!(fetch(&format!("{url}/search?q=testville&key=test&limit=50")).await.status, 200);
+    assert_eq!(fetch(&format!("{url}/search?profile=immich&q=testville&key=test&limit=50")).await.status, 200);
 
     for dataset in ["everything", "admin-minimal.exact.none", "full.exact.none"] {
-        assert_ne!(fetch(&format!("{url}/search?q=testville&key=daily&dataset={dataset}")).await.status, 200, "{dataset}");
+        assert_ne!(fetch(&format!("{url}/search?profile=immich&q=testville&key=daily&dataset={dataset}")).await.status, 200, "{dataset}");
     }
-    assert_eq!(fetch(&format!("{url}/search?q=testville&key=daily")).await.status, 200);
+    let unsupported = fetch(&format!("{url}/search?q=testville&key=daily&profile=full")).await;
+    assert_eq!((unsupported.status, unsupported.body.as_str()), (400, "Profile not built: full"));
+    assert_eq!(fetch(&format!("{url}/search?profile=immich&q=testville&key=daily")).await.status, 200);
     assert_eq!(fetch(&format!("{url}/reverse?lat=10.5&lon=20.5&key=daily")).await.status, 200);
-    let spent = fetch(&format!("{url}/search?q=testville&key=daily")).await;
+    let spent = fetch(&format!("{url}/search?profile=immich&q=testville&key=daily")).await;
     assert_eq!(spent.status, 429);
     gate.open();
     round.await.unwrap().unwrap();
@@ -436,12 +440,12 @@ async fn a_start_serves_at_once_and_its_place_search_answers_as_each_group_opens
     let failed = || p.served().unwrap().search.json()["groups"].as_array().unwrap().iter().any(|g| g["state"] == "failed");
     until("the failing group", failed).await;
 
-    let building = fetch(&format!("{url}/search?q=testville&key=test")).await;
+    let building = fetch(&format!("{url}/search?profile=immich&q=testville&key=test")).await;
     assert_eq!((building.status, building.header("retry-after"), building.content_type.as_deref()), (503, Some("5"), Some("application/json")));
     let body = building.json();
     assert_eq!((&body["status"], &body["dataset"], &body["index"]), (&"building".into(), &"full.simplified.all".into(), &"full.simplified.all".into()));
     assert!(body["since"].as_str().is_some_and(|s| s.ends_with('Z')), "{body}");
-    let broken = fetch(&format!("{url}/search?q=testville&key=test&dataset=max-quality")).await;
+    let broken = fetch(&format!("{url}/search?profile=immich&q=testville&key=test&dataset=max-quality")).await;
     assert_eq!((broken.status, broken.header("retry-after")), (503, None));
     let body = broken.json();
     assert_eq!((&body["status"], &body["dataset"], &body["index"]), (&"failed".into(), &"full.exact.all".into(), &"full.exact.all".into()));
@@ -453,13 +457,13 @@ async fn a_start_serves_at_once_and_its_place_search_answers_as_each_group_opens
     assert_eq!(health["datasets"], 28);
     until("a group of another index open", || p.served().unwrap().search.json()["groups"].as_array().unwrap()
         .iter().any(|g| g["index"] == "admin-minimal.simplified.none" && g["state"] == "ready")).await;
-    assert_eq!(fetch(&format!("{url}/search?q=testville&key=test&dataset=smallest")).await.status, 200);
+    assert_eq!(fetch(&format!("{url}/search?profile=immich&q=testville&key=test&dataset=smallest")).await.status, 200);
 
     gate.open();
     assert_eq!(round.await.unwrap(), Ok(format!("build {DATE} is served ({DATE}-1)")));
-    assert_eq!(fetch(&format!("{url}/search?q=testville&key=test")).await.status, 200);
+    assert_eq!(fetch(&format!("{url}/search?profile=immich&q=testville&key=test")).await.status, 200);
     let health = health_search(&url).await;
-    assert_eq!(health["ready"], 25);
+    assert_eq!(health["ready"], 27);
     assert_eq!(state_of(&health, "full.simplified.all")["origin"], "built");
 }
 
@@ -493,13 +497,13 @@ async fn a_sync_opens_the_place_search_of_its_build_before_it_switches_to_it() {
     until("the new build's place search opening", || {
         p.status().running.is_some_and(|r| r == format!("opening the place search of build {NEXT}-1"))
     }).await;
-    let meanwhile = fetch(&format!("{url}/search?q=testville&key=test")).await;
+    let meanwhile = fetch(&format!("{url}/search?profile=immich&q=testville&key=test")).await;
     assert_eq!((meanwhile.status, meanwhile.header("x-geocoder-build")), (200, Some(DATE)));
     assert_eq!(p.served().unwrap().dir, format!("{DATE}-1"));
 
     gate.open();
     assert_eq!(round.await.unwrap(), Ok(format!("build {NEXT} is served ({NEXT}-1)")));
-    let after = fetch(&format!("{url}/search?q=testville&key=test")).await;
+    let after = fetch(&format!("{url}/search?profile=immich&q=testville&key=test")).await;
     assert_eq!((after.status, after.header("x-geocoder-build")), (200, Some(NEXT)));
     assert_eq!(health_search(&url).await["ready"], 28);
 }
@@ -531,19 +535,19 @@ async fn a_group_that_fails_doesnt_refuse_its_build_and_the_next_round_tries_it_
 
     assert_eq!(tries.load(Ordering::SeqCst), 1);
     assert!(!data.path().join(REFUSED).exists() || !std::fs::read_to_string(data.path().join(REFUSED)).unwrap().contains(DATE));
-    let failed = fetch(&format!("{url}/search?q=testville&key=test&dataset=admin.exact.notable")).await;
+    let failed = fetch(&format!("{url}/search?profile=immich&q=testville&key=test&dataset=full.exact.notable")).await;
     assert_eq!((failed.status, failed.json()["reason"].as_str()), (503, Some("dataset full.exact.notable: the disk is full")));
-    let panicked = fetch(&format!("{url}/search?q=testville&key=test&dataset=full.simplified.none")).await;
+    let panicked = fetch(&format!("{url}/search?profile=immich&q=testville&key=test&dataset=full.simplified.none")).await;
     assert_eq!(panicked.status, 503);
     assert!(panicked.json()["reason"].as_str().unwrap().contains("a build that panics"), "{}", panicked.body);
-    assert_eq!(fetch(&format!("{url}/search?q=testville&key=test")).await.status, 200);
-    assert_eq!(fetch(&format!("{url}/reverse?lat=10.5&lon=20.5&key=test&dataset=admin.exact.notable")).await.status, 200);
+    assert_eq!(fetch(&format!("{url}/search?profile=immich&q=testville&key=test")).await.status, 200);
+    assert_eq!(fetch(&format!("{url}/reverse?lat=10.5&lon=20.5&key=test&dataset=full.exact.notable")).await.status, 200);
 
     assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({DATE}-1)")));
 
     assert_eq!(tries.load(Ordering::SeqCst), 2);
-    for dataset in ["admin.exact.notable", "full.simplified.none"] {
-        assert_eq!(fetch(&format!("{url}/search?q=testville&key=test&dataset={dataset}")).await.status, 200, "{dataset}");
+    for dataset in ["full.exact.notable", "full.simplified.none"] {
+        assert_eq!(fetch(&format!("{url}/search?profile=immich&q=testville&key=test&dataset={dataset}")).await.status, 200, "{dataset}");
     }
     assert_eq!(health_search(&url).await["ready"], 28);
 }
@@ -571,7 +575,7 @@ async fn a_build_served_again_opens_the_indexes_it_holds_and_a_pruned_one_takes_
     for group in health["groups"].as_array().unwrap() {
         assert_eq!(group["origin"], "current", "{group}");
     }
-    let again = fetch(&format!("{url}/search?q=testville&key=test")).await;
+    let again = fetch(&format!("{url}/search?profile=immich&q=testville&key=test")).await;
     assert_eq!((again.status, again.header("x-geocoder-build")), (200, Some(DATE)));
     // Once THIRD is served, the build served before it is NEXT, the newer.
     let first = data.path().join(BUILDS).join(format!("{DATE}-1")).join(sync::SEARCH);
@@ -589,7 +593,7 @@ async fn a_build_served_again_opens_the_indexes_it_holds_and_a_pruned_one_takes_
 async fn index_builds_run_a_few_at_once_at_the_lowest_priority_the_costliest_first() {
     let bucket = sharing().await;
     let (files_of, manifest) = manifest_of(&bucket).await;
-    let plan = catalog::plan(&files_of, &manifest).unwrap();
+    let plan = catalog::plan(&files_of, &manifest, &catalog::default_regions()).unwrap();
     let mut costliest: Vec<&catalog::Group> = plan.groups.iter().collect();
     costliest.sort_by(|a, b| b.cost.cmp(&a.cost).then_with(|| a.name.cmp(&b.name)));
     let costliest: Vec<String> = costliest.into_iter().map(|g| g.name.clone()).collect();
@@ -681,7 +685,7 @@ async fn the_index_files_alike_in_two_groups_are_hard_links_of_one() {
     portal(data.path(), config(&bucket, own)).round(true).await.unwrap();
 
     let linked = index_files(alike.path(), &build);
-    assert_eq!(linked.keys().map(|(g, _)| g.clone()).collect::<BTreeSet<_>>().len(), 12);
+    assert_eq!(linked.keys().map(|(g, _)| g.clone()).collect::<BTreeSet<_>>().len(), 20);
     let mut by_name: BTreeMap<&str, BTreeSet<u64>> = BTreeMap::new();
     for ((_, name), (ino, _)) in &linked {
         by_name.entry(name.as_str()).or_default().insert(*ino);
@@ -725,9 +729,9 @@ async fn datasets_and_health_tell_each_datasets_index() {
     let health = health_search(&url).await;
     assert_eq!((&health["ready"], &health["datasets"]), (&28.into(), &28.into()));
     assert_eq!(health["groups"].as_array().unwrap().iter().map(|g| g["index"].as_str().unwrap().to_string()).collect::<Vec<_>>(), names);
-    let group = state_of(&health, "full.simplified.major");
+    let group = state_of(&health, "no-addresses.simplified.major");
     assert_eq!((&group["state"], &group["origin"], &group["shipped"]), (&"ready".into(), &"built".into(), &serde_json::Value::Null));
-    assert_eq!(group["datasets"], serde_json::json!(["full.simplified.major", "no-addresses.simplified.major", "admin.simplified.major"]));
+    assert_eq!(group["datasets"], serde_json::json!(["no-addresses.simplified.major", "admin.simplified.major"]));
     assert!(group["since"].as_str().is_some() && group["seconds"].as_f64().is_some(), "{group}");
     let t = template();
     let published: Vec<serde_json::Value> = t["search_index"]["files"].as_array().unwrap().iter()
@@ -803,7 +807,7 @@ async fn a_dataset_whose_files_changed_since_its_load_fails_its_group() {
     let (data, files) = (ScratchDir::new(), ScratchDir::new());
     let mut cfg = config(&bucket, testland(&files));
     cfg.open_search = opener(|group, dir| {
-        if group == "full.simplified.notable" && dir.ends_with("no-addresses.simplified.notable") {
+        if group == "no-addresses.simplified.notable" && dir.ends_with("admin.simplified.notable") {
             let file = dir.join("place_nodes.bin");
             let copy = dir.join("place_nodes.bin.copy");
             std::fs::copy(&file, &copy).unwrap();
@@ -816,9 +820,9 @@ async fn a_dataset_whose_files_changed_since_its_load_fails_its_group() {
     assert_eq!(p.round(true).await, Ok(format!("build {DATE} is served ({DATE}-1)")));
 
     let health = p.served().unwrap().search.json();
-    let group = state_of(&health, "full.simplified.notable");
+    let group = state_of(&health, "no-addresses.simplified.notable");
     assert_eq!(group["state"], "failed");
-    assert!(group["reason"].as_str().unwrap().starts_with("dataset no-addresses.simplified.notable: The dataset in "), "{group}");
+    assert!(group["reason"].as_str().unwrap().starts_with("dataset admin.simplified.notable: The dataset in "), "{group}");
     assert!(group["reason"].as_str().unwrap().ends_with("changed since it was loaded: load it again"), "{group}");
 }
 
@@ -838,11 +842,11 @@ async fn searches_have_places_of_their_own() {
     assert_eq!((p.searches.available_permits(), Config::from_env().searches_at_once), (2, SEARCHES_AT_ONCE));
 
     let lookups = p.lookups.clone().try_acquire_many_owned(LOOKUPS_AT_ONCE as u32).unwrap();
-    assert_eq!(fetch(&format!("{url}/search?q=testville&key=test")).await.status, 200);
+    assert_eq!(fetch(&format!("{url}/search?profile=immich&q=testville&key=test")).await.status, 200);
     drop(lookups);
     let searches = p.searches.clone().try_acquire_many_owned(2).unwrap();
     let waiting = tokio::spawn({
-        let at = format!("{url}/search?q=testville&key=test");
+        let at = format!("{url}/search?profile=immich&q=testville&key=test");
         async move { fetch(&at).await.status }
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -852,4 +856,106 @@ async fn searches_have_places_of_their_own() {
     drop(searches);
     assert_eq!(waiting.await.unwrap(), 200);
     assert_eq!(p.searches.available_permits(), 2);
+}
+
+#[tokio::test]
+async fn native_search_validates_each_option_and_refuses_unbuilt_searches() {
+    let bucket = sharing().await;
+    let (data, files) = (ScratchDir::new(), ScratchDir::new());
+    let p = portal(data.path(), config(&bucket, testland(&files)));
+    p.round(true).await.unwrap();
+    let url = serve(router(p, db())).await;
+
+    for (params, message) in [
+        ("", "Profile not built: full"),
+        ("&profile=full", "Profile not built: full"),
+        ("&profile=other", "Unknown profile: other"),
+        ("&profile=immich&mode=nominatim", "Option not supported: mode"),
+        ("&profile=immich&mode=other", "Unknown match mode: other"),
+        ("&profile=immich&limit=many", "limit must be 1 to 50"),
+        ("&profile=immich&lang=de", "Option not supported: langs"),
+        ("&profile=immich&accept-language=de", "Option not supported: langs"),
+        ("&profile=immich&lang=de%3Bq%3Dbad", "Invalid lang"),
+        ("&profile=immich&lat=1", "lat and lon must be given together"),
+        ("&profile=immich&lon=1", "lat and lon must be given together"),
+        ("&profile=immich&lat=NaN&lon=1", "Invalid lat or lon"),
+        ("&profile=immich&lat=91&lon=1", "Invalid lat or lon"),
+        ("&profile=immich&lat=1&lon=181", "Invalid lat or lon"),
+        ("&profile=immich&zoom=19&lat=1&lon=2", "Invalid zoom"),
+        ("&profile=immich&zoom=1.5&lat=1&lon=2", "Invalid zoom"),
+        ("&profile=immich&location_bias_scale=1.1&lat=1&lon=2", "Invalid location_bias_scale"),
+        ("&profile=immich&location_bias_scale=NaN&lat=1&lon=2", "Invalid location_bias_scale"),
+        ("&profile=immich&zoom=0", "Location bias needs lat and lon"),
+        ("&profile=immich&location_bias_scale=0", "Location bias needs lat and lon"),
+        ("&profile=immich&lat=0&lon=0&zoom=18&location_bias_scale=1", "Option not supported: bias"),
+        ("&profile=immich&bbox=0,1,2", "Invalid bbox"),
+        ("&profile=immich&bbox=0,1,2,3,4", "Invalid bbox"),
+        ("&profile=immich&bbox=0,3,2,1", "Invalid bbox"),
+        ("&profile=immich&bbox=3,0,2,1", "Invalid bbox"),
+        ("&profile=immich&bbox=0,0,2,91", "Invalid bbox"),
+        ("&profile=immich&bbox=0,0,NaN,1", "Invalid bbox"),
+        ("&profile=immich&bbox=-180,-90,180,90", "Option not supported: viewbox"),
+        ("&profile=immich&countrycodes=U1", "Invalid countrycodes"),
+        ("&profile=immich&countrycodes=DEU", "Invalid countrycodes"),
+        ("&profile=immich&countrycodes=DE,%20us", "Option not supported: countries"),
+        ("&profile=immich&layer=house", "Unknown layer: house"),
+        ("&profile=immich&layer=Address,%20poi", "Option not supported: layers"),
+        ("&profile=immich&dedupe=0", "Option not supported: dedupe"),
+        ("&profile=immich&dedupe=true", "dedupe must be 0 or 1"),
+    ] {
+        let answer = fetch(&format!("{url}/search?q=testville&key=test{params}")).await;
+        assert_eq!((answer.status, answer.body.as_str()), (400, message), "{params}");
+    }
+
+    let answer = fetch(&format!("{url}/search?q=testville&key=test&profile=immich&mode=photon&dedupe=1")).await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+}
+
+#[tokio::test]
+async fn one_portal_serves_each_selected_region() {
+    let bucket = sharing().await;
+    let (data, files) = (ScratchDir::new(), ScratchDir::new());
+    let mut cfg = config(&bucket, testland(&files));
+    cfg.regions = vec!["europe".to_string(), "north-america".to_string()];
+    let (manifest_files, manifest) = manifest_of(&bucket).await;
+    let plan = catalog::plan(&manifest_files, &manifest, &cfg.regions).unwrap();
+    assert_eq!(plan.datasets[plan.default].id, "europe/full.simplified.all");
+    let europe = plan.find("europe/full.simplified.all").unwrap();
+    let america = plan.find("north-america/full.simplified.all").unwrap();
+    assert_ne!(plan.datasets[europe].group, plan.datasets[america].group);
+
+    for regions in [vec![], vec!["unknown".to_string()], vec!["europe".to_string(); 2]] {
+        assert!(catalog::plan(&manifest_files, &manifest, &regions).is_err(), "{regions:?}");
+    }
+
+    let p = portal(data.path(), cfg);
+    p.round(true).await.unwrap();
+    let url = serve(router(p, db())).await;
+    for region in ["europe", "north-america"] {
+        let dataset = format!("{region}/full.simplified.all");
+        let answer = fetch(&format!("{url}/search?q=testville&key=test&profile=immich&dataset={dataset}")).await;
+        assert_eq!((answer.status, answer.header("x-geocoder-dataset")), (200, Some(dataset.as_str())), "{}", answer.body);
+        assert_eq!(answer.json()[0]["name"], "Testville");
+    }
+}
+
+#[tokio::test]
+async fn a_portal_dataset_with_continents_searches_all_loaded_regions() {
+    let bucket = sharing().await;
+    let (data, files) = (ScratchDir::new(), ScratchDir::new());
+    write_dataset(&files.path().join("europe"), "Westland");
+    write_dataset(&files.path().join("asia"), "Eastland");
+    let dir = files.path().to_owned();
+    let p = portal(data.path(), config(&bucket, Arc::new(move |_| load_dataset(&dir))));
+    p.round(true).await.unwrap();
+    let url = serve(router(p, db())).await;
+
+    for name in ["Westland", "Eastland", "Testville"] {
+        let answer = fetch(&format!("{url}/search?q={name}&key=test&profile=immich&limit=1")).await;
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert_eq!(answer.json().as_array().unwrap().len(), 1);
+        assert_eq!(answer.json()[0]["name"], name);
+    }
+    let answer = fetch(&format!("{url}/search?q=Testville&key=test&profile=immich")).await;
+    assert_eq!(answer.json().as_array().unwrap().len(), 1);
 }
