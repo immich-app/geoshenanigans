@@ -1,4 +1,5 @@
 #include "cell_index.h"
+#include "search_files.h"
 
 #include <algorithm>
 #include <array>
@@ -872,7 +873,8 @@ static size_t write_postcode_files(const std::string& dir, const std::vector<pos
     return cell_count;
 }
 
-void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode) {
+void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode,
+                 const search_files::Layout* layout) {
     ensure_dir(output_dir);
     const std::string label = "      " + dir_label(output_dir) + ": ";
     auto _wt = std::chrono::steady_clock::now();
@@ -1003,7 +1005,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     // name_id into the correct tier file. Written unconditionally into
     // every directory that contains a strings_*.bin so the server can
     // load from any mode/opt-in dir without cross-dir discovery.
-    write_strings_layout(output_dir, data.strings_tier_bases);
+    write_strings_layout(output_dir, layout ? *layout : data.strings_tier_bases);
+    search_files::write_host_mode(data, output_dir, mode);
 
     // The postcode centroids (postcode_files.h), optional files: every
     // (country, postcode), in cell order. They were summed once on the full
@@ -1482,8 +1485,9 @@ static StringSubset admin_minimal_names(const ParsedData& data, const std::vecto
 
 // Holds the nodes' keys and order and the three files until they are written:
 // write_schedule.h's kPlaceWriterTimes counts them.
-void write_place_files(const std::string& dir, const std::vector<PlaceNode>& nodes) {
-    std::vector<uint32_t> order, keys(nodes.size(), NO_DATA);
+std::vector<uint32_t> place_file_order(const std::vector<PlaceNode>& nodes, std::vector<uint32_t>& keys) {
+    keys.assign(nodes.size(), NO_DATA);
+    std::vector<uint32_t> order;
     order.reserve(nodes.size());
     for (size_t i = 0; i < nodes.size(); i++) {
         if (!place_files::is_visible(nodes[i])) continue;
@@ -1494,6 +1498,12 @@ void write_place_files(const std::string& dir, const std::vector<PlaceNode>& nod
     std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return keys[a] < keys[b]; });
     for (size_t i = 0; i < nodes.size(); i++)
         if (!place_files::is_visible(nodes[i])) order.push_back(static_cast<uint32_t>(i));
+    return order;
+}
+
+void write_place_files(const std::string& dir, const std::vector<PlaceNode>& nodes) {
+    std::vector<uint32_t> keys;
+    const auto order = place_file_order(nodes, keys);
     std::vector<uint8_t> cells, blocks, hidden;
     auto into = [](std::vector<uint8_t>& v) { return [&v](const uint8_t* p, size_t n) { v.insert(v.end(), p, p + n); }; };
     place_files::Encoder enc(into(cells), into(blocks), into(hidden));
@@ -1558,12 +1568,15 @@ void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, con
     // shown.
     std::vector<PlaceNode> places;
     places.reserve(data.place_nodes.size());
-    for (const PlaceNode& node : data.place_nodes) {
+    std::vector<uint32_t> source;
+    for (uint32_t i = 0; i < data.place_nodes.size(); ++i) {
+        const PlaceNode& node = data.place_nodes[i];
         if (!admin_minimal_keeps_place(node.place_type)) continue;
         PlaceNode pn = node;
         remap_place_parent_unhiding_orphans(pn, slots.slot_of);
         pn.name_id = strings.name(pn.name_id);
         places.push_back(pn);
+        source.push_back(i);
     }
     write_place_files(dir, places);
 
@@ -1582,7 +1595,23 @@ void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, con
     write_cell_index_sorted(dir + "/admin_cells.bin", dir + "/admin_entries.bin", cell_pairs::ADMIN, cells);
 
     string_files::write_file(dir + "/" + STR_TIER_FILENAMES[0], strings.core.data(), strings.core.size());
-    write_strings_layout(dir, strings.bases);
+    std::vector<uint32_t> keys;
+    const auto order = place_file_order(places, keys);
+    auto place = [&](size_t i) { return source[order[i]]; };
+    const auto tags = search_files::core(data, places.size(), place, slots.count,
+                                        [&](size_t i) { return records.polygon_of[i]; });
+    auto bases = strings.bases;
+    if (strings.subset) {
+        bases[STR_TIER_TAGS_POI] = search_files::tier_end(bases[STR_TIER_TAGS_CORE], tags.bytes.size());
+        bases.back() = bases[STR_TIER_TAGS_POI];
+    }
+    search_files::write_core(dir, tags, bases[STR_TIER_TAGS_CORE], places.size());
+    if (data.search_tags->host) {
+        std::vector<uint64_t> ids;
+        for (size_t i = 0; i < order.size(); ++i) ids.push_back(search_files::object(data.place_osm_ids, place(i)));
+        emit_strategy2_sidecar(dir + "/place_nodes.osm_ids", {}, ids);
+    }
+    write_strings_layout(dir, bases);
     // The postcode grid and the postal cities, which name no string: the
     // mode dirs' bytes.
     if (!data.postcode_grid_file.empty())
@@ -1608,7 +1637,8 @@ void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, con
 
 }  // namespace
 
-void write_admin_minimal(const ParsedData& data, const std::string& region_dir, const std::string& region_prev) {
+void write_admin_minimal(const ParsedData& data, const std::string& region_dir, const std::string& region_prev,
+                         const std::array<uint32_t, STR_TIER_COUNT + 1>* layout) {
     require_arcs_in_step(data);
     const std::vector<uint32_t> kept = polygons_holding(data, ArcSet::Minimal);
 
@@ -1624,7 +1654,7 @@ void write_admin_minimal(const ParsedData& data, const std::string& region_dir, 
     const std::string poi_dir = region_dir + "/" + kAdminMinimalPoiDir;
     ensure_dir(poi_dir);
     write_admin_minimal_dir(data, poi_dir, shared_admin_minimal_slots(data, kept),
-                            {data.strings_tiers[0], data.strings_tier_bases});
+                            {data.strings_tiers[0], layout ? *layout : data.strings_tier_bases});
 }
 
 void write_admin_tiers(const ParsedData& data, const std::string& region_dir) {
@@ -1663,6 +1693,8 @@ void write_admin_tiers(const ParsedData& data, const std::string& region_dir) {
                 ? data.admin_osm_ids[i]
                 : (static_cast<uint64_t>(gc::id_alloc::ObjectType::SYNTHETIC) << 56);
     }
+    if (data.search_tags->host)
+        emit_strategy2_sidecar(region_dir + "/quality/simplified/admin_polygons.osm_ids", data.admin_sidecar_blob, packed_fallback);
     emit_strategy2_sidecar(admin_sidecar_path(region_dir), data.admin_sidecar_blob, packed_fallback);
     gc::id_alloc::IdAllocator::write_sidecar(arc_sidecar_path(region_dir, ArcSet::Full), arcs.set(ArcSet::Full).sidecar);
     write_arc_fallback_sidecar(arc_fallback_sidecar_path(region_dir, ArcSet::Full), arcs.set(ArcSet::Full));

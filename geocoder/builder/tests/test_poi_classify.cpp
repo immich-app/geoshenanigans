@@ -829,3 +829,17 @@ TEST(poi_classify_names_a_water_street_by_its_tags_alone) {
     pedestrian.highway = "pedestrian";
     CHECK(!poi_water_street(pedestrian.natural, pedestrian.landuse, pedestrian.highway, nullptr, nullptr));
 }
+
+TEST(a_folded_poi_category_keeps_the_raw_class_that_selected_it) {
+    Tags tags;
+    tags.tourism = "unrecognised";
+    tags.shop = "doityourself";
+    const auto shop = classify(tags);
+    REQUIRE(shop.has_value());
+    CHECK(shop->category == PoiCategory::SHOP_HARDWARE);
+    CHECK(std::string(shop->class_key) == "shop");
+    tags.tourism = "museum";
+    const auto museum = classify(tags);
+    REQUIRE(museum.has_value());
+    CHECK(std::string(museum->class_key) == "tourism");
+}

@@ -14,7 +14,8 @@
 #include "cell_index_io.h"
 #include "memory_limit.h"
 
-void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode);
+void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode,
+                 const std::array<uint32_t, STR_TIER_COUNT + 1>* layout = nullptr);
 
 // Tier t's covering of its set's polygons (the stage's tier t, of `arcs` over
 // the store), per arc: each arc's boundary cells once (admin_arc_cells over the
@@ -153,6 +154,7 @@ void write_exact_admin_geometry(const ParsedData& data, const std::string& dir);
 // Writes nodes' place files into dir (place_files.h): the visible ones
 // stably sorted by their admin cell (at kAdminCellLevel), then the hidden ones
 // in their order.
+std::vector<uint32_t> place_file_order(const std::vector<PlaceNode>& nodes, std::vector<uint32_t>& keys);
 void write_place_files(const std::string& dir, const std::vector<PlaceNode>& nodes);
 
 // Writes admin-minimal, the smallest useful set, in two dirs under
@@ -178,4 +180,5 @@ void write_place_files(const std::string& dir, const std::vector<PlaceNode>& nod
 //     slots, which a POI's parent_poly_id names (a tombstone at each slot
 //     it drops), and the shared core strings and layout, which the POI
 //     tier's names extend.
-void write_admin_minimal(const ParsedData& data, const std::string& region_dir, const std::string& region_prev);
+void write_admin_minimal(const ParsedData& data, const std::string& region_dir, const std::string& region_prev,
+                         const std::array<uint32_t, STR_TIER_COUNT + 1>* layout = nullptr);

@@ -1115,3 +1115,72 @@ TEST(a_build_of_two_extracts_sharing_a_boundary_and_its_place_node_links_the_nod
     std::printf("    %s\n", answers[0].c_str());
     CHECK(names(answers[0], "town", "Sosnovka"));
 }
+
+TEST(search_tags_follow_the_pbf_records_and_host_data_is_optional) {
+    Fixture f;
+    f.country(29, -99, 31, -97, "United States", "US");
+    f.boundary(29.5, -98.9, 30.9, -97.1, 4, "Texas", {{"ISO3166-2", "US-TX"}});
+    f.node(30, -98, {{"place", "city"}, {"name", "München"}, {"name:en", "Munich"}});
+    f.node(30.1, -98, {{"place", "suburb"}, {"name", "West"}, {"alt_name", "Westside"}});
+    f.node(30.2, -98, {{"tourism", "museum"}, {"name", "Museum"}, {"brand", "Foundation"}});
+    f.line({{30, -98}, {30.1, -98}}, {{"highway", "residential"}, {"name", "Hauptstraße"}, {"name:en", "Main Street"}});
+    f.square(30, -98, 30.01, -97.99, {{"building", "commercial"}, {"name", "FUTO"}, {"addr:housenumber", "1044"}});
+    ScratchDir scratch("search-tags");
+    const auto pbf = scratch.path() + "/fixture.pbf";
+    write_test_pbf(pbf, f.objects(), 1000);
+    for (bool host : {false, true}) {
+        const auto out = scratch.path() + (host ? "/host" : "/client");
+        std::vector<std::string> args{GEOCODER_BUILD_INDEX_BIN, out, pbf, "--multi-output", "--multi-quality"};
+        if (host) args.push_back("--host-data");
+        REQUIRE(gctest::run(args, out + ".log"));
+        const auto full = out + "/planet/full/";
+        const auto minimal = out + "/planet/admin-minimal/";
+        auto contains = [&](const std::string& path, std::string_view value) {
+            const auto bytes = file_bytes(path);
+            return std::search(bytes.begin(), bytes.end(), value.begin(), value.end()) != bytes.end();
+        };
+        for (const auto& dir : {full, minimal}) {
+            const auto bytes = file_bytes(dir + "strings_tags_core.bin");
+            REQUIRE(!bytes.empty());
+            std::string pool;
+            string_files::decode(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(),
+                                 [&](const char* p, size_t n) { pool.append(p, n); });
+            CHECK(pool.find("ISO3166-2\x1fUS-TX") != pool.npos);
+            CHECK(pool.find("name\x1fMünchen") != pool.npos);
+            CHECK((pool.find("Westside") == pool.npos) == (dir == minimal));
+            const auto nodes = file_bytes(dir + place_files::NODES_FILE);
+            const auto rows = file_bytes(dir + "place_tags.bin");
+            REQUIRE(nodes.size() >= place_files::FOOTER_BYTES);
+            REQUIRE(rows.size() >= side_blocks::FOOTER_BYTES);
+            const auto* np = reinterpret_cast<const uint8_t*>(nodes.data());
+            const auto* rp = reinterpret_cast<const uint8_t*>(rows.data());
+            const auto place_count = place_files::read_footer(np + nodes.size() - place_files::FOOTER_BYTES, nodes.size()).rows;
+            CHECK(side_blocks::read_footer("place_tags.bin", rp + rows.size() - side_blocks::FOOTER_BYTES, rows.size()).values == place_count);
+            if (dir == minimal) {
+                std::string core;
+                const auto core_bytes = file_bytes(dir + "strings_core.bin");
+                string_files::decode(reinterpret_cast<const uint8_t*>(core_bytes.data()), core_bytes.size(),
+                                     [&](const char* p, size_t n) { core.append(p, n); });
+                side_blocks::decode("place_tags.bin", rp, rows.size(), [&](const uint32_t* p, size_t n) {
+                    for (size_t i = 0; i < n; ++i) if (p[i] != NO_DATA) {
+                        REQUIRE(p[i] >= core.size() && p[i] - core.size() < pool.size());
+                        const size_t off = p[i] - core.size();
+                        CHECK(off == 0 || pool[off - 1] == 0);
+                        CHECK(std::strchr(pool.c_str() + off, TAG_KEY_SEP) != nullptr);
+                    }
+                });
+            }
+            CHECK(std::filesystem::exists(dir + "place_imp.bin"));
+            CHECK(std::filesystem::exists(dir + "place_nodes.osm_ids") == host);
+        }
+        CHECK(contains(full + "addr_tags.host", "name\x1f" "FUTO") == host);
+        CHECK(contains(full + "street_tags.host", "name\x1fHauptstraße") == host);
+        if (host) {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(scratch.path() + "/client")) {
+                if (!entry.is_regular_file()) continue;
+                const auto rel = entry.path().lexically_relative(scratch.path() + "/client");
+                CHECK(file_bytes(entry.path()) == file_bytes(std::filesystem::path(out) / rel));
+            }
+        }
+    }
+}

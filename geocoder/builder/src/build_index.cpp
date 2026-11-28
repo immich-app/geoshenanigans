@@ -56,6 +56,7 @@
 #include "interpolation.h"
 #include "continent_filter.h"
 #include "cell_index.h"
+#include "search_files.h"
 #include "parent_linking.h"
 #include "polygon_rings.h"
 #include "admin_rank_config.h"
@@ -1174,15 +1175,33 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             timed_phase("    " + region + ": poi names in record order", [&] { order_poi_strings_by_record(d); });
         }
 
+        std::vector<uint32_t> place_keys;
+        const auto place_order = place_file_order(d.place_nodes, place_keys);
+        free_storage(place_keys);
+        const auto core_tags = search_files::core(d, place_order.size(), [&](size_t i) { return place_order[i]; },
+                                                  d.admin_polygons.size(), [](size_t i) { return uint32_t(i); });
+        const auto poi_tags = search_files::poi(d);
+        auto layout = d.strings_tier_bases;
+        layout[STR_TIER_TAGS_POI] = search_files::tier_end(layout[STR_TIER_TAGS_CORE], core_tags.bytes.size());
+        layout.back() = search_files::tier_end(layout[STR_TIER_TAGS_POI], poi_tags.bytes.size());
+        auto mode_files = [&](const std::string& dir, IndexMode selected) {
+            write_index(d, dir, selected, &layout);
+            search_files::write_core(dir, core_tags, layout[STR_TIER_TAGS_CORE], place_order.size());
+            if (d.search_tags->host) {
+                std::vector<uint64_t> ids;
+                for (uint32_t i : place_order) ids.push_back(search_files::object(d.place_osm_ids, i));
+                emit_strategy2_sidecar(dir + "/place_nodes.osm_ids", {}, ids);
+            }
+        };
         auto write_modes = [&] {
             if (multi_output) {
                 // Write all 3 modes in parallel (they read shared data, write to separate dirs)
-                auto wf1 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/full", IndexMode::Full); });
-                auto wf2 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/no-addresses", IndexMode::NoAddresses); });
-                auto wf3 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/admin", IndexMode::AdminOnly); });
+                auto wf1 = std::async(std::launch::async, [&]{ mode_files(base_dir + "/full", IndexMode::Full); });
+                auto wf2 = std::async(std::launch::async, [&]{ mode_files(base_dir + "/no-addresses", IndexMode::NoAddresses); });
+                auto wf3 = std::async(std::launch::async, [&]{ mode_files(base_dir + "/admin", IndexMode::AdminOnly); });
                 wf1.get(); wf2.get(); wf3.get();
             } else {
-                write_index(d, base_dir, mode);
+                mode_files(base_dir, mode);
             }
         };
         auto write_boundary_tiers = [&] {
@@ -1213,7 +1232,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         auto write_admin_minimal_set = [&] {
             // Written for a region without admin polygons too: every
             // configuration of the region lists the tier's files.
-            if (multi_output && !d.place_nodes.empty()) write_admin_minimal(d, base_dir, region_prev);
+            if (multi_output && !d.place_nodes.empty()) write_admin_minimal(d, base_dir, region_prev, &layout);
         };
         auto write_poi_tiers = [&] {
             // Write POI tier variants
@@ -1344,7 +1363,12 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                         string_files::write_file(poi_dir + "/" + STR_TIER_FILENAMES[STR_TIER_POI], names.data(),
                                                  names.size());
                     }
-                    write_strings_layout(poi_dir, d.strings_tier_bases);
+                    string_files::write_file(poi_dir + "/" + STR_TIER_FILENAMES[STR_TIER_TAGS_POI], poi_tags.bytes.data(),
+                                             poi_tags.group_ends[tier_var.max_tier]);
+                    search_files::write_rows(poi_dir, "poi", poi_tags, layout[STR_TIER_TAGS_POI], selected.size(),
+                                             [&](size_t i) { return selected[i]; });
+                    if (d.search_tags->host) search_files::write_host_poi(d, poi_dir, selected);
+                    write_strings_layout(poi_dir, layout);
                     // Wikidata's credit, where its sitelinks ranked a live POI
                     // of the tier; the mode dir credits the rest.
                     // A tombstone carries no flags.
@@ -1988,6 +2012,7 @@ static int run(int argc, char* argv[]) {
         std::cerr << "  --multi-output         Write full, no-addresses, admin-only indexes (needs --multi-quality)" << std::endl;
         std::cerr << "  --continents           Also generate per-continent indexes" << std::endl;
         std::cerr << "  --mode <mode>          Index mode: full, no-addresses, admin-only (default: full)" << std::endl;
+        std::cerr << "  --host-data            Write search host sidecars and row maps" << std::endl;
         std::cerr << "  --multi-quality        Write the boundary tiers: quality/simplified and quality/exact" << std::endl;
         std::cerr << "  --tiger-data <path>          Load TIGER address data (tar.gz or directory of CSVs)" << std::endl;
         std::cerr << "  --external-postcodes <path>  Load GeoNames postcode centroids (CSV or .csv.gz)" << std::endl;
@@ -2014,6 +2039,7 @@ static int run(int argc, char* argv[]) {
     // build. Empty means "fresh start, no stable IDs".
     std::string prev_output_dir;
     std::string rank_dump;
+    bool host_data = false;
     bool multi_output = false;
     bool generate_continents = false;
     IndexMode mode = IndexMode::Full;
@@ -2031,6 +2057,8 @@ static int run(int argc, char* argv[]) {
             multi_output = true;
         } else if (arg == "--continents") {
             generate_continents = true;
+        } else if (arg == "--host-data") {
+            host_data = true;
         } else if (arg == "--multi-quality") {
             multi_quality = true;
             if (i + 1 < argc && is_scale_list(argv[i + 1])) {
@@ -2085,6 +2113,8 @@ static int run(int argc, char* argv[]) {
     if (!marine_path.empty()) marine::check_file(marine_path);
 
     ParsedData data;
+    data.search_tags->host = host_data;
+    using tag_bundles::Use;
     // The postal cities' inputs, small and read before the parse, so a bad
     // one fails the build at once.
     if (!postal_places_path.empty()) {
@@ -2209,6 +2239,7 @@ static int run(int argc, char* argv[]) {
                 // What each reader thread collects, joined after: one shared
                 // lock held across the vectors' growth queued every thread.
                 struct Collected {
+                    tag_bundles::Collections tags;
                     std::vector<CollectedRelation> relations;
                     std::vector<int64_t> label_nodes;
                     std::vector<CollectedPoiRelation> poi_relations;
@@ -2224,6 +2255,21 @@ static int run(int argc, char* argv[]) {
                 std::vector<Collected> collected(pbf.thread_count());
                 pbf.read_blocks([&](PbfBlock& block, unsigned thread) {
                     Collected& mine = collected[thread];
+                    auto collect = [&](const PbfRelation& rel, Use use, const char* class_key = nullptr) {
+                        const uint64_t id = relation_boundary_id(rel.id);
+                        auto each = [&](auto f) {
+                            const auto& st = *rel.tags.string_table;
+                            for (auto [k, v] : rel.tags.indices)
+                                if (k < st.size() && v < st.size()) f(st[k], st[v]);
+                        };
+                        mine.tags.add(use, id, each);
+                        mine.tags.add(Use::Wiki, id, each);
+                        if (host_data && use == Use::Poi) {
+                            mine.tags.add(Use::PoiAddress, id, each);
+                            if (rel.tag("addr:housenumber")) mine.tags.add(Use::Address, id, each);
+                            mine.tags.values[size_t(Use::PoiClass)].add(id, tag_bundles::poi_class(each, class_key));
+                        }
+                    };
                     for (auto& rel : block.relations) {
                         const char* boundary = rel.tag("boundary");
                         const char* rel_type = rel.tag("type");
@@ -2284,6 +2330,7 @@ static int run(int argc, char* argv[]) {
                                             }
                                         }
                                         if (!cr.members.empty()) {
+                                            collect(rel, Use::Core);
                                             mine.relations.push_back(std::move(cr));
                                             mine.label_nodes.insert(mine.label_nodes.end(), label_node_ids.begin(),
                                                                     label_node_ids.end());
@@ -2361,6 +2408,7 @@ static int run(int argc, char* argv[]) {
                         if (!cr.members.empty()) {
                             mine.label_nodes.insert(mine.label_nodes.end(), cr.label_node_ids.begin(),
                                                     cr.label_node_ids.end());
+                            collect(rel, Use::Core);
                             mine.relations.push_back(std::move(cr));
                         }
                     }
@@ -2376,6 +2424,7 @@ static int run(int argc, char* argv[]) {
                         const char* r_office   = rel.tag("office");
 
                         PoiCategory poi_cat = PoiCategory::UNKNOWN;
+                        const char* class_key = nullptr;
                         // A water multipolygon (poi_water_kind), which
                         // Nominatim imports as it does a closed way, is
                         // classified as a closed way is (classify_poi), but
@@ -2434,16 +2483,21 @@ static int run(int argc, char* argv[]) {
                                 for (size_t mi = 0; could_lead && mi < rel.members.size(); mi++)
                                     if (rel.member_role(mi) == "inner") places_only = true;
                                 if (places_only) water_poi.reset();
-                                else poi_cat = water_poi->category;
+                                else {
+                                    poi_cat = water_poi->category;
+                                    class_key = water_poi->class_key;
+                                }
                             }
                         }
                         // boundary
                         if (poi_cat == PoiCategory::UNKNOWN && r_boundary) {
+                            class_key = "boundary";
                             if (std::strcmp(r_boundary, "national_park") == 0) poi_cat = PoiCategory::NATIONAL_PARK;
                             else if (std::strcmp(r_boundary, "protected_area") == 0) poi_cat = PoiCategory::PROTECTED_AREA;
                         }
                         // leisure
                         if (poi_cat == PoiCategory::UNKNOWN && r_leisure) {
+                            class_key = "leisure";
                             if (std::strcmp(r_leisure, "park") == 0) poi_cat = PoiCategory::PARK;
                             else if (std::strcmp(r_leisure, "nature_reserve") == 0) poi_cat = PoiCategory::NATURE_RESERVE;
                             else if (std::strcmp(r_leisure, "stadium") == 0) poi_cat = PoiCategory::STADIUM;
@@ -2455,6 +2509,7 @@ static int run(int argc, char* argv[]) {
                         }
                         // tourism
                         if (poi_cat == PoiCategory::UNKNOWN && r_tourism) {
+                            class_key = "tourism";
                             if (std::strcmp(r_tourism, "theme_park") == 0) poi_cat = PoiCategory::THEME_PARK;
                             else if (std::strcmp(r_tourism, "zoo") == 0) poi_cat = PoiCategory::ZOO;
                             else if (std::strcmp(r_tourism, "museum") == 0) poi_cat = PoiCategory::MUSEUM;
@@ -2464,6 +2519,7 @@ static int run(int argc, char* argv[]) {
                         }
                         // natural
                         if (poi_cat == PoiCategory::UNKNOWN && r_natural) {
+                            class_key = "natural";
                             if (std::strcmp(r_natural, "bay") == 0) poi_cat = PoiCategory::BAY;
                             else if (std::strcmp(r_natural, "island") == 0) poi_cat = PoiCategory::ISLAND;
                             else if (std::strcmp(r_natural, "beach") == 0) poi_cat = PoiCategory::BEACH;
@@ -2472,15 +2528,18 @@ static int run(int argc, char* argv[]) {
                         }
                         // aeroway
                         if (poi_cat == PoiCategory::UNKNOWN && r_aeroway) {
+                            class_key = "aeroway";
                             if (std::strcmp(r_aeroway, "aerodrome") == 0) poi_cat = PoiCategory::AERODROME;
                         }
                         // place
                         if (poi_cat == PoiCategory::UNKNOWN && r_place) {
+                            class_key = "place";
                             if (std::strcmp(r_place, "island") == 0 || std::strcmp(r_place, "islet") == 0)
                                 poi_cat = PoiCategory::ISLAND;
                         }
                         // office
                         if (poi_cat == PoiCategory::UNKNOWN && r_office) {
+                            class_key = "office";
                             if (std::strcmp(r_office, "government") == 0) poi_cat = PoiCategory::GOVERNMENT;
                         }
 
@@ -2554,7 +2613,10 @@ static int run(int argc, char* argv[]) {
                                     }
                                 }
 
-                                if (!cpr.members.empty()) mine.poi_relations.push_back(std::move(cpr));
+                                if (!cpr.members.empty()) {
+                                    collect(rel, Use::Poi, class_key);
+                                    mine.poi_relations.push_back(std::move(cpr));
+                                }
                             }
                         }
                     }
@@ -2569,6 +2631,7 @@ static int run(int argc, char* argv[]) {
                 size_t postal_without_code = 0;
                 size_t place_rank0 = 0;
                 for (auto& c : collected) {
+                    data.search_tags->absorb(c.tags);
                     std::move(c.relations.begin(), c.relations.end(), std::back_inserter(data.collected_relations));
                     wanted_label_nodes.insert(c.label_nodes.begin(), c.label_nodes.end());
                     std::move(c.poi_relations.begin(), c.poi_relations.end(),
@@ -2660,6 +2723,8 @@ static int run(int argc, char* argv[]) {
             // same way_needs_nodes rule to the same blobs, and a lookup of
             // an unmarked id fails the build after it.
             SparseNodeIndex index(MAX_NODE_ID_DEFAULT);
+            std::unique_ptr<SparseNodeIndex> roads;
+            if (host_data) roads = std::make_unique<SparseNodeIndex>(MAX_NODE_ID_DEFAULT);
             {
                 auto _mt = std::chrono::steady_clock::now();
                 auto _mc = CpuTicks::now();
@@ -2669,6 +2734,8 @@ static int run(int argc, char* argv[]) {
                     if (refs.empty()) return;
                     bool relation_member = is_admin_way(way_id) || is_poi_way(way_id);
                     const WayTags t = parse_way_tags(tag_keys, tag_vals, ntags, st);
+                    if (roads && t.highway && is_included_highway_full(t.highway, t.footway))
+                        for (int64_t ref : refs.get()) roads->mark(ref);
                     if (!way_needs_nodes(t, relation_member) &&
                         !water_way_wanted(t, is_water_way(way_id), in_waterway(way_id), [&] {
                             const auto& r = refs.get();
@@ -2691,6 +2758,7 @@ static int run(int argc, char* argv[]) {
             std::cerr << "  Pass 2: processing nodes with " << num_threads << " threads..." << std::endl;
             {
                 struct NodeThreadLocal {
+                    tag_bundles::Collections tags;
                     // Strings below are codes into `strings` (kNone: none).
                     StringDict strings;
                     // Address locations as stored (float) and street cells of
@@ -2829,7 +2897,14 @@ static int run(int argc, char* argv[]) {
                                     break;
                             }
                         }
+                        const auto each = tag_bundles::indexed_tags(tag_keys, tag_vals, ntags, st);
+                        const auto key = pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, id);
+                        if (n_place) {
+                            tl_node_data->tags.add(Use::Core, key, each);
+                            tl_node_data->tags.add(Use::Wiki, key, each);
+                        }
                         if (housenumber) {
+                            if (host_data) tl_node_data->tags.add(Use::Address, key, each, roads->contains(id));
                             // Nominatim's IsAddressPoint accepts any
                             // rank-30 row with a housenumber, even
                             // without addr:street — it resolves the
@@ -2863,6 +2938,12 @@ static int run(int argc, char* argv[]) {
                                 n_highway, n_shop, n_landuse, n_emergency, /*footway=*/nullptr, /*area=*/false);
                             const char* name = poi_name(n_name_en, n_name);
                             if (cls && name) {
+                                tl_node_data->tags.add(Use::Poi, key, each);
+                                tl_node_data->tags.add(Use::Wiki, key, each);
+                                if (host_data) {
+                                    tl_node_data->tags.add(Use::PoiAddress, key, each, roads->contains(id));
+                                    tl_node_data->tags.values[size_t(Use::PoiClass)].add(key, tag_bundles::poi_class(each, cls->class_key));
+                                }
                                 PoiRecord pr{};
                                 pr.lat = static_cast<float>(lat);
                                 pr.lng = static_cast<float>(lng);
@@ -2937,6 +3018,8 @@ static int run(int argc, char* argv[]) {
                 });
 
                 // Reset thread_local for next use
+                roads.reset();
+                for (auto& local : ntld) data.search_tags->absorb(local.tags);
                 tl_node_data = nullptr;
                 uint64_t total_nodes = 0;
                 for (const auto& local : ntld) total_nodes += local.nodes;
@@ -3072,6 +3155,7 @@ static int run(int argc, char* argv[]) {
             {
                 // Thread-local data for parallel way processing
                 struct ThreadLocalData {
+                    tag_bundles::Collections tags;
                     std::vector<WayHeader> ways;
                     std::vector<int64_t> way_osm_ids;  // parallel to ways; stable identity for strategy-2 allocator
                     std::vector<NodeCoord> street_nodes;
@@ -3160,6 +3244,8 @@ static int run(int argc, char* argv[]) {
                         tl_way_data = &tld[idx % tld.size()];
                     }
                     auto& local = *tl_way_data;
+                    const auto each = tag_bundles::indexed_tags(tag_keys, tag_vals, ntags, st);
+                    const uint64_t key = way_boundary_id(way_id);
 
                     const WayTags t = parse_way_tags(tag_keys, tag_vals, ntags, st);
                     const char* t_best_name = t.best_name();
@@ -3251,6 +3337,7 @@ static int run(int argc, char* argv[]) {
                                 local.interp_osm_way_ids.push_back(way_id);
                                 local.interp_strings.push_back(local.strings.add(street));
                                 local.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
+                                if (host_data) local.tags.add(Use::Interpolation, key, each);
                                 local.interp_count++;
                             }
                         }
@@ -3320,6 +3407,7 @@ static int run(int argc, char* argv[]) {
                             }
                             local.building_addr_poly_off.push_back(poly_off);
                             local.building_addr_poly_cnt.push_back(poly_cnt);
+                            if (host_data) local.tags.add(Use::Address, key, each);
                             local.building_addr_count++;
                         }
                     }
@@ -3338,6 +3426,7 @@ static int run(int argc, char* argv[]) {
                         local.way_strings.push_back(local.strings.add(t_best_name));
                         local.way_orig_names.push_back(orig_name[0] ? local.strings.add(orig_name) : StringDict::kNone);
                         local.deferred_ways.push_back({wid, noff, header.node_count});
+                        if (host_data) local.tags.add(Use::Street, key, each);
                         local.way_count++;
                     }
 
@@ -3372,6 +3461,12 @@ static int run(int argc, char* argv[]) {
                             t.wikipedia, t.wikidata,
                             t.highway, t.shop, t.landuse, t.emergency, t.footway, /*area=*/true);
                         if (cls) {
+                            local.tags.add(Use::Poi, key, each);
+                            local.tags.add(Use::Wiki, key, each);
+                            if (host_data) {
+                                local.tags.add(Use::PoiAddress, key, each);
+                                local.tags.values[size_t(Use::PoiClass)].add(key, tag_bundles::poi_class(each, cls->class_key));
+                            }
                             // Compute centroid
                             double sum_lat = 0, sum_lng = 0;
                             for (const auto& loc : resolved_locs) {
@@ -3448,6 +3543,8 @@ static int run(int argc, char* argv[]) {
                             if (whole && al >= 2 && al < kMinBoundaryWayLevel) (level == 2 ? local.country_ways : local.dropped_ways)++;
                             if (level != 0 && whole) {
                                 std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
+                                local.tags.add(Use::Core, key, each);
+                                local.tags.add(Use::Wiki, key, each);
                                 local.closed_way_admins.push_back({std::move(verts), std::string(aname), level,
                                                                    level == 2 ? std::string(iso) : std::string(), way_id,
                                                                    static_cast<uint8_t>(boundary_place_value(t.place)),
@@ -3461,6 +3558,8 @@ static int run(int argc, char* argv[]) {
                                 AdminPlaceType pt = classify_place_override(t.place);
                                 if (is_address_place_type(pt) && all_valid && resolved_locs.size() >= 3) {
                                     std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
+                                    local.tags.add(Use::Core, key, each);
+                                    local.tags.add(Use::Wiki, key, each);
                                     local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), way_id,
                                                                        static_cast<uint8_t>(place_value_of(t.place)), way_link_tags(t, way_id)});
                                 }
@@ -3483,12 +3582,15 @@ static int run(int argc, char* argv[]) {
                             && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
                         if (is_place_area_way(t.place) && all_valid && resolved_locs.size() >= 3) {
                             std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
+                            local.tags.add(Use::Core, key, each);
+                            local.tags.add(Use::Wiki, key, each);
                             local.closed_way_admins.push_back({std::move(verts), std::string(t_best_name), uint8_t(15), std::string(),
                                                                way_id, static_cast<uint8_t>(place_value_of(t.place)),
                                                                way_link_tags(t, way_id)});
                         }
                     }
                 });
+                for (auto& local : tld) data.search_tags->absorb(local.tags);
                 tl_way_data = nullptr;
                 std::cerr << "  Parallel way processing complete." << std::endl;
                 if (uint64_t miss = index.unmarked_lookups()) {
@@ -4395,6 +4497,7 @@ static int run(int argc, char* argv[]) {
                   << data.poi_vertices.size() << " polygon vertices)" << std::endl;
         std::cerr << "  " << data.place_nodes.size() << " place nodes" << std::endl;
 
+        data.search_tags->sort(num_threads);
         log_phase("    Release + shrink parsed data", _pt, _cpu);
 
         // The arcs, which every admin dir's geometry is, and the admin cell

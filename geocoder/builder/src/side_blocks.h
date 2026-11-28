@@ -61,6 +61,12 @@ inline constexpr SideFile SIDE_FILES[] = {
     {"interp_postcodes", "interp_postcodes.bin"},
     {"addr_postcodes", "addr_postcodes.bin"},
     {"addr_cities", "addr_cities.bin"},
+    {"place_tags", "place_tags.bin"},
+    {"admin_tags", "admin_tags.bin"},
+    {"poi_tags", "poi_tags.bin"},
+    {"place_imp", "place_imp.bin"},
+    {"admin_imp", "admin_imp.bin"},
+    {"poi_imp", "poi_imp.bin"},
 };
 
 // Every refusal names the file it is of.

@@ -228,6 +228,7 @@ inline std::optional<PoiClassification> classify_poi(
     const char* t_wikipedia, const char* t_wikidata, const char* t_highway,
     const char* t_shop, const char* t_landuse, const char* t_emergency, const char* t_footway, bool area) {
     PoiCategory cat = PoiCategory::UNKNOWN;
+    const char* class_key = nullptr;
 
     // The water rule runs before any category. A water kind is the object's
     // category where a main tag of a lower positive rank ranks it, whatever
@@ -295,6 +296,7 @@ inline std::optional<PoiClassification> classify_poi(
 
     // tourism (highest priority)
     if (cat == PoiCategory::UNKNOWN && t_tourism) {
+        class_key = "tourism";
         if (std::strcmp(t_tourism, "museum") == 0) cat = PoiCategory::MUSEUM;
         else if (std::strcmp(t_tourism, "attraction") == 0) cat = PoiCategory::ATTRACTION;
         else if (std::strcmp(t_tourism, "viewpoint") == 0) cat = PoiCategory::VIEWPOINT;
@@ -322,6 +324,7 @@ inline std::optional<PoiClassification> classify_poi(
     }
     // historic
     if (cat == PoiCategory::UNKNOWN && t_historic) {
+        class_key = "historic";
         if (std::strcmp(t_historic, "castle") == 0) cat = PoiCategory::CASTLE;
         else if (std::strcmp(t_historic, "monument") == 0) cat = PoiCategory::MONUMENT;
         else if (std::strcmp(t_historic, "ruins") == 0) cat = PoiCategory::RUINS;
@@ -345,6 +348,7 @@ inline std::optional<PoiClassification> classify_poi(
     }
     // boundary
     if (cat == PoiCategory::UNKNOWN && t_boundary) {
+        class_key = "boundary";
         if (std::strcmp(t_boundary, "national_park") == 0) cat = PoiCategory::NATIONAL_PARK;
         else if (std::strcmp(t_boundary, "protected_area") == 0) cat = PoiCategory::PROTECTED_AREA;
         // `boundary=forest` (managed-forest admin) folds
@@ -357,6 +361,7 @@ inline std::optional<PoiClassification> classify_poi(
     // of the GENERIC_RANK30 fallback below, so residential/
     // industrial zones don't flood the index.
     if (cat == PoiCategory::UNKNOWN && t_landuse) {
+        class_key = "landuse";
         if (std::strcmp(t_landuse, "forest") == 0) cat = PoiCategory::WOOD;
         else if (std::strcmp(t_landuse, "meadow") == 0) cat = PoiCategory::MEADOW;
         else if (std::strcmp(t_landuse, "orchard") == 0) cat = PoiCategory::ORCHARD;
@@ -377,6 +382,7 @@ inline std::optional<PoiClassification> classify_poi(
     }
     // amenity
     if (cat == PoiCategory::UNKNOWN && t_amenity) {
+        class_key = "amenity";
         if (std::strcmp(t_amenity, "place_of_worship") == 0) cat = PoiCategory::PLACE_OF_WORSHIP;
         else if (std::strcmp(t_amenity, "university") == 0) cat = PoiCategory::UNIVERSITY;
         else if (std::strcmp(t_amenity, "college") == 0) cat = PoiCategory::COLLEGE;
@@ -471,6 +477,7 @@ inline std::optional<PoiClassification> classify_poi(
     }
     // leisure
     if (cat == PoiCategory::UNKNOWN && t_leisure) {
+        class_key = "leisure";
         if (std::strcmp(t_leisure, "park") == 0) cat = PoiCategory::PARK;
         else if (std::strcmp(t_leisure, "swimming_area") == 0) cat = PoiCategory::SWIMMING_AREA;
         else if (std::strcmp(t_leisure, "nature_reserve") == 0) cat = PoiCategory::NATURE_RESERVE;
@@ -494,10 +501,12 @@ inline std::optional<PoiClassification> classify_poi(
     }
     // emergency
     if (cat == PoiCategory::UNKNOWN && t_emergency) {
+        class_key = "emergency";
         if (std::strcmp(t_emergency, "fire_water_pond") == 0) cat = PoiCategory::FIRE_WATER_POND;
     }
     // natural
     if (cat == PoiCategory::UNKNOWN && t_natural) {
+        class_key = "natural";
         if (std::strcmp(t_natural, "peak") == 0) cat = PoiCategory::PEAK;
         else if (std::strcmp(t_natural, "volcano") == 0) cat = PoiCategory::VOLCANO;
         else if (std::strcmp(t_natural, "beach") == 0) cat = PoiCategory::BEACH;
@@ -525,14 +534,17 @@ inline std::optional<PoiClassification> classify_poi(
     }
     // railway
     if (cat == PoiCategory::UNKNOWN && t_railway) {
+        class_key = "railway";
         if (std::strcmp(t_railway, "station") == 0) cat = PoiCategory::STATION;
     }
     // aeroway
     if (cat == PoiCategory::UNKNOWN && t_aeroway) {
+        class_key = "aeroway";
         if (std::strcmp(t_aeroway, "aerodrome") == 0) cat = PoiCategory::AERODROME;
     }
     // man_made
     if (cat == PoiCategory::UNKNOWN && t_man_made) {
+        class_key = "man_made";
         if (std::strcmp(t_man_made, "tower") == 0) cat = PoiCategory::TOWER;
         else if (std::strcmp(t_man_made, "lighthouse") == 0) cat = PoiCategory::LIGHTHOUSE;
         else if (std::strcmp(t_man_made, "windmill") == 0) cat = PoiCategory::WINDMILL;
@@ -546,33 +558,40 @@ inline std::optional<PoiClassification> classify_poi(
     }
     // building
     if (cat == PoiCategory::UNKNOWN && t_building) {
+        class_key = "building";
         if (std::strcmp(t_building, "cathedral") == 0) cat = PoiCategory::CATHEDRAL;
         else if (std::strcmp(t_building, "palace") == 0) cat = PoiCategory::PALACE;
     }
     // craft
     if (cat == PoiCategory::UNKNOWN && t_craft) {
+        class_key = "craft";
         if (std::strcmp(t_craft, "winery") == 0) cat = PoiCategory::WINERY;
         else if (std::strcmp(t_craft, "brewery") == 0) cat = PoiCategory::BREWERY;
     }
     // power
     if (cat == PoiCategory::UNKNOWN && t_power) {
+        class_key = "power";
         if (std::strcmp(t_power, "plant") == 0) cat = PoiCategory::POWER_PLANT;
     }
     // place
     if (cat == PoiCategory::UNKNOWN && t_place) {
+        class_key = "place";
         if (std::strcmp(t_place, "island") == 0 || std::strcmp(t_place, "islet") == 0)
             cat = PoiCategory::ISLAND;
     }
     // waterway
     if (cat == PoiCategory::UNKNOWN && t_waterway) {
+        class_key = "waterway";
         if (std::strcmp(t_waterway, "waterfall") == 0) cat = PoiCategory::WATERFALL;
     }
     // office
     if (cat == PoiCategory::UNKNOWN && t_office) {
+        class_key = "office";
         if (std::strcmp(t_office, "government") == 0) cat = PoiCategory::GOVERNMENT;
     }
     // shop — split common values, fall back to generic SHOP.
     if (cat == PoiCategory::UNKNOWN && t_shop) {
+        class_key = "shop";
         if (std::strcmp(t_shop, "supermarket") == 0) cat = PoiCategory::SHOP_SUPERMARKET;
         else if (std::strcmp(t_shop, "convenience") == 0) cat = PoiCategory::SHOP_CONVENIENCE;
         else if (std::strcmp(t_shop, "clothes") == 0) cat = PoiCategory::SHOP_CLOTHES;
@@ -608,6 +627,15 @@ inline std::optional<PoiClassification> classify_poi(
             t_natural || t_aeroway || t_railway || t_power ||
             t_shop) {
             cat = PoiCategory::GENERIC_RANK30;
+            // The generic category folds several main tags into one. Keep
+            // the first of the qualifying raw keys for the host row.
+            for (const auto& [key, value] : {std::pair{"amenity", t_amenity}, {"tourism", t_tourism},
+                    {"historic", t_historic}, {"leisure", t_leisure}, {"man_made", t_man_made},
+                    {"craft", t_craft}, {"office", t_office}, {"waterway", t_waterway},
+                    {"natural", t_natural}, {"aeroway", t_aeroway}, {"railway", t_railway},
+                    {"power", t_power}, {"shop", t_shop}}) {
+                if (value && std::strcmp(value, "no") != 0) { class_key = key; break; }
+            }
             auto is = [](const char* v, const char* value) { return v && std::strcmp(v, value) == 0; };
             const bool natural30 = is(t_natural, "tree") || is(t_natural, "rock") || is(t_natural, "stone");
             below_rank30 = yielded == PoiCategory::UNKNOWN && kept == PoiCategory::UNKNOWN &&
@@ -666,5 +694,7 @@ inline std::optional<PoiClassification> classify_poi(
     }
     if (tier > POI_MAX_SHIPPED_TIER) return std::optional<PoiClassification>{};
 
-    return PoiClassification{cat, tier, flags, yielded};
+    if (cat == kind && kind != PoiCategory::UNKNOWN)
+        class_key = kind == PoiCategory::RESERVOIR ? "landuse" : "natural";
+    return PoiClassification{cat, tier, flags, yielded, class_key};
 }

@@ -399,6 +399,7 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
     data.admin_links.clear();
     data.place_claims.clear();
     data.place_node_links.clear();
+    std::vector<std::pair<uint64_t, std::string>> linked_names;
     for (size_t k = 0; k < objects.size(); k++) {
         const AdminObject& o = objects[k];
         const PlaceLink& link = links[k];
@@ -424,6 +425,9 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
             }
             // Every copy of the node, as two overlapping extracts list it twice.
             const uint64_t node_id = pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, c.node);
+            const auto& tags = *data.search_tags;
+            linked_names.emplace_back(o.id, tag_bundles::merge_linked(tags.get(tag_bundles::Use::Core, o.id),
+                tags.get(tag_bundles::Use::Core, node_id), country_language(node_country[link.candidate])));
             for (auto p = std::lower_bound(place_at.begin(), place_at.end(), std::make_pair(node_id, uint32_t(0)));
                  p != place_at.end() && p->first == node_id; ++p)
                 data.place_node_links.push_back({p->second, o.id});
@@ -437,6 +441,7 @@ LinkStats find_linked_places(ParsedData& data, const RankLookups& lookups, unsig
         data.place_claims.push_back({pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, nodes[i].node), objects[claimant[i]].id});
         stats.claimed++;
     }
+    data.search_tags->stores[size_t(tag_bundles::Use::Core)].replace(linked_names, threads);
     sort_place_node_links(data.place_node_links);
     candidates = LinkCandidates{};
     return stats;

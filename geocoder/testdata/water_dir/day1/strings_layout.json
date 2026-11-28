@@ -4,6 +4,8 @@
     {"name": "street", "file": "strings_street.bin", "start": 32, "end": 32},
     {"name": "addr", "file": "strings_addr.bin", "start": 32, "end": 32},
     {"name": "postcode", "file": "strings_postcode.bin", "start": 32, "end": 32},
-    {"name": "poi", "file": "strings_poi.bin", "start": 32, "end": 32}
+    {"name": "poi", "file": "strings_poi.bin", "start": 32, "end": 32},
+    {"name": "tags_core", "file": "strings_tags_core.bin", "start": 32, "end": 32},
+    {"name": "tags_poi", "file": "strings_tags_poi.bin", "start": 32, "end": 32}
   ]
 }

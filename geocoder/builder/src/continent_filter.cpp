@@ -84,6 +84,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     PlanetRecords records) {
 
     ParsedData out;
+    out.search_tags = full.search_tags;
     auto _ft = std::chrono::steady_clock::now();
     auto _fc = CpuTicks::now();
     const bool consume = records == PlanetRecords::Consume;
