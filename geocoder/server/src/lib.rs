@@ -1144,13 +1144,13 @@ impl StringPool {
             .map_err(|e| format!("Failed to parse {}: {}", layout_path, e))?;
         let entries = v.get("tiers").and_then(|t| t.as_array())
             .ok_or_else(|| format!("{}: missing 'tiers' array", layout_path))?;
-        if entries.len() != STR_TIER_COUNT {
-            return Err(format!("{}: expected {} tier entries, got {}",
+        if entries.len() < STR_TIER_COUNT {
+            return Err(format!("{}: expected at least {} tier entries, got {}",
                 layout_path, STR_TIER_COUNT, entries.len()));
         }
         let mut bases = [0u32; STR_TIER_COUNT + 1];
         let mut tiers: [Option<strings::Tier>; STR_TIER_COUNT] = Default::default();
-        for (t, entry) in entries.iter().enumerate() {
+        for (t, entry) in entries.iter().take(STR_TIER_COUNT).enumerate() {
             let start = entry.get("start").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             let end   = entry.get("end").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             bases[t] = start;

@@ -26,7 +26,7 @@ use std::sync::Arc;
 /// tiers of their names (the polygons' own names beside them among them) and the boundary
 /// geometry its label points come from, the boundary tier's own arcs among it (the records and
 /// rings are the same in every tier).
-pub const DATASET_FILES: [&str; 12] = [
+pub const DATASET_FILES: [&str; 20] = [
     "admin_own_names.bin",
     "admin_polygons.bin",
     "admin_rings.bin",
@@ -39,7 +39,77 @@ pub const DATASET_FILES: [&str; 12] = [
     "strings_core.bin",
     "strings_layout.json",
     "strings_poi.bin",
+    TAG_TIERS[0], TAG_TIERS[1],
+    PLACE_TAGS_FILE, ADMIN_TAGS_FILE, POI_TAGS_FILE,
+    IMPORTANCE_FILES[0], IMPORTANCE_FILES[1], IMPORTANCE_FILES[2],
 ];
+
+/// Search-only files. Opening reverse data never reads a bundle or importance column.
+#[derive(Default)]
+pub struct SearchFiles {
+    tiers: [Option<(u32, query_server::strings::Tier)>; 2],
+    tags: [Option<query_server::side_blocks::SideBlocks>; 3],
+    wiki: [Option<query_server::side_blocks::SideBlocks>; 3],
+}
+
+impl SearchFiles {
+    pub fn open(dir: &Path, geo: &Index) -> Result<Self, String> {
+        let mut files = Self::default();
+        let counts = [geo.place_node_count(), geo.admin_polygon_count(), geo.poi_records.as_ref().map_or(0, |p| p.len())];
+        let optional = |name: &str| {
+            let path = dir.join(name);
+            if !path.try_exists().map_err(|e| e.to_string())? { return Ok(None); }
+            query_server::mmap_file(path.to_str().ok_or("invalid dataset path")?).map(Some)
+        };
+        for (i, name) in [PLACE_TAGS_FILE, ADMIN_TAGS_FILE, POI_TAGS_FILE].into_iter().enumerate() {
+            for (file, col) in [(name, &mut files.tags[i]), (IMPORTANCE_FILES[i], &mut files.wiki[i])] {
+                if let Some(bytes) = optional(file)? {
+                    let side = query_server::side_blocks::SideBlocks::open(bytes, file)?;
+                    if side.count() != counts[i] { return Err(format!("{file} has {} rows, expected {}", side.count(), counts[i])); }
+                    *col = Some(side);
+                }
+            }
+        }
+        for (i, name) in TAG_TIERS.into_iter().enumerate() {
+            if let Some(bytes) = optional(name)? {
+                let layout: Value = serde_json::from_reader(File::open(dir.join("strings_layout.json")).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+                let entry = layout["tiers"].as_array().and_then(|ts| ts.iter().find(|t| t["file"] == name))
+                    .ok_or_else(|| format!("missing layout for {name}"))?;
+                let bounds = |field: &str| entry[field].as_u64().and_then(|u| u32::try_from(u).ok()).ok_or_else(|| format!("bad {field} for {name}"));
+                let tier = query_server::strings::Tier::open(bytes)?;
+                let base = bounds("start")?;
+                if tier.len() > bounds("end")?.checked_sub(base).ok_or("reversed tier bounds")? {
+                    return Err(format!("{name} exceeds its layout"));
+                }
+                files.tiers[i] = Some((base, tier));
+            }
+        }
+        Ok(files)
+    }
+
+    /// Place rows, admin slots and POI rows respectively.
+    pub fn bundle(&self, kind: crate::model::Kind, row: u32) -> Option<crate::tags::TagBundle<'_>> {
+        let k = Self::column(kind);
+        let offset = self.tags[k].as_ref()?.get(row)?;
+        let (base, tier) = self.tiers[usize::from(k == 2)].as_ref()?;
+        crate::tags::TagBundle::parse(tier.get(offset.checked_sub(*base)?))
+    }
+
+    pub fn wiki_importance(&self, kind: crate::model::Kind, row: u32) -> Option<u32> {
+        self.wiki[Self::column(kind)].as_ref()?.get(row).filter(|&v| v != 0)
+    }
+
+    fn column(kind: crate::model::Kind) -> usize {
+        use crate::model::Kind;
+        match kind { Kind::Place | Kind::Minor => 0, Kind::Area | Kind::Linked => 1, Kind::Poi => 2 }
+    }
+}
+
+/// Opens a host column only for the full profile that consumes it.
+pub fn host_tags(path: &Path) -> Result<crate::tags::TagBlob, String> {
+    crate::tags::TagBlob::open(query_server::mmap_file(path.to_str().ok_or("invalid host file path")?)?)
+}
 
 /// The sha256 (hex) of each dataset file present, by name.
 pub type Fingerprint = BTreeMap<String, String>;
@@ -269,6 +339,7 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
     let held = HeldIndexDir::take(index, Contended::Wait)?;
     let cache = index.join(HASH_CACHE_FILE);
     let mut hashes = HashCache::load(&cache);
+    let search_files = SearchFiles::open(dir, geo)?;
     let have = fingerprint_loaded(dir, loaded, &mut hashes)?;
 
     // Held, so an unfinished publish is a dead build's: some files there may be its own and some
@@ -298,7 +369,8 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
     // Only saves a later open the hashing; a read-only index dir is fine.
     let _ = hashes.save(&cache);
     // Mapped while held: files a later build moves in are new ones, these stay as mapped.
-    let opened = SearchIndex::open(geo, index, None, None)?;
+    let mut opened = SearchIndex::open(geo, index, None, None)?;
+    opened.search_files = search_files;
     drop(held);
     Ok((opened, origin))
 }
