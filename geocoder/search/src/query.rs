@@ -2,7 +2,15 @@
 //! context, importance ranking, de-duplication, settlements before same-named areas) over the
 //! mapped index. Context is not stored: a candidate's country / state / county / city come from
 //! reverse geocoding its point with the geocoder itself, only for the candidates that need it.
+pub mod assign;
+pub mod lookup;
+pub mod phrases;
 pub mod plan;
+#[cfg(test)]
+mod plan_tests;
+#[cfg(test)]
+mod readings;
+pub mod tokenize;
 
 use crate::build::prefix_text;
 use crate::constants::*;

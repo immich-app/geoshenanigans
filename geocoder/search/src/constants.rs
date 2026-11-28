@@ -217,3 +217,149 @@ pub const REF_MAX_CHARS: usize = 40;
 /// The pattern a place's postcode is read by in a country of postcodes and no pattern of its own
 /// (the clean-postcodes default-pattern of Nominatim's settings/sanitizers.yaml).
 pub const POSTCODE_DEFAULT_PATTERN: &str = "[A-Z0-9- ]{3,12}";
+
+// ---- reading a query (query/): Nominatim's penalties, thresholds and limits, each named after
+// the line of Nominatim's search/ that sets it
+/// A query is split into phrases at this character (core.py:280).
+pub const PHRASE_SEPARATOR: char = ',';
+/// A phrase of this many characters or more reads as nothing (settings/query_preprocessing.yaml).
+pub const PHRASE_MAX_CHARS: usize = 500;
+/// A query of more token slots than this is refused (icu_tokenizer.py:132).
+pub const QUERY_MAX_SLOTS: usize = 50;
+/// A node's token of this many characters or more makes no node (icu_tokenizer.py:222).
+pub const NODE_TOKEN_MAX_CHARS: usize = 256;
+/// Penalties of the break before a node (query.py:93-101): the query's start and end and a
+/// phrase break; a word break; a break inside a word; between the terms of one written word.
+pub const BREAK_PENALTY_PHRASE: f64 = -0.5;
+pub const BREAK_PENALTY_WORD: f64 = 0.1;
+pub const BREAK_PENALTY_PART: f64 = 0.2;
+pub const BREAK_PENALTY_TOKEN: f64 = 0.4;
+/// Coordinates in a nominatim-mode query make a point results lie within this many degrees of
+/// (v1/server_glue.py:313).
+pub const NEAR_RADIUS_DEG: f64 = 0.1;
+/// N-grams a query's words are looked up as: at most this many nodes and characters
+/// (query.py:474-480).
+pub const NGRAM_MAX_NODES: usize = 20;
+pub const NGRAM_MAX_CHARS: usize = 255;
+/// A node's partial is missing at this penalty or more (query.py:184, icu_tokenizer.py:224).
+pub const PARTIAL_MISSING_PENALTY: f64 = 10.0;
+/// Base penalties of a looked-up token (icu_tokenizer.py:60-72): a partial word; a full name of
+/// one character, a digit or not; each character of a house number other than digits and
+/// spaces, and each character but one of a house number without digits; a country of one
+/// character.
+pub const PARTIAL_PENALTY: f64 = 0.3;
+pub const WORD_ONE_DIGIT_PENALTY: f64 = 0.2;
+pub const WORD_ONE_CHAR_PENALTY: f64 = 0.3;
+pub const HOUSENUMBER_NON_DIGIT_PENALTY: f64 = 0.1;
+pub const HOUSENUMBER_NO_DIGIT_PENALTY: f64 = 0.2;
+pub const COUNTRY_ONE_CHAR_PENALTY: f64 = 0.3;
+/// A whole word of at most this many digits and no house-number term reads as a house number at
+/// this penalty (icu_tokenizer.py:244-262).
+pub const DIGITS_HOUSENUMBER_MAX_CHARS: usize = 4;
+pub const DIGITS_HOUSENUMBER_PENALTY: f64 = 0.2;
+/// Where a postcode can be read, every other token pays this, but a house number whose first
+/// word has at most POSTCODE_RERANK_HOUSENUMBER_MAX_CHARS characters (icu_tokenizer.py:270-279).
+pub const POSTCODE_RERANK_PENALTY: f64 = 0.39;
+pub const POSTCODE_RERANK_HOUSENUMBER_MAX_CHARS: usize = 4;
+/// Where a house number of at most this many characters with a digit can be read, every other
+/// token pays SIMPLE_HOUSENUMBER_PENALTY less the house number's own (icu_tokenizer.py:282-291).
+pub const SIMPLE_HOUSENUMBER_MAX_CHARS: usize = 3;
+pub const SIMPLE_HOUSENUMBER_PENALTY: f64 = 0.5;
+/// A token other than a name or a partial pays this many times its match penalty
+/// (icu_tokenizer.py:299-300).
+pub const MATCH_PENALTY_FACTOR_OTHER: f64 = 2.0;
+/// The photon mode's last-word completions, and near spellings, looked up per kind and n-gram.
+pub const PREFIX_TERMS_MAX: usize = 64;
+pub const FUZZY_TERMS_MAX: usize = 64;
+/// Photon's AUTO fuzziness (SearchQueryBuilder.java:47-49, 113): no edit in a query shorter than
+/// TYPO_MIN_QUERY_CHARS; per word, one edit from TYPO_ONE_EDIT_MIN_CHARS characters and two from
+/// TYPO_TWO_EDITS_MIN_CHARS; the first TYPO_ANCHOR_SHORT characters kept as typed in a word of at
+/// most TYPO_ANCHOR_SHORT_MAX_CHARS, TYPO_ANCHOR_LONG in a longer one.
+pub const TYPO_MIN_QUERY_CHARS: usize = 4;
+pub const TYPO_ONE_EDIT_MIN_CHARS: usize = 3;
+pub const TYPO_TWO_EDITS_MIN_CHARS: usize = 6;
+pub const TYPO_ANCHOR_SHORT_MAX_CHARS: usize = 6;
+pub const TYPO_ANCHOR_SHORT: usize = 1;
+pub const TYPO_ANCHOR_LONG: usize = 2;
+/// The direction a query is read in is told for at most this many token slots, from two slots'
+/// difference over DIRECTION_TWO_SLOT_DIVISOR or a regression over more (query.py:24-25, 383-396).
+pub const DIRECTION_MAX_SLOTS: usize = 50;
+pub const DIRECTION_TWO_SLOT_DIVISOR: f64 = 3.0;
+/// Readings (token_assignment.py): a house number with two partial ranges on the side its
+/// reading puts the name pays HOUSENUMBER_TWO_PRIORS_PENALTY, one with more is no reading
+/// (:210-243); one with a near item pays HOUSENUMBER_NEAR_ITEM_PENALTY (:244-245).
+pub const HOUSENUMBER_PRIORS_MAX: usize = 2;
+pub const HOUSENUMBER_TWO_PRIORS_PENALTY: f64 = 0.8;
+pub const HOUSENUMBER_NEAR_ITEM_PENALTY: f64 = 1.0;
+/// A postcode search with an address pays POSTCODE_LATE_PENALTY when the postcode comes last and
+/// POSTCODE_EXTRA_ADDRESS_PENALTY for each address range past the first (:256-265); an address
+/// reading with the postcode first pays POSTCODE_FIRST_PENALTY (:379-381).
+pub const POSTCODE_LATE_PENALTY: f64 = 0.1;
+pub const POSTCODE_EXTRA_ADDRESS_PENALTY: f64 = 0.1;
+pub const POSTCODE_FIRST_PENALTY: f64 = 0.1;
+/// A name split off the first range pays SPLIT_PENALTY with a house number after it or commas in
+/// the query; one split off the last range SPLIT_AFTER_HOUSENUMBER_PENALTY with a house number
+/// before it and SPLIT_PENALTY with commas (:297-301, 343-346).
+pub const SPLIT_PENALTY: f64 = 0.25;
+pub const SPLIT_AFTER_HOUSENUMBER_PENALTY: f64 = 0.4;
+/// The house-number search of a reading costs its best address reading's penalty, at most its own
+/// plus HOUSENUMBER_READING_SPAN, and HOUSENUMBER_READING_PENALTY more (:383, 397-399).
+pub const HOUSENUMBER_READING_SPAN: f64 = 2.0;
+pub const HOUSENUMBER_READING_PENALTY: f64 = 0.1;
+/// Searches (db_search_builder.py): a name ranking's default is its partials' penalties plus
+/// RANKING_PARTIALS_PENALTY (:309, 351); an address ranking's the cheapest cover by partials plus
+/// RANKING_ADDRESS_DEFAULT_PENALTY (:357), its covers counted up to RANKING_ADDRESS_MAX_VARIANTS
+/// (:348).
+pub const RANKING_PARTIALS_PENALTY: f64 = 0.2;
+pub const RANKING_ADDRESS_DEFAULT_PENALTY: f64 = 0.3;
+pub const RANKING_ADDRESS_MAX_VARIANTS: usize = 10;
+/// A postcode search without a country pays this (:145).
+pub const POSTCODE_SEARCH_NO_COUNTRY_PENALTY: f64 = 0.1;
+/// A house-number search looks its numbers up below this many expected rows (:169); else its
+/// address partials by LOOKUP_HOUSENUMBER_LIMIT and _FACTOR (:175, 180), else at most
+/// HOUSENUMBER_SEARCH_MAX_FULLS full names of its first address range (:184).
+pub const HOUSENUMBER_LOOKUP_MAX_COUNT: u64 = 10_000;
+pub const LOOKUP_HOUSENUMBER_LIMIT: u64 = 20_000;
+pub const LOOKUP_HOUSENUMBER_FACTOR: u64 = 5;
+pub const HOUSENUMBER_SEARCH_MAX_FULLS: usize = 5;
+/// How many partials drive a lookup: the fewest of the rarest whose expected rows stay below a
+/// limit that grows by a factor with each one (db_search_fields.py:36-57), at most
+/// LOOKUP_TERMS_MAX; a term of count 1 has no statistics and sorts as COUNT_WITHOUT_STATISTICS
+/// (:25-31). A name alone (db_search_builder.py:230); a name and an address (:254-255), and both
+/// again when both are too frequent (:271-272).
+pub const LOOKUP_TERMS_MAX: usize = 3;
+pub const COUNT_WITHOUT_STATISTICS: u64 = 100_000;
+pub const LOOKUP_NAME_LIMIT: u64 = 30_000;
+pub const LOOKUP_NAME_FACTOR: u64 = 6;
+pub const LOOKUP_ADDRESS_NAME_LIMIT: u64 = 20_000;
+pub const LOOKUP_ADDRESS_NAME_FACTOR: u64 = 6;
+pub const LOOKUP_ADDRESS_LIMIT: u64 = 10_000;
+pub const LOOKUP_ADDRESS_FACTOR: u64 = 3;
+pub const LOOKUP_FREQUENT_NAME_LIMIT: u64 = 50_000;
+pub const LOOKUP_FREQUENT_NAME_FACTOR: u64 = 10;
+pub const LOOKUP_FREQUENT_ADDRESS_LIMIT: u64 = 30_000;
+pub const LOOKUP_FREQUENT_ADDRESS_FACTOR: u64 = 5;
+/// The rows a lookup of all a name's or an address's partials is expected to find: its rarest
+/// term's count over this factor for each other term (:233, 244, 280, 286).
+pub const EXPECTED_NAME_FACTOR: u64 = 5;
+pub const EXPECTED_ADDRESS_FACTOR: u64 = 3;
+/// A name too frequent to look up by its partials: by its full names below
+/// FULLS_NAME_MAX_COUNT, else by its partials at PARTIALS_LOOKUP_PENALTY below
+/// PARTIALS_LOOKUP_MAX_COUNT (:236-247).
+pub const FULLS_NAME_MAX_COUNT: u64 = 50_000;
+pub const PARTIALS_LOOKUP_PENALTY: f64 = 1.0;
+pub const PARTIALS_LOOKUP_MAX_COUNT: u64 = 50_000;
+/// A name and an address both too frequent: by the name's full names below
+/// FULLS_ADDRESS_MAX_COUNT, the other lookups paying FULLS_FIRST_PENALTY more, all
+/// FREQUENT_PENALTY more (:257-272); by name and address partials together at
+/// BOTH_PARTIALS_PENALTY below BOTH_PARTIALS_MAX_COUNT, at most BOTH_PARTIALS_TERMS of each
+/// (:287-297).
+pub const FULLS_ADDRESS_MAX_COUNT: u64 = 80_000;
+pub const FULLS_FIRST_PENALTY: f64 = 0.2;
+pub const FREQUENT_PENALTY: f64 = 0.4;
+pub const BOTH_PARTIALS_PENALTY: f64 = 0.5;
+pub const BOTH_PARTIALS_MAX_COUNT: u64 = 50_000;
+pub const BOTH_PARTIALS_TERMS: usize = 3;
+/// At most this many searches run (geocoder.py:310), and with a [class=type] near query only
+/// that many are wrapped (geocoder.py:276).
+pub const SEARCHES_MAX: usize = 50;
