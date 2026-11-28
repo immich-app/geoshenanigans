@@ -308,3 +308,60 @@ pub const SPLIT_AFTER_HOUSENUMBER_PENALTY: f64 = 0.4;
 /// plus HOUSENUMBER_READING_SPAN, and HOUSENUMBER_READING_PENALTY more (:383, 397-399).
 pub const HOUSENUMBER_READING_SPAN: f64 = 2.0;
 pub const HOUSENUMBER_READING_PENALTY: f64 = 0.1;
+/// Searches (db_search_builder.py): a name ranking's default is its partials' penalties plus
+/// RANKING_PARTIALS_PENALTY (:309, 351); an address ranking's the cheapest cover by partials plus
+/// RANKING_ADDRESS_DEFAULT_PENALTY (:357), its covers counted up to RANKING_ADDRESS_MAX_VARIANTS
+/// (:348).
+pub const RANKING_PARTIALS_PENALTY: f64 = 0.2;
+pub const RANKING_ADDRESS_DEFAULT_PENALTY: f64 = 0.3;
+pub const RANKING_ADDRESS_MAX_VARIANTS: usize = 10;
+/// A postcode search without a country pays this (:145).
+pub const POSTCODE_SEARCH_NO_COUNTRY_PENALTY: f64 = 0.1;
+/// A house-number search looks its numbers up below this many expected rows (:169); else its
+/// address partials by LOOKUP_HOUSENUMBER_LIMIT and _FACTOR (:175, 180), else at most
+/// HOUSENUMBER_SEARCH_MAX_FULLS full names of its first address range (:184).
+pub const HOUSENUMBER_LOOKUP_MAX_COUNT: u64 = 10_000;
+pub const LOOKUP_HOUSENUMBER_LIMIT: u64 = 20_000;
+pub const LOOKUP_HOUSENUMBER_FACTOR: u64 = 5;
+pub const HOUSENUMBER_SEARCH_MAX_FULLS: usize = 5;
+/// How many partials drive a lookup: the fewest of the rarest whose expected rows stay below a
+/// limit that grows by a factor with each one (db_search_fields.py:36-57), at most
+/// LOOKUP_TERMS_MAX; a term of count 1 has no statistics and sorts as COUNT_WITHOUT_STATISTICS
+/// (:25-31). A name alone (db_search_builder.py:230); a name and an address (:254-255), and both
+/// again when both are too frequent (:271-272).
+pub const LOOKUP_TERMS_MAX: usize = 3;
+pub const COUNT_WITHOUT_STATISTICS: u64 = 100_000;
+pub const LOOKUP_NAME_LIMIT: u64 = 30_000;
+pub const LOOKUP_NAME_FACTOR: u64 = 6;
+pub const LOOKUP_ADDRESS_NAME_LIMIT: u64 = 20_000;
+pub const LOOKUP_ADDRESS_NAME_FACTOR: u64 = 6;
+pub const LOOKUP_ADDRESS_LIMIT: u64 = 10_000;
+pub const LOOKUP_ADDRESS_FACTOR: u64 = 3;
+pub const LOOKUP_FREQUENT_NAME_LIMIT: u64 = 50_000;
+pub const LOOKUP_FREQUENT_NAME_FACTOR: u64 = 10;
+pub const LOOKUP_FREQUENT_ADDRESS_LIMIT: u64 = 30_000;
+pub const LOOKUP_FREQUENT_ADDRESS_FACTOR: u64 = 5;
+/// The rows a lookup of all a name's or an address's partials is expected to find: its rarest
+/// term's count over this factor for each other term (:233, 244, 280, 286).
+pub const EXPECTED_NAME_FACTOR: u64 = 5;
+pub const EXPECTED_ADDRESS_FACTOR: u64 = 3;
+/// A name too frequent to look up by its partials: by its full names below
+/// FULLS_NAME_MAX_COUNT, else by its partials at PARTIALS_LOOKUP_PENALTY below
+/// PARTIALS_LOOKUP_MAX_COUNT (:236-247).
+pub const FULLS_NAME_MAX_COUNT: u64 = 50_000;
+pub const PARTIALS_LOOKUP_PENALTY: f64 = 1.0;
+pub const PARTIALS_LOOKUP_MAX_COUNT: u64 = 50_000;
+/// A name and an address both too frequent: by the name's full names below
+/// FULLS_ADDRESS_MAX_COUNT, the other lookups paying FULLS_FIRST_PENALTY more, all
+/// FREQUENT_PENALTY more (:257-272); by name and address partials together at
+/// BOTH_PARTIALS_PENALTY below BOTH_PARTIALS_MAX_COUNT, at most BOTH_PARTIALS_TERMS of each
+/// (:287-297).
+pub const FULLS_ADDRESS_MAX_COUNT: u64 = 80_000;
+pub const FULLS_FIRST_PENALTY: f64 = 0.2;
+pub const FREQUENT_PENALTY: f64 = 0.4;
+pub const BOTH_PARTIALS_PENALTY: f64 = 0.5;
+pub const BOTH_PARTIALS_MAX_COUNT: u64 = 50_000;
+pub const BOTH_PARTIALS_TERMS: usize = 3;
+/// At most this many searches run (geocoder.py:310), and with a [class=type] near query only
+/// that many are wrapped (geocoder.py:276).
+pub const SEARCHES_MAX: usize = 50;

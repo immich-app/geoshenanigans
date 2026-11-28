@@ -1,41 +1,31 @@
-# Nominatim's readings of a few queries, from its debug=1 pages: the word tokens (type, span,
-# token, lookup word, penalty, count, addr_count, info), the direction penalty and every search
-# each reading built (penalty, lookups, house numbers, postcodes, countries, qualifiers,
-# categories, rankings), word ids left out. "oracle" pages are the local oracle's (master
-# 52f78eba on oracle-b, 2026-11-28), "public" ones nominatim.openstreetmap.org's (2026-11-25).
-# Written by golden_testdata.py; the reading tests seed their terms with the tokens.
+# Tokens and directions from Nominatim debug=1. Local traces use oracle-b, master 52f78eba.
+# Public traces (2026-11-25) also include every abstract search, to the page's precision.
 query	FUTO Austin	futo-public	public
-token	w	0	1	futo	futo	0.3	191	5617	
-token	w	1	2	austin	austin	0.3	10308	75598	
+token	w	0	1	futo	futo	0.3	191	5617
+token	w	1	2	austin	austin	0.3	10308	75598
 token	W	0	1	futo	フト	2.0	1	5250	{'addr_count': 5250}
 token	W	0	1	futo	フト	2.0	1	5250	{'lookup': 'フト', 'addr_count': 5250}
 token	W	0	1	futo	futo	0.0	6	1	{'count': 6}
 token	W	0	1	futo	ふと	2.0	2	1	{'count': 2}
 token	W	1	2	austin	austin	0.0	92	61263	{'count': 92, 'addr_count': 61263}
 direction	0.0290353146049806
-search	0.9 | LookupAll(name_vector[[P]futo]) |  |  |  |  |  | 
-search	 | Restrict(name_vector[[P]austin]) |  |  |  |  |  | 
+search	0.9 | LookupAll(name_vector[[P]futo]) |  |  |  |  |  |
+search	 | Restrict(name_vector[[P]austin]) |  |  |  |  |  |
 search	0.258 | LookupAll(name_vector[[P]futo]) |  |  |  |  |  | nameaddress_vector([[W]austin]^0,def=0.6)
 search	 | Restrict(nameaddress_vector[[P]austin]) |  |  |  |  |  | name_vector([[W]futo]^0,[[W]フト]^2,[[W]フト]^2,[[W]ふと]^2,def=0.5)
 search	0.2 | LookupAll(nameaddress_vector[[P]futo]) |  |  |  |  |  | nameaddress_vector([[W]futo]^0,[[W]フト]^2,[[W]フト]^2,[[W]ふと]^2,def=0.6)
 search	 | Restrict(name_vector[[P]austin]) |  |  |  |  |  | name_vector([[W]austin]^0,def=0.5)
 query	FUTO Austin	futo	oracle
-token	w	0	1	futo	futo	0.3	1	1	
-token	w	1	2	austin	austin	0.3	2818	56467	
+token	w	0	1	futo	futo	0.3	1	1
+token	w	1	2	austin	austin	0.3	2818	56467
 token	W	0	1	futo	futo	0.0	1	1	{}
 token	W	1	2	austin	austin	0.0	16	55241	{'count': 16, 'addr_count': 55241}
 direction	-0.15082229906384415
-search	0.9 | LookupAll(name_vector[[P]austin]) |  |  |  |  |  | 
-search	 | Restrict(name_vector[[P]futo]) |  |  |  |  |  | 
-search	0.2 | LookupAll(name_vector[[P]futo]) |  |  |  |  |  | nameaddress_vector([[W]austin]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]austin]) |  |  |  |  |  | name_vector([[W]futo]^0,def=0.5)
-search	0.502 | LookupAll(nameaddress_vector[[P]futo]) |  |  |  |  |  | nameaddress_vector([[W]futo]^0,def=0.6)
-search	 | Restrict(name_vector[[P]austin]) |  |  |  |  |  | name_vector([[W]austin]^0,def=0.5)
 query	1044 Liberty Park Drive	liberty	oracle
-token	w	0	1	1044	1044	1.4700000000000002	39	100	
-token	w	1	2	liberty	liberty	0.3	1060	10787	
-token	w	2	3	park	park	0.3	32610	51438	
-token	w	3	4	drive	drive	0.3	195110	79654	
+token	w	0	1	1044	1044	1.4700000000000002	39	100
+token	w	1	2	liberty	liberty	0.3	1060	10787
+token	w	2	3	park	park	0.3	32610	51438
+token	w	3	4	drive	drive	0.3	195110	79654
 token	H	0	1	1044	1044	0.0	16	1	{'count': 16, 'lookup': '1044'}
 token	W	0	1	1044	1044	0.39	16	99	{'count': 16, 'addr_count': 99}
 token	P	0	1	1044	1044	0.0	1	1	None
@@ -51,88 +41,16 @@ token	Q	2	3	park	park	0.0	1	1	{'op': None, 'type': 'park', 'class': 'leisure'}
 token	W	2	4	park drive	park drive	0.0	134	14	{'count': 134, 'addr_count': 14}
 token	W	3	4	drive	drive	0.0	5	2	{'count': 5, 'addr_count': 2}
 direction	0.1587092741278001
-search	2.87 | LookupAll(name_vector[[P]1044]) |  |  |  |  |  | 
-search	 | Restrict(name_vector[[P]liberty,[P]park,[P]drive]) |  |  |  |  |  | 
-search	0.907 | LookupAll(name_vector[[P]1044]) |  |  |  |  |  | nameaddress_vector([[W]liberty park drive]^0,[[W]liberty park,[W]drive]^0.1,[[W]liberty,[...,def=2.1)
-search	 | Restrict(nameaddress_vector[[P]liberty,[P]park,[P]drive]) |  |  |  |  |  | name_vector([[W]1044]^0,def=1.28)
-search	2.59 | LookupAll(name_vector[[P]1044]) |  |  |  |  |  | nameaddress_vector([[W]park drive]^0,[[W]park,[W]drive]^0.1,[[W]park]^0.4,[[W]drive...,def=1)
-search	 | Restrict(name_vector[[P]liberty]) |  |  |  |  |  | 
-search	 | Restrict(nameaddress_vector[[P]park,[P]drive]) |  |  |  |  |  | 
-search	2.99 | LookupAll(name_vector[[P]1044]) |  |  |  |  |  | nameaddress_vector([[W]drive]^0,def=0.6)
-search	 | Restrict(name_vector[[P]liberty,[P]park]) |  |  |  |  |  | 
-search	 | Restrict(nameaddress_vector[[P]drive]) |  |  |  |  |  | 
-search	0.59 | LookupAll(nameaddress_vector[[P]1044]) |  |  |  |  |  | nameaddress_vector([[W]1044]^0,def=1.38)
-search	 | Restrict(name_vector[[P]liberty,[P]park,[P]drive]) |  |  |  |  |  | name_vector([[W]liberty park drive]^0,def=1.3)
-search	0.69 | LookupAll(nameaddress_vector[[P]1044]) |  |  |  |  |  | nameaddress_vector([[W]1044,[W]liberty]^0,[[W]1044]^0.3,[[W]liberty]^1.08,def=1.68)
-search	 | Restrict(nameaddress_vector[[P]liberty]) |  |  |  |  |  | name_vector([[W]park drive]^0,def=0.9)
-search	 | Restrict(name_vector[[P]park,[P]drive]) |  |  |  |  |  | 
-search	0.69 | LookupAll(nameaddress_vector[[P]1044]) |  |  |  |  |  | nameaddress_vector([[W]1044,[W]liberty park]^0,[[W]1044,[W]liberty,[W]park]^0.1...,def=2.08)
-search	 | Restrict(nameaddress_vector[[P]liberty,[P]park]) |  |  |  |  |  | name_vector([[W]drive]^0,def=0.5)
-search	 | Restrict(name_vector[[P]drive]) |  |  |  |  |  | 
-search	2.47 | LookupAll(name_vector[[P]1044]) |  |  |  | ('leisure', 'park')^0.0 |  | nameaddress_vector([[W]drive]^0,def=0.6)
-search	 | Restrict(name_vector[[P]liberty]) |  |  |  |  |  | 
-search	 | Restrict(nameaddress_vector[[P]drive]) |  |  |  |  |  | 
-search	0.89 | LookupAll(nameaddress_vector[[P]1044]) |  |  |  | ('leisure', 'park')^0.0 |  | nameaddress_vector([[W]1044,[W]liberty]^0,[[W]1044]^0.3,[[W]liberty]^1.08,def=1.68)
-search	 | Restrict(nameaddress_vector[[P]liberty]) |  |  |  |  |  | name_vector([[W]drive]^0,def=0.5)
-search	 | Restrict(name_vector[[P]drive]) |  |  |  |  |  | 
-search	0.3 | Restrict(nameaddress_vector[[P]liberty,[P]park,[P]drive]) |  | 1044^0.0 |  |  |  | nameaddress_vector([[W]liberty park drive]^0,[[W]liberty park,[W]drive]^0.1,[[W]liberty,[...,def=2.1)
-search	 |  |  | LV-1044^0.2857142857142857 |  |  |  | 
-search	 |  |  | VC1044^0.3333333333333333 |  |  |  | 
-search	 |  |  | VG1044^0.3333333333333333 |  |  |  | 
-search	 |  |  | MD-1044^0.2857142857142857 |  |  |  | 
-search	0.4 | LookupAll(name_vector[[P]liberty]) |  | 1044^0.0 |  |  |  | name_vector([[W]liberty park drive]^0,def=1.3)
-search	 | Restrict(name_vector[[P]park,[P]drive]) |  | LV-1044^0.2857142857142857 |  |  |  | 
-search	 |  |  | VC1044^0.3333333333333333 |  |  |  | 
-search	 |  |  | VG1044^0.3333333333333333 |  |  |  | 
-search	 |  |  | MD-1044^0.2857142857142857 |  |  |  | 
-search	0.6 | LookupAll(name_vector[[P]park,[P]drive]) |  | 1044^0.0 |  |  |  | nameaddress_vector([[W]liberty]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]liberty]) |  | LV-1044^0.2857142857142857 |  |  |  | name_vector([[W]park drive]^0,def=0.9)
-search	 |  |  | VC1044^0.3333333333333333 |  |  |  | 
-search	 |  |  | VG1044^0.3333333333333333 |  |  |  | 
-search	 |  |  | MD-1044^0.2857142857142857 |  |  |  | 
-search	0.6 | LookupAll(nameaddress_vector[[P]liberty,[P]park]) |  | 1044^0.0 |  |  |  | nameaddress_vector([[W]liberty park]^0,[[W]liberty,[W]park]^0.1,[[W]liberty]^0.4,[[W]park...,def=1)
-search	 | Restrict(name_vector[[P]drive]) |  | LV-1044^0.2857142857142857 |  |  |  | name_vector([[W]drive]^0,def=0.5)
-search	 |  |  | VC1044^0.3333333333333333 |  |  |  | 
-search	 |  |  | VG1044^0.3333333333333333 |  |  |  | 
-search	 |  |  | MD-1044^0.2857142857142857 |  |  |  | 
-search	0.8 | LookupAny(name_vector[[W]drive]) |  | 1044^0.0 |  | ('leisure', 'park')^0.0 |  | nameaddress_vector([[W]liberty]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]liberty]) |  | LV-1044^0.2857142857142857 |  |  |  | name_vector([[W]drive]^0,def=0.5)
-search	 |  |  | VC1044^0.3333333333333333 |  |  |  | 
-search	 |  |  | VG1044^0.3333333333333333 |  |  |  | 
-search	 |  |  | MD-1044^0.2857142857142857 |  |  |  | 
-search	1.4 | LookupAll(nameaddress_vector[[P]liberty]) |  | 1044^0.0 |  | ('leisure', 'park')^0.0 |  | nameaddress_vector([[W]liberty]^0,def=0.6)
-search	 | Restrict(name_vector[[P]drive]) |  | LV-1044^0.2857142857142857 |  |  |  | name_vector([[W]drive]^0,def=0.5)
-search	 |  |  | VC1044^0.3333333333333333 |  |  |  | 
-search	 |  |  | VG1044^0.3333333333333333 |  |  |  | 
-search	 |  |  | MD-1044^0.2857142857142857 |  |  |  | 
-search	0.517 | LookupAll(name_vector[[P]liberty]) | 1044^0.0 |  |  |  |  | name_vector([[W]liberty park drive]^0,def=1.3)
-search	 | Restrict(name_vector[[P]park,[P]drive]) |  |  |  |  |  | 
-search	0.717 | LookupAll(name_vector[[P]liberty]) | 1044^0.0 |  |  |  |  | nameaddress_vector([[W]park drive]^0,[[W]park,[W]drive]^0.1,[[W]park]^0.4,[[W]drive...,def=1)
-search	 | Restrict(nameaddress_vector[[P]park,[P]drive]) |  |  |  |  |  | name_vector([[W]liberty]^0,def=0.5)
-search	0.717 | LookupAll(name_vector[[P]liberty]) | 1044^0.0 |  |  |  |  | nameaddress_vector([[W]drive]^0,def=0.6)
-search	 | Restrict(name_vector[[P]park]) |  |  |  |  |  | name_vector([[W]liberty park]^0,def=0.9)
-search	 | Restrict(nameaddress_vector[[P]drive]) |  |  |  |  |  | 
-search	0.717 | LookupAny(name_vector[[H]1044]) |  |  |  |  |  | nameaddress_vector([[W]liberty park drive]^0,[[W]liberty park,[W]drive]^0.1,[[W]liberty,[...,def=2.1)
-search	 | Restrict(nameaddress_vector[[P]liberty,[P]park,[P]drive]) |  |  |  |  |  | 
 query	zijldijk 8a	zijldijk	oracle
-token	w	0	1	zijldijk	zijldijk	0.3	51	66	
-token	w	1	2	8a	8a	0.7	98	74	
+token	w	0	1	zijldijk	zijldijk	0.3	51	66
+token	w	1	2	8a	8a	0.7	98	74
 token	W	0	1	zijldijk	zijldijk	0.0	49	66	{'count': 49, 'addr_count': 66}
 token	W	1	2	8a	8a	0.4	57	69	{'count': 57, 'addr_count': 69}
 token	H	1	2	8a	8 a	0.7666666666666666	69	1	{'count': 69, 'lookup': '8 a'}
 direction	0.04462333532100974
-search	0.967 | LookupAll(name_vector[[P]zijldijk]) | 8 a^0.0 |  |  |  |  | name_vector([[W]zijldijk]^0,def=0.5)
-search	1.17 | LookupAny(name_vector[[H]8 a]) |  |  |  |  |  | nameaddress_vector([[W]zijldijk]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]zijldijk]) |  |  |  |  |  | 
-search	1.3 | LookupAll(name_vector[[P]zijldijk]) |  |  |  |  |  | 
-search	 | Restrict(name_vector[[P]8a]) |  |  |  |  |  | 
-search	0.689 | LookupAll(name_vector[[P]zijldijk]) |  |  |  |  |  | nameaddress_vector([[W]8a]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]8a]) |  |  |  |  |  | name_vector([[W]zijldijk]^0,def=0.5)
-search	0.6 | LookupAll(nameaddress_vector[[P]zijldijk]) |  |  |  |  |  | nameaddress_vector([[W]zijldijk]^0,def=0.6)
-search	 | Restrict(name_vector[[P]8a]) |  |  |  |  |  | name_vector([[W]8a]^0,def=0.5)
 query	cafe Austin	cafe	oracle
-token	w	0	1	cafe	cafe	0.3	7039	1	
-token	w	1	2	austin	austin	0.3	2818	56467	
+token	w	0	1	cafe	cafe	0.3	7039	1
+token	w	1	2	austin	austin	0.3	2818	56467
 token	W	0	1	cafe	café	0.25	4	1	{'count': 4}
 token	W	0	1	cafe	cafe	0.0	8	1	{'count': 8}
 token	Q	0	1	cafe	café	0.5	1	1	{'op': None, 'type': 'pub', 'class': 'amenity'}
@@ -140,18 +58,10 @@ token	Q	0	1	cafe	café	0.5	1	1	{'op': None, 'type': 'cafe', 'class': 'amenity'}
 token	Q	0	1	cafe	cafe	0.0	1	1	{'op': None, 'type': 'cafe', 'class': 'amenity'}
 token	W	1	2	austin	austin	0.0	16	55241	{'count': 16, 'addr_count': 55241}
 direction	-0.31744161724566233
-search	0.9 | LookupAll(name_vector[[P]austin]) |  |  |  |  |  | 
-search	 | Restrict(name_vector[[P]cafe]) |  |  |  |  |  | 
-search	0.2 | LookupAll(name_vector[[P]cafe]) |  |  |  |  |  | nameaddress_vector([[W]austin]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]austin]) |  |  |  |  |  | name_vector([[W]cafe]^0,[[W]café]^0.25,def=0.5)
-search	0.835 | LookupAll(nameaddress_vector[[P]cafe]) |  |  |  |  |  | nameaddress_vector([[W]cafe]^0,[[W]café]^0.25,def=0.6)
-search	 | Restrict(name_vector[[P]austin]) |  |  |  |  |  | name_vector([[W]austin]^0,def=0.5)
-search	0.2 | LookupAll(name_vector[[P]austin]) |  |  |  | ('amenity', 'pub')^0.5 |  | name_vector([[W]austin]^0,def=0.5)
-search	 |  |  |  |  | ('amenity', 'cafe')^0.0 |  | 
 query	cafes in Austin	cafes-in	oracle
-token	w	0	1	cafes	cafes	0.3	1	1	
-token	w	1	2	in	in	0.3	4930	13675	
-token	w	2	3	austin	austin	0.3	2818	56467	
+token	w	0	1	cafes	cafes	0.3	1	1
+token	w	1	2	in	in	0.3	4930	13675
+token	w	2	3	austin	austin	0.3	2818	56467
 token	W	0	1	cafes	cafés	0.2	1	1	{}
 token	Q	0	1	cafes	cafés	0.4	1	1	{'op': None, 'type': 'pub', 'class': 'amenity'}
 token	Q	0	1	cafes	cafés	0.4	1	1	{'op': None, 'type': 'cafe', 'class': 'amenity'}
@@ -162,40 +72,16 @@ token	N	0	2	cafes in	cafes in	0.0	1	1	{'op': 'in', 'type': 'cafe', 'class': 'ame
 token	C	1	2	in	in	0.0	1	1	{'cc': 'in', 'internal': 'yes'}
 token	W	2	3	austin	austin	0.0	16	55241	{'count': 16, 'addr_count': 55241}
 direction	-0.22623344859576622
-search	1.3 | LookupAll(name_vector[[P]austin]) |  |  |  |  |  | 
-search	 | Restrict(name_vector[[P]in,[P]cafes]) |  |  |  |  |  | 
-search	0.8 | LookupAll(name_vector[[P]cafes]) |  |  |  |  |  | nameaddress_vector([[W]austin]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]in,[P]austin]) |  |  |  |  |  | name_vector([[W]cafés]^0,def=0.3)
-search	1.1 | LookupAll(name_vector[[P]in]) |  |  |  |  |  | nameaddress_vector([[W]austin]^0,def=0.6)
-search	 | Restrict(name_vector[[P]cafes]) |  |  |  |  |  | 
-search	 | Restrict(nameaddress_vector[[P]austin]) |  |  |  |  |  | 
-search	1.75 | LookupAll(nameaddress_vector[[P]cafes]) |  |  |  |  |  | nameaddress_vector([[W]cafés]^0,def=0.4)
-search	 | Restrict(name_vector[[P]austin,[P]in]) |  |  |  |  |  | 
-search	1.25 | LookupAll(name_vector[[P]austin]) |  |  |  |  |  | nameaddress_vector([[W]cafés]^0,def=0.4)
-search	 | Restrict(nameaddress_vector[[P]in,[P]cafes]) |  |  |  |  |  | name_vector([[W]austin]^0,def=0.5)
-search	0.2 | LookupAll(name_vector[[P]austin]) |  |  |  |  | ('amenity', 'cafe')^0.0 | name_vector([[W]austin]^0,def=0.5)
-search	 |  |  |  |  |  | ('amenity', 'pub')^0.25 | 
-search	1.1 | LookupAll(name_vector[[P]austin]) |  |  |  | ('amenity', 'pub')^0.4 |  | 
-search	 | Restrict(name_vector[[P]in]) |  |  |  | ('amenity', 'cafe')^0.0 |  | 
-search	0.9 | LookupAll(name_vector[[P]in]) |  |  |  | ('amenity', 'pub')^0.4 |  | nameaddress_vector([[W]austin]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]austin]) |  |  |  | ('amenity', 'cafe')^0.0 |  | 
 query	Hotel Austin	hotel	oracle
-token	w	0	1	hotel	hotel	0.3	4901	29	
-token	w	1	2	austin	austin	0.3	2818	56467	
+token	w	0	1	hotel	hotel	0.3	4901	29
+token	w	1	2	austin	austin	0.3	2818	56467
 token	W	0	1	hotel	hotel	0.0	7	1	{'count': 7}
 token	Q	0	1	hotel	hotel	0.0	1	1	{'op': None, 'type': 'hotel', 'class': 'tourism'}
 token	W	1	2	austin	austin	0.0	16	55241	{'count': 16, 'addr_count': 55241}
 direction	-0.31552818141678535
-search	0.9 | LookupAll(name_vector[[P]austin]) |  |  |  |  |  | 
-search	 | Restrict(name_vector[[P]hotel]) |  |  |  |  |  | 
-search	0.2 | LookupAll(name_vector[[P]hotel]) |  |  |  |  |  | nameaddress_vector([[W]austin]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]austin]) |  |  |  |  |  | name_vector([[W]hotel]^0,def=0.5)
-search	0.831 | LookupAll(nameaddress_vector[[P]hotel]) |  |  |  |  |  | nameaddress_vector([[W]hotel]^0,def=0.6)
-search	 | Restrict(name_vector[[P]austin]) |  |  |  |  |  | name_vector([[W]austin]^0,def=0.5)
-search	0.2 | LookupAll(name_vector[[P]austin]) |  |  |  | ('tourism', 'hotel')^0.0 |  | name_vector([[W]austin]^0,def=0.5)
 query	2361 AB	postcode-nl	oracle
-token	w	0	1	2361	2361	1.4700000000000002	14	14	
-token	w	1	2	ab	ab	0.3	110	253	
+token	w	0	1	2361	2361	1.4700000000000002	14	14
+token	w	1	2	ab	ab	0.3	110	253
 token	H	0	1	2361	2361	0.0	6	1	{'count': 6, 'lookup': '2361'}
 token	W	0	1	2361	2361	0.39	2	14	{'count': 2, 'addr_count': 14}
 token	P	0	1	2361	LV-2361	0.2857142857142857	1	1	None
@@ -206,43 +92,18 @@ token	P	0	1	2361	2361	0.0	1	1	None
 token	P	0	2	2361 ab	2361 AB	0.5714285714285714	1	1	None
 token	W	1	2	ab	ab	0.0	6	1	{'count': 6}
 direction	-0.06565656565656565
-search	0.671 |  |  | 2361 AB^0.0 |  |  |  | 
-search	2.07 | LookupAll(name_vector[[P]2361]) |  |  |  |  |  | 
-search	 | Restrict(name_vector[[P]ab]) |  |  |  |  |  | 
-search	0.59 | LookupAll(name_vector[[P]2361]) |  |  |  |  |  | nameaddress_vector([[W]ab]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]ab]) |  |  |  |  |  | name_vector([[W]2361]^0,def=1.28)
-search	0.721 | LookupAll(nameaddress_vector[[P]2361]) |  |  |  |  |  | nameaddress_vector([[W]2361]^0,def=1.38)
-search	 | Restrict(name_vector[[P]ab]) |  |  |  |  |  | name_vector([[W]ab]^0,def=0.5)
-search	0.3 | Restrict(nameaddress_vector[[P]ab]) |  | LV-2361^0.2857142857142857 |  |  |  | nameaddress_vector([[W]ab]^0,def=0.6)
-search	 |  |  | VC2361^0.3333333333333333 |  |  |  | 
-search	 |  |  | MD-2361^0.2857142857142857 |  |  |  | 
-search	 |  |  | VG2361^0.3333333333333333 |  |  |  | 
-search	 |  |  | 2361^0.0 |  |  |  | 
-search	0.4 | LookupAll(name_vector[[P]ab]) |  | LV-2361^0.2857142857142857 |  |  |  | name_vector([[W]ab]^0,def=0.5)
-search	 |  |  | VC2361^0.3333333333333333 |  |  |  | 
-search	 |  |  | MD-2361^0.2857142857142857 |  |  |  | 
-search	 |  |  | VG2361^0.3333333333333333 |  |  |  | 
-search	 |  |  | 2361^0.0 |  |  |  | 
-search	0.2 | LookupAll(name_vector[[P]ab]) | 2361^0.0 |  |  |  |  | name_vector([[W]ab]^0,def=0.5)
-search	0.4 | LookupAny(name_vector[[H]2361]) |  |  |  |  |  | nameaddress_vector([[W]ab]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]ab]) |  |  |  |  |  | 
 query	78746	postcode-us	oracle
-token	w	0	1	78746	78746	10.0	1	1	
+token	w	0	1	78746	78746	10.0	1	1
 token	P	0	1	78746	LC78 746	0.5	1	1	None
 token	P	0	1	78746	BB78746	0.2857142857142857	1	1	None
 token	P	0	1	78746	78-746	0.3333333333333333	1	1	None
 token	P	0	1	78746	787 46	0.3333333333333333	1	1	None
 token	P	0	1	78746	78746	0.0	1	1	None
 direction	0
-search	0.1 |  |  | LC78 746^0.5 |  |  |  | 
-search	 |  |  | BB78746^0.2857142857142857 |  |  |  | 
-search	 |  |  | 78-746^0.3333333333333333 |  |  |  | 
-search	 |  |  | 787 46^0.3333333333333333 |  |  |  | 
-search	 |  |  | 78746^0.0 |  |  |  | 
 query	12345 Research Blvd	postcode-hnr	oracle
-token	w	0	1	12345	12345	10.780000000000001	1	1	
-token	w	1	2	research	research	0.3	741	702	
-token	w	2	3	blvd	blvd	0.3	44124	21538	
+token	w	0	1	12345	12345	10.780000000000001	1	1
+token	w	1	2	research	research	0.3	741	702
+token	w	2	3	blvd	blvd	0.3	44124	21538
 token	H	0	1	12345	12345	0.39	5	1	{'count': 5, 'lookup': '12345'}
 token	P	0	1	12345	123 45	0.3333333333333333	1	1	None
 token	P	0	1	12345	12345	0.0	1	1	None
@@ -254,42 +115,15 @@ token	W	1	3	research blvd	research blvd	0.0	1	1	{}
 token	W	1	3	research blvd	research blvd	0.0	206	427	{'count': 206, 'lookup': 'research blvd', 'addr_count': 427}
 token	W	2	3	blvd	blvd	0.0	1	1	{}
 direction	0.08599342085224333
-search	0.3 | Restrict(nameaddress_vector[[P]research,[P]blvd]) |  | 123 45^0.3333333333333333 |  |  |  | nameaddress_vector([[W]research blvd]^0,[[W]research blvd]^0,[[W]research,[W]blvd]^0.1...,def=1)
-search	 |  |  | 12345^0.0 |  |  |  | 
-search	 |  |  | BB12345^0.2857142857142857 |  |  |  | 
-search	 |  |  | LC12 345^0.5 |  |  |  | 
-search	 |  |  | 12-345^0.3333333333333333 |  |  |  | 
-search	0.4 | LookupAll(name_vector[[P]research]) |  | 123 45^0.3333333333333333 |  |  |  | name_vector([[W]research blvd]^0,[[W]research blvd]^0,def=0.9)
-search	 | Restrict(name_vector[[P]blvd]) |  | 12345^0.0 |  |  |  | 
-search	 |  |  | BB12345^0.2857142857142857 |  |  |  | 
-search	 |  |  | LC12 345^0.5 |  |  |  | 
-search	 |  |  | 12-345^0.3333333333333333 |  |  |  | 
-search	0.6 | LookupAll(nameaddress_vector[[P]research]) |  | 123 45^0.3333333333333333 |  |  |  | nameaddress_vector([[W]research]^0,def=0.6)
-search	 | Restrict(name_vector[[P]blvd]) |  | 12345^0.0 |  |  |  | name_vector([[W]blvd]^0,def=0.5)
-search	 |  |  | BB12345^0.2857142857142857 |  |  |  | 
-search	 |  |  | LC12 345^0.5 |  |  |  | 
-search	 |  |  | 12-345^0.3333333333333333 |  |  |  | 
-search	0.762 | LookupAll(name_vector[[P]research]) | 12345^0.0 |  |  |  |  | name_vector([[W]research blvd]^0,[[W]research blvd]^0,def=0.9)
-search	 | Restrict(name_vector[[P]blvd]) |  |  |  |  |  | 
-search	0.962 | LookupAll(name_vector[[P]research]) | 12345^0.0 |  |  |  |  | nameaddress_vector([[W]blvd]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]blvd]) |  |  |  |  |  | name_vector([[W]research]^0,def=0.5)
-search	0.962 | LookupAny(name_vector[[H]12345]) |  |  |  |  |  | nameaddress_vector([[W]research blvd]^0,[[W]research blvd]^0,[[W]research,[W]blvd]^0.1...,def=1)
-search	 | Restrict(nameaddress_vector[[P]research,[P]blvd]) |  |  |  |  |  | 
 query	Austin, TX	austin-tx	oracle
-token	w	0	1	austin	austin	0.3	2818	56467	
-token	w	1	2	tx	tx	0.3	34821	1596595	
+token	w	0	1	austin	austin	0.3	2818	56467
+token	w	1	2	tx	tx	0.3	34821	1596595
 token	W	0	1	austin	austin	0.0	16	55241	{'count': 16, 'addr_count': 55241}
 token	W	1	2	tx	tx	0.0	1	1596570	{'addr_count': 1596570}
 direction	-0.008729689311080872
-search	0 | LookupAll(name_vector[[P]austin]) |  |  |  |  |  | nameaddress_vector([[W]tx]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]tx]) |  |  |  |  |  | name_vector([[W]austin]^0,def=0.5)
-search	0 | LookupAny(name_vector[[W]tx]) |  |  |  |  |  | nameaddress_vector([[W]austin]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]austin]) |  |  |  |  |  | name_vector([[W]tx]^0,def=0.5)
-search	0.6 | LookupAll(name_vector[[P]tx]) |  |  |  |  |  | nameaddress_vector([[W]austin]^0,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]austin]) |  |  |  |  |  | name_vector([[W]tx]^0,def=0.5)
 query	Brno, Czechia	brno	oracle
-token	w	0	1	brno	brno	0.3	854	73917	
-token	w	1	2	czechia	czechia	0.3	12	3	
+token	w	0	1	brno	brno	0.3	854	73917
+token	w	1	2	czechia	czechia	0.3	12	3
 token	W	0	1	brno	brno	0.0	10	37660	{'count': 10, 'addr_count': 37660}
 token	W	0	1	brno	ብርኖ	1.3333333333333333	1	37660	{'addr_count': 37660}
 token	W	0	1	brno	բռնո	1.0	1	37660	{'addr_count': 37660}
@@ -300,8 +134,102 @@ token	W	0	1	brno	ಬೃನೋ	1.0	1	37660	{'addr_count': 37660}
 token	W	1	2	czechia	czechia	0.0	1	1	{}
 token	C	1	2	czechia	czechia	0.0	1	1	{'cc': 'cz', 'internal': 'yes'}
 direction	0.26285948652106655
-search	0 | LookupAll(name_vector[[P]brno]) |  |  | cz^0.0 |  |  | name_vector([[W]brno]^0,[[W]բռնո]^1,[[W]брно]^1,[[W]бърно]^1,[[W]ბრნო]^1,[[W]...,def=0.5)
-search	0 | LookupAll(nameaddress_vector[[P]czechia]) |  |  |  |  |  | nameaddress_vector([[W]czechia]^0,def=0.6)
-search	 | Restrict(name_vector[[P]brno]) |  |  |  |  |  | name_vector([[W]brno]^0,[[W]բռնո]^1,[[W]брно]^1,[[W]бърно]^1,[[W]ბრნო]^1,[[W]...,def=0.5)
-search	0 | LookupAll(name_vector[[P]czechia]) |  |  |  |  |  | nameaddress_vector([[W]brno]^0,[[W]բռնո]^1,[[W]брно]^1,[[W]бърно]^1,[[W]ბრნო]^1,[[W]...,def=0.6)
-search	 | Restrict(nameaddress_vector[[P]brno]) |  |  |  |  |  | name_vector([[W]czechia]^0,def=0.5)
+query	1044 Liberty Park Drive	liberty-public	public
+token	w	0	1	1044	1044	1.4700000000000002	1206	619
+token	w	1	2	liberty	liberty	0.3	21487	71074
+token	w	2	3	park	park	0.3	684387	2228394
+token	w	3	4	drive	drive	0.3	2056972	1883396
+token	W	0	1	1044	1044	0.39	252	229	{'count': 252, 'addr_count': 229}
+token	H	0	1	1044	1044	0.0	1028	1	{'count': 1028, 'lookup': '1044'}
+token	P	0	1	1044	LV-1044	0.2857142857142857	1	1	None
+token	P	0	1	1044	VG1044	0.3333333333333333	1	1	None
+token	P	0	1	1044	VC1044	0.3333333333333333	1	1	None
+token	P	0	1	1044	MD-1044	0.2857142857142857	1	1	None
+token	P	0	1	1044	1044	0.0	1	1	None
+token	W	1	2	liberty	liberty	0.0	1095	25235	{'count': 1095, 'addr_count': 25235}
+token	W	1	2	liberty	liberty	0.0	5	1	{'count': 5, 'lookup': 'liberty'}
+token	W	1	3	liberty park	liberty park	0.0	180	2045	{'count': 180, 'addr_count': 2045}
+token	W	1	4	liberty park drive	liberty park drive	0.0	19	5	{'count': 19, 'addr_count': 5}
+token	W	2	3	park	park	0.0	1634	17904	{'count': 1634, 'addr_count': 17904}
+token	W	2	3	park	ပါက	1.3333333333333333	2	10	{'count': 2, 'addr_count': 10}
+token	W	2	3	park	парк	1.0	517	35	{'count': 517, 'addr_count': 35}
+token	W	2	3	park	پارک	1.0	323	43	{'count': 323, 'addr_count': 43}
+token	W	2	3	park	park	0.0	16	1	{'count': 16, 'lookup': 'park'}
+token	W	2	3	park	паркъ	1.0	1	1	{}
+token	Q	2	3	park	park	0.0	1	1	{'op': None, 'type': 'park', 'class': 'leisure'}
+token	Q	2	3	park	парк	2.0	1	1	{'op': None, 'type': 'park', 'class': 'leisure'}
+token	Q	2	3	park	پارک	2.0	1	1	{'op': None, 'type': 'park', 'class': 'leisure'}
+token	W	2	4	park drive	park drive	0.0	3366	2062	{'count': 3366, 'addr_count': 2062}
+token	W	2	4	park drive	park  drive	0.09090909090909091	8	1	{'count': 8}
+token	W	3	4	drive	drive	0.0	171	380	{'count': 171, 'addr_count': 380}
+token	W	3	4	drive	drive	0.0	1	1	{'lookup': 'drive'}
+direction	-0.04135685054110647
+search	2.87 | LookupAll(name_vector[[P]1044]) |  |  |  |  |  |
+search	 | Restrict(name_vector[[P]liberty,[P]park,[P]drive]) |  |  |  |  |  |
+search	0.59 | LookupAll(name_vector[[P]1044]) |  |  |  |  |  | nameaddress_vector([[W]liberty park drive]^0,[[W]liberty park,[W]drive]^0.1,[[W]liberty par...,def=1.8)
+search	 | Restrict(nameaddress_vector[[P]liberty,[P]drive,[P]park]) |  |  |  |  |  | name_vector([[W]1044]^0,def=1.28)
+search	2.27 | LookupAll(name_vector[[P]1044]) |  |  |  |  |  | nameaddress_vector([[W]park drive]^0,[[W]park  drive]^0.0909,[[W]park,[W]drive]^0.1...,def=1)
+search	 | Restrict(name_vector[[P]liberty]) |  |  |  |  |  |
+search	 | Restrict(nameaddress_vector[[P]drive,[P]park]) |  |  |  |  |  |
+search	2.67 | LookupAll(name_vector[[P]1044]) |  |  |  |  |  | nameaddress_vector([[W]drive]^0,[[W]drive]^0,def=0.6)
+search	 | Restrict(name_vector[[P]liberty,[P]park]) |  |  |  |  |  |
+search	 | Restrict(nameaddress_vector[[P]drive]) |  |  |  |  |  |
+search	0.673 | LookupAll(nameaddress_vector[[P]1044]) |  |  |  |  |  | nameaddress_vector([[W]1044]^0,def=1.38)
+search	 | Restrict(name_vector[[P]liberty,[P]park,[P]drive]) |  |  |  |  |  | name_vector([[W]liberty park drive]^0,def=1.3)
+search	0.773 | LookupAll(nameaddress_vector[[P]1044]) |  |  |  |  |  | nameaddress_vector([[W]1044,[W]liberty]^0,[[W]1044,[W]liberty]^0,[[W]1044]^0....,def=1.68)
+search	 | Restrict(nameaddress_vector[[P]liberty]) |  |  |  |  |  | name_vector([[W]park drive]^0,[[W]park  drive]^0.0909,def=0.9)
+search	 | Restrict(name_vector[[P]park,[P]drive]) |  |  |  |  |  |
+search	0.773 | LookupAll(nameaddress_vector[[P]1044]) |  |  |  |  |  | nameaddress_vector([[W]1044,[W]liberty park]^0,[[W]1044,[W]liberty,[W]park]^0....,def=2.87)
+search	 | Restrict(nameaddress_vector[[P]liberty,[P]park]) |  |  |  |  |  | name_vector([[W]drive]^0,[[W]drive]^0,def=0.5)
+search	 | Restrict(name_vector[[P]drive]) |  |  |  |  |  |
+search	2.47 | LookupAll(name_vector[[P]1044]) |  |  |  | ('leisure', 'park')^0.0 |  | nameaddress_vector([[W]drive]^0,[[W]drive]^0,def=0.6)
+search	 | Restrict(name_vector[[P]liberty]) |  |  |  |  |  |
+search	 | Restrict(nameaddress_vector[[P]drive]) |  |  |  |  |  |
+search	0.89 | LookupAll(nameaddress_vector[[P]1044]) |  |  |  | ('leisure', 'park')^0.0 |  | nameaddress_vector([[W]1044,[W]liberty]^0,[[W]1044,[W]liberty]^0,[[W]1044]^0....,def=1.68)
+search	 | Restrict(nameaddress_vector[[P]liberty]) |  |  |  |  |  | name_vector([[W]drive]^0,[[W]drive]^0,def=0.5)
+search	 | Restrict(name_vector[[P]drive]) |  |  |  |  |  |
+search	0.3 | Restrict(nameaddress_vector[[P]liberty,[P]park,[P]drive]) |  | LV-1044^0.2857142857142857 |  |  |  | nameaddress_vector([[W]liberty park drive]^0,[[W]liberty park,[W]drive]^0.1,[[W]liberty par...,def=1.8)
+search	 |  |  | VG1044^0.3333333333333333 |  |  |  |
+search	 |  |  | VC1044^0.3333333333333333 |  |  |  |
+search	 |  |  | MD-1044^0.2857142857142857 |  |  |  |
+search	 |  |  | 1044^0.0 |  |  |  |
+search	0.4 | LookupAll(name_vector[[P]liberty]) |  | LV-1044^0.2857142857142857 |  |  |  | name_vector([[W]liberty park drive]^0,def=1.3)
+search	 | Restrict(name_vector[[P]park,[P]drive]) |  | VG1044^0.3333333333333333 |  |  |  |
+search	 |  |  | VC1044^0.3333333333333333 |  |  |  |
+search	 |  |  | MD-1044^0.2857142857142857 |  |  |  |
+search	 |  |  | 1044^0.0 |  |  |  |
+search	0.683 | LookupAny(name_vector[[W]park drive,[W]park  drive]) |  | LV-1044^0.2857142857142857 |  |  |  | nameaddress_vector([[W]liberty]^0,[[W]liberty]^0,def=0.6)
+search	 | Restrict(nameaddress_vector[[P]liberty]) |  | VG1044^0.3333333333333333 |  |  |  | name_vector([[W]park drive]^0,[[W]park  drive]^0.0909,def=0.9)
+search	 |  |  | VC1044^0.3333333333333333 |  |  |  |
+search	 |  |  | MD-1044^0.2857142857142857 |  |  |  |
+search	 |  |  | 1044^0.0 |  |  |  |
+search	1.78 | LookupAll(name_vector[[P]park,[P]drive]) |  | LV-1044^0.2857142857142857 |  |  |  | nameaddress_vector([[W]liberty]^0,[[W]liberty]^0,def=0.6)
+search	 | LookupAll(nameaddress_vector[[P]liberty]) |  | VG1044^0.3333333333333333 |  |  |  | name_vector([[W]park drive]^0,[[W]park  drive]^0.0909,def=0.9)
+search	 |  |  | VC1044^0.3333333333333333 |  |  |  |
+search	 |  |  | MD-1044^0.2857142857142857 |  |  |  |
+search	 |  |  | 1044^0.0 |  |  |  |
+search	0.683 | LookupAny(name_vector[[W]drive,[W]drive]) |  | LV-1044^0.2857142857142857 |  |  |  | nameaddress_vector([[W]liberty park]^0,[[W]liberty,[W]park]^0.1,[[W]liberty,[W]park...,def=1.3)
+search	 | Restrict(nameaddress_vector[[P]liberty,[P]park]) |  | VG1044^0.3333333333333333 |  |  |  | name_vector([[W]drive]^0,[[W]drive]^0,def=0.5)
+search	 |  |  | VC1044^0.3333333333333333 |  |  |  |
+search	 |  |  | MD-1044^0.2857142857142857 |  |  |  |
+search	 |  |  | 1044^0.0 |  |  |  |
+search	1.28 | LookupAll(nameaddress_vector[[P]liberty,[P]park]) |  | LV-1044^0.2857142857142857 |  |  |  | nameaddress_vector([[W]liberty park]^0,[[W]liberty,[W]park]^0.1,[[W]liberty,[W]park...,def=1.3)
+search	 | Restrict(name_vector[[P]drive]) |  | VG1044^0.3333333333333333 |  |  |  | name_vector([[W]drive]^0,[[W]drive]^0,def=0.5)
+search	 |  |  | VC1044^0.3333333333333333 |  |  |  |
+search	 |  |  | MD-1044^0.2857142857142857 |  |  |  |
+search	 |  |  | 1044^0.0 |  |  |  |
+search	0.883 | LookupAny(name_vector[[W]drive,[W]drive]) |  | LV-1044^0.2857142857142857 |  | ('leisure', 'park')^0.0 |  | nameaddress_vector([[W]liberty]^0,[[W]liberty]^0,def=0.6)
+search	 | Restrict(nameaddress_vector[[P]liberty]) |  | VG1044^0.3333333333333333 |  |  |  | name_vector([[W]drive]^0,[[W]drive]^0,def=0.5)
+search	 |  |  | VC1044^0.3333333333333333 |  |  |  |
+search	 |  |  | MD-1044^0.2857142857142857 |  |  |  |
+search	 |  |  | 1044^0.0 |  |  |  |
+search	0.2 | LookupAll(name_vector[[P]liberty]) | 1044^0.0 |  |  |  |  | name_vector([[W]liberty park drive]^0,def=1.3)
+search	 | Restrict(name_vector[[P]park,[P]drive]) |  |  |  |  |  |
+search	0.4 | LookupAny(name_vector[[W]liberty,[W]liberty]) | 1044^0.0 |  |  |  |  | nameaddress_vector([[W]park drive]^0,[[W]park  drive]^0.0909,[[W]park,[W]drive]^0.1...,def=1)
+search	 | Restrict(nameaddress_vector[[P]drive,[P]park]) |  |  |  |  |  | name_vector([[W]liberty]^0,[[W]liberty]^0,def=0.5)
+search	1 | LookupAll(name_vector[[P]liberty]) | 1044^0.0 |  |  |  |  | nameaddress_vector([[W]park drive]^0,[[W]park  drive]^0.0909,[[W]park,[W]drive]^0.1...,def=1)
+search	 | Restrict(nameaddress_vector[[P]drive,[P]park]) |  |  |  |  |  | name_vector([[W]liberty]^0,[[W]liberty]^0,def=0.5)
+search	0.4 | LookupAll(name_vector[[P]liberty,[P]park]) | 1044^0.0 |  |  |  |  | nameaddress_vector([[W]drive]^0,[[W]drive]^0,def=0.6)
+search	 | Restrict(nameaddress_vector[[P]drive]) |  |  |  |  |  | name_vector([[W]liberty park]^0,def=0.9)
+search	0.4 | LookupAny(name_vector[[H]1044]) |  |  |  |  |  | nameaddress_vector([[W]liberty park drive]^0,[[W]liberty park,[W]drive]^0.1,[[W]liberty par...,def=1.8)
+search	 | Restrict(nameaddress_vector[[P]liberty,[P]drive,[P]park]) |  |  |  |  |  |

@@ -7,6 +7,8 @@ pub mod lookup;
 pub mod phrases;
 pub mod plan;
 #[cfg(test)]
+mod plan_tests;
+#[cfg(test)]
 mod readings;
 pub mod tokenize;
 

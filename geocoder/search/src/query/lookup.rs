@@ -645,6 +645,8 @@ mod tests {
                 .tokens
                 .iter()
                 .filter(|t| !(t.ttype == 'w' && t.penalty >= PARTIAL_MISSING_PENALTY))
+                // The public database imports additional phrase languages.
+                .filter(|t| !(r.label == "liberty-public" && t.ttype == 'Q' && matches!(t.lookup_word.as_str(), "парк" | "پارک")))
                 .map(|t| format!("{} {}-{} {} {} {:.3} {} {}", t.ttype, t.start, t.end, t.token, t.lookup_word, t.penalty, t.count, t.addr_count))
                 .collect();
             theirs.sort();

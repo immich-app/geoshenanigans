@@ -88,7 +88,7 @@ pub fn readings() -> Vec<Reading> {
             "direction" => out.last_mut().expect("a query first").direction = f[1].parse().expect("a direction"),
             "search" => {
                 let r = out.last_mut().expect("a query first");
-                let row = f[1].split(" | ").map(str::trim).collect::<Vec<_>>().join(" | ");
+                let row = f[1].split('|').map(str::trim).collect::<Vec<_>>().join(" | ");
                 if row.split(" | ").next() == Some("") {
                     r.searches.last_mut().expect("a search first").push(row);
                 } else {
