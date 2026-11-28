@@ -345,7 +345,10 @@ pub async fn serve_tampered(components: serde_json::Value, tamper: impl Fn(&str,
     serve_with(components, tamper, &[]).await
 }
 
-async fn serve_with(components: serde_json::Value, tamper: impl Fn(&str, &mut Vec<u8>), alike: &[&str]) -> TestBucket {
+async fn serve_with(mut components: serde_json::Value, tamper: impl Fn(&str, &mut Vec<u8>), alike: &[&str]) -> TestBucket {
+    for names in ["en", "all"] {
+        components.as_object_mut().unwrap().entry(format!("names.{names}")).or_insert(serde_json::json!({}));
+    }
     let template: serde_json::Value = serde_json::from_str(TEMPLATE).unwrap();
     let regions: Vec<&String> = template["axes"]["region"]["values"].as_object().unwrap().keys().collect();
     let mut paths = BTreeSet::new();

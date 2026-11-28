@@ -19,7 +19,9 @@
         "dir.*",
         "quality.*",
         "poi_tier.*",
-        "water.*"
+        "water.*",
+        "names.*",
+        "name-files.*"
       ]
     },
     {
@@ -253,6 +255,23 @@
           "order": 4
         }
       }
+    },
+    "names": {
+      "label": "Search names",
+      "description": "Which additional names to download for place search.",
+      "order": 6,
+      "values": {
+        "en": {
+          "label": "English and references",
+          "description": "Stored names, distinct English names, subdivision codes and references.",
+          "order": 1
+        },
+        "all": {
+          "label": "All names",
+          "description": "All available names, aliases and references used for search.",
+          "order": 2
+        }
+      }
     }
   },
   "constraints": [
@@ -299,9 +318,6 @@
         "{region}/admin-minimal/attribution.json"
       ],
       "optional_files": [
-        "{region}/admin-minimal/strings_tags_core.bin",
-        "{region}/admin-minimal/place_tags.bin",
-        "{region}/admin-minimal/admin_tags.bin",
         "{region}/admin-minimal/place_imp.bin",
         "{region}/admin-minimal/admin_imp.bin",
         "{region}/admin-minimal/postcode_grid.bin",
@@ -333,9 +349,6 @@
         "{region}/admin-minimal-poi/attribution.json"
       ],
       "optional_files": [
-        "{region}/admin-minimal-poi/strings_tags_core.bin",
-        "{region}/admin-minimal-poi/place_tags.bin",
-        "{region}/admin-minimal-poi/admin_tags.bin",
         "{region}/admin-minimal-poi/place_imp.bin",
         "{region}/admin-minimal-poi/admin_imp.bin",
         "{region}/admin-minimal-poi/postcode_grid.bin",
@@ -362,9 +375,6 @@
         "{region}/admin/attribution.json"
       ],
       "optional_files": [
-        "{region}/admin/strings_tags_core.bin",
-        "{region}/admin/place_tags.bin",
-        "{region}/admin/admin_tags.bin",
         "{region}/admin/place_imp.bin",
         "{region}/admin/admin_imp.bin",
         "{region}/admin/postcode_centroids.bin",
@@ -394,9 +404,6 @@
         "{region}/no-addresses/attribution.json"
       ],
       "optional_files": [
-        "{region}/no-addresses/strings_tags_core.bin",
-        "{region}/no-addresses/place_tags.bin",
-        "{region}/no-addresses/admin_tags.bin",
         "{region}/no-addresses/place_imp.bin",
         "{region}/no-addresses/admin_imp.bin",
         "{region}/no-addresses/postcode_centroids.bin",
@@ -433,9 +440,6 @@
         "{region}/full/attribution.json"
       ],
       "optional_files": [
-        "{region}/full/strings_tags_core.bin",
-        "{region}/full/place_tags.bin",
-        "{region}/full/admin_tags.bin",
         "{region}/full/place_imp.bin",
         "{region}/full/admin_imp.bin",
         "{region}/full/addr_cities.bin",
@@ -477,10 +481,10 @@
         "{region}/poi/major/poi_meta.json"
       ],
       "optional_files": [
-        "{region}/poi/major/strings_tags_poi.bin",
-        "{region}/poi/major/poi_tags.bin",
         "{region}/poi/major/poi_imp.bin",
-        "{region}/poi/major/poi_attribution.json"
+        "{region}/poi/major/poi_attribution.json",
+        "{region}/poi/major/names-{names}/strings_tags_poi.bin",
+        "{region}/poi/major/names-{names}/poi_tags.bin"
       ]
     },
     "poi_tier.notable": {
@@ -493,10 +497,10 @@
         "{region}/poi/notable/poi_meta.json"
       ],
       "optional_files": [
-        "{region}/poi/notable/strings_tags_poi.bin",
-        "{region}/poi/notable/poi_tags.bin",
         "{region}/poi/notable/poi_imp.bin",
-        "{region}/poi/notable/poi_attribution.json"
+        "{region}/poi/notable/poi_attribution.json",
+        "{region}/poi/notable/names-{names}/strings_tags_poi.bin",
+        "{region}/poi/notable/names-{names}/poi_tags.bin"
       ]
     },
     "poi_tier.all": {
@@ -509,10 +513,10 @@
         "{region}/poi/all/poi_meta.json"
       ],
       "optional_files": [
-        "{region}/poi/all/strings_tags_poi.bin",
-        "{region}/poi/all/poi_tags.bin",
         "{region}/poi/all/poi_imp.bin",
-        "{region}/poi/all/poi_attribution.json"
+        "{region}/poi/all/poi_attribution.json",
+        "{region}/poi/all/names-{names}/strings_tags_poi.bin",
+        "{region}/poi/all/names-{names}/poi_tags.bin"
       ]
     },
     "water.none": {
@@ -568,6 +572,53 @@
         "{region}/water/all/exact/water_meta.json",
         "{region}/water/all/exact/attribution.json"
       ]
+    },
+    "names.en": {
+      "extends": "name-files.core"
+    },
+    "names.all": {
+      "extends": "name-files.core"
+    },
+    "name-files.minimal": {
+      "optional_files": [
+        "{region}/admin-minimal/names-{names}/strings_tags_core.bin",
+        "{region}/admin-minimal/names-{names}/place_tags.bin",
+        "{region}/admin-minimal/names-{names}/admin_tags.bin"
+      ]
+    },
+    "name-files.minimal-poi": {
+      "optional_files": [
+        "{region}/admin-minimal-poi/names-{names}/strings_tags_core.bin",
+        "{region}/admin-minimal-poi/names-{names}/place_tags.bin",
+        "{region}/admin-minimal-poi/names-{names}/admin_tags.bin"
+      ]
+    },
+    "name-files.mode": {
+      "optional_files": [
+        "{region}/{mode}/names-{names}/strings_tags_core.bin",
+        "{region}/{mode}/names-{names}/place_tags.bin",
+        "{region}/{mode}/names-{names}/admin_tags.bin"
+      ]
+    },
+    "name-files.core": {
+      "variants": [
+        {
+          "when": {
+            "mode": "admin-minimal",
+            "poi_tier": "none"
+          },
+          "component": "name-files.minimal"
+        },
+        {
+          "when": {
+            "mode": "admin-minimal"
+          },
+          "component": "name-files.minimal-poi"
+        },
+        {
+          "component": "name-files.mode"
+        }
+      ]
     }
   },
   "presets": [
@@ -580,7 +631,8 @@
         "mode": "admin-minimal",
         "quality": "simplified",
         "poi_tier": "none",
-        "water": "none"
+        "water": "none",
+        "names": "en"
       }
     },
     {
@@ -592,7 +644,8 @@
         "mode": "admin",
         "quality": "simplified",
         "poi_tier": "major",
-        "water": "none"
+        "water": "none",
+        "names": "en"
       },
       "default": true
     },
@@ -605,7 +658,8 @@
         "mode": "full",
         "quality": "simplified",
         "poi_tier": "all",
-        "water": "none"
+        "water": "none",
+        "names": "all"
       }
     },
     {
@@ -617,7 +671,8 @@
         "mode": "full",
         "quality": "exact",
         "poi_tier": "all",
-        "water": "none"
+        "water": "none",
+        "names": "all"
       }
     }
   ],
@@ -642,12 +697,14 @@
       {
         "mode": "full",
         "quality": "simplified",
-        "poi_tier": "all"
+        "poi_tier": "all",
+        "names": "all"
       },
       {
         "mode": "full",
         "quality": "exact",
-        "poi_tier": "all"
+        "poi_tier": "all",
+        "names": "all"
       }
     ]
   },

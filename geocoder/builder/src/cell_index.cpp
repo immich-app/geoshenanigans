@@ -1598,14 +1598,18 @@ void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, con
     std::vector<uint32_t> keys;
     const auto order = place_file_order(places, keys);
     auto place = [&](size_t i) { return source[order[i]]; };
-    const auto tags = search_files::core(data, places.size(), place, slots.count,
-                                        [&](size_t i) { return records.polygon_of[i]; });
+    const auto admin = [&](size_t i) { return records.polygon_of[i]; };
+    const auto tags = search_files::core(data, places.size(), place, slots.count, admin);
+    const auto en = search_files::core<tag_bundles::Use::CoreEn>(data, places.size(), place, slots.count, admin);
     auto bases = strings.bases;
     if (strings.subset) {
         bases[STR_TIER_TAGS_POI] = search_files::tier_end(bases[STR_TIER_TAGS_CORE], tags.bytes.size());
         bases.back() = bases[STR_TIER_TAGS_POI];
     }
-    search_files::write_core(dir, tags, places.size());
+    search_files::write_core(search_files::names_dir(dir, ALL_NAMES_DIR), tags, places.size());
+    search_files::write_core(search_files::names_dir(dir, EN_NAMES_DIR), en, places.size());
+    search_files::write_importance(dir, "place", places.size());
+    search_files::write_importance(dir, "admin", slots.count);
     if (data.search_tags->host) {
         std::vector<uint64_t> ids;
         for (size_t i = 0; i < order.size(); ++i) ids.push_back(search_files::object(data.place_osm_ids, place(i)));

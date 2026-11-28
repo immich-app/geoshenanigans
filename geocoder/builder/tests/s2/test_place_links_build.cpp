@@ -1122,7 +1122,7 @@ TEST(search_tags_follow_the_pbf_records_and_host_data_is_optional) {
     f.boundary(29.5, -98.9, 30.9, -97.1, 4, "Texas", {{"ISO3166-2", "US-TX"}});
     f.node(30, -98, {{"place", "city"}, {"name", "München"}, {"name:en", "Munich"}});
     f.node(30.1, -98, {{"place", "suburb"}, {"name", "West"}, {"alt_name", "Westside"}});
-    f.node(30.2, -98, {{"tourism", "museum"}, {"name", "Museum"}, {"brand", "Foundation"}});
+    f.node(30.2, -98, {{"tourism", "museum"}, {"name", "Museum"}, {"brand", "Foundation"}, {"ref", "MU42"}});
     f.line({{30, -98}, {30.1, -98}}, {{"highway", "residential"}, {"name", "Hauptstraße"}, {"name:en", "Main Street"}});
     f.square(30, -98, 30.01, -97.99, {{"building", "commercial"}, {"name", "FUTO"}, {"addr:housenumber", "1044"}});
     ScratchDir scratch("search-tags");
@@ -1140,16 +1140,24 @@ TEST(search_tags_follow_the_pbf_records_and_host_data_is_optional) {
             return std::search(bytes.begin(), bytes.end(), value.begin(), value.end()) != bytes.end();
         };
         for (const auto& dir : {full, minimal}) {
-            const auto bytes = file_bytes(dir + "strings_tags_core.bin");
+            const auto bytes = file_bytes(dir + "names-all/strings_tags_core.bin");
             REQUIRE(!bytes.empty());
             std::string pool;
             string_files::decode(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(),
                                  [&](const char* p, size_t n) { pool.append(p, n); });
+            const auto english = file_bytes(dir + "names-en/strings_tags_core.bin");
+            std::string en_pool;
+            string_files::decode(reinterpret_cast<const uint8_t*>(english.data()), english.size(),
+                                 [&](const char* p, size_t n) { en_pool.append(p, n); });
+            CHECK(en_pool.find("ISO3166-2\x1fUS-TX") != en_pool.npos);
+            CHECK(en_pool.find("München") == en_pool.npos);
+            CHECK(en_pool.find("Munich") == en_pool.npos);
+            CHECK(en_pool.find("Westside") == en_pool.npos);
             CHECK(pool.find("ISO3166-2\x1fUS-TX") != pool.npos);
             CHECK(pool.find("name\x1fMünchen") != pool.npos);
             CHECK((pool.find("Westside") == pool.npos) == (dir == minimal));
             const auto nodes = file_bytes(dir + place_files::NODES_FILE);
-            const auto rows = file_bytes(dir + "place_tags.bin");
+            const auto rows = file_bytes(dir + "names-all/place_tags.bin");
             REQUIRE(nodes.size() >= place_files::FOOTER_BYTES);
             REQUIRE(rows.size() >= side_blocks::FOOTER_BYTES);
             const auto* np = reinterpret_cast<const uint8_t*>(nodes.data());
@@ -1168,6 +1176,15 @@ TEST(search_tags_follow_the_pbf_records_and_host_data_is_optional) {
             }
             CHECK(std::filesystem::exists(dir + "place_imp.bin"));
             CHECK(std::filesystem::exists(dir + "place_nodes.osm_ids") == host);
+        }
+        for (const char* names : {"names-all", "names-en"}) {
+            const auto bytes = file_bytes(out + "/planet/poi/all/" + names + "/strings_tags_poi.bin");
+            REQUIRE(!bytes.empty());
+            std::string pool;
+            string_files::decode(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(),
+                                 [&](const char* p, size_t n) { pool.append(p, n); });
+            CHECK(pool.find("ref\x1fMU42") != pool.npos);
+            CHECK((pool.find("brand\x1f" "Foundation") != pool.npos) == (std::string_view(names) == "names-all"));
         }
         CHECK(contains(full + "addr_tags.host", "name\x1f" "FUTO") == host);
         CHECK(contains(full + "street_tags.host", "name\x1fHauptstraße") == host);

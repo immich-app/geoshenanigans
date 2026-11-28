@@ -51,7 +51,7 @@ function catalog(edit = () => {}) {
   const t = structuredClone(template);
   edit(t);
   const values = (axis) => Object.entries(t.axes[axis].values).sort((a, b) => a[1].order - b[1].order || a[0].localeCompare(b[0]));
-  const served = ['region', 'mode', 'quality', 'poi_tier'];
+  const served = ['region', 'mode', 'quality', 'poi_tier', 'names'];
   const dry = t.presets.filter((p) => (p.selections.water ?? 'none') === 'none');
   const axes = served.map((id) => ({
     id,
@@ -64,30 +64,32 @@ function catalog(edit = () => {}) {
   for (const [mode, m] of values('mode')) {
     for (const [quality, q] of values('quality')) {
       for (const [poi_tier, p] of values('poi_tier')) {
-        const selection = { region: 'planet', mode, quality, poi_tier };
-        const id = `${mode}.${quality}.${poi_tier}`;
-        const has = (o) => Object.entries(o).every(([axis, v]) => selection[axis] === v);
-        const broken = t.constraints.find((c) => has(c.when) && !has(c.requires));
-        if (broken) {
-          excluded.push({ id, selection, constraint: broken.id, message: broken.message, requires: broken.requires });
-          continue;
+        for (const [names, name] of values('names')) {
+          const selection = { region: 'planet', mode, quality, poi_tier, names };
+          const id = `${mode}.${quality}.${poi_tier}.${names}`;
+          const has = (o) => Object.entries(o).every(([axis, v]) => selection[axis] === v);
+          const broken = t.constraints.find((c) => has(c.when) && !has(c.requires));
+          if (broken) {
+            excluded.push({ id, selection, constraint: broken.id, message: broken.message, requires: broken.requires });
+            continue;
+          }
+          const preset = dry.find((x) => served.every((axis) => x.selections[axis] === selection[axis]));
+          const n = datasets.length + 1;
+          datasets.push({
+            id,
+            label: preset ? preset.label : [m, q, p, name].map((v) => v.label).join(' · '),
+            description: preset ? preset.description : null,
+            preset: preset ? preset.id : null,
+            selection,
+            size_disk: n * 2 ** 30,
+            size_download: n * 2 ** 29,
+          });
         }
-        const preset = dry.find((x) => served.every((axis) => x.selections[axis] === selection[axis]));
-        const n = datasets.length + 1;
-        datasets.push({
-          id,
-          label: preset ? preset.label : [m, q, p].map((v) => v.label).join(' · '),
-          description: preset ? preset.description : null,
-          preset: preset ? preset.id : null,
-          selection,
-          size_disk: n * 2 ** 30,
-          size_download: n * 2 ** 29,
-        });
       }
     }
   }
   const presets = dry.map((p) => ({
-    id: p.id, label: p.label, description: p.description, dataset: `${p.selections.mode}.${p.selections.quality}.${p.selections.poi_tier}`,
+    id: p.id, label: p.label, description: p.description, dataset: `${p.selections.mode}.${p.selections.quality}.${p.selections.poi_tier}.${p.selections.names}`,
   }));
   const components = Object.keys(t.components).sort();
   const water = t.axes.water && {
@@ -99,7 +101,7 @@ function catalog(edit = () => {}) {
       ...(v === 'none' ? {} : { region: 'planet', size_disk: i * 2 ** 28, size_download: i * 2 ** 27 }),
     })),
   };
-  return { build: { date: '2026-11-20', version: 24, id: ID, dir: '2026-11-20-1' }, default: 'full.simplified.all', axes, presets, datasets, excluded, components, water: water || null };
+  return { build: { date: '2026-11-20', version: 24, id: ID, dir: '2026-11-20-1' }, default: 'full.simplified.all.all', axes, presets, datasets, excluded, components, water: water || null };
 }
 
 // The publication IDs of two builds of 2026-11-20, the second published
@@ -110,8 +112,8 @@ const ID = '2026-11-20-9bc04e7d1a25';
 const AGAIN = '2026-11-20-3fa2b1c4d5e6';
 
 const MESSAGE = template.constraints[0].message;
-const ADMIN_MINIMAL = { region: 'planet', mode: 'admin-minimal', quality: 'simplified', poi_tier: 'none' };
-const FULL_EXACT = { region: 'planet', mode: 'full', quality: 'exact', poi_tier: 'all' };
+const ADMIN_MINIMAL = { region: 'planet', mode: 'admin-minimal', quality: 'simplified', poi_tier: 'none', names: 'en' };
+const FULL_EXACT = { region: 'planet', mode: 'full', quality: 'exact', poi_tier: 'all', names: 'all' };
 
 // A template whose every string the page shows is markup: labels,
 // descriptions and the constraint's message, a preset's id, and a value's
@@ -202,9 +204,9 @@ const went = (sent) => sent.map((s) => [s.url, s.at]);
 
 test('the link names a dataset per column, the points and the build', () => {
   const { parseLink, linkSearch } = core();
-  const link = parseLink('?d=with-addresses&d=admin.simplified.major&at=48.8584,2.2945&at=-33.85,151.2&b=2026-11-19');
+  const link = parseLink('?d=with-addresses&d=admin.simplified.major.en&at=48.8584,2.2945&at=-33.85,151.2&b=2026-11-19');
   assert.deepEqual(plain(link), {
-    datasets: ['with-addresses', 'admin.simplified.major'],
+    datasets: ['with-addresses', 'admin.simplified.major.en'],
     points: [{ lat: 48.8584, lng: 2.2945 }, { lat: -33.85, lng: 151.2 }],
     build: '2026-11-19',
     q: '',
@@ -213,8 +215,8 @@ test('the link names a dataset per column, the points and the build', () => {
     mode: null,
   });
   assert.equal(
-    linkSearch({ datasets: ['with-addresses', 'europe/full.simplified.all'], point: { lat: 48.8584, lng: 2.2945 }, build: '2026-11-20' }),
-    '?d=with-addresses&d=europe/full.simplified.all&at=48.8584,2.2945&b=2026-11-20',
+    linkSearch({ datasets: ['with-addresses', 'europe/full.simplified.all.all'], point: { lat: 48.8584, lng: 2.2945 }, build: '2026-11-20' }),
+    '?d=with-addresses&d=europe/full.simplified.all.all&at=48.8584,2.2945&b=2026-11-20',
   );
   assert.deepEqual(plain(parseLink(linkSearch({ datasets: ['smallest'], point: { lat: 1.000000123, lng: -2.5 }, build: null }))),
     { datasets: ['smallest'], points: [{ lat: 1.000000123, lng: -2.5 }], build: null, q: '', water: null, profile: null, mode: null });
@@ -256,16 +258,16 @@ test('a bare link opens with with-addresses and smallest', () => {
   assert.deepEqual(plain(openingTokens(catalog((t) => { t.presets = t.presets.filter((p) => p.id !== 'smallest'); }))), ['with-addresses']);
   const bare = catalog();
   bare.presets = [];
-  assert.deepEqual(plain(openingTokens(bare)), ['full.simplified.all']);
+  assert.deepEqual(plain(openingTokens(bare)), ['full.simplified.all.all']);
 });
 
 test('a column added shows a preset whose dataset no column shows', () => {
   const { addedToken, resolveColumn } = core();
   const c = catalog();
   const columns = (tokens) => tokens.map((token) => resolveColumn(c, token));
-  assert.equal(addedToken(c, columns(['with-addresses', 'admin-minimal.simplified.none'])), 'immich-recommended');
-  assert.equal(addedToken(c, columns(['smallest', 'admin.simplified.major', 'full.simplified.all'])), 'max-quality');
-  assert.equal(addedToken(c, columns(['smallest', 'immich-recommended', 'with-addresses', 'max-quality'])), 'full.exact.none');
+  assert.equal(addedToken(c, columns(['with-addresses', 'admin-minimal.simplified.none.en'])), 'immich-recommended');
+  assert.equal(addedToken(c, columns(['smallest', 'admin.simplified.major.en', 'full.simplified.all.all'])), 'max-quality');
+  assert.equal(addedToken(c, columns(['smallest', 'immich-recommended', 'with-addresses', 'max-quality'])), 'full.exact.none.en');
   assert.equal(addedToken(c, columns(['everything'])), 'smallest');
 });
 
@@ -284,21 +286,21 @@ test('a column names its dataset by a preset id or its own, and says why it has 
   const { resolveColumn } = core();
   const c = catalog();
   const preset = resolveColumn(c, 'with-addresses');
-  assert.equal(preset.dataset.id, 'full.simplified.all');
+  assert.equal(preset.dataset.id, 'full.simplified.all.all');
   assert.equal(preset.custom, false);
   assert.equal(preset.error, null);
-  const custom = resolveColumn(c, 'admin.simplified.major');
-  assert.equal(custom.dataset.id, 'admin.simplified.major');
+  const custom = resolveColumn(c, 'admin.simplified.major.en');
+  assert.equal(custom.dataset.id, 'admin.simplified.major.en');
   assert.equal(custom.dataset.label, 'Immich recommended');
   assert.equal(custom.custom, true);
-  const excluded = resolveColumn(c, 'admin-minimal.exact.none');
+  const excluded = resolveColumn(c, 'admin-minimal.exact.none.en');
   assert.equal(excluded.dataset, null);
-  assert.equal(excluded.error, `dataset admin-minimal.exact.none is not offered: ${MESSAGE}`);
+  assert.equal(excluded.error, `dataset admin-minimal.exact.none.en is not offered: ${MESSAGE}`);
   assert.equal(excluded.selection.quality, 'exact');
   const unknown = resolveColumn(c, 'everything');
   assert.equal(unknown.dataset, null);
   assert.match(unknown.error, /^unknown dataset "everything"/);
-  assert.deepEqual(plain(unknown.selection), { region: 'planet', mode: 'full', quality: 'simplified', poi_tier: 'all' });
+  assert.deepEqual(plain(unknown.selection), { region: 'planet', mode: 'full', quality: 'simplified', poi_tier: 'all', names: 'all' });
 });
 
 test('a custom pick greys out a value the constraints exclude, with its message', () => {
@@ -316,10 +318,10 @@ test('a value whose constraint requires another moves that axis and says why', (
   const { pick } = core();
   const c = catalog();
   const moved = pick(c, FULL_EXACT, 'mode', 'admin-minimal');
-  assert.equal(moved.dataset.id, 'admin-minimal.simplified.all');
+  assert.equal(moved.dataset.id, 'admin-minimal.simplified.all.all');
   assert.equal(moved.note, `Boundary precision moves to Simplified: ${MESSAGE}`);
   const plain = pick(c, FULL_EXACT, 'poi_tier', 'none');
-  assert.equal(plain.dataset.id, 'full.exact.none');
+  assert.equal(plain.dataset.id, 'full.exact.none.all');
   assert.equal(plain.note, null);
   assert.equal(pick(c, ADMIN_MINIMAL, 'quality', 'exact'), null);
 });
@@ -333,14 +335,15 @@ test('the picker offers the presets with their sizes, and the axes of a custom p
     assert.match(preset, new RegExp(`<option value="${p.id}"[^>]*>${p.label} · ${size} GiB</option>`), p.id);
   }
   assert.match(preset, /<option value="smallest" selected[^>]*>Smallest useful/);
-  assert.ok(preset.includes('25.00 GiB on disk · 12.50 GiB download'), preset);
+  const smallest = c.datasets.find((d) => d.id === c.presets.find((p) => p.id === 'smallest').dataset);
+  assert.ok(preset.includes(`${(smallest.size_disk / 2 ** 30).toFixed(2)} GiB on disk · ${(smallest.size_download / 2 ** 30).toFixed(2)} GiB download`), preset);
   assert.ok(preset.includes('data-action="remove"'));
   assert.ok(!preset.includes('data-axis='));
   assert.ok(!pickerHtml(c, resolveColumn(c, 'smallest'), 0, 1).includes('data-action="remove"'));
 
-  const custom = pickerHtml(c, resolveColumn(c, 'admin-minimal.simplified.all'), 1, 2);
+  const custom = pickerHtml(c, resolveColumn(c, 'admin-minimal.simplified.all.all'), 1, 2);
   assert.match(custom, /<option value="" selected>Custom/);
-  for (const axis of ['mode', 'quality', 'poi_tier']) {
+  for (const axis of ['mode', 'quality', 'poi_tier', 'names']) {
     assert.ok(custom.includes(`data-axis="${axis}"`), axis);
   }
   assert.ok(!custom.includes('data-axis="region"'), 'a region axis of one value is not offered');
@@ -354,16 +357,16 @@ test('the picker offers the presets with their sizes, and the axes of a custom p
 test('each control of the pickers has a key of its own, which finds it once they are drawn anew', () => {
   const { pickerHtml, resolveColumn, controlKey } = core();
   const c = catalog();
-  const columns = [resolveColumn(c, 'smallest'), resolveColumn(c, 'admin.exact.major')];
+  const columns = [resolveColumn(c, 'smallest'), resolveColumn(c, 'admin.exact.major.all')];
   const controls = (html) => [...html.matchAll(/<(?:select|button)\b([^>]*)>/g)]
     .map((m) => Object.fromEntries([...m[1].matchAll(/data-(\w+)="([^"]*)"/g)].map((a) => [a[1], a[2]])));
   const keys = (cols) => controls(cols.map((col, i) => pickerHtml(c, col, i, cols.length)).join('')).map((data) => controlKey(data));
   const drawn = keys(columns);
-  assert.equal(drawn.length, 7, 'a preset and a remove button each, and three axes of the custom pick');
+  assert.equal(drawn.length, 8, 'a preset and a remove button each, and four axes of the custom pick');
   assert.ok(drawn.every((key) => key !== null));
   assert.equal(new Set(drawn).size, drawn.length);
   // The second column's mode moved to admin-minimal: its controls keep their keys.
-  const moved = keys([columns[0], resolveColumn(c, 'admin-minimal.simplified.major')]);
+  const moved = keys([columns[0], resolveColumn(c, 'admin-minimal.simplified.major.all')]);
   assert.deepEqual(moved, drawn);
   assert.equal(controlKey({}), null);
 });
@@ -373,11 +376,11 @@ test('each control of the pickers has a key of its own, which finds it once they
 test('every string and id of the manifest, and a link\'s dataset, is escaped where the page shows it', () => {
   const { pickerHtml, resolveColumn, pick, detailHtml, cardHtml, statusHtml } = core();
   const c = renameAxis(catalog(hostile), 'poi_tier', 'poi"><b>');
-  const moved = pick(c, c.datasets.find((d) => d.id === 'full.exact.all').selection, 'mode', 'admin-minimal');
+  const moved = pick(c, c.datasets.find((d) => d.id === 'full.exact.all.all').selection, 'mode', 'admin-minimal');
   assert.ok(moved.note.includes('<em>no</em>'), moved.note);
   const linked = resolveColumn(c, '<script>alert(5)</script>');
-  const columns = [resolveColumn(c, 'smallest'), resolveColumn(c, 'admin-minimal.exact.none'), resolveColumn(c, 'full.exact.all'),
-    { ...resolveColumn(c, moved.dataset.id), note: moved.note }, resolveColumn(c, `admin.simplified.${MAJOR}`), linked];
+  const columns = [resolveColumn(c, 'smallest'), resolveColumn(c, 'admin-minimal.exact.none.en'), resolveColumn(c, 'full.exact.all.all'),
+    { ...resolveColumn(c, moved.dataset.id), note: moved.note }, resolveColumn(c, `admin.simplified.${MAJOR}.en`), linked];
   const picker = columns.map((col, i) => pickerHtml(c, col, i, columns.length)).join('');
   assertEscaped(picker);
   assert.ok(picker.includes('&lt;img src=x onerror=alert(1)&gt;'));
@@ -386,10 +389,10 @@ test('every string and id of the manifest, and a link\'s dataset, is escaped whe
   assert.ok(picker.includes('<option value="&quot;&gt;&lt;img src=x onerror=alert(4)&gt;"'), 'a preset id');
   assert.ok(picker.includes('data-axis="poi&quot;&gt;&lt;b&gt;"'), 'an axis id');
   assert.ok(picker.includes('<option value="major&quot;&gt;&lt;u&gt;"'), 'a value id');
-  assert.ok(picker.includes(' · admin.simplified.major&quot;&gt;&lt;u&gt;</div>'), 'a dataset id');
+  assert.ok(picker.includes(' · admin.simplified.major&quot;&gt;&lt;u&gt;.en</div>'), 'a dataset id');
   assert.ok(picker.includes('unknown dataset &quot;&lt;script&gt;alert(5)&lt;/script&gt;&quot;'), "a link's dataset");
 
-  const dataset = c.datasets.find((d) => d.id === 'admin-minimal.simplified.none');
+  const dataset = c.datasets.find((d) => d.id === 'admin-minimal.simplified.none.en');
   const answer = { data: { display_name: '<img src=y>', address: { road: '<b>x</b>' }, places: [{ name: '<i>p</i>', category: '<u>c</u>', distance_m: 3 }] }, build: '<s>', ms: 3 };
   const views = [{ label: dataset.label, color: '#fff', dataset, answer }, { label: linked.token, color: '#000', dataset: null, answer: { error: linked.error } }];
   const detail = detailHtml(views, '2026-11-20');
@@ -407,12 +410,12 @@ test('every string and id of the manifest, and a link\'s dataset, is escaped whe
 // the portal's dir of it (X-Geocoder-Build-Dir), which is its volume's.
 test('an answer keeps the dataset and build that answered and the time it took', () => {
   const { answerOf } = core();
-  const headers = { 'x-geocoder-build': '2026-11-20', 'x-geocoder-build-id': AGAIN, 'x-geocoder-build-dir': '2026-11-20-1', 'x-geocoder-dataset': 'full.simplified.all' };
+  const headers = { 'x-geocoder-build': '2026-11-20', 'x-geocoder-build-id': AGAIN, 'x-geocoder-build-dir': '2026-11-20-1', 'x-geocoder-dataset': 'full.simplified.all.all' };
   const header = (name) => headers[name.toLowerCase()] ?? null;
   assert.deepEqual(plain(answerOf(200, header, '{"display_name":"Paris"}', 12.4)),
-    { data: { display_name: 'Paris' }, build: AGAIN, dataset: 'full.simplified.all', ms: 12.4 });
-  const refused = answerOf(400, () => null, 'dataset admin-minimal.exact.none is not offered: x', 2);
-  assert.equal(refused.error, 'HTTP 400: dataset admin-minimal.exact.none is not offered: x');
+    { data: { display_name: 'Paris' }, build: AGAIN, dataset: 'full.simplified.all.all', ms: 12.4 });
+  const refused = answerOf(400, () => null, 'dataset admin-minimal.exact.none.en is not offered: x', 2);
+  assert.equal(refused.error, 'HTTP 400: dataset admin-minimal.exact.none.en is not offered: x');
   assert.equal(refused.data, undefined);
   assert.equal(answerOf(200, () => null, 'not json', 1).error, 'not JSON: not json');
 });
@@ -466,7 +469,7 @@ test('answers differ by display name, a field, or the places and their distances
 test('the detail shows per answer its dataset, build, sizes and time, and flags another build', () => {
   const { detailHtml } = core();
   const c = catalog();
-  const dataset = c.datasets.find((d) => d.id === 'full.simplified.all');
+  const dataset = c.datasets.find((d) => d.id === 'full.simplified.all.all');
   const answer = (city, build) => ({ data: { display_name: city, address: { city } }, build, ms: 12.4 });
   const views = [
     { label: dataset.label, color: '#111', dataset, answer: answer('Paris', '2026-11-20') },
@@ -474,7 +477,7 @@ test('the detail shows per answer its dataset, build, sizes and time, and flags 
     { label: 'loading', color: '#333', dataset, answer: { loading: true } },
   ];
   const out = detailHtml(views, '2026-11-20');
-  assert.ok(out.includes('full.simplified.all · build 2026-11-20 · 12 ms'), out);
+  assert.ok(out.includes('full.simplified.all.all · build 2026-11-20 · 12 ms'), out);
   assert.ok(out.includes(`${(dataset.size_disk / 2 ** 30).toFixed(2)} GiB on disk · ${(dataset.size_download / 2 ** 30).toFixed(2)} GiB download`));
   // The sizes are those of the build served: an answer of another build goes
   // without them.
@@ -527,14 +530,14 @@ test('a card names the first answer and says when the columns differ', () => {
 test('a link to a result names the oldest build other than the one served that answered it in the columns', () => {
   const { linkBuild } = core();
   const answers = {
-    'full.simplified.all': { data: {}, build: '2026-11-20' },
-    'admin-minimal.simplified.none': { data: {}, build: '2026-11-19' },
-    'admin.simplified.major': { loading: true },
-    'full.exact.all': { data: {}, build: '2026-11-18' },
+    'full.simplified.all.all': { data: {}, build: '2026-11-20' },
+    'admin-minimal.simplified.none.en': { data: {}, build: '2026-11-19' },
+    'admin.simplified.major.en': { loading: true },
+    'full.exact.all.all': { data: {}, build: '2026-11-18' },
   };
-  assert.equal(linkBuild(answers, ['full.simplified.all', 'admin-minimal.simplified.none', 'admin.simplified.major'], '2026-11-21'), '2026-11-19');
-  assert.equal(linkBuild(answers, ['full.simplified.all'], '2026-11-21'), '2026-11-20');
-  assert.equal(linkBuild(answers, ['admin.simplified.major', 'no-addresses.exact.none'], '2026-11-21'), '2026-11-21');
+  assert.equal(linkBuild(answers, ['full.simplified.all.all', 'admin-minimal.simplified.none.en', 'admin.simplified.major.en'], '2026-11-21'), '2026-11-19');
+  assert.equal(linkBuild(answers, ['full.simplified.all.all'], '2026-11-21'), '2026-11-20');
+  assert.equal(linkBuild(answers, ['admin.simplified.major.en', 'no-addresses.exact.none.all'], '2026-11-21'), '2026-11-21');
   assert.equal(linkBuild({ '': { data: {} } }, [''], null), null);
   const NEXT = '2026-11-21-0d1e2f3a4b5c';
   const republished = {
@@ -834,7 +837,7 @@ test("Nominatim's column shows its answer, its request in flight, or why it fail
 test('a saved result keeps its answers; one the page saved before the dataset columns keeps its point', () => {
   const { storedResult } = core();
   const now = { id: 'a', lat: 1, lng: 2, source: 'map click', nominatim: null,
-    answers: { 'admin.simplified.major': { data: { display_name: 'Paris' }, build: '2026-11-20', dataset: 'admin.simplified.major', ms: 3 } } };
+    answers: { 'admin.simplified.major.en': { data: { display_name: 'Paris' }, build: '2026-11-20', dataset: 'admin.simplified.major.en', ms: 3 } } };
   assert.deepEqual(plain(storedResult(now)), now);
   const before = { id: 1763600000000, lat: 48.85, lng: 2.29, data: { display_name: 'Paris' }, nominatim: { display_name: 'Paris, France' },
     minimal: { display_name: 'France' }, source: 'IMG_1.jpg' };
@@ -853,15 +856,15 @@ test('a result is saved with every answer it has but those being asked, and read
   const { savedResult, storedResult } = core();
   const entry = { id: 'a', lat: 1, lng: 2, source: 'map click', nominatim: { display_name: 'Paris, France' }, nominatimLoading: false, nominatimError: null,
     answers: {
-      'full.simplified.all': { data: { display_name: 'Paris' }, build: '2026-11-20-1', dataset: 'full.simplified.all', ms: 3 },
-      'admin.simplified.major': { data: { display_name: 'Paris' }, build: '2026-11-19-1', dataset: 'admin.simplified.major', ms: 4 },
-      'admin-minimal.simplified.none': { error: 'HTTP 502: Bad Gateway', build: null, dataset: null, ms: 1 },
-      'no-addresses.exact.none': { loading: true, pending: Promise.resolve() },
+      'full.simplified.all.all': { data: { display_name: 'Paris' }, build: '2026-11-20-1', dataset: 'full.simplified.all.all', ms: 3 },
+      'admin.simplified.major.en': { data: { display_name: 'Paris' }, build: '2026-11-19-1', dataset: 'admin.simplified.major.en', ms: 4 },
+      'admin-minimal.simplified.none.en': { error: 'HTTP 502: Bad Gateway', build: null, dataset: null, ms: 1 },
+      'no-addresses.exact.none.all': { loading: true, pending: Promise.resolve() },
     } };
   const saved = JSON.parse(JSON.stringify(savedResult(entry)));
   assert.deepEqual(saved, {
     id: 'a', lat: 1, lng: 2, source: 'map click', nominatim: { display_name: 'Paris, France' },
-    answers: Object.fromEntries(Object.entries(entry.answers).filter(([key]) => key !== 'no-addresses.exact.none')),
+    answers: Object.fromEntries(Object.entries(entry.answers).filter(([key]) => key !== 'no-addresses.exact.none.all')),
   });
   assert.deepEqual(plain(storedResult(saved)), saved);
 });
@@ -891,7 +894,7 @@ test('polygons are drawn only while no clear came after their request and its re
   const { PolygonOverlay } = core();
   const asked = [];
   const drawn = [];
-  const KEY = 'full.simplified.all';
+  const KEY = 'full.simplified.all.all';
   let shown = { id: 'a', key: KEY };
   const overlay = new PolygonOverlay({
     // What the pacer gives.
@@ -909,7 +912,7 @@ test('polygons are drawn only while no clear came after their request and its re
   assert.deepEqual(drawn, ['erased']);
   // Nor while another column or result is shown.
   const otherColumn = overlay.show('a', KEY, '/polygons?n=2');
-  shown = { id: 'a', key: 'admin.simplified.none' };
+  shown = { id: 'a', key: 'admin.simplified.none.all' };
   asked[1](2);
   assert.equal(await otherColumn, false);
   shown = { id: 'a', key: KEY };
@@ -938,7 +941,7 @@ test('a reload of the datasets or a picker moves the polygon overlay where its d
   const c = catalog();
   const columns = (tokens) => tokens.map((token) => resolveColumn(c, token));
   const shown = overlayTarget(0, columns(['with-addresses', 'smallest']), '2026-11-20-1');
-  assert.deepEqual(plain(shown), { key: 'full.simplified.all', build: '2026-11-20-1' });
+  assert.deepEqual(plain(shown), { key: 'full.simplified.all.all', build: '2026-11-20-1' });
   assert.equal(overlayMoved(shown, overlayTarget(0, columns(['with-addresses', 'smallest']), '2026-11-20-1')), false);
   assert.equal(overlayMoved(shown, overlayTarget(0, columns(['with-addresses', 'smallest']), '2026-11-20-2')), true);
   assert.equal(overlayMoved(shown, overlayTarget(0, columns(['smallest', 'with-addresses']), '2026-11-20-1')), true);
@@ -969,10 +972,10 @@ test('a polygon request is cancelled once another show or a clear comes after it
     },
     draw: () => assert.fail('nothing is drawn'),
     erase: () => {},
-    shown: () => ({ id: 'b', key: 'full.simplified.all' }),
+    shown: () => ({ id: 'b', key: 'full.simplified.all.all' }),
   });
-  const first = overlay.show('a', 'full.simplified.all', '/polygons?n=1');
-  const second = overlay.show('b', 'full.simplified.all', '/polygons?n=2');
+  const first = overlay.show('a', 'full.simplified.all.all', '/polygons?n=1');
+  const second = overlay.show('b', 'full.simplified.all.all', '/polygons?n=2');
   assert.deepEqual(signals.map((s) => Boolean(s && s.aborted)), [true, false]);
   assert.equal(await first, false);
   overlay.clear();
@@ -1142,8 +1145,8 @@ test('the search is offered where /datasets names each dataset\'s index', () => 
 
 test('a search asks /search for 10 results of a dataset, with how each was found', () => {
   const { searchUrl } = core();
-  const url = searchUrl('paris, texas & #5', 'full.simplified.all');
-  assert.equal(url, '/search?q=paris%2C%20texas%20%26%20%235&dataset=full.simplified.all&limit=10&key=test&debug=1');
+  const url = searchUrl('paris, texas & #5', 'full.simplified.all.all');
+  assert.equal(url, '/search?q=paris%2C%20texas%20%26%20%235&dataset=full.simplified.all.all&limit=10&key=test&debug=1');
   assert.equal(new URL(url, 'http://portal').searchParams.get('q'), 'paris, texas & #5');
   assert.equal(searchUrl('x', 'a"b'), '/search?q=x&dataset=a%22b&limit=10&key=test&debug=1');
 });
@@ -1156,9 +1159,9 @@ test('search links restore profile and mode and requests carry the search contro
   assert.equal(parseLink('?p=unknown&m=other').profile, null);
   assert.equal(parseLink('?p=unknown&m=other').mode, null);
   const options = { profile: link.profile, mode: link.mode, bias: { lat: 52.5, lon: 13.4, zoom: 11 }, lang: 'de-AT,de;q=0.8', countrycodes: 'de,at', layer: 'address,poi' };
-  const params = new URL(searchUrl('Berlin', 'europe/full.simplified.all', 10, options), 'http://portal').searchParams;
+  const params = new URL(searchUrl('Berlin', 'europe/full.simplified.all.all', 10, options), 'http://portal').searchParams;
   assert.deepEqual(Object.fromEntries(params), {
-    q: 'Berlin', dataset: 'europe/full.simplified.all', limit: '10', key: 'test', debug: '1',
+    q: 'Berlin', dataset: 'europe/full.simplified.all.all', limit: '10', key: 'test', debug: '1',
     profile: 'full', mode: 'nominatim', lat: '52.5', lon: '13.4', zoom: '11',
     lang: 'de-AT,de;q=0.8', countrycodes: 'de,at', layer: 'address,poi',
   });
@@ -1176,16 +1179,16 @@ test('address result kinds have labels and stay distinct from other results', ()
 
 test('a search answer keeps its results and timings, or the state of the index, or why it has none', () => {
   const { searchAnswerOf } = core();
-  const headers = { 'x-geocoder-build-id': ID, 'x-geocoder-dataset': 'full.simplified.all', 'x-geocoder-search-index': 'full.simplified.all', 'retry-after': '5' };
+  const headers = { 'x-geocoder-build-id': ID, 'x-geocoder-dataset': 'full.simplified.all.all', 'x-geocoder-search-index': 'full.simplified.all.all', 'retry-after': '5' };
   const header = (name) => headers[name.toLowerCase()] ?? null;
   const paris = hit('Paris', 48.8566, 2.3522);
   assert.deepEqual(plain(searchAnswerOf(200, header, debugBody([paris]), 12.4)),
-    { results: [paris], us: 1104.5, index: 'full.simplified.all', build: ID, dataset: 'full.simplified.all', ms: 12.4 });
-  const building = searchAnswerOf(503, header, '{"dataset":"smallest","index":"admin-minimal.simplified.none","since":"2026-11-21T18:57:07Z","status":"building"}', 1);
-  assert.deepEqual(plain(building), { building: { index: 'admin-minimal.simplified.none', since: '2026-11-21T18:57:07Z' }, retry: 5, dataset: 'smallest', ms: 1 });
+    { results: [paris], us: 1104.5, index: 'full.simplified.all.all', build: ID, dataset: 'full.simplified.all.all', ms: 12.4 });
+  const building = searchAnswerOf(503, header, '{"dataset":"smallest","index":"admin-minimal.simplified.none.en","since":"2026-11-21T18:57:07Z","status":"building"}', 1);
+  assert.deepEqual(plain(building), { building: { index: 'admin-minimal.simplified.none.en', since: '2026-11-21T18:57:07Z' }, retry: 5, dataset: 'smallest', ms: 1 });
   assert.equal(searchAnswerOf(503, () => null, '{"dataset":"x","index":"x","since":"t","status":"building"}', 1).retry, 5, 'Retry-After or 5 s');
-  const failed = searchAnswerOf(503, () => null, '{"dataset":"x","index":"full.exact.all","reason":"dataset x: no room","since":"2026-11-21T19:00:00Z","status":"failed"}', 1);
-  assert.deepEqual(plain(failed), { failed: { index: 'full.exact.all', since: '2026-11-21T19:00:00Z', reason: 'dataset x: no room' }, dataset: 'x', ms: 1 });
+  const failed = searchAnswerOf(503, () => null, '{"dataset":"x","index":"full.exact.all.all","reason":"dataset x: no room","since":"2026-11-21T19:00:00Z","status":"failed"}', 1);
+  assert.deepEqual(plain(failed), { failed: { index: 'full.exact.all.all', since: '2026-11-21T19:00:00Z', reason: 'dataset x: no room' }, dataset: 'x', ms: 1 });
   assert.equal(searchAnswerOf(503, () => null, 'no build to serve: waiting for a build of version 24', 1).error,
     'HTTP 503: no build to serve: waiting for a build of version 24');
   assert.equal(searchAnswerOf(400, () => null, 'q must be at most 256 bytes', 1).error, 'HTTP 400: q must be at most 256 bytes');
@@ -1301,7 +1304,7 @@ test('the matrix gives each row its rank in each column, marking what a column l
   const views = [
     searchView('With addresses', '#6c8cff', { results: lists[0] }),
     searchView('Smallest', '#d9944a', { results: lists[1] }),
-    searchView('Max quality', '#c77dff', { building: { since: '2026-11-21T18:57:07Z', index: 'full.exact.all' } }),
+    searchView('Max quality', '#c77dff', { building: { since: '2026-11-21T18:57:07Z', index: 'full.exact.all.all' } }),
   ];
   const out = searchMatrixHtml(searchRows(lists), views, false);
   assert.ok(out.includes('<th class="rank" style="color:#6c8cff" title="With addresses">1</th>'), out);
@@ -1345,36 +1348,36 @@ test('the matrix shows 5 rows, and every row once asked', () => {
 test('each column\'s head tells its search: its time and index, or its index building or failed, or why it has no answer', () => {
   const { searchHeadsHtml } = core();
   const health = { search: { ready: 6, datasets: 28, groups: [
-    { index: 'full.simplified.all', state: 'ready' }, { index: 'full.exact.all', state: 'building', since: '2026-11-21T18:57:07Z' },
-    { index: 'admin-minimal.simplified.none', state: 'queued', since: '2026-11-21T18:57:00Z' }, { index: 'full.exact.none', state: 'failed' },
+    { index: 'full.simplified.all.all', state: 'ready' }, { index: 'full.exact.all.all', state: 'building', since: '2026-11-21T18:57:07Z' },
+    { index: 'admin-minimal.simplified.none.en', state: 'queued', since: '2026-11-21T18:57:00Z' }, { index: 'full.exact.none.en', state: 'failed' },
   ] } };
-  const results = { results: [hit('Paris', 1, 2), hit('Paris', 3, 4)], us: 1104.5, ms: 12.4, index: 'full.simplified.all' };
+  const results = { results: [hit('Paris', 1, 2), hit('Paris', 3, 4)], us: 1104.5, ms: 12.4, index: 'full.simplified.all.all' };
   const out = searchHeadsHtml([
     searchView('With addresses', '#6c8cff', results),
     searchView('No addresses', '#d9944a', { ...results, results: [hit('Paris', 1, 2)] }),
-    searchView('Max quality', '#c77dff', { building: { since: '2026-11-21T18:57:07Z', index: 'full.exact.all' } }),
-    searchView('Smallest', '#4ac9d9', { building: { since: '2026-11-21T18:57:00Z', index: 'admin-minimal.simplified.none' } }),
+    searchView('Max quality', '#c77dff', { building: { since: '2026-11-21T18:57:07Z', index: 'full.exact.all.all' } }),
+    searchView('Smallest', '#4ac9d9', { building: { since: '2026-11-21T18:57:00Z', index: 'admin-minimal.simplified.none.en' } }),
   ], health);
   const heads = [...out.matchAll(/<div class="search-head" style="border-left-color:([^"]+)">([\s\S]*?)<\/div>/g)].map((m) => [m[1], m[2]]);
   assert.equal(heads.length, 4, out);
-  assert.equal(heads[0][1], '<span style="color:#6c8cff">1</span> With addresses: 2 results · 12 ms, 1.10 ms in the search · index full.simplified.all');
-  assert.equal(heads[1][1], '<span style="color:#d9944a">2</span> No addresses: 1 result · 12 ms, 1.10 ms in the search · index full.simplified.all, as 1\'s');
-  assert.equal(heads[2][1], '<span style="color:#c77dff">3</span> Max quality: <span class="loading-spinner"></span>index full.exact.all building since 2026-11-21 18:57:07 UTC · 1 of 4 indexes ready');
-  assert.equal(heads[3][1], '<span style="color:#4ac9d9">4</span> Smallest: <span class="loading-spinner"></span>index admin-minimal.simplified.none queued since 2026-11-21 18:57:00 UTC · 1 of 4 indexes ready');
+  assert.equal(heads[0][1], '<span style="color:#6c8cff">1</span> With addresses: 2 results · 12 ms, 1.10 ms in the search · index full.simplified.all.all');
+  assert.equal(heads[1][1], '<span style="color:#d9944a">2</span> No addresses: 1 result · 12 ms, 1.10 ms in the search · index full.simplified.all.all, as 1\'s');
+  assert.equal(heads[2][1], '<span style="color:#c77dff">3</span> Max quality: <span class="loading-spinner"></span>index full.exact.all.all building since 2026-11-21 18:57:07 UTC · 1 of 4 indexes ready');
+  assert.equal(heads[3][1], '<span style="color:#4ac9d9">4</span> Smallest: <span class="loading-spinner"></span>index admin-minimal.simplified.none.en queued since 2026-11-21 18:57:00 UTC · 1 of 4 indexes ready');
 
   const others = searchHeadsHtml([
-    searchView('Max quality', '#6c8cff', { failed: { since: '2026-11-21T19:00:00Z', index: 'full.exact.all', reason: 'dataset full.exact.all: no room' } }),
+    searchView('Max quality', '#6c8cff', { failed: { since: '2026-11-21T19:00:00Z', index: 'full.exact.all.all', reason: 'dataset full.exact.all.all: no room' } }),
     searchView('Smallest', '#d9944a', { error: 'HTTP 429: Rate limit exceeded' }),
     searchView('Mine', '#c77dff', { loading: true }),
     searchView('everything', '#4ac9d9', null, null, 'unknown dataset "everything": pick one'),
   ], null);
-  assert.ok(others.includes('Max quality: <span class="warn">search unavailable: dataset full.exact.all: no room</span> · index full.exact.all, failed 2026-11-21 19:00:00 UTC; the next sync round tries it again'), others);
+  assert.ok(others.includes('Max quality: <span class="warn">search unavailable: dataset full.exact.all.all: no room</span> · index full.exact.all.all, failed 2026-11-21 19:00:00 UTC; the next sync round tries it again'), others);
   assert.ok(others.includes('Smallest: <span class="warn">HTTP 429: Rate limit exceeded</span>'), others);
   assert.ok(others.includes('Mine: <span class="loading-spinner"></span>searching…'), others);
   assert.ok(others.includes('everything: <span class="warn">unknown dataset &quot;everything&quot;: pick one</span>'), others);
   // Without /health's groups, a building index says so without its progress.
-  assert.ok(searchHeadsHtml([searchView('Max quality', '#6c8cff', { building: { since: '2026-11-21T18:57:07Z', index: 'full.exact.all' } })], null)
-    .endsWith('index full.exact.all building since 2026-11-21 18:57:07 UTC</div></div>'));
+  assert.ok(searchHeadsHtml([searchView('Max quality', '#6c8cff', { building: { since: '2026-11-21T18:57:07Z', index: 'full.exact.all.all' } })], null)
+    .endsWith('index full.exact.all.all building since 2026-11-21 18:57:07 UTC</div></div>'));
 });
 
 test('every string of a search answer and of its index is escaped where the page shows it', () => {
@@ -1398,7 +1401,7 @@ test('every string of a search answer and of its index is escaped where the page
 
 test('the search shows the heads, then the matrix', () => {
   const { searchRows, searchHtml } = core();
-  const views = [searchView('With addresses', '#6c8cff', { results: [hit('Paris', 1, 2)], us: 1, ms: 1, index: 'full.simplified.all' })];
+  const views = [searchView('With addresses', '#6c8cff', { results: [hit('Paris', 1, 2)], us: 1, ms: 1, index: 'full.simplified.all.all' })];
   const rows = searchRows([views[0].answer.results]);
   const out = searchHtml(views, null, rows, false);
   assert.match(out, /^<div class="search-heads">[\s\S]*<\/div><table class="search-matrix">/);
@@ -1427,7 +1430,7 @@ test('a result picked from the matrix is looked up as a search of its best colum
 test('a search waits for 250 ms of quiet in the box, and Enter searches at once', () => {
   const { PlaceSearch } = core();
   const timers = handTimers();
-  const { search, sent } = handSearch(PlaceSearch, timers, () => ['full.simplified.all', 'admin-minimal.simplified.none']);
+  const { search, sent } = handSearch(PlaceSearch, timers, () => ['full.simplified.all.all', 'admin-minimal.simplified.none.en']);
   search.typed('p');
   timers.advance(100);
   search.typed('pa');
@@ -1437,9 +1440,9 @@ test('a search waits for 250 ms of quiet in the box, and Enter searches at once'
   assert.deepEqual(sent, []);
   assert.equal(search.q, '');
   timers.advance(1);
-  assert.deepEqual(sent.map((s) => [s.q, s.dataset]), [['par', 'full.simplified.all'], ['par', 'admin-minimal.simplified.none']]);
+  assert.deepEqual(sent.map((s) => [s.q, s.dataset]), [['par', 'full.simplified.all.all'], ['par', 'admin-minimal.simplified.none.en']]);
   assert.equal(search.q, 'par');
-  assert.equal(sent[0].url, '/search?q=par&dataset=full.simplified.all&limit=10&key=test&debug=1');
+  assert.equal(sent[0].url, '/search?q=par&dataset=full.simplified.all.all&limit=10&key=test&debug=1');
 
   // Text typed back to the search shown asks nothing again; Enter asks it
   // again at once, and the pause typed before it is dropped.
@@ -1520,10 +1523,10 @@ test('a column whose index is building is asked again after Retry-After, showing
   const timers = handTimers();
   const { search, sent } = handSearch(PlaceSearch, timers, () => ['a', 'b']);
   search.submit('paris');
-  sent[0].answer(503, '{"dataset":"a","index":"full.exact.all","since":"2026-11-21T18:57:07Z","status":"building"}', { 'retry-after': '5' });
-  sent[1].answer(503, '{"dataset":"b","index":"full.exact.none","reason":"no room","since":"2026-11-21T19:00:00Z","status":"failed"}');
+  sent[0].answer(503, '{"dataset":"a","index":"full.exact.all.all","since":"2026-11-21T18:57:07Z","status":"building"}', { 'retry-after': '5' });
+  sent[1].answer(503, '{"dataset":"b","index":"full.exact.none.en","reason":"no room","since":"2026-11-21T19:00:00Z","status":"failed"}');
   await settle();
-  assert.deepEqual(plain(search.answers.a.building), { index: 'full.exact.all', since: '2026-11-21T18:57:07Z' });
+  assert.deepEqual(plain(search.answers.a.building), { index: 'full.exact.all.all', since: '2026-11-21T18:57:07Z' });
   assert.equal(search.answers.b.failed.reason, 'no room');
   assert.deepEqual(timers.pending(), [5000]);
   timers.advance(5000);
@@ -1536,7 +1539,7 @@ test('a column whose index is building is asked again after Retry-After, showing
 
   // A newer search drops the retry of the one before.
   search.submit('lyon');
-  sent[3].answer(503, '{"dataset":"a","index":"full.exact.all","since":"2026-11-21T18:57:07Z","status":"building"}', { 'retry-after': '5' });
+  sent[3].answer(503, '{"dataset":"a","index":"full.exact.all.all","since":"2026-11-21T18:57:07Z","status":"building"}', { 'retry-after': '5' });
   await settle();
   assert.deepEqual(timers.pending(), [5000]);
   search.submit('nice');
@@ -1643,15 +1646,15 @@ const NOTHING = { text: null, name: null, road: null, house_number: null, city: 
 
 test("a report of a column's reverse answer names its dataset, build, point and answer, what was expected, and the link", () => {
   const { reverseTarget, feedbackReport, feedbackSays } = core();
-  const dataset = catalog().datasets.find((d) => d.id === 'full.simplified.all');
+  const dataset = catalog().datasets.find((d) => d.id === 'full.simplified.all.all');
   const data = { display_name: 'Avenue Anatole France, Paris', address: { road: 'Avenue Anatole France', city: 'Paris' } };
-  const view = { label: dataset.label, color: '#111', dataset, answer: { data, build: ID, dataset: 'full.simplified.all', ms: 3 } };
+  const view = { label: dataset.label, color: '#111', dataset, answer: { data, build: ID, dataset: 'full.simplified.all.all', ms: 3 } };
   const form = { text: ' the tower itself ', name: 'Tour Eiffel', road: '', house_number: ' 5 ', city: '', postcode: '', country: '', comment: 'right there' };
 
   const report = plain(feedbackReport(reverseTarget(view, { id: 'r1', lat: 48.8584, lng: 2.2945 }), form, PAGE));
 
   assert.deepEqual(report, {
-    kind: 'reverse', lat: 48.8584, lon: 2.2945, q: null, result_index: null, dataset: 'full.simplified.all', build: ID,
+    kind: 'reverse', lat: 48.8584, lon: 2.2945, q: null, result_index: null, dataset: 'full.simplified.all.all', build: ID,
     answer: data, answer_trimmed: false,
     expected: { ...NOTHING, text: 'the tower itself', name: 'Tour Eiffel', house_number: '5' },
     comment: 'right there',
@@ -1679,15 +1682,15 @@ test("a report carries the contact its sender gave, and the form shows the remem
 test("a report of a column's search names the query, and the result picked with its point", () => {
   const { searchTarget, feedbackReport } = core();
   const results = [hit('Paris', 48.8566, 2.3522), hit('Paris', 33.6609, -95.5555, { admin1name: 'Texas' })];
-  const answer = { results, build: ID, dataset: 'full.simplified.all', index: 'full.simplified.all', ms: 7 };
-  const target = searchTarget(searchView('With addresses', '#111', answer, { id: 'full.simplified.all' }), 'paris');
+  const answer = { results, build: ID, dataset: 'full.simplified.all.all', index: 'full.simplified.all.all', ms: 7 };
+  const target = searchTarget(searchView('With addresses', '#111', answer, { id: 'full.simplified.all.all' }), 'paris');
   const page = { columns: ['with-addresses'], point: null, q: 'paris' };
 
   const picked = plain(feedbackReport(target, { result: '1', text: 'Paris, Texas first' }, page));
   const whole = plain(feedbackReport(target, { result: '', empty: 'on' }, page));
 
   assert.deepEqual([picked.kind, picked.q, picked.result_index, picked.lat, picked.lon, picked.dataset, picked.build],
-    ['search', 'paris', 1, 33.6609, -95.5555, 'full.simplified.all', ID]);
+    ['search', 'paris', 1, 33.6609, -95.5555, 'full.simplified.all.all', ID]);
   assert.deepEqual(picked.answer, plain(results));
   assert.deepEqual(picked.page, { columns: ['with-addresses'], point: null, q: 'paris' });
   assert.deepEqual([whole.result_index, whole.lat, whole.lon, whole.expected], [null, null, null, { ...NOTHING, empty: true }]);
@@ -1722,7 +1725,7 @@ test('an answer too long for a report goes as the start of its JSON, of at most 
   const { reverseTarget, feedbackReport, FEEDBACK_ANSWER_MAX } = core();
   const places = Array.from({ length: 400 }, (_, i) => ({ name: `Café "☕" 東京 ${i}`, category: 'cafe', distance_m: i }));
   const data = { display_name: 'Tōkyō', places };
-  const view = (d) => ({ label: 'x', color: '#111', dataset: { id: 'full.exact.all' }, answer: { data: d, build: ID, dataset: 'full.exact.all' } });
+  const view = (d) => ({ label: 'x', color: '#111', dataset: { id: 'full.exact.all.all' }, answer: { data: d, build: ID, dataset: 'full.exact.all.all' } });
   const entry = { lat: 35.68, lng: 139.76 };
 
   const long = feedbackReport(reverseTarget(view(data), entry), { comment: 'x' }, PAGE);
@@ -1827,7 +1830,7 @@ test('the Immich column is one of the others: a link or the picker names it, and
   assert.equal(col.error, null);
   assert.equal(columnKey(col), 'immich-cities500');
   // Made a custom pick, it starts from the default dataset's axes.
-  assert.deepEqual(plain(col.selection), { region: 'planet', mode: 'full', quality: 'simplified', poi_tier: 'all' });
+  assert.deepEqual(plain(col.selection), { region: 'planet', mode: 'full', quality: 'simplified', poi_tier: 'all', names: 'all' });
   assert.match(resolveColumn(catalog(), 'immich-cities500').error, /^unknown dataset "immich-cities500"/);
 
   const link = parseLink('?d=with-addresses&d=immich-cities500&at=48.8566,2.3522');
@@ -1896,9 +1899,9 @@ test('the Immich column has no search and no polygons, and says so in its search
   const { resolveColumn, searchDatasets, searchHeadsHtml, searchMatrixHtml, searchRows, overlayTarget, polygonKey } = core();
   const c = withImmich();
   const columns = ['with-addresses', 'immich-cities500', 'smallest'].map((token) => resolveColumn(c, token));
-  assert.deepEqual(plain(searchDatasets(columns)), ['full.simplified.all', 'admin-minimal.simplified.none']);
+  assert.deepEqual(plain(searchDatasets(columns)), ['full.simplified.all.all', 'admin-minimal.simplified.none.en']);
 
-  const results = { results: [hit('Paris', 48.85, 2.35)], us: 900, ms: 5, index: 'full.simplified.all' };
+  const results = { results: [hit('Paris', 48.85, 2.35)], us: 900, ms: 5, index: 'full.simplified.all.all' };
   const views = [searchView('With addresses', '#111', results, columns[0].dataset), searchView(IMMICH.label, '#222', null, IMMICH)];
   const heads = searchHeadsHtml(views, null);
   assert.ok(heads.includes(`${IMMICH.label}: <span class="warn">no search</span>: this column looks up points alone, as Immich does`), heads);
@@ -1908,7 +1911,7 @@ test('the Immich column has no search and no polygons, and says so in its search
 
   assert.equal(polygonKey(columns[1]), null);
   assert.equal(overlayTarget(1, columns, ID), null);
-  assert.deepEqual(plain(overlayTarget(2, columns, ID)), { key: 'admin-minimal.simplified.none', build: ID });
+  assert.deepEqual(plain(overlayTarget(2, columns, ID)), { key: 'admin-minimal.simplified.none.en', build: ID });
 });
 
 test("a report of the Immich column's answer names its dataset and no build", () => {
@@ -2246,7 +2249,7 @@ test("a pattern of applies_to names the components a shell pattern matches, as f
     ['water.all[]-]exact', ['water.all-exact']], ['water.all[a-]exact', ['water.all-exact']], ['water[.]all', ['water.all']],
     ['water.al?', ['water.all']], ['*', ids], ['', []], ['[', []], ['water.[', []],
     ['dir.admin-mini[a-c-m]al', ['dir.admin-minimal']], ['\\water.major', []], ['*.all*', ['water.all', 'water.all-exact']],
-    ['?????.*', water], ['water.*-exact', ['water.all-exact']],
+    ['w????.*', water], ['water.*-exact', ['water.all-exact']],
   ];
   for (const [pattern, want] of named) {
     assert.deepEqual(ids.filter((id) => namesId(pattern, id)), want, pattern);
@@ -2292,7 +2295,7 @@ test('the disclosure credits a source of the water alone only while the columns 
   // The patterns name the build's components as shell patterns do: those
   // that name only water components are of the water alone, however they
   // are written.
-  for (const applies_to of [['wate[r].major'], ['water*'], ['[w]ater.all', 'w?ter.all-*'], ['?????.*']]) {
+  for (const applies_to of [['wate[r].major'], ['water*'], ['[w]ater.all', 'w?ter.all-*'], ['w????.*']]) {
     const out = creditsHtml({ ...catalog(), attribution: [OSM, { ...sea, applies_to }] });
     assert.ok(!text(out).includes('The seas, cut to the land.'), JSON.stringify(applies_to));
   }
@@ -2364,19 +2367,19 @@ test('a column asks with the water the toggle picks, the Immich column without; 
   const geocoder = resolveColumn(c, 'with-addresses');
   const immich = resolveColumn(c, 'immich-cities500');
   const single = { single: true, token: null, dataset: null };
-  assert.equal(reverseUrl(46.45, 6.55, geocoder, 'major'), '/reverse?lat=46.45&lon=6.55&key=test&dataset=full.simplified.all&water=major');
-  assert.equal(reverseUrl(46.45, 6.55, geocoder, null), '/reverse?lat=46.45&lon=6.55&key=test&dataset=full.simplified.all');
+  assert.equal(reverseUrl(46.45, 6.55, geocoder, 'major'), '/reverse?lat=46.45&lon=6.55&key=test&dataset=full.simplified.all.all&water=major');
+  assert.equal(reverseUrl(46.45, 6.55, geocoder, null), '/reverse?lat=46.45&lon=6.55&key=test&dataset=full.simplified.all.all');
   assert.equal(reverseUrl(46.45, 6.55, immich, 'major'), '/reverse?lat=46.45&lon=6.55&key=test&dataset=immich-cities500');
   assert.equal(reverseUrl(46.45, 6.55, single, 'all'), '/reverse?lat=46.45&lon=6.55&key=test');
   assert.deepEqual([geocoder, immich, single].map(takesWater), [true, false, false]);
 
-  assert.equal(answerKey(geocoder, 'all'), 'full.simplified.all~all');
-  assert.equal(answerKey(geocoder, 'none'), 'full.simplified.all~none');
-  assert.equal(answerKey(geocoder, null), 'full.simplified.all');
+  assert.equal(answerKey(geocoder, 'all'), 'full.simplified.all.all~all');
+  assert.equal(answerKey(geocoder, 'none'), 'full.simplified.all.all~none');
+  assert.equal(answerKey(geocoder, null), 'full.simplified.all.all');
   assert.equal(answerKey(immich, 'all'), 'immich-cities500');
   assert.equal(answerKey(single, 'all'), '');
   // The polygons' key is the dataset's, whatever the water.
-  assert.equal(columnKey(geocoder), 'full.simplified.all');
+  assert.equal(columnKey(geocoder), 'full.simplified.all.all');
 });
 
 test('a link carries the water where it is not the build\'s default', () => {
@@ -2389,10 +2392,10 @@ test('a link carries the water where it is not the build\'s default', () => {
 
 test('an answer keeps the water it was answered with', () => {
   const { answerOf } = core();
-  const headers = { 'x-geocoder-build-id': ID, 'x-geocoder-dataset': 'full.simplified.all', 'x-geocoder-water': 'major' };
+  const headers = { 'x-geocoder-build-id': ID, 'x-geocoder-dataset': 'full.simplified.all.all', 'x-geocoder-water': 'major' };
   const header = (name) => headers[name.toLowerCase()] ?? null;
   assert.deepEqual(plain(answerOf(200, header, `{"address":{},"water":${JSON.stringify(GENEVA)}}`, 3)),
-    { data: { address: {}, water: GENEVA }, build: ID, dataset: 'full.simplified.all', water: 'major', ms: 3 });
+    { data: { address: {}, water: GENEVA }, build: ID, dataset: 'full.simplified.all.all', water: 'major', ms: 3 });
   assert.equal(answerOf(400, header, 'unknown water', 1).water, 'major');
 });
 
@@ -2413,7 +2416,7 @@ test('each column shows its answer\'s water, which a row of the field table comp
   // In each geocoder column's head: the name, then its class and type, and
   // the water it was asked with.
   assert.equal(out.match(/<div class="answer-water">Water: <strong>Lac Léman<\/strong> <span class="water-kind">natural\/water<\/span><\/div>/g).length, 2, out);
-  assert.ok(out.includes('full.simplified.all · water all · build'), out);
+  assert.ok(out.includes('full.simplified.all.all · water all · build'), out);
   // The row: the two geocoder columns agree; the Immich column and
   // Nominatim take no part, and lack nothing.
   const row = out.match(/<tr class="water">([\s\S]*?)<\/tr>/);

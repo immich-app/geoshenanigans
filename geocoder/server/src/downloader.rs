@@ -24,8 +24,8 @@ pub enum DownloadError {
     NotInManifest(String),
     Decompress(String),
     UnknownRegion(String),
-    /// The selection names a value on `axis` (mode, quality, poi_tier or
-    /// water) that the build has no component for; `offered` lists those it
+    /// The selection names a value on `axis` (mode, quality, poi_tier, water or
+    /// names) that the build has no component for; `offered` lists those it
     /// has.
     NotOffered { axis: &'static str, value: String, offered: Vec<String> },
     /// The manifest names a component (as a parent or a variant) that it
@@ -148,7 +148,7 @@ pub struct UnitEntry {
 }
 
 /// The axes a selection takes one component of, `<axis>.<value>`.
-pub const COMPONENT_AXES: [&str; 4] = ["mode", "quality", "poi_tier", "water"];
+pub const COMPONENT_AXES: [&str; 5] = ["mode", "quality", "poi_tier", "water", "names"];
 
 impl Configurations {
     /// The values of `axis` the build has a component for, in order.
@@ -159,7 +159,7 @@ impl Configurations {
 }
 
 /// Fails, naming the value and those the build offers, unless the build has
-/// a component for each of `sel`'s mode, quality, poi_tier and water. The
+/// a component for each of `sel`'s mode, quality, poi_tier, water and names. The
 /// region isn't checked: the manifest's files table holds it.
 pub fn check_selection(cfg: &Configurations, sel: &RegionSelection) -> Result<(), DownloadError> {
     for axis in COMPONENT_AXES {
@@ -172,7 +172,7 @@ pub fn check_selection(cfg: &Configurations, sel: &RegionSelection) -> Result<()
 }
 
 /// Per-region selection passed in by the configuration endpoint. The
-/// mode/quality/poi_tier/water strings have to match component IDs in
+/// mode/quality/poi_tier/water/names strings have to match component IDs in
 /// configurations.components (e.g. "simplified", "major").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionSelection {
@@ -181,6 +181,7 @@ pub struct RegionSelection {
     pub quality: String,
     pub poi_tier: String,
     pub water: String,
+    pub names: String,
 }
 
 impl RegionSelection {
@@ -192,6 +193,7 @@ impl RegionSelection {
             "quality" => Some(&self.quality),
             "poi_tier" => Some(&self.poi_tier),
             "water" => Some(&self.water),
+            "names" => Some(&self.names),
             _ => None,
         }
     }
@@ -232,6 +234,7 @@ fn substitute(path: &str, sel: &RegionSelection) -> String {
         .replace("{quality}", &sel.quality)
         .replace("{poi_tier}", &sel.poi_tier)
         .replace("{water}", &sel.water)
+        .replace("{names}", &sel.names)
 }
 
 /// The component `id`'s `dir`, none for one without: an error unless it is
@@ -1273,6 +1276,7 @@ pub fn stamped_source(text: &str, region: &str) -> Option<(String, RegionSelecti
         quality: value("quality")?,
         poi_tier: value("poi_tier")?,
         water: value("water")?,
+        names: value("names")?,
     };
     (stamp_text(date, &base_url, &sel) == text).then_some((base_url, sel))
 }
@@ -1392,6 +1396,9 @@ mod tests {
     fn cfg(components: Vec<(&str, Component)>) -> Configurations {
         let mut components: BTreeMap<String, Component> = components.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         components.entry("water.none".into()).or_insert_with(|| component(&[], &[], None));
+        for names in ["en", "all"] {
+            components.entry(format!("names.{names}")).or_insert_with(|| component(&[], &[], None));
+        }
         Configurations {
             build: BuildMeta { date: "2026-01-01".into() },
             components,
@@ -1411,6 +1418,7 @@ mod tests {
             quality: quality.to_string(),
             poi_tier: poi_tier.to_string(),
             water: water.to_string(),
+            names: "all".into(),
         }
     }
 
@@ -1538,11 +1546,11 @@ mod tests {
 
         assert_eq!(missing(serde_json::json!({
             "mode.full": { "files": ["{region}/full/a.bin"], "extends": "full/base" },
-            "quality.simplified": {}, "poi_tier.none": {}, "water.none": {}
+            "quality.simplified": {}, "poi_tier.none": {}, "water.none": {}, "names.all": {}
         })), "full/base");
         assert_eq!(missing(serde_json::json!({
             "mode.full": { "files": ["{region}/full/a.bin"], "variants": [{ "component": "full/alone" }] },
-            "quality.simplified": {}, "poi_tier.none": {}, "water.none": {}
+            "quality.simplified": {}, "poi_tier.none": {}, "water.none": {}, "names.all": {}
         })), "full/alone");
     }
 
@@ -1568,7 +1576,8 @@ mod tests {
                 "quality.simplified": {},
                 "poi_tier.none": {},
                 "poi_tier.major": { "files": ["{region}/poi/{poi_tier}/p.bin"] },
-                "water.none": {}
+                "water.none": {},
+                "names.all": {}
             })).unwrap(),
             files: BTreeMap::new(),
             units: BTreeMap::new(),
@@ -1672,7 +1681,7 @@ mod tests {
         })
     }
 
-    /// Every mode × quality × poi_tier × water the template's constraints
+    /// Every mode × quality × poi_tier × water × names the template's constraints
     /// allow, in europe, and its presets' selections.
     fn template_selections(v: &serde_json::Value) -> Vec<RegionSelection> {
         let mut all = Vec::new();
@@ -1680,7 +1689,9 @@ mod tests {
             for quality in axis_values(v, "quality") {
                 for poi_tier in axis_values(v, "poi_tier") {
                     for water in axis_values(v, "water") {
-                        all.push(wet("europe", &mode, &quality, &poi_tier, &water));
+                        for names in axis_values(v, "names") {
+                            all.push(RegionSelection { names, ..wet("europe", &mode, &quality, &poi_tier, &water) });
+                        }
                     }
                 }
             }
@@ -1688,9 +1699,40 @@ mod tests {
         all.retain(|s| allowed(v, s));
         for preset in v["presets"].as_array().unwrap() {
             let axis = |name: &str| preset["selections"][name].as_str().unwrap().to_string();
-            all.push(wet(&axis("region"), &axis("mode"), &axis("quality"), &axis("poi_tier"), &axis("water")));
+            all.push(RegionSelection {
+                names: axis("names"),
+                ..wet(&axis("region"), &axis("mode"), &axis("quality"), &axis("poi_tier"), &axis("water"))
+            });
         }
         all
+    }
+
+    #[test]
+    fn names_switches_only_the_tag_tiers_and_their_columns() {
+        let (v, c) = template();
+        for all in template_selections(&v).into_iter().filter(|s| s.names == "all") {
+            let en = RegionSelection { names: "en".into(), ..all.clone() };
+            let placed = |s: &RegionSelection| {
+                let files = resolve_files(&c, s).unwrap();
+                files.paths.iter().map(|path| (files.dest(path).to_string(), path.clone())).collect::<BTreeMap<_, _>>()
+            };
+            let (all_files, en_files) = (placed(&all), placed(&en));
+            assert!(all_files.keys().eq(en_files.keys()), "{all:?}");
+            let mut changed = BTreeSet::from(["strings_tags_core.bin", "place_tags.bin", "admin_tags.bin"]);
+            if all.poi_tier != "none" {
+                changed.extend(["strings_tags_poi.bin", "poi_tags.bin"]);
+            }
+            for (name, path) in all_files {
+                let other = &en_files[&name];
+                if changed.remove(name.as_str()) {
+                    assert!(path.contains("/names-all/"), "{path}");
+                    assert_eq!(*other, path.replace("/names-all/", "/names-en/"));
+                } else {
+                    assert_eq!(*other, path);
+                }
+            }
+            assert!(changed.is_empty(), "{all:?}");
+        }
     }
 
     // Index::load needs strings_layout.json in every region dir and
@@ -1753,7 +1795,7 @@ mod tests {
                      "place_cells.bin", "place_hidden.bin", "place_imp.bin", "place_nodes.bin", "place_tags.bin",
                      "postal_cities.bin", "postcode_grid.bin", "strings_core.bin", "strings_layout.json", "strings_tags_core.bin"];
         let minimal: Vec<RegionSelection> = template_selections(&v).into_iter()
-            .filter(|s| s.mode == "admin-minimal" && s.region == "europe")
+            .filter(|s| s.mode == "admin-minimal" && s.region == "europe" && s.names == "all")
             .collect();
         assert_eq!(minimal.len(), axis_values(&v, "poi_tier").len() * axis_values(&v, "water").len());
         for s in minimal {
@@ -1763,7 +1805,8 @@ mod tests {
             } else {
                 ("europe/admin-minimal-poi/", "europe/admin-minimal/")
             };
-            let in_dir: Vec<&str> = paths.iter().filter_map(|p| p.strip_prefix(dir)).collect();
+            let mut in_dir: Vec<&str> = paths.iter().filter_map(|p| p.strip_prefix(dir)).map(basename).collect();
+            in_dir.sort_unstable();
             assert_eq!(in_dir, files, "{:?}", s);
             // A region of no grid has no postcode_grid.bin in its manifest: the dir's is optional.
             assert!(optional.contains(&format!("{dir}postcode_grid.bin")), "{:?}", s);
@@ -1829,9 +1872,9 @@ mod tests {
     fn the_default_configuration_is_a_selection_the_template_allows() {
         let (v, c) = template();
         let d = crate::region_state::Configuration::default();
-        let s = wet("europe", &d.mode, &d.quality, &d.poi_tier, &d.water);
+        let s = d.selection("europe");
 
-        for (axis, value) in [("mode", &d.mode), ("quality", &d.quality), ("poi_tier", &d.poi_tier), ("water", &d.water)] {
+        for (axis, value) in [("mode", &d.mode), ("quality", &d.quality), ("poi_tier", &d.poi_tier), ("water", &d.water), ("names", &d.names)] {
             assert!(axis_values(&v, axis).contains(value), "{axis} {value}");
         }
         assert!(allowed(&v, &s));
@@ -2288,6 +2331,29 @@ mod tests {
             assert_eq!(differing(&held(&dir), &files_of(&bucket, &s)), Vec::<String>::new(), "{water}");
             let ledger = std::fs::read_to_string(dir.join(FILE_LEDGER)).unwrap();
             assert_eq!(ledger.lines().any(|l| l.starts_with("water/")), water != "none", "{water}: {ledger}");
+        }
+    }
+
+    #[tokio::test]
+    async fn switching_the_name_tier_replaces_its_flat_file() {
+        let bucket = test_bucket::serve(serde_json::json!({
+            "mode.admin": { "files": ["{region}/admin/admin_cells.bin"] },
+            "quality.simplified": {},
+            "poi_tier.none": {},
+            "water.none": {},
+            "names.en": { "files": ["{region}/admin/names-en/aliases.bin"] },
+            "names.all": { "files": ["{region}/admin/names-all/aliases.bin"] }
+        })).await;
+        let root = ScratchDir::new();
+        let all = sel("europe", "admin", "simplified", "none");
+        for names in ["en", "all", "en"] {
+            let s = RegionSelection { names: names.into(), ..all.clone() };
+            download(&bucket, &s, root.path()).await.unwrap();
+            let dir = root.path().join(&s.region);
+            assert_eq!(std::fs::read(dir.join("aliases.bin")).unwrap(),
+                       bucket.file(&format!("europe/admin/names-{names}/aliases.bin")));
+            assert_eq!(stamped_source(&std::fs::read_to_string(dir.join(BUILD_STAMP)).unwrap(), "europe"),
+                       Some((bucket.url.clone(), s)));
         }
     }
 
@@ -3213,10 +3279,10 @@ mod tests {
         let s = wet("europe", "full", "exact", "major", "all-exact");
         let text = stamp_text("2026-01-01", "http://bucket/geocoder", &s);
 
-        assert_eq!(text, "2026-01-01\nbase_url http://bucket/geocoder\nmode full\nquality exact\npoi_tier major\nwater all-exact\n");
+        assert_eq!(text, "2026-01-01\nbase_url http://bucket/geocoder\nmode full\nquality exact\npoi_tier major\nwater all-exact\nnames all\n");
         assert_eq!(stamped_source(&text, "europe"), Some(("http://bucket/geocoder".to_string(), s.clone())));
         let swapped = text.replace("mode full\nquality exact", "quality exact\nmode full");
-        let cut = text.trim_end_matches("water all-exact\n").to_string();
+        let cut = text.trim_end_matches("names all\n").to_string();
         for other in ["2026-01-01".to_string(), swapped, cut, stamp_text("2026-01-01", "http://bucket\nmode admin", &s)] {
             assert_eq!(stamped_source(&other, "europe"), None, "{other:?}");
         }

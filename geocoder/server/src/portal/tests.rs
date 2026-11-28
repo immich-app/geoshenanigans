@@ -3,7 +3,7 @@
 // bucket on localhost (test_bucket.rs), whose template build has real
 // transport units. Its datasets load through an injected loader: a small
 // dataset of each one's own (write_dataset), its country named by the
-// dataset's id; the real load of a build's 28 is the box gate's. Its water
+// dataset's id; the real load of a build's selections is the box gate's. Its water
 // dirs load as the builder's water dir fixture (water_fixture), whose water
 // lies around 47 N 8 E, off the datasets' country.
 
@@ -256,12 +256,14 @@ fn template_selections() -> Vec<(RegionSelection, bool)> {
     for mode in template_values("mode") {
         for quality in template_values("quality") {
             for poi_tier in template_values("poi_tier") {
-                let s = RegionSelection { region: "planet".into(), mode: mode.clone(), quality: quality.clone(), poi_tier, water: "none".into() };
-                let allowed = t["constraints"].as_array().unwrap().iter().all(|c| {
-                    let has = |key: &str| c[key].as_object().unwrap().iter().all(|(axis, value)| s.axis(axis) == value.as_str());
-                    !has("when") || has("requires")
-                });
-                all.push((s, allowed));
+                for names in template_values("names") {
+                    let s = RegionSelection { region: "planet".into(), mode: mode.clone(), quality: quality.clone(), poi_tier: poi_tier.clone(), water: "none".into(), names };
+                    let allowed = t["constraints"].as_array().unwrap().iter().all(|c| {
+                        let has = |key: &str| c[key].as_object().unwrap().iter().all(|(axis, value)| s.axis(axis) == value.as_str());
+                        !has("when") || has("requires")
+                    });
+                    all.push((s, allowed));
+                }
             }
         }
     }
@@ -391,7 +393,7 @@ async fn a_dataset_answers_byte_for_byte_what_query_server_answers_from_its_file
         for q in &queries {
             let want = fetch(&format!("{theirs}/{route}?{q}")).await;
             *found.entry(route).or_insert(0) += usize::from(want.status == 200 && want.body.contains("Testland"));
-            for dataset in ["", "&dataset=with-addresses", "&dataset=full.simplified.all"] {
+            for dataset in ["", "&dataset=with-addresses", "&dataset=full.simplified.all.all"] {
                 let got = fetch(&format!("{ours}/{route}?{q}{dataset}")).await;
                 assert_eq!((got.status, &got.content_type, &got.body), (want.status, &want.content_type, &want.body), "/{route}?{q}{dataset}");
             }
@@ -425,7 +427,7 @@ async fn a_builds_objects_cover_every_selection_it_serves_and_its_sync_fetches_e
     }
     let (mut units, mut taken) = (BTreeSet::new(), BTreeSet::new());
     let allowed: Vec<RegionSelection> = template_selections().into_iter().filter(|(_, allowed)| *allowed).map(|(s, _)| s).collect();
-    assert_eq!(allowed.len(), 28);
+    assert_eq!(allowed.len(), 56);
     for s in &allowed {
         let resolved = resolve_files(&cfg, s).unwrap();
         let files: Vec<&String> = resolved.paths.iter().filter(|p| cfg.files.contains_key(*p)).collect();
@@ -558,7 +560,7 @@ async fn water_is_none_or_a_water_dir_of_the_build_and_all_by_default() {
 
     let listed = fetch(&format!("{url}/datasets")).await.json();
     let axes: Vec<&str> = listed["axes"].as_array().unwrap().iter().map(|a| a["id"].as_str().unwrap()).collect();
-    assert_eq!(axes, ["region", "mode", "quality", "poi_tier"]);
+    assert_eq!(axes, ["region", "mode", "quality", "poi_tier", "names"]);
     let water = &listed["water"];
     assert_eq!((water["default"].as_str(), water["label"].as_str()), (Some("all"), Some("Bodies of water")));
     let values: Vec<&str> = water["values"].as_array().unwrap().iter().map(|v| v["id"].as_str().unwrap()).collect();
@@ -845,7 +847,7 @@ async fn a_manifest_whose_constraints_or_presets_name_what_it_lacks_or_shares_ca
     .await
     .map(|_| ());
     assert_eq!(twice, Err("two presets have the id smallest".to_string()));
-    for id in ["full.exact.none", "admin.simplified.major", "admin-minimal.exact.none"] {
+    for id in ["full.exact.none.en", "admin.simplified.major.en", "admin-minimal.exact.none.en"] {
         let got = plan_edited(&bucket, |m| m["presets"][1]["id"] = id.into()).await.map(|_| ());
         assert_eq!(got, Err(format!("preset {id} has the id of a selection, which dataset= names as such")), "{id}");
     }
@@ -916,7 +918,7 @@ async fn a_start_without_a_usable_build_answers_503_with_the_reason_and_keeps_sy
     let health = fetch(&format!("{url}/health")).await;
     assert_eq!(health.status, 200);
     assert_eq!(health.json()["build"]["dir"], format!("{DATE}-1"));
-    assert_eq!(health.json()["datasets"], 28);
+    assert_eq!(health.json()["datasets"], 56);
     assert_eq!(fetch(&format!("{url}/reverse?lat=10.5&lon=20.5&key=test")).await.status, 200);
 }
 
@@ -1746,7 +1748,7 @@ async fn a_build_the_volume_holds_damaged_is_fetched_again_before_it_is_served_a
     assert_eq!(build_dirs(data.path()), [format!("{DATE}-2"), format!("{NEXT}-1")]);
 }
 
-// /datasets lists the 28 planet selections the constraints allow, in the
+// /datasets lists the planet selections the constraints allow, in the
 // axes' order, each with its label, description, preset, values and sizes
 // (the bytes of its dir, which holds one file of each name as a client's
 // download does, and the manifest's sum of what a client downloads), the
@@ -1754,7 +1756,7 @@ async fn a_build_the_volume_holds_damaged_is_fetched_again_before_it_is_served_a
 // with theirs, and the 4 combinations the constraint excludes, each with
 // the constraint's message and what it requires.
 #[tokio::test]
-async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_exclude() {
+async fn datasets_lists_the_offered_and_the_combinations_the_constraints_exclude() {
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
     let data = ScratchDir::new();
     let (_fixtures, load) = fixtures();
@@ -1769,26 +1771,26 @@ async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_excl
     assert_eq!(json["build"], serde_json::json!({
         "date": DATE, "version": BUILD_VERSION, "id": publication_of(&bucket, DATE).await, "dir": format!("{DATE}-1"),
     }));
-    assert_eq!(json["default"], "full.simplified.all");
+    assert_eq!(json["default"], "full.simplified.all.all");
     let datasets = json["datasets"].as_array().unwrap();
     assert_eq!(datasets.iter().map(|d| d["id"].as_str().unwrap()).collect::<Vec<_>>(), template_ids());
-    assert_eq!(datasets.len(), 28);
+    assert_eq!(datasets.len(), 56);
     let presets: Vec<(&str, &str)> = json["presets"].as_array().unwrap().iter().map(|p| (p["id"].as_str().unwrap(), p["dataset"].as_str().unwrap())).collect();
-    assert_eq!(presets, [("smallest", "admin-minimal.simplified.none"), ("immich-recommended", "admin.simplified.major"),
-                         ("with-addresses", "full.simplified.all"), ("max-quality", "full.exact.all")]);
+    assert_eq!(presets, [("smallest", "admin-minimal.simplified.none.en"), ("immich-recommended", "admin.simplified.major.en"),
+                         ("with-addresses", "full.simplified.all.all"), ("max-quality", "full.exact.all.all")]);
     for (got, want) in json["presets"].as_array().unwrap().iter().zip(t["presets"].as_array().unwrap()) {
         assert_eq!((&got["label"], &got["description"]), (&want["label"], &want["description"]), "preset {}", want["id"]);
         assert!(want["label"].is_string() && want["description"].is_string(), "preset {}", want["id"]);
     }
     let dataset = |id: &str| datasets.iter().find(|d| d["id"] == id).unwrap().clone();
     let with_addresses = &t["presets"].as_array().unwrap()[2];
-    assert_eq!(dataset("full.simplified.all")["label"], with_addresses["label"]);
-    assert_eq!(dataset("full.simplified.all")["description"], with_addresses["description"]);
-    assert_eq!(dataset("full.simplified.all")["preset"], "with-addresses");
-    assert_eq!(dataset("admin.exact.notable")["label"], "Admin only · Exact · Notable (~3.8M POIs)");
-    assert_eq!(dataset("admin.exact.notable")["preset"], serde_json::Value::Null);
-    assert_eq!(dataset("admin.exact.notable")["selection"],
-               serde_json::json!({ "region": "planet", "mode": "admin", "quality": "exact", "poi_tier": "notable" }));
+    assert_eq!(dataset("full.simplified.all.all")["label"], with_addresses["label"]);
+    assert_eq!(dataset("full.simplified.all.all")["description"], with_addresses["description"]);
+    assert_eq!(dataset("full.simplified.all.all")["preset"], "with-addresses");
+    assert_eq!(dataset("admin.exact.notable.all")["label"], "Admin only · Exact · Notable (~3.8M POIs) · All names");
+    assert_eq!(dataset("admin.exact.notable.all")["preset"], serde_json::Value::Null);
+    assert_eq!(dataset("admin.exact.notable.all")["selection"],
+               serde_json::json!({ "region": "planet", "mode": "admin", "quality": "exact", "poi_tier": "notable", "names": "all" }));
     let sets = data.path().join(BUILDS).join(format!("{DATE}-1")).join(SETS);
     for (s, _) in template_selections().into_iter().filter(|(_, allowed)| *allowed) {
         let files: Vec<String> = resolve_files(&cfg, &s).unwrap().paths.into_iter().filter(|p| cfg.files.contains_key(p)).collect();
@@ -1805,13 +1807,13 @@ async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_excl
     let excluded: Vec<serde_json::Value> = template_selections().into_iter().filter(|(_, allowed)| !*allowed)
         .map(|(s, _)| serde_json::json!({
             "id": catalog::dataset_id(&s),
-            "selection": { "region": s.region, "mode": s.mode, "quality": s.quality, "poi_tier": s.poi_tier },
+            "selection": { "region": s.region, "mode": s.mode, "quality": s.quality, "poi_tier": s.poi_tier, "names": s.names },
             "constraint": constraint["id"],
             "message": constraint["message"],
             "requires": constraint["requires"],
         }))
         .collect();
-    assert_eq!(excluded.len(), 4);
+    assert_eq!(excluded.len(), 8);
     assert_eq!(json["excluded"].as_array().unwrap(), &excluded);
 
     let axes: Vec<(&str, Vec<&str>)> = json["axes"].as_array().unwrap().iter()
@@ -1820,7 +1822,8 @@ async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_excl
     let values = |axis: &str| template_values(axis);
     assert_eq!(axes, [("region", vec!["planet"]), ("mode", values("mode").iter().map(String::as_str).collect()),
                       ("quality", values("quality").iter().map(String::as_str).collect()),
-                      ("poi_tier", values("poi_tier").iter().map(String::as_str).collect())]);
+                      ("poi_tier", values("poi_tier").iter().map(String::as_str).collect()),
+                      ("names", values("names").iter().map(String::as_str).collect())]);
     for axis in json["axes"].as_array().unwrap() {
         let want = &t["axes"][axis["id"].as_str().unwrap()];
         assert_eq!((&axis["label"], &axis["description"]), (&want["label"], &want["description"]), "axis {}", axis["id"]);
@@ -1965,17 +1968,17 @@ async fn a_request_without_a_dataset_answers_with_addresses() {
     let url = serve(router(p, db())).await;
 
     for route in ["reverse", "polygons"] {
-        for (dataset, id) in [("", "full.simplified.all"), ("&dataset=with-addresses", "full.simplified.all"),
-                              ("&dataset=smallest", "admin-minimal.simplified.none"), ("&dataset=admin.simplified.major", "admin.simplified.major")] {
+        for (dataset, id) in [("", "full.simplified.all.all"), ("&dataset=with-addresses", "full.simplified.all.all"),
+                              ("&dataset=smallest", "admin-minimal.simplified.none.en"), ("&dataset=admin.simplified.major.en", "admin.simplified.major.en")] {
             let got = fetch(&format!("{url}/{route}?lat=10.5&lon=20.5&key=test{dataset}")).await;
             assert_eq!(got.status, 200, "{route} {dataset}");
             assert!(got.body.contains(&format!("\"{id}\"")), "{route} {dataset}: {}", got.body);
             assert_eq!((got.header("x-geocoder-dataset"), got.header("x-geocoder-build")), (Some(id), Some(DATE)), "{route} {dataset}");
         }
     }
-    let excluded = fetch(&format!("{url}/reverse?lat=10.5&lon=20.5&key=test&dataset=admin-minimal.exact.none")).await;
+    let excluded = fetch(&format!("{url}/reverse?lat=10.5&lon=20.5&key=test&dataset=admin-minimal.exact.none.en")).await;
     assert_eq!((excluded.status, excluded.body.as_str()),
-               (400, format!("dataset admin-minimal.exact.none is not offered: {}", template()["constraints"][0]["message"].as_str().unwrap()).as_str()));
+               (400, format!("dataset admin-minimal.exact.none.en is not offered: {}", template()["constraints"][0]["message"].as_str().unwrap()).as_str()));
     let unknown = fetch(&format!("{url}/reverse?lat=10.5&lon=20.5&key=test&dataset=everything")).await;
     assert_eq!(unknown.status, 400);
     assert!(unknown.body.starts_with("unknown dataset \"everything\": this build offers the presets smallest, immich-recommended, with-addresses, max-quality and "), "{}", unknown.body);
@@ -1999,7 +2002,7 @@ async fn a_reverse_the_portal_cant_answer_takes_nothing_of_the_keys_allowance() 
 
     assert_eq!(fetch(&reverse("")).await.status, 503);
     p.round(true).await.unwrap();
-    for dataset in ["&dataset=everything", "&dataset=admin-minimal.exact.none"] {
+    for dataset in ["&dataset=everything", "&dataset=admin-minimal.exact.none.en"] {
         assert_eq!(fetch(&reverse(dataset)).await.status, 400, "{dataset}");
     }
 

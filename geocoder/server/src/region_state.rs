@@ -53,7 +53,7 @@ thread_local! {
     static ONCE_DOWNLOADED: std::cell::Cell<Option<Box<dyn FnOnce(&std::path::Path)>>> = const { std::cell::Cell::new(None) };
 }
 
-/// The selection a server downloads. A mode, quality, poi_tier or water
+/// The selection a server downloads. A mode, quality, POI tier, water or names
 /// value its build has no component for fails each download, naming the
 /// values the build offers; a PUT naming one is refused when the build's
 /// manifest is at hand.
@@ -76,6 +76,9 @@ pub struct Configuration {
     /// axis's default, where the configuration names none.
     #[serde(default = "water_none")]
     pub water: String,
+    /// Additional search names. Must match a `names.*` component.
+    #[serde(default = "names_en")]
+    pub names: String,
     /// Regions to preload on configuration push. Anything not listed
     /// here can still be downloaded lazily on first request.
     #[serde(default)]
@@ -91,6 +94,7 @@ impl Default for Configuration {
             quality: "simplified".to_string(),
             poi_tier: "none".to_string(),
             water: water_none(),
+            names: names_en(),
             preload: Vec::new(),
         }
     }
@@ -101,6 +105,10 @@ fn water_none() -> String {
     "none".to_string()
 }
 
+fn names_en() -> String {
+    "en".to_string()
+}
+
 impl Configuration {
     pub fn selection(&self, region: &str) -> RegionSelection {
         RegionSelection {
@@ -109,6 +117,7 @@ impl Configuration {
             quality: self.quality.clone(),
             poi_tier: self.poi_tier.clone(),
             water: self.water.clone(),
+            names: self.names.clone(),
         }
     }
 }

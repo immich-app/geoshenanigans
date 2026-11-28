@@ -100,7 +100,8 @@ using TierBases = std::array<uint32_t, STRING_TIER_COUNT + 1>;
 static bool borrows_tier(const std::string& dir, size_t tier) {
     auto component = std::filesystem::path(dir).lexically_normal();
     if (component.filename().empty()) component = component.parent_path();
-    return tier < STR_TIER_TAGS_CORE && component.filename() != "admin-minimal";
+    return tier < STR_TIER_TAGS_CORE && component.filename() != "admin-minimal" &&
+           component.filename() != EN_NAMES_DIR && component.filename() != ALL_NAMES_DIR;
 }
 
 // Mode dirs can omit tiers and POI dirs can ship just a prefix. Once a

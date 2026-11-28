@@ -5,7 +5,7 @@ Usage: build_search_indexes.py <output dir> <place-search binary> [--jobs N] [--
 
 configurations.json's search_index block names the selections whose packs ship the index
 (`shipped`) and where it goes (`dir`). For each region of the output, a shipped selection's
-files (its mode, quality and POI tier components, as a client resolves them) are linked into
+files (its mode, quality, POI tier and names components, as a client resolves them) are linked into
 one flat dir, the way a client holds them, and `place-search build` writes the index of that
 dir into `dir`. compress_index.py then publishes it with the rest. A client of the selection
 downloads it; any other selection builds it on the device. The index records the sha256 of
@@ -23,7 +23,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-AXES = ("mode", "quality", "poi_tier")
+AXES = ("mode", "quality", "poi_tier", "names")
 
 # Prints the CPUs the nightly's tools size their threads by.
 CPU_BUDGET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpu_budget.sh")

@@ -16,49 +16,70 @@ inline uint32_t tier_end(uint32_t base, size_t bytes) {
 
 inline uint64_t object(const std::vector<uint64_t>& ids, size_t i) { return i < ids.size() ? ids[i] : 0; }
 
-inline std::string_view names(const ParsedData& d, Use use, uint64_t id, uint32_t name) {
-    const auto b = d.search_tags->get(use, id);
-    if (tag_bundles::name_alone(b)) {
-        const char* stored = d.get_string(name);
-        if (stored && b.substr(b.find(TAG_KEY_SEP) + 1) == stored) return {};
+template <Use UseOfNames>
+auto names(const ParsedData& d, uint64_t id, uint32_t name) {
+    const auto bundle = d.search_tags->get(UseOfNames, id);
+    if constexpr (UseOfNames == Use::CoreEn || UseOfNames == Use::PoiEn) {
+        const char* stored = bundle.empty() ? nullptr : d.get_string(name);
+        return tag_bundles::without_stored_english(bundle, stored ? stored : std::string_view());
+    } else {
+        if (tag_bundles::name_alone(bundle)) {
+            const char* stored = d.get_string(name);
+            if (stored && bundle.substr(bundle.find(TAG_KEY_SEP) + 1) == stored) return std::string_view();
+        }
+        return bundle;
     }
-    return b;
 }
 
-template <class Place, class Admin>
+template <Use UseOfNames = Use::Core, class Place, class Admin>
 LaidOutTier core(const ParsedData& d, size_t places, Place place, size_t admins, Admin admin) {
-    return tag_bundles::lay_out(places + admins, 1, [&](size_t row) -> std::string_view {
+    return tag_bundles::lay_out(places + admins, 1, [&](size_t row) {
         if (row < places) {
             const auto i = place(row);
-            return names(d, Use::Core, object(d.place_osm_ids, i), d.place_nodes[i].name_id);
+            return names<UseOfNames>(d, object(d.place_osm_ids, i), d.place_nodes[i].name_id);
         }
         const auto i = admin(row - places);
-        return i == NO_DATA ? std::string_view() : names(d, Use::Core, object(d.admin_osm_ids, i), d.admin_polygons[i].name_id);
+        if (i == NO_DATA) return decltype(names<UseOfNames>(d, 0, NO_DATA)){};
+        return names<UseOfNames>(d, object(d.admin_osm_ids, i), d.admin_polygons[i].name_id);
     }, [](size_t) { return 0; });
 }
 
-inline LaidOutTier poi(const ParsedData& d) {
+template <Use UseOfNames = Use::Poi>
+LaidOutTier poi(const ParsedData& d) {
     return tag_bundles::lay_out(d.poi_records.size(), POI_MAX_SHIPPED_TIER + 1,
-        [&](size_t i) { return names(d, Use::Poi, object(d.poi_osm_ids, i), d.poi_records[i].name_id); },
+        [&](size_t i) { return names<UseOfNames>(d, object(d.poi_osm_ids, i), d.poi_records[i].name_id); },
         [&](size_t i) { return poi_lowest_tier(d.poi_records[i]); });
 }
 
+inline std::string names_dir(const std::string& dir, const char* tier) {
+    const auto path = dir + "/" + tier;
+    std::filesystem::create_directory(path);
+    return path;
+}
+
 template <class Index>
-void write_rows(const std::string& dir, const std::string& kind, const LaidOutTier& tier,
-                size_t count, Index index) {
+void write_rows(const std::string& dir, const std::string& kind, const LaidOutTier& tier, size_t count, Index index) {
     std::vector<uint32_t> rows(count);
     for (size_t i = 0; i < count; ++i) {
         rows[i] = tier.offsets[index(i)];
     }
     write_side_file(dir, kind + "_tags.bin", rows, kind, count);
-    std::fill(rows.begin(), rows.end(), 0);
-    write_side_file(dir, kind + "_imp.bin", rows, kind, count);
+}
+
+inline void write_importance(const std::string& dir, const std::string& kind, size_t count) {
+    write_side_file(dir, kind + "_imp.bin", std::vector<uint32_t>(count, 0), kind, count);
 }
 
 inline void write_core(const std::string& dir, const LaidOutTier& tier, size_t places) {
     string_files::write_file(dir + "/" + STR_TIER_FILENAMES[STR_TIER_TAGS_CORE], tier.bytes.data(), tier.bytes.size());
     write_rows(dir, "place", tier, places, [](size_t i) { return i; });
     write_rows(dir, "admin", tier, tier.offsets.size() - places, [&](size_t i) { return places + i; });
+}
+
+inline void write_poi(const std::string& dir, const LaidOutTier& tier, size_t tier_limit,
+                      const std::vector<uint32_t>& selected) {
+    string_files::write_file(dir + "/" + STR_TIER_FILENAMES[STR_TIER_TAGS_POI], tier.bytes.data(), tier.group_ends[tier_limit]);
+    write_rows(dir, "poi", tier, selected.size(), [&](size_t i) { return selected[i]; });
 }
 
 // A block's offsets fit u32 even when the complete planet address blob exceeds 4 GiB.

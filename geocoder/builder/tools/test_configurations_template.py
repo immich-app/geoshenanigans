@@ -27,6 +27,15 @@ def load_template():
         return json.load(f)
 
 
+class NamesAxisTest(unittest.TestCase):
+    def test_presets_choose_a_name_tier(self):
+        cfg = load_template()
+        self.assertEqual(list(cfg["axes"]["names"]["values"]), ["en", "all"])
+        self.assertEqual({p["id"]: p["selections"]["names"] for p in cfg["presets"]}, {
+            "smallest": "en", "immich-recommended": "en", "with-addresses": "all", "max-quality": "all",
+        })
+
+
 class WaterAxisTest(unittest.TestCase):
     def test_water_is_an_axis_of_its_own_that_no_preset_takes(self):
         cfg = load_template()

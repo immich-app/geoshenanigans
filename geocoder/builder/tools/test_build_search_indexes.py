@@ -88,6 +88,18 @@ class BuildSearchIndexesTest(unittest.TestCase):
             self.assertIn("strings_tags_core.bin", names)
             self.assertEqual("strings_tags_poi.bin" in names, sel["poi_tier"] != "none", sel)
 
+    def test_switching_names_changes_only_the_tag_files(self):
+        for sel in selections(self.cfg):
+            all_paths = set(sut.resolve(self.cfg, dict(sel, names="all"))[0])
+            en_paths = set(sut.resolve(self.cfg, dict(sel, names="en"))[0])
+            changed = {"place_tags.bin", "admin_tags.bin", "strings_tags_core.bin"}
+            if sel["poi_tier"] != "none":
+                changed.update(("poi_tags.bin", "strings_tags_poi.bin"))
+            self.assertEqual({os.path.basename(p) for p in all_paths - en_paths}, changed, sel)
+            self.assertEqual(en_paths - all_paths, {
+                os.path.join(os.path.dirname(os.path.dirname(p)), "names-en", os.path.basename(p)) for p in all_paths - en_paths
+            }, sel)
+
     def write_output(self, regions):
         """Every file of every component in `regions`, as the builder writes them."""
         os.makedirs(self.out)
@@ -313,7 +325,7 @@ def allowed(cfg, sel):
 
 
 def selections(cfg, region="planet"):
-    """Every mode × quality × poi_tier the template's constraints allow, in `region`."""
+    """Every mode × quality × poi_tier × names the template's constraints allow, in `region`."""
     axes = [list(cfg["axes"][axis]["values"]) for axis in sut.AXES]
     every = (dict(zip(sut.AXES, values), region=region) for values in itertools.product(*axes))
     return [sel for sel in every if allowed(cfg, sel)]
@@ -336,13 +348,13 @@ class TemplateTest(unittest.TestCase):
         # point into: beside a POI tier the mode takes admin-minimal-poi/, on the shared slots and strings.
         cfg = load_template()
         minimal = [sel for sel in selections(cfg) if sel["mode"] == "admin-minimal"]
-        self.assertEqual(len(minimal), len(cfg["axes"]["poi_tier"]["values"]))
+        self.assertEqual(len(minimal), len(cfg["axes"]["poi_tier"]["values"]) * len(cfg["axes"]["names"]["values"]))
         for sel in minimal:
             paths, _ = sut.resolve(cfg, sel)
             own, poi = "planet/admin-minimal/", "planet/admin-minimal-poi/"
             dir_, other = (own, poi) if sel["poi_tier"] == "none" else (poi, own)
 
-            self.assertEqual([p[len(dir_):] for p in paths if p.startswith(dir_)], self.MINIMAL_FILES, sel)
+            self.assertEqual(sorted(os.path.basename(p) for p in paths if p.startswith(dir_)), self.MINIMAL_FILES, sel)
             self.assertEqual([p for p in paths if p.startswith(other) or p.startswith("planet/quality/")], [], sel)
 
     def test_every_selection_takes_each_admin_geometry_file_once_from_its_dir(self):
@@ -426,7 +438,7 @@ class ResolveTest(unittest.TestCase):
         "quality.base": {"files": ["{region}/quality/base.bin"]},
         "poi_tier.none": {"files": []},
     }}
-    SEL = {"region": "planet", "mode": "small", "quality": "simplified", "poi_tier": "none"}
+    SEL = {"region": "planet", "mode": "small", "quality": "simplified", "poi_tier": "none", "names": "all"}
 
     def test_takes_extended_and_optional_files_minus_the_replaced(self):
         paths, optional = sut.resolve(self.CFG, self.SEL)

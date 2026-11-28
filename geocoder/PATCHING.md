@@ -50,7 +50,7 @@ A file is published either as its own `<path>.zst` or inside a transport unit
 
 ## Files Overview
 
-A complete geocoder index for a given region and configuration consists of files from **up to four directories**:
+A complete geocoder index for a given region and configuration takes the following components:
 
 ### Mode directory (pick one)
 
@@ -103,6 +103,19 @@ links, which the addr:city crosscheck and place search read too.
 | `poi/all/` | 7 files | All POIs including minor ones (picnic sites, small galleries, etc.) |
 
 POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin`, `strings_poi.bin`, `strings_layout.json`, `poi_meta.json`, and `poi_attribution.json` (optional: Wikidata's credit, where its sitelinks ranked a POI of the tier; Attribution, below). POIs with Wikipedia/Wikidata tags are promoted one tier.
+
+### Search names (pick one)
+
+The `names` axis offers `en` (the stored name, a distinct English name,
+`ISO3166-2` and `ref`) and `all` (all available search name keys). Smallest and
+Immich recommended select `en`. With-addresses and max-quality select `all`.
+
+Take `strings_tags_core.bin`, `place_tags.bin` and `admin_tags.bin` from
+`names-<value>/` under the selected mode directory. With a POI tier, take
+`strings_tags_poi.bin` and `poi_tags.bin` from `names-<value>/` under that tier.
+Install these files in the flat dataset by basename. Each names directory has
+its own patch and its columns use offsets into its own string tier. Search
+indexes derive their names from the installed files.
 
 ### Water directory (optional, pick one)
 

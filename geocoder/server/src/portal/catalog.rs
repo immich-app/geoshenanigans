@@ -89,7 +89,7 @@ pub struct Build {
     pub version: u32,
 }
 
-/// An axis of a selection (region, mode, quality, poi_tier).
+/// An axis of a selection (region, mode, quality, poi_tier, names).
 #[derive(Deserialize, Debug, Clone)]
 pub struct Axis {
     pub label: String,
@@ -130,12 +130,12 @@ pub struct Preset {
 
 /// The axes of a selection, in the order a dataset's id names them after
 /// its region.
-const AXES: [&str; 3] = ["mode", "quality", "poi_tier"];
+const AXES: [&str; 4] = ["mode", "quality", "poi_tier", "names"];
 
-/// A selection's dataset id: `<mode>.<quality>.<poi_tier>`, after
+/// A selection's dataset id: `<mode>.<quality>.<poi_tier>.<names>`, after
 /// `<region>/` where the region isn't planet.
 pub fn dataset_id(sel: &RegionSelection) -> String {
-    let id = format!("{}.{}.{}", sel.mode, sel.quality, sel.poi_tier);
+    let id = format!("{}.{}.{}.{}", sel.mode, sel.quality, sel.poi_tier, sel.names);
     if sel.region == PLANET_REGION {
         id
     } else {
@@ -384,7 +384,8 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest, regions: &[String]) -> Re
     }
 
     let (modes, qualities, tiers) = (values(manifest, "mode")?, values(manifest, "quality")?, values(manifest, "poi_tier")?);
-    for (axis, values) in AXES.iter().zip([&modes, &qualities, &tiers]) {
+    let names = values(manifest, "names")?;
+    for (axis, values) in AXES.iter().zip([&modes, &qualities, &tiers, &names]) {
         if let Some((value, _)) = values.iter().find(|(value, _)| !plain_value(value)) {
             return Err(format!("the manifest's {axis} value {value:?} is not a plain name (letters, digits, '-' and '_')"));
         }
@@ -408,44 +409,47 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest, regions: &[String]) -> Re
         for (mode, mode_value) in &modes {
             for (quality, quality_value) in &qualities {
                 for (tier, tier_value) in &tiers {
-                    let sel = RegionSelection {
-                        region: region.to_string(),
-                        mode: mode.to_string(),
-                        quality: quality.to_string(),
-                        poi_tier: tier.to_string(),
-                        water: NO_WATER.to_string(),
-                    };
-                    let id = dataset_id(&sel);
-                    if !id.split('/').all(plain_name) {
-                        return Err(format!("the dataset id {id:?} is not a plain name"));
+                    for (names, name_value) in &names {
+                        let sel = RegionSelection {
+                            region: region.to_string(),
+                            mode: mode.to_string(),
+                            quality: quality.to_string(),
+                            poi_tier: tier.to_string(),
+                            water: NO_WATER.to_string(),
+                            names: names.to_string(),
+                        };
+                        let id = dataset_id(&sel);
+                        if !id.split('/').all(plain_name) {
+                            return Err(format!("the dataset id {id:?} is not a plain name"));
+                        }
+                        if let Some(c) = broken(manifest, &sel) {
+                            excluded.push(Excluded {
+                                id, selection: sel, constraint: c.id.clone(), message: c.message.clone(), requires: c.requires.clone(),
+                            });
+                            continue;
+                        }
+                        let resolved = downloader::resolve_files(cfg, &sel).map_err(|e| format!("{id}: {e}"))?;
+                        let (files, fetches) = taken(cfg, &resolved, &resolved.paths, region, &mut objects).map_err(|why| format!("{id}: {why}"))?;
+                        let mut dataset = Dataset {
+                            id,
+                            selection: sel,
+                            label: {
+                                let mut labels = [mode_value, quality_value, tier_value, name_value].map(|v| v.label.as_str()).to_vec();
+                                if region != PLANET_REGION {
+                                    labels.insert(0, &manifest.axes["region"].values[region].label);
+                                }
+                                labels.join(" · ")
+                            },
+                            description: None,
+                            preset: None,
+                            size_disk: 0,
+                            size_download: fetches,
+                            files,
+                            group: 0,
+                        };
+                        dataset.size_disk = dataset.links().values().map(|p| cfg.files[p].size_raw).sum();
+                        datasets.push(dataset);
                     }
-                    if let Some(c) = broken(manifest, &sel) {
-                        excluded.push(Excluded {
-                            id, selection: sel, constraint: c.id.clone(), message: c.message.clone(), requires: c.requires.clone(),
-                        });
-                        continue;
-                    }
-                    let resolved = downloader::resolve_files(cfg, &sel).map_err(|e| format!("{id}: {e}"))?;
-                    let (files, fetches) = taken(cfg, &resolved, &resolved.paths, region, &mut objects).map_err(|why| format!("{id}: {why}"))?;
-                    let mut dataset = Dataset {
-                        id,
-                        selection: sel,
-                        label: {
-                            let mut labels = [mode_value, quality_value, tier_value].map(|v| v.label.as_str()).to_vec();
-                            if region != PLANET_REGION {
-                                labels.insert(0, &manifest.axes["region"].values[region].label);
-                            }
-                            labels.join(" · ")
-                        },
-                        description: None,
-                        preset: None,
-                        size_disk: 0,
-                        size_download: fetches,
-                        files,
-                        group: 0,
-                    };
-                    dataset.size_disk = dataset.links().values().map(|p| cfg.files[p].size_raw).sum();
-                    datasets.push(dataset);
                 }
             }
         }
@@ -712,7 +716,7 @@ impl Plan {
             })
             .collect();
         Err(format!(
-            "unknown dataset \"{wanted}\": this build offers the presets {} and <mode>.<quality>.<poi_tier> of {}, except the combinations /datasets lists as excluded",
+            "unknown dataset \"{wanted}\": this build offers the presets {} and <mode>.<quality>.<poi_tier>.<names> of {}, except the combinations /datasets lists as excluded",
             presets.join(", "), axes.join("; ")
         ))
     }
@@ -723,7 +727,7 @@ impl Plan {
     /// components, which the attribution's applies_to names.
     pub fn json(&self, id: &str, dir: &str) -> serde_json::Value {
         let selection = |s: &RegionSelection| {
-            serde_json::json!({ "region": s.region, "mode": s.mode, "quality": s.quality, "poi_tier": s.poi_tier })
+            serde_json::json!({ "region": s.region, "mode": s.mode, "quality": s.quality, "poi_tier": s.poi_tier, "names": s.names })
         };
         let axes: Vec<serde_json::Value> = self.axes.iter().map(|(name, axis)| {
             let mut values: Vec<(&String, &AxisValue)> = axis.values.iter().collect();

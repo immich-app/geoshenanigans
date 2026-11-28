@@ -1299,4 +1299,5 @@ struct CollectedPoiRelation {
 inline constexpr char TAG_KEY_SEP = '\x1f', TAG_PAIR_SEP = '\x1e';
 inline constexpr size_t TAG_ARENA_BLOCK_BYTES = size_t(1) << 20;
 inline constexpr uint32_t TAG_BLOB_BLOCK_ROWS = 4096;
+inline constexpr char EN_NAMES_DIR[] = "names-en", ALL_NAMES_DIR[] = "names-all";
 inline constexpr size_t STR_TIER_TAGS_CORE = 5, STR_TIER_TAGS_POI = 6;

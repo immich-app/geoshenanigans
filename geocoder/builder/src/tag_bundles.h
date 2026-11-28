@@ -28,6 +28,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -363,7 +364,7 @@ struct LaidOutTier {
 // home(r) < groups.
 template <class BundleOf, class HomeOf>
 LaidOutTier lay_out(size_t n, size_t groups, BundleOf&& bundle, HomeOf&& home, unsigned threads = 0) {
-    std::vector<std::string_view> of(n);
+    std::vector<std::decay_t<std::invoke_result_t<BundleOf, size_t>>> of(n);
     parallel_for(n, [&](size_t b, size_t e, unsigned) {
         for (size_t r = b; r < e; r++) of[r] = bundle(r);
     }, threads);
@@ -412,7 +413,23 @@ LaidOutTier lay_out(size_t n, size_t groups, BundleOf&& bundle, HomeOf&& home, u
 
 namespace tag_bundles {
 
-enum class Use { Core, Poi, Wiki, Street, Address, PoiAddress, Interpolation, PoiClass, Count };
+enum class Use { Core, Poi, Wiki, Street, Address, PoiAddress, Interpolation, PoiClass, CoreEn, PoiEn, Count };
+
+inline std::string without_stored_english(std::string_view bundle, std::string_view stored) {
+    std::string out;
+    while (!bundle.empty()) {
+        const size_t end = bundle.find(PAIR_SEP);
+        const auto pair = bundle.substr(0, end);
+        const size_t key_end = pair.find(KEY_SEP);
+        if (pair.substr(0, key_end) != "name:en" || pair.substr(key_end + 1) != stored) {
+            if (!out.empty()) out += PAIR_SEP;
+            out += pair;
+        }
+        if (end == bundle.npos) break;
+        bundle.remove_prefix(end + 1);
+    }
+    return out;
+}
 
 inline bool poi_name_key(std::string_view k) { return k == "brand" || k == "iata" || k == "icao" || k == "faa"; }
 
@@ -422,6 +439,10 @@ std::string select(Use use, Each each, bool road_member = false) {
     each([&](std::string_view k, std::string_view v) {
         if (use == Use::Wiki) {
             if (k == "wikidata" || k == "wikipedia" || detail::starts_with(k, "wikipedia:")) pairs.emplace_back(k, v);
+            return;
+        }
+        if (use == Use::CoreEn || use == Use::PoiEn) {
+            if (k == "name:en" || k == "ISO3166-2" || k == "ref") pairs.emplace_back(k, v);
             return;
         }
         const auto cls = key_class(k);
@@ -451,6 +472,10 @@ struct Collections {
     template <class Each>
     void add(Use use, uint64_t id, Each each, bool member = false) {
         values[size_t(use)].add(id, select(use, each, member), use == Use::Address);
+        if (use == Use::Core || use == Use::Poi) {
+            const Use english = use == Use::Core ? Use::CoreEn : Use::PoiEn;
+            values[size_t(english)].add(id, select(english, each));
+        }
     }
 };
 

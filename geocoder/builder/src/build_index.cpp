@@ -1178,15 +1178,22 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         std::vector<uint32_t> place_keys;
         const auto place_order = place_file_order(d.place_nodes, place_keys);
         free_storage(place_keys);
-        const auto core_tags = search_files::core(d, place_order.size(), [&](size_t i) { return place_order[i]; },
-                                                  d.admin_polygons.size(), [](size_t i) { return uint32_t(i); });
+        const auto place = [&](size_t i) { return place_order[i]; };
+        const auto admin = [](size_t i) { return uint32_t(i); };
+        const auto core_tags = search_files::core(d, place_order.size(), place, d.admin_polygons.size(), admin);
+        const auto core_en = search_files::core<tag_bundles::Use::CoreEn>(d, place_order.size(), place, d.admin_polygons.size(), admin);
         const auto poi_tags = search_files::poi(d);
+        const auto poi_en = search_files::poi<tag_bundles::Use::PoiEn>(d);
         auto layout = d.strings_tier_bases;
         layout[STR_TIER_TAGS_POI] = search_files::tier_end(layout[STR_TIER_TAGS_CORE], core_tags.bytes.size());
         layout.back() = search_files::tier_end(layout[STR_TIER_TAGS_POI], poi_tags.bytes.size());
         auto mode_files = [&](const std::string& dir, IndexMode selected) {
             write_index(d, dir, selected, &layout);
-            search_files::write_core(dir, core_tags, place_order.size());
+            const auto all = multi_output ? search_files::names_dir(dir, ALL_NAMES_DIR) : dir;
+            search_files::write_core(all, core_tags, place_order.size());
+            search_files::write_core(search_files::names_dir(dir, EN_NAMES_DIR), core_en, place_order.size());
+            search_files::write_importance(dir, "place", place_order.size());
+            search_files::write_importance(dir, "admin", d.admin_polygons.size());
             if (d.search_tags->host) {
                 std::vector<uint64_t> ids;
                 for (uint32_t i : place_order) ids.push_back(search_files::object(d.place_osm_ids, i));
@@ -1363,10 +1370,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                         string_files::write_file(poi_dir + "/" + STR_TIER_FILENAMES[STR_TIER_POI], names.data(),
                                                  names.size());
                     }
-                    string_files::write_file(poi_dir + "/" + STR_TIER_FILENAMES[STR_TIER_TAGS_POI], poi_tags.bytes.data(),
-                                             poi_tags.group_ends[tier_var.max_tier]);
-                    search_files::write_rows(poi_dir, "poi", poi_tags, selected.size(),
-                                             [&](size_t i) { return selected[i]; });
+                    search_files::write_poi(search_files::names_dir(poi_dir, ALL_NAMES_DIR), poi_tags, tier_var.max_tier, selected);
+                    search_files::write_poi(search_files::names_dir(poi_dir, EN_NAMES_DIR), poi_en, tier_var.max_tier, selected);
+                    search_files::write_importance(poi_dir, "poi", selected.size());
                     if (d.search_tags->host) search_files::write_host_poi(d, poi_dir, selected);
                     write_strings_layout(poi_dir, layout);
                     // Wikidata's credit, where its sitelinks ranked a live POI

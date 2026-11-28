@@ -229,3 +229,15 @@ TEST(address_bundles_can_be_read_after_their_scratch_block_fills) {
     CHECK(store.find(1) == payload);
     CHECK(store.find(count) == payload);
 }
+
+TEST(english_name_bundles_keep_only_english_names_and_references) {
+    using tag_bundles::Use;
+    const Tags tags = {{"ISO3166-2", "DE-BY"}, {"alt_name", "Bavaria"}, {"name", "Bayern"},
+                       {"name:de", "Bayern"}, {"name:en", "Bavaria"}, {"ref", "BY"}, {"brand", "Brand"}};
+    const auto selected = tag_bundles::select(Use::CoreEn, each_of(tags));
+    CHECK_EQ(selected, bundle({{"ISO3166-2", "DE-BY"}, {"name:en", "Bavaria"}, {"ref", "BY"}}));
+    CHECK_EQ(tag_bundles::select(Use::PoiEn, each_of(tags)), selected);
+    CHECK_EQ(tag_bundles::without_stored_english(selected, "Bavaria"), bundle({{"ISO3166-2", "DE-BY"}, {"ref", "BY"}}));
+    CHECK_EQ(tag_bundles::without_stored_english(selected, "Bayern"), selected);
+    CHECK(tag_bundles::without_stored_english(bundle({{"name:en", "Bavaria"}}), "Bavaria").empty());
+}

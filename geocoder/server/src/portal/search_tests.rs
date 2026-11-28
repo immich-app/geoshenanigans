@@ -131,19 +131,23 @@ async fn datasets_whose_index_files_are_alike_are_one_group() {
     let mut want = Vec::new();
     for quality in template_values("quality") {
         for tier in template_values("poi_tier") {
-            let id = format!("full.{quality}.{tier}");
-            want.push((id.clone(), vec![id]));
+            for names in template_values("names") {
+                let id = format!("full.{quality}.{tier}.{names}");
+                want.push((id.clone(), vec![id]));
+            }
         }
     }
     for quality in template_values("quality") {
         for tier in template_values("poi_tier") {
-            let ids = ["no-addresses", "admin"].map(|mode| format!("{mode}.{quality}.{tier}")).to_vec();
+            let ids: Vec<_> = ["no-addresses", "admin"].into_iter()
+                .flat_map(|mode| template_values("names").into_iter().map(move |names| (mode, names)))
+                .map(|(mode, names)| format!("{mode}.{quality}.{tier}.{names}")).collect();
             want.push((ids[0].clone(), ids));
         }
     }
     for tier in template_values("poi_tier") {
-        let id = format!("admin-minimal.simplified.{tier}");
-        want.push((id.clone(), vec![id]));
+        let ids: Vec<_> = template_values("names").into_iter().map(|names| format!("admin-minimal.simplified.{tier}.{names}")).collect();
+        want.push((ids[0].clone(), ids));
     }
     assert_eq!(got, want);
 }
@@ -192,14 +196,14 @@ async fn the_groups_of_the_shipped_selections_know_the_published_index() {
 
     let shipped: Vec<(&str, &catalog::Shipped)> = plan.groups.iter().filter_map(|g| Some((g.name.as_str(), g.shipped.as_ref()?))).collect();
     let selections: Vec<String> = t["search_index"]["shipped"].as_array().unwrap().iter()
-        .map(|s| format!("full.{}.{}", s["quality"].as_str().unwrap(), s["poi_tier"].as_str().unwrap()))
+        .map(|s| format!("full.{}.{}.{}", s["quality"].as_str().unwrap(), s["poi_tier"].as_str().unwrap(), s["names"].as_str().unwrap()))
         .collect();
     let mut groups: Vec<String> = shipped.iter().map(|(g, _)| g.to_string()).collect();
     groups.sort();
     let mut selections = selections;
     selections.sort();
     assert_eq!(groups, selections);
-    let (_, simplified) = shipped.iter().find(|(g, _)| *g == "full.simplified.all").unwrap();
+    let (_, simplified) = shipped.iter().find(|(g, _)| *g == "full.simplified.all.all").unwrap();
     assert_eq!(simplified.dir, "planet/search/full/simplified/all");
     assert_eq!(simplified.files.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), names);
     for (name, sha256) in &simplified.files {
@@ -261,7 +265,7 @@ async fn a_search_answers_byte_for_byte_what_the_binding_answers_from_its_index(
     let build = format!("{DATE}-1");
 
     let mut found = 0;
-    for (dataset, group) in [("with-addresses", "full.simplified.all"), ("admin.exact.major", "no-addresses.exact.major"), ("smallest", "admin-minimal.simplified.none")] {
+    for (dataset, group) in [("with-addresses", "full.simplified.all.all"), ("admin.exact.major.all", "no-addresses.exact.major.en"), ("smallest", "admin-minimal.simplified.none.en")] {
         let id = p.served().unwrap().plan.datasets[p.served().unwrap().plan.find(dataset).unwrap()].id.clone();
         let set = data.path().join(BUILDS).join(&build).join(SETS).join(&id);
         let loaded = load(&set).unwrap();
@@ -316,14 +320,14 @@ async fn a_search_names_its_dataset_as_a_lookup_does() {
     p.round(true).await.unwrap();
 
     let got = fetch(&search("")).await;
-    assert_eq!((got.status, got.header("x-geocoder-dataset")), (200, Some("full.simplified.all")));
+    assert_eq!((got.status, got.header("x-geocoder-dataset")), (200, Some("full.simplified.all.all")));
     assert_eq!(got.body, fetch(&search("&dataset=with-addresses")).await.body);
     let unknown = fetch(&search("&dataset=everything")).await;
     assert_eq!(unknown.status, 400);
     assert!(unknown.body.starts_with("unknown dataset \"everything\": this build offers the presets "), "{}", unknown.body);
-    let excluded = fetch(&search("&dataset=admin-minimal.exact.none")).await;
+    let excluded = fetch(&search("&dataset=admin-minimal.exact.none.en")).await;
     assert_eq!((excluded.status, excluded.body.as_str()),
-               (400, format!("dataset admin-minimal.exact.none is not offered: {}", template()["constraints"][0]["message"].as_str().unwrap()).as_str()));
+               (400, format!("dataset admin-minimal.exact.none.en is not offered: {}", template()["constraints"][0]["message"].as_str().unwrap()).as_str()));
 }
 
 // A /search takes a key (401 without one or with a bad one), q of 1 to 256
@@ -340,7 +344,7 @@ async fn a_search_checks_its_key_query_limit_and_rate() {
     let waiting = gate.waiting();
     let mut cfg = config(&bucket, testland(&files));
     cfg.open_search = opener(move |group, _| {
-        if group == "full.exact.none" {
+        if group == "full.exact.none.en" {
             waiting.wait();
         }
         Ok(())
@@ -358,7 +362,7 @@ async fn a_search_checks_its_key_query_limit_and_rate() {
     // The volume's build, served at start: its groups open after, one of
     // them held.
     portal(data.path(), config(&bucket, testland(&files))).round(true).await.unwrap();
-    std::fs::remove_dir_all(index_dir(data.path(), &format!("{DATE}-1"), "full.exact.none")).unwrap();
+    std::fs::remove_dir_all(index_dir(data.path(), &format!("{DATE}-1"), "full.exact.none.en")).unwrap();
     let round = tokio::spawn({
         let p = p.clone();
         async move { p.round(true).await }
@@ -371,7 +375,7 @@ async fn a_search_checks_its_key_query_limit_and_rate() {
     // runner keeps waiting while the test goes on.
     until("the default dataset's group open and the held one building", || {
         let search = p.served().unwrap().search.json();
-        state_of(&search, "full.simplified.all")["state"] == "ready" && state_of(&search, "full.exact.none")["state"] == "building"
+        state_of(&search, "full.simplified.all.all")["state"] == "ready" && state_of(&search, "full.exact.none.en")["state"] == "building"
     }).await;
 
     let cases = [
@@ -395,7 +399,7 @@ async fn a_search_checks_its_key_query_limit_and_rate() {
     assert_eq!((over.status, over.body.as_str()), (400, "q must be at most 256 bytes"));
     assert_eq!(fetch(&format!("{url}/search?profile=immich&q=testville&key=test&limit=50")).await.status, 200);
 
-    for dataset in ["everything", "admin-minimal.exact.none", "full.exact.none"] {
+    for dataset in ["everything", "admin-minimal.exact.none.en", "full.exact.none.en"] {
         assert_ne!(fetch(&format!("{url}/search?profile=immich&q=testville&key=daily&dataset={dataset}")).await.status, 200, "{dataset}");
     }
     let unsupported = fetch(&format!("{url}/search?q=testville&key=daily&profile=full")).await;
@@ -424,11 +428,11 @@ async fn a_start_serves_at_once_and_its_place_search_answers_as_each_group_opens
     let waiting = gate.waiting();
     let mut cfg = config(&bucket, testland(&files));
     cfg.open_search = opener(move |group, _| match group {
-        "full.simplified.all" => {
+        "full.simplified.all.all" => {
             waiting.wait();
             Ok(())
         }
-        "full.exact.all" => Err("no room for its sort runs".to_string()),
+        "full.exact.all.all" => Err("no room for its sort runs".to_string()),
         _ => Ok(()),
     });
     let p = portal(data.path(), cfg);
@@ -446,28 +450,28 @@ async fn a_start_serves_at_once_and_its_place_search_answers_as_each_group_opens
     let building = fetch(&format!("{url}/search?profile=immich&q=testville&key=test")).await;
     assert_eq!((building.status, building.header("retry-after"), building.content_type.as_deref()), (503, Some("5"), Some("application/json")));
     let body = building.json();
-    assert_eq!((&body["status"], &body["dataset"], &body["index"]), (&"building".into(), &"full.simplified.all".into(), &"full.simplified.all".into()));
+    assert_eq!((&body["status"], &body["dataset"], &body["index"]), (&"building".into(), &"full.simplified.all.all".into(), &"full.simplified.all.all".into()));
     assert!(body["since"].as_str().is_some_and(|s| s.ends_with('Z')), "{body}");
     let broken = fetch(&format!("{url}/search?profile=immich&q=testville&key=test&dataset=max-quality")).await;
     assert_eq!((broken.status, broken.header("retry-after")), (503, None));
     let body = broken.json();
-    assert_eq!((&body["status"], &body["dataset"], &body["index"]), (&"failed".into(), &"full.exact.all".into(), &"full.exact.all".into()));
-    assert_eq!(body["reason"], "dataset full.exact.all: no room for its sort runs");
+    assert_eq!((&body["status"], &body["dataset"], &body["index"]), (&"failed".into(), &"full.exact.all.all".into(), &"full.exact.all.all".into()));
+    assert_eq!(body["reason"], "dataset full.exact.all.all: no room for its sort runs");
     let health = health_search(&url).await;
-    assert_eq!(state_of(&health, "full.simplified.all")["state"], "building");
-    assert_eq!(state_of(&health, "full.exact.all")["state"], "failed");
-    assert_eq!(state_of(&health, "full.exact.all")["reason"], "dataset full.exact.all: no room for its sort runs");
-    assert_eq!(health["datasets"], 28);
+    assert_eq!(state_of(&health, "full.simplified.all.all")["state"], "building");
+    assert_eq!(state_of(&health, "full.exact.all.all")["state"], "failed");
+    assert_eq!(state_of(&health, "full.exact.all.all")["reason"], "dataset full.exact.all.all: no room for its sort runs");
+    assert_eq!(health["datasets"], 56);
     until("a group of another index open", || p.served().unwrap().search.json()["groups"].as_array().unwrap()
-        .iter().any(|g| g["index"] == "admin-minimal.simplified.none" && g["state"] == "ready")).await;
+        .iter().any(|g| g["index"] == "admin-minimal.simplified.none.en" && g["state"] == "ready")).await;
     assert_eq!(fetch(&format!("{url}/search?profile=immich&q=testville&key=test&dataset=smallest")).await.status, 200);
 
     gate.open();
     assert_eq!(round.await.unwrap(), Ok(format!("build {DATE} is served ({DATE}-1)")));
     assert_eq!(fetch(&format!("{url}/search?profile=immich&q=testville&key=test")).await.status, 200);
     let health = health_search(&url).await;
-    assert_eq!(health["ready"], 27);
-    assert_eq!(state_of(&health, "full.simplified.all")["origin"], "built");
+    assert_eq!(health["ready"], 55);
+    assert_eq!(state_of(&health, "full.simplified.all.all")["origin"], "built");
 }
 
 // A sync builds and opens the place search of the build it fetched before
@@ -508,7 +512,7 @@ async fn a_sync_opens_the_place_search_of_its_build_before_it_switches_to_it() {
     assert_eq!(round.await.unwrap(), Ok(format!("build {NEXT} is served ({NEXT}-1)")));
     let after = fetch(&format!("{url}/search?profile=immich&q=testville&key=test")).await;
     assert_eq!((after.status, after.header("x-geocoder-build")), (200, Some(NEXT)));
-    assert_eq!(health_search(&url).await["ready"], 28);
+    assert_eq!(health_search(&url).await["ready"], 56);
 }
 
 // A group whose index fails to open refuses nothing: the build is switched
@@ -523,10 +527,10 @@ async fn a_group_that_fails_doesnt_refuse_its_build_and_the_next_round_tries_it_
     let (counted, once) = (tries.clone(), panicked.clone());
     let mut cfg = config(&bucket, testland(&files));
     cfg.open_search = opener(move |group, _| {
-        if group == "full.exact.notable" && counted.fetch_add(1, Ordering::SeqCst) == 0 {
+        if group == "full.exact.notable.all" && counted.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err("the disk is full".to_string());
         }
-        if group == "full.simplified.none" && !once.swap(true, Ordering::SeqCst) {
+        if group == "full.simplified.none.all" && !once.swap(true, Ordering::SeqCst) {
             panic!("a build that panics");
         }
         Ok(())
@@ -538,21 +542,21 @@ async fn a_group_that_fails_doesnt_refuse_its_build_and_the_next_round_tries_it_
 
     assert_eq!(tries.load(Ordering::SeqCst), 1);
     assert!(!data.path().join(REFUSED).exists() || !std::fs::read_to_string(data.path().join(REFUSED)).unwrap().contains(DATE));
-    let failed = fetch(&format!("{url}/search?profile=immich&q=testville&key=test&dataset=full.exact.notable")).await;
-    assert_eq!((failed.status, failed.json()["reason"].as_str()), (503, Some("dataset full.exact.notable: the disk is full")));
-    let panicked = fetch(&format!("{url}/search?profile=immich&q=testville&key=test&dataset=full.simplified.none")).await;
+    let failed = fetch(&format!("{url}/search?profile=immich&q=testville&key=test&dataset=full.exact.notable.all")).await;
+    assert_eq!((failed.status, failed.json()["reason"].as_str()), (503, Some("dataset full.exact.notable.all: the disk is full")));
+    let panicked = fetch(&format!("{url}/search?profile=immich&q=testville&key=test&dataset=full.simplified.none.all")).await;
     assert_eq!(panicked.status, 503);
     assert!(panicked.json()["reason"].as_str().unwrap().contains("a build that panics"), "{}", panicked.body);
     assert_eq!(fetch(&format!("{url}/search?profile=immich&q=testville&key=test")).await.status, 200);
-    assert_eq!(fetch(&format!("{url}/reverse?lat=10.5&lon=20.5&key=test&dataset=full.exact.notable")).await.status, 200);
+    assert_eq!(fetch(&format!("{url}/reverse?lat=10.5&lon=20.5&key=test&dataset=full.exact.notable.all")).await.status, 200);
 
     assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({DATE}-1)")));
 
     assert_eq!(tries.load(Ordering::SeqCst), 2);
-    for dataset in ["full.exact.notable", "full.simplified.none"] {
+    for dataset in ["full.exact.notable.all", "full.simplified.none.all"] {
         assert_eq!(fetch(&format!("{url}/search?profile=immich&q=testville&key=test&dataset={dataset}")).await.status, 200, "{dataset}");
     }
-    assert_eq!(health_search(&url).await["ready"], 28);
+    assert_eq!(health_search(&url).await["ready"], 56);
 }
 
 // A build served again (latest.json moved back to it) opens its place
@@ -574,7 +578,7 @@ async fn a_build_served_again_opens_the_indexes_it_holds_and_a_pruned_one_takes_
     assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({DATE}-1)")));
 
     let health = health_search(&url).await;
-    assert_eq!(health["ready"], 28);
+    assert_eq!(health["ready"], 56);
     for group in health["groups"].as_array().unwrap() {
         assert_eq!(group["origin"], "current", "{group}");
     }
@@ -587,7 +591,7 @@ async fn a_build_served_again_opens_the_indexes_it_holds_and_a_pruned_one_takes_
     bucket.set_latest(THIRD, Some(BUILD_VERSION));
     assert_eq!(p.round(false).await, Ok(format!("build {THIRD} is served ({THIRD}-1)")));
     assert!(!first.exists());
-    assert!(index_dir(data.path(), &format!("{THIRD}-1"), "full.simplified.all").is_dir());
+    assert!(index_dir(data.path(), &format!("{THIRD}-1"), "full.simplified.all.all").is_dir());
 }
 
 // The index builds run at most search_jobs at once, each on a thread at the
@@ -688,7 +692,7 @@ async fn the_index_files_alike_in_two_groups_are_hard_links_of_one() {
     portal(data.path(), config(&bucket, own)).round(true).await.unwrap();
 
     let linked = index_files(alike.path(), &build);
-    assert_eq!(linked.keys().map(|(g, _)| g.clone()).collect::<BTreeSet<_>>().len(), 20);
+    assert_eq!(linked.keys().map(|(g, _)| g.clone()).collect::<BTreeSet<_>>().len(), 28);
     let mut by_name: BTreeMap<&str, BTreeSet<u64>> = BTreeMap::new();
     for ((_, name), (ino, _)) in &linked {
         by_name.entry(name.as_str()).or_default().insert(*ino);
@@ -724,27 +728,27 @@ async fn datasets_and_health_tell_each_datasets_index() {
 
     let datasets = fetch(&format!("{url}/datasets")).await.json();
     for d in datasets["datasets"].as_array().unwrap() {
-        let shipped = ["full.simplified.all", "full.exact.all"].contains(&d["search"]["index"].as_str().unwrap());
+        let shipped = ["full.simplified.all.all", "full.exact.all.all"].contains(&d["search"]["index"].as_str().unwrap());
         assert_eq!(d["search"]["shipped"], shipped, "{d}");
         assert!(names.iter().any(|n| d["search"]["index"] == n.as_str()), "{d}");
     }
-    assert_eq!(datasets["datasets"][0]["search"], serde_json::json!({ "index": "full.exact.none", "shipped": false }));
+    assert_eq!(datasets["datasets"][0]["search"], serde_json::json!({ "index": "full.exact.none.en", "shipped": false }));
     let health = health_search(&url).await;
-    assert_eq!((&health["ready"], &health["datasets"]), (&28.into(), &28.into()));
+    assert_eq!((&health["ready"], &health["datasets"]), (&56.into(), &56.into()));
     assert_eq!(health["groups"].as_array().unwrap().iter().map(|g| g["index"].as_str().unwrap().to_string()).collect::<Vec<_>>(), names);
-    let group = state_of(&health, "no-addresses.simplified.major");
+    let group = state_of(&health, "no-addresses.simplified.major.en");
     assert_eq!((&group["state"], &group["origin"], &group["shipped"]), (&"ready".into(), &"built".into(), &serde_json::Value::Null));
-    assert_eq!(group["datasets"], serde_json::json!(["no-addresses.simplified.major", "admin.simplified.major"]));
+    assert_eq!(group["datasets"], serde_json::json!(["no-addresses.simplified.major.en", "no-addresses.simplified.major.all", "admin.simplified.major.en", "admin.simplified.major.all"]));
     assert!(group["since"].as_str().is_some() && group["seconds"].as_f64().is_some(), "{group}");
     let t = template();
     let published: Vec<serde_json::Value> = t["search_index"]["files"].as_array().unwrap().iter()
         .chain(t["search_index"]["optional_files"].as_array().unwrap())
         .filter(|n| *n != META_FILE)
-        .filter(|n| index_dir(data.path(), &format!("{DATE}-1"), "full.simplified.all").join(n.as_str().unwrap()).exists())
+        .filter(|n| index_dir(data.path(), &format!("{DATE}-1"), "full.simplified.all.all").join(n.as_str().unwrap()).exists())
         .cloned()
         .collect();
     assert!(!published.is_empty());
-    assert_eq!(state_of(&health, "full.simplified.all")["shipped"], serde_json::json!({
+    assert_eq!(state_of(&health, "full.simplified.all.all")["shipped"], serde_json::json!({
         "dir": "planet/search/full/simplified/all", "same": false, "differ": [], "unpublished": published,
     }));
 
@@ -781,7 +785,7 @@ async fn a_shipped_index_is_compared_with_the_one_built_here() {
         out.sort();
         out
     };
-    let (simplified, exact) = (built("full.simplified.all"), built("full.exact.all"));
+    let (simplified, exact) = (built("full.simplified.all.all"), built("full.exact.all.all"));
     bucket.edit_build(DATE, |m| {
         for (group, files) in [("simplified", &simplified), ("exact", &exact)] {
             for (name, sha256, size) in files.iter() {
@@ -794,9 +798,9 @@ async fn a_shipped_index_is_compared_with_the_one_built_here() {
     assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({DATE}-2)")));
 
     let health = health_search(&url).await;
-    assert_eq!(state_of(&health, "full.simplified.all")["shipped"],
+    assert_eq!(state_of(&health, "full.simplified.all.all")["shipped"],
                serde_json::json!({ "dir": "planet/search/full/simplified/all", "same": true, "differ": [], "unpublished": [] }));
-    assert_eq!(state_of(&health, "full.exact.all")["shipped"],
+    assert_eq!(state_of(&health, "full.exact.all.all")["shipped"],
                serde_json::json!({ "dir": "planet/search/full/exact/all", "same": false, "differ": ["places.bnd"], "unpublished": [] }));
 }
 
@@ -811,7 +815,7 @@ async fn a_dataset_whose_files_changed_since_its_load_fails_its_group() {
     let (_fixtures, load) = fixtures();
     let mut cfg = config(&bucket, load);
     cfg.open_search = opener(|group, dir| {
-        if group == "no-addresses.simplified.notable" && dir.ends_with("admin.simplified.notable") {
+        if group == "no-addresses.simplified.notable.en" && dir.ends_with("admin.simplified.notable.all") {
             let file = dir.join("place_nodes.bin");
             let copy = dir.join("place_nodes.bin.copy");
             std::fs::copy(&file, &copy).unwrap();
@@ -824,9 +828,9 @@ async fn a_dataset_whose_files_changed_since_its_load_fails_its_group() {
     assert_eq!(p.round(true).await, Ok(format!("build {DATE} is served ({DATE}-1)")));
 
     let health = p.served().unwrap().search.json();
-    let group = state_of(&health, "no-addresses.simplified.notable");
+    let group = state_of(&health, "no-addresses.simplified.notable.en");
     assert_eq!(group["state"], "failed");
-    assert!(group["reason"].as_str().unwrap().starts_with("dataset admin.simplified.notable: The dataset in "), "{group}");
+    assert!(group["reason"].as_str().unwrap().starts_with("dataset admin.simplified.notable.all: The dataset in "), "{group}");
     assert!(group["reason"].as_str().unwrap().ends_with("changed since it was loaded: load it again"), "{group}");
 }
 
@@ -923,9 +927,9 @@ async fn one_portal_serves_each_selected_region() {
     cfg.regions = vec!["europe".to_string(), "north-america".to_string()];
     let (manifest_files, manifest) = manifest_of(&bucket).await;
     let plan = catalog::plan(&manifest_files, &manifest, &cfg.regions).unwrap();
-    assert_eq!(plan.datasets[plan.default].id, "europe/full.simplified.all");
-    let europe = plan.find("europe/full.simplified.all").unwrap();
-    let america = plan.find("north-america/full.simplified.all").unwrap();
+    assert_eq!(plan.datasets[plan.default].id, "europe/full.simplified.all.all");
+    let europe = plan.find("europe/full.simplified.all.all").unwrap();
+    let america = plan.find("north-america/full.simplified.all.all").unwrap();
     assert_ne!(plan.datasets[europe].group, plan.datasets[america].group);
 
     for regions in [vec![], vec!["unknown".to_string()], vec!["europe".to_string(); 2]] {
@@ -936,7 +940,7 @@ async fn one_portal_serves_each_selected_region() {
     p.round(true).await.unwrap();
     let url = serve(router(p, db())).await;
     for region in ["europe", "north-america"] {
-        let dataset = format!("{region}/full.simplified.all");
+        let dataset = format!("{region}/full.simplified.all.all");
         let answer = fetch(&format!("{url}/search?q=testville&key=test&profile=immich&dataset={dataset}")).await;
         assert_eq!((answer.status, answer.header("x-geocoder-dataset")), (200, Some(dataset.as_str())), "{}", answer.body);
         assert_eq!(answer.json()[0]["name"], "Testville");
