@@ -522,8 +522,8 @@ async fn a_group_that_fails_doesnt_refuse_its_build_and_the_next_round_tries_it_
     let (tries, panicked) = (Arc::new(AtomicUsize::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
     let (counted, once) = (tries.clone(), panicked.clone());
     let mut cfg = config(&bucket, testland(&files));
-    cfg.open_search = opener(move |group, dir| {
-        if group == "full.exact.notable" && dir.ends_with("full.exact.notable") && counted.fetch_add(1, Ordering::SeqCst) == 0 {
+    cfg.open_search = opener(move |group, _| {
+        if group == "full.exact.notable" && counted.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err("the disk is full".to_string());
         }
         if group == "full.simplified.none" && !once.swap(true, Ordering::SeqCst) {
