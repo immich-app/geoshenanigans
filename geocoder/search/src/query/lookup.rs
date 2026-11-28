@@ -112,7 +112,7 @@ pub struct TokenList {
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryNode {
     pub node: Node,
-    /// None where the word is no term.
+    /// A missing word has the missing-partial penalty; the end node has no partial.
     pub partial: Option<Token>,
     pub starting: Vec<TokenList>,
 }
@@ -164,6 +164,7 @@ pub fn tokens(nodes: Nodes, source: &dyn TermSource, lookup: Lookup) -> QueryGra
             g.widen_partial(i, terms);
         }
     }
+    g.fill_missing_partials();
     g.add_digit_housenumbers();
     g.add_postcodes();
     g.rerank();
@@ -436,6 +437,27 @@ impl QueryGraph {
         self.nodes[i].partial = Some(Token { term: id, penalty: PARTIAL_PENALTY + best });
     }
 
+    // The oracle reranks missing words too. Their counts inform direction, but
+    // their penalty excludes them from assignments and all driving lookups.
+    fn fill_missing_partials(&mut self) {
+        for i in 0..self.slots() {
+            if self.nodes[i].partial.is_none() {
+                let node = &self.nodes[i].node;
+                let id = self.intern(Term {
+                    kind: TermKind::Partial,
+                    token: node.token.clone(),
+                    word: node.token.clone(),
+                    lookup_word: node.word.clone(),
+                    count: 1,
+                    addr_count: 1,
+                    info: TermInfo::None,
+                    postings: Vec::new(),
+                });
+                self.nodes[i].partial = Some(Token { term: id, penalty: PARTIAL_MISSING_PENALTY });
+            }
+        }
+    }
+
     /// A whole word of digits that no house-number term reads becomes one (icu_tokenizer.py:244-262).
     fn add_digit_housenumbers(&mut self) {
         let mut candidate: Option<String> = None;
@@ -665,7 +687,6 @@ mod tests {
             let mut theirs: Vec<String> = r
                 .tokens
                 .iter()
-                .filter(|t| !(t.ttype == 'w' && t.penalty >= PARTIAL_MISSING_PENALTY))
                 // The public database imports additional phrase languages.
                 .filter(|t| !(r.label == "liberty-public" && t.ttype == 'Q' && matches!(t.lookup_word.as_str(), "парк" | "پارک")))
                 .map(|t| format!("{} {}-{} {} {} {:.3} {} {}", t.ttype, t.start, t.end, t.token, t.lookup_word, t.penalty, t.count, t.addr_count))
@@ -879,7 +900,7 @@ mod tests {
 
         assert!(of_type(&g, 'W').is_empty());
         assert_eq!(g.term(g.nodes[2].partial.unwrap().term).count, 40);
-        assert!(typo.nodes[1].partial.is_none());
+        assert!(typo.partial(1).is_none());
     }
 
     #[test]
@@ -891,8 +912,8 @@ mod tests {
         let short = graph("asn", &terms, Lookup::Typo);
 
         assert_eq!(of_type(&g, 'W'), ["1-2 austin austin 0.167"]);
-        assert_eq!(of_type(&g, 'w'), ["1-2 austn austn 0.467"]);
-        assert!(numbers.nodes[0].partial.is_none());
-        assert!(short.nodes[0].partial.is_none(), "a query of three characters is read as typed");
+        assert_eq!(of_type(&g, 'w'), ["0-1 futo futo 10.000", "1-2 austn austn 0.467"]);
+        assert!(numbers.partial(0).is_none());
+        assert!(short.partial(0).is_none(), "a query of three characters is read as typed");
     }
 }

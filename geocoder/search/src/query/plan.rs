@@ -156,8 +156,7 @@ pub struct SearchPlan {
     pub tokens: Vec<TokenRow>,
 }
 
-/// A token of the query as Nominatim's debug page lists it: partials first in each node, then the
-/// tokens that start there.
+/// A token in debug-page order: the partial at each node, then the typed spans.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TokenRow {
     pub ttype: TokenType,
@@ -273,6 +272,8 @@ fn token_rows(g: &QueryGraph) -> Vec<TokenRow> {
                 penalty: p.penalty,
             });
         }
+    }
+    for (i, n) in g.nodes.iter().enumerate() {
         for list in &n.starting {
             for t in &list.tokens {
                 let lookup_word = g.term(t.term).lookup_word.clone();
@@ -791,6 +792,16 @@ mod tests {
         let mut req = SearchRequest::new(q, Profile::Full);
         req.mode = MatchMode::Nominatim;
         req
+    }
+
+    #[test]
+    fn debug_rows_keep_missing_partials_and_list_all_partials_first() {
+        let terms = crate::query::readings::reading("futo").terms();
+        let plan = read(&request("FUTO 4321 absentword"), &terms, Pass::First).unwrap();
+        let first: Vec<_> = plan.tokens.iter().take(3).map(|r| (r.ttype, r.lookup_word.as_str(), r.penalty)).collect();
+        assert_eq!(first, [(TokenType::Partial, "futo", 0.3), (TokenType::Partial, "4321", 10.0 + 0.39 + 0.39),
+                           (TokenType::Partial, "absentword", 10.0)]);
+        assert!(plan.searches.is_empty());
     }
 
     #[test]
