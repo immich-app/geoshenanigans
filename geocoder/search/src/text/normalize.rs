@@ -243,6 +243,26 @@ pub fn normalized(s: &str) -> String {
     rules_normalized(s).trim().to_string()
 }
 
+/// The normalised form of a name as Nominatim's import makes it, the word its terms are made
+/// from: the query's normalised form, with each run of white space, '-' and ':' one space
+/// (nominatim_db/tokenizer/icu_tokenizer/token_analysis.py:27-28).
+pub fn name_normalized(s: &str) -> String {
+    let mut out = String::new();
+    let mut gap = false;
+    for c in rules_normalized(s).chars() {
+        if c.is_whitespace() || c == '-' || c == ':' {
+            gap = true;
+            continue;
+        }
+        if gap && !out.is_empty() {
+            out.push(' ');
+        }
+        gap = false;
+        out.push(c);
+    }
+    out
+}
+
 /// The normalised form as Nominatim's rules leave it before Python strips it, with any space at
 /// either end. House numbers keep it (Nominatim's house-number analysis does not strip).
 pub(super) fn rules_normalized(s: &str) -> String {
@@ -420,6 +440,20 @@ mod tests {
             ("München", "münchen"),
         ] {
             assert_eq!(normalized(name), norm, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_names_normalised_form_has_no_breaks_but_spaces() {
+        for (name, norm) in [
+            ("Do-it-yourself", "do it yourself"),
+            ("U-Bahn-Station", "u bahn station"),
+            ("Café's", "café s"),
+            ("a : b", "a b"),
+            (" -München- ", "münchen"),
+            ("Frankfurt (Oder)", "frankfurt oder"),
+        ] {
+            assert_eq!(name_normalized(name), norm, "{name}");
         }
     }
 
