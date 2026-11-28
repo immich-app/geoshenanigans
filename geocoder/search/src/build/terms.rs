@@ -81,7 +81,10 @@ impl SpellingCache {
     fn with(&mut self, name: &str, language: Option<&'static str>, mut use_spelling: impl FnMut(&Spelling)) {
         let mut h = DefaultHasher::new();
         (name, language).hash(&mut h);
-        let i = h.finish() as usize % self.slots.len();
+        let Some(i) = (h.finish() as usize).checked_rem(self.slots.len()) else {
+            Variants::get().spellings(&name_normalized(name), language).iter().for_each(use_spelling);
+            return;
+        };
         if let Some(hit) = self.slots[i].as_ref().filter(|c| c.language == language && c.name == name) {
             hit.spellings.iter().for_each(use_spelling);
             return;
@@ -146,17 +149,30 @@ fn name_keys(
 // are final when the last row of a key leaves the merge.
 type Occurrence = [u32; 3];
 
+/// Checking polygon label points can leave the linked-node tables resident. Deduct
+/// their actual allocations once across the workers before sizing the sort runs.
+fn worker_buffers(per_worker: usize, threads: usize, resident: usize) -> (usize, usize) {
+    let budget = per_worker.saturating_sub(resident.div_ceil(threads)).max(MIN_RUN_BUDGET_BYTES);
+    let cache_bytes = (budget / SPELLING_BUDGET_DIVISOR).min(budget - MIN_RUN_BUDGET_BYTES);
+    let slots = (cache_bytes / SPELLING_SLOT_BYTES).min(MAX_SPELLING_SLOTS);
+    (budget - slots * SPELLING_SLOT_BYTES, slots)
+}
+
+fn table_bytes<T>(table: &std::sync::OnceLock<Vec<T>>) -> usize {
+    table.get().map_or(0, |rows| rows.capacity() * size_of::<T>())
+}
+
 fn emit(
     records: &CoreRecords,
     areas: &AreaRanges,
     rows: &[u8],
-    budget: usize,
+    buffers: (usize, usize),
     tmp: &Path,
     worker: usize,
 ) -> io::Result<SortedRuns<Occurrence>> {
-    let slots = (budget / SPELLING_BUDGET_DIVISOR / SPELLING_SLOT_BYTES).clamp(1, MAX_SPELLING_SLOTS);
+    let (budget, slots) = buffers;
     let mut cache = SpellingCache::new(slots);
-    let mut sort = ExternalSort::new(budget - slots * SPELLING_SLOT_BYTES, tmp, format!("names-{worker}"))?;
+    let mut sort = ExternalSort::new(budget, tmp, format!("names-{worker}"))?;
     for b in rows.chunks_exact(CORE_RECORD_BYTES) {
         let e = EntityRef::unpack(number(b, 0).unwrap()).unwrap();
         let id = number(b, 4).unwrap();
@@ -400,6 +416,8 @@ pub(super) fn build(
     let rows = map(&tmp.join("records"))?;
     let areas = AreaRanges::open(out, n, profile)?;
     let budget = crate::sort::run_budget(opts.mem_mb, opts.threads).map_err(invalid)?;
+    let resident = table_bytes(&records.geo.linked_centres) + table_bytes(&records.geo.linked_names);
+    let buffers = worker_buffers(budget, opts.threads, resident);
     let mut names = SortedRuns::default();
     std::thread::scope(|scope| -> io::Result<()> {
         let areas = &areas;
@@ -407,7 +425,7 @@ pub(super) fn build(
         let mut workers = Vec::new();
         let chunk = (n as usize).div_ceil(opts.threads).max(1) * CORE_RECORD_BYTES;
         for (worker, rows) in rows.chunks(chunk).enumerate() {
-            workers.push(scope.spawn(move || emit(records, areas, rows, budget, tmp, worker)));
+            workers.push(scope.spawn(move || emit(records, areas, rows, buffers, tmp, worker)));
         }
         for w in workers {
             names.append(w.join().map_err(|_| invalid("name worker failed"))??);
@@ -506,6 +524,20 @@ mod tests {
         fixture::TempDir,
         index::{terms::TermSource, Dictionary},
     };
+    #[test]
+    fn term_workers_share_the_budget_with_resident_label_tables() {
+        let mib = 1 << 20;
+        let (run, slots) = worker_buffers(16 * mib, 1, 7 * mib);
+        assert_eq!(run + slots * SPELLING_SLOT_BYTES, 9 * mib);
+        let (run, slots) = worker_buffers(4 * mib, 4, 7 * mib);
+        assert_eq!(4 * (run + slots * SPELLING_SLOT_BYTES), 9 * mib);
+        assert_eq!(worker_buffers(mib, 1, 2 * mib), (MIN_RUN_BUDGET_BYTES, 0));
+        let mut uncached = SpellingCache::new(0);
+        let mut spellings = Vec::new();
+        uncached.with("Airport", None, |s| spellings.push(s.token.clone()));
+        assert_eq!(spellings, ["airport"]);
+    }
+
     #[test]
     fn three_million_postings_share_one_term_in_the_device_budget() {
         const N: u32 = 3_000_000;
