@@ -380,14 +380,17 @@ pub const CORE_FILES: &[&str] =
     &["core.ent", "core.chn", "core.area", "core.fst", "core.post", "core.pfx.fst", "core.pfx"];
 pub const BBOX_COORDS: usize = 4;
 pub const BBOX_BYTES: usize = BBOX_COORDS * size_of::<i32>();
+/// The exact label point and its resolved country follow the four outline bounds.
+pub const AREA_POINT_BYTES: usize = 2 * size_of::<f64>() + size_of::<u32>();
+pub const AREA_DETAIL_BYTES: usize = BBOX_BYTES + AREA_POINT_BYTES;
 pub const ENTITY_MAGIC: &[u8; 4] = b"PSE3";
-pub const SKIP_EVERY: u32 = 128;
-pub const TOPK_MIN_DF: u32 = 1024;
-pub const TOPK_PER_TERM: usize = 256;
 pub const ENTITY_BLOCK_ROWS: u32 = 128;
 pub const CORE_KIND_BITS: u32 = 2;
 pub const KINDS_PER_BYTE: u32 = u8::BITS / CORE_KIND_BITS;
 pub const ENTITY_HEADER_BYTES: usize = ENTITY_MAGIC.len() + size_of::<u32>();
+pub const SKIP_EVERY: u32 = 128;
+pub const TOPK_MIN_DF: u32 = 1024;
+pub const TOPK_PER_TERM: usize = 256;
 pub const IMP_UNIT: f64 = 1.0 / 655_350_000.0;
 pub const DEFAULT_IMPORTANCE_BASE: f64 = 0.40001;
 pub const IMPORTANCE_RANK_DIVISOR: f64 = 75.0;
@@ -406,13 +409,13 @@ pub const CORE_KINDS: [crate::index::entities::EntityKind; 3] = [
 ];
 /// Odd posting references carry singleton entity IDs. Even references address the posting file.
 pub const INLINE_POSTING: u64 = 1;
-pub const SKIP_BYTES: usize = 2 * size_of::<u32>();
-/// Sixteen u16-length keys take at most one MiB alongside the final merge.
-pub const TERM_MERGE_BATCH: usize = 16;
 /// A sparse FST entry points at a front-coded group; other entries hold their posting reference directly.
 pub const TERM_BLOCK: u64 = 1;
 pub const TERM_BLOCK_ROWS: usize = 64;
 pub const TERM_BLOCK_BYTES: usize = 64 * 1024;
+pub const SKIP_BYTES: usize = 2 * size_of::<u32>();
+/// Sixteen u16-length keys take at most one MiB alongside the final merge.
+pub const TERM_MERGE_BATCH: usize = 16;
 pub const POSTING_BUFFER_BYTES: usize = WRITE_BUFFER;
 pub const CHAIN_CACHE_CELLS: usize = 64;
 pub const PHOTON_MAX_EDITS: u8 = 2;

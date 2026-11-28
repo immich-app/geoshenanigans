@@ -95,6 +95,12 @@ impl CoreIndex {
         records.read_in_chain(self.entities.get(id)?, self.chains.outer_slot(id))
     }
 
+    /// The score for an ID that passed posting and range filters. Validate the row,
+    /// point and name as a full read would, without fetching display tags or OSM IDs.
+    pub fn candidate_importance(&self, id: u32, records: &CoreRecords<'_>) -> Option<u32> {
+        records.candidate_importance(self.entities.get(id)?)
+    }
+
     /// The most important readable matches of a posting after the caller's filters.
     pub fn best(
         &self,

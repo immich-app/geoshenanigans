@@ -199,10 +199,38 @@ impl<'a> CoreRecords<'a> {
         self.files.bundle(Self::kind(e), e.record())
     }
     pub(super) fn importance(&self, e: EntityRef, row: SourceRow, cc: &str) -> u32 {
-        self.files.wiki_importance(Self::kind(e), e.record()).unwrap_or_else(|| {
-            let rank = row.ranks(cc).0;
-            ((DEFAULT_IMPORTANCE_BASE - f64::from(rank) / IMPORTANCE_RANK_DIVISOR) / IMP_UNIT).round() as u32
-        })
+        self.files.wiki_importance(Self::kind(e), e.record()).unwrap_or_else(|| Self::default_importance(row, cc))
+    }
+    fn default_importance(row: SourceRow, cc: &str) -> u32 {
+        let rank = row.ranks(cc).0;
+        ((DEFAULT_IMPORTANCE_BASE - f64::from(rank) / IMPORTANCE_RANK_DIVISOR) / IMP_UNIT).round() as u32
+    }
+    pub(crate) fn candidate_importance(&self, e: EntityRef) -> Option<u32> {
+        let row = self.row(e)?;
+        let label = self.area_label(e);
+        let point = label.map(|(p, _)| p).or_else(|| row.point(self.geo))?;
+        if self.geo.get_string(row.name_id()).is_empty() {
+            return None;
+        }
+        if let Some(wiki) = self.files.wiki_importance(Self::kind(e), e.record()) {
+            return Some(wiki);
+        }
+        let cc = match row {
+            SourceRow::Area(_) => label
+                .map(|(_, cc)| cc)
+                .unwrap_or_else(|| row.country().or_else(|| self.geo.find_admin(point.0, point.1).country_code)),
+            _ => None,
+        };
+        let cc = cc.unwrap_or_default().map(|b| b.to_ascii_uppercase());
+        Some(Self::default_importance(row, std::str::from_utf8(&cc).unwrap_or("")))
+    }
+
+    fn area_label(&self, e: EntityRef) -> Option<((f64, f64), Option<[u8; 2]>)> {
+        if e.kind() == EntityKind::Area {
+            self.areas?.label(e.record())
+        } else {
+            None
+        }
     }
 }
 impl Entities for CoreRecords<'_> {
@@ -211,25 +239,27 @@ impl Entities for CoreRecords<'_> {
     }
     fn read_in_chain(&self, e: EntityRef, outer_slot: Option<u32>) -> Option<EntityRecord<'_>> {
         let row = self.row(e)?;
-        let point = row.point(self.geo)?;
+        let label = self.area_label(e);
+        let point = label.map(|(point, _)| point).or_else(|| row.point(self.geo))?;
         // A point chain starts with its containing country. An area's parent chain can
         // cross a border away from its label point, and a closed country way can have no rank.
-        let mut country_code = row
-            .country()
-            .or_else(|| {
-                if matches!(row, SourceRow::Area(_)) {
-                    return None;
-                }
-                let slot = outer_slot?;
-                let poly = self.geo.admin_polygon(slot)?;
-                if poly.admin_level != COUNTRY_LEVEL
-                    || query_server::polygon_field(&query_server::RankedPoly::of(slot, poly)) != Some("country")
-                {
-                    return None;
-                }
-                query_server::country_code_bytes(poly.country_code)
-            })
-            .or_else(|| self.geo.find_admin(point.0, point.1).country_code);
+        let mut country_code = label.map(|(_, cc)| cc).unwrap_or_else(|| {
+            row.country()
+                .or_else(|| {
+                    if matches!(row, SourceRow::Area(_)) {
+                        return None;
+                    }
+                    let slot = outer_slot?;
+                    let poly = self.geo.admin_polygon(slot)?;
+                    if poly.admin_level != COUNTRY_LEVEL
+                        || query_server::polygon_field(&query_server::RankedPoly::of(slot, poly)) != Some("country")
+                    {
+                        return None;
+                    }
+                    query_server::country_code_bytes(poly.country_code)
+                })
+                .or_else(|| self.geo.find_admin(point.0, point.1).country_code)
+        });
         if let Some(cc) = &mut country_code {
             cc.make_ascii_lowercase();
         }

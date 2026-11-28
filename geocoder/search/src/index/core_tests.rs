@@ -760,3 +760,62 @@ fn sparse_dictionary_blocks_preserve_order_across_variant_sources() {
     assert!(core.terms.exact(TermKind::Word, "aprt09").is_empty());
     assert_eq!(core.terms.fuzzy(TermKind::Word, "aprt099", Fuzz { edits: 1, anchor: 4 }, 2).len(), 2);
 }
+
+#[test]
+fn reading_a_full_area_uses_its_indexed_label_point() {
+    let tmp = TempDir::new("label-point");
+    let set = tmp.0.join("dataset");
+    let mut f = Geo::default();
+    let polygon = f.boundary("Boundary", 6, [-1., -1., 1., 1.]);
+    let label = f.place("Boundary", 1, 0.125, -0.25);
+    f.claim(polygon, label);
+    let geo = f.load(&set);
+    build_core(
+        &geo,
+        &crate::dataset::core_stamps(&set).unwrap(),
+        &set,
+        &tmp.0,
+        Profile::Full,
+        &BuildOpts::new(tmp.0.join("runs")),
+    )
+    .unwrap();
+    let core = CoreIndex::open(&tmp.0).unwrap();
+    let geo = f.load(&set);
+    let rows = CoreRecords::for_index(&geo, &set, &core).unwrap();
+    let record = core.record(0, &rows).unwrap();
+    assert_eq!(record.point, (0.125, -0.25));
+    assert!(geo.linked_centres.get().is_none());
+}
+
+#[test]
+fn ranking_reads_only_eligible_records_and_returns_the_resolved_importance() {
+    let tmp = TempDir::new("ranking-fields");
+    let set = tmp.0.join("dataset");
+    let mut f = Geo::default();
+    let country = f.boundary("Canada", 2, [-2., -2., 2., 2.]);
+    f.country(country, *b"CA");
+    f.place("Village", 1, 1., 1.);
+    f.poi("Store", 1., 1., 0);
+    f.poi("", 1., 1., 0);
+    let geo = f.load(&set);
+    fs::write(set.join("poi_imp.bin"), query_server::side_blocks::encode(&[123, 456])).unwrap();
+    for profile in [Profile::Full, Profile::Immich] {
+        let out = tmp.0.join(profile.as_str());
+        build_core(
+            &geo,
+            &crate::dataset::core_stamps(&set).unwrap(),
+            &set,
+            &out,
+            profile,
+            &BuildOpts::new(tmp.0.join("runs")),
+        )
+        .unwrap();
+        let core = CoreIndex::open(&out).unwrap();
+        let records = CoreRecords::for_index(&geo, &set, &core).unwrap();
+        for id in 0..=core.entities.len() {
+            let expected =
+                core.record(id, &records).map(|r| (r.importance / crate::constants::IMP_UNIT).round() as u32);
+            assert_eq!(core.candidate_importance(id, &records), expected);
+        }
+    }
+}

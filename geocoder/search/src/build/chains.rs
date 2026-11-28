@@ -128,6 +128,14 @@ pub(super) fn build(
         ExternalSort::new(budget, tmp, "chain".into())?
     };
     let mut key = Vec::new();
+    // Ring chunk boxes omit the southern edge. Keep the exact extrema from the vertex pass.
+    let mut bounds = if profile == Profile::Full {
+        let file = std::fs::File::options().read(true).write(true).create_new(true).open(tmp.join("bounds"))?;
+        file.set_len(u64::from(records.geo.admin_polygon_count()) * AREA_DETAIL_BYTES as u64)?;
+        Some(file)
+    } else {
+        None
+    };
     for kind in CORE_KINDS {
         let n = records.sizes[kind as usize];
         let ids = side(&set.join(CORE_CHAIN_FILES[kind as usize]), n)?;
@@ -152,6 +160,14 @@ pub(super) fn build(
                 _ => row.point(records.geo),
             };
             let Some((lat, lon)) = point else { continue };
+            if let (SourceRow::Area(_), Some(file)) = (row, &mut bounds) {
+                let cc = row.country().or_else(|| records.geo.find_admin(lat, lon).country_code);
+                let country = u32::from(cc.map_or(0, u16::from_be_bytes));
+                file.seek(SeekFrom::Start(u64::from(i) * AREA_DETAIL_BYTES as u64 + BBOX_BYTES as u64))?;
+                file.write_all(&lat.to_le_bytes())?;
+                file.write_all(&lon.to_le_bytes())?;
+                file.write_all(&country.to_le_bytes())?;
+            }
             key.clear();
             let chain_id = if shipped.is_some() {
                 chain.filter(|&id| id != NO_DATA).ok_or_else(|| invalid("incomplete shipped chain files"))?
@@ -177,14 +193,6 @@ pub(super) fn build(
     let mut n = 0u32;
     let mut cc = 0;
     let mut blob = Vec::new();
-    // Ring chunk boxes omit the southern edge. Keep the exact extrema from the vertex pass.
-    let mut bounds = if profile == Profile::Full {
-        let file = std::fs::File::options().read(true).write(true).create_new(true).open(tmp.join("bounds"))?;
-        file.set_len(u64::from(records.geo.admin_polygon_count()) * BBOX_BYTES as u64)?;
-        Some(file)
-    } else {
-        None
-    };
     while let Some([id, packed, rank]) = input.next(&mut key)? {
         if id != last_id || prev.as_ref() != Some(&key) {
             last_id = id;
@@ -263,7 +271,7 @@ pub(super) fn build(
                 });
                 added?;
                 read.ok_or_else(|| invalid("unreadable area outline"))?;
-                file.seek(SeekFrom::Start(u64::from(e.record()) * BBOX_BYTES as u64))?;
+                file.seek(SeekFrom::Start(u64::from(e.record()) * AREA_DETAIL_BYTES as u64))?;
                 let mut row = [0; BBOX_BYTES];
                 for (dst, coord) in row.chunks_exact_mut(size_of::<i32>()).zip(bbox) {
                     dst.copy_from_slice(&coord.to_le_bytes());

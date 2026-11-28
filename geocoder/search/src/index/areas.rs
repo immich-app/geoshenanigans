@@ -1,5 +1,8 @@
 use super::{entities::BBox, small, BlobTable};
-use crate::{constants::BBOX_BYTES, profile::Profile};
+use crate::{
+    constants::{AREA_DETAIL_BYTES, BBOX_BYTES},
+    profile::Profile,
+};
 use std::{io, ops::Range, path::Path};
 pub struct AreaRanges {
     table: BlobTable,
@@ -8,7 +11,7 @@ pub struct AreaRanges {
 }
 impl AreaRanges {
     pub(crate) fn open(dir: &Path, entities: u32, profile: Profile) -> io::Result<Self> {
-        let stride = size_of::<u32>() + if profile == Profile::Full { BBOX_BYTES } else { 0 };
+        let stride = size_of::<u32>() + if profile == Profile::Full { AREA_DETAIL_BYTES } else { 0 };
         Ok(Self { table: BlobTable::open(&dir.join("core.area"), stride)?, entities, profile })
     }
 
@@ -21,6 +24,19 @@ impl AreaRanges {
         let (min_lat, min_lon) = query_server::PointE7 { lat: coord(0)?, lng: coord(1)? }.degrees();
         let (max_lat, max_lon) = query_server::PointE7 { lat: coord(2)?, lng: coord(3)? }.degrees();
         (min_lat < max_lat && min_lon < max_lon).then_some(BBox { min_lat, min_lon, max_lat, max_lon })
+    }
+    pub(crate) fn label(&self, slot: u32) -> Option<((f64, f64), Option<[u8; 2]>)> {
+        self.bbox(slot)?;
+        let row = slot as usize;
+        let coord = |offset| {
+            let lo = u64::from(self.table.field(row, offset)?);
+            let hi = u64::from(self.table.field(row, offset + size_of::<u32>())?);
+            Some(f64::from_bits(hi << u32::BITS | lo))
+        };
+        let lat = coord(BBOX_BYTES)?;
+        let lon = coord(BBOX_BYTES + size_of::<f64>())?;
+        let code = u16::try_from(self.table.field(row, BBOX_BYTES + 2 * size_of::<f64>())?).ok()?;
+        query_server::coords_in_range(lat, lon).then_some(((lat, lon), query_server::country_code_bytes(code)))
     }
     /// Disjoint half-open ranges, including any sampled intersections.
     pub fn ranges(&self, slot: u32) -> impl Iterator<Item = Range<u32>> + '_ {

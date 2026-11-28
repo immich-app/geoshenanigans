@@ -1,5 +1,5 @@
 use super::write::TableWriter;
-use crate::constants::{BBOX_BYTES, BBOX_COORDS};
+use crate::constants::AREA_DETAIL_BYTES;
 use crate::{index::invalid, sort::ExternalSort, varint};
 use std::{
     fs::File,
@@ -37,10 +37,10 @@ pub(super) fn write(
         file.rewind()?;
     }
     let mut bounds = bounds.map(BufReader::new);
-    let mut fields = vec![0; if bounds.is_some() { BBOX_COORDS } else { 0 }];
+    let mut fields = vec![0; if bounds.is_some() { AREA_DETAIL_BYTES / size_of::<u32>() } else { 0 }];
     for slot in 0..slots {
         if let Some(bounds) = &mut bounds {
-            let mut row = [0; BBOX_BYTES];
+            let mut row = [0; AREA_DETAIL_BYTES];
             bounds.read_exact(&mut row)?;
             for (field, b) in fields.iter_mut().zip(row.chunks_exact(size_of::<u32>())) {
                 *field = u32::from_le_bytes(b.try_into().unwrap());
