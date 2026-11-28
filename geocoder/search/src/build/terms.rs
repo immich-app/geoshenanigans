@@ -8,7 +8,12 @@ use super::{
 };
 use crate::{
     constants::*,
-    index::{areas::AreaRanges, entities::EntityRef, invalid, map, number, terms::TermKind},
+    index::{
+        areas::AreaRanges,
+        entities::{EntityKind, EntityRef},
+        invalid, map, number,
+        terms::TermKind,
+    },
     sort::{ExternalSort, SortRecord, SortedRuns},
     text::{
         normalize::{name_normalized, transliterated},
@@ -112,6 +117,36 @@ struct NameInput {
     country: [u8; 2],
 }
 
+impl NameInput {
+    // A numeric sort groups identical analyses and walks display-name strings in offset order.
+    fn sort_row(self, entity: EntityRef, id: u32, importance: u32) -> [u32; 7] {
+        let country = u32::from(u16::from_be_bytes(self.country));
+        let scope = country | (u32::from(self.country_term) << u16::BITS);
+        [
+            self.name,
+            self.bundle.unwrap_or(query_server::NO_DATA),
+            self.own.unwrap_or(query_server::NO_DATA),
+            scope,
+            entity.packed(),
+            id,
+            importance,
+        ]
+    }
+
+    fn from_row([name, bundle, own, scope, packed, id, importance]: [u32; 7]) -> (Self, EntityRef, u32, u32) {
+        let entity = EntityRef::unpack(packed).unwrap();
+        let input = Self {
+            name,
+            own: (own != query_server::NO_DATA).then_some(own),
+            bundle: (bundle != query_server::NO_DATA).then_some(bundle),
+            poi: entity.kind() == EntityKind::Poi,
+            country_term: scope >> u16::BITS != 0,
+            country: (scope as u16).to_be_bytes(),
+        };
+        (input, entity, id, importance)
+    }
+}
+
 /// Bundle and display-name offsets identify every language tag before opening a string page.
 struct KeyCache {
     slots: Vec<Option<(NameInput, Vec<Vec<u8>>)>>,
@@ -147,14 +182,8 @@ impl KeyCache {
     }
 }
 
-fn name_keys(
-    records: &CoreRecords,
-    e: EntityRef,
-    input: NameInput,
-    country: &str,
-    cache: &mut SpellingCache,
-) -> Vec<Vec<u8>> {
-    let bundle = records.tags(e);
+fn name_keys(records: &CoreRecords, input: NameInput, country: &str, cache: &mut SpellingCache) -> Vec<Vec<u8>> {
+    let bundle = input.bundle.and_then(|offset| records.bundle_at(input.poi, offset));
     let name = records.geo.get_string(input.name);
     let own = input.own.map(|id| records.geo.get_string(id));
     let mut tags: Vec<_> = bundle.iter().flat_map(|b| b.iter()).collect();
@@ -235,7 +264,7 @@ fn emit(
     let spelling_slots = slots / 2;
     let mut cache = SpellingCache::new(spelling_slots);
     let mut keys = KeyCache::new(slots - spelling_slots);
-    let mut sort = ExternalSort::new(budget, tmp, format!("names-{worker}"))?;
+    let mut order = ExternalSort::fixed(budget, tmp, format!("string-offsets-{worker}"))?;
     for b in rows.chunks_exact(CORE_RECORD_BYTES) {
         let e = EntityRef::unpack(number(b, 0).unwrap()).unwrap();
         let id = number(b, 4).unwrap();
@@ -253,13 +282,24 @@ fn emit(
             country_term: row.is_country(),
             country: upper.map(|b| b.to_ascii_lowercase()),
         };
+        order.push(&[], input.sort_row(e, id, imp))?;
+    }
+    let mut ordered = order.finish()?.merge(tmp, &format!("string-merge-{worker}"))?;
+    let mut key = Vec::new();
+    let mut sort = ExternalSort::new(
+        budget.saturating_sub(MERGE_FAN_IN * RUN_READ_BUFFER).max(MIN_RUN_BUDGET_BYTES),
+        tmp,
+        format!("names-{worker}"),
+    )?;
+    while let Some(row) = ordered.next(&mut key)? {
+        let (input, e, id, imp) = NameInput::from_row(row);
         keys.with(
             input,
-            || name_keys(records, e, input, std::str::from_utf8(&input.country).unwrap_or("").trim(), &mut cache),
+            || name_keys(records, input, std::str::from_utf8(&input.country).unwrap_or("").trim(), &mut cache),
             |keys| -> io::Result<()> {
                 for k in keys {
                     sort.push(k, occurrence(id, NAME_OCCURRENCE, imp))?;
-                    if is_area && k[0] != TermKind::Country as u8 {
+                    if e.kind() == EntityKind::Area && k[0] != TermKind::Country as u8 {
                         for r in areas.ranges(e.record()) {
                             sort.push(k, occurrence(r.start, AREA_MEMBERS, r.end))?;
                         }
@@ -688,5 +728,26 @@ mod cache_tests {
         cache.with(input, || vec![vec![0; SPELLING_SLOT_BYTES]], |k| assert_eq!(k[0].len(), SPELLING_SLOT_BYTES));
         cache.with(input, keys, |k| assert_eq!(k, &keys()));
         KeyCache::new(0).with(input, keys, |k| assert_eq!(k, &keys()));
+    }
+}
+
+#[cfg(test)]
+mod name_order_tests {
+    use super::*;
+
+    #[test]
+    fn sorting_names_preserves_the_analysis_context_and_entity() {
+        use crate::index::entities::EntityKind;
+        let e = EntityRef::new(EntityKind::Poi, 19).unwrap();
+        let input =
+            NameInput { name: 4, own: Some(3), bundle: Some(5), poi: true, country_term: false, country: *b"de" };
+        let row = input.sort_row(e, 41, 87);
+        assert_eq!(row[0], input.name);
+        let (restored, entity, id, imp) = NameInput::from_row(row);
+        assert!(restored == input);
+        assert_eq!((entity, id, imp), (e, 41, 87));
+        let e = EntityRef::new(EntityKind::Area, 0).unwrap();
+        let input = NameInput { country_term: true, poi: false, country: *b"  ", own: None, bundle: None, ..input };
+        assert!(NameInput::from_row(input.sort_row(e, 0, 0)).0 == input);
     }
 }

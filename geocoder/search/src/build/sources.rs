@@ -195,6 +195,9 @@ impl<'a> CoreRecords<'a> {
     pub(super) fn bundle_id(&self, e: EntityRef) -> Option<u32> {
         self.files.bundle_id(Self::kind(e), e.record())
     }
+    pub(super) fn bundle_at(&self, poi: bool, offset: u32) -> Option<TagBundle<'_>> {
+        self.files.bundle_at(poi, offset)
+    }
     pub(super) fn tags(&self, e: EntityRef) -> Option<TagBundle<'_>> {
         self.files.bundle(Self::kind(e), e.record())
     }
