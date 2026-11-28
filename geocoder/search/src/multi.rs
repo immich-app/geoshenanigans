@@ -45,7 +45,7 @@ impl MultiSearch {
                 .as_ref()
                 .map_err(Clone::clone)
                 .and_then(|stamps| open(geo.clone(), stamps, &dataset, &output))
-                .map_err(|e| format!("{}: {e}", slot.name))?;
+                .map_err(|e| if slot.continent.is_some() { format!("{}: {e}", slot.name) } else { e })?;
             if opened == Origin::Built {
                 origin = Origin::Built;
             }
@@ -178,6 +178,18 @@ mod tests {
         let (found, stats) = search.search(&req).unwrap();
         assert_eq!(found.len(), limit);
         assert_eq!(stats.reverse_lookups, found.len());
+    }
+
+    #[test]
+    fn a_flat_search_open_preserves_the_error_text() {
+        let dir = TempDir::new("flat-search-open-error");
+        Geo::default().write(&dir.0);
+        let index = load(&dir.0);
+
+        let reason = "No room for sort runs";
+        let error = MultiSearch::open_with(&index, None, |_, _, _, _| Err(reason.to_string())).err().unwrap();
+
+        assert_eq!(error, reason);
     }
 
     #[test]

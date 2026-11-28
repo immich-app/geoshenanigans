@@ -452,11 +452,11 @@ async fn a_start_serves_at_once_and_its_place_search_answers_as_each_group_opens
     assert_eq!((broken.status, broken.header("retry-after")), (503, None));
     let body = broken.json();
     assert_eq!((&body["status"], &body["dataset"], &body["index"]), (&"failed".into(), &"full.exact.all".into(), &"full.exact.all".into()));
-    assert_eq!(body["reason"], "dataset full.exact.all: world: no room for its sort runs");
+    assert_eq!(body["reason"], "dataset full.exact.all: no room for its sort runs");
     let health = health_search(&url).await;
     assert_eq!(state_of(&health, "full.simplified.all")["state"], "building");
     assert_eq!(state_of(&health, "full.exact.all")["state"], "failed");
-    assert_eq!(state_of(&health, "full.exact.all")["reason"], "dataset full.exact.all: world: no room for its sort runs");
+    assert_eq!(state_of(&health, "full.exact.all")["reason"], "dataset full.exact.all: no room for its sort runs");
     assert_eq!(health["datasets"], 28);
     until("a group of another index open", || p.served().unwrap().search.json()["groups"].as_array().unwrap()
         .iter().any(|g| g["index"] == "admin-minimal.simplified.none" && g["state"] == "ready")).await;
@@ -539,7 +539,7 @@ async fn a_group_that_fails_doesnt_refuse_its_build_and_the_next_round_tries_it_
     assert_eq!(tries.load(Ordering::SeqCst), 1);
     assert!(!data.path().join(REFUSED).exists() || !std::fs::read_to_string(data.path().join(REFUSED)).unwrap().contains(DATE));
     let failed = fetch(&format!("{url}/search?profile=immich&q=testville&key=test&dataset=full.exact.notable")).await;
-    assert_eq!((failed.status, failed.json()["reason"].as_str()), (503, Some("dataset full.exact.notable: world: the disk is full")));
+    assert_eq!((failed.status, failed.json()["reason"].as_str()), (503, Some("dataset full.exact.notable: the disk is full")));
     let panicked = fetch(&format!("{url}/search?profile=immich&q=testville&key=test&dataset=full.simplified.none")).await;
     assert_eq!(panicked.status, 503);
     assert!(panicked.json()["reason"].as_str().unwrap().contains("a build that panics"), "{}", panicked.body);
@@ -826,7 +826,7 @@ async fn a_dataset_whose_files_changed_since_its_load_fails_its_group() {
     let health = p.served().unwrap().search.json();
     let group = state_of(&health, "no-addresses.simplified.notable");
     assert_eq!(group["state"], "failed");
-    assert!(group["reason"].as_str().unwrap().starts_with("dataset admin.simplified.notable: world: The dataset in "), "{group}");
+    assert!(group["reason"].as_str().unwrap().starts_with("dataset admin.simplified.notable: The dataset in "), "{group}");
     assert!(group["reason"].as_str().unwrap().ends_with("changed since it was loaded: load it again"), "{group}");
 }
 
