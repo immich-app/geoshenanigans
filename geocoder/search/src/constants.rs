@@ -385,6 +385,7 @@ pub const TOPK_PER_TERM: usize = 256;
 pub const IMP_UNIT: f64 = 1.0 / 655_350_000.0;
 pub const DEFAULT_IMPORTANCE_BASE: f64 = 0.40001;
 pub const IMPORTANCE_RANK_DIVISOR: f64 = 75.0;
+pub const MAX_ADDRESS_RANK: u8 = 25;
 pub const POI_SEARCH_RANK: u8 = 30;
 pub const COUNTRY_LEVEL: u8 = 2;
 pub const PLACE_AREA_LEVEL: u8 = 15;

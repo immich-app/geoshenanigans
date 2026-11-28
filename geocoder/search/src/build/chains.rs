@@ -89,6 +89,24 @@ impl Shipped {
         Ok(&self.slots)
     }
 }
+/// Each polygon has an open interval only while the chain's entities can take its rank.
+struct Parent {
+    slot: u32,
+    rank: u8,
+    start: Option<u32>,
+}
+
+fn transition(parents: &mut [Parent], max_rank: u8, at: u32, ranges: &mut ExternalSort<[u32; 3]>) -> io::Result<()> {
+    for p in parents {
+        if p.rank != 0 && p.rank < max_rank {
+            p.start.get_or_insert(at);
+        } else if let Some(start) = p.start.take() {
+            ranges.push(&[], [p.slot, start, at])?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn build(
     records: &CoreRecords,
     set: &Path,
@@ -126,7 +144,13 @@ pub(super) fn build(
                     key.extend_from_slice(&field.to_be_bytes())
                 }
             }
-            sort.push(&key, [e.packed()])?;
+            let rank = match row {
+                SourceRow::Place(p) if p.rank_address == 0 => query_server::PLACE_NODE_SEARCH_RANK[p.place_type as usize],
+                SourceRow::Place(p) => p.rank_address,
+                SourceRow::Area(a) => a.rank_address,
+                SourceRow::Poi(_) => MAX_ADDRESS_RANK,
+            };
+            sort.push(&key, [e.packed(), u32::from(rank.min(MAX_ADDRESS_RANK))])?;
         }
     }
     let mut input = sort.finish()?.merge(tmp, "chain-merge")?;
@@ -138,16 +162,16 @@ pub(super) fn build(
     let mut ranges = ExternalSort::new(budget / 4, tmp, "ranges".into())?;
     let mut prev: Option<Vec<u8>> = None;
     let mut slots = Vec::new();
-    let mut first = 0;
+    let mut parents = Vec::new();
+    let mut previous_rank = 0;
     let mut n = 0u32;
     let mut cc = 0;
     let mut blob = Vec::new();
-    while let Some([packed]) = input.next(&mut key)? {
+    while let Some([packed, rank]) = input.next(&mut key)? {
         if prev.as_ref() != Some(&key) {
-            for &s in &slots {
-                ranges.push(&[], [s, first, n])?;
-            }
-            first = n;
+            transition(&mut parents, 0, n, &mut ranges)?;
+            parents.clear();
+            previous_rank = 0;
             slots.clear();
             if let Some(dict) = &mut shipped {
                 slots.extend_from_slice(dict.through(u32::from_be_bytes(key[..].try_into().unwrap()))?);
@@ -158,6 +182,8 @@ pub(super) fn build(
             }
             blob.clear();
             for &s in &slots {
+                let poly = records.geo.admin_polygon(s).ok_or_else(|| invalid("chain contains an unknown polygon"))?;
+                parents.push(Parent { slot: s, rank: poly.rank_address, start: None });
                 varint::put(&mut blob, s.into());
             }
             chains.begin(&[n])?;
@@ -169,11 +195,24 @@ pub(super) fn build(
                 .map_or(0, |p| p.country_code as u32);
             prev.get_or_insert_with(Vec::new).clone_from(&key);
         }
+        let e = EntityRef::unpack(packed).unwrap();
+        let max_rank = if rank == 0 && e.kind() == EntityKind::Area {
+            // Without the original geometry_to_rank inputs, use the country's search rank.
+            let poly = records.geo.admin_polygon(e.record()).ok_or_else(|| invalid("missing area record"))?;
+            let country = query_server::country_code_bytes(poly.country_code)
+                .or_else(|| query_server::country_code_bytes(cc as u16)).unwrap_or_default().map(|b| b.to_ascii_uppercase());
+            query_server::area_search_rank(&poly, std::str::from_utf8(&country).unwrap_or("")).min(MAX_ADDRESS_RANK)
+        } else {
+            rank as u8
+        };
+        if previous_rank != max_rank {
+            transition(&mut parents, max_rank, n, &mut ranges)?;
+            previous_rank = max_rank;
+        }
         ents.write_all(&packed.to_le_bytes())?;
         by_record.push(&[], [packed, n, cc])?;
         let end = n.checked_add(1).ok_or_else(|| invalid("too many entities"))?;
         if profile == Profile::Full {
-            let e = EntityRef::unpack(packed).unwrap();
             if e.kind() == EntityKind::Area {
                 let poly =
                     records.geo.admin_polygon(e.record()).ok_or_else(|| invalid("missing polygon of shipped chain"))?;
@@ -187,6 +226,9 @@ pub(super) fn build(
                     let parents = points.get(lat, lon);
                     if parents != last {
                         for s in parents.iter().filter_map(|v| v.checked_sub(1)).filter(|s| !slots.contains(s)) {
+                            if !records.geo.admin_polygon(s).is_some_and(|p| p.rank_address != 0 && p.rank_address < max_rank) {
+                                continue;
+                            }
                             if let Err(e) = ranges.push(&[], [s, n, end]) {
                                 added = Err(e);
                                 break;
@@ -201,9 +243,7 @@ pub(super) fn build(
         }
         n = end;
     }
-    for s in slots {
-        ranges.push(&[], [s, first, n])?;
-    }
+    transition(&mut parents, 0, n, &mut ranges)?;
     ents.seek(SeekFrom::Start(4))?;
     ents.write_all(&n.to_le_bytes())?;
     ents.flush()?;
