@@ -21,7 +21,7 @@ fn core_membership_counts_and_names_follow_the_dataset() {
     let poi = f.poi("FUTO", 0.6, 0.6, 0);
     f.poi_tags(poi, &[("name:de", "Büro")]);
     let geo = f.load(&set);
-    let stamps = crate::dataset::Stamps::of(&set).unwrap();
+    let stamps = crate::dataset::core_stamps(&set).unwrap();
     let mut files = Vec::new();
     for threads in [1, 4, 16] {
         let out = tmp.0.join(threads.to_string());
@@ -111,7 +111,7 @@ fn a_frequent_term_seeks_and_walks_past_its_importance_head() {
     let imps: Vec<_> = (1..=n).collect();
     fs::write(set.join("poi_imp.bin"), query_server::side_blocks::encode(&imps)).unwrap();
     let opts = BuildOpts::new(tmp.0.join("runs"));
-    build_core(&geo, &crate::dataset::Stamps::of(&set).unwrap(), &set, &tmp.0, Profile::Immich, &opts).unwrap();
+    build_core(&geo, &crate::dataset::core_stamps(&set).unwrap(), &set, &tmp.0, Profile::Immich, &opts).unwrap();
     let core = CoreIndex::open(&tmp.0).unwrap();
     let term = &core.terms.exact(TermKind::Word, "common")[0];
     let list = core.terms.posting(term.postings[0]).unwrap();
@@ -132,7 +132,7 @@ fn interrupted_core_publish_is_refused_until_rebuilt() {
     f.place("One", 0, 1., 1.);
     let geo = f.load(&set);
     let opts = BuildOpts::new(dir.0.join("runs"));
-    let stamp = crate::dataset::Stamps::of(&set).unwrap();
+    let stamp = crate::dataset::core_stamps(&set).unwrap();
     build_core(&geo, &stamp, &set, &dir.0, Profile::Immich, &opts).unwrap();
     let aside = dir.0.join(BUILD_STAGE_DIR).join(BUILD_ASIDE_DIR);
     fs::create_dir_all(&aside).unwrap();
@@ -150,7 +150,7 @@ fn an_interrupted_generation_stays_unreadable_after_a_failed_rebuild() {
     let mut f = Geo::default();
     f.poi("one", 1., 1., 0);
     let geo = f.load(&set);
-    let stamps = crate::dataset::Stamps::of(&set).unwrap();
+    let stamps = crate::dataset::core_stamps(&set).unwrap();
     let opts = BuildOpts::new(tmp.0.join("runs"));
     build_core(&geo, &stamps, &set, &tmp.0, Profile::Immich, &opts).unwrap();
     let aside = tmp.0.join(BUILD_STAGE_DIR).join(BUILD_ASIDE_DIR);
@@ -178,7 +178,7 @@ fn a_shipped_chain_dictionary_is_read_in_id_order_and_partial_inputs_fail() {
     let geo = f.load(&set);
     let opts = BuildOpts::new(tmp.0.join("sort"));
     let build = |dir: &str| {
-        build_core(&geo, &crate::dataset::Stamps::of(&set).unwrap(), &set, &tmp.0.join(dir), Profile::Immich, &opts)
+        build_core(&geo, &crate::dataset::core_stamps(&set).unwrap(), &set, &tmp.0.join(dir), Profile::Immich, &opts)
     };
     build("geometry").unwrap();
     fs::write(set.join("admin_chains.bin"), query_server::side_blocks::encode(&[1])).unwrap();
@@ -217,7 +217,7 @@ fn a_city_crossing_the_county_line_is_in_both_counties_in_the_full_profile() {
     let unranked = f.boundary("Unranked town", 8, [0.2, 0.2, 0.8, 0.6]);
     f.area_rank(unranked, 0);
     let geo = f.load(&set);
-    let stamp = crate::dataset::Stamps::of(&set).unwrap();
+    let stamp = crate::dataset::core_stamps(&set).unwrap();
     for profile in Profile::ALL {
         let out = tmp.0.join(profile.as_str());
         build_core(&geo, &stamp, &set, &out, profile, &BuildOpts::new(tmp.0.join("sort"))).unwrap();
@@ -252,7 +252,7 @@ fn damaged_offsets_and_rows_end_the_walk() {
         f.poi("Same", 1., 1., 0);
     }
     let geo = f.load(&set);
-    let stamp = crate::dataset::Stamps::of(&set).unwrap();
+    let stamp = crate::dataset::core_stamps(&set).unwrap();
     build_core(&geo, &stamp, &set, &tmp.0, Profile::Immich, &BuildOpts::new(tmp.0.join("runs"))).unwrap();
     for file in ["core.ent", "core.fst", "core.post", "core.chn", "core.area", "core.pfx", "core.pfx.fst"] {
         let path = tmp.0.join(file);
@@ -289,7 +289,7 @@ fn exact_prefix_and_fuzzy_terms_order_the_source_names_before_taking_the_limit()
     let geo = f.load(&set);
     build_core(
         &geo,
-        &crate::dataset::Stamps::of(&set).unwrap(),
+        &crate::dataset::core_stamps(&set).unwrap(),
         &set,
         &tmp.0,
         Profile::Immich,
@@ -305,14 +305,14 @@ fn exact_prefix_and_fuzzy_terms_order_the_source_names_before_taking_the_limit()
 
 #[test]
 fn a_core_is_reused_only_for_its_dataset_and_profile() {
-    use crate::dataset::{open_core, BuildOnDevice, Origin, Stamps};
+    use crate::dataset::{core_stamps, open_core, BuildOnDevice, Origin};
     let tmp = TempDir::new("reuse");
     let set = tmp.0.join("set");
     let index = tmp.0.join("index");
     let mut f = Geo::default();
     f.poi("One", 1., 1., 0);
     let geo = f.load(&set);
-    let stamps = Stamps::of(&set).unwrap();
+    let stamps = core_stamps(&set).unwrap();
     let open = |profile| open_core(&geo, &stamps, &set, &index, profile, &BuildOnDevice::default()).map(|(_, o)| o);
     assert_eq!(open(Profile::Immich).unwrap(), Origin::Built);
     fs::write(set.join("poi_addr.host"), "ignored").unwrap();
@@ -323,7 +323,7 @@ fn a_core_is_reused_only_for_its_dataset_and_profile() {
     let changed = f.load(&set);
     assert!(open(Profile::Full).is_err());
     let (core, origin) =
-        open_core(&changed, &Stamps::of(&set).unwrap(), &set, &index, Profile::Full, &BuildOnDevice::default())
+        open_core(&changed, &core_stamps(&set).unwrap(), &set, &index, Profile::Full, &BuildOnDevice::default())
             .unwrap();
     assert_eq!(origin, Origin::Built);
     assert_eq!(core.entities.len(), 2);
@@ -358,7 +358,7 @@ fn ranked_postings_resolve_each_candidate_before_it_can_take_a_result_slot() {
     fs::write(set.join("poi_imp.bin"), query_server::side_blocks::encode(&scores)).unwrap();
     build_core(
         &geo,
-        &crate::dataset::Stamps::of(&set).unwrap(),
+        &crate::dataset::core_stamps(&set).unwrap(),
         &set,
         &tmp.0,
         Profile::Immich,
@@ -386,7 +386,7 @@ fn an_empty_core_opens_and_searches() {
     let geo = Geo::default().load(&set);
     build_core(
         &geo,
-        &crate::dataset::Stamps::of(&set).unwrap(),
+        &crate::dataset::core_stamps(&set).unwrap(),
         &set,
         &tmp.0,
         Profile::Immich,
@@ -448,7 +448,7 @@ fn full_core_is_independent_of_worker_count_and_immich_ignores_host_files() {
         let dir = tmp.0.join(format!("{}-{threads}", Profile::as_str(profile)));
         build_core(
             &geo,
-            &crate::dataset::Stamps::of(&set).unwrap(),
+            &crate::dataset::core_stamps(&set).unwrap(),
             &set,
             &dir,
             profile,
@@ -477,7 +477,7 @@ fn absent_parent_levels_keep_the_same_tuple_order_as_shipped_chain_ids() {
         let out = tmp.0.join(name);
         build_core(
             &geo,
-            &crate::dataset::Stamps::of(&set).unwrap(),
+            &crate::dataset::core_stamps(&set).unwrap(),
             &set,
             &out,
             Profile::Immich,
@@ -503,7 +503,7 @@ fn a_build_cleans_its_default_scratch_and_preserves_shared_scratch() {
     let run = |scratch: &std::path::Path| {
         build_core(
             &geo,
-            &crate::dataset::Stamps::of(&set).unwrap(),
+            &crate::dataset::core_stamps(&set).unwrap(),
             &set,
             &out,
             Profile::Immich,
@@ -538,7 +538,7 @@ fn an_indexed_record_uses_its_ranked_country_and_recovers_a_missing_country() {
     f.poi("Outside", 4., 4., 0);
     let geo = f.load(&set);
     let out = tmp.0.join("core");
-    let stamps = crate::dataset::Stamps::of(&set).unwrap();
+    let stamps = crate::dataset::core_stamps(&set).unwrap();
     build_core(&geo, &stamps, &set, &out, Profile::Immich, &BuildOpts::new(tmp.0.join("runs"))).unwrap();
     let core = CoreIndex::open(&out).unwrap();
     let records = CoreRecords::open(&geo, &set).unwrap();
@@ -582,4 +582,16 @@ fn country_names_use_only_their_identity_spelling() {
     ] {
         assert_eq!(!core.terms.exact(kind, token).is_empty(), present, "{kind:?} {token}");
     }
+}
+
+#[test]
+fn search_chain_inputs_belong_to_the_search_snapshot() {
+    let tmp = TempDir::new("search-stamps");
+    let before = query_server::Stamps::of(&tmp.0).unwrap();
+    let search = crate::dataset::load(&tmp.0, || {
+        fs::write(tmp.0.join("search_chains.bin"), [0]).unwrap();
+        Ok(())
+    });
+    assert!(search.is_err());
+    assert_eq!(query_server::Stamps::of(&tmp.0).unwrap(), before);
 }

@@ -63,16 +63,6 @@ pub const DATASET_FILES: [&str; 20] = [
     "poi_imp.bin",
 ];
 
-/// The membership inputs used by the chain-sorted core.
-const CHAIN_INPUTS: [&str; 6] = [
-    "admin_cells.bin",
-    "admin_entries.bin",
-    "search_chains.bin",
-    "place_chains.bin",
-    "admin_chains.bin",
-    "poi_chains.bin",
-];
-
 /// The stat of each dataset file present, by name. A file's hash is reused while it keeps its
 /// stamp: a patched file is always hashed again.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -81,9 +71,7 @@ pub struct Stamps(pub BTreeMap<String, FileStamp>);
 impl Stamps {
     /// The stamps of the dataset files in `dir`.
     pub fn of(dir: &Path) -> std::io::Result<Stamps> {
-        let mut files = stamps_of(dir, &DATASET_FILES)?;
-        files.extend(stamps_of(dir, &CHAIN_INPUTS)?);
-        Ok(Stamps(files))
+        stamps_of(dir, &DATASET_FILES).map(Stamps)
     }
 }
 

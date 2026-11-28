@@ -403,6 +403,7 @@ pub const CHAIN_CACHE_CELLS: usize = 64;
 pub const PHOTON_MAX_EDITS: u8 = 2;
 pub const CORE_CHAIN_FILES: [&str; 3] = ["place_chains.bin", "admin_chains.bin", "poi_chains.bin"];
 pub const CHAIN_DICTIONARY: &str = "search_chains.bin";
+pub const CHAIN_INPUTS: [&str; 6] = ["admin_cells.bin", "admin_entries.bin", CHAIN_DICTIONARY, CORE_CHAIN_FILES[0], CORE_CHAIN_FILES[1], CORE_CHAIN_FILES[2]];
 pub const CORE_RECOVERY_DIR: &str = ".core-rebuild";
 pub const WORD_BEFORE: u8 = 1;
 pub const WORD_SAME: u8 = 2;

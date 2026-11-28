@@ -25,6 +25,12 @@ use std::sync::Arc;
 
 pub use query_server::{Stamps, DATASET_FILES};
 
+pub(crate) fn core_stamps(dir: &Path) -> std::io::Result<Stamps> {
+    let mut stamps = Stamps::of(dir)?;
+    stamps.0.extend(stamps_of(dir, &CHAIN_INPUTS)?);
+    Ok(stamps)
+}
+
 /// Search-only files. Opening reverse data never reads a bundle or importance column.
 #[derive(Default)]
 pub struct SearchFiles {
@@ -109,7 +115,7 @@ pub fn load<T>(dir: &Path, load: impl FnOnce() -> Result<T, String>) -> Result<(
     } else {
         query_server::continents().iter().map(|c| dir.join(c.name)).filter(|d| d.is_dir()).collect()
     };
-    let of = |d: &Path| Ok::<_, std::io::Error>((Stamps::of(d)?, stamps_of(&d.join(WATER_DIR), &WATER_FILES)?));
+    let of = |d: &Path| Ok::<_, std::io::Error>((core_stamps(d)?, stamps_of(&d.join(WATER_DIR), &WATER_FILES)?));
     let stamps = || {
         let own = of(dir).map_err(|e| e.to_string())?;
         Ok::<_, String>((own, continents.iter().map(|d| of(d).ok()).collect::<Vec<_>>()))
@@ -194,18 +200,20 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// hashes `hashes` holds reused: refused when they no longer have those stamps, before the
 /// hashing or after it, as the files hashed would not be the ones loaded.
 fn fingerprint_loaded(dir: &Path, loaded: &Stamps, hashes: &mut HashCache) -> Result<Fingerprint, String> {
-    checked_fingerprint(dir, loaded, || hashes.fingerprint(dir, loaded))
+    let mut base = loaded.clone();
+    base.0.retain(|name, _| DATASET_FILES.contains(&name.as_str()));
+    checked_fingerprint(dir, &base, Stamps::of, || hashes.fingerprint_inputs(dir, &base))
 }
 
 pub(crate) fn core_fingerprint(dir: &Path, loaded: &Stamps, hashes: &mut HashCache) -> Result<Fingerprint, String> {
-    checked_fingerprint(dir, loaded, || hashes.fingerprint_inputs(dir, loaded))
+    checked_fingerprint(dir, loaded, core_stamps, || hashes.fingerprint_inputs(dir, loaded))
 }
 
 fn checked_fingerprint(
-    dir: &Path, loaded: &Stamps, fingerprint: impl FnOnce() -> std::io::Result<Fingerprint>,
+    dir: &Path, loaded: &Stamps, stamps: fn(&Path) -> std::io::Result<Stamps>, fingerprint: impl FnOnce() -> std::io::Result<Fingerprint>,
 ) -> Result<Fingerprint, String> {
     let io = |e: std::io::Error| format!("{}: {e}", dir.display());
-    let unchanged = || match Stamps::of(dir).map_err(|e| e.to_string())? {
+    let unchanged = || match stamps(dir).map_err(|e| e.to_string())? {
         now if now == *loaded => Ok(()),
         _ => Err(format!("The dataset in {} changed since it was loaded: load it again", dir.display())),
     };
@@ -347,7 +355,7 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
 /// and dataset whose entity ids the postings address.
 pub fn read_core(dir: &Path, index: &Path, profile: Profile) -> Result<crate::index::CoreIndex, String> {
     let held = HeldIndexDir::take(index, Contended::Wait)?;
-    let loaded = Stamps::of(dir).map_err(|e| e.to_string())?;
+    let loaded = core_stamps(dir).map_err(|e| e.to_string())?;
     let cache = index.join(HASH_CACHE_FILE);
     let mut hashes = HashCache::load(&cache);
     let have = core_fingerprint(dir, &loaded, &mut hashes)?;
@@ -1090,7 +1098,7 @@ mod tests {
         for (what, got) in [("replaced", replaced), ("added", added), ("removed", removed)] {
             assert!(got.unwrap_err().contains("changed while it was loading"), "{what}");
         }
-        assert_eq!(kept.unwrap().1, Stamps::of(&ds.0).unwrap());
+        assert_eq!(kept.unwrap().1, core_stamps(&ds.0).unwrap());
     }
 
     // A dir of continent dirs (no admin_cells.bin of its own) loads each continent's dataset
