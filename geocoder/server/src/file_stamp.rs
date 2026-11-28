@@ -2,6 +2,10 @@
 //! (a patch or a download renames a new file over the old one, which gives it a new inode), so
 //! whatever was computed from a file is reused while the file keeps its stamp.
 
+use std::collections::BTreeMap;
+use std::io::ErrorKind;
+use std::path::Path;
+
 use serde_json::{json, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +34,54 @@ impl FileStamp {
     pub fn from_json(v: &Value) -> Option<FileStamp> {
         Some(FileStamp { size: v["size"].as_u64()?, mtime_ns: v["mtime_ns"].as_str()?.parse().ok()?, ino: v["ino"].as_u64()? })
     }
+}
+
+/// The geocoder files an index is derived from: the records its postings point at, the string
+/// tiers of their names (the polygons' own names beside them among them) and the boundary
+/// geometry its label points come from, the boundary tier's own arcs among it (the records and
+/// rings are the same in every tier).
+pub const DATASET_FILES: [&str; 12] = [
+    "admin_own_names.bin",
+    "admin_polygons.bin",
+    "admin_rings.bin",
+    "arc_index.bin",
+    "arc_vertices.bin",
+    "place_cells.bin",
+    "place_hidden.bin",
+    "place_nodes.bin",
+    "poi_records.bin",
+    "strings_core.bin",
+    "strings_layout.json",
+    "strings_poi.bin",
+];
+
+/// The stat of each dataset file present, by name. A file's hash is reused while it keeps its
+/// stamp: a patched file is always hashed again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stamps(pub BTreeMap<String, FileStamp>);
+
+impl Stamps {
+    /// The stamps of the dataset files in `dir`.
+    pub fn of(dir: &Path) -> std::io::Result<Stamps> {
+        stamps_of(dir, &DATASET_FILES).map(Stamps)
+    }
+}
+
+/// The stat of each of the files `names` present in `dir`, by name; an error names the file it
+/// is of.
+pub fn stamps_of(dir: &Path, names: &[&str]) -> std::io::Result<BTreeMap<String, FileStamp>> {
+    let mut out = BTreeMap::new();
+    for name in names {
+        let path = dir.join(name);
+        match std::fs::metadata(&path) {
+            Ok(m) => {
+                out.insert(name.to_string(), FileStamp::of(&m));
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

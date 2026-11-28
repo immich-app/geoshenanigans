@@ -13,7 +13,7 @@ use crate::constants::*;
 use crate::profile::{MatchMode, Profile, RequestError, SearchRequest};
 use crate::query::{Found, QueryStats, Searcher};
 use crate::reader::SearchIndex;
-use query_server::{lower_hex, FileStamp, Index, WATER_DIR, WATER_FILES};
+use query_server::{lower_hex, stamps_of, FileStamp, Index, WATER_DIR, WATER_FILES};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -22,56 +22,10 @@ use std::io::{ErrorKind, Read};
 use std::path::Path;
 use std::sync::Arc;
 
-/// The geocoder files an index is derived from: the records its postings point at, the string
-/// tiers of their names (the polygons' own names beside them among them) and the boundary
-/// geometry its label points come from, the boundary tier's own arcs among it (the records and
-/// rings are the same in every tier).
-pub const DATASET_FILES: [&str; 12] = [
-    "admin_own_names.bin",
-    "admin_polygons.bin",
-    "admin_rings.bin",
-    "arc_index.bin",
-    "arc_vertices.bin",
-    "place_cells.bin",
-    "place_hidden.bin",
-    "place_nodes.bin",
-    "poi_records.bin",
-    "strings_core.bin",
-    "strings_layout.json",
-    "strings_poi.bin",
-];
+pub use query_server::{Stamps, DATASET_FILES};
 
 /// The sha256 (hex) of each dataset file present, by name.
 pub type Fingerprint = BTreeMap<String, String>;
-
-/// The stat of each dataset file present, by name. A file's hash is reused while it keeps its
-/// stamp: a patched file is always hashed again.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Stamps(BTreeMap<String, FileStamp>);
-
-impl Stamps {
-    /// The stamps of the dataset files in `dir`.
-    pub fn of(dir: &Path) -> std::io::Result<Stamps> {
-        stamps_of(dir, &DATASET_FILES).map(Stamps)
-    }
-}
-
-/// The stat of each of the files `names` present in `dir`, by name; an error names the file it
-/// is of.
-fn stamps_of(dir: &Path, names: &[&str]) -> std::io::Result<BTreeMap<String, FileStamp>> {
-    let mut out = BTreeMap::new();
-    for name in names {
-        let path = dir.join(name);
-        match std::fs::metadata(&path) {
-            Ok(m) => {
-                out.insert(name.to_string(), FileStamp::of(&m));
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
-        }
-    }
-    Ok(out)
-}
 
 /// Runs `load` (which loads the geocoder index of the dataset in `dir`) and returns what it
 /// loaded with the stamps of the dataset files it read: those and the files of the dataset's
@@ -333,11 +287,16 @@ impl PlaceSearch {
         req.require_limit()?;
         Ok(self.searcher.search(&req.q, req.limit))
     }
+
+    pub(crate) fn candidates(&self, req: &SearchRequest) -> (Vec<Found<'_>>, QueryStats) {
+        self.searcher.candidates(&req.q, req.limit)
+    }
+
 }
 
 /// Fails for a request this index can't honour: it answers the immich profile in photon mode,
 /// deduplicated, from the query and the limit alone.
-fn require_supported(req: &SearchRequest) -> Result<(), RequestError> {
+pub(crate) fn require_supported(req: &SearchRequest) -> Result<(), RequestError> {
     if req.profile != Profile::Immich {
         return Err(RequestError::ProfileNotBuilt(req.profile));
     }

@@ -23,7 +23,7 @@ pub use geo_index::{GeoIndex, GeoLists};
 mod exact_pip;
 pub use exact_pip::{edge_crosses, on_edge, to_e7, PointE7};
 mod file_stamp;
-pub use file_stamp::FileStamp;
+pub use file_stamp::{stamps_of, FileStamp, Stamps, DATASET_FILES};
 mod hex;
 pub use hex::lower_hex;
 pub mod place_files;
@@ -1248,6 +1248,10 @@ impl Continent {
         Continent { name, vertices, min_lat, max_lat, min_lng, max_lng }
     }
 
+    pub fn bounds(&self) -> ((f64, f64), (f64, f64)) {
+        ((self.min_lat, self.min_lng), (self.max_lat, self.max_lng))
+    }
+
     pub fn contains(&self, lat: f64, lng: f64) -> bool {
         if lat < self.min_lat || lat > self.max_lat || lng < self.min_lng || lng > self.max_lng {
             return false;
@@ -1421,6 +1425,9 @@ pub struct Index {
     /// The credit of the data in the dir as it loaded (dir_credits): a download may replace the
     /// dir's files later, while this index answers from those it mapped.
     pub credits: Vec<serde_json::Value>,
+    /// The files that search postings refer to, stamped with this mapping. A conflicting
+    /// stamp makes search unavailable while reverse still follows the download checks.
+    pub search_stamps: Result<Stamps, String>,
 }
 
 /// Normalised street-name token overlap, mirroring the builder's
@@ -1678,6 +1685,8 @@ impl Index {
         if let Some(why) = geo_reach_refused(search_distance, street_cell_level) {
             return Err(why);
         }
+        let stamp = || Stamps::of(std::path::Path::new(dir)).map_err(|e| e.to_string());
+        let before = stamp();
         // The reach of the geo lookups and the primary-feature selection.
         // The internal distances are stored in radians² (via `to_radians()`
         // before squaring), so convert metres → radians → radians².
@@ -1760,7 +1769,7 @@ impl Index {
             return Err(format!("{dir}/{ADMIN_OWN_NAMES_FILE}: {} bytes, not records of {ADMIN_OWN_NAME_BYTES}", bytes.len()));
         }
 
-        Ok(Index {
+        let mut index = Index {
             geo_index,
             streets,
             addrs,
@@ -1791,7 +1800,15 @@ impl Index {
             linked_names: Default::default(),
             linked_centres: Default::default(),
             credits: dir_credits(dir),
-        })
+            search_stamps: before,
+        };
+        index.search_stamps = index.search_stamps.and_then(|before| {
+            if stamp()? != before {
+                return Err(format!("The dataset in {dir} changed while it was loading"));
+            }
+            Ok(before)
+        });
+        Ok(index)
     }
 
     pub fn get_string(&self, offset: u32) -> Cow<'_, str> {
@@ -5307,6 +5324,7 @@ mod query_tests {
             linked_names: Default::default(),
             linked_centres: Default::default(),
             credits: Vec::new(),
+            search_stamps: Ok(Stamps::default()),
         }
     }
 
@@ -12315,6 +12333,7 @@ mod admin_scan_tests {
             linked_names: Default::default(),
             linked_centres: Default::default(),
             credits: Vec::new(),
+            search_stamps: Ok(Stamps::default()),
         }
     }
 
