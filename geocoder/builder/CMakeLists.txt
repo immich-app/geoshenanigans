@@ -139,6 +139,11 @@ target_link_libraries(pbf-apply PRIVATE ZLIB::ZLIB libdeflate::libdeflate EXPAT:
 target_include_directories(pbf-apply PRIVATE tools src)
 target_compile_definitions(pbf-apply PRIVATE _FILE_OFFSET_BITS=64)
 
+add_executable(namecensus EXCLUDE_FROM_ALL tools/namecensus.cpp src/pbf_reader.cpp)
+target_link_libraries(namecensus PRIVATE ZLIB::ZLIB libdeflate::libdeflate Threads::Threads)
+target_include_directories(namecensus PRIVATE src)
+target_compile_definitions(namecensus PRIVATE _FILE_OFFSET_BITS=64)
+
 target_include_directories(build-index PRIVATE "${EMBEDDED_POLY_DIR}")
 
 if(GEOCODER_S2_PREFIX)
@@ -208,9 +213,9 @@ target_compile_definitions(geocoder-tests PRIVATE
     GEOCODER_TESTDATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../testdata"
     GEOCODER_DIFF_BIN="$<TARGET_FILE:geocoder-diff>"
     GEOCODER_PATCH_BIN="$<TARGET_FILE:geocoder-patch>"
+    GEOCODER_NAMECENSUS_BIN="$<TARGET_FILE:namecensus>"
     _FILE_OFFSET_BITS=64)
-# tests/test_patch_roundtrip.cpp and test_patch_lowmem.cpp run the tools.
-add_dependencies(geocoder-tests geocoder-diff geocoder-patch)
+add_dependencies(geocoder-tests geocoder-diff geocoder-patch namecensus)
 target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate EXPAT::EXPAT Threads::Threads)
 # As geocoder-patch compiles the codecs.
 set_source_files_properties(tests/test_gcs_codec.cpp tests/test_gcs_patch.cpp tests/test_gcs_poi_io.cpp tests/test_poi_replay.cpp
@@ -281,7 +286,7 @@ if(GEOCODER_SANITIZE)
     add_executable(geocoder-sanitizer-reports tests/fixtures/sanitizer_reports.cpp)
     target_compile_definitions(geocoder-tests PRIVATE GEOCODER_SANITIZER_REPORTS_BIN="$<TARGET_FILE:geocoder-sanitizer-reports>")
     add_dependencies(geocoder-tests geocoder-sanitizer-reports)
-    foreach(target geocoder-tests geocoder-diff geocoder-patch geocoder-sanitizer-reports)
+    foreach(target geocoder-tests geocoder-diff geocoder-patch geocoder-sanitizer-reports namecensus)
         target_compile_options(${target} PRIVATE ${GEOCODER_SANITIZE_FLAGS})
         target_link_options(${target} PRIVATE ${GEOCODER_SANITIZE_FLAGS})
     endforeach()
