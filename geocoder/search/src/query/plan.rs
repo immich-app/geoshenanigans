@@ -799,8 +799,10 @@ mod tests {
         let terms = crate::query::readings::reading("futo").terms();
         let plan = read(&request("FUTO 4321 absentword"), &terms, Pass::First).unwrap();
         let first: Vec<_> = plan.tokens.iter().take(3).map(|r| (r.ttype, r.lookup_word.as_str(), r.penalty)).collect();
-        assert_eq!(first, [(TokenType::Partial, "futo", 0.3), (TokenType::Partial, "4321", 10.0 + 0.39 + 0.39),
-                           (TokenType::Partial, "absentword", 10.0)]);
+        assert_eq!(
+            first,
+            [(TokenType::Partial, "futo", 0.3), (TokenType::Partial, "4321", 10.0 + 0.39 + 0.39), (TokenType::Partial, "absentword", 10.0)]
+        );
         assert!(plan.searches.is_empty());
     }
 
@@ -947,6 +949,50 @@ mod tests {
                 assert_eq!(data.lookups.iter().map(|l| l.kind).collect::<Vec<_>>(), kinds);
             }
         }
+    }
+
+    #[test]
+    fn postcodes_restrict_the_parents_combined_name_and_address() {
+        let fixture = crate::query::readings::reading("postcode-hnr");
+        let searches = read(&request(&fixture.q), &fixture.terms(), Pass::First).unwrap().searches;
+        assert!(searches.iter().any(|s| matches!(s, Search::Postcode { data, .. }
+            if matches!(data.lookups.as_slice(), [FieldLookup { field: Field::NameAndAddress, kind: LookupKind::Restrict, .. }]))));
+        let mut req = request(&fixture.q);
+        req.layers = Some([Layer::Poi].into());
+        let poi = read(&req, &fixture.terms(), Pass::First).unwrap().searches;
+        assert!(!poi.is_empty());
+        assert!(poi.iter().all(|s| !matches!(s, Search::Address { .. } | Search::Postcode { .. })));
+    }
+
+    #[test]
+    fn only_the_first_fifty_bases_are_wrapped_by_a_bracket_category() {
+        let terms = crate::query::readings::reading("futo").terms();
+        let q = vec!["FUTO"; 28].join(" ");
+        let bases = read(&request(&q), &terms, Pass::First).unwrap().searches;
+        let wrapped = read(&request(&format!("[amenity=cafe] {q}")), &terms, Pass::First).unwrap().searches;
+        assert!(bases.len() > SEARCHES_MAX);
+        assert_eq!(wrapped.len(), SEARCHES_MAX);
+        for (near, expected) in wrapped.iter().zip(&bases) {
+            assert!(matches!(near, Search::Near { base, .. } if base.as_ref() == expected));
+        }
+    }
+
+    #[test]
+    fn a_bounded_box_enables_a_category_phrase_and_checks_the_query_point() {
+        use crate::index::entities::BBox;
+        let bounds = BBox { min_lat: 30.0, max_lat: 31.0, min_lon: -98.0, max_lon: -97.0 };
+        let terms = crate::query::readings::reading("futo").terms();
+        let mut req = request("Hotel");
+        req.viewbox = Some(Viewbox::Preferred(bounds));
+        assert!(!read(&req, &terms, Pass::First).unwrap().searches.iter().any(|s| matches!(s, Search::Poi { .. })));
+        req.viewbox = Some(Viewbox::Bounded(bounds));
+        assert!(read(&req, &terms, Pass::First).unwrap().searches.iter().any(|s| matches!(s, Search::Poi { .. })));
+        req.q = "FUTO 30.0, -98.0".into();
+        assert!(read(&req, &terms, Pass::First).unwrap().searches.is_empty());
+        req.q = "FUTO 32.0, -98.0".into();
+        assert!(!read(&req, &terms, Pass::First).unwrap().searches.is_empty());
+        req.layers = Some(Default::default());
+        assert!(read(&req, &terms, Pass::First).unwrap().searches.is_empty());
     }
 
     fn place(penalty: f64) -> Search {

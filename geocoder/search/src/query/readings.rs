@@ -1,5 +1,5 @@
-//! Nominatim's own readings of a few queries (testdata/readings.txt): their word tokens, which
-//! seed an in-memory term source, the direction penalty and every search each reading built.
+//! Word tokens and directions from the oracle and saved public debug pages.
+//! The public pages also supply the search tables at planet frequencies.
 use crate::index::terms::{MemTerms, TermInfo, TermKind};
 
 const READINGS: &str = include_str!("../../testdata/readings.txt");
