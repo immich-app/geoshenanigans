@@ -2,7 +2,7 @@
   "schema_version": 1,
   "build": {
     "version": 25,
-    "patch_version": 25
+    "patch_version": 26
   },
   "attribution": [
     {
@@ -299,6 +299,11 @@
         "{region}/admin-minimal/attribution.json"
       ],
       "optional_files": [
+        "{region}/admin-minimal/strings_tags_core.bin",
+        "{region}/admin-minimal/place_tags.bin",
+        "{region}/admin-minimal/admin_tags.bin",
+        "{region}/admin-minimal/place_imp.bin",
+        "{region}/admin-minimal/admin_imp.bin",
         "{region}/admin-minimal/postcode_grid.bin",
         "{region}/admin-minimal/postal_cities.bin"
       ],
@@ -328,6 +333,11 @@
         "{region}/admin-minimal-poi/attribution.json"
       ],
       "optional_files": [
+        "{region}/admin-minimal-poi/strings_tags_core.bin",
+        "{region}/admin-minimal-poi/place_tags.bin",
+        "{region}/admin-minimal-poi/admin_tags.bin",
+        "{region}/admin-minimal-poi/place_imp.bin",
+        "{region}/admin-minimal-poi/admin_imp.bin",
         "{region}/admin-minimal-poi/postcode_grid.bin",
         "{region}/admin-minimal-poi/postal_cities.bin"
       ],
@@ -352,6 +362,11 @@
         "{region}/admin/attribution.json"
       ],
       "optional_files": [
+        "{region}/admin/strings_tags_core.bin",
+        "{region}/admin/place_tags.bin",
+        "{region}/admin/admin_tags.bin",
+        "{region}/admin/place_imp.bin",
+        "{region}/admin/admin_imp.bin",
         "{region}/admin/postcode_centroids.bin",
         "{region}/admin/postcode_centroid_cells.bin",
         "{region}/admin/postcode_grid.bin",
@@ -379,6 +394,11 @@
         "{region}/no-addresses/attribution.json"
       ],
       "optional_files": [
+        "{region}/no-addresses/strings_tags_core.bin",
+        "{region}/no-addresses/place_tags.bin",
+        "{region}/no-addresses/admin_tags.bin",
+        "{region}/no-addresses/place_imp.bin",
+        "{region}/no-addresses/admin_imp.bin",
         "{region}/no-addresses/postcode_centroids.bin",
         "{region}/no-addresses/postcode_centroid_cells.bin",
         "{region}/no-addresses/postcode_grid.bin",
@@ -413,6 +433,11 @@
         "{region}/full/attribution.json"
       ],
       "optional_files": [
+        "{region}/full/strings_tags_core.bin",
+        "{region}/full/place_tags.bin",
+        "{region}/full/admin_tags.bin",
+        "{region}/full/place_imp.bin",
+        "{region}/full/admin_imp.bin",
         "{region}/full/addr_cities.bin",
         "{region}/full/interp_postcodes.bin",
         "{region}/full/postcode_centroids.bin",
@@ -449,10 +474,12 @@
         "{region}/poi/major/poi_cells.bin",
         "{region}/poi/major/poi_entries.bin",
         "{region}/poi/major/strings_poi.bin",
-        "{region}/poi/major/strings_layout.json",
         "{region}/poi/major/poi_meta.json"
       ],
       "optional_files": [
+        "{region}/poi/major/strings_tags_poi.bin",
+        "{region}/poi/major/poi_tags.bin",
+        "{region}/poi/major/poi_imp.bin",
         "{region}/poi/major/poi_attribution.json"
       ]
     },
@@ -463,10 +490,12 @@
         "{region}/poi/notable/poi_cells.bin",
         "{region}/poi/notable/poi_entries.bin",
         "{region}/poi/notable/strings_poi.bin",
-        "{region}/poi/notable/strings_layout.json",
         "{region}/poi/notable/poi_meta.json"
       ],
       "optional_files": [
+        "{region}/poi/notable/strings_tags_poi.bin",
+        "{region}/poi/notable/poi_tags.bin",
+        "{region}/poi/notable/poi_imp.bin",
         "{region}/poi/notable/poi_attribution.json"
       ]
     },
@@ -477,10 +506,12 @@
         "{region}/poi/all/poi_cells.bin",
         "{region}/poi/all/poi_entries.bin",
         "{region}/poi/all/strings_poi.bin",
-        "{region}/poi/all/strings_layout.json",
         "{region}/poi/all/poi_meta.json"
       ],
       "optional_files": [
+        "{region}/poi/all/strings_tags_poi.bin",
+        "{region}/poi/all/poi_tags.bin",
+        "{region}/poi/all/poi_imp.bin",
         "{region}/poi/all/poi_attribution.json"
       ]
     },

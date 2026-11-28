@@ -1748,9 +1748,10 @@ mod tests {
     #[test]
     fn template_admin_minimal_takes_its_poi_dir_beside_a_poi_tier() {
         let (v, c) = template();
-        let files = ["admin_cells.bin", "admin_entries.bin", "admin_own_names.bin", "admin_polygons.bin", "admin_rings.bin",
-                     "arc_index.bin", "arc_vertices.bin", "attribution.json", "place_cells.bin", "place_hidden.bin", "place_nodes.bin",
-                     "postal_cities.bin", "postcode_grid.bin", "strings_core.bin", "strings_layout.json"];
+        let files = ["admin_cells.bin", "admin_entries.bin", "admin_imp.bin", "admin_own_names.bin", "admin_polygons.bin",
+                     "admin_rings.bin", "admin_tags.bin", "arc_index.bin", "arc_vertices.bin", "attribution.json",
+                     "place_cells.bin", "place_hidden.bin", "place_imp.bin", "place_nodes.bin", "place_tags.bin",
+                     "postal_cities.bin", "postcode_grid.bin", "strings_core.bin", "strings_layout.json", "strings_tags_core.bin"];
         let minimal: Vec<RegionSelection> = template_selections(&v).into_iter()
             .filter(|s| s.mode == "admin-minimal" && s.region == "europe")
             .collect();
@@ -1930,7 +1931,7 @@ mod tests {
                 assert!(got.contains_key(name), "{s:?} {name}");
             }
             assert!(got == files_of(&bucket, &s), "{s:?}: {:?}", got.keys().collect::<Vec<_>>());
-            units += resolve_files(&bucket.manifest, &s).unwrap().paths.iter().filter(|p| bucket.manifest.files[*p].unit.is_some()).count();
+            units += resolve_files(&bucket.manifest, &s).unwrap().paths.iter().filter(|p| bucket.manifest.files.get(*p).is_some_and(|f| f.unit.is_some())).count();
         }
         assert!(units > 0);
     }
@@ -1946,7 +1947,8 @@ mod tests {
 
         download_region(&reqwest::Client::new(), &bucket.url, &bucket.manifest, &s, root.path(), |p| seen.lock().unwrap().push(p)).await.unwrap();
 
-        let paths = resolve_files(&bucket.manifest, &s).unwrap().paths;
+        let paths: Vec<_> = resolve_files(&bucket.manifest, &s).unwrap().paths.into_iter()
+            .filter(|p| bucket.manifest.files.contains_key(p)).collect();
         let units: BTreeSet<&str> = paths.iter().filter_map(|p| bucket.manifest.files[p].unit.as_deref()).collect();
         assert_eq!(units, BTreeSet::from(["europe/admin/places.tt.zst", "europe/poi/major/pois.tt.zst",
                                           "europe/quality/simplified/admin_polygons.tt.zst", "europe/quality/simplified/arcs.tt.zst"]));
@@ -2902,7 +2904,7 @@ mod tests {
             let kept = std::fs::read_to_string(dir.join(FILE_LEDGER)).unwrap() == ledger;
             download(&bucket, &after, root.path()).await.unwrap();
 
-            assert!(theirs.len() > 1 && theirs.iter().all(|n| n.starts_with("poi_") || n.starts_with("strings_poi")), "{mode}: {theirs:?}");
+            assert!(theirs.len() > 1 && theirs.iter().all(|n| n.starts_with("poi_") || matches!(n.as_str(), "strings_poi.bin" | "strings_tags_poi.bin")), "{mode}: {theirs:?}");
             assert_eq!(stopped, Err("I/O error: stopped once the files the selection doesn't take were removed".to_string()), "{mode}");
             assert_eq!((left, stamped, fetched, kept), (Vec::<&String>::new(), false, 0, true), "{mode}");
             assert_eq!(differing(&held(&dir), &files_of(&bucket, &after)), Vec::<String>::new(), "{mode}");
@@ -2913,7 +2915,7 @@ mod tests {
     /// files of names no file of the build has, hidden or not.
     fn not_taken(bucket: &TestBucket, before: &RegionSelection, after: &RegionSelection) -> (Vec<String>, BTreeMap<String, Vec<u8>>) {
         let theirs: Vec<String> = files_of(bucket, before).into_keys().filter(|n| !files_of(bucket, after).contains_key(n)).collect();
-        assert!(theirs.len() > 1 && theirs.iter().all(|n| n.starts_with("poi_") || n.starts_with("strings_poi")), "{theirs:?}");
+        assert!(theirs.len() > 1 && theirs.iter().all(|n| n.starts_with("poi_") || matches!(n.as_str(), "strings_poi.bin" | "strings_tags_poi.bin")), "{theirs:?}");
         let unknown = [("notes.txt", "not the build's"), (".notes", "nor the build's")];
         (theirs, unknown.into_iter().map(|(n, b)| (n.to_string(), b.as_bytes().to_vec())).collect())
     }

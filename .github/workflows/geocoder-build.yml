@@ -1283,7 +1283,7 @@ jobs:
           # index files or Finalize to end should it outlast their wait for it.
           # Then compression's uploads go, held back until now.
           $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
-          find "$WORKDIR/output" -name '*.osm_ids' -printf "cp %p s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/%P\n" > "$WORKDIR/sidecars.run"
+          find "$WORKDIR/output" -name '*.osm_ids' ! -name place_nodes.osm_ids ! -name poi_rows.osm_ids ! -path '*/quality/simplified/admin_polygons.osm_ids' -printf "cp %p s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/%P\n" > "$WORKDIR/sidecars.run"
           # The inner script expands its own arguments ($0 is the status file).
           # shellcheck disable=SC2016
           setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/sidecars.status" \
@@ -1451,7 +1451,7 @@ jobs:
             s5cmd --endpoint-url "$S3_ENDPOINT" --numworkers 32 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
             # The strategy-2 sidecars, as the patch step uploads them.
             rm -f "$WORKDIR/sidecars.status"
-            find "$WORKDIR/output" -name '*.osm_ids' -printf "cp %p s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/%P\n" > "$WORKDIR/sidecars.run"
+            find "$WORKDIR/output" -name '*.osm_ids' ! -name place_nodes.osm_ids ! -name poi_rows.osm_ids ! -path '*/quality/simplified/admin_polygons.osm_ids' -printf "cp %p s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/%P\n" > "$WORKDIR/sidecars.run"
             # The inner script expands its own arguments ($0 is the status file).
             # shellcheck disable=SC2016
             setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/sidecars.status" \
@@ -1559,7 +1559,7 @@ jobs:
           # The .zst files streamed up during compression (the prefix was
           # cleared then): only what is missing or differs in size goes now.
           # The runner's ~1 Gbit/s link caps the rate; 16 workers reach it.
-          s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 cp --if-size-differ --concurrency 8 \
+          s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 cp --if-size-differ --exclude '*.host' --exclude '*/place_nodes.osm_ids' --exclude '*/poi_rows.osm_ids' --exclude '*/quality/simplified/admin_polygons.osm_ids' --concurrency 8 \
             "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" || \
             echo "::warning::Some files failed on first pass — verify loop will retry"
           echo "Tigris upload first pass complete in $(($(date +%s) - UPLOAD_START))s"
@@ -1625,7 +1625,7 @@ jobs:
 
           # List local files, strip the workdir prefix. Includes the
           # osm_ids sidecars, which upload to Tigris too.
-          (cd "$WORKDIR/output" && find . -type f \( -name "*.zst" -o -name "*.gcpatch" -o -name "*.json" -o -name "*.sha256" -o -name "*.osm_ids" \)) \
+          (cd "$WORKDIR/output" && find . -type f \( -name "*.zst" -o -name "*.gcpatch" -o -name "*.json" -o -name "*.sha256" -o -name "*.osm_ids" \) ! -name place_nodes.osm_ids ! -name poi_rows.osm_ids ! -path '*/quality/simplified/admin_polygons.osm_ids') \
             | sed 's|^\./||' | sort > /tmp/local.txt
 
           missing=$(comm -23 /tmp/local.txt /tmp/remote.txt)

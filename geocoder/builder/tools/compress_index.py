@@ -149,6 +149,8 @@ def index_files(out, search=None):
         for name in names:
             # Strategy-2 sidecars (*.osm_ids) stay uncompressed: they're cached
             # only and the next build's IdAllocator reads them directly.
+            if name.endswith((".host", ".osm_ids")):
+                continue
             if name.endswith(".bin") or name in JSON_FILES or (in_search and not name.endswith(".zst")):
                 found.append(os.path.join(root, name))
     return sorted(found, key=lambda p: (-os.path.getsize(p), p))

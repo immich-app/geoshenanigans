@@ -72,6 +72,22 @@ class BuildSearchIndexesTest(unittest.TestCase):
             f.write(FAKE.format(python=sys.executable, files=self.cfg["search_index"]["files"]))
         os.chmod(self.binary, 0o755)
 
+    def test_each_search_file_has_one_destination_in_every_selection(self):
+        axes = [self.cfg["axes"][a]["values"] for a in sut.AXES]
+        for values in itertools.product(*axes):
+            sel = dict(zip(sut.AXES, values), region="planet")
+            if sel["mode"] == "admin-minimal" and sel["quality"] != "simplified":
+                continue
+            paths, _ = sut.resolve(self.cfg, sel)
+            names = [os.path.basename(path) for path in paths]
+            self.assertEqual(len(names), len(set(names)), sel)
+            for kind in ("place", "admin", "poi"):
+                included = kind != "poi" or sel["poi_tier"] != "none"
+                for suffix in ("tags", "imp"):
+                    self.assertEqual(f"{kind}_{suffix}.bin" in names, included, sel)
+            self.assertIn("strings_tags_core.bin", names)
+            self.assertEqual("strings_tags_poi.bin" in names, sel["poi_tier"] != "none", sel)
+
     def write_output(self, regions):
         """Every file of every component in `regions`, as the builder writes them."""
         os.makedirs(self.out)
@@ -310,9 +326,10 @@ def flat(paths):
 
 
 class TemplateTest(unittest.TestCase):
-    MINIMAL_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_own_names.bin", "admin_polygons.bin", "admin_rings.bin",
-                     "arc_index.bin", "arc_vertices.bin", "attribution.json", "place_cells.bin", "place_hidden.bin",
-                     "place_nodes.bin", "postal_cities.bin", "postcode_grid.bin", "strings_core.bin", "strings_layout.json"]
+    MINIMAL_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_imp.bin", "admin_own_names.bin", "admin_polygons.bin",
+                     "admin_rings.bin", "admin_tags.bin", "arc_index.bin", "arc_vertices.bin", "attribution.json",
+                     "place_cells.bin", "place_hidden.bin", "place_imp.bin", "place_nodes.bin", "place_tags.bin",
+                     "postal_cities.bin", "postcode_grid.bin", "strings_core.bin", "strings_layout.json", "strings_tags_core.bin"]
 
     def test_admin_minimal_takes_its_poi_dir_beside_a_poi_tier(self):
         # admin-minimal/ holds strings of its own, which a POI tier's names and parent polygons don't
