@@ -1,0 +1,40 @@
+special_phrases.tsv
+===================
+
+Source: the OpenStreetMap wiki pages Nominatim/Special_Phrases/EN, /DE, /NL and
+/CS (https://wiki.openstreetmap.org/wiki/Nominatim/Special_Phrases), read
+through Special:Export on 2026-11-27 at these revisions:
+
+  EN  2861977  2025-06-02T14:00:52Z
+  DE  2916988  2025-11-09T11:40:16Z
+  NL  2611290  2023-11-03T08:58:05Z
+  CS  2052471  2020-10-22T08:16:23Z
+
+Licence: OpenStreetMap wiki content is available under the Creative Commons
+Attribution-ShareAlike 2.0 licence (CC BY-SA 2.0,
+https://creativecommons.org/licenses/by-sa/2.0/). The phrases are the work of
+the wiki's contributors; see each page's history for the authors.
+
+The file holds the phrases Nominatim imports from those pages with
+`nominatim special-phrases --import-from-wiki` and its default settings:
+
+- Every table row with at least five data cells gives (phrase, class, type,
+  operator) from its first four. A cell with one single `|` holds attributes
+  before it and its content after it, so a row written `| - |Y` has one cell
+  fewer and is skipped, as Nominatim's wiki reader skips it.
+- Double quotes are removed from the type. An operator other than `in` or
+  `near` is `-`.
+- Nominatim's default phrase settings drop boundary=administrative and
+  place=house/houses, keep only bus_stop, rest_area and raceway' of highway,
+  and drop every building phrase. Class and type must each be a single word
+  (\w+).
+- A repeated (phrase, class, type, operator) is kept once, at its first place.
+  The pages are read in the order EN, DE, NL, CS.
+
+12,188 rows read, 9,559 kept. Phrases are not normalised here: the search
+normalises them as it does names. Nominatim matches a phrase whatever the
+language of the page it came from.
+
+The same rows feed the local Nominatim the search is compared with: written as
+CSV (header phrase,class,type,operator), they are what
+`nominatim special-phrases --import-from-csv` imports.

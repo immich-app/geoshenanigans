@@ -23,6 +23,18 @@ const GRID: u32 = 32;
 /// The step in degrees between the points along a way's edge whose street cells list the way.
 const EDGE_STEP_DEG: f32 = 1e-4;
 
+/// xorshift: deterministic test values without a dependency.
+pub struct Rng(pub u64);
+
+impl Rng {
+    pub fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
 /// A fresh directory under the temp dir, removed on drop.
 pub struct TempDir(pub PathBuf);
 
@@ -191,6 +203,11 @@ impl Geo {
         self.side(Side::WayParents, way, poly);
     }
 
+    /// Boundary `poly` as the country `code` (ISO 3166-1 alpha-2, either case).
+    pub fn country(&mut self, poly: u32, code: [u8; 2]) {
+        self.polygons[poly as usize].0.country_code = packed_country(code);
+    }
+
     /// The postcode of street `way`.
     pub fn way_postcode(&mut self, way: u32, postcode: &str) {
         let postcode_id = self.string(postcode);
@@ -233,10 +250,10 @@ impl Geo {
         self.side(Side::InterpPostcodes, interp, postcode_id);
     }
 
-    /// A postcode centroid of `country` (ISO 3166-1 alpha-2, lower case) at (`lat`, `lng`).
+    /// A postcode centroid of `country` (ISO 3166-1 alpha-2, either case) at (`lat`, `lng`).
     pub fn postcode_centroid(&mut self, postcode: &str, country: [u8; 2], lat: f32, lng: f32) {
         let postcode_id = self.string(postcode);
-        self.centroids.push(postcode_files::Centroid { lat, lng, postcode_id, country_code: u16::from_be_bytes(country) });
+        self.centroids.push(postcode_files::Centroid { lat, lng, postcode_id, country_code: packed_country(country) });
     }
 
     /// The tags of place node `node`, as the bundle place_tags.bin points at.
@@ -296,7 +313,7 @@ impl Geo {
         admin.sort_unstable();
         admin.dedup();
         let (admin_cells, admin_entries) = cell_pairs::write_pairs(admin, cell_pairs::ADMIN);
-        let (places, _) = place_files::encode(&self.nodes, DEFAULT_ADMIN_CELL_LEVEL);
+        let (places, place_rows) = place_files::encode(&self.nodes, DEFAULT_ADMIN_CELL_LEVEL);
         let end = self.strings.len();
         let tiers: Vec<String> = (0..STR_TIER_COUNT)
             .map(|t| format!("{{\"start\": {}, \"end\": {end}}}", if t == 0 { 0 } else { end }))
@@ -347,7 +364,10 @@ impl Geo {
         for (&side, set) in &self.sides {
             let mut values = vec![NO_DATA; self.records_beside(side)];
             for &(record, value) in set {
-                values[record as usize] = value;
+                // The place files order their nodes by cell (place_files::encode); every other
+                // file keeps its records in the order they were added.
+                let row = if side == Side::PlaceTags { place_rows[record as usize] } else { record };
+                values[row as usize] = value;
             }
             files.push((side.file(), side_blocks::encode(&values)));
         }
@@ -443,6 +463,11 @@ pub fn build_search(geo: &Index, out: &Path, extras: Option<&Path>) {
     build_all(geo, &held_subs(geo, SUB_INDEXES), out, &opts, || Ok(meta)).unwrap();
 }
 
+/// A country code as the builder packs it: upper case, the first letter the high byte.
+fn packed_country(code: [u8; 2]) -> u16 {
+    u16::from_be_bytes(code.map(|b| b.to_ascii_uppercase()))
+}
+
 /// A ring of (lat, lng) degrees on the e7 grid.
 fn e7_ring(ring: &[(f32, f32)]) -> Vec<PointE7> {
     ring.iter().map(|&(lat, lng)| arc_fixture::e7(lat as f64, lng as f64)).collect()
@@ -523,7 +548,21 @@ mod tests {
         let centroids = geo.postcode_centroids.as_ref().unwrap();
         let mut rows = Vec::new();
         centroids.rows_of(0, 1, |row, c| rows.push((row, geo.get_string(c.postcode_id).into_owned(), c.country_code.to_be_bytes())));
-        assert_eq!((centroids.rows(), rows), (1, vec![(0, "78746".to_string(), *b"us")]));
+        assert_eq!((centroids.rows(), rows), (1, vec![(0, "78746".to_string(), *b"US")]));
+    }
+
+    #[test]
+    fn a_postcode_centroid_answers_a_reverse_lookup_in_its_country() {
+        let mut g = Geo::default();
+        let us = g.boundary("United States", 2, [25.0, -106.0, 36.0, -93.0]);
+        g.country(us, *b"us");
+        g.postcode_centroid("78746", *b"us", 30.3, -97.8);
+        let dir = TempDir::new("fixture-centroid-country");
+
+        let geo = g.load(&dir.0);
+
+        let answer = serde_json::to_string(&geo.query(30.3, -97.8)).unwrap();
+        assert!(answer.contains(r#""postcode":"78746""#), "{answer}");
     }
 
     #[test]
@@ -545,9 +584,34 @@ mod tests {
             let offset = side.get(record).unwrap();
             (offset != NO_DATA).then(|| TagBundle::parse(geo.get_string(offset).into_owned()).unwrap().get(key).unwrap().to_string())
         };
-        assert_eq!(tag(PLACE_TAGS_FILE, city, "name:it").as_deref(), Some("Monaco di Baviera"));
-        assert_eq!(tag(PLACE_TAGS_FILE, 1, "name"), None);
+        let place_row = |name: &str| (0..geo.place_node_count()).find(|&row| geo.get_string(geo.place_node_record(row).unwrap().name_id) == name).unwrap();
+        assert_eq!(tag(PLACE_TAGS_FILE, place_row("Munich"), "name:it").as_deref(), Some("Monaco di Baviera"));
+        assert_eq!(tag(PLACE_TAGS_FILE, place_row("Garching"), "name"), None);
         assert_eq!(tag(ADMIN_TAGS_FILE, land, "ISO3166-2").as_deref(), Some("DE-BY"));
         assert_eq!(tag(POI_TAGS_FILE, cafe, "amenity").as_deref(), Some("cafe"));
+    }
+
+    #[test]
+    fn a_place_tag_bundle_sits_beside_its_places_row() {
+        // A hidden node goes after the visible ones, so the first place added is the last row.
+        let mut g = Geo::default();
+        let land = g.boundary("Bayern", 4, [47.0, 9.0, 50.0, 14.0]);
+        let label = g.place("Bayern label", 3, 48.9, 11.4);
+        g.claim(land, label);
+        let city = g.place("Munich", 0, 48.137, 11.575);
+        g.place_tags(label, &[("name", "Bayern label")]);
+        g.place_tags(city, &[("name", "Munich")]);
+        let dir = TempDir::new("fixture-place-rows");
+
+        let geo = g.load(&dir.0);
+
+        let side = SideBlocks::open(FileBytes::Owned(std::fs::read(dir.0.join(PLACE_TAGS_FILE)).unwrap()), PLACE_TAGS_FILE).unwrap();
+        let rows: Vec<(String, String)> = (0..geo.place_node_count())
+            .map(|row| {
+                let bundle = TagBundle::parse(geo.get_string(side.get(row).unwrap()).into_owned()).unwrap();
+                (geo.get_string(geo.place_node_record(row).unwrap().name_id).into_owned(), bundle.get("name").unwrap().to_string())
+            })
+            .collect();
+        assert_eq!(rows, [("Munich".into(), "Munich".into()), ("Bayern label".into(), "Bayern label".into())]);
     }
 }

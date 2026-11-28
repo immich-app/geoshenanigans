@@ -1,10 +1,13 @@
 //! Postcodes in a query, as Nominatim's postcode parser finds them: every run of query words that
 //! starts like one of the countries' postcode patterns, with or without a country code before it,
-//! and the code each matching pattern writes for it.
+//! and the code each matching pattern writes for it. And a place's postcode as Nominatim's
+//! formatter writes it, in its country's format.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::OnceLock;
 
 use super::Break;
+use crate::constants::POSTCODE_DEFAULT_PATTERN;
 
 /// The postcode formats of the countries, in country order: country, pattern (`d` a digit, `l` a
 /// capital letter, otherwise a regular expression) and the output, a template of the pattern's
@@ -175,6 +178,95 @@ pub const POSTCODE_FORMATS: &[(&str, &str, Option<&str>)] = &[
     ("zm", r"dddd", None),
 ];
 
+/// The countries Nominatim takes no postcode in (`postcode: no` in its country settings). The
+/// builder lists the same (`country_without_postcodes`); a test keeps them equal.
+pub const COUNTRIES_WITHOUT_POSTCODES: [&str; 54] = [
+    "ae", "ag", "ao", "bf", "bi", "bj", "bo", "bs", "bw", "bz", "cd", "cf", "cg", "ci", "ck", "cm", "dj", "dm", "er", "fj", "ga",
+    "gd", "gm", "gq", "gy", "jm", "ki", "km", "kp", "ly", "ml", "mr", "mw", "nr", "nu", "qa", "rw", "sb", "sc", "sl", "sr", "ss",
+    "st", "sy", "td", "tg", "tk", "tl", "to", "tv", "ug", "vu", "ye", "zw",
+];
+
+/// One postcode pattern of a country, as Nominatim's SimplePostcodeMatcher reads a place's
+/// postcode with it: `norm` is `(?:CC[ -]?)?(pattern)` (the white space either side of it is read
+/// apart), `pattern` the pattern alone.
+struct Format {
+    norm: Regex,
+    pattern: Regex,
+    output: Option<&'static str>,
+}
+
+impl Format {
+    fn new(country: &str, pattern: &str, output: Option<&'static str>) -> Format {
+        let pattern = pattern.replace('d', "[0-9]").replace('l', "[A-Z]");
+        let norm = format!("(?:{}[ -]?)?({pattern})", country.to_ascii_uppercase());
+        Format { norm: Regex::parse(&norm).expect("a postcode pattern"), pattern: Regex::parse(&pattern).expect("a postcode pattern"), output }
+    }
+
+    /// The postcode `upper` (upper case) reads as, as Python's `norm_pattern.fullmatch` and then
+    /// `pattern.fullmatch` of its group read it: white space first, as much as Python's greedy
+    /// `\s*` takes; None when it does not read, or reads as nothing but zeros, '-' and ' '.
+    fn read(&self, upper: &[char]) -> Option<String> {
+        let lead = upper.iter().take_while(|&&c| is_python_space(c)).count();
+        for start in (0..=lead).rev() {
+            let text = &upper[start..];
+            let Some(norm) = self.norm.first_match(text, |end| text[end..].iter().all(|&c| is_python_space(c))) else { continue };
+            let (from, to) = norm.groups[1]?;
+            let code = &text[from..to];
+            let m = self.pattern.first_match(code, |end| end == code.len())?;
+            if code.iter().all(|c| matches!(c, '0' | '-' | ' ')) {
+                return None;
+            }
+            return Some(match self.output {
+                Some(template) => m.expand(template, code),
+                None => String::from_iter(code),
+            });
+        }
+        None
+    }
+}
+
+/// White space as Python's `\s` reads it in a str: Unicode's, and the separators U+001C-U+001F.
+fn is_python_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1C}'..='\u{1F}').contains(&c)
+}
+
+/// The countries' postcode formats, as Nominatim's PostcodeFormatter holds them for its
+/// clean-postcodes sanitizer: each country's patterns in order, and the default for a country of
+/// postcodes and no pattern of its own.
+pub struct PostcodeFormats {
+    countries: HashMap<&'static str, Vec<Format>>,
+    default: Format,
+}
+
+impl PostcodeFormats {
+    /// The formats, read once.
+    pub fn get() -> &'static PostcodeFormats {
+        static FORMATS: OnceLock<PostcodeFormats> = OnceLock::new();
+        FORMATS.get_or_init(|| {
+            let mut countries: HashMap<&'static str, Vec<Format>> = HashMap::new();
+            for &(cc, pattern, output) in POSTCODE_FORMATS {
+                countries.entry(cc).or_default().push(Format::new(cc, pattern, output));
+            }
+            PostcodeFormats { countries, default: Format::new("", POSTCODE_DEFAULT_PATTERN, None) }
+        })
+    }
+
+    /// A place's postcode `value` in its country's format, for a place in `country` (a lower-case
+    /// code, "" for none): the output of the first of the country's patterns that reads it, upper
+    /// case, with or without the country's code before it. None for a place of no country or of
+    /// one without postcodes, and for a value no pattern reads.
+    pub fn formatted(&self, country: &str, value: &str) -> Option<String> {
+        if country.is_empty() || COUNTRIES_WITHOUT_POSTCODES.contains(&country) {
+            return None;
+        }
+        let upper: Vec<char> = value.to_uppercase().chars().collect();
+        match self.countries.get(country) {
+            Some(formats) => formats.iter().find_map(|f| f.read(&upper)),
+            None => self.default.read(&upper),
+        }
+    }
+}
+
 /// The characters a postcode may be followed by in the word the parser matches: a phrase break,
 /// a word break, a colon or the end of the query.
 const POSTCODE_END: [char; 4] = [':', ',', ' ', '>'];
@@ -302,8 +394,8 @@ impl PostcodeParser {
 }
 
 /// The few regular expressions the postcode patterns are written in: characters, classes of
-/// characters and ranges, groups (capturing or `(?:`), alternatives, and `?` or `{n}` after an
-/// item. Matched as Python's re matches: greedy, alternatives in order, first match wins.
+/// characters and ranges, groups (capturing or `(?:`), alternatives, and `?`, `{n}` or `{m,n}`
+/// after an item. Matched as Python's re matches: greedy, alternatives in order, first match wins.
 struct Regex {
     alternatives: Vec<Vec<Item>>,
     groups: usize,
@@ -422,9 +514,13 @@ impl Regex {
                 }
                 Some('{') => {
                     let close = p[*at..].iter().position(|&c| c == '}').ok_or("an unclosed count")? + *at;
-                    let n: usize = String::from_iter(&p[*at + 1..close]).parse().map_err(|_| "a count that is no number")?;
+                    let counts = String::from_iter(&p[*at + 1..close]);
+                    let count = |n: &str| n.parse::<usize>().map_err(|_| "a count that is no number");
                     *at = close + 1;
-                    (n, n)
+                    match counts.split_once(',') {
+                        Some((min, max)) => (count(min)?, count(max)?),
+                        None => (count(&counts)?, count(&counts)?),
+                    }
                 }
                 _ => (1, 1),
             };
@@ -435,11 +531,20 @@ impl Regex {
 
     /// The first match from the start of `text`, in the order Python's re tries them.
     fn match_prefix(&self, text: &[char]) -> Option<Match> {
+        self.first_match(text, |_| true)
+    }
+
+    /// The first match from the start of `text` whose end `fits`, in the order Python's re tries
+    /// them (`end == text.len()` for a whole match).
+    fn first_match(&self, text: &[char], fits: impl Fn(usize) -> bool) -> Option<Match> {
         let mut found = None;
         let mut caps: Captures = vec![None; self.groups + 1];
         let matcher = Matcher { text };
         for alternative in &self.alternatives {
             if matcher.sequence(alternative, 0, &mut caps, &mut |end, caps| {
+                if !fits(end) {
+                    return false;
+                }
                 found = Some(Match { end, groups: caps.clone() });
                 true
             }) {
@@ -560,6 +665,58 @@ mod tests {
         let spaced = [Node { btype: Break::Start, word: "2361 ab" }, Node { btype: Break::End, word: "" }];
         assert!(parser.parse(&spaced).iter().all(|p| p.end <= 1));
         assert!(parser.parse(&[]).is_empty());
+    }
+
+    #[test]
+    fn formats_a_places_postcode_as_nominatims_formatter() {
+        let formats = PostcodeFormats::get();
+        for (country, value, code) in [
+            ("nl", "NL-2361AB", Some("2361 AB")),
+            ("nl", "2361ab", Some("2361 AB")),
+            ("nl", "\u{1C} 2361 AB\u{1F}", Some("2361 AB")),
+            ("us", "78746-1234", Some("78746")),
+            ("ad", "500", Some("AD500")),
+            ("ad", "AD500", Some("AD500")),
+            ("cz", "CZ 110 00", Some("110 00")),
+            ("ng", "123456", Some("123456")),
+            ("ng", "AB 12 3CD EF 45", Some("AB-12-3CD-EF-45")),
+            ("gb", "sw1a1aa", Some("SW1A 1AA")),
+            ("pr", "pr-00901", Some("PR-00901")),
+            ("pr", "a b c", Some("A B C")),
+            ("pr", "straße", Some("STRASSE")),
+            ("nl", "Amsterdam", None),
+            ("de", "00000", None),
+            ("ae", "12345", None),
+            ("", "12345", None),
+            ("pr", "ab", None),
+            ("pr", "1234567890123", None),
+        ] {
+            assert_eq!(formats.formatted(country, value).as_deref(), code, "{country} {value:?}");
+        }
+    }
+
+    #[test]
+    fn a_count_can_be_a_range() {
+        let regex = Regex::parse("[A-Z]{2,3}").expect("a pattern");
+        let ends = |text: &str| regex.match_prefix(&text.chars().collect::<Vec<_>>()).map(|m| m.end);
+        assert_eq!((ends("A"), ends("AB"), ends("ABCD")), (None, Some(2), Some(3)));
+        assert!(Regex::parse("[A-Z]{2,x}").is_err());
+    }
+
+    #[test]
+    fn the_countries_without_postcodes_are_the_builders() {
+        let header = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../builder/src/postcode_validation.h"))
+            .expect("builder/src/postcode_validation.h");
+        let body = &header[header.find("country_without_postcodes(").expect("country_without_postcodes")..];
+        let body = &body[..body.find("return true;").expect("its list")];
+        let theirs: Vec<String> = body
+            .lines()
+            .filter(|l| l.trim().starts_with("case ("))
+            .map(|l| l.split('\'').skip(1).step_by(2).collect())
+            .collect();
+        assert_eq!(COUNTRIES_WITHOUT_POSTCODES.to_vec(), theirs);
+        let default = format!("compile(\"\", \"{POSTCODE_DEFAULT_PATTERN}\", nullptr)");
+        assert!(header.contains(&default), "the builder reads a feature's postcode by another default");
     }
 
     #[test]

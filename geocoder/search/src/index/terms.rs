@@ -71,12 +71,18 @@ pub struct PostingRef {
     pub offset: u64,
 }
 
-/// A term a lookup found.
+/// A term a lookup found. Its kind, token, word and info make it one term: a variant spelt as
+/// another name is (Nominatim's `word` rows, lib-sql/tokenizer/icu_tokenizer.sql:167-193).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Term {
     pub kind: TermKind,
     pub token: String,
-    /// The word Nominatim looks it up by: a variant's source name, else the token.
+    /// The normalised name the term was made from, Nominatim's `word`: for a variant its source
+    /// name, with the language that varied it after TERM_WORD_LANGUAGE_MARK; the token for a term
+    /// made from no name.
+    pub word: String,
+    /// The text a query's words are matched against (Nominatim's `info.lookup`): a variant's own
+    /// normalised spelling, else the word without its language.
     pub lookup_word: String,
     /// Entities with it in their names, Nominatim's `count` (tokenizer.py:85-118), summed over
     /// the sub-indexes the search reads; 1 for a term without statistics.
@@ -98,9 +104,9 @@ pub struct Fuzz {
 }
 
 /// What a search looks terms up in: an index's term dictionaries, or an in-memory table. Each
-/// lookup answers in (token, lookup word, info) order, a prefix or fuzzy one at most `max` terms.
+/// lookup answers in (token, word, info) order, a prefix or fuzzy one at most `max` terms.
 pub trait TermSource {
-    /// The terms of `kind` whose token is `token`, one a lookup word.
+    /// The terms of `kind` whose token is `token`, one a word.
     fn exact(&self, kind: TermKind, token: &str) -> Vec<Term>;
     /// The terms of `kind` whose token starts with `prefix`.
     fn prefix(&self, kind: TermKind, prefix: &str, max: usize) -> Vec<Term>;
@@ -116,12 +122,22 @@ pub struct MemTerms(std::collections::BTreeMap<(TermKind, String, String, TermIn
 
 #[cfg(test)]
 impl MemTerms {
-    /// Term `token` of `kind`, looked up by `lookup_word` (the token for ""), with Nominatim's
-    /// counts and `info`.
-    pub fn insert(&mut self, kind: TermKind, token: &str, lookup_word: &str, (count, addr_count): (u32, u32), info: TermInfo) {
-        let lookup_word = if lookup_word.is_empty() { token } else { lookup_word };
-        let term = Term { kind, token: token.into(), lookup_word: lookup_word.into(), count, addr_count, info: info.clone(), postings: Vec::new() };
-        self.0.insert((kind, token.into(), lookup_word.into(), info), term);
+    /// Term `token` of `kind` made from `word` (the token for ""), matched against `lookup_word`
+    /// (the word without its language for ""), with Nominatim's counts and `info`.
+    pub fn insert(&mut self, kind: TermKind, token: &str, (word, lookup_word): (&str, &str), (count, addr_count): (u32, u32), info: TermInfo) {
+        let word = if word.is_empty() { token } else { word };
+        let lookup_word = if lookup_word.is_empty() { word.split(crate::constants::TERM_WORD_LANGUAGE_MARK).next().unwrap_or(word) } else { lookup_word };
+        let term = Term {
+            kind,
+            token: token.into(),
+            word: word.into(),
+            lookup_word: lookup_word.into(),
+            count,
+            addr_count,
+            info: info.clone(),
+            postings: Vec::new(),
+        };
+        self.0.insert((kind, token.into(), word.into(), info), term);
     }
 
     /// The terms of `kind` whose token `matches`, at most `max`.
@@ -162,28 +178,40 @@ mod tests {
         assert_eq!((TermKind::from_byte(0), TermKind::from_byte(8)), (None, None));
     }
 
-    /// Terms of "Liberty Park Drive" and "Austin", and some near them.
+    /// Terms of "Liberty Park Drive" (the oracle's `word` rows for it) and "Austin", a road named
+    /// "Liberty Park Dr", and some terms near them.
     fn liberty() -> MemTerms {
         let mut terms = MemTerms::default();
-        terms.insert(TermKind::Partial, "park", "", (41_502, 120_334), TermInfo::None);
-        terms.insert(TermKind::Partial, "parkway", "", (9_001, 3_012), TermInfo::None);
-        terms.insert(TermKind::Partial, "spark", "", (120, 7), TermInfo::None);
-        terms.insert(TermKind::Partial, "austin", "", (3_500, 280_000), TermInfo::None);
-        terms.insert(TermKind::Word, "liberty park dr", "liberty park drive", (2, 0), TermInfo::None);
-        terms.insert(TermKind::Word, "liberty park dr", "liberty park dr", (1, 0), TermInfo::None);
-        terms.insert(TermKind::Word, "park", "", (300, 0), TermInfo::None);
+        terms.insert(TermKind::Partial, "park", ("", ""), (41_502, 120_334), TermInfo::None);
+        terms.insert(TermKind::Partial, "parkway", ("", ""), (9_001, 3_012), TermInfo::None);
+        terms.insert(TermKind::Partial, "spark", ("", ""), (120, 7), TermInfo::None);
+        terms.insert(TermKind::Partial, "austin", ("", ""), (3_500, 280_000), TermInfo::None);
+        terms.insert(TermKind::Word, "liberty park drive", ("liberty park drive", ""), (5, 2), TermInfo::None);
+        terms.insert(TermKind::Word, "liberty park dr", ("liberty park drive@en", "liberty park dr"), (5, 2), TermInfo::None);
+        terms.insert(TermKind::Word, "liberty park dr", ("liberty park dr", ""), (1, 0), TermInfo::None);
+        terms.insert(TermKind::Word, "park", ("", ""), (300, 0), TermInfo::None);
         terms
     }
 
     #[test]
-    fn an_exact_lookup_finds_a_term_a_lookup_word_of_its_kind_alone() {
+    fn an_exact_lookup_finds_the_terms_of_its_kind_and_token_alone() {
+        let terms = liberty();
+
+        let found = terms.exact(TermKind::Word, "liberty park drive");
+
+        assert_eq!(found.iter().map(|t| (t.word.as_str(), t.lookup_word.as_str(), t.count)).collect::<Vec<_>>(), [("liberty park drive", "liberty park drive", 5)]);
+        assert_eq!(terms.exact(TermKind::Partial, "park").iter().map(|t| (t.word.as_str(), t.lookup_word.as_str(), t.count, t.addr_count)).collect::<Vec<_>>(), [("park", "park", 41_502, 120_334)]);
+        assert!(terms.exact(TermKind::Partial, "liberty park drive").is_empty());
+    }
+
+    #[test]
+    fn a_variant_and_a_name_spelt_as_it_is_are_two_terms() {
         let terms = liberty();
 
         let found = terms.exact(TermKind::Word, "liberty park dr");
 
-        assert_eq!(found.iter().map(|t| (t.lookup_word.as_str(), t.count)).collect::<Vec<_>>(), [("liberty park dr", 1), ("liberty park drive", 2)]);
-        assert_eq!(terms.exact(TermKind::Partial, "park").iter().map(|t| (t.lookup_word.as_str(), t.count, t.addr_count)).collect::<Vec<_>>(), [("park", 41_502, 120_334)]);
-        assert!(terms.exact(TermKind::Partial, "liberty park dr").is_empty());
+        let written: Vec<(&str, &str, u32)> = found.iter().map(|t| (t.word.as_str(), t.lookup_word.as_str(), t.count)).collect();
+        assert_eq!(written, [("liberty park dr", "liberty park dr", 1), ("liberty park drive@en", "liberty park dr", 5)]);
     }
 
     #[test]
@@ -213,10 +241,10 @@ mod tests {
     #[test]
     fn a_name_stands_for_each_country_and_category_it_names() {
         let mut terms = MemTerms::default();
-        terms.insert(TermKind::Country, "congo", "", (1, 1), TermInfo::Country(*b"cd"));
-        terms.insert(TermKind::Country, "congo", "", (1, 1), TermInfo::Country(*b"cg"));
+        terms.insert(TermKind::Country, "congo", ("", ""), (1, 1), TermInfo::Country(*b"cd"));
+        terms.insert(TermKind::Country, "congo", ("", ""), (1, 1), TermInfo::Country(*b"cg"));
         let cafe = Category { class: "amenity".into(), typ: "cafe".into() };
-        terms.insert(TermKind::Category, "cafe", "", (1, 1), TermInfo::Category(cafe.clone()));
+        terms.insert(TermKind::Category, "cafe", ("", ""), (1, 1), TermInfo::Category(cafe.clone()));
 
         let countries: Vec<TermInfo> = terms.exact(TermKind::Country, "congo").into_iter().map(|t| t.info).collect();
 
