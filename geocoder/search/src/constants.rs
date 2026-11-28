@@ -442,6 +442,7 @@ pub const LOOKUP_IS_TOKEN: u8 = 1;
 /// Raw display-name bytes per window of the name/bundle merge. Its compressed
 /// buckets share the device page cache with the tag tier and sort runs.
 pub const NAME_WINDOW_BYTES: u32 = 2 * 1024 * 1024;
+pub const NAME_WINDOW_BUDGET_DIVISOR: usize = 8;
 pub const SPELLING_SLOT_BYTES: usize = 1024;
 pub const MAX_SPELLING_SLOTS: usize = 2048;
 pub const SPELLING_BUDGET_DIVISOR: usize = 16;

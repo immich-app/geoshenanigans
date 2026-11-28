@@ -240,10 +240,12 @@ fn occurrence(id: u32, kind: u32, value: u32) -> Occurrence {
     Occurrence([id * 2 + kind, value])
 }
 
-/// Checking polygon label points can leave the linked-node tables resident. Deduct
-/// their actual allocations once across the workers before sizing the sort runs.
+/// The string and label directories stay resident during emission. Leave file pages
+/// available for the display-name window as well as the fixed merge-read buffers.
 fn worker_buffers(per_worker: usize, threads: usize, resident: usize) -> (usize, usize) {
     let budget = per_worker.saturating_sub(resident.div_ceil(threads)).max(MIN_RUN_BUDGET_BYTES);
+    let window = (budget / NAME_WINDOW_BUDGET_DIVISOR).min(NAME_WINDOW_BYTES as usize);
+    let budget = budget.saturating_sub(window).max(MIN_RUN_BUDGET_BYTES);
     let cache_bytes = (budget / SPELLING_BUDGET_DIVISOR).min(budget - MIN_RUN_BUDGET_BYTES);
     let slots = (cache_bytes / SPELLING_SLOT_BYTES).min(MAX_SPELLING_SLOTS);
     (budget - slots * SPELLING_SLOT_BYTES, slots)
@@ -538,7 +540,9 @@ pub(super) fn build(
     let rows = map(&tmp.join("records"))?;
     let areas = AreaRanges::open(out, n, profile)?;
     let budget = crate::sort::run_budget(opts.mem_mb, opts.threads).map_err(invalid)?;
-    let resident = table_bytes(&records.geo.linked_centres) + table_bytes(&records.geo.linked_names);
+    let resident = records.string_directory_bytes()
+        + table_bytes(&records.geo.linked_centres)
+        + table_bytes(&records.geo.linked_names);
     let buffers = worker_buffers(budget, opts.threads, resident);
     let mut names = SortedRuns::default();
     std::thread::scope(|scope| -> io::Result<()> {
@@ -652,12 +656,12 @@ mod tests {
         index::{terms::TermSource, Dictionary},
     };
     #[test]
-    fn term_workers_share_the_budget_with_resident_label_tables() {
+    fn term_workers_share_the_budget_with_resident_tables_and_string_pages() {
         let mib = 1 << 20;
         let (run, slots) = worker_buffers(16 * mib, 1, 7 * mib);
-        assert_eq!(run + slots * SPELLING_SLOT_BYTES, 9 * mib);
+        assert_eq!(run + slots * SPELLING_SLOT_BYTES, 9 * mib * 7 / 8);
         let (run, slots) = worker_buffers(4 * mib, 4, 7 * mib);
-        assert_eq!(4 * (run + slots * SPELLING_SLOT_BYTES), 9 * mib);
+        assert_eq!(4 * (run + slots * SPELLING_SLOT_BYTES), 9 * mib * 7 / 8);
         assert_eq!(worker_buffers(mib, 1, 2 * mib), (MIN_RUN_BUDGET_BYTES, 0));
         let mut uncached = SpellingCache::new(0);
         let mut spellings = Vec::new();

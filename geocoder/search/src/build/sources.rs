@@ -192,6 +192,11 @@ impl<'a> CoreRecords<'a> {
             _ => unreachable!(),
         }
     }
+    pub(super) fn string_directory_bytes(&self) -> usize {
+        self.files.string_directory_bytes()
+            + self.geo.strings.tiers.iter().flatten().map(|tier| tier.directory_bytes()).sum::<usize>()
+    }
+
     pub(super) fn bundle_id(&self, e: EntityRef) -> Option<u32> {
         self.files.bundle_id(Self::kind(e), e.record())
     }

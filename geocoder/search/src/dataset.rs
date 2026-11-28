@@ -96,6 +96,10 @@ impl SearchFiles {
         crate::tags::TagBundle::parse(tier.get(offset.checked_sub(*base)?))
     }
 
+    pub(crate) fn string_directory_bytes(&self) -> usize {
+        self.tiers.iter().flatten().map(|(_, tier)| tier.directory_bytes()).sum()
+    }
+
     pub(crate) fn bundle_id(&self, kind: crate::model::Kind, row: u32) -> Option<u32> {
         self.tags[Self::column(kind)].as_ref()?.get(row).filter(|&v| v != query_server::NO_DATA)
     }
