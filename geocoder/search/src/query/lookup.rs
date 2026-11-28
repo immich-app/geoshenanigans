@@ -198,13 +198,13 @@ impl QueryGraph {
 
     /// What going on over the nodes inside `span` costs (query.py:408-413).
     pub fn in_word_penalty(&self, span: Span) -> f64 {
-        self.nodes[span.start + 1..span.end].iter().map(|n| n.node.word_continuation_penalty()).sum()
+        compensated_sum(self.nodes[span.start + 1..span.end].iter().map(|n| n.node.word_continuation_penalty()))
     }
 
     /// The penalties of `span`'s partials and of the word breaks between them (query.py:421-427).
     pub fn partial_penalty(&self, span: Span) -> f64 {
         let penalty = |i: usize| self.nodes[i].partial.map_or(PARTIAL_MISSING_PENALTY, |p| p.penalty);
-        penalty(span.start) + (span.start + 1..span.end).map(|i| penalty(i) + self.nodes[i].node.word_break_penalty()).sum::<f64>()
+        penalty(span.start) + compensated_sum((span.start + 1..span.end).map(|i| penalty(i) + self.nodes[i].node.word_break_penalty()))
     }
 
     /// The direction a query is read in, from its partials' counts (query.py:383-396): negative
@@ -223,8 +223,8 @@ impl QueryGraph {
             return (ratio(1) - ratio(0)) / DIRECTION_TWO_SLOT_DIVISOR;
         }
         let nf = n as f64;
-        let weighted: f64 = (0..n).map(|i| i as f64 * ratio(i)).sum();
-        let total: f64 = (0..n).map(ratio).sum();
+        let weighted = compensated_sum((0..n).map(|i| i as f64 * ratio(i)));
+        let total = compensated_sum((0..n).map(ratio));
         // The denominator of the slope of a linear regression over positions 0..n.
         let squares: f64 = (0..n).map(|i| (i * i) as f64).sum();
         let linfac = nf * (squares - (nf - 1.0) * nf * (nf - 1.0) / 4.0);
@@ -588,6 +588,19 @@ impl QueryGraph {
     }
 }
 
+// Python 3.12 sums floats with compensation. A last-bit difference here can
+// exchange two searches before the executor applies its round limit.
+fn compensated_sum(values: impl Iterator<Item = f64>) -> f64 {
+    let mut sum: f64 = 0.0;
+    let mut residual = 0.0;
+    for value in values {
+        let next = sum + value;
+        residual += if sum.abs() >= value.abs() { (sum - next) + value } else { (value - next) + sum };
+        sum = next;
+    }
+    sum + residual
+}
+
 /// A looked-up token's penalty before any other token is known (icu_tokenizer.py:60-72).
 fn base_penalty(term: &Term) -> f64 {
     let token: Vec<char> = term.token.chars().collect();
@@ -695,6 +708,16 @@ mod tests {
             assert_eq!(rows(&g), theirs, "{}", r.label);
             assert!((g.direction_penalty() - r.direction).abs() < 1e-9, "{}: {} not {}", r.label, g.direction_penalty(), r.direction);
         }
+    }
+
+    #[test]
+    fn direction_preserves_the_oracles_rounding_for_close_searches() {
+        let mut terms = MemTerms::default();
+        for (word, count) in [("one", 1), ("two", 2), ("three", 2)] {
+            terms.insert(TermKind::Partial, word, ("", ""), (count, 1), TermInfo::None);
+        }
+        let g = graph("one two three", &terms, Lookup::Exact);
+        assert_eq!(g.direction_penalty(), 0.08333333333333333);
     }
 
     #[test]
