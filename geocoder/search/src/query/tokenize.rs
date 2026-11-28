@@ -374,6 +374,14 @@ mod tests {
     }
 
     #[test]
+    fn coordinates_parted_by_a_long_run_of_separators_are_read() {
+        let q = format!("1.5{} 2.5", " ,".repeat(50_000));
+
+        assert_eq!(near(&q), (String::new(), Some((1.5, 2.5))));
+        assert_eq!(near(&"1".repeat(100_000)).1, None);
+    }
+
+    #[test]
     fn a_class_and_type_in_brackets_become_a_category() {
         let cafe = Category { class: "amenity".into(), typ: "cafe".into() };
         for (q, text, category) in [

@@ -28,7 +28,13 @@ struct Item {
 enum Atom {
     Char(char),
     Class(Vec<ClassItem>),
-    Group(Option<usize>, Vec<Vec<Item>>),
+    Group(Group),
+}
+
+/// A group: the number of its capture, if it captures, and its alternatives.
+struct Group {
+    capture: Option<usize>,
+    alternatives: Vec<Vec<Item>>,
 }
 
 enum ClassItem {
@@ -142,7 +148,7 @@ impl Regex {
                         return Err("an unclosed group".into());
                     }
                     *at += 1;
-                    Atom::Group(capture, inner)
+                    Atom::Group(Group { capture, alternatives: inner })
                 }
                 '[' => {
                     *at += 1;
@@ -247,38 +253,47 @@ impl Matcher<'_> {
     fn sequence(&self, items: &[Item], at: usize, caps: &mut Captures, then: Then) -> bool {
         match items.split_first() {
             None => then(at, caps),
-            Some((item, rest)) => self.repeat(item, 0, at, caps, &mut |next, caps| self.sequence(rest, next, caps, &mut *then)),
+            Some((item, rest)) => self.repeat(item, at, caps, &mut |next, caps| self.sequence(rest, next, caps, &mut *then)),
         }
     }
 
-    /// The item `done` times so far: once more while it may (greedy), else what follows.
-    fn repeat(&self, item: &Item, done: usize, at: usize, caps: &mut Captures, then: Then) -> bool {
-        // An item that matched nothing matches nothing again: Python stops repeating it there too.
+    /// The item as many times as it may (greedy), then fewer, each time what follows.
+    fn repeat(&self, item: &Item, at: usize, caps: &mut Captures, then: Then) -> bool {
+        let rest = self.text.get(at..).unwrap_or_default().iter().take(item.max);
+        // A character or class is taken in a loop, its longest run first as Python gives it back:
+        // recursing per character overflows the stack on a query of a few thousand characters.
+        let run = match &item.atom {
+            Atom::Char(a) => rest.take_while(|&c| c == a).count(),
+            Atom::Class(items) => rest.take_while(|&&c| items.iter().any(|i| i.contains(c))).count(),
+            Atom::Group(group) => return self.repeat_group(item, group, 0, at, caps, then),
+        };
+        (item.min..=run).rev().any(|n| then(at + n, caps))
+    }
+
+    /// A group `done` times so far: once more while it may (greedy), else what follows.
+    fn repeat_group(&self, item: &Item, group: &Group, done: usize, at: usize, caps: &mut Captures, then: Then) -> bool {
+        // A group that matched nothing matches nothing again: Python stops repeating it there too.
         let more = |next: usize| next > at || done < item.min;
-        if done < item.max && self.atom(&item.atom, at, caps, &mut |next, caps| more(next) && self.repeat(item, done + 1, next, caps, &mut *then)) {
+        if done < item.max && self.group(group, at, caps, &mut |next, caps| more(next) && self.repeat_group(item, group, done + 1, next, caps, &mut *then)) {
             return true;
         }
         done >= item.min && then(at, caps)
     }
 
-    fn atom(&self, atom: &Atom, at: usize, caps: &mut Captures, then: Then) -> bool {
-        match atom {
-            Atom::Char(c) => self.text.get(at) == Some(c) && then(at + 1, caps),
-            Atom::Class(items) => self.text.get(at).is_some_and(|&c| items.iter().any(|i| i.contains(c))) && then(at + 1, caps),
-            Atom::Group(capture, alternatives) => alternatives.iter().any(|alternative| {
-                self.sequence(alternative, at, caps, &mut |end, caps| match capture {
-                    Some(g) => {
-                        let before = caps[*g].replace((at, end));
-                        let matched = then(end, caps);
-                        if !matched {
-                            caps[*g] = before;
-                        }
-                        matched
+    fn group(&self, group: &Group, at: usize, caps: &mut Captures, then: Then) -> bool {
+        group.alternatives.iter().any(|alternative| {
+            self.sequence(alternative, at, caps, &mut |end, caps| match group.capture {
+                Some(g) => {
+                    let before = caps[g].replace((at, end));
+                    let matched = then(end, caps);
+                    if !matched {
+                        caps[g] = before;
                     }
-                    None => then(end, caps),
-                })
-            }),
-        }
+                    matched
+                }
+                None => then(end, caps),
+            })
+        })
     }
 }
 
@@ -315,6 +330,16 @@ mod tests {
         assert_eq!(whole(r"(a+)?b", "b"), Some(vec![None]));
         assert!(whole(r"a+", "").is_none());
         assert!(whole(r"(a*)*b", "aac").is_none());
+    }
+
+    #[test]
+    fn a_long_run_matches_and_gives_back_without_exhausting_the_stack() {
+        let separators = format!("1.5{}x", " ,".repeat(100_000));
+        let digits = "1".repeat(200_000);
+
+        assert_eq!(whole(r"(\d+\.\d+)[\s,]+x", &separators), Some(vec![Some("1.5".into())]));
+        assert_eq!(whole(r"(\d+)(\d)", &digits).map(|g| g[1].clone()), Some(Some("1".into())));
+        assert!(whole(r"\d+\.", &digits).is_none());
     }
 
     #[test]
