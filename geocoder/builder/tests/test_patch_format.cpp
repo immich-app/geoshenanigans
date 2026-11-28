@@ -3002,7 +3002,7 @@ size_t check_strings_section_round_trip(uint64_t seed, PoolOrder order) {
     size_t order_moves = 0;
     for (int round = 0; round < 400; round++) {
         const RandomTiers r = random_tiers(rnd, order);
-        const uint32_t shipped = rnd(32), referenced = rnd(32);
+        const uint32_t shipped = rnd(1u << STRING_TIER_COUNT), referenced = rnd(1u << STRING_TIER_COUNT);
         std::vector<char> buf;
         const auto stats = append_strings_section(buf, r.pools(), shipped, referenced, r.moved);
         DecodedStrings dec;
@@ -3392,6 +3392,23 @@ TEST(patch_format_sorted_tier_sends_no_indices) {
     const std::string u = pool_in_order({"g", "b", "a", "c", "f"});
     CHECK(!string_pool_sorted(u.data(), u.size()));
     CHECK(!tier_edit(o, u).diff.sorted);
+}
+
+TEST(a_tag_tier_follows_the_global_extent_of_a_poi_prefix) {
+    const auto old = pool_in_order({"a", "z"}), next = pool_in_order({"z", "a"});
+    std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
+    tiers[STR_TIER_TAGS_CORE].old_gap = 7;
+    tiers[STR_TIER_TAGS_CORE].new_gap = 9;
+    tiers[STR_TIER_TAGS_POI] = pools_of(old, next);
+    const std::vector<std::pair<uint32_t, uint32_t>> moved{{7, 11}, {9, 9}};
+    std::vector<char> bytes;
+    const auto stats = append_strings_section(bytes, tiers, 1u << STR_TIER_TAGS_POI, 0, moved);
+    size_t pos = 0;
+    const auto section = parse_strings_section(bytes.data(), bytes.size(), pos);
+    CHECK(section.old_size(STR_TIER_TAGS_CORE) == 0);
+    CHECK(section.old_base[STR_TIER_TAGS_POI] == 7 && section.new_base[STR_TIER_TAGS_POI] == 9);
+    CHECK(stats.n_pairs == 1);
+    CHECK(stats.edit_bytes[STR_TIER_TAGS_POI] == bytes.size() - (4 + STRING_TIER_COUNT * 16 + 8 + 4));
 }
 
 TEST(patch_format_strings_section_refuses_indices_out_of_order) {

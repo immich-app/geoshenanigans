@@ -588,8 +588,9 @@ inline bool is_remapped_record_file(uint32_t fid) {
 // (UNSECTIONED_OLD_FILES). Its marker shares 0xFFFFFFF6 with
 // SECONDARY_REMAP_MARKER: position, not value, tells them apart.
 //   marker STRINGS_TIERED_MARKER,
-//   5 × {old_size u32, new_size u32}: every tier of the build, so global
-//     offsets (tier t at the sum of the sizes before it) need no tier file,
+//   STRING_TIER_COUNT × {old_size, new_size, old_gap, new_gap}, all u32:
+//     size counts decoded bytes, gap the omitted tail. Their sum places
+//     the next tier even when the selection ships only a prefix.
 //   shipped u32: bit t = the dir ships tier t and rebuilds it from its own
 //     old file (a tier the old dir lacked is unshipped here and its client
 //     file comes whole in a per-file section),
@@ -2752,7 +2753,10 @@ StringsSectionStats append_strings_section(std::vector<char>& out,
     if (pairs.size() > pairs_max) stats.unsent_pairs.swap(pairs);
     stats.n_pairs = static_cast<uint32_t>(pairs.size());
     put(&stats.n_pairs, 4);
-    for (const auto& [og, ng] : pairs) { put(&og, 4); put(&ng, 4); }
+    for (const auto& [og, ng] : pairs) {
+        put(&og, 4); put(&ng, 4);
+        stats.edit_bytes[tier_of(og, old_base)] += sizeof(og) + sizeof(ng);
+    }
     return stats;
 }
 
