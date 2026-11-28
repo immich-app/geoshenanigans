@@ -198,6 +198,9 @@ pub const NAME_LANGUAGES: [&str; 30] = [
 pub const NAME_SUFFIXES_WITHOUT_LANGUAGE: [&str; 2] = ["left", "right"];
 /// A name whose rules would make more variants than this keeps only itself.
 pub const VARIANT_MAX_PARTIALS: usize = 128;
+/// What stands between a term's source name and the language that varied it in the term's word
+/// ("liberty park drive@en"), as in Nominatim's `word` column.
+pub const TERM_WORD_LANGUAGE_MARK: char = '@';
 /// A house number with a run of this many characters between list delimiters is a name.
 pub const HOUSENUMBER_AS_NAME_RUN: usize = 15;
 /// A house number with a list part of this many characters and no digit is a name.
