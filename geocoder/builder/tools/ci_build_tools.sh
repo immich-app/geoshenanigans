@@ -22,7 +22,7 @@ set -euo pipefail
 build=$(realpath -m "$1")
 cache=$(realpath -m "$2")
 s2_prefix=$3
-tools=(build-index geocoder-diff geocoder-patch pbf-apply heap-peak-shim heap-peak-probe geocoder-tests)
+tools=(build-index geocoder-diff geocoder-patch pbf-apply heap-peak-shim heap-peak-probe namecensus geocoder-tests)
 source_dir=$(cd "$(dirname "$0")/.." && pwd)
 cpus=$("$source_dir/tools/cpu_budget.sh")
 shards=$((cpus < 16 ? cpus : 16))
