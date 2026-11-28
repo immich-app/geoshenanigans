@@ -718,3 +718,41 @@ fn entity_blocks_restart_at_random_access_boundaries() {
     assert!(core.entities.get(n).is_none());
     assert!(fs::metadata(tmp.0.join("core.ent")).unwrap().len() < 2 * u64::from(n));
 }
+
+#[test]
+fn sparse_dictionary_blocks_preserve_order_across_variant_sources() {
+    let tmp = TempDir::new("token-sources");
+    let set = tmp.0.join("dataset");
+    let mut f = Geo::default();
+    let airport = f.poi("Airport", 0., 0., 0);
+    f.poi_tags(airport, &[("name:en", "Airport")]);
+    f.poi("Aprt", 0., 0., 0);
+    for i in 0..200 {
+        f.poi(&format!("Aprt{i:03}"), 0., 0., 0);
+    }
+    let geo = f.load(&set);
+    build_core(
+        &geo,
+        &crate::dataset::core_stamps(&set).unwrap(),
+        &set,
+        &tmp.0,
+        Profile::Immich,
+        &BuildOpts::new(tmp.0.join("runs")),
+    )
+    .unwrap();
+    let core = CoreIndex::open(&tmp.0).unwrap();
+    let terms = core.terms.exact(TermKind::Word, "aprt");
+    assert_eq!(terms.iter().map(|t| t.word.as_str()).collect::<Vec<_>>(), ["airport@en", "aprt"]);
+    let fst = crate::keys::Keys::new(fs::read(tmp.0.join("core.fst")).unwrap()).unwrap();
+    use fst::Streamer;
+    let mut stream = fst.stream();
+    let mut blocks = 0;
+    while stream.next().is_some() {
+        blocks += 1;
+    }
+    assert!(blocks < 100, "{blocks} entries for two families of 200 adjacent terms");
+    assert_eq!(core.terms.prefix(TermKind::Word, "aprt0", 101).len(), 100);
+    assert_eq!(core.terms.exact(TermKind::Word, "aprt099")[0].word, "aprt099");
+    assert!(core.terms.exact(TermKind::Word, "aprt09").is_empty());
+    assert_eq!(core.terms.fuzzy(TermKind::Word, "aprt099", Fuzz { edits: 1, anchor: 4 }, 2).len(), 2);
+}

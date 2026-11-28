@@ -1,5 +1,8 @@
 use super::{invalid, map, terms::*, PostingList, Sub};
-use crate::keys::Keys;
+use crate::{
+    constants::{INLINE_POSTING, MAX_KEY_BYTES, TERM_BLOCK, TERM_BLOCK_ROWS},
+    keys::Keys,
+};
 use fst::{Automaton, Streamer};
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA, SINK_STATE};
 use memmap2::Mmap;
@@ -78,16 +81,83 @@ impl Dictionary {
         })
     }
     fn matching(&self, aut: impl Automaton, max: usize) -> Vec<Term> {
-        let mut stream = self.fst.search(aut);
+        let mut stream = self.fst.search(Routes(&aut));
         let mut terms = Vec::new();
+        let mut key = Vec::new();
         while terms.len() < max {
-            let Some((key, val)) = stream.next() else { break };
-            if let Some(term) = self.decode(key, val) {
-                terms.push(term)
+            let Some((route, value)) = stream.next() else { break };
+            if value & TERM_BLOCK == 0 {
+                if accepts(&aut, route) {
+                    terms.extend(self.decode(route, value >> 1));
+                }
+                continue;
+            }
+            let offset = value >> 1;
+            let Some(mut at) = usize::try_from(offset).ok() else { continue };
+            let Some(n) = super::small(&self.post, &mut at).filter(|&n| n as usize <= TERM_BLOCK_ROWS) else {
+                continue;
+            };
+            key.clear();
+            key.extend_from_slice(route);
+            for _ in 0..n {
+                let Some(posting) = self.block_entry(route.len(), &mut key, offset, &mut at) else { break };
+                if accepts(&aut, &key) {
+                    terms.extend(self.decode(&key, posting));
+                    if terms.len() == max {
+                        break;
+                    }
+                }
             }
         }
         terms
     }
+    fn block_entry(&self, prefix: usize, key: &mut Vec<u8>, block: u64, at: &mut usize) -> Option<u64> {
+        let shared = prefix.checked_add(super::small(&self.post, at)? as usize)?;
+        let length = super::small(&self.post, at)? as usize;
+        if shared > key.len() || shared.checked_add(length)? > MAX_KEY_BYTES {
+            return None;
+        }
+        let suffix = self.post.get(*at..)?.get(..length)?;
+        key.truncate(shared);
+        key.extend_from_slice(suffix);
+        *at += length;
+        let value = crate::varint::try_get(&self.post, at)?;
+        if value & INLINE_POSTING != 0 {
+            Some(value)
+        } else {
+            Some(block.checked_sub(value >> 1)? << 1)
+        }
+    }
+}
+
+// A route may end before the automaton has consumed the query. Its block
+// supplies the rest of each key, including its source-word identity.
+struct Routes<'a, A>(&'a A);
+impl<A: Automaton> Automaton for Routes<'_, A> {
+    type State = A::State;
+    fn start(&self) -> A::State {
+        self.0.start()
+    }
+    fn is_match(&self, s: &A::State) -> bool {
+        self.0.can_match(s)
+    }
+    fn can_match(&self, s: &A::State) -> bool {
+        self.0.can_match(s)
+    }
+    fn accept(&self, s: &A::State, b: u8) -> A::State {
+        self.0.accept(s, b)
+    }
+}
+
+fn accepts(aut: &impl Automaton, key: &[u8]) -> bool {
+    let mut state = aut.start();
+    for &byte in key {
+        state = aut.accept(&state, byte);
+        if !aut.can_match(&state) {
+            return false;
+        }
+    }
+    aut.is_match(&state)
 }
 // The matcher consumes only the token. A successful token then accepts its identity suffix.
 struct Fuzzy<'a> {

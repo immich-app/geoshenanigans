@@ -31,10 +31,10 @@ impl<'a> PostingList<'a> {
         let mut at = usize::try_from(value >> 1).ok()?;
         let count = small(bytes, &mut at)?;
         let addr_count = small(bytes, &mut at)?;
-        let df = small(bytes, &mut at)?;
-        let n = small(bytes, &mut at)?;
+        let df = count;
+        let n = df / SKIP_EVERY;
         let len = small(bytes, &mut at)? as usize;
-        if df > entities || n != df / SKIP_EVERY || len < df as usize {
+        if df > entities || len < df as usize {
             return None;
         }
         let tail = bytes.get(at..)?;

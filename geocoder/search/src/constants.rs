@@ -404,11 +404,15 @@ pub const CORE_KINDS: [crate::index::entities::EntityKind; 3] = [
     crate::index::entities::EntityKind::Area,
     crate::index::entities::EntityKind::Poi,
 ];
-/// Odd FST values carry singleton entity ids. Even values address the posting file.
+/// Odd posting references carry singleton entity IDs. Even references address the posting file.
 pub const INLINE_POSTING: u64 = 1;
 pub const SKIP_BYTES: usize = 2 * size_of::<u32>();
 /// Sixteen u16-length keys take at most one MiB alongside the final merge.
 pub const TERM_MERGE_BATCH: usize = 16;
+/// A sparse FST entry points at a front-coded group; other entries hold their posting reference directly.
+pub const TERM_BLOCK: u64 = 1;
+pub const TERM_BLOCK_ROWS: usize = 64;
+pub const TERM_BLOCK_BYTES: usize = 64 * 1024;
 pub const POSTING_BUFFER_BYTES: usize = WRITE_BUFFER;
 pub const CHAIN_CACHE_CELLS: usize = 64;
 pub const PHOTON_MAX_EDITS: u8 = 2;

@@ -1,4 +1,4 @@
-use super::fst_writer::FstWriter;
+use super::{dictionary::TermBlocks, fst_writer::FstWriter};
 use super::{
     counts::Coverage,
     sources::{CoreRecords, SourceRow},
@@ -296,7 +296,7 @@ impl ListWriter {
         } else {
             let value = *pos << 1;
             self.scratch.clear();
-            for v in [self.df, self.coverage.count, self.df, self.df / SKIP_EVERY, self.deltas.len] {
+            for v in [self.df, self.coverage.count, self.deltas.len] {
                 varint::put(&mut self.scratch, v.into());
             }
             *pos += self.scratch.len() as u64 + u64::from(self.deltas.len) + u64::from(self.skips.len);
@@ -452,7 +452,7 @@ fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<Te
     let start = Instant::now();
     let mut list = ListWriter::new(tmp)?;
     let mut prefixes = (0..2 * PREFIX_TABLE_MAX_CHARS).map(|i| Prefix::new(tmp, i)).collect::<io::Result<Vec<_>>>()?;
-    let mut fst = FstWriter::new(writer(&out.join("core.fst"))?)?;
+    let mut dictionary = TermBlocks::new(out)?;
     let mut post = writer(&out.join("core.post"))?;
     let (mut prev, mut top, mut pos, mut terms, mut postings) = (Vec::new(), Vec::new(), 0u64, 0u64, 0u64);
     let mut flush = |k: &[u8], list: &mut ListWriter| -> io::Result<()> {
@@ -462,7 +462,7 @@ fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<Te
         postings += u64::from(list.df);
         terms += 1;
         let value = list.finish(&mut post, &mut pos, &mut top)?;
-        fst.insert(k, value)?;
+        dictionary.add(k, value, &mut post, &mut pos)?;
         if k[0] == TermKind::Word as u8 || k[0] == TermKind::Partial as u8 {
             let token = std::str::from_utf8(k[1..].split(|&b| b == 0).next().unwrap()).map_err(io::Error::other)?;
             let first = if k[0] == TermKind::Word as u8 { 0 } else { PREFIX_TABLE_MAX_CHARS };
@@ -504,7 +504,7 @@ fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<Te
         }
     }
     flush(&prev, &mut list)?;
-    fst.finish()?;
+    dictionary.finish(&mut post, &mut pos)?;
     post.flush()?;
     drop(rows);
     stats.fst_s = (start.elapsed() - final_read).as_secs_f64();
@@ -561,5 +561,21 @@ mod tests {
         let zero = &terms.exact(TermKind::Partial, "z")[0];
         assert_eq!((zero.count, zero.addr_count), (0, 17));
         assert_eq!(terms.posting(zero.postings[0]).unwrap().ids().next(), None);
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_lists_store_each_statistic_once() {
+        let dir = crate::fixture::TempDir::new("list-size");
+        let mut list = ListWriter::new(&dir.0).unwrap();
+        list.add([2, NAME_OCCURRENCE, 5]).unwrap();
+        list.add([3, NAME_OCCURRENCE, 7]).unwrap();
+        let mut out = Vec::new();
+        list.finish(&mut out, &mut 0, &mut Vec::new()).unwrap();
+        assert_eq!(out, [2, 0, 2, 2, 1]);
     }
 }
