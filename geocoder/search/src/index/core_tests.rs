@@ -418,17 +418,30 @@ fn full_records_read_outline_bounds_and_optional_host_object_ids() {
     let tmp = TempDir::new("core-record-geometry");
     let mut f = Geo::default();
     let poly = f.boundary("County", 6, [-3., -4., 1., 2.]);
+    let way = f.boundary("District", 8, [-2., -3., 0., 1.]);
     let unused = f.boundary("Excluded level", 14, [0., 0., 1., 1.]);
-    f.poi("Bench", 2., 3., 0);
+    let node = f.poi("Bench", 2., 3., 0);
+    let relation = f.poi("Museum", 2., 3., 0);
     let geo = f.load(&tmp.0);
     let mut bytes = Vec::new();
-    for word in [0xd0510ead_u32, 1, 2] {
+    for word in [0xd0510ead_u32, 1, 3] {
         bytes.extend(word.to_le_bytes());
     }
     bytes.extend([3, 0, 0, 0]);
-    bytes.extend(42u64.to_le_bytes());
+    bytes.extend([7, 0, 42, 0, 0, 0, 0, 0]);
+    bytes.extend([2, 0, 0, 0]);
+    bytes.extend(43u64.to_le_bytes());
     bytes.extend([0; 12]);
     fs::write(tmp.0.join("admin_polygons.osm_ids"), &bytes).unwrap();
+    let mut poi = Vec::new();
+    for word in [0xd0510ead_u32, 1, 2] {
+        poi.extend(word.to_le_bytes());
+    }
+    poi.extend([1, 0, 0, 0]);
+    poi.extend(44u64.to_le_bytes());
+    poi.extend([3, 0, 0, 0]);
+    poi.extend([2, 0, 45, 0, 0, 0, 0, 0]);
+    fs::write(tmp.0.join("poi_rows.osm_ids"), poi).unwrap();
     let e = EntityRef::new(EntityKind::Area, poly).unwrap();
     let out = tmp.0.join("full-index");
     let stamps = crate::dataset::load(&tmp.0, || Ok(())).unwrap().1;
@@ -452,11 +465,21 @@ fn full_records_read_outline_bounds_and_optional_host_object_ids() {
     let r = full.read(e).unwrap();
     assert_eq!(r.osm, Some(OsmRef { kind: OsmKind::Relation, id: 42 }));
     assert_eq!(r.bbox, Some(BBox { min_lat: -3., min_lon: -4., max_lat: 1., max_lon: 2. }));
-    assert_eq!(full.read(EntityRef::new(EntityKind::Poi, 0).unwrap()).unwrap().osm, None);
+    for (kind, row, osm) in [
+        (EntityKind::Area, way, OsmRef { kind: OsmKind::Way, id: 43 }),
+        (EntityKind::Poi, node, OsmRef { kind: OsmKind::Node, id: 44 }),
+        (EntityKind::Poi, relation, OsmRef { kind: OsmKind::Relation, id: 45 }),
+    ] {
+        assert_eq!(full.read(EntityRef::new(kind, row).unwrap()).unwrap().osm, Some(osm));
+    }
     drop(full);
+    fs::remove_file(tmp.0.join("poi_rows.osm_ids")).unwrap();
     bytes[13] = 1;
     fs::write(tmp.0.join("admin_polygons.osm_ids"), &bytes).unwrap();
-    assert_eq!(CoreRecords::for_index(&geo, &tmp.0, &core).unwrap().read(e).unwrap().osm, None);
+    let full = CoreRecords::for_index(&geo, &tmp.0, &core).unwrap();
+    assert_eq!(full.read(e).unwrap().osm, None);
+    assert_eq!(full.read(EntityRef::new(EntityKind::Poi, node).unwrap()).unwrap().osm, None);
+    drop(full);
     bytes.pop();
     fs::write(tmp.0.join("admin_polygons.osm_ids"), bytes).unwrap();
     assert!(CoreRecords::for_index(&geo, &tmp.0, &core).is_err());

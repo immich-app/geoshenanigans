@@ -109,7 +109,12 @@ impl OsmRows {
             3 => OsmKind::Relation,
             _ => return None,
         };
-        let id = u64::from_le_bytes(bytes[4..].try_into().ok()?);
+        let stable_id = u64::from_le_bytes(bytes[4..].try_into().ok()?);
+        // Slot assignment distinguishes a relation's rings. Search exposes the OSM object they share.
+        let id = match kind {
+            OsmKind::Relation => stable_id >> OSM_RELATION_RING_BITS,
+            _ => stable_id,
+        };
         (id != 0).then_some(OsmRef { kind, id })
     }
 }

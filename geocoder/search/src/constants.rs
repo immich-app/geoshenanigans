@@ -440,6 +440,7 @@ pub const OSM_SLOT_VERSION: u32 = 1;
 pub const OSM_SLOT_HEADER: usize = 3 * size_of::<u32>();
 pub const OSM_SLOT_BYTES: usize = 4 + size_of::<u64>();
 pub const OSM_SLOT_TOMBSTONE: u8 = 1;
+pub const OSM_RELATION_RING_BITS: u32 = 16;
 pub const NAME_OCCURRENCE: u32 = 0;
 pub const AREA_MEMBERS: u32 = 1;
 /// Fixed-width registry entries bound suffix sharing even for a multilingual alphabet.
