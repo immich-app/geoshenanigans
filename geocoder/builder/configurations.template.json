@@ -846,7 +846,7 @@
     }
   ],
   "search_index": {
-    "description": "Place search index of one selection. The selections in `shipped` (those it adds at most 5% to on planet, zstd; builder/PATCHING.md) publish it in every region under `dir` (download each file into <dataset>/search/); any other selection builds it on the device from its own files.",
+    "description": "Place search index of one selection. The selections in `shipped` publish it in every region under `dir`. Download each file into <dataset>/search/. Other selections build it on the device. See builder/PATCHING.md for the 5% download target and measured sizes.",
     "dir": "{region}/search/{mode}/{quality}/{poi_tier}",
     "files": [
       "places.fst",

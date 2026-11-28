@@ -642,30 +642,44 @@ surface.
   empty dir, so `search/` stays with the old files: moved beside the new
   ones or not, the next open builds the index.
 
-A selection ships the index when it adds at most 5% (zstd) to the selection's
-planet pack. On the published 2026-11-16 packs no selection is under it: the
-two full-mode selections, which `search_index.shipped` lists, are at 5.7% and
-5.3%. Measured 2026-11-17 on a planet build of 2026-10-18's data, pack sizes
-from the published 2026-11-16 build without the index. Index is what it
-downloads (zstd -18 of every file), On disk what it takes in `search/`. Device
-build is `place-search build --threads 1`, the build the binding's open runs
-(the dataset hashed, then the index built), with the selection's files evicted
-from the page cache first, on one core; in 32 MiB the same build in a 32 MiB
-cgroup without swap:
+The index meets the shipping size target when it adds at most 5% (zstd) to
+the selection's planet pack. The nightly publishes the two full-mode
+selections in `search_index.shipped`. The planet-b measurements compare
+the v2 index built from stored names with the v2 index built from the
+installed name bundles. The pack column uses the transport data sizes
+below plus the corresponding name files, excluding the index. The index
+download is the sum of zstd -18 bytes for its files. Device builds use
+`place-search build --threads 1` on a single core with the source files
+evicted from the page cache first. The capped runs use 32 MiB without swap.
+The smallest row is from the published 2026-11-16 pack.
 
-| Selection | Pack | Index | On disk | Adds | Ships | Device build | In 32 MiB |
-|-----------|------|-------|---------|------|-------|--------------|-----------|
-| smallest (admin-minimal) | 95.8 MiB | 36.1 MiB | 56.3 MiB | +37.7% | no | 11 s | 26 s |
-| recommended (admin + q2.5 + poi/major) | 296.4 MiB | 57.4 MiB | 91.5 MiB | +19.4% | no | 18 s | 50 s |
-| with-addresses (full + q2.5 + poi/all) | 6,371.5 MiB | 364.4 MiB | 634.4 MiB | +5.7% | yes | 132 s | 296 s |
-| max-quality (full + uncapped + poi/all) | 6,822.7 MiB | 364.4 MiB | 634.4 MiB | +5.3% | yes | 134 s | 330 s |
+| Selection | Names indexed | Pack | Index | On disk | Adds | Ships | Device build | In 32 MiB |
+|-----------|---------------|------|-------|---------|------|-------|--------------|-----------|
+| smallest (historical) | stored | 95.8 MiB | 36.1 MiB | 56.3 MiB | +37.7% | no | 11 s | 26 s |
+| immich-recommended | stored (before) | 293.43 MiB | 57.50 MiB | 91.89 MiB | +19.60% | no | 18.22 s | 50.51 s |
+| immich-recommended | en | 246.57 MiB | 58.44 MiB | 93.91 MiB | +23.70% | no | 19.08 s | 51.82 s |
+| immich-recommended | all | 293.08 MiB | 95.50 MiB | 168.51 MiB | +32.58% | no | 38.29 s | 93.01 s |
+| with-addresses | stored (before) | 6,208.22 MiB | 364.49 MiB | 634.80 MiB | +5.87% | yes | — | — |
+| with-addresses | all | 6,205.46 MiB | 455.83 MiB | 812.29 MiB | +7.35% | yes | — | — |
+| max-quality | stored (before) | 6,652.48 MiB | 364.50 MiB | 634.80 MiB | +5.48% | yes | — | — |
+| max-quality | all | 6,649.72 MiB | 455.83 MiB | 812.29 MiB | +6.85% | yes | — | — |
 
-The build's peak anonymous memory is 15.4 MiB (smallest) to 24.6 MiB (the
-full selections), and its peak disk, the sort runs beside the index, 151 MiB
-to 1,988 MiB.
+The four-thread planet-only run built the two shipped selections
+sequentially. It took 178.58 s at 1,584,556 KiB peak RSS before and
+235.17 s at 2,021,072 KiB peak RSS with the name bundles. The nightly run
+across all regions used four threads per build with the normal job
+scheduler. It took 90.71 s at 1,583,832 KiB peak RSS before and
+125.35 s at 2,016,184 KiB peak RSS after.
 
-A shipped selection ships it in every region. With-addresses' index adds
-from +2.1% (north-america, 47.0 MiB) to +16.5% (africa, 19.9 MiB) to its
+The earlier stored-name device runs of with-addresses and max-quality
+took 132 and 134 s on one core, and 296 and 330 s under the 32 MiB cap.
+
+The earlier stored-name build used 15.4 MiB of peak anonymous memory for
+smallest and up to 24.6 MiB for the full selections. Its sort runs beside
+the index used 151 MiB to 1,988 MiB of peak disk space.
+
+A shipped selection publishes an index in every region. In the earlier
+stored-name run, the with-addresses index added from +2.1% (north-america, 47.0 MiB) to +16.5% (africa, 19.9 MiB) to its
 regional pack, and +19.2% to antarctica's 0.55 MiB (the same build, its
 regional packs measured on it at zstd -18).
 
