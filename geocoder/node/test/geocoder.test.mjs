@@ -412,6 +412,52 @@ test('a search limit outside 1 to 50 is refused', async () => {
   assert.equal(JSON.parse(await geocoder.searchPlaces('testville', 50)).length, 1);
 });
 
+test('place search opens all installed continents and merges overlapping results', async () => {
+  const dir = mkdtempSync(join(root, 'continents-'));
+  const indexDir = mkdtempSync(join(root, 'continent-search-'));
+  cpSync(dataset(['Testville', 'Testland']), join(dir, 'europe'), { recursive: true });
+  cpSync(dataset(['Testville', 'Testford']), join(dir, 'asia'), { recursive: true });
+  const geocoder = Geocoder.load(dir);
+
+  assert.equal(await geocoder.openPlaceSearch({ indexDir, threads: 2 }), 'built');
+  assert.deepEqual(readdirSync(indexDir).sort(), ['asia', 'europe']);
+  assert.deepEqual(await names(geocoder, 'testville'), ['Testville']);
+  assert.deepEqual((await names(geocoder, 'test')).sort(), ['Testford', 'Testland', 'Testville']);
+  assert.equal(await Geocoder.load(dir).openPlaceSearch({ indexDir }), 'current');
+
+  writeDataset(join(dir, 'asia'), ['Testville', 'Testwood']);
+  await assert.rejects(geocoder.openPlaceSearch({ indexDir }), /changed since it was loaded/);
+  assert.deepEqual(await names(geocoder, 'testford'), ['Testford']);
+  const patched = Geocoder.load(dir);
+  assert.equal(await patched.openPlaceSearch({ indexDir }), 'built');
+  assert.deepEqual(await names(patched, 'testwood'), ['Testwood']);
+});
+
+test('place search options validate and reach the engine', async () => {
+  const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));
+  assert.throws(() => geocoder.openPlaceSearch({ threads: 0 }), /Invalid threads/);
+  await geocoder.openPlaceSearch({ threads: 1 });
+  assert.equal(await geocoder.searchPlaces('testville', undefined, {}), await geocoder.searchPlaces('testville'));
+
+  for (const [options, error] of [
+    [{ lang: 'de' }, /Option not supported: langs/],
+    [{ lat: 0, lon: 0, zoom: 0 }, /Option not supported: bias/],
+    [{ bbox: [0, 0, 1, 1] }, /Option not supported: viewbox/],
+    [{ countrycodes: 'de,US' }, /Option not supported: countries/],
+    [{ layer: 'address,poi' }, /Option not supported: layers/],
+    [{ lang: 'de;q=x' }, /Invalid lang/],
+    [{ lat: 0 }, /lat and lon must be given together/],
+    [{ lon: 181, lat: 0 }, /Invalid lat or lon/],
+    [{ zoom: 10 }, /Location bias needs lat and lon/],
+    [{ zoom: 1.5, lat: 0, lon: 0 }, /Invalid zoom/],
+    [{ bbox: [0, 0, 1] }, /Invalid bbox/],
+    [{ countrycodes: 'deu' }, /Invalid countrycodes/],
+    [{ layer: 'house' }, /Unknown layer: house/],
+  ]) {
+    await assert.rejects(async () => geocoder.searchPlaces('testville', 10, options), error);
+  }
+});
+
 test('search before opening is refused', () => {
   const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));
 
