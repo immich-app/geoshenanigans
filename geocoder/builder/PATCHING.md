@@ -1196,8 +1196,8 @@ own names beside the admin polygons.
 | 40 | `admin_own_names.bin` | merge at stride 8 (v25), string field `name_id` at byte 4 (the slot at 0 a polygon keeps), after the admin geometry |
 | 41, 42 | `strings_tags_core.bin`, `strings_tags_poi.bin` | FCC2 bundle tiers, edited in record order |
 | 43 | reserved for `strings_poi_everything.bin` | |
-| 44, 46 | `place_tags.bin`, `poi_tags.bin` | SDB1 bundle offsets, parallel delta along place and POI rows, string remap |
-| 45 | `admin_tags.bin` | SDB1 bundle offsets, sparse delta by polygon slot, string remap |
+| 44, 46 | `place_tags.bin`, `poi_tags.bin` | STG1 offsets into the names dir's own tier; a parallel delta that carries the parent's merge runs inline (stride 0xFE, v28), except `poi/all`'s `poi_tags.bin`, a sparse delta by row; string remap |
+| 45 | `admin_tags.bin` | STG1 offsets into the names dir's own tier, sparse delta by polygon slot, string remap |
 | 47–49 | `place_imp.bin`, `admin_imp.bin`, `poi_imp.bin` | SDB1 importance values, zero for absent, no remap |
 
 The four admin geometry files (`ADMIN_SLOT_FAMILIES`) follow the place nodes
