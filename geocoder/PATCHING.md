@@ -115,7 +115,9 @@ Take `strings_tags_core.bin`, `place_tags.bin` and `admin_tags.bin` from
 `strings_tags_poi.bin` and `poi_tags.bin` from `names-<value>/` under that tier.
 Install these files in the flat dataset by basename. Each names directory has
 its own patch and its columns use offsets into its own string tier. Search
-indexes derive their names from the installed files.
+indexes derive their names from the installed files. The mode and POI tier
+select the `name-files.<value>-<variant>` components whose sizes appear in
+`component_sizes`.
 
 ### Water directory (optional, pick one)
 
