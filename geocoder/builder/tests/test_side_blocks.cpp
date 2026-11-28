@@ -597,8 +597,8 @@ TEST(tag_blocks_refuse_invalid_extents_and_absent_values_in_the_payload) {
     sb::put32(bytes.data() + footer.table_at + sb::TABLE_ENTRY_BYTES, footer.table_at + 1);
     CHECK_EQ(refusal_of([&] { decode(bytes, file); }), "Malformed place_tags.bin: invalid tag block extent");
 
-    auto full = sb::encode("dense.bin", values.data(), sb::BLOCK_VALUES);
-    full[1] = full[2] = full[3] = full[4] = 0xff;
-    std::copy_n(bytes.end() - 4, 4, full.end() - 4);
-    CHECK(refusal_of([&] { decode(full, file); }) == "Malformed place_tags.bin: invalid presence or size of block 0");
+    const std::vector<uint32_t> absent(sb::BLOCK_VALUES, sb::ABSENT);
+    auto full = sb::encode("dense.bin", absent.data(), absent.size());
+    std::copy(std::begin(sb::TAG_MAGIC), std::end(sb::TAG_MAGIC), full.end() - sizeof(sb::TAG_MAGIC));
+    CHECK_EQ(refusal_of([&] { decode(full, file); }), "Malformed place_tags.bin: invalid presence or size of block 0");
 }

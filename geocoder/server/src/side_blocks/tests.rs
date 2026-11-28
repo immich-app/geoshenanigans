@@ -336,7 +336,8 @@ fn tags_read_a_mixed_block_an_empty_block_and_a_full_block() {
     let mut rows = vec![NO_DATA; 2 * BLOCK_VALUES];
     rows[1] = 42;
     rows[BLOCK_VALUES - 1] = 101;
-    rows.extend([4, 9]);
+    rows.extend([4; BLOCK_VALUES]);
+    rows[2 * BLOCK_VALUES + 1] = 9;
     let tags = open_tags(&encode_tags(&rows)).unwrap();
     assert_eq!(tags.get(0), None);
     assert_eq!(tags.get(1), Some(42));
@@ -364,7 +365,7 @@ fn tag_reader_refuses_invalid_masks_and_a_dense_no_data_value() {
         assert_eq!(tags.get(0), None, "mask {mask}");
         assert_eq!(tags.values().collect::<Vec<_>>(), [None; 3], "mask {mask}");
     }
-    let tags = open_tags(&as_tags(encode(&[NO_DATA]))).unwrap();
+    let tags = open_tags(&as_tags(encode(&[NO_DATA; BLOCK_VALUES]))).unwrap();
     assert_eq!(tags.get(0), None);
-    assert_eq!(tags.values().collect::<Vec<_>>(), [None]);
+    assert_eq!(tags.values().collect::<Vec<_>>(), [None; BLOCK_VALUES]);
 }

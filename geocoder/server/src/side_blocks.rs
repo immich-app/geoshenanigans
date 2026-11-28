@@ -3,7 +3,7 @@
 //! interp_postcodes.bin, addr_postcodes.bin, addr_cities.bin), in blocks of BLOCK_VALUES values,
 //! each FOR or a dictionary, with a table of the blocks' offsets and a footer after them. A
 //! value's id is its record's, and it is read from its block in place. NO_DATA is a value like
-//! any other.
+//! any other in SDB1. An STG1 tag column stores only the present rows of each block.
 
 use crate::coord_keys::{bit_length, bits_at};
 use crate::FileBytes;
@@ -91,7 +91,7 @@ impl SideBlocks {
         let table_at = footer_at
             .checked_sub(blocks * TABLE_ENTRY_BYTES)
             .ok_or_else(|| format!("{name} is shorter than its block table"))?;
-        // A block is its FOR head at the least. 2^26 blocks of 262 bytes pass 32 bits.
+        // A dense block needs its FOR header. An empty tag block uses no bytes.
         if table_at < blocks * min_block || table_at as u64 > blocks as u64 * max_block as u64 {
             return Err(format!("{name} has blocks of a size its values cannot take"));
         }
