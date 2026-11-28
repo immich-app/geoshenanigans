@@ -499,7 +499,6 @@ mod tests {
     use super::*;
     use crate::fixture::{Rng, TempDir};
 
-    /// A test record: a number and a byte, ordered as the pair.
     #[test]
     fn a_front_coded_run_rejects_invalid_or_truncated_keys() {
         let mut key = b"abc".to_vec();
@@ -516,6 +515,7 @@ mod tests {
         assert!(read_prefix(&mut long.as_slice(), &mut key).is_err());
     }
 
+    /// A test record: a number and a byte, ordered as the pair.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     struct Rec(u32, u8);
 
