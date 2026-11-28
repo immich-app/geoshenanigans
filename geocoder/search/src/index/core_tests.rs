@@ -405,15 +405,17 @@ fn full_records_read_outline_bounds_and_optional_host_object_ids() {
     use crate::index::entities::{BBox, EntityRef, OsmKind, OsmRef};
     let tmp = TempDir::new("core-record-geometry");
     let mut f = Geo::default();
-    let poly = f.boundary("County", 6, [1., 2., 3., 4.]);
+    let poly = f.boundary("County", 6, [-3., -4., 1., 2.]);
+    let unused = f.boundary("Excluded level", 14, [0., 0., 1., 1.]);
     f.poi("Bench", 2., 3., 0);
     let geo = f.load(&tmp.0);
     let mut bytes = Vec::new();
-    for word in [0xd0510ead_u32, 1, 1] {
+    for word in [0xd0510ead_u32, 1, 2] {
         bytes.extend(word.to_le_bytes());
     }
     bytes.extend([3, 0, 0, 0]);
     bytes.extend(42u64.to_le_bytes());
+    bytes.extend([0; 12]);
     fs::write(tmp.0.join("admin_polygons.osm_ids"), &bytes).unwrap();
     let e = EntityRef::new(EntityKind::Area, poly).unwrap();
     let out = tmp.0.join("full-index");
@@ -429,10 +431,12 @@ fn full_records_read_outline_bounds_and_optional_host_object_ids() {
         expected.max_lon = expected.max_lon.max(lon);
     }).unwrap();
     assert_eq!(core.areas.bbox(poly), Some(expected));
+    assert_eq!(core.areas.bbox(unused), None);
+    assert_eq!(core.areas.bbox(u32::MAX), None);
     let full = CoreRecords::for_index(&geo, &tmp.0, &core).unwrap();
     let r = full.read(e).unwrap();
     assert_eq!(r.osm, Some(OsmRef { kind: OsmKind::Relation, id: 42 }));
-    assert_eq!(r.bbox, Some(BBox { min_lat: 1., min_lon: 2., max_lat: 3., max_lon: 4. }));
+    assert_eq!(r.bbox, Some(BBox { min_lat: -3., min_lon: -4., max_lat: 1., max_lon: 2. }));
     assert_eq!(full.read(EntityRef::new(EntityKind::Poi, 0).unwrap()).unwrap().osm, None);
     drop(full);
     bytes[13] = 1;

@@ -18,7 +18,7 @@ impl AreaRanges {
         let coord = |i| self.table.field(row, i * size_of::<i32>()).map(|n| i64::from(n as i32));
         let (min_lat, min_lon) = query_server::PointE7 { lat: coord(0)?, lng: coord(1)? }.degrees();
         let (max_lat, max_lon) = query_server::PointE7 { lat: coord(2)?, lng: coord(3)? }.degrees();
-        (min_lat <= max_lat && min_lon <= max_lon).then_some(BBox { min_lat, min_lon, max_lat, max_lon })
+        (min_lat < max_lat && min_lon < max_lon).then_some(BBox { min_lat, min_lon, max_lat, max_lon })
     }
     /// Disjoint half-open ranges, including any sampled intersections.
     pub fn ranges(&self, slot: u32) -> impl Iterator<Item = Range<u32>> + '_ {
