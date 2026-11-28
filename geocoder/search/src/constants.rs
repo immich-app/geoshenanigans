@@ -234,3 +234,38 @@ pub const BREAK_PENALTY_TOKEN: f64 = 0.4;
 /// Coordinates in a nominatim-mode query make a point results lie within this many degrees of
 /// (v1/server_glue.py:313).
 pub const NEAR_RADIUS_DEG: f64 = 0.1;
+/// N-grams a query's words are looked up as: at most this many nodes and characters
+/// (query.py:474-480).
+pub const NGRAM_MAX_NODES: usize = 20;
+pub const NGRAM_MAX_CHARS: usize = 255;
+/// A node's partial is missing at this penalty or more (query.py:184, icu_tokenizer.py:224).
+pub const PARTIAL_MISSING_PENALTY: f64 = 10.0;
+/// Base penalties of a looked-up token (icu_tokenizer.py:60-72): a partial word; a full name of
+/// one character, a digit or not; each character of a house number other than digits and
+/// spaces, and each character but one of a house number without digits; a country of one
+/// character.
+pub const PARTIAL_PENALTY: f64 = 0.3;
+pub const WORD_ONE_DIGIT_PENALTY: f64 = 0.2;
+pub const WORD_ONE_CHAR_PENALTY: f64 = 0.3;
+pub const HOUSENUMBER_NON_DIGIT_PENALTY: f64 = 0.1;
+pub const HOUSENUMBER_NO_DIGIT_PENALTY: f64 = 0.2;
+pub const COUNTRY_ONE_CHAR_PENALTY: f64 = 0.3;
+/// A whole word of at most this many digits and no house-number term reads as a house number at
+/// this penalty (icu_tokenizer.py:244-262).
+pub const DIGITS_HOUSENUMBER_MAX_CHARS: usize = 4;
+pub const DIGITS_HOUSENUMBER_PENALTY: f64 = 0.2;
+/// Where a postcode can be read, every other token pays this, but a house number whose first
+/// word has at most POSTCODE_RERANK_HOUSENUMBER_MAX_CHARS characters (icu_tokenizer.py:270-279).
+pub const POSTCODE_RERANK_PENALTY: f64 = 0.39;
+pub const POSTCODE_RERANK_HOUSENUMBER_MAX_CHARS: usize = 4;
+/// Where a house number of at most this many characters with a digit can be read, every other
+/// token pays SIMPLE_HOUSENUMBER_PENALTY less the house number's own (icu_tokenizer.py:282-291).
+pub const SIMPLE_HOUSENUMBER_MAX_CHARS: usize = 3;
+pub const SIMPLE_HOUSENUMBER_PENALTY: f64 = 0.5;
+/// A token other than a name or a partial pays this many times its match penalty
+/// (icu_tokenizer.py:299-300).
+pub const MATCH_PENALTY_FACTOR_OTHER: f64 = 2.0;
+/// The direction a query is read in is told for at most this many token slots, from two slots'
+/// difference over DIRECTION_TWO_SLOT_DIVISOR or a regression over more (query.py:24-25, 383-396).
+pub const DIRECTION_MAX_SLOTS: usize = 50;
+pub const DIRECTION_TWO_SLOT_DIVISOR: f64 = 3.0;
