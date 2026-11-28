@@ -1,3 +1,8 @@
+//! Shipped chain ids let devices skip point-in-polygon tests. Each record family has
+//! an SDB1 column in its original row order, with NO_DATA for excluded records.
+//! Ids index search_chains.bin in lexicographic level-tuple order. Each tuple is
+//! a varint slot count followed by that many absolute varint polygon slots, outer
+//! levels first. Sorting records by id makes this table a single forward read.
 use super::{
     counts,
     sources::{side, CoreRecords, SourceRow},

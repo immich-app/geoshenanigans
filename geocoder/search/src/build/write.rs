@@ -130,7 +130,7 @@ pub(crate) fn build_core_held(
             let records = CoreRecords::open(geo, set)?;
             let n = chains::build(&records, set, &stage, &tmp, opts, profile)?;
             let chain_s = start.elapsed().as_secs_f64();
-            let (terms, postings) = terms::build(&records, &stage, &tmp, opts, n)?;
+            let (terms, postings) = terms::build(records, &stage, &tmp, opts, n)?;
             let dataset = dataset::core_fingerprint(set, loaded, hashes).map_err(invalid)?;
             let mut bytes = std::collections::BTreeMap::new();
             for &name in CORE_FILES {

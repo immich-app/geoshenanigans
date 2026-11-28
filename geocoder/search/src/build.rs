@@ -9,6 +9,7 @@
 //! geocoder files, a labelled boundary's point too (its label node's).
 mod chains;
 mod counts;
+mod fst_writer;
 pub(crate) mod sources;
 mod terms;
 mod write;

@@ -64,7 +64,8 @@ pub enum TermInfo {
     Category(Category<'static>),
 }
 
-/// Where a term's posting list starts in a sub-index's postings.
+/// A sub-index's reference to a posting list. In the core, an odd value carries a
+/// singleton entity id and an even value carries a file offset, each shifted left by one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PostingRef {
     pub sub: Sub,

@@ -422,3 +422,16 @@ pub const OSM_SLOT_BYTES: usize = 4 + size_of::<u64>();
 pub const OSM_SLOT_TOMBSTONE: u8 = 1;
 pub const NAME_OCCURRENCE: u32 = 0;
 pub const AREA_MEMBERS: u32 = 1;
+/// Fixed-width registry entries bound suffix sharing even for a multilingual alphabet.
+pub const CORE_FST_CACHE_SLOTS: usize = 32 * 1024;
+pub const CORE_FST_CACHE_ARCS: usize = 2;
+pub const FST_ALPHABET: usize = 256;
+pub const FST_STATE_COUNT_MASK: u8 = 0x3f;
+pub const FST_FINAL_FLAG: u8 = 0x40;
+pub const FST_ONE_FLAG: u8 = 0x80;
+pub const FST_NEXT_FLAG: u8 = 0xc0;
+pub const CRC32C_REVERSED: u32 = 0x82f63b78;
+pub const SNAPPY_CRC_MASK: u32 = 0xa282ead8;
+pub const FST_HASH_PRIME: u64 = 1099511628211;
+pub const FST_SIZE_SHIFT: usize = 4;
+pub const SNAPPY_CRC_ROTATION: u32 = 15;

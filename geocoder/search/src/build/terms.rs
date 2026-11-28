@@ -1,3 +1,4 @@
+use super::fst_writer::FstWriter;
 use super::{
     counts::Coverage,
     sources::{CoreRecords, SourceRow},
@@ -15,7 +16,6 @@ use crate::{
     },
     varint,
 };
-use fst::MapBuilder;
 use std::{
     cmp::Reverse,
     collections::{BTreeSet, BinaryHeap},
@@ -343,7 +343,7 @@ impl Prefix {
 fn prefix_files(prefixes: Vec<Prefix>, out: &Path) -> io::Result<()> {
     let mut readers = prefixes.into_iter().map(Prefix::reader).collect::<io::Result<Vec<_>>>()?;
     let mut heads = readers.iter_mut().map(super::read_prefix).collect::<io::Result<Vec<_>>>()?;
-    let mut fst = MapBuilder::new(writer(&out.join("core.pfx.fst"))?).map_err(io::Error::other)?;
+    let mut fst = FstWriter::new(writer(&out.join("core.pfx.fst"))?)?;
     let mut data = writer(&out.join("core.pfx"))?;
     let (mut best, mut buf, mut pos) = (Vec::new(), Vec::new(), 0u64);
     while let Some(first) = heads.iter().flatten().map(|(k, _)| k).min() {
@@ -363,20 +363,21 @@ fn prefix_files(prefixes: Vec<Prefix>, out: &Path) -> io::Result<()> {
         for &(_, id) in &best {
             varint::put(&mut buf, id.into());
         }
-        fst.insert(key, pos).map_err(io::Error::other)?;
+        fst.insert(key, pos)?;
         data.write_all(&buf)?;
         pos += buf.len() as u64;
     }
-    fst.into_inner().map_err(io::Error::other)?.flush()?;
+    fst.finish()?;
     data.flush()
 }
-pub(super) fn build(records: &CoreRecords, out: &Path, tmp: &Path, opts: &BuildOpts, n: u32) -> io::Result<(u64, u64)> {
+pub(super) fn build(records: CoreRecords, out: &Path, tmp: &Path, opts: &BuildOpts, n: u32) -> io::Result<(u64, u64)> {
     let rows = map(&tmp.join("records"))?;
     let areas = AreaRanges::open(out, n)?;
     let budget = crate::sort::run_budget(opts.mem_mb, opts.threads).map_err(invalid)?;
     let mut names = SortedRuns::default();
     std::thread::scope(|scope| -> io::Result<()> {
         let areas = &areas;
+        let records = &records;
         let mut workers = Vec::new();
         let chunk = (n as usize).div_ceil(opts.threads).max(1) * CORE_RECORD_BYTES;
         for (worker, rows) in rows.chunks(chunk).enumerate() {
@@ -387,6 +388,9 @@ pub(super) fn build(records: &CoreRecords, out: &Path, tmp: &Path, opts: &BuildO
         }
         Ok(())
     })?;
+    drop(rows);
+    drop(areas);
+    drop(records);
     merge(names, out, tmp)
 }
 
@@ -394,7 +398,7 @@ fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<(u
     let mut rows = names.merge(tmp, "name-merge")?;
     let mut list = ListWriter::new(tmp)?;
     let mut prefixes = (0..2 * PREFIX_TABLE_MAX_CHARS).map(|i| Prefix::new(tmp, i)).collect::<io::Result<Vec<_>>>()?;
-    let mut fst = MapBuilder::new(writer(&out.join("core.fst"))?).map_err(io::Error::other)?;
+    let mut fst = FstWriter::new(writer(&out.join("core.fst"))?)?;
     let mut post = writer(&out.join("core.post"))?;
     let (mut key, mut prev, mut top, mut pos, mut terms, mut postings) =
         (Vec::new(), Vec::new(), Vec::new(), 0u64, 0u64, 0u64);
@@ -405,7 +409,7 @@ fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<(u
         postings += u64::from(list.df);
         terms += 1;
         let value = list.finish(&mut post, &mut pos, &mut top)?;
-        fst.insert(k, value).map_err(io::Error::other)?;
+        fst.insert(k, value)?;
         if k[0] == TermKind::Word as u8 || k[0] == TermKind::Partial as u8 {
             let token = std::str::from_utf8(k[1..].split(|&b| b == 0).next().unwrap()).map_err(io::Error::other)?;
             let first = if k[0] == TermKind::Word as u8 { 0 } else { PREFIX_TABLE_MAX_CHARS };
@@ -430,7 +434,7 @@ fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<(u
         list.add(row)?;
     }
     flush(&prev, &mut list)?;
-    fst.into_inner().map_err(io::Error::other)?.flush()?;
+    fst.finish()?;
     post.flush()?;
     drop(rows);
     prefix_files(prefixes, out)?;

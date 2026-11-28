@@ -1,5 +1,5 @@
 //! The fst files of a sub-index (its keys and its prefix table), read without trusting their
-//! bytes. The build writes them with the fst crate's MapBuilder (format VERSION); that crate's
+//! bytes. Both builders write the fst crate's map format (VERSION); that crate's
 //! reader decodes each node as if the file were whole, so a damaged one indexes past its end,
 //! overflows, or follows a transition back up to a node it came from and walks without end. Here
 //! a node is read only within the file and below the node whose transition leads to it, so every
@@ -21,9 +21,9 @@ const FOOTER_BYTES: usize = 20;
 /// The address of the final node of no transition and no output, which takes no bytes.
 const EMPTY: usize = 0;
 /// A node of more transitions holds a 256-byte table of them by input.
-const TRANS_INDEX_THRESHOLD: usize = 32;
+pub(crate) const TRANS_INDEX_THRESHOLD: usize = 32;
 /// The inputs a state byte holds itself, by its low six bits less one (fst's common inputs).
-const COMMON_INPUTS: &[u8; 63] = b"te/oasripcnw.hlm-du012g=:bf3y5&_4v9678k%?xCDASFIBEjPTzRNM+LOqHG";
+pub(crate) const COMMON_INPUTS: &[u8; 63] = b"te/oasripcnw.hlm-du012g=:bf3y5&_4v9678k%?xCDASFIBEjPTzRNM+LOqHG";
 
 /// An fst map: a value for each key.
 pub struct Keys<D> {
