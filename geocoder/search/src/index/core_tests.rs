@@ -37,6 +37,11 @@ fn core_membership_counts_and_names_follow_the_dataset() {
         let records = CoreRecords::open(&geo, &set).unwrap();
         assert_eq!(core.entities.len(), 6);
         let west: BTreeSet<_> = [county, city].into_iter().flat_map(|s| core.areas.ranges(s).flatten()).collect();
+        let mut words = core.address_words();
+        let matches: BTreeSet<_> = words.ranges("west").iter().cloned().flatten().collect();
+        assert_eq!(matches, west);
+        assert!(words.ranges("absent").is_empty());
+        assert_eq!(words.ranges("west").iter().cloned().flatten().count(), west.len());
         let mut brute = BTreeSet::new();
         let mut prev = None;
         for id in 0..core.entities.len() {

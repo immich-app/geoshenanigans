@@ -57,3 +57,46 @@ impl AreaRanges {
         .fuse()
     }
 }
+
+/// Address-word unions shared by the alternate searches of one query.
+pub struct AddressWords<'a> {
+    core: &'a super::CoreIndex,
+    words: std::collections::HashMap<String, Vec<Range<u32>>>,
+}
+
+impl super::CoreIndex {
+    pub fn address_words(&self) -> AddressWords<'_> {
+        AddressWords { core: self, words: Default::default() }
+    }
+}
+
+impl AddressWords<'_> {
+    pub fn ranges(&mut self, word: &str) -> &[Range<u32>] {
+        use super::{
+            entities::EntityKind,
+            terms::{TermKind, TermSource},
+        };
+        self.words.entry(word.to_owned()).or_insert_with(|| {
+            let mut ranges = Vec::new();
+            for term in self.core.terms.exact(TermKind::Partial, word) {
+                for posting in term.postings {
+                    let Some(list) = self.core.terms.posting(posting) else { continue };
+                    for id in list.ids().filter(|&id| self.core.entities.kind(id) == Some(EntityKind::Area)) {
+                        if let Some(entity) = self.core.entities.get(id) {
+                            ranges.extend(self.core.areas.ranges(entity.record()));
+                        }
+                    }
+                }
+            }
+            ranges.sort_unstable_by_key(|r| r.start);
+            ranges.dedup_by(|next, prev| {
+                if next.start > prev.end {
+                    return false;
+                }
+                prev.end = prev.end.max(next.end);
+                true
+            });
+            ranges
+        })
+    }
+}
