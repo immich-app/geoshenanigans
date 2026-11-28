@@ -303,7 +303,7 @@ async fn datasets_lists_the_immich_column_among_the_others() {
         p.round(true).await.unwrap();
         let url = serve(router(p, db())).await;
         let json = fetch(&format!("{url}/datasets")).await.json();
-        assert_eq!(json["datasets"].as_array().unwrap().len(), 28);
+        assert_eq!(json["datasets"].as_array().unwrap().len(), 56);
         assert_eq!(json["others"].as_array().unwrap().len(), others);
         let reverse = fetch(&format!("{url}/reverse?lat=10&lon=10&key=test&dataset={}", immich::ID)).await;
         if !with {

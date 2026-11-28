@@ -809,8 +809,8 @@ async fn a_manifest_naming_a_path_or_a_name_the_sync_cant_keep_in_its_build_dir_
         let got = plan_edited(&bucket, |m| m["axes"][axis]["values"][value] = serde_json::json!({ "label": "x", "order": 99 })).await.map(|_| ());
         assert_eq!(got, Err(format!("the manifest's {axis} value {value:?} is not a plain name (letters, digits, '-' and '_')")), "{axis} {value:?}");
     }
-    let got = plan_edited(&bucket, |m| m["axes"]["poi_tier"]["values"]["tmp"] = serde_json::json!({ "label": "x", "order": 99 })).await.map(|_| ());
-    let id = format!("{}.{}.tmp", template_values("mode")[0], template_values("quality")[0]);
+    let got = plan_edited(&bucket, |m| m["axes"]["names"]["values"]["tmp"] = serde_json::json!({ "label": "x", "order": 99 })).await.map(|_| ());
+    let id = format!("{}.{}.{}.tmp", template_values("mode")[0], template_values("quality")[0], template_values("poi_tier")[0]);
     assert_eq!(got, Err(format!("the dataset id {id:?} is not a plain name")));
 }
 
