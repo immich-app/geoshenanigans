@@ -192,7 +192,7 @@ fn in_table(c: char, table: &[(u32, u32)]) -> bool {
 }
 
 /// The value of a decimal digit of any script.
-pub(super) fn decimal_digit(c: char) -> Option<u32> {
+pub(crate) fn decimal_digit(c: char) -> Option<u32> {
     let u = c as u32;
     let i = DECIMAL_ZEROS.partition_point(|&zero| zero <= u);
     let zero = DECIMAL_ZEROS[..i].last()?;
@@ -309,7 +309,7 @@ pub fn transliterated(norm: &str) -> String {
 /// The token as Nominatim's rules leave it before Python strips it: with one space at either end
 /// where the text had space or dropped characters there. House numbers keep it (Nominatim's
 /// house-number analysis does not strip).
-pub(super) fn spaced_token(norm: &str) -> String {
+pub(crate) fn spaced_token(norm: &str) -> String {
     let mut out = String::with_capacity(norm.len());
     let mut space = false;
     let mut buf = [0u8; 4];

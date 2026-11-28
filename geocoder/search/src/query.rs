@@ -3,6 +3,7 @@
 //! mapped index. Context is not stored: a candidate's country / state / county / city come from
 //! reverse geocoding its point with the geocoder itself, only for the candidates that need it.
 pub mod plan;
+pub mod tokenize;
 
 use crate::build::prefix_text;
 use crate::constants::*;

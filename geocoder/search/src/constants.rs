@@ -214,3 +214,20 @@ pub const REF_MAX_CHARS: usize = 40;
 /// The pattern a place's postcode is read by in a country of postcodes and no pattern of its own
 /// (the clean-postcodes default-pattern of Nominatim's settings/sanitizers.yaml).
 pub const POSTCODE_DEFAULT_PATTERN: &str = "[A-Z0-9- ]{3,12}";
+
+// ---- reading a query (query/): Nominatim's penalties, thresholds and limits, each named after
+// the line of Nominatim's search/ that sets it
+/// A query is split into phrases at this character (core.py:280).
+pub const PHRASE_SEPARATOR: char = ',';
+/// A phrase of this many characters or more reads as nothing (settings/query_preprocessing.yaml).
+pub const PHRASE_MAX_CHARS: usize = 500;
+/// A query of more token slots than this is refused (icu_tokenizer.py:132).
+pub const QUERY_MAX_SLOTS: usize = 50;
+/// A node's token of this many characters or more makes no node (icu_tokenizer.py:222).
+pub const NODE_TOKEN_MAX_CHARS: usize = 256;
+/// Penalties of the break before a node (query.py:93-101): the query's start and end and a
+/// phrase break; a word break; a break inside a word; between the terms of one written word.
+pub const BREAK_PENALTY_PHRASE: f64 = -0.5;
+pub const BREAK_PENALTY_WORD: f64 = 0.1;
+pub const BREAK_PENALTY_PART: f64 = 0.2;
+pub const BREAK_PENALTY_TOKEN: f64 = 0.4;
