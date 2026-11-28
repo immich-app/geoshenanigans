@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 use super::normalize::{normalized, transliterated};
-use crate::constants::{NAME_LANGUAGES, NAME_SUFFIXES_WITHOUT_LANGUAGE, VARIANT_MAX_PARTIALS};
+use crate::constants::{NAME_LANGUAGES, NAME_SUFFIXES_WITHOUT_LANGUAGE, TERM_WORD_LANGUAGE_MARK, VARIANT_MAX_PARTIALS};
 
 /// Photon's rule files by language, without Croatian, which neither Photon's analyzer nor
 /// Nominatim applies.
@@ -48,11 +48,14 @@ const COUNTRY_LANGUAGES: &str = include_str!("../../data/variants/country-langua
 /// Letters a language spells in a second way too, every occurrence each way (German: ä as ae).
 const MUTATIONS: [(&str, char, &str); 3] = [("de", 'ä', "ae"), ("de", 'ö', "oe"), ("de", 'ü', "ue")];
 
-/// The token (transliterated) a name or variant is indexed by and the normalised form it was
-/// spelt from, which a query's match is measured against.
+/// A full-name term of a name: the token (transliterated) it is indexed by, its word (the name it
+/// was made from, with the language that varied it: the term's identity beside its token) and its
+/// lookup (the normalised spelling of the token, which a query's match is measured against). They
+/// are the `word_token`, `word` and `info.lookup` of Nominatim's `word` rows.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Spelling {
     pub token: String,
+    pub word: String,
     pub lookup: String,
 }
 
@@ -313,8 +316,9 @@ impl Variants {
     pub fn spellings(&self, norm: &str, language: Option<&str>) -> Vec<Spelling> {
         let Some(lang) = language else {
             let token = transliterated(norm);
-            return if token.is_empty() { Vec::new() } else { vec![Spelling { token, lookup: norm.to_string() }] };
+            return if token.is_empty() { Vec::new() } else { vec![Spelling { token, word: norm.to_string(), lookup: norm.to_string() }] };
         };
+        let word = format!("{norm}{TERM_WORD_LANGUAGE_MARK}{lang}");
         let mut spelt = match self.rules.get(lang) {
             Some(rules) => rules.vary(norm),
             None => vec![norm.to_string()],
@@ -335,7 +339,7 @@ impl Variants {
             .filter(|v| v != norm)
             .filter_map(|lookup| {
                 let token = transliterated(&lookup);
-                (!token.is_empty()).then_some(Spelling { token, lookup })
+                (!token.is_empty()).then(|| Spelling { token, word: word.clone(), lookup })
             })
             .collect();
         out.sort_unstable();
@@ -367,6 +371,8 @@ fn mutated(name: &str, letter: char, spelling: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::terms::{MemTerms, TermInfo, TermKind, TermSource};
+    use crate::text::difflib::{opcodes, Tag};
 
     /// Nominatim's own generic analysis (with the oracle's ICU rules) configured with these rule
     /// files as Nominatim configures its own, over 1,283 names of the oracle and edge cases:
@@ -422,10 +428,33 @@ mod tests {
     }
 
     #[test]
-    fn a_variant_keeps_its_own_spelling_as_lookup_word() {
+    fn a_variant_keeps_its_own_spelling_as_lookup_word_and_its_source_name_as_word() {
         let terms = Variants::get().spellings("liberty park drive", Some("en"));
-        assert!(terms.contains(&Spelling { token: "liberty park dr".into(), lookup: "liberty park dr".into() }), "{terms:?}");
+        let variant = Spelling { token: "liberty park dr".into(), word: "liberty park drive@en".into(), lookup: "liberty park dr".into() };
+        assert!(terms.contains(&variant), "{terms:?}");
         assert!(!terms.iter().any(|t| t.lookup == "liberty park drive"), "the name itself is no variant");
+        let name = Spelling { token: "liberty park drive".into(), word: "liberty park drive".into(), lookup: "liberty park drive".into() };
+        assert_eq!(Variants::get().spellings("liberty park drive", None), [name]);
+    }
+
+    #[test]
+    fn a_variant_and_a_name_spelt_as_it_is_stay_two_terms_that_match_alike() {
+        let mut terms = MemTerms::default();
+        for (name, language, count) in [("Liberty Park Drive", Some("en"), 5), ("Liberty Park Dr", None, 1)] {
+            for s in Variants::get().spellings(&normalized(name), language) {
+                terms.insert(TermKind::Word, &s.token, (&s.word, &s.lookup), (count, 0), TermInfo::None);
+            }
+        }
+        let query: Vec<char> = normalized("Liberty Park Dr").chars().collect();
+
+        let found = terms.exact(TermKind::Word, &transliterated(&normalized("Liberty Park Dr")));
+
+        let words: Vec<(&str, u32)> = found.iter().map(|t| (t.word.as_str(), t.count)).collect();
+        assert_eq!(words, [("liberty park dr", 1), ("liberty park drive@en", 5)]);
+        for term in &found {
+            let lookup: Vec<char> = term.lookup_word.chars().collect();
+            assert!(opcodes(&lookup, &query).iter().all(|o| o.tag == Tag::Equal), "{term:?}");
+        }
     }
 
     #[test]

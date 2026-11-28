@@ -1,10 +1,12 @@
 //! A place's names and address parts as Nominatim's sanitizers leave them for its tokenizer
 //! (`settings/sanitizers.yaml`, then the tokenizer's language tagging), in that order: URLs and
 //! some address kinds dropped, house-number lists split and short interpolations expanded,
-//! multilingual concatenations, name lists, affixes, long or listed refs and brace terms dealt
-//! with, the TIGER county cleaned, and each name given the languages it is varied in.
+//! postcodes formatted, the TIGER county cleaned, multilingual concatenations, name lists,
+//! affixes, long or listed refs and brace terms dealt with, and each name given the languages it
+//! is varied in.
 
 use super::normalize::decimal_digit;
+use super::postcode::PostcodeFormats;
 use super::variants::Variants;
 use crate::constants::{
     HOUSENUMBER_AS_NAME_RUN, HOUSENUMBER_AS_NAME_WORD, INTERPOLATION_EXPAND_BELOW, MULTILINGUAL_DELIMITERS, REF_MAX_CHARS,
@@ -88,6 +90,7 @@ impl Place {
         self.address.retain(|a| !has_url(&a.name) && !a.name.contains('='));
         self.address.retain(|a| !matches!(a.kind.as_str(), "unit" | "floor" | "flats" | "country" | "full" | "inclusion") && !a.kind.starts_with('_'));
         self.clean_housenumbers();
+        self.clean_postcodes(country);
         self.clean_tiger_county();
         self.drop_multilingual_concatenations();
         self.names = self.names.iter().flat_map(split_name_list).collect();
@@ -127,6 +130,19 @@ impl Place {
             }
         }
         self.address = address;
+    }
+
+    /// Each postcode in its country's format (PostcodeFormats::formatted). One the format does not
+    /// read becomes an address part of the kind `unofficial_postcode`, which a search still finds
+    /// as an address word.
+    fn clean_postcodes(&mut self, country: &str) {
+        let formats = PostcodeFormats::get();
+        for part in self.address.iter_mut().filter(|a| a.kind == "postcode") {
+            match formats.formatted(country, &part.name) {
+                Some(code) => part.name = code,
+                None => part.kind = "unofficial_postcode".into(),
+            }
+        }
     }
 
     /// The first `tiger:county` becomes a county ("Travis, TX" -> "Travis").
@@ -398,9 +414,9 @@ fn delimiter_end(value: &str, at: usize) -> Option<usize> {
 mod tests {
     use super::*;
 
-    /// Nominatim's own sanitizers (without clean-postcodes and tag-japanese) over 776 places of the
-    /// oracle chosen for each step: country, names, address, and the names and address parts it
-    /// left (name, kind, suffix, and for names the language).
+    /// Nominatim's own sanitizers (without tag-japanese) over places of the oracle chosen for each
+    /// step: country, names, address, and the names and address parts it left (name, kind,
+    /// suffix, and for names the language).
     const ORACLE: &str = include_str!("../../testdata/sanitize.jsonl");
 
     fn parts(map: &serde_json::Value) -> Vec<PlaceName> {
@@ -520,6 +536,30 @@ mod tests {
         let place = sanitized(&[("addr:conscriptionnumber", "699"), ("addr:streetnumber", "30")], "cz");
         let numbers: Vec<(&str, &str)> = place.address.iter().map(|a| (a.kind.as_str(), a.name.as_str())).collect();
         assert_eq!(numbers, [("housenumber", "699"), ("housenumber", "30")]);
+    }
+
+    #[test]
+    fn a_postcode_takes_its_countrys_format_or_becomes_an_address_word() {
+        for (country, value, kind, name) in [
+            ("nl", "NL-2361AB", "postcode", "2361 AB"),
+            ("nl", "2361ab", "postcode", "2361 AB"),
+            ("us", "78746-1234", "postcode", "78746"),
+            ("ad", "500", "postcode", "AD500"),
+            ("cz", "cz-11000", "postcode", "110 00"),
+            ("ng", "AB 12 3CD EF 45", "postcode", "AB-12-3CD-EF-45"),
+            ("pr", "pr-00901", "postcode", "PR-00901"),
+            ("pr", "straße", "postcode", "STRASSE"),
+            ("nl", "Amsterdam", "unofficial_postcode", "Amsterdam"),
+            ("de", "00000", "unofficial_postcode", "00000"),
+            ("ae", "12345", "unofficial_postcode", "12345"),
+            ("", "12345", "unofficial_postcode", "12345"),
+            ("pr", "ab", "unofficial_postcode", "ab"),
+            ("pr", "1234567890123", "unofficial_postcode", "1234567890123"),
+        ] {
+            let place = sanitized(&[("addr:postcode", value)], country);
+            let parts: Vec<(&str, &str)> = place.address.iter().map(|a| (a.kind.as_str(), a.name.as_str())).collect();
+            assert_eq!(parts, [(kind, name)], "{country} {value}");
+        }
     }
 
     #[test]
