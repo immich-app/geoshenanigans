@@ -231,3 +231,6 @@ pub const BREAK_PENALTY_PHRASE: f64 = -0.5;
 pub const BREAK_PENALTY_WORD: f64 = 0.1;
 pub const BREAK_PENALTY_PART: f64 = 0.2;
 pub const BREAK_PENALTY_TOKEN: f64 = 0.4;
+/// Coordinates in a nominatim-mode query make a point results lie within this many degrees of
+/// (v1/server_glue.py:313).
+pub const NEAR_RADIUS_DEG: f64 = 0.1;

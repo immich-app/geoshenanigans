@@ -1,11 +1,139 @@
 //! A query's text as Nominatim's ICU analyzer reads it: its phrases, preprocessed and normalised,
 //! split into nodes at its breaks (search/icu_tokenizer.py:116-231, search/query.py:93-101,
-//! settings/query_preprocessing.yaml, query_preprocessing/).
+//! settings/query_preprocessing.yaml, query_preprocessing/); and what Nominatim's /search front
+//! door takes out of it first (v1/server_glue.py:303-330, v1/helpers.py:154-221).
 use crate::constants::*;
-use crate::text::normalize::{normalized, spaced_token};
-use crate::text::regex::is_python_space;
+use crate::index::entities::Category;
+use crate::query::plan::NearPoint;
+use crate::text::normalize::{decimal_digit, normalized, spaced_token};
+use crate::text::regex::{is_python_space, Regex};
 use crate::text::Break;
 use std::fmt;
+use std::sync::OnceLock;
+
+/// A query after Nominatim's front door: the text left to read, the point its coordinates named
+/// and the category its `[class=type]` named.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrontDoor {
+    pub q: String,
+    pub near: Option<NearPoint>,
+    pub category: Option<Category<'static>>,
+}
+
+/// `q` through Nominatim's front door: coordinates at its start or end become a point, then the
+/// first `[class=type]` a category.
+pub fn front_door(q: &str) -> FrontDoor {
+    let (q, near) = match coordinates(q) {
+        Some((rest, lat, lon)) => (rest, Some(NearPoint { lat, lon, radius: NEAR_RADIUS_DEG })),
+        None => (q.to_string(), None),
+    };
+    match category(&q) {
+        Some((rest, category)) => FrontDoor { q: rest, near, category: Some(category) },
+        None => FrontDoor { q, near, category: None },
+    }
+}
+
+/// The forms a coordinate pair is written in, each a whole pair (v1/helpers.py:154-174): signed
+/// hemisphere letters before or after degrees, degrees and minutes, degrees, minutes and seconds,
+/// and a plain pair of decimal degrees.
+const COORDINATE_FORMS: [&str; 7] = [
+    r"(?P<ns>[NS])\s*(?P<lat_deg>\d+\.\d+)°?[\s,]+(?P<ew>[EW])\s*(?P<lon_deg>\d+\.\d+)°?",
+    r"(?P<lat_deg>\d+\.\d+)°?\s*(?P<ns>[NS])[\s,]+(?P<lon_deg>\d+\.\d+)°?\s*(?P<ew>[EW])",
+    r"(?P<ns>[NS])\s*(?P<lat_deg>\d+)[°\s]+(?P<lat_min>[\d.]+)[′']*[\s,]+(?P<ew>[EW])\s*(?P<lon_deg>\d+)[°\s]+(?P<lon_min>[\d.]+)[′']*",
+    r"(?P<lat_deg>\d+)[°\s]+(?P<lat_min>[\d.]+)[′']*\s*(?P<ns>[NS])[\s,]+(?P<lon_deg>\d+)[°\s]+(?P<lon_min>[\d.]+)[′']*\s*(?P<ew>[EW])",
+    r#"(?P<ns>[NS])\s*(?P<lat_deg>\d+)[°\s]+(?P<lat_min>\d+)[′'\s]+(?P<lat_sec>[\d.]+)["″]*[\s,]+(?P<ew>[EW])\s*(?P<lon_deg>\d+)[°\s]+(?P<lon_min>\d+)[′'\s]+(?P<lon_sec>[\d.]+)["″]*"#,
+    r#"(?P<lat_deg>\d+)[°\s]+(?P<lat_min>\d+)[′'\s]+(?P<lat_sec>[\d.]+)["″]*\s*(?P<ns>[NS])[\s,]+(?P<lon_deg>\d+)[°\s]+(?P<lon_min>\d+)[′'\s]+(?P<lon_sec>[\d.]+)["″]*\s*(?P<ew>[EW])"#,
+    r"\[?(?P<lat_deg>[+-]?\d+\.\d+)[\s,]+(?P<lon_deg>[+-]?\d+\.\d+)\]?",
+];
+
+/// The first coordinate form that `q` is, written alone or with text on one side of it, as
+/// Python fullmatches `(?:(?P<pre>.*?)\s+)??<form>(?:\s+(?P<post>.*))?`: the text, the latitude
+/// and the longitude.
+fn coordinates(q: &str) -> Option<(String, f64, f64)> {
+    static FORMS: OnceLock<Vec<Regex>> = OnceLock::new();
+    let forms = FORMS.get_or_init(|| COORDINATE_FORMS.iter().map(|f| Regex::parse(f).expect("a coordinate form")).collect());
+    let text: Vec<char> = q.chars().collect();
+    let n = text.len();
+    let spaces_from = |at: usize| at + text[at..].iter().take_while(|&&c| is_python_space(c)).count();
+    // Where the post group's text starts when the form ends at `end`: after its white space, and
+    // only when no line break follows (`.` takes none).
+    let post_at = |end: usize| {
+        let from = spaces_from(end);
+        (from > end && !text[from..].contains(&'\n')).then_some(from)
+    };
+    // The form starts at 0, or after a pre group (the fewest characters, no line break) and the
+    // white space after it: the same start for every pre group within one run of white space.
+    let mut starts = vec![(None, 0)];
+    for k in 0..n {
+        if is_python_space(text[k]) && (k == 0 || !is_python_space(text[k - 1])) {
+            starts.push((Some(k), spaces_from(k)));
+        }
+        if text[k] == '\n' {
+            break;
+        }
+    }
+    for form in forms {
+        let found = starts.iter().find_map(|&(pre, start)| {
+            let m = form.first_match(&text[start..], |end| start + end == n || post_at(start + end).is_some())?;
+            Some((pre, start, m))
+        });
+        let Some((pre, start, m)) = found else { continue };
+        let pre = pre.map(|k| String::from_iter(&text[..k])).filter(|p| !p.is_empty());
+        let post = post_at(start + m.end).map(|from| String::from_iter(&text[from..])).filter(|p| !p.is_empty());
+        if pre.is_some() && post.is_some() {
+            continue;
+        }
+        let group = |name: &str| form.group(name).and_then(|g| m.groups[g]).map(|(s, e)| String::from_iter(&text[start + s..start + e]));
+        let value = |name: &str| group(name).map_or(Some(0.0), |v| python_float(&v));
+        let letter = |name: &str| group(name).unwrap_or_default();
+        // A value Python's float cannot read fails Nominatim's request; here the query reads as
+        // written.
+        let mut lat = value("lat_deg")? + value("lat_min")? / 60.0 + value("lat_sec")? / 3600.0;
+        let mut lon = value("lon_deg")? + value("lon_min")? / 60.0 + value("lon_sec")? / 3600.0;
+        if letter("ns") == "S" {
+            lat = -lat;
+        }
+        if letter("ew") == "W" {
+            lon = -lon;
+        }
+        return Some((pre.or(post).unwrap_or_default(), lat, lon));
+    }
+    None
+}
+
+/// Python's `float()` of a number written in decimal digits of any script.
+fn python_float(s: &str) -> Option<f64> {
+    let ascii: Option<String> = s.chars().map(|c| if matches!(c, '.' | '+' | '-') { Some(c) } else { decimal_digit(c).map(|d| char::from(b'0' + d as u8)) }).collect();
+    ascii?.parse().ok()
+}
+
+/// The first `[class=type]` of `q` (letters and '_' each side) and the text around it on its
+/// line, as Python searches `(?P<pre>.*?)\[(?P<cls>[a-zA-Z_]+)=(?P<typ>[a-zA-Z_]+)\](?P<post>.*)`.
+fn category(q: &str) -> Option<(String, Category<'static>)> {
+    let name = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphabetic() || b == b'_');
+    let mut line_start = 0;
+    for (i, c) in q.char_indices() {
+        if c == '\n' {
+            line_start = i + 1;
+            continue;
+        }
+        if c != '[' {
+            continue;
+        }
+        let rest = &q[i + 1..];
+        let Some(close) = rest.find(']') else { continue };
+        let Some((class, typ)) = rest[..close].split_once('=') else { continue };
+        if !name(class) || !name(typ) {
+            continue;
+        }
+        let pre = q[line_start..i].trim_matches(is_python_space);
+        let after = &rest[close + 1..];
+        let post = after[..after.find('\n').unwrap_or(after.len())].trim_matches(is_python_space);
+        let text = format!("{pre} {post}").trim_matches(is_python_space).to_string();
+        return Some((text, Category { class: class.to_string().into(), typ: typ.to_string().into() }));
+    }
+    None
+}
 
 /// A query node: the break before it and the word from it to the next node.
 #[derive(Clone, Debug, PartialEq)]
@@ -213,6 +341,62 @@ fn split_transliteration(trans: &str, word: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn near(q: &str) -> (String, Option<(f64, f64)>) {
+        let door = front_door(q);
+        let round = |v: f64| (v * 1e6).round() / 1e6;
+        (door.q, door.near.map(|n| (round(n.lat), round(n.lon))))
+    }
+
+    #[test]
+    fn coordinates_at_either_end_become_a_point() {
+        for (q, text, point) in [
+            ("52.5 13.4", "", Some((52.5, 13.4))),
+            ("Berlin 52.5 13.4", "Berlin", Some((52.5, 13.4))),
+            ("52.5, 13.4 Berlin", "Berlin", Some((52.5, 13.4))),
+            ("[52.5, 13.4]", "", Some((52.5, 13.4))),
+            ("-33.9 151.2", "", Some((-33.9, 151.2))),
+            (" 52.5 13.4 ", "", Some((52.5, 13.4))),
+            ("N 52.5 E 13.4", "", Some((52.5, 13.4))),
+            ("52.5 S 13.4 W", "", Some((-52.5, -13.4))),
+            ("N 52 30.5 E 13 24", "", Some((52.508333, 13.4))),
+            ("52°30′N 13°24′E", "", Some((52.5, 13.4))),
+            ("N 52 30 18 E 13 24 36", "", Some((52.505, 13.41))),
+            ("cafe N 52 30 18 E 13 24 36", "cafe", Some((52.505, 13.41))),
+            ("a 52.5 13.4 b", "a 52.5 13.4 b", None),
+            ("1044 Liberty Park Drive", "1044 Liberty Park Drive", None),
+            ("Austin 30.26", "Austin 30.26", None),
+            ("N 52 1.2.3 E 13 4", "N 52 1.2.3 E 13 4", None),
+        ] {
+            assert_eq!(near(q), (text.to_string(), point), "{q}");
+        }
+        assert_eq!(front_door("52.5 13.4").near.map(|n| n.radius), Some(0.1));
+    }
+
+    #[test]
+    fn a_class_and_type_in_brackets_become_a_category() {
+        let cafe = Category { class: "amenity".into(), typ: "cafe".into() };
+        for (q, text, category) in [
+            ("[amenity=cafe] Austin", "Austin", Some(&cafe)),
+            ("cafe [amenity=cafe]", "cafe", Some(&cafe)),
+            ("[amenity=cafe]", "", Some(&cafe)),
+            ("a [b] [amenity=cafe] c", "a [b] c", Some(&cafe)),
+            ("x\n[amenity=cafe] y", "y", Some(&cafe)),
+            ("[amenity=café]", "[amenity=café]", None),
+            ("[amenity=]", "[amenity=]", None),
+        ] {
+            let door = front_door(q);
+            assert_eq!((door.q.as_str(), door.category.as_ref()), (text, category), "{q:?}");
+        }
+    }
+
+    #[test]
+    fn coordinates_go_before_the_category_is_read() {
+        let door = front_door("[amenity=cafe] 52.5 13.4");
+
+        assert_eq!((door.q.as_str(), door.category.map(|c| c.typ.into_owned())), ("", Some("cafe".to_string())));
+        assert_eq!(door.near.map(|n| (n.lat, n.lon)), Some((52.5, 13.4)));
+    }
 
     /// The nodes as Nominatim's debug page writes them: break character, then the token.
     fn written(q: &str) -> String {
