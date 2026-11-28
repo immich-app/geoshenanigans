@@ -127,6 +127,10 @@ impl<R: SortRecord> ExternalSort<R> {
         Self::with_arena_limit(budget, MAX_RUN_ARENA_BYTES, dir, tag)
     }
 
+    pub(crate) fn fixed(budget: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
+        Self::with_arena_limit(budget, 0, dir, tag)
+    }
+
     /// `new` with at most `arena_limit` key bytes per run.
     fn with_arena_limit(budget: usize, arena_limit: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
         let (arena_cap, items_cap) = run_capacities::<R>(budget, arena_limit);

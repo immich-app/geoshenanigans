@@ -188,6 +188,10 @@ fn a_shipped_chain_dictionary_is_read_in_id_order_and_partial_inputs_fail() {
     fs::write(set.join("place_chains.bin"), query_server::side_blocks::encode(&[1])).unwrap();
     fs::write(set.join("poi_chains.bin"), query_server::side_blocks::encode(&[1, 0, 1])).unwrap();
     build("side").unwrap();
+    let fresh = f.load(&set);
+    build_core(&fresh, &crate::dataset::core_stamps(&set).unwrap(), &set, &tmp.0.join("fresh"), Profile::Immich, &opts)
+        .unwrap();
+    assert!(fresh.linked_centres.get().is_none(), "the record scan retained its label table");
     for file in crate::constants::CORE_FILES {
         assert_eq!(
             fs::read(tmp.0.join("side").join(file)).unwrap(),

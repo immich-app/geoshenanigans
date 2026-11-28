@@ -13,7 +13,7 @@ use crate::{
     constants::*,
     index::{
         entities::{EntityKind, EntityRef},
-        invalid, map, small,
+        invalid,
     },
     profile::Profile,
     sort::ExternalSort,
@@ -71,8 +71,7 @@ impl<'a> PointChains<'a> {
 /// Shipped chain ids are in tuple order. Once records have been sorted by id, the
 /// dictionary is consumed front to back, including chains unused by this selection.
 struct Shipped {
-    bytes: memmap2::Mmap,
-    at: usize,
+    reader: std::io::BufReader<std::fs::File>,
     next: u32,
     slots: Vec<u32>,
 }
@@ -80,9 +79,9 @@ impl Shipped {
     fn through(&mut self, id: u32) -> io::Result<&[u32]> {
         while self.next <= id {
             self.slots.clear();
-            let n = small(&self.bytes, &mut self.at).ok_or_else(|| invalid("missing shipped chain"))?;
+            let n = varint::read_u32(&mut self.reader)?;
             for _ in 0..n {
-                self.slots.push(small(&self.bytes, &mut self.at).ok_or_else(|| invalid("short shipped chain"))?);
+                self.slots.push(varint::read_u32(&mut self.reader)?);
             }
             self.next = self.next.checked_add(1).ok_or_else(|| invalid("chain id overflow"))?;
         }
@@ -117,10 +116,17 @@ pub(super) fn build(
 ) -> io::Result<u32> {
     let mut points = PointChains { geo: records.geo, cells: Default::default() };
     let budget = opts.mem_mb << 20;
-    let mut sort = ExternalSort::new(budget, tmp, "chain".into())?;
     let dict = set.join(CHAIN_DICTIONARY);
-    let mut shipped =
-        if dict.try_exists()? { Some(Shipped { bytes: map(&dict)?, at: 0, next: 0, slots: Vec::new() }) } else { None };
+    let mut shipped = if dict.try_exists()? {
+        Some(Shipped { reader: std::io::BufReader::new(std::fs::File::open(dict)?), next: 0, slots: Vec::new() })
+    } else {
+        None
+    };
+    let mut sort = if shipped.is_some() {
+        ExternalSort::fixed(budget / 2, tmp, "chain".into())?
+    } else {
+        ExternalSort::new(budget, tmp, "chain".into())?
+    };
     let mut key = Vec::new();
     for kind in CORE_KINDS {
         let n = records.sizes[kind as usize];
@@ -128,32 +134,43 @@ pub(super) fn build(
         if n > 0 && shipped.is_some() != ids.is_some() {
             return Err(invalid("incomplete shipped chain files"));
         }
+        let mut column = ids.as_ref().map(|ids| ids.values());
+        // The rest of the device build needs these pages for strings and sort runs.
+        let labels = std::sync::OnceLock::new();
         for i in 0..n {
+            let chain = column.as_mut().and_then(|values| values.next()).flatten();
             let e = EntityRef::new(kind, i).ok_or_else(|| invalid("record exceeds entity row"))?;
             let Some(row) = records.row(e) else { continue };
             if matches!(row, SourceRow::Poi(p) if p.tier > opts.poi_max_tier) {
                 continue;
             }
-            let Some((lat, lon)) = row.point(records.geo) else { continue };
+            let point = match row {
+                SourceRow::Area(a) => records
+                    .geo
+                    .area_centre_with(&a, &labels)
+                    .filter(|&(lat, lon)| query_server::coords_in_range(lat, lon)),
+                _ => row.point(records.geo),
+            };
+            let Some((lat, lon)) = point else { continue };
             key.clear();
-            if let Some(ids) = &ids {
-                let id =
-                    ids.get(i).filter(|&id| id != NO_DATA).ok_or_else(|| invalid("incomplete shipped chain files"))?;
-                key.extend_from_slice(&id.to_be_bytes());
+            let chain_id = if shipped.is_some() {
+                chain.filter(|&id| id != NO_DATA).ok_or_else(|| invalid("incomplete shipped chain files"))?
             } else {
                 for field in points.get(lat, lon) {
                     key.extend_from_slice(&field.to_be_bytes())
                 }
-            }
-            sort.push(&key, [e.packed(), u32::from(row.max_rank(records.geo, (lat, lon)))])?;
+                0
+            };
+            sort.push(&key, [chain_id, e.packed(), u32::from(row.max_rank(records.geo, (lat, lon)))])?;
         }
     }
     let mut input = sort.finish()?.merge(tmp, "chain-merge")?;
     let mut ents = EntityWriter::new(out, tmp)?;
     let mut chains = TableWriter::new(out, "core.chn", tmp)?;
-    let mut by_record = ExternalSort::new(budget / 2, tmp, "record".into())?;
-    let mut ranges = ExternalSort::new(budget / 4, tmp, "ranges".into())?;
+    let mut by_record = ExternalSort::fixed(budget / 2, tmp, "record".into())?;
+    let mut ranges = ExternalSort::fixed(budget / 4, tmp, "ranges".into())?;
     let mut prev: Option<Vec<u8>> = None;
+    let mut last_id = 0;
     let mut slots = Vec::new();
     let mut parents = Vec::new();
     let mut previous_rank = 0;
@@ -168,14 +185,15 @@ pub(super) fn build(
     } else {
         None
     };
-    while let Some([packed, rank]) = input.next(&mut key)? {
-        if prev.as_ref() != Some(&key) {
+    while let Some([id, packed, rank]) = input.next(&mut key)? {
+        if id != last_id || prev.as_ref() != Some(&key) {
+            last_id = id;
             transition(&mut parents, 0, n, &mut ranges)?;
             parents.clear();
             previous_rank = 0;
             slots.clear();
             if let Some(dict) = &mut shipped {
-                slots.extend_from_slice(dict.through(u32::from_be_bytes(key[..].try_into().unwrap()))?);
+                slots.extend_from_slice(dict.through(id)?);
             } else {
                 slots.extend(
                     key.chunks_exact(4).filter_map(|b| u32::from_be_bytes(b.try_into().unwrap()).checked_sub(1)),

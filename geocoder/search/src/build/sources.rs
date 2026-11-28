@@ -12,7 +12,9 @@ pub(crate) fn side(path: &Path, count: u32) -> io::Result<Option<SideBlocks>> {
         return Ok(None);
     }
     let name = path.to_str().ok_or_else(|| invalid("non UTF-8 dataset path"))?;
-    let rows = SideBlocks::open(query_server::mmap_file(name).map_err(invalid)?, name).map_err(invalid)?;
+    let bytes = query_server::mmap_file(name).map_err(invalid)?;
+    bytes.advise_in_order(true);
+    let rows = SideBlocks::open(bytes, name).map_err(invalid)?;
     if rows.count() != count {
         return Err(invalid(format!("{} has {} rows, expected {count}", path.display(), rows.count())));
     }
