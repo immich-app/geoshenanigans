@@ -560,3 +560,26 @@ fn an_indexed_record_uses_its_ranked_country_and_recovers_a_missing_country() {
     }
     assert!(core.record(core.entities.len(), &records).is_none());
 }
+
+#[test]
+fn country_names_use_only_their_identity_spelling() {
+    let tmp = TempDir::new("country-spellings");
+    let set = tmp.0.join("set");
+    let mut f = Geo::default();
+    let country = f.boundary("Saint Lucia", 2, [1., 1., 2., 2.]);
+    f.country(country, *b"LC");
+    f.area_tags(country, &[("name:en", "Saint Lucia")]);
+    let geo = f.load(&set);
+    let stamps = crate::dataset::load(&set, || Ok(())).unwrap().1;
+    build_core(&geo, &stamps, &set, &tmp.0, Profile::Immich, &BuildOpts::new(tmp.0.join("tmp"))).unwrap();
+    let core = CoreIndex::open(&tmp.0).unwrap();
+    for (kind, token, present) in [
+        (TermKind::Country, "lc", true),
+        (TermKind::Country, "saint lucia", true),
+        (TermKind::Country, "st lucia", false),
+        (TermKind::Word, "st lucia", true),
+        (TermKind::Partial, "st", true),
+    ] {
+        assert_eq!(!core.terms.exact(kind, token).is_empty(), present, "{kind:?} {token}");
+    }
+}

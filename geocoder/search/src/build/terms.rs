@@ -10,7 +10,7 @@ use crate::{
     index::{areas::AreaRanges, entities::EntityRef, invalid, map, number, terms::TermKind},
     sort::{ExternalSort, SortedRuns},
     text::{
-        normalize::name_normalized,
+        normalize::{name_normalized, normalized, transliterated},
         sanitize::Place,
         variants::{Spelling, Variants},
     },
@@ -124,10 +124,14 @@ fn name_keys(
             for w in s.token.split_whitespace() {
                 keys.push(key(TermKind::Partial, w, w, w, None));
             }
-            if row.is_country() && !country.is_empty() {
-                keys.push(key(TermKind::Country, &s.token, &s.word, &s.lookup, Some(country)));
-            }
         });
+        if row.is_country() && !country.is_empty() {
+            let word = normalized(&n.name);
+            let token = transliterated(&word);
+            if !word.is_empty() && !token.is_empty() {
+                keys.push(key(TermKind::Country, &token, &word, &word, Some(country)));
+            }
+        }
     }
     if row.is_country() && !country.is_empty() {
         keys.push(key(TermKind::Country, country, country, country, Some(country)))
