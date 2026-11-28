@@ -608,3 +608,21 @@ fn search_chain_inputs_belong_to_the_search_snapshot() {
     assert!(search.is_err());
     assert_eq!(query_server::Stamps::of(&tmp.0).unwrap(), before);
 }
+
+#[test]
+fn core_stats_account_for_the_term_build() {
+    let tmp = TempDir::new("term-timings");
+    let set = tmp.0.join("set");
+    let mut f = Geo::default();
+    f.place("Town", 1, 0.5, 0.5);
+    let geo = f.load(&set);
+    let stamps = crate::dataset::load(&set, || Ok(())).unwrap().1;
+    build_core(&geo, &stamps, &set, &tmp.0, Profile::Immich, &BuildOpts::new(tmp.0.join("tmp"))).unwrap();
+    let meta: serde_json::Value = serde_json::from_slice(&fs::read(tmp.0.join("search_meta.json")).unwrap()).unwrap();
+    let stats = &meta["core"];
+    for field in ["emit_s", "sort_s", "merge_s", "fst_s", "prefix_s"] {
+        assert!(stats[field].as_f64().is_some_and(|seconds| seconds > 0.), "{field}");
+    }
+    assert_eq!(stats["sort_runs"], 1);
+    assert_eq!(stats["merge_passes"], 1);
+}

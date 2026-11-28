@@ -23,6 +23,7 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     io::{self, BufReader, BufWriter, Seek, Write},
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 fn key(kind: TermKind, token: &str, word: &str, lookup: &str, cc: Option<&str>) -> Vec<u8> {
@@ -374,7 +375,21 @@ fn prefix_files(prefixes: Vec<Prefix>, out: &Path) -> io::Result<()> {
     fst.finish()?;
     data.flush()
 }
-pub(super) fn build(records: CoreRecords, out: &Path, tmp: &Path, opts: &BuildOpts, n: u32, profile: crate::profile::Profile) -> io::Result<(u64, u64)> {
+#[derive(Default)]
+pub(super) struct TermStats {
+    pub terms: u64,
+    pub postings: u64,
+    pub emit_s: f64,
+    pub sort_s: f64,
+    pub merge_s: f64,
+    pub fst_s: f64,
+    pub prefix_s: f64,
+    pub sort_runs: usize,
+    pub merge_passes: usize,
+}
+
+pub(super) fn build(records: CoreRecords, out: &Path, tmp: &Path, opts: &BuildOpts, n: u32, profile: crate::profile::Profile) -> io::Result<TermStats> {
+    let start = Instant::now();
     let rows = map(&tmp.join("records"))?;
     let areas = AreaRanges::open(out, n, profile)?;
     let budget = crate::sort::run_budget(opts.mem_mb, opts.threads).map_err(invalid)?;
@@ -395,11 +410,20 @@ pub(super) fn build(records: CoreRecords, out: &Path, tmp: &Path, opts: &BuildOp
     drop(rows);
     drop(areas);
     drop(records);
-    merge(names, out, tmp)
+    let emit_s = start.elapsed().as_secs_f64();
+    let mut stats = merge(names, out, tmp)?;
+    stats.emit_s = emit_s;
+    Ok(stats)
 }
 
-fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<(u64, u64)> {
+fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<TermStats> {
+    let start = Instant::now();
+    let mut stats = TermStats { sort_runs: names.len(), sort_s: names.spill_time().as_secs_f64(), ..TermStats::default() };
     let mut rows = names.merge(tmp, "name-merge")?;
+    stats.merge_s = start.elapsed().as_secs_f64();
+    stats.merge_passes = rows.passes();
+    // The final merge streams directly into the posting and FST writers.
+    let start = Instant::now();
     let mut list = ListWriter::new(tmp)?;
     let mut prefixes = (0..2 * PREFIX_TABLE_MAX_CHARS).map(|i| Prefix::new(tmp, i)).collect::<io::Result<Vec<_>>>()?;
     let mut fst = FstWriter::new(writer(&out.join("core.fst"))?)?;
@@ -441,8 +465,13 @@ fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<(u
     fst.finish()?;
     post.flush()?;
     drop(rows);
+    stats.fst_s = start.elapsed().as_secs_f64();
+    let start = Instant::now();
     prefix_files(prefixes, out)?;
-    Ok((terms, postings))
+    stats.prefix_s = start.elapsed().as_secs_f64();
+    stats.terms = terms;
+    stats.postings = postings;
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -464,7 +493,8 @@ mod tests {
         }
         let empty = key(TermKind::Partial, "z", "z", "z", None);
         sort.push(&empty, [2, AREA_MEMBERS, 19]).unwrap();
-        assert_eq!(merge(sort.finish().unwrap(), &dir.0, &dir.0).unwrap(), (2, N.into()));
+        let stats = merge(sort.finish().unwrap(), &dir.0, &dir.0).unwrap();
+        assert_eq!((stats.terms, stats.postings), (2, N.into()));
         let terms = Dictionary::open(&dir.0, N).unwrap();
         let term = &terms.exact(TermKind::Partial, "de")[0];
         let list = terms.posting(term.postings[0]).unwrap();

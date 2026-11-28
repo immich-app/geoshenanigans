@@ -173,6 +173,7 @@ impl<R: SortRecord> ExternalSort<R> {
         if self.items.is_empty() {
             return Ok(());
         }
+        let start = std::time::Instant::now();
         let arena = self.arena.as_slice();
         let key = |it: &Item<R>| &arena[it.off as usize..it.off as usize + it.len as usize];
         self.items.as_mut_slice().sort_unstable_by(|a, b| key(a).cmp(key(b)).then_with(|| a.rec.order(&b.rec)));
@@ -185,6 +186,7 @@ impl<R: SortRecord> ExternalSort<R> {
             self.runs.spilled += write_entry(&mut w, key(it), &it.rec, &mut self.scratch)?;
         }
         w.flush()?;
+        self.runs.spill_time += start.elapsed();
         self.items.clear();
         self.arena.clear();
         Ok(())
@@ -196,12 +198,13 @@ impl<R: SortRecord> ExternalSort<R> {
 pub struct SortedRuns<R> {
     files: RunFiles,
     spilled: u64,
+    spill_time: std::time::Duration,
     _rec: PhantomData<R>,
 }
 
 impl<R> Default for SortedRuns<R> {
     fn default() -> Self {
-        SortedRuns { files: RunFiles::default(), spilled: 0, _rec: PhantomData }
+        SortedRuns { files: RunFiles::default(), spilled: 0, spill_time: Default::default(), _rec: PhantomData }
     }
 }
 
@@ -219,19 +222,24 @@ impl<R: SortRecord> SortedRuns<R> {
         self.spilled
     }
 
+    /// Total worker time spent sorting and writing the initial runs.
+    pub fn spill_time(&self) -> std::time::Duration { self.spill_time }
+
     /// Takes over `other`'s runs, after this one's.
     pub fn append(&mut self, mut other: SortedRuns<R>) {
         self.files.0.append(&mut other.files.0);
         self.spilled += other.spilled;
+        self.spill_time += other.spill_time;
     }
 
     /// Every run's entries in order: the runs are merged in groups of MERGE_FAN_IN into longer
     /// runs in `dir` (named after `tag`) until at most MERGE_FAN_IN are left, which the merge
     /// then reads.
     pub fn merge(self, dir: &Path, tag: &str) -> std::io::Result<Merged<R>> {
-        let (files, rewritten) = reduce_runs::<R>(self.files, dir, tag)?;
+        let (files, rewritten, passes) = reduce_runs::<R>(self.files, dir, tag)?;
         let mut m = Merged::open(files)?;
         m.rewritten = rewritten;
+        m.passes = passes;
         Ok(m)
     }
 }
@@ -242,6 +250,7 @@ pub struct Merged<R> {
     heap: BinaryHeap<Head<R>>,
     files: RunFiles,
     rewritten: u64,
+    passes: usize,
     error: Option<(usize, std::io::Error)>,
 }
 
@@ -258,13 +267,16 @@ impl<R: SortRecord> Merged<R> {
                 heap.push(Head { key, rec, run });
             }
         }
-        Ok(Merged { readers, heap, files, rewritten: 0, error: None })
+        Ok(Merged { readers, heap, files, rewritten: 0, passes: 0, error: None })
     }
 
     /// Bytes the runs over MERGE_FAN_IN were merged into longer runs as.
     pub fn rewritten_bytes(&self) -> u64 {
         self.rewritten
     }
+    /// Merge depth including the final streaming scan, zero for an empty input.
+    pub fn passes(&self) -> usize { self.passes }
+
 
     /// The next entry's record and its key in `key`, or None at the end. A run read failure
     /// returns the same error on this and all subsequent calls.
@@ -303,12 +315,14 @@ fn run_error(path: &Path, e: &std::io::Error) -> std::io::Error {
 /// MERGE_FAN_IN are left (consecutive, so entries that compare equal keep their run order).
 /// Each pass merges every run while more than MERGE_FAN_IN² are left, then only as many of the
 /// last runs as it takes to leave MERGE_FAN_IN. Returns the runs left and the bytes rewritten.
-fn reduce_runs<R: SortRecord>(mut files: RunFiles, dir: &Path, tag: &str) -> std::io::Result<(RunFiles, u64)> {
+fn reduce_runs<R: SortRecord>(mut files: RunFiles, dir: &Path, tag: &str) -> std::io::Result<(RunFiles, u64, usize)> {
+    let mut passes = usize::from(!files.0.is_empty());
     let mut rewritten = 0u64;
     let mut suffix = 0;
     let mut key = Vec::new();
     let mut scratch = vec![0; R::BYTES];
     while files.0.len() > MERGE_FAN_IN {
+        passes += 1;
         let n = files.0.len();
         let excess = n - MERGE_FAN_IN;
         let merged = if n > MERGE_FAN_IN * MERGE_FAN_IN { n } else { excess + excess.div_ceil(MERGE_FAN_IN - 1) };
@@ -340,7 +354,7 @@ fn reduce_runs<R: SortRecord>(mut files: RunFiles, dir: &Path, tag: &str) -> std
         }
         files = next;
     }
-    Ok((files, rewritten))
+    Ok((files, rewritten, passes))
 }
 
 /// One run entry: u16 key length, key, record (`scratch` holds its bytes). Returns the bytes
@@ -504,7 +518,7 @@ mod tests {
     }
 
     fn runs_of(files: Vec<PathBuf>) -> SortedRuns<Rec> {
-        SortedRuns { files: RunFiles(files), spilled: 0, _rec: PhantomData }
+        SortedRuns { files: RunFiles(files), spilled: 0, spill_time: Default::default(), _rec: PhantomData }
     }
 
     /// `n` runs of random entries; returns the run files and every entry.
@@ -704,24 +718,26 @@ mod tests {
         let (files, all) = random_runs(&dir.0, MERGE_FAN_IN + 1, &mut Rng(11));
         let last_two: u64 = files[MERGE_FAN_IN - 1..].iter().map(|f| std::fs::metadata(f).unwrap().len()).sum();
 
-        let (left, rewritten) = reduce_runs::<Rec>(RunFiles(files.clone()), &dir.0, "t").unwrap();
+        let (left, rewritten, passes) = reduce_runs::<Rec>(RunFiles(files.clone()), &dir.0, "t").unwrap();
 
         assert_eq!(left.0.len(), MERGE_FAN_IN);
         assert_eq!(left.0[..MERGE_FAN_IN - 1], files[..MERGE_FAN_IN - 1]);
         assert_eq!(rewritten, last_two);
+        assert_eq!(passes, 2);
         assert!(!files[MERGE_FAN_IN].exists());
         assert_eq!(read_all(Merged::open(left)), all);
     }
 
     #[test]
     fn a_merge_takes_passes_until_the_fan_in_is_left() {
-        for n in [MERGE_FAN_IN, 3 * MERGE_FAN_IN + 5, MERGE_FAN_IN * MERGE_FAN_IN + 3] {
+        for (n, expected_passes) in [(0, 0), (MERGE_FAN_IN, 1), (3 * MERGE_FAN_IN + 5, 2), (MERGE_FAN_IN * MERGE_FAN_IN + 3, 3)] {
             let dir = TempDir::new("sort-reduce");
             let (files, all) = random_runs(&dir.0, n, &mut Rng(n as u64));
 
-            let (left, rewritten) = reduce_runs::<Rec>(RunFiles(files), &dir.0, "t").unwrap();
+            let (left, rewritten, passes) = reduce_runs::<Rec>(RunFiles(files), &dir.0, "t").unwrap();
 
             assert!(left.0.len() <= MERGE_FAN_IN);
+            assert_eq!(passes, expected_passes);
             assert_eq!(rewritten == 0, n <= MERGE_FAN_IN);
             assert_eq!(read_all(Merged::open(left)), all);
         }
