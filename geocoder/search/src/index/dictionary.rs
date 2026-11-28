@@ -134,6 +134,14 @@ impl Automaton for Fuzzy<'_> {
         }
     }
 }
+fn edit_builder(edits: u8) -> Option<&'static LevenshteinAutomatonBuilder> {
+    use crate::constants::PHOTON_MAX_EDITS;
+    use std::sync::OnceLock;
+    static BUILDERS: [OnceLock<LevenshteinAutomatonBuilder>; PHOTON_MAX_EDITS as usize + 1] =
+        [const { OnceLock::new() }; PHOTON_MAX_EDITS as usize + 1];
+    Some(BUILDERS.get(usize::from(edits))?.get_or_init(|| LevenshteinAutomatonBuilder::new(edits, true)))
+}
+
 impl TermSource for Dictionary {
     fn exact(&self, kind: TermKind, token: &str) -> Vec<Term> {
         if token.contains('\0') {
@@ -150,11 +158,25 @@ impl TermSource for Dictionary {
         self.matching(fst::automaton::Str::new(&key).starts_with(), max)
     }
     fn fuzzy(&self, kind: TermKind, word: &str, fuzz: Fuzz, max: usize) -> Vec<Term> {
-        if max == 0 || fuzz.edits > crate::constants::PHOTON_MAX_EDITS {
+        if max == 0 {
             return Vec::new();
         }
-        let dfa = LevenshteinAutomatonBuilder::new(fuzz.edits, true).build_dfa(word);
+        let Some(builder) = edit_builder(fuzz.edits) else { return Vec::new() };
+        let dfa = builder.build_dfa(word);
         let anchor = word.char_indices().nth(fuzz.anchor).map_or(word.len(), |(i, _)| i);
         self.matching(Fuzzy { kind: kind as u8, dfa: &dfa, anchor: &word.as_bytes()[..anchor] }, max)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fuzzy_lookups_share_the_tables_for_each_supported_distance() {
+        for edits in 0..=crate::constants::PHOTON_MAX_EDITS {
+            let builder = edit_builder(edits).unwrap();
+            assert!(std::ptr::eq(builder, edit_builder(edits).unwrap()));
+        }
+        assert!(edit_builder(crate::constants::PHOTON_MAX_EDITS + 1).is_none());
     }
 }
