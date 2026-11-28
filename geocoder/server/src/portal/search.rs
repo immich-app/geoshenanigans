@@ -46,10 +46,6 @@ pub fn open_search(geo: Arc<Index>, loaded: &Stamps, dir: &Path, index: &Path) -
 pub struct Loaded {
     pub id: String,
     pub index: Arc<MultiIndex>,
-    /// The stamps of its files, taken as it loaded (place_search::dataset::load).
-    pub stamps: Stamps,
-    /// Its dir: the files it loaded from.
-    pub dir: PathBuf,
 }
 
 /// Where a group's index is.
@@ -244,13 +240,8 @@ impl Searches {
             let mut origin = Origin::Current;
             for &d in &group.datasets {
                 let dataset = &self.datasets[d];
-                let opened = if let [slot] = dataset.index.continents.as_slice() {
-                    let geo = slot.index.load_full().ok_or("Dataset not loaded")?;
-                    open(geo, &dataset.stamps, &dataset.dir, &dir).map(|(search, origin)| (MultiSearch::single(search), origin))
-                } else {
-                    MultiSearch::open_with(&dataset.index, Some(&dir), &**open)
-                };
-                let (search, opened) = opened.map_err(|e| format!("dataset {}: {e}", dataset.id))?;
+                let (search, opened) = MultiSearch::open_with(&dataset.index, Some(&dir), &**open)
+                    .map_err(|e| format!("dataset {}: {e}", dataset.id))?;
                 if opened == Origin::Built {
                     origin = Origin::Built;
                 }

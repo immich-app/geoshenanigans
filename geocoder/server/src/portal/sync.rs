@@ -632,10 +632,9 @@ impl Portal {
     /// Every dataset of the build dir `name`, whose configurations.json is of
     /// sha256 `manifest_sha256`, loaded, named by its publication ID
     /// (publication_id), and each water dir served beside them, once; or the
-    /// first that doesn't load, and why. Each dataset keeps the stamps of the
-    /// files it loaded from (place_search::dataset::load), which its place
-    /// search opens over; one whose files changed while it loaded doesn't
-    /// load.
+    /// first that doesn't load and why. Refuse a dataset whose files change during
+    /// loading (place_search::dataset::load). Search later opens using the stamps
+    /// that belong to the mapped indexes.
     async fn load(&self, name: &str, plan: Plan, manifest_sha256: String) -> Result<Served, String> {
         let root = self.builds().join(name);
         let (sets, load, dir) = (root.join(SETS), self.config.load.clone(), name.to_string());
@@ -644,10 +643,10 @@ impl Portal {
             let (mut indexes, mut loaded) = (Vec::with_capacity(plan.datasets.len()), Vec::with_capacity(plan.datasets.len()));
             for dataset in &plan.datasets {
                 let set = sets.join(&dataset.id);
-                let (index, stamps) = place_search::dataset::load(&set, || load(&set)).map_err(|e| format!("dataset {}: {e}", dataset.id))?;
+                let (index, _) = place_search::dataset::load(&set, || load(&set)).map_err(|e| format!("dataset {}: {e}", dataset.id))?;
                 let index = Arc::new(index);
                 indexes.push(index.clone());
-                loaded.push(Loaded { id: dataset.id.clone(), index, stamps, dir: set });
+                loaded.push(Loaded { id: dataset.id.clone(), index });
             }
             let water = plan.water.iter()
                 .map(|w| load_water(&sets.join(w.set())).map(Arc::new).map_err(|e| format!("water {}: {e}", w.set())))

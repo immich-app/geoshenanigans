@@ -1680,6 +1680,11 @@ thread_local! {
     static NEAR_BLOCKS: std::cell::RefCell<Vec<postcode_files::NearBlock>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+#[cfg(any(test, feature = "fixtures"))]
+thread_local! {
+    static AFTER_INDEX_MAPPING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 impl Index {
     pub fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
         if let Some(why) = geo_reach_refused(search_distance, street_cell_level) {
@@ -1802,6 +1807,10 @@ impl Index {
             credits: dir_credits(dir),
             search_stamps: before,
         };
+        #[cfg(any(test, feature = "fixtures"))]
+        if let Some(hook) = AFTER_INDEX_MAPPING.take() {
+            hook();
+        }
         index.search_stamps = index.search_stamps.and_then(|before| {
             if stamp()? != before {
                 return Err(format!("The dataset in {dir} changed while it was loading"));

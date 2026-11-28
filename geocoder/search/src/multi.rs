@@ -15,10 +15,6 @@ pub struct MultiSearch {
 }
 
 impl MultiSearch {
-    pub fn single(search: PlaceSearch) -> Self {
-        Self { regions: vec![(None, search)] }
-    }
-
     /// Open the current snapshot of the loaded regions. A flat layout uses the index directory
     /// itself; regional layouts have a separate index per region, under the override when set.
     pub fn open(index: &MultiIndex, index_dir: Option<&Path>, options: &BuildOnDevice) -> Result<(Self, Origin), String> {
@@ -44,7 +40,11 @@ impl MultiSearch {
                 (Some(dir), None) => dir.to_path_buf(),
                 (None, _) => dataset.join(DATASET_SEARCH_DIR),
             };
-            let (search, opened) = open(geo.clone(), geo.search_stamps.as_ref().map_err(Clone::clone)?, &dataset, &output)
+            let (search, opened) = geo
+                .search_stamps
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|stamps| open(geo.clone(), stamps, &dataset, &output))
                 .map_err(|e| format!("{}: {e}", slot.name))?;
             if opened == Origin::Built {
                 origin = Origin::Built;
@@ -132,6 +132,46 @@ mod tests {
         assert!(matches_region(Some(america), Some(Viewbox::Bounded(bbox))));
         assert!(matches_region(Some(europe), Some(Viewbox::Preferred(bbox))));
         assert!(matches_region(None, Some(Viewbox::Bounded(bbox))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_region_replaced_during_install_can_reverse_but_refuses_search_until_reinstalled() {
+        use query_server::arc_fixture::after_next_index_mapping;
+        use query_server::place_files::NODES_FILE;
+
+        let dir = TempDir::new("continent-install-race");
+        let index = load(&dir.0);
+        let europe = dir.0.join("europe");
+        let (lat, lon) = (52.5, 13.4);
+        let mut geo = Geo::default();
+        geo.place("Testville", 1, lat, lon);
+        let country = geo.boundary("Testland", 2, [52.0, 13.0, 53.0, 14.0]);
+        geo.country(country, *b"tl");
+        geo.write(&europe);
+        let nodes = europe.join(NODES_FILE);
+        let patch = dir.0.join("patch");
+        let mut patched = Geo::default();
+        patched.place("Testville", 0, lat, lon);
+        patched.write(&patch);
+        let replacement = patch.join(NODES_FILE);
+        after_next_index_mapping(move || std::fs::rename(replacement, nodes).unwrap());
+
+        index.install_region("europe").unwrap();
+
+        let slot = index.continents.iter().find(|slot| slot.name == "europe").unwrap();
+        let loaded = slot.index.load_full().expect("Europe was installed");
+        assert!(index.query_json(f64::from(lat), f64::from(lon)).contains("Testland"));
+        let reason = format!("The dataset in {} changed while it was loading", europe.display());
+        assert_eq!(loaded.search_stamps.as_ref().unwrap_err(), &reason);
+        let err = MultiSearch::open(&index, None, &BuildOnDevice::default()).err().expect("search refused the changed files");
+        assert_eq!(err, format!("europe: {reason}"));
+
+        index.install_region("europe").unwrap();
+        let (search, origin) = MultiSearch::open(&index, None, &BuildOnDevice::default()).unwrap();
+        assert_eq!(origin, Origin::Built);
+        let (found, _) = search.search(&new_request("Testville", 1)).unwrap();
+        assert_eq!((&*found[0].name, &*found[0].typ), ("Testville", "city"));
     }
 
     #[test]

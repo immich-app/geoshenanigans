@@ -291,7 +291,6 @@ impl PlaceSearch {
     pub(crate) fn candidates(&self, req: &SearchRequest) -> (Vec<Found<'_>>, QueryStats) {
         self.searcher.candidates(&req.q, req.limit)
     }
-
 }
 
 /// Fails for a request this index can't honour: it answers the immich profile in photon mode,
