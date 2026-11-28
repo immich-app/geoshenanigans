@@ -106,10 +106,18 @@ logical_sizes() {
 # every string tier as the diff resolves it (dir, ../full, ../../full), and
 # 64 MiB.
 side_weight_kib() {
-  local dir=$1 mapped=$2 tier f strings=0
+  local dir=$1 mapped=$2 tier source f strings=0 parent=$1
+  case "$dir" in
+    */names-en|*/names-all)
+      if [[ -f "$dir/place_tags.bin" || ( -f "$dir/poi_tags.bin" && "${dir%/*}" != */poi/all ) ]]; then
+        parent=${dir%/*}
+      fi ;;
+  esac
   for tier in core street addr postcode poi tags_core tags_poi; do
-    for f in "$dir" "$dir/../full" "$dir/../../full"; do
-      if [[ "$f" != "$dir" && ( "${dir%/}" == */admin-minimal || "$tier" == tags_* ) ]]; then break; fi
+    source=$parent
+    [[ "$tier" == tags_* ]] && source=$dir
+    for f in "$source" "$source/../full" "$source/../../full"; do
+      if [[ "$f" != "$source" && ( "$source" == */admin-minimal || "$source" == */names-en || "$source" == */names-all || "$tier" == tags_* ) ]]; then break; fi
       if [ -s "$f/strings_$tier.bin" ]; then strings=$((strings + $(size_kib "$f/strings_$tier.bin"))); break; fi
     done
   done

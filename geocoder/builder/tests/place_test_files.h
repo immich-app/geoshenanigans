@@ -21,16 +21,15 @@ inline PlaceNode test_place(float lat, float lng, uint32_t name) {
 }
 
 // The place files of nodes into d: the visible ones (no flags) in their
-// order, the ith of them in the cell of key i / 3 (the patch tools read no
-// cell from a point), then the hidden ones in theirs, whose rows hold no
-// rank, as the builder writes them.
-inline void put_places(gctest::BuildDir& d, const std::vector<PlaceNode>& nodes) {
+// order, places_per_cell to each successive cell key, then the hidden ones in
+// their order. The hidden rows carry no rank.
+inline void put_places(gctest::BuildDir& d, const std::vector<PlaceNode>& nodes, uint32_t places_per_cell = 3) {
     std::vector<uint8_t> cells, blocks, hidden;
     auto into = [](std::vector<uint8_t>& v) { return [&v](const uint8_t* p, size_t n) { v.insert(v.end(), p, p + n); }; };
     place_files::Encoder enc(into(cells), into(blocks), into(hidden));
     uint32_t visible = 0;
     for (const PlaceNode& n : nodes)
-        if (place_files::is_visible(n)) enc.add({n, visible++ / 3});
+        if (place_files::is_visible(n)) enc.add({n, visible++ / places_per_cell});
     for (PlaceNode n : nodes)
         if (!place_files::is_visible(n)) {
             n.rank_address = 0;

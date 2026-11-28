@@ -342,6 +342,7 @@ TEST(patch_format_stride_sentinel_values) {
     CHECK_EQ(SPARSE_DELTA_STRIDE, uint32_t(0xFC));
     CHECK_EQ(COPY_OLD_STRIDE, uint32_t(0xFD));
     CHECK_EQ(PARALLEL_DELTA_STRIDE, uint32_t(0xFA));
+    CHECK_EQ(DETACHED_PARALLEL_STRIDE, uint32_t(0xFE));
     // From 0xFA up a stride is a section kind's or refused (0xFB was the cell
     // list delta's to v18): no merge section has one.
     CHECK_EQ(MAX_RECORD_STRIDE, uint32_t(0xF9));
@@ -368,6 +369,7 @@ TEST(patch_format_stride_sentinels_no_collision_with_real_strides) {
         CHECK(s != SPARSE_DELTA_STRIDE);
         CHECK(s != COPY_OLD_STRIDE);
         CHECK(s != PARALLEL_DELTA_STRIDE);
+        CHECK(s != DETACHED_PARALLEL_STRIDE);
         CHECK(s <= MAX_RECORD_STRIDE);
     }
 }
@@ -420,7 +422,7 @@ TEST(patch_format_magic_and_version) {
     // logical stream; v22: the address points' addr:city side file; v20: the
     // postcode grid's logical stream; v19: the postcode centroids'). The
     // patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(27));
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(28));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }

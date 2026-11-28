@@ -1114,11 +1114,20 @@ static int run(int argc, char* argv[]) {
                       << " bytes from old)" << section_io() << std::endl;
             continue;
         }
-        if (stride == PARALLEL_DELTA_STRIDE) {
+        if (stride == PARALLEL_DELTA_STRIDE || stride == DETACHED_PARALLEL_STRIDE) {
             // v8 side file: the parent's merge replayed at one value per
             // record, then the changed values (see PARALLEL_DELTA_STRIDE).
             uint32_t parent_fid = patch.u32(), value_stride = patch.u32(), remap_kind = patch.u32();
             check_parallel_delta_header(file_id, parent_fid, value_stride, remap_kind);
+            const bool detached = stride == DETACHED_PARALLEL_STRIDE;
+            uint32_t n_runs = 0;
+            const char* runs = nullptr;
+            if (detached) {
+                if (file_id != static_cast<uint32_t>(PatchFileId::PLACE_TAGS) && file_id != static_cast<uint32_t>(PatchFileId::POI_TAGS))
+                    throw std::runtime_error("Detached parallel delta requires a place or POI tag column");
+                n_runs = patch.u32();
+                runs = patch.take_items(n_runs, DETACHED_RUN_BYTES, "detached parallel runs");
+            }
             uint32_t n_ins = patch.u32();
             const char* ins = patch.take_items(n_ins, 4, "parallel values");
             uint32_t n_changes = patch.u32();
@@ -1165,7 +1174,20 @@ static int run(int argc, char* argv[]) {
                 }
             };
             auto sit = merge_seqs.find(parent_fid);
-            if (sit == merge_seqs.end()) {
+            if (detached) {
+                for (uint32_t i = 0; i < n_runs; ++i, runs += DETACHED_RUN_BYTES) {
+                    const uint8_t op = static_cast<uint8_t>(runs[0]);
+                    uint32_t count;
+                    memcpy(&count, runs + 1, sizeof(count));
+                    if (!count || (op != OP_MATCH_RUN && op != OP_INSERT_RUN && op != OP_DELETE_RUN) ||
+                        (op != OP_INSERT_RUN && oi + count > old_size / value_stride) ||
+                        (op != OP_DELETE_RUN && ni + count > new_size / value_stride))
+                        throw std::runtime_error("Malformed detached parallel run");
+                    walk(op, count);
+                }
+                if (oi * value_stride != old_size)
+                    throw std::runtime_error("Detached parallel delta does not consume the old column");
+            } else if (sit == merge_seqs.end()) {
                 walk(OP_MATCH_RUN, static_cast<uint32_t>(new_size / 4));  // parent sent unchanged
             } else {
                 size_t q = sit->second.start, qend = q + sit->second.size;

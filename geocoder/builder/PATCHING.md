@@ -752,7 +752,7 @@ build 23's unit of the old rows with their cells and entries files, and take
 257,858,727 B (245.91 MiB), and with-addresses and max-quality, whose full
 dir holds the same two files, 0.14 MiB more than above too.
 
-## Patch Format (.gcpatch, version 27)
+## Patch Format (.gcpatch, version 28)
 
 Tag row files (`place_tags.bin`, `admin_tags.bin` and `poi_tags.bin`, ids 44–46)
 use STG1 in the dataset and the existing u32 logical rows in the patch.
@@ -923,9 +923,16 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     in cell order, then the hidden ones). A side file goes as a sparse delta
     instead when its parent has no record on the old day, or when it does
     not hold one value per parent record on both days.
+  stride=0xFE (v28): parallel delta for place_tags or a compact poi_tags
+    column in a separate name directory. Between remap_kind and n_inserted
+    it carries n_runs (u32) followed by that many (op u8, count u32) runs
+    from the parent's merge. MATCH also covers parent REPLACE runs since
+    both reuse the old side value. No parent rows are needed to apply it.
+    The slot-ordered admin_tags and poi/all name columns use positional
+    sparse deltas.
   stride=0xFB: none since v19 (to v18 a cell list delta of the postcode
     centroid index): the patcher refuses it as a record stride ("Malformed
-    record stride: <file>"), with 0xFE and 0xFF
+    record stride: <file>"), with 0xFF
   otherwise (a record stride, at most 0xF9, MAX_RECORD_STRIDE): n_runs (u32)
     + n_values (u32) + runs_size (u32) + values_size (u32) + runs + values
     + n_string_fixups (u32, v12) + string_fixups_size (u32) + string fixups

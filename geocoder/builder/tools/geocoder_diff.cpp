@@ -95,13 +95,37 @@ static size_t get_rss_mb() {
 using TierMaps = std::array<MappedFile, STRING_TIER_COUNT>;
 using TierBases = std::array<uint32_t, STRING_TIER_COUNT + 1>;
 
-// Admin-minimal has a local string space. The tag tiers are local to the
-// directory that ships them, even when their layout reserves a wider range.
-static bool borrows_tier(const std::string& dir, size_t tier) {
-    auto component = std::filesystem::path(dir).lexically_normal();
+// The shifting rows of a detached tag column are in its parent directory.
+struct NameParent {
+    std::string dir;
+    PatchFileId records;
+};
+static std::optional<NameParent> name_parent(const std::string& dir) {
+    auto path = std::filesystem::absolute(dir).lexically_normal();
+    if (path.filename().empty()) path = path.parent_path();
+    if (path.filename() != EN_NAMES_DIR && path.filename() != ALL_NAMES_DIR) return {};
+    const auto parent = path.parent_path();
+    if (std::filesystem::exists(path / "place_tags.bin"))
+        return NameParent{parent.string(), PatchFileId::PLACE_NODES};
+    if (std::filesystem::exists(path / "poi_tags.bin") &&
+        !(parent.filename() == "all" && parent.parent_path().filename() == "poi"))
+        return NameParent{parent.string(), PatchFileId::POI_RECORDS};
+    return {};
+}
+
+static std::vector<std::string> tier_paths(const std::string& dir, const std::optional<NameParent>& parent, size_t tier) {
+    if (tier >= STR_TIER_TAGS_CORE) return {dir + "/" + STRING_TIER_FILES[tier]};
+    const auto& source = parent ? parent->dir : dir;
+    std::vector<std::string> paths = {source + "/" + STRING_TIER_FILES[tier]};
+    auto component = std::filesystem::path(source).lexically_normal();
     if (component.filename().empty()) component = component.parent_path();
-    return tier < STR_TIER_TAGS_CORE && component.filename() != "admin-minimal" &&
-           component.filename() != EN_NAMES_DIR && component.filename() != ALL_NAMES_DIR;
+    // Admin-minimal has a local string space.
+    if (component.filename() != "admin-minimal" && component.filename() != EN_NAMES_DIR &&
+        component.filename() != ALL_NAMES_DIR) {
+        paths.push_back(source + "/../full/" + STRING_TIER_FILES[tier]);
+        paths.push_back(source + "/../../full/" + STRING_TIER_FILES[tier]);
+    }
+    return paths;
 }
 
 // Mode dirs can omit tiers and POI dirs can ship just a prefix. Once a
@@ -1014,8 +1038,12 @@ static uint64_t string_pool_size(const std::string& path) {
 static int logical_size(const std::string& dir) {
     if (!std::filesystem::is_directory(dir)) throw std::runtime_error("Not a dir: " + dir);
     uint64_t mapped = 0, scratch = 0;
+    const auto parent = name_parent(dir);
     for (const LogicalFamily& f : logical_families()) {
-        const uint64_t logical = f.logical_size(f, dir);
+        uint64_t logical = f.logical_size(f, dir);
+        if (parent && f.files.front() == std::string(patch_file_names[static_cast<uint32_t>(parent->records)])) {
+            logical += f.logical_size(f, parent->dir);
+        }
         mapped += logical;
         scratch += logical;
     }
@@ -1032,9 +1060,8 @@ static int logical_size(const std::string& dir) {
         mapped += e.file_size();
     }
     for (size_t t = 0; t < STRING_TIER_COUNT; ++t) {
-        for (const char* in : {"/", "/../full/", "/../../full/"}) {
-            if (in[1] && !borrows_tier(dir, t)) break;
-            const uint64_t pool = string_pool_size(dir + in + STRING_TIER_FILES[t]);
+        for (const auto& path : tier_paths(dir, parent, t)) {
+            const uint64_t pool = string_pool_size(path);
             if (pool == 0) continue;
             scratch += pool;
             break;
@@ -1420,6 +1447,24 @@ static int run(int argc, char* argv[]) {
     // The logical files, removed beside the patch's last sections once they
     // are read; the diff ends once they are gone.
     logical_decode::Remover removing;
+    const auto detached = name_parent(new_dir);
+    auto old_parent = detached;
+    if (old_parent) {
+        old_parent->dir = std::filesystem::absolute(std::filesystem::path(old_dir) / "..").lexically_normal().string();
+    }
+    const std::string parent_old = scratch.path() + "/parent-old", parent_new = scratch.path() + "/parent-new";
+    auto decode_name_parent = [](const std::optional<NameParent>& parent, const std::string& to) {
+        if (!parent) return;
+        const auto& families = logical_families();
+        const char* file = patch_file_names[static_cast<uint32_t>(parent->records)];
+        for (const auto& family : families) {
+            if (family.files.front() != std::string_view(file)) continue;
+            std::filesystem::create_directory(to);
+            family.decode(family, parent->dir, to);
+            return;
+        }
+        throw std::logic_error(std::string("No decoder for ") + file);
+    };
     // A shipped tier is rebuilt from the client's own old file, so both
     // sides come from the dir itself. The others are only remapped through
     // and may be borrowed; a newly shipped one is sent whole at the end.
@@ -1437,8 +1482,8 @@ static int run(int argc, char* argv[]) {
     // patches the size of the whole vertex stream.
     std::array<MappedFile, STRING_TIER_COUNT> old_tier_maps{}, new_tier_maps{};
     std::array<uint64_t, STRING_TIER_COUNT> old_tier_hash{}, new_tier_hash{};
-    auto load_tiers = [&](const std::string& dir, const std::string& day, std::array<MappedFile, STRING_TIER_COUNT>& maps,
-                          std::array<uint64_t, STRING_TIER_COUNT>& hashes) {
+    auto load_tiers = [&](const std::string& dir, const std::optional<NameParent>& parent, const std::string& day,
+                          std::array<MappedFile, STRING_TIER_COUNT>& maps, std::array<uint64_t, STRING_TIER_COUNT>& hashes) {
         size_t pools = 0;
         auto load_tier = [&](const std::string& path) {
             return map_string_pool(path, scratch.path() + "/pool-" + day + "-" + std::to_string(pools++));
@@ -1450,13 +1495,8 @@ static int run(int argc, char* argv[]) {
                 hashes[t] = string_tier_file_hash_of(dir + "/" + name);
                 continue;
             }
-            // Only the files of this dir can reference its tag tiers.
-            if (!borrows_tier(dir, t)) {
-                maps[t] = load_tier(dir + "/" + name);
-                continue;
-            }
-            for (const char* in : {"/", "/../full/", "/../../full/"}) {
-                maps[t] = load_tier(dir + in + name);
+            for (const auto& path : tier_paths(dir, parent, t)) {
+                maps[t] = load_tier(path);
                 if (maps[t].size > 0 || maps[t].data != nullptr) break;
             }
         }
@@ -1478,11 +1518,15 @@ static int run(int argc, char* argv[]) {
                 }
             });
         };
-        std::thread t_old = beside(old_failed, [&] { old_has = decode_logical_files(old_dir, old_to); });
-        std::thread t_old_tiers = beside(old_tiers_failed, [&] { load_tiers(old_dir, "old", old_tier_maps, old_tier_hash); });
-        std::thread t_new_tiers = beside(new_tiers_failed, [&] { load_tiers(new_dir, "new", new_tier_maps, new_tier_hash); });
+        std::thread t_old = beside(old_failed, [&] {
+            old_has = decode_logical_files(old_dir, old_to);
+            decode_name_parent(old_parent, parent_old);
+        });
+        std::thread t_old_tiers = beside(old_tiers_failed, [&] { load_tiers(old_dir, old_parent, "old", old_tier_maps, old_tier_hash); });
+        std::thread t_new_tiers = beside(new_tiers_failed, [&] { load_tiers(new_dir, detached, "new", new_tier_maps, new_tier_hash); });
         try {
             new_has = decode_logical_files(new_dir, new_to);
+            decode_name_parent(detached, parent_new);
         } catch (...) {
             new_failed = std::current_exception();
         }
@@ -1548,7 +1592,9 @@ static int run(int argc, char* argv[]) {
     };
     for (const MergedFile& f : MERGED_FILES) {
         const char* name = patch_file_names[static_cast<uint32_t>(f.id)];
-        const uint64_t old_size = merged_size(old_dir, name), new_size = merged_size(new_dir, name);
+        const bool follows = detached && detached->records == f.id;
+        const uint64_t old_size = merged_size(follows ? parent_old : old_dir, name),
+                       new_size = merged_size(follows ? parent_new : new_dir, name);
         require_merge_records(name, old_size, new_size, f.stride, file_records_max);
     }
     if (old_tiers_failed) std::rethrow_exception(old_tiers_failed);
@@ -1635,8 +1681,11 @@ static int run(int argc, char* argv[]) {
     // Group 1: addr_points (independent)
     // Group 2: street_ways → street_nodes (sequential within group)
     // Group 3: interp_ways → interp_nodes (sequential within group)
-    FileMergeResult res_addr, res_addr_v, res_ways, res_nodes, res_interp_w, res_interp_n, res_poi_r, res_poi_v, res_place_n,
-        res_postcodes, res_grid, res_postal;
+    FileMergeResult res_addr, res_addr_v, res_ways, res_nodes, res_interp_w, res_interp_n, res_postcodes, res_grid, res_postal;
+    FileMergeResult res_poi_r{PatchFileId::POI_RECORDS, "poi_records.bin", poi_stride, 0, 0, {}, {}};
+    FileMergeResult res_poi_v{PatchFileId::POI_VERTICES, "poi_vertices.bin", 1, 0, 0, {}, {}};
+    FileMergeResult res_place_n{PatchFileId::PLACE_NODES, "place_nodes.bin", place_stride, 0, 0, {}, {}};
+    FileMergeResult detached_merge{};
 
     // Byte-block merge for the v15 variable-stride vertex stream
     // (poi_vertices / addr_vertices). The vertex bytes for polygon i live
@@ -1986,12 +2035,15 @@ static int run(int argc, char* argv[]) {
     // Group 4: poi_records → poi_vertices (may not exist in old builds)
     std::thread t_poi([&]() {
         double gs = now_ms();
-        auto old_data = mmap_file_rw(merge_path(old_dir, "poi_records.bin"));
-        auto new_data = mmap_file(merge_path(new_dir, "poi_records.bin"));
+        const bool follows = detached && detached->records == PatchFileId::POI_RECORDS;
+        const auto& old_records = follows ? parent_old : old_dir;
+        const auto& new_records = follows ? parent_new : new_dir;
+        FileMergeResult& records = follows ? detached_merge : res_poi_r;
+        auto old_data = mmap_file_rw(merge_path(old_records, "poi_records.bin"));
+        auto new_data = mmap_file(merge_path(new_records, "poi_records.bin"));
         // Handle missing POI files gracefully (new feature, old builds may not have them)
         if (new_data.size == 0 && old_data.size == 0) {
-            res_poi_r = {PatchFileId::POI_RECORDS, "poi_records.bin", poi_stride, 0, 0, MergeSequence{}, {}};
-            res_poi_v = {PatchFileId::POI_VERTICES, "poi_vertices.bin", 1, 0, 0, MergeSequence{}, {}};
+            if (follows) detached_merge = res_poi_r;
             if (old_data.data) unmap_file(old_data);
             if (new_data.data) unmap_file(new_data);
             log_time("  group:poi (empty)", gs);
@@ -2008,8 +2060,8 @@ static int run(int argc, char* argv[]) {
         if (old_data.size > 0)
             remap_string_fields(old_data.data, old_data.size, PatchFileId::POI_RECORDS, poi_stride, str_remap);
 
-        auto old_v = mmap_file(merge_path(old_dir, "poi_vertices.bin"));
-        auto new_v = mmap_file(merge_path(new_dir, "poi_vertices.bin"));
+        auto old_v = mmap_file(merge_path(old_records, "poi_vertices.bin"));
+        auto new_v = mmap_file(merge_path(new_records, "poi_vertices.bin"));
         if (old_v.data) madvise(const_cast<char*>(old_v.data), old_v.size, MADV_SEQUENTIAL);
         if (new_v.data) madvise(const_cast<char*>(new_v.data), new_v.size, MADV_SEQUENTIAL);
         size_t n = old_data.size / poi_stride;
@@ -2027,9 +2079,18 @@ static int run(int argc, char* argv[]) {
                                   return ((uint64_t)name_id << 16) | ((uint64_t)cat << 8) | (vert_count & 0xff);
                               });
         }
-        auto fixups = collect_offset_fixups(old_offsets, old_data.data, poi_stride, POI_RECORD_VERTEX_OFFSET_OFF);
         auto pr_seq = unchanged ? match_all(n)
                                 : build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, poi_stride);
+        if (follows) {
+            records = {PatchFileId::POI_RECORDS, "poi_records.bin", poi_stride,
+                       old_data.size, new_data.size, std::move(pr_seq), {}};
+            unmap_file(old_data);
+            unmap_file(new_data);
+            unmap_file(old_v);
+            unmap_file(new_v);
+            return;
+        }
+        auto fixups = collect_offset_fixups(old_offsets, old_data.data, poi_stride, POI_RECORD_VERTEX_OFFSET_OFF);
         auto soft = secondary_match_from_merge(pr_seq, old_data.data, old_data.size,
             new_data.data, new_data.size, poi_stride,
             [](const char* rec) -> uint64_t {
@@ -2099,11 +2160,13 @@ static int run(int argc, char* argv[]) {
     std::thread t_place([&]() {
         double gs = now_ms();
         // The place files' logical streams (decode_place_files).
-        auto old_data = mmap_file_rw(merge_path(old_dir, place_files::NODES_FILE));
-        auto new_data = mmap_file(merge_path(new_dir, place_files::NODES_FILE));
+        const bool follows = detached && detached->records == PatchFileId::PLACE_NODES;
+        FileMergeResult& records = follows ? detached_merge : res_place_n;
+        auto old_data = mmap_file_rw(merge_path(follows ? parent_old : old_dir, place_files::NODES_FILE));
+        auto new_data = mmap_file(merge_path(follows ? parent_new : new_dir, place_files::NODES_FILE));
         // Handle missing place files gracefully (new feature, old builds may not have them)
         if (new_data.size == 0 && old_data.size == 0) {
-            res_place_n = {PatchFileId::PLACE_NODES, "place_nodes.bin", place_stride, 0, 0, MergeSequence{}, {}};
+            if (follows) detached_merge = res_place_n;
             if (old_data.data) unmap_file(old_data);
             if (new_data.data) unmap_file(new_data);
             log_time("  group:place (empty)", gs);
@@ -2119,9 +2182,9 @@ static int run(int argc, char* argv[]) {
         // runs. No id remap: no file the patch rebuilds holds place node ids.
         auto pn_seq = unchanged ? match_all(old_data.size / place_stride)
                                 : build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, place_stride);
-        res_place_n = {PatchFileId::PLACE_NODES, "place_nodes.bin", place_stride,
-                       old_data.size, new_data.size, pn_seq, {}};
-        log_merge(res_place_n);
+        records = {PatchFileId::PLACE_NODES, "place_nodes.bin", place_stride,
+                       old_data.size, new_data.size, std::move(pn_seq), {}};
+        log_merge(records);
         if (old_data.data) unmap_file(old_data);
         if (new_data.data) unmap_file(new_data);
         log_time("  group:place", gs);
@@ -2768,10 +2831,8 @@ static int run(int argc, char* argv[]) {
 
     // v8: a per-record side file follows its parent's merge (old values of
     // kept records copied and remapped, inserted records' values inline),
-    // then the values that changed. Falls back to the positional sparse
-    // delta when the parent wasn't merged, and with it to a full replacement
-    // of the values of a file the old dir lacks. A file the new dir lacks
-    // gets no section.
+    // then the values that changed. A name tier carries the merge runs
+    // inline when its rows shift and its parent is patched separately.
     auto emit_parallel_delta = [&](const ParallelDeltaFile& f) {
         const char* fname = patch_file_names[(uint32_t)f.fid];
         struct stat nst, ost;
@@ -2781,10 +2842,12 @@ static int run(int argc, char* argv[]) {
         if (stat(new_path.c_str(), &nst) != 0) throw std::runtime_error("Cannot read " + new_path);
         uint64_t new_size = (uint64_t)nst.st_size;
         uint64_t old_size = stat(old_path.c_str(), &ost) == 0 ? (uint64_t)ost.st_size : 0;
-        const FileMergeResult& parent = *parent_merges.at(f.parent);
+        const bool inline_runs = detached && f.parent == detached->records;
+        const FileMergeResult& parent = inline_runs ? detached_merge : *parent_merges.at(f.parent);
         const size_t ps = parent.stride;
         const size_t p_old = ps ? parent.old_size / ps : 0, p_new = ps ? parent.new_size / ps : 0;
-        if (ps == 0 || p_old == 0 || old_size != p_old * f.value_stride || new_size != p_new * f.value_stride) {
+        if (ps == 0 || (!inline_runs && p_old == 0) || old_size != p_old * f.value_stride || new_size != p_new * f.value_stride) {
+            if (inline_runs) throw std::runtime_error(std::string("Tag column row count differs from its parent: ") + fname);
             emit_sparse_delta(f.fid, fname, f.value_stride, f.remap_kind);
             return;
         }
@@ -2824,10 +2887,32 @@ static int run(int argc, char* argv[]) {
         // patcher walks a parent it copied.
         for_each_merge_op(parent.seq, ps, [&](uint8_t op, uint32_t count, const char*) { walk(op, count); });
         if (oi != p_old || ni != p_new) throw std::runtime_error(std::string("Parallel delta walk mismatch: ") + fname);
-        uint32_t fid_u = (uint32_t)f.fid, stride = PARALLEL_DELTA_STRIDE, pfid = (uint32_t)f.parent;
+        uint32_t fid_u = (uint32_t)f.fid, stride = inline_runs ? DETACHED_PARALLEL_STRIDE : PARALLEL_DELTA_STRIDE,
+                 pfid = (uint32_t)f.parent;
         uint32_t vs = f.value_stride, rk = f.remap_kind, n_ins = static_cast<uint32_t>(ins.size());
         wval(patch, &fid_u, 4); wval(patch, &stride, 4); wval(patch, &old_size, 8); wval(patch, &new_size, 8);
         wval(patch, &pfid, 4); wval(patch, &vs, 4); wval(patch, &rk, 4);
+        if (inline_runs) {
+            const size_t count_at = patch.size();
+            uint32_t runs = 0, rows = 0;
+            uint8_t last = OP_MATCH_RUN;
+            wval(patch, &runs, 4);
+            auto flush = [&] {
+                if (!rows) return;
+                wval(patch, &last, 1);
+                wval(patch, &rows, 4);
+                ++runs;
+                rows = 0;
+            };
+            for_each_merge_op(parent.seq, ps, [&](uint8_t op, uint32_t count, const char*) {
+                if (op == OP_REPLACE_RUN) op = OP_MATCH_RUN;
+                if (op != last) flush();
+                last = op;
+                rows += count;
+            });
+            flush();
+            memcpy(patch.data() + count_at, &runs, 4);
+        }
         wval(patch, &n_ins, 4);
         if (n_ins) wval(patch, ins.data(), (size_t)n_ins * 4);
         wval(patch, &n_changes, 4);

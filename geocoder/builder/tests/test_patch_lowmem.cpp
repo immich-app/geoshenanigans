@@ -493,8 +493,11 @@ LogCheck encoder_peaks_at_most(const std::string& family, uint64_t limit) { retu
 // The old and new dirs of a case under root/<name>.{old,new}, the patch
 // between them, and what applying it gave.
 struct LowMemCase {
-    std::string root, name;
-    std::string dir(const std::string& kind) const { return root + "/" + name + "." + kind; }
+    std::string root, name, input_subdir = {};
+    std::string parent(const std::string& kind) const { return root + "/" + name + "." + kind; }
+    std::string dir(const std::string& kind) const {
+        return parent(kind) + ((kind == "old" || kind == "new") ? input_subdir : "");
+    }
     std::string patch() const { return dir("gcpatch"); }
     std::string log() const { return dir("log"); }
 };
@@ -2590,18 +2593,113 @@ TEST(patch_lowmem_rebuilds_a_string_tier_in_any_order) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
-TEST(patch_lowmem_rebuilds_a_name_tier_without_its_parent_rows) {
+TEST(patch_lowmem_follows_detached_place_and_poi_name_rows) {
     ScratchDir dir("names-only");
-    BuildDir old_d, new_d;
-    old_d["strings_tags_core.bin"] = {'a', TAG_KEY_SEP, 'b', 0};
-    new_d["strings_tags_core.bin"] = {'a', TAG_KEY_SEP, 'c', 0, 'a', TAG_KEY_SEP, 'b', 0};
-    for (uint32_t off : {NO_DATA, 0u, NO_DATA, 0u}) append(old_d["place_tags.bin"], off);
-    for (uint32_t off : {NO_DATA, 4u, 0u, NO_DATA}) append(new_d["place_tags.bin"], off);
-    for (uint32_t off : {NO_DATA, NO_DATA}) append(old_d["admin_tags.bin"], off);
-    for (uint32_t off : {NO_DATA, 4u}) append(new_d["admin_tags.bin"], off);
-    const LowMemCase c{dir.path(), "name-tier"};
-    REQUIRE(prepare(c, old_d, new_d).empty());
-    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    constexpr uint32_t ROWS = 4096, INSERT_AT = 7, DELETE_AT = ROWS / 2;
+    for (bool poi : {false, true}) {
+        BuildDir old_parent, new_parent, old_tags, new_tags;
+        const std::string stored("town\0", 5), added("city\0", 5);
+        const uint32_t moved_name = added.size();
+        old_parent["strings_core.bin"].assign(stored.begin(), stored.end());
+        new_parent["strings_core.bin"].assign(added.begin(), added.end());
+        auto& new_pool = new_parent["strings_core.bin"];
+        new_pool.insert(new_pool.end(), stored.begin(), stored.end());
+        auto put_rows = [&](const auto& rows, const auto& inserted, auto put) {
+            auto edited = rows;
+            edited.erase(edited.begin() + DELETE_AT);
+            edited.insert(edited.begin() + INSERT_AT, inserted);
+            put(old_parent, rows, 0);
+            put(new_parent, edited, moved_name);
+        };
+        if (poi) {
+            auto point = [](uint32_t i) {
+                const float coord[] = {47.0f + static_cast<float>(i) * 1e-4f, 8.0f};
+                uint64_t id;
+                memcpy(&id, coord, sizeof(id));
+                return Poi{id, {}};
+            };
+            std::vector<Poi> points;
+            for (uint32_t i = 0; i < ROWS; i++) points.push_back(point(i));
+            put_rows(points, point(ROWS), [](auto& d, const auto& rows, uint32_t name) {
+                put_pois(d, rows, std::vector<uint32_t>(rows.size(), name));
+                auto& records = d["poi_records.bin"];
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    const size_t row = i * POI_RECORD_STRIDE;
+                    put_at(records, row + offsetof(PoiRecord, parent_street_id), NO_DATA);
+                    put_at(records, row + offsetof(PoiRecord, parent_postcode_id), NO_DATA);
+                }
+            });
+        } else {
+            const auto places = some_places(ROWS);
+            PlaceNode inserted = places[INSERT_AT];
+            inserted.lat = (inserted.lat + places[INSERT_AT - 1].lat) / 2;
+            put_rows(places, inserted, [](auto& d, auto rows, uint32_t name) {
+                for (auto& p : rows) {
+                    p._pad1 = 0;
+                    p.name_id = name;
+                    p.parent_poly_id = NO_DATA;
+                }
+                put_places(d, rows, ROWS);
+            });
+        }
+        const char* tags = poi ? "poi_tags.bin" : "place_tags.bin";
+        const char* pool = poi ? "strings_tags_poi.bin" : "strings_tags_core.bin";
+        old_tags[pool] = {'a', TAG_KEY_SEP, 'b', 0};
+        new_tags[pool] = {'a', TAG_KEY_SEP, 'c', 0, 'a', TAG_KEY_SEP, 'b', 0};
+        for (uint32_t i = 0; i < ROWS; i++) {
+            append(old_tags[tags], i % 2 ? NO_DATA : 0u);
+            if (i == INSERT_AT) append(new_tags[tags], 0u);
+            if (i != DELETE_AT) append(new_tags[tags], i % 2 ? NO_DATA : 4u);
+        }
+        const LowMemCase c{dir.path(), poi ? "major" : "admin", poi ? "/names-all" : "/names-en"};
+        REQUIRE(write_dir(c.parent("old"), old_parent));
+        REQUIRE(write_dir(c.parent("new"), new_parent));
+        REQUIRE(prepare(c, old_tags, new_tags).empty());
+        const std::vector<char> raw = raw_patch(c);
+        CHECK(raw.size() < 2048);
+        std::vector<char> header;
+        append(header, uint32_t(poi ? PatchFileId::POI_TAGS : PatchFileId::PLACE_TAGS));
+        append(header, DETACHED_PARALLEL_STRIDE);
+        append(header, uint64_t(ROWS * sizeof(uint32_t)));
+        append(header, uint64_t(ROWS * sizeof(uint32_t)));
+        append(header, uint32_t(poi ? PatchFileId::POI_RECORDS : PatchFileId::PLACE_NODES));
+        append(header, uint32_t(sizeof(uint32_t)));
+        append(header, uint32_t(2));  // string remap
+        const size_t at = find_once(raw, header);
+        REQUIRE(at != std::string::npos);
+        // The patch carries the parent runs so no parent files are needed on the client.
+        for (const auto& file : std::filesystem::directory_iterator(c.parent("old")))
+            if (file.is_regular_file()) std::filesystem::remove(file);
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
+
+        const size_t n_runs = at + header.size(), first = n_runs + sizeof(uint32_t);
+        uint32_t runs;
+        memcpy(&runs, raw.data() + n_runs, sizeof(runs));
+        REQUIRE(runs > 0 && runs <= (raw.size() - first) / DETACHED_RUN_BYTES);
+        size_t match = first;
+        const size_t end = first + runs * DETACHED_RUN_BYTES;
+        while (match < end && raw[match] != OP_MATCH_RUN) match += DETACHED_RUN_BYTES;
+        REQUIRE(match < end);
+        uint32_t match_count;
+        memcpy(&match_count, raw.data() + match + 1, sizeof(match_count));
+        REQUIRE(match_count > 1);
+        for (const auto& [name, change_at, value, refusal] : {
+                 std::tuple<const char*, size_t, uint32_t, const char*>{
+                     "short-runs", n_runs, UINT32_MAX, "bytes for detached parallel runs"},
+                 {"zero-run", first + 1, 0, "Malformed detached parallel run"},
+                 {"run-past-end", first + 1, ROWS + 1, "Malformed detached parallel run"},
+                 {"bad-op", first, OP_REPLACE_RUN, "Malformed detached parallel run"},
+                 {"short-old", match + 1, match_count - 1,
+                  "Detached parallel delta does not consume the old column"},
+             }) {
+            auto edited = raw;
+            if (change_at == first) edited[first] = static_cast<char>(value);
+            else put_at(edited, change_at, value);
+            const auto patch = c.dir(std::string(name) + ".gcpatch");
+            REQUIRE(write_patch(c, patch, edited));
+            CHECK(not_refused(c, ALL_MODES, patch, name, refusal).empty());
+        }
+    }
 }
 
 // A new dir without an encoded family's files (the POI family, both files

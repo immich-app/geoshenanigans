@@ -307,7 +307,7 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // a hidden node). File id 40 names admin_own_names.bin, the own name of each
 // polygon that goes by its place node's English name, which merges as a
 // record file of a string field after the admin geometry.
-static constexpr uint32_t GCPATCH_VERSION = 27;
+static constexpr uint32_t GCPATCH_VERSION = 28;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -781,9 +781,14 @@ inline void require_copy_old_sizes(const std::string& name, uint64_t old_size, u
 //   n_inserted(u32) + [value:u32] x n_inserted,
 //   n_changes(u32) + [(pos:u32, value:u32)] x n_changes (pos ascending)
 constexpr uint32_t PARALLEL_DELTA_STRIDE = 0xFA;
+// A place or POI tag column in a separately patched directory. Between remap_kind and
+// n_inserted it carries n_runs(u32) and that many (op:u8, count:u32) runs. MATCH also
+// represents REPLACE, since both keep the old side value. The runs contain no parent records.
+constexpr uint32_t DETACHED_PARALLEL_STRIDE = 0xFE;
+constexpr size_t DETACHED_RUN_BYTES = sizeof(uint8_t) + sizeof(uint32_t);
 // The widest record a merge section may give (the patcher sizes a record buffer by it): the
 // widest real record is 36 bytes, and a stride from 0xFA (PARALLEL_DELTA_STRIDE) up is a section
-// kind's or none's, refused as a record stride: 0xFB (a cell list delta to v18), 0xFE and 0xFF.
+// kind's or none's, refused as a record stride: 0xFB (a cell list delta to v18) and 0xFF.
 static constexpr uint32_t MAX_RECORD_STRIDE = 0xF9;
 // The most records a merge section's old or new file may hold: record indices are u32s below
 // NO_DATA (0xFFFFFFFF) in the diff's id remaps and secondary matches and in the patcher's
