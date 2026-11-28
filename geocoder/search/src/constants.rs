@@ -211,3 +211,6 @@ pub const INTERPOLATION_EXPAND_BELOW: u128 = 10;
 pub const MULTILINGUAL_DELIMITERS: [char; 3] = ['/', '-', ' '];
 /// A ref longer than this is no name.
 pub const REF_MAX_CHARS: usize = 40;
+/// The pattern a place's postcode is read by in a country of postcodes and no pattern of its own
+/// (the clean-postcodes default-pattern of Nominatim's settings/sanitizers.yaml).
+pub const POSTCODE_DEFAULT_PATTERN: &str = "[A-Z0-9- ]{3,12}";
