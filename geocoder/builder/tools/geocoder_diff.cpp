@@ -1599,6 +1599,20 @@ static int run(int argc, char* argv[]) {
     }
     if (old_tiers_failed) std::rethrow_exception(old_tiers_failed);
     if (new_tiers_failed) std::rethrow_exception(new_tiers_failed);
+    // Ordinary offsets are only used to align the detached column's parent
+    // records. They do not share the tag tier's local offset space.
+    SortedU32Map parent_strings;
+    if (detached) {
+        TierMaps old_records{}, new_records{};
+        std::swap_ranges(old_tier_maps.begin(), old_tier_maps.begin() + STR_TIER_TAGS_CORE, old_records.begin());
+        std::swap_ranges(new_tier_maps.begin(), new_tier_maps.begin() + STR_TIER_TAGS_CORE, new_records.begin());
+        parent_strings = tier_remap(old_records, tier_bases(old_parent->dir, old_records),
+                                    new_records, tier_bases(detached->dir, new_records));
+        for (size_t t = 0; t < STR_TIER_TAGS_CORE; ++t) {
+            unmap_file(old_records[t]);
+            unmap_file(new_records[t]);
+        }
+    }
     const auto old_tier_bases = tier_bases(old_dir, old_tier_maps);
     const auto new_tier_bases = tier_bases(new_dir, new_tier_maps);
     auto str_remap = tier_remap(old_tier_maps, old_tier_bases, new_tier_maps, new_tier_bases);
@@ -2058,7 +2072,8 @@ static int run(int argc, char* argv[]) {
         // (parent_poly_id) is an admin slot, which a polygon keeps.
         const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
         if (old_data.size > 0)
-            remap_string_fields(old_data.data, old_data.size, PatchFileId::POI_RECORDS, poi_stride, str_remap);
+            remap_string_fields(old_data.data, old_data.size, PatchFileId::POI_RECORDS, poi_stride,
+                                follows ? parent_strings : str_remap);
 
         auto old_v = mmap_file(merge_path(old_records, "poi_vertices.bin"));
         auto new_v = mmap_file(merge_path(new_records, "poi_vertices.bin"));
@@ -2176,7 +2191,8 @@ static int run(int argc, char* argv[]) {
         // String remap on name_id field (offset 8); parent_poly_id (byte 16)
         // is an admin slot, which a polygon keeps.
         if (old_data.size > 0)
-            remap_string_fields(old_data.data, old_data.size, PatchFileId::PLACE_NODES, place_stride, str_remap);
+            remap_string_fields(old_data.data, old_data.size, PatchFileId::PLACE_NODES, place_stride,
+                                follows ? parent_strings : str_remap);
         // A merge of the logical rows, the visible nodes in cell order and
         // then the hidden ones: a day's new node is an INSERT among MATCH
         // runs. No id remap: no file the patch rebuilds holds place node ids.

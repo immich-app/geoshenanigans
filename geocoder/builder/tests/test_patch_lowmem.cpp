@@ -2597,19 +2597,21 @@ TEST(patch_lowmem_follows_detached_place_and_poi_name_rows) {
     ScratchDir dir("names-only");
     constexpr uint32_t ROWS = 4096, INSERT_AT = 7, DELETE_AT = ROWS / 2;
     for (bool poi : {false, true}) {
-        BuildDir old_parent, new_parent, old_tags, new_tags;
+        BuildDir old_parent, new_parent, same_pool_parent, old_tags, new_tags;
         const std::string stored("town\0", 5), added("city\0", 5);
         const uint32_t moved_name = added.size();
         old_parent["strings_core.bin"].assign(stored.begin(), stored.end());
         new_parent["strings_core.bin"].assign(added.begin(), added.end());
         auto& new_pool = new_parent["strings_core.bin"];
         new_pool.insert(new_pool.end(), stored.begin(), stored.end());
+        same_pool_parent["strings_core.bin"] = old_parent["strings_core.bin"];
         auto put_rows = [&](const auto& rows, const auto& inserted, auto put) {
             auto edited = rows;
             edited.erase(edited.begin() + DELETE_AT);
             edited.insert(edited.begin() + INSERT_AT, inserted);
             put(old_parent, rows, 0);
             put(new_parent, edited, moved_name);
+            put(same_pool_parent, edited, 0);
         };
         if (poi) {
             auto point = [](uint32_t i) {
@@ -2657,6 +2659,9 @@ TEST(patch_lowmem_follows_detached_place_and_poi_name_rows) {
         REQUIRE(prepare(c, old_tags, new_tags).empty());
         const std::vector<char> raw = raw_patch(c);
         CHECK(raw.size() < 2048);
+        REQUIRE(write_dir(c.parent("new"), same_pool_parent));
+        REQUIRE(prepare(c, old_tags, new_tags).empty());
+        CHECK(raw_patch(c) == raw);
         std::vector<char> header;
         append(header, uint32_t(poi ? PatchFileId::POI_TAGS : PatchFileId::PLACE_TAGS));
         append(header, DETACHED_PARALLEL_STRIDE);
