@@ -482,9 +482,7 @@
       ],
       "optional_files": [
         "{region}/poi/major/poi_imp.bin",
-        "{region}/poi/major/poi_attribution.json",
-        "{region}/poi/major/names-{names}/strings_tags_poi.bin",
-        "{region}/poi/major/names-{names}/poi_tags.bin"
+        "{region}/poi/major/poi_attribution.json"
       ]
     },
     "poi_tier.notable": {
@@ -498,9 +496,7 @@
       ],
       "optional_files": [
         "{region}/poi/notable/poi_imp.bin",
-        "{region}/poi/notable/poi_attribution.json",
-        "{region}/poi/notable/names-{names}/strings_tags_poi.bin",
-        "{region}/poi/notable/names-{names}/poi_tags.bin"
+        "{region}/poi/notable/poi_attribution.json"
       ]
     },
     "poi_tier.all": {
@@ -514,9 +510,7 @@
       ],
       "optional_files": [
         "{region}/poi/all/poi_imp.bin",
-        "{region}/poi/all/poi_attribution.json",
-        "{region}/poi/all/names-{names}/strings_tags_poi.bin",
-        "{region}/poi/all/names-{names}/poi_tags.bin"
+        "{region}/poi/all/poi_attribution.json"
       ]
     },
     "water.none": {
@@ -574,50 +568,225 @@
       ]
     },
     "names.en": {
-      "extends": "name-files.core"
-    },
-    "names.all": {
-      "extends": "name-files.core"
-    },
-    "name-files.minimal": {
-      "optional_files": [
-        "{region}/admin-minimal/names-{names}/strings_tags_core.bin",
-        "{region}/admin-minimal/names-{names}/place_tags.bin",
-        "{region}/admin-minimal/names-{names}/admin_tags.bin"
-      ]
-    },
-    "name-files.minimal-poi": {
-      "optional_files": [
-        "{region}/admin-minimal-poi/names-{names}/strings_tags_core.bin",
-        "{region}/admin-minimal-poi/names-{names}/place_tags.bin",
-        "{region}/admin-minimal-poi/names-{names}/admin_tags.bin"
-      ]
-    },
-    "name-files.mode": {
-      "optional_files": [
-        "{region}/{mode}/names-{names}/strings_tags_core.bin",
-        "{region}/{mode}/names-{names}/place_tags.bin",
-        "{region}/{mode}/names-{names}/admin_tags.bin"
-      ]
-    },
-    "name-files.core": {
+      "extends": "name-files.en-poi",
       "variants": [
         {
           "when": {
             "mode": "admin-minimal",
             "poi_tier": "none"
           },
-          "component": "name-files.minimal"
+          "component": "name-files.en-admin-minimal"
         },
         {
           "when": {
             "mode": "admin-minimal"
           },
-          "component": "name-files.minimal-poi"
+          "component": "name-files.en-admin-minimal-poi"
         },
         {
-          "component": "name-files.mode"
+          "when": {
+            "mode": "admin"
+          },
+          "component": "name-files.en-admin"
+        },
+        {
+          "when": {
+            "mode": "no-addresses"
+          },
+          "component": "name-files.en-no-addresses"
+        },
+        {
+          "when": {
+            "mode": "full"
+          },
+          "component": "name-files.en-full"
         }
+      ]
+    },
+    "name-files.en-poi": {
+      "variants": [
+        {
+          "when": {
+            "poi_tier": "major"
+          },
+          "component": "name-files.en-poi-major"
+        },
+        {
+          "when": {
+            "poi_tier": "notable"
+          },
+          "component": "name-files.en-poi-notable"
+        },
+        {
+          "when": {
+            "poi_tier": "all"
+          },
+          "component": "name-files.en-poi-all"
+        }
+      ]
+    },
+    "name-files.en-admin-minimal": {
+      "optional_files": [
+        "{region}/admin-minimal/names-en/strings_tags_core.bin",
+        "{region}/admin-minimal/names-en/place_tags.bin",
+        "{region}/admin-minimal/names-en/admin_tags.bin"
+      ]
+    },
+    "name-files.en-admin-minimal-poi": {
+      "optional_files": [
+        "{region}/admin-minimal-poi/names-en/strings_tags_core.bin",
+        "{region}/admin-minimal-poi/names-en/place_tags.bin",
+        "{region}/admin-minimal-poi/names-en/admin_tags.bin"
+      ]
+    },
+    "name-files.en-admin": {
+      "optional_files": [
+        "{region}/admin/names-en/strings_tags_core.bin",
+        "{region}/admin/names-en/place_tags.bin",
+        "{region}/admin/names-en/admin_tags.bin"
+      ]
+    },
+    "name-files.en-no-addresses": {
+      "optional_files": [
+        "{region}/no-addresses/names-en/strings_tags_core.bin",
+        "{region}/no-addresses/names-en/place_tags.bin",
+        "{region}/no-addresses/names-en/admin_tags.bin"
+      ]
+    },
+    "name-files.en-full": {
+      "optional_files": [
+        "{region}/full/names-en/strings_tags_core.bin",
+        "{region}/full/names-en/place_tags.bin",
+        "{region}/full/names-en/admin_tags.bin"
+      ]
+    },
+    "name-files.en-poi-major": {
+      "optional_files": [
+        "{region}/poi/major/names-en/strings_tags_poi.bin",
+        "{region}/poi/major/names-en/poi_tags.bin"
+      ]
+    },
+    "name-files.en-poi-notable": {
+      "optional_files": [
+        "{region}/poi/notable/names-en/strings_tags_poi.bin",
+        "{region}/poi/notable/names-en/poi_tags.bin"
+      ]
+    },
+    "name-files.en-poi-all": {
+      "optional_files": [
+        "{region}/poi/all/names-en/strings_tags_poi.bin",
+        "{region}/poi/all/names-en/poi_tags.bin"
+      ]
+    },
+    "names.all": {
+      "extends": "name-files.all-poi",
+      "variants": [
+        {
+          "when": {
+            "mode": "admin-minimal",
+            "poi_tier": "none"
+          },
+          "component": "name-files.all-admin-minimal"
+        },
+        {
+          "when": {
+            "mode": "admin-minimal"
+          },
+          "component": "name-files.all-admin-minimal-poi"
+        },
+        {
+          "when": {
+            "mode": "admin"
+          },
+          "component": "name-files.all-admin"
+        },
+        {
+          "when": {
+            "mode": "no-addresses"
+          },
+          "component": "name-files.all-no-addresses"
+        },
+        {
+          "when": {
+            "mode": "full"
+          },
+          "component": "name-files.all-full"
+        }
+      ]
+    },
+    "name-files.all-poi": {
+      "variants": [
+        {
+          "when": {
+            "poi_tier": "major"
+          },
+          "component": "name-files.all-poi-major"
+        },
+        {
+          "when": {
+            "poi_tier": "notable"
+          },
+          "component": "name-files.all-poi-notable"
+        },
+        {
+          "when": {
+            "poi_tier": "all"
+          },
+          "component": "name-files.all-poi-all"
+        }
+      ]
+    },
+    "name-files.all-admin-minimal": {
+      "optional_files": [
+        "{region}/admin-minimal/names-all/strings_tags_core.bin",
+        "{region}/admin-minimal/names-all/place_tags.bin",
+        "{region}/admin-minimal/names-all/admin_tags.bin"
+      ]
+    },
+    "name-files.all-admin-minimal-poi": {
+      "optional_files": [
+        "{region}/admin-minimal-poi/names-all/strings_tags_core.bin",
+        "{region}/admin-minimal-poi/names-all/place_tags.bin",
+        "{region}/admin-minimal-poi/names-all/admin_tags.bin"
+      ]
+    },
+    "name-files.all-admin": {
+      "optional_files": [
+        "{region}/admin/names-all/strings_tags_core.bin",
+        "{region}/admin/names-all/place_tags.bin",
+        "{region}/admin/names-all/admin_tags.bin"
+      ]
+    },
+    "name-files.all-no-addresses": {
+      "optional_files": [
+        "{region}/no-addresses/names-all/strings_tags_core.bin",
+        "{region}/no-addresses/names-all/place_tags.bin",
+        "{region}/no-addresses/names-all/admin_tags.bin"
+      ]
+    },
+    "name-files.all-full": {
+      "optional_files": [
+        "{region}/full/names-all/strings_tags_core.bin",
+        "{region}/full/names-all/place_tags.bin",
+        "{region}/full/names-all/admin_tags.bin"
+      ]
+    },
+    "name-files.all-poi-major": {
+      "optional_files": [
+        "{region}/poi/major/names-all/strings_tags_poi.bin",
+        "{region}/poi/major/names-all/poi_tags.bin"
+      ]
+    },
+    "name-files.all-poi-notable": {
+      "optional_files": [
+        "{region}/poi/notable/names-all/strings_tags_poi.bin",
+        "{region}/poi/notable/names-all/poi_tags.bin"
+      ]
+    },
+    "name-files.all-poi-all": {
+      "optional_files": [
+        "{region}/poi/all/names-all/strings_tags_poi.bin",
+        "{region}/poi/all/names-all/poi_tags.bin"
       ]
     }
   },

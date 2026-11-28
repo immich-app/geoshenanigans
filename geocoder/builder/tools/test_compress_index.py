@@ -1080,6 +1080,20 @@ class TemplateAttributionTest(unittest.TestCase):
         # Marine Regions' seas and oceans are in the water dirs alone.
         self.assertEqual(self.applies(self.entries[5]), ["water.all", "water.all-exact", "water.major"])
 
+    def test_each_names_value_has_component_sizes_for_its_mode_and_poi_files(self):
+        files, expected = {}, {}
+        for names in ("en", "all"):
+            for folder in ("admin-minimal", "admin-minimal-poi", "admin", "no-addresses", "full",
+                           "poi/major", "poi/notable", "poi/all"):
+                leaf = f"name-files.{names}-{folder.replace('/', '-')}"
+                columns = ("strings_tags_poi", "poi_tags") if folder.startswith("poi/") else (
+                    "strings_tags_core", "place_tags", "admin_tags")
+                for column in columns:
+                    files[f"planet/{folder}/names-{names}/{column}.bin"] = {"size_raw": 40, "size_zst": 20}
+                expected[leaf] = {"raw": 40 * len(columns), "wire": 20 * len(columns)}
+        cfg = {"components": self.components, "axes": {"region": {"values": {"planet": {}}}}}
+        self.assertEqual(sut.component_sizes(cfg, files, {}), {"planet": expected})
+
     def test_each_poi_tier_lists_its_poi_attribution_json_as_optional(self):
         # The builder writes it only where Wikidata's sitelinks ranked the POIs (--wikidata-sitelinks),
         # by a name of its own: downloads land flat by name, beside the mode dir's attribution.json.
