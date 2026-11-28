@@ -29,9 +29,8 @@ namespace gctest {
 // interp_ways.bin the 12- and 24-byte records, street_nodes.bin and
 // interp_nodes.bin their ways' nodes back to back, addr_points.bin the
 // 28-byte records, addr_vertices.bin their footprints' logical blobs back to
-// back, a side file (way_parents.bin, way_postcodes.bin,
-// interp_postcodes.bin, addr_postcodes.bin, addr_cities.bin) its u32 values,
-// a strings_*.bin its pool.
+// back, a side file (side_blocks.h SIDE_FILES) its u32 values, a
+// strings_*.bin its pool.
 using BuildDir = std::map<std::string, std::vector<char>>;
 
 inline bool is_string_tier(const std::string& name) {
@@ -126,17 +125,16 @@ inline void write_addr_family(const WrittenFamily& family, const BuildDir& files
 }
 
 inline const std::vector<WrittenFamily>& written_families() {
-    static const std::vector<WrittenFamily> f = {
-        {"poi_records.bin", write_poi_family},
-        {"street_ways.bin", write_way_pair},
-        {"interp_ways.bin", write_way_pair},
-        {"addr_points.bin", write_addr_family},
-        {"way_parents.bin", write_side_file},
-        {"way_postcodes.bin", write_side_file},
-        {"interp_postcodes.bin", write_side_file},
-        {"addr_postcodes.bin", write_side_file},
-        {"addr_cities.bin", write_side_file},
-    };
+    static const std::vector<WrittenFamily> f = [] {
+        std::vector<WrittenFamily> f = {
+            {"poi_records.bin", write_poi_family},
+            {"street_ways.bin", write_way_pair},
+            {"interp_ways.bin", write_way_pair},
+            {"addr_points.bin", write_addr_family},
+        };
+        for (const side_blocks::SideFile& s : side_blocks::SIDE_FILES) f.push_back({s.file, write_side_file});
+        return f;
+    }();
     return f;
 }
 

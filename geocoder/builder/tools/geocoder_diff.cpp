@@ -849,8 +849,8 @@ static uint64_t side_logical_size(const LogicalFamily& family, const std::string
     unmap_file(m);
     return f.logical_bytes();
 }
-static const std::vector<LogicalFamily>& logical_families() {
-    static const std::vector<LogicalFamily> f = {
+static std::vector<LogicalFamily> encoded_logical_families() {
+    std::vector<LogicalFamily> f = {
         {"streets", {"street_ways.bin", "street_nodes.bin"}, {"street_ways.bin", "street_nodes.bin"}, decode_way_files, way_logical_size},
         {"interps", {"interp_ways.bin", "interp_nodes.bin"}, {"interp_ways.bin", "interp_nodes.bin"}, decode_way_files, way_logical_size},
         {"addr",
@@ -871,12 +871,13 @@ static const std::vector<LogicalFamily>& logical_families() {
          postcode_logical_size},
         {"grid", {postcode_grid::FILE_NAME}, {postcode_grid::FILE_NAME}, decode_grid_file, grid_logical_size},
         {"postal", {postal_cities::FILE_NAME}, {postal_cities::FILE_NAME}, decode_postal_file, postal_logical_size},
-        {"way_parents", {"way_parents.bin"}, {"way_parents.bin"}, decode_side_file, side_logical_size},
-        {"way_postcodes", {"way_postcodes.bin"}, {"way_postcodes.bin"}, decode_side_file, side_logical_size},
-        {"interp_postcodes", {"interp_postcodes.bin"}, {"interp_postcodes.bin"}, decode_side_file, side_logical_size},
-        {"addr_postcodes", {"addr_postcodes.bin"}, {"addr_postcodes.bin"}, decode_side_file, side_logical_size},
-        {"addr_cities", {"addr_cities.bin"}, {"addr_cities.bin"}, decode_side_file, side_logical_size},
     };
+    for (const side_blocks::SideFile& s : side_blocks::SIDE_FILES)
+        f.push_back({s.family, {s.file}, {s.file}, decode_side_file, side_logical_size});
+    return f;
+}
+static const std::vector<LogicalFamily>& logical_families() {
+    static const std::vector<LogicalFamily> f = encoded_logical_families();
     return f;
 }
 static bool is_logical_file(const std::string& name) {

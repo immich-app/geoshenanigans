@@ -4,12 +4,13 @@
 // street and the interpolation ways, way_files.h; the address files, addr_files.h; the POI
 // files, R2 and V2: poi_files.h; the place files, place_files.h; the postcode centroid files,
 // postcode_files.h; the postcode grid, postcode_grid.h; the postal cities, postal_cities.h;
-// each of the five side files, side_blocks.h) is encoded in every dir under
+// each side file, side_blocks.h SIDE_FILES) is encoded in every dir under
 // today's names, the place files' logical stream as place_nodes.bin and the postcode
 // centroids' as postcode_centroids.bin. No today's-format file of an encoded family touches the
 // disk. A family a patch leaves unchanged goes through neither: the patcher copies its files
 // (copied_files).
 #pragma once
+#include <functional>
 #include <malloc.h>
 #include <map>
 #include <set>
@@ -33,13 +34,21 @@ struct FamilyDesc {
     const char* name;
     std::vector<const char*> today;
     std::vector<const char*> beside;
-    Decoder* (*decoder)(const std::string& dir);
-    Encoder* (*encoder)(const std::string& dir, const ListedSizes& sizes);
-    uint64_t (*decoded_size)(const std::string& dir, int port);
+    std::function<Decoder*(const std::string& dir)> decoder;
+    std::function<Encoder*(const std::string& dir, const ListedSizes& sizes)> encoder;
+    std::function<uint64_t(const std::string& dir, int port)> decoded_size;
 };
-// The encoded families.
-static const std::vector<FamilyDesc>& families() {
-    static const std::vector<FamilyDesc> f = {
+// The family of a side file (side_blocks.h).
+inline FamilyDesc side_family(const side_blocks::SideFile& s) {
+    const std::string family = s.family;
+    return {s.family, {s.file}, {},
+            [family](const std::string& dir) -> Decoder* { return new side::Dec(dir, family); },
+            [family](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, family); },
+            [family](const std::string& dir, int) { return side::decoded_size(dir, family); }};
+}
+// The encoded families, the side files' after the way pairs.
+static std::vector<FamilyDesc> encoded_families() {
+    std::vector<FamilyDesc> f = {
         {"streets", {"street_ways.bin", "street_nodes.bin"}, {},
          [](const std::string& dir) -> Decoder* { return new ways::Dec(dir, way_files::STREETS); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new ways::Enc(dir, way_files::STREETS); },
@@ -48,26 +57,9 @@ static const std::vector<FamilyDesc>& families() {
          [](const std::string& dir) -> Decoder* { return new ways::Dec(dir, way_files::INTERPS); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new ways::Enc(dir, way_files::INTERPS); },
          [](const std::string& dir, int port) { return ways::decoded_size(dir, way_files::INTERPS, port); }},
-        {"way_parents", {"way_parents.bin"}, {},
-         [](const std::string& dir) -> Decoder* { return new side::Dec(dir, "way_parents"); },
-         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "way_parents"); },
-         [](const std::string& dir, int) { return side::decoded_size(dir, "way_parents"); }},
-        {"way_postcodes", {"way_postcodes.bin"}, {},
-         [](const std::string& dir) -> Decoder* { return new side::Dec(dir, "way_postcodes"); },
-         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "way_postcodes"); },
-         [](const std::string& dir, int) { return side::decoded_size(dir, "way_postcodes"); }},
-        {"interp_postcodes", {"interp_postcodes.bin"}, {},
-         [](const std::string& dir) -> Decoder* { return new side::Dec(dir, "interp_postcodes"); },
-         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "interp_postcodes"); },
-         [](const std::string& dir, int) { return side::decoded_size(dir, "interp_postcodes"); }},
-        {"addr_postcodes", {"addr_postcodes.bin"}, {},
-         [](const std::string& dir) -> Decoder* { return new side::Dec(dir, "addr_postcodes"); },
-         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "addr_postcodes"); },
-         [](const std::string& dir, int) { return side::decoded_size(dir, "addr_postcodes"); }},
-        {"addr_cities", {"addr_cities.bin"}, {},
-         [](const std::string& dir) -> Decoder* { return new side::Dec(dir, "addr_cities"); },
-         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "addr_cities"); },
-         [](const std::string& dir, int) { return side::decoded_size(dir, "addr_cities"); }},
+    };
+    for (const side_blocks::SideFile& s : side_blocks::SIDE_FILES) f.push_back(side_family(s));
+    f.insert(f.end(), {
         {"addr", {"addr_points.bin", "addr_vertices.bin"}, {addr_files::INDEX_FILE},
          [](const std::string& dir) -> Decoder* { return new addr::Dec(dir); },
          [](const std::string& dir, const ListedSizes& sizes) -> Encoder* {
@@ -95,7 +87,11 @@ static const std::vector<FamilyDesc>& families() {
          [](const std::string& dir) -> Decoder* { return new postal::Dec(dir); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new postal::Enc(dir); },
          [](const std::string& dir, int) { return postal::decoded_size(dir); }},
-    };
+    });
+    return f;
+}
+static const std::vector<FamilyDesc>& families() {
+    static const std::vector<FamilyDesc> f = encoded_families();
     return f;
 }
 
