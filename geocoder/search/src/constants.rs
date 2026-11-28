@@ -109,10 +109,8 @@ pub const MIN_RUN_BUDGET_BYTES: usize = (MAX_KEY_BYTES * 100).div_ceil(RUN_ARENA
 /// The smallest page an anonymous mapping starts on, so the most a sort buffer's elements may
 /// be aligned to.
 pub const MIN_PAGE_BYTES: usize = 4096;
-/// Least entries a sort run holds, whatever its budget.
-pub const MIN_RUN_ENTRIES: usize = 1024;
 /// Most key bytes a sort run holds: an entry addresses its key by a u32 offset, so the arena share
-/// past 4 GiB (above 6,826 MiB of budget per thread) stays unused.
+/// past 4 GiB (above 6,826 MiB of budget per thread) can go to entries instead.
 pub const MAX_RUN_ARENA_BYTES: usize = u32::MAX as usize;
 /// Read buffer per sort run during the merge.
 pub const RUN_READ_BUFFER: usize = 64 * 1024;

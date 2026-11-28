@@ -121,18 +121,23 @@ pub struct ExternalSort<R: SortRecord> {
 }
 
 impl<R: SortRecord> ExternalSort<R> {
-    /// A sort in `budget` bytes, whose runs go to `dir` as `<tag>-<n>.run`.
+    /// A sort in `budget` bytes of run buffers, whose runs go to `dir` as `<tag>-<n>.run`.
+    /// An error if the budget cannot hold one entry.
     pub fn new(budget: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
         Self::with_arena_limit(budget, MAX_RUN_ARENA_BYTES, dir, tag)
     }
 
     /// `new` with at most `arena_limit` key bytes per run.
     fn with_arena_limit(budget: usize, arena_limit: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
-        // Fixed capacities: a run spills when either fills, so memory never exceeds the budget.
         let (arena_cap, items_cap) = run_capacities::<R>(budget, arena_limit);
+        if items_cap == 0 {
+            let e = format!("a sort budget of {budget} bytes holds no entry");
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e));
+        }
+
         Ok(ExternalSort {
             arena: MapVec::with_capacity(arena_cap)?,
-            items: MapVec::with_capacity(items_cap.max(MIN_RUN_ENTRIES))?,
+            items: MapVec::with_capacity(items_cap)?,
             runs: SortedRuns::default(),
             dir: dir.to_path_buf(),
             tag,
@@ -400,11 +405,13 @@ pub fn run_budget(mem_mb: usize, threads: usize) -> Result<usize, String> {
     Ok(budget)
 }
 
-/// (key bytes, entries) one sort run of `budget` bytes holds: RUN_ARENA_PERCENT of the budget for
-/// keys, at most `arena_limit` of it, and the rest for entries.
+/// (key bytes, entries) one sort run of `budget` bytes holds. The arena takes up to
+/// RUN_ARENA_PERCENT of the budget, leaving room for at least one entry if it fits.
 fn run_capacities<R>(budget: usize, arena_limit: usize) -> (usize, usize) {
-    let arena_share = budget * RUN_ARENA_PERCENT / 100;
-    (arena_share.min(arena_limit), (budget - arena_share) / std::mem::size_of::<Item<R>>())
+    let item_bytes = std::mem::size_of::<Item<R>>();
+    let arena_share = (budget as u128 * RUN_ARENA_PERCENT as u128 / 100) as usize;
+    let arena_cap = arena_share.min(arena_limit).min(budget.saturating_sub(item_bytes));
+    (arena_cap, (budget - arena_cap) / item_bytes)
 }
 
 #[cfg(test)]
@@ -430,6 +437,25 @@ mod tests {
 
         fn order(&self, other: &Self) -> Ordering {
             self.cmp(other)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Wide([u8; Wide::BYTES]);
+
+    impl SortRecord for Wide {
+        const BYTES: usize = 1024;
+
+        fn put(&self, out: &mut [u8]) {
+            out.copy_from_slice(&self.0);
+        }
+
+        fn get(b: &[u8]) -> Self {
+            Wide(b.try_into().unwrap())
+        }
+
+        fn order(&self, other: &Self) -> Ordering {
+            self.0.cmp(&other.0)
         }
     }
 
@@ -546,11 +572,10 @@ mod tests {
     #[test]
     fn run_keys_stay_addressable_at_any_budget() {
         // An entry addresses its key by a u32 offset into the run's arena.
-        for mem_mb in [DEFAULT_RUN_BUDGET_MB, 6_826, 6_827, 6_828, 1 << 20] {
-            let budget = run_budget(mem_mb, 1).unwrap();
+        for budget in [DEFAULT_RUN_BUDGET_MB << 20, MAX_RUN_ARENA_BYTES, MAX_RUN_ARENA_BYTES.saturating_mul(2), usize::MAX] {
             let (arena, items) = run_capacities::<Rec>(budget, MAX_RUN_ARENA_BYTES);
-            assert!(arena <= u32::MAX as usize, "{mem_mb} MiB: {arena} key bytes");
-            assert_eq!(items, (budget - budget * RUN_ARENA_PERCENT / 100) / std::mem::size_of::<Item<Rec>>());
+            assert!(arena <= u32::MAX as usize, "{budget} bytes: {arena} key bytes");
+            assert_eq!(items, (budget - arena) / std::mem::size_of::<Item<Rec>>());
         }
     }
 
@@ -572,9 +597,61 @@ mod tests {
         assert_eq!(read_all(runs.merge(&dir.0, "m")).into_iter().map(|(k, _)| k).collect::<Vec<_>>(), want);
     }
 
+    /// Bytes a sort's run buffers take.
+    fn run_bytes<R: SortRecord>(sut: &ExternalSort<R>) -> usize {
+        sut.arena.capacity() + sut.items.capacity() * std::mem::size_of::<Item<R>>()
+    }
+
+    #[test]
+    fn a_sort_run_fits_its_budget_whatever_its_record() {
+        let dir = TempDir::new("sort-run-bytes");
+        for budget in [MIN_RUN_BUDGET_BYTES, 1 << 20] {
+            let narrow = ExternalSort::<Rec>::new(budget, &dir.0, "n".into()).unwrap();
+            let wide = ExternalSort::<Wide>::new(budget, &dir.0, "w".into()).unwrap();
+
+            assert!(run_bytes(&narrow) <= budget, "{budget} bytes: narrow runs take {}", run_bytes(&narrow));
+            assert!(run_bytes(&wide) <= budget, "{budget} bytes: wide runs take {}", run_bytes(&wide));
+        }
+    }
+
+    #[test]
+    fn a_sort_refuses_a_budget_that_holds_no_entry() {
+        let dir = TempDir::new("sort-no-entry");
+        for budget in [0, std::mem::size_of::<Item<Wide>>() - 1] {
+            let err = ExternalSort::<Wide>::new(budget, &dir.0, "t".into()).err().map(|e| (e.kind(), e.to_string()));
+
+            assert_eq!(err, Some((std::io::ErrorKind::InvalidInput, format!("a sort budget of {budget} bytes holds no entry"))));
+        }
+    }
+
+    #[test]
+    fn a_sort_spills_when_the_budget_holds_only_one_entry() {
+        for key in [&b""[..], b"x"] {
+            let dir = TempDir::new("sort-one-entry");
+            let budget = std::mem::size_of::<Item<Wide>>() + key.len();
+            let mut sut = ExternalSort::<Wide>::new(budget, &dir.0, "t".into()).unwrap();
+            assert!(run_bytes(&sut) <= budget);
+            let high = Wide([2; Wide::BYTES]);
+            let low = Wide([1; Wide::BYTES]);
+            sut.push(key, high).unwrap();
+            sut.push(key, low).unwrap();
+
+            let runs = sut.finish().unwrap();
+
+            assert_eq!(runs.len(), 2);
+            let mut merged = runs.merge(&dir.0, "m").unwrap();
+            let mut got_key = Vec::new();
+            assert_eq!(merged.next(&mut got_key).unwrap().unwrap().0, low.0);
+            assert_eq!(got_key, key);
+            assert_eq!(merged.next(&mut got_key).unwrap().unwrap().0, high.0);
+            assert_eq!(got_key, key);
+            assert!(merged.next(&mut got_key).unwrap().is_none());
+        }
+    }
+
     #[test]
     fn a_sort_refuses_a_key_it_cannot_hold() {
-        for (budget, key_len) in [(0, 1), (MIN_RUN_BUDGET_BYTES - 1, MAX_KEY_BYTES), (2 * MIN_RUN_BUDGET_BYTES, MAX_KEY_BYTES + 1)] {
+        for (budget, key_len) in [(MIN_RUN_BUDGET_BYTES - 1, MAX_KEY_BYTES), (2 * MIN_RUN_BUDGET_BYTES, MAX_KEY_BYTES + 1)] {
             let dir = TempDir::new("sort-refuse");
             let mut sut = ExternalSort::new(budget, &dir.0, "t".into()).unwrap();
 
