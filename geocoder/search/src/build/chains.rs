@@ -6,7 +6,7 @@
 use super::{
     counts,
     sources::{side, CoreRecords, SourceRow},
-    write::{writer, TableWriter},
+    write::{writer, EntityWriter, TableWriter},
     BuildOpts,
 };
 use crate::{
@@ -149,9 +149,7 @@ pub(super) fn build(
         }
     }
     let mut input = sort.finish()?.merge(tmp, "chain-merge")?;
-    let mut ents = writer(&out.join("core.ent"))?;
-    ents.write_all(ENTITY_MAGIC)?;
-    ents.write_all(&0u32.to_le_bytes())?;
+    let mut ents = EntityWriter::new(out, tmp)?;
     let mut chains = TableWriter::new(out, "core.chn", tmp)?;
     let mut by_record = ExternalSort::new(budget / 2, tmp, "record".into())?;
     let mut ranges = ExternalSort::new(budget / 4, tmp, "ranges".into())?;
@@ -204,7 +202,7 @@ pub(super) fn build(
             transition(&mut parents, max_rank, n, &mut ranges)?;
             previous_rank = max_rank;
         }
-        ents.write_all(&packed.to_le_bytes())?;
+        ents.push(n, e)?;
         by_record.push(&[], [packed, n, cc])?;
         let end = n.checked_add(1).ok_or_else(|| invalid("too many entities"))?;
         if let Some(file) = &mut bounds {
@@ -258,9 +256,7 @@ pub(super) fn build(
         n = end;
     }
     transition(&mut parents, 0, n, &mut ranges)?;
-    ents.seek(SeekFrom::Start(4))?;
-    ents.write_all(&n.to_le_bytes())?;
-    ents.flush()?;
+    ents.finish(n, tmp)?;
     chains.finish(&[n], &tmp.join("core.chn.blob"))?;
     let runs = by_record.finish()?;
     counts::write(ranges, out, tmp, records.geo.admin_polygon_count(), bounds)?;

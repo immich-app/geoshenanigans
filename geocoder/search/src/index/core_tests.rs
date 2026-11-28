@@ -36,7 +36,6 @@ fn core_membership_counts_and_names_follow_the_dataset() {
         let core = CoreIndex::open(&out).unwrap();
         let records = CoreRecords::open(&geo, &set).unwrap();
         assert_eq!(core.entities.len(), 6);
-        assert_eq!(fs::metadata(out.join("core.ent")).unwrap().len(), 8 + 4 * 6);
         let west: BTreeSet<_> = [county, city].into_iter().flat_map(|s| core.areas.ranges(s).flatten()).collect();
         let mut brute = BTreeSet::new();
         let mut prev = None;
@@ -690,4 +689,32 @@ fn an_unranked_area_uses_its_label_points_country_for_its_search_rank() {
     let id = (0..core.entities.len()).find(|&id| core.entities.get(id).unwrap().record() == region).unwrap();
     assert_eq!(core.record(id, &records).unwrap().rank_search, 10);
     assert!(!core.areas.ranges(county).any(|r| r.contains(&id)));
+}
+
+#[test]
+fn entity_blocks_restart_at_random_access_boundaries() {
+    let tmp = TempDir::new("entity-blocks");
+    let set = tmp.0.join("dataset");
+    let mut f = Geo::default();
+    let n = 389;
+    for _ in 0..n {
+        f.poi("Repeated", 0., 0., 0);
+    }
+    let geo = f.load(&set);
+    build_core(
+        &geo,
+        &crate::dataset::core_stamps(&set).unwrap(),
+        &set,
+        &tmp.0,
+        Profile::Immich,
+        &BuildOpts::new(tmp.0.join("runs")),
+    )
+    .unwrap();
+    let core = CoreIndex::open(&tmp.0).unwrap();
+    for id in (0..n).rev() {
+        let e = core.entities.get(id).unwrap();
+        assert_eq!((e.kind(), e.record()), (EntityKind::Poi, id));
+    }
+    assert!(core.entities.get(n).is_none());
+    assert!(fs::metadata(tmp.0.join("core.ent")).unwrap().len() < 2 * u64::from(n));
 }

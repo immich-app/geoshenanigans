@@ -1,6 +1,9 @@
 //! What a format-3 index names: entities, each a kind and a record of that kind, and what a
 //! search reads of one (its record) through an `Entities` resolver.
-use crate::constants::ENTITY_RECORD_BITS;
+use crate::constants::{
+    CORE_KINDS, CORE_KIND_BITS, ENTITY_BLOCK_ROWS, ENTITY_HEADER_BYTES, ENTITY_MAGIC, ENTITY_RECORD_BITS,
+    KINDS_PER_BYTE,
+};
 use crate::tags::TagBundle;
 use std::borrow::Cow;
 
@@ -140,20 +143,34 @@ pub trait Entities {
     }
 }
 
-/// Chain-sorted four-byte entity references in the published core.
+/// Chain-sorted records in restartable delta blocks, with two kind bits per entity.
 pub struct EntityTable {
     bytes: memmap2::Mmap,
     count: u32,
+    kinds: usize,
+    offsets: usize,
 }
 impl EntityTable {
     pub(crate) fn open(dir: &std::path::Path) -> std::io::Result<Self> {
         use super::{invalid, map, number};
         let bytes = map(&dir.join("core.ent"))?;
-        let count = number(&bytes, 4).ok_or_else(|| invalid("missing entity count"))?;
-        if bytes.get(..4) != Some(crate::constants::ENTITY_MAGIC) || bytes.len() as u64 != 8 + 4 * u64::from(count) {
+        let count = number(&bytes, ENTITY_MAGIC.len()).ok_or_else(|| invalid("missing entity count"))?;
+        let blocks = count.div_ceil(ENTITY_BLOCK_ROWS) as usize;
+        let offsets = bytes
+            .len()
+            .checked_sub((blocks + 1) * size_of::<u32>())
+            .ok_or_else(|| invalid("short entity directory"))?;
+        let kinds = offsets
+            .checked_sub(count.div_ceil(KINDS_PER_BYTE) as usize)
+            .ok_or_else(|| invalid("short entity kinds"))?;
+        if bytes.get(..ENTITY_MAGIC.len()) != Some(ENTITY_MAGIC)
+            || kinds.checked_sub(ENTITY_HEADER_BYTES)
+                != number(&bytes, bytes.len() - size_of::<u32>()).map(|v| v as usize)
+            || number(&bytes, offsets) != Some(0)
+        {
             return Err(invalid("bad entity table"));
         }
-        Ok(Self { bytes, count })
+        Ok(Self { bytes, count, kinds, offsets })
     }
     pub fn len(&self) -> u32 {
         self.count
@@ -161,12 +178,26 @@ impl EntityTable {
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
-    pub fn get(&self, id: u32) -> Option<EntityRef> {
+    pub fn kind(&self, id: u32) -> Option<EntityKind> {
         if id >= self.count {
             return None;
         }
-        EntityRef::unpack(super::number(&self.bytes, 8 + id as usize * 4)?)
-            .filter(|e| crate::constants::CORE_KINDS.contains(&e.kind()))
+        let bits = self.bytes[self.kinds + (id / KINDS_PER_BYTE) as usize] >> ((id % KINDS_PER_BYTE) * CORE_KIND_BITS);
+        CORE_KINDS.get(usize::from(bits & ((1 << CORE_KIND_BITS) - 1))).copied()
+    }
+    pub fn get(&self, id: u32) -> Option<EntityRef> {
+        let kind = self.kind(id)?;
+        let off = self.offsets + (id / ENTITY_BLOCK_ROWS) as usize * size_of::<u32>();
+        let start = super::number(&self.bytes, off)? as usize;
+        let end = super::number(&self.bytes, off + size_of::<u32>())? as usize;
+        let data = self.bytes[ENTITY_HEADER_BYTES..self.kinds].get(start..end)?;
+        let mut at = 0;
+        let mut record = super::small(data, &mut at)?;
+        for _ in 0..id % ENTITY_BLOCK_ROWS {
+            let d = super::small(data, &mut at)?;
+            record = if d == 0 { super::small(data, &mut at)? } else { record.checked_add(d)? };
+        }
+        EntityRef::new(kind, record)
     }
 }
 

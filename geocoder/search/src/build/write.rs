@@ -33,6 +33,72 @@ pub(super) fn writer(path: &Path) -> io::Result<BufWriter<File>> {
     File::create(path).map(|f| BufWriter::with_capacity(WRITE_BUFFER, f))
 }
 
+/// Keeps kind tests independent of the record deltas. In particular an address-word
+/// search can discard thousands of non-area postings without reading their blocks.
+pub(super) struct EntityWriter {
+    data: BufWriter<File>,
+    kinds: BufWriter<File>,
+    offsets: BufWriter<File>,
+    size: u32,
+    previous: u32,
+    kind_byte: u8,
+    delta: Vec<u8>,
+}
+impl EntityWriter {
+    pub fn new(out: &Path, tmp: &Path) -> io::Result<Self> {
+        let mut data = writer(&out.join("core.ent"))?;
+        data.write_all(ENTITY_MAGIC)?;
+        data.write_all(&0u32.to_le_bytes())?;
+        Ok(Self {
+            data,
+            kinds: writer(&tmp.join("kinds"))?,
+            offsets: writer(&tmp.join("entity-offsets"))?,
+            size: 0,
+            previous: 0,
+            kind_byte: 0,
+            delta: Vec::new(),
+        })
+    }
+    pub fn push(&mut self, id: u32, entity: crate::index::entities::EntityRef) -> io::Result<()> {
+        let slot = id % KINDS_PER_BYTE;
+        self.kind_byte |= (entity.kind() as u8) << (slot * CORE_KIND_BITS);
+        if slot + 1 == KINDS_PER_BYTE {
+            self.kinds.write_all(&[self.kind_byte])?;
+            self.kind_byte = 0;
+        }
+        self.delta.clear();
+        let record = entity.record();
+        if id.is_multiple_of(ENTITY_BLOCK_ROWS) {
+            self.offsets.write_all(&self.size.to_le_bytes())?;
+            crate::varint::put(&mut self.delta, record.into());
+        } else if record > self.previous {
+            crate::varint::put(&mut self.delta, (record - self.previous).into());
+        } else {
+            self.delta.push(0);
+            crate::varint::put(&mut self.delta, record.into());
+        }
+        self.data.write_all(&self.delta)?;
+        self.size =
+            self.size.checked_add(self.delta.len() as u32).ok_or_else(|| invalid("entity data exceeds 4 GiB"))?;
+        self.previous = record;
+        Ok(())
+    }
+    pub fn finish(mut self, count: u32, tmp: &Path) -> io::Result<()> {
+        if !count.is_multiple_of(KINDS_PER_BYTE) {
+            self.kinds.write_all(&[self.kind_byte])?;
+        }
+        self.kinds.flush()?;
+        self.offsets.write_all(&self.size.to_le_bytes())?;
+        self.offsets.flush()?;
+        for name in ["kinds", "entity-offsets"] {
+            io::copy(&mut File::open(tmp.join(name))?, &mut self.data)?;
+        }
+        self.data.seek(io::SeekFrom::Start(ENTITY_MAGIC.len() as u64))?;
+        self.data.write_all(&count.to_le_bytes())?;
+        self.data.flush()
+    }
+}
+
 /// The row directory precedes its variable-size slices, so the blob is spooled separately.
 pub(super) struct TableWriter {
     rows: BufWriter<File>,
