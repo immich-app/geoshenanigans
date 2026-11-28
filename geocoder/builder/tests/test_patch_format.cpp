@@ -3741,6 +3741,16 @@ TEST(patch_format_parallel_delta_files_follow_any_kept_record_merge) {
         CHECK(!is_parallel_delta_parent(fid));
 }
 
+// The diff keeps a parent's merge for the side files only while a row of
+// PARALLEL_DELTA_FILES follows it: none follows the POI records or the place
+// nodes yet.
+TEST(patch_format_side_files_follow_the_street_ways_addresses_and_interpolations) {
+    for (const PatchFileId fid : {PatchFileId::STREET_WAYS, PatchFileId::ADDR_POINTS, PatchFileId::INTERP_WAYS})
+        CHECK(has_side_files(fid));
+    for (const PatchFileId fid : {PatchFileId::POI_RECORDS, PatchFileId::PLACE_NODES, PatchFileId::STREET_NODES})
+        CHECK(!has_side_files(fid));
+}
+
 // --- geo entry list deltas ---
 
 TEST(patch_format_geo_list_delta_round_trip) {

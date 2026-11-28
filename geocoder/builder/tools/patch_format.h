@@ -823,6 +823,12 @@ static_assert(
         return true;
     }(),
     "a side file follows a record merge the diff keeps");
+// Whether a row of PARALLEL_DELTA_FILES follows parent's merge.
+constexpr bool has_side_files(PatchFileId parent) {
+    for (const auto& f : PARALLEL_DELTA_FILES)
+        if (f.parent == parent) return true;
+    return false;
+}
 inline const ParallelDeltaFile* parallel_delta_file(PatchFileId fid) {
     for (const auto& f : PARALLEL_DELTA_FILES)
         if (f.fid == fid) return &f;

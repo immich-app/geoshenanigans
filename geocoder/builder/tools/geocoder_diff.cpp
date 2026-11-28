@@ -2416,11 +2416,19 @@ static int run(int argc, char* argv[]) {
     // new lists.
     double t1 = now_ms();
 
-    // Free merge sequences (already serialized to patch), but those of
-    // PARALLEL_DELTA_PARENTS, which the side files follow.
+    // The merge of each of PARALLEL_DELTA_PARENTS, kept until the side files
+    // are sent when a side file follows it.
+    const std::map<PatchFileId, FileMergeResult*> parent_merges = {
+        {PatchFileId::STREET_WAYS, &res_ways}, {PatchFileId::ADDR_POINTS, &res_addr},
+        {PatchFileId::INTERP_WAYS, &res_interp_w}, {PatchFileId::POI_RECORDS, &res_poi_r},
+        {PatchFileId::PLACE_NODES, &res_place_n}};
+    // Free merge sequences (already serialized to patch), but those the side
+    // files follow.
     { std::vector<char>().swap(res_nodes.seq.data); std::vector<char>().swap(res_interp_n.seq.data);
       std::vector<char>().swap(res_poi_v.seq.data); std::vector<char>().swap(res_postcodes.seq.data);
-      std::vector<char>().swap(res_grid.seq.data); std::vector<char>().swap(res_postal.seq.data); }
+      std::vector<char>().swap(res_grid.seq.data); std::vector<char>().swap(res_postal.seq.data);
+      for (const auto& [parent, merge] : parent_merges)
+          if (!has_side_files(parent)) std::vector<char>().swap(merge->seq.data); }
 
     {
         const GeoIndexMap old_geo(old_dir), new_geo(new_dir);
@@ -2706,11 +2714,6 @@ static int run(int argc, char* argv[]) {
     // delta when the parent wasn't merged, and with it to a full replacement
     // of the values of a file the old dir lacks. A file the new dir lacks
     // gets no section.
-    // The merge of each of PARALLEL_DELTA_PARENTS, kept until the side files are sent.
-    const std::map<PatchFileId, FileMergeResult*> parent_merges = {
-        {PatchFileId::STREET_WAYS, &res_ways}, {PatchFileId::ADDR_POINTS, &res_addr},
-        {PatchFileId::INTERP_WAYS, &res_interp_w}, {PatchFileId::POI_RECORDS, &res_poi_r},
-        {PatchFileId::PLACE_NODES, &res_place_n}};
     auto emit_parallel_delta = [&](const ParallelDeltaFile& f) {
         const char* fname = patch_file_names[(uint32_t)f.fid];
         struct stat nst, ost;
