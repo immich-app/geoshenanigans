@@ -242,22 +242,23 @@ pub struct Merged<R> {
     heap: BinaryHeap<Head<R>>,
     files: RunFiles,
     rewritten: u64,
+    error: Option<(usize, std::io::Error)>,
 }
 
 impl<R: SortRecord> Merged<R> {
     fn open(files: RunFiles) -> std::io::Result<Self> {
         let mut readers = Vec::with_capacity(files.0.len());
         for f in &files.0 {
-            readers.push(RunReader::open(f).map_err(|e| run_error(f, e))?);
+            readers.push(RunReader::open(f).map_err(|e| run_error(f, &e))?);
         }
         let mut heap = BinaryHeap::with_capacity(readers.len());
         for (run, r) in readers.iter_mut().enumerate() {
             let mut key = Vec::new();
-            if let Some(rec) = r.read_into(&mut key).map_err(|e| run_error(&files.0[run], e))? {
+            if let Some(rec) = r.read_into(&mut key).map_err(|e| run_error(&files.0[run], &e))? {
                 heap.push(Head { key, rec, run });
             }
         }
-        Ok(Merged { readers, heap, files, rewritten: 0 })
+        Ok(Merged { readers, heap, files, rewritten: 0, error: None })
     }
 
     /// Bytes the runs over MERGE_FAN_IN were merged into longer runs as.
@@ -265,18 +266,28 @@ impl<R: SortRecord> Merged<R> {
         self.rewritten
     }
 
-    /// The next entry's record, its key copied into `key`; None after the last, an error for a
-    /// run that fails to read or is cut short.
+    /// The next entry's record and its key in `key`, or None at the end. A run read failure
+    /// returns the same error on this and all subsequent calls.
     pub fn next(&mut self, key: &mut Vec<u8>) -> std::io::Result<Option<R>> {
+        if let Some((run, e)) = &self.error {
+            return Err(run_error(&self.files.0[*run], e));
+        }
+
         let Some(mut top) = self.heap.peek_mut() else { return Ok(None) };
         key.clear();
         key.extend_from_slice(&top.key);
         let rec = top.rec;
         let run = top.run;
-        match self.readers[run].read_into(&mut top.key).map_err(|e| run_error(&self.files.0[run], e))? {
-            Some(next) => top.rec = next,
-            None => {
+        match self.readers[run].read_into(&mut top.key) {
+            Ok(Some(next)) => top.rec = next,
+            Ok(None) => {
                 std::collections::binary_heap::PeekMut::pop(top);
+            }
+            Err(e) => {
+                // The read can replace part of the head's key before it fails.
+                let err = run_error(&self.files.0[run], &e);
+                self.error = Some((run, e));
+                return Err(err);
             }
         }
         Ok(Some(rec))
@@ -284,7 +295,7 @@ impl<R: SortRecord> Merged<R> {
 }
 
 /// A sort run's open or read error, naming the run.
-fn run_error(path: &Path, e: std::io::Error) -> std::io::Error {
+fn run_error(path: &Path, e: &std::io::Error) -> std::io::Error {
     std::io::Error::new(e.kind(), format!("sort run {}: {e}", path.display()))
 }
 
@@ -844,6 +855,33 @@ mod tests {
 
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_merge_fails_every_read_after_a_run_cut_short() {
+        // The first run is cut inside its second key, which the first read reaches.
+        let dir = TempDir::new("sort-merge-cut");
+        let mut bytes = Vec::new();
+        for (k, r) in [(&b"a"[..], Rec(1, 0)), (b"ab", Rec(3, 0))] {
+            write_entry(&mut bytes, k, &r, &mut Vec::new()).unwrap();
+        }
+        bytes.truncate(bytes.len() - Rec::BYTES - 1);
+        let cut = dir.0.join("cut.run");
+        std::fs::write(&cut, &bytes).unwrap();
+        let whole = write_run(&dir.0, "whole.run", &[(b"b".to_vec(), Rec(2, 0))]);
+        let mut sut = runs_of(vec![cut.clone(), whole]).merge(&dir.0, "m").unwrap();
+        let run_name = cut.display().to_string();
+        let mut key = Vec::new();
+
+        let got: Vec<_> = (0..3)
+            .map(|_| {
+                let next = sut.next(&mut key);
+                next.map(|rec| rec.map(|rec| (key.clone(), rec))).map_err(|e| (e.kind(), e.to_string()))
+            })
+            .collect();
+
+        assert!(got.iter().all(|r| matches!(r, Err((std::io::ErrorKind::UnexpectedEof, message)) if message.contains(&run_name))), "{got:?}");
+        assert!(got.windows(2).all(|pair| pair[0] == pair[1]), "{got:?}");
     }
 
     #[test]
