@@ -10,7 +10,7 @@ use crate::index::entities::Category;
 use crate::index::terms::{Term, TermInfo, TermSource};
 use crate::profile::{Layer, MatchMode, SearchRequest, Viewbox};
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 
 /// A term of the query: its place among the plan's terms (`SearchPlan::terms`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -145,6 +145,9 @@ pub struct NearPoint {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SearchPlan {
     pub terms: Vec<Term>,
+    /// Each widened partial and the dictionary terms it can match. A candidate
+    /// pays the cheapest matching member's excess over the partial's base cost.
+    pub partial_matches: BTreeMap<TermId, Vec<Token>>,
     pub near: Option<NearPoint>,
     /// Whether the query is coordinates alone: its answer is the reverse lookup at `near`, as
     /// Nominatim's (v1/server_glue.py:316-325).
@@ -254,7 +257,7 @@ impl Details {
         let mut searches: Vec<Search> = assignments(&g).iter().flat_map(|a| builder.build(a)).collect();
         searches.sort_by(|a, b| a.penalty().total_cmp(&b.penalty()).then(a.prio().cmp(&b.prio())));
         let rows = token_rows(&g);
-        Ok(SearchPlan { terms: g.terms, near, reverse: false, searches, tokens: rows })
+        Ok(SearchPlan { terms: g.terms, partial_matches: g.partial_matches, near, reverse: false, searches, tokens: rows })
     }
 }
 

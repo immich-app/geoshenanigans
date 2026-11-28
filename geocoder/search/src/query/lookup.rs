@@ -123,6 +123,7 @@ pub struct QueryGraph {
     pub phrases: usize,
     pub nodes: Vec<QueryNode>,
     pub terms: Vec<Term>,
+    pub partial_matches: BTreeMap<TermId, Vec<Token>>,
     ids: HashMap<(TermKind, String, String, TermInfo), TermId>,
 }
 
@@ -133,6 +134,7 @@ pub fn tokens(nodes: Nodes, source: &dyn TermSource, lookup: Lookup) -> QueryGra
         nodes: nodes.nodes.into_iter().map(|node| QueryNode { node, partial: None, starting: Vec::new() }).collect(),
         terms: Vec::new(),
         ids: HashMap::new(),
+        partial_matches: BTreeMap::new(),
     };
     if g.slots() == 0 {
         return g;
@@ -324,7 +326,8 @@ impl QueryGraph {
             TokenType::Partial => node.partial = Some(token),
             TokenType::Qualifier if full_phrase => {}
             _ => match node.starting.iter_mut().find(|l| l.end == span.end && l.ttype == ttype) {
-                Some(list) => list.tokens.push(token),
+                Some(list) if !list.tokens.contains(&token) => list.tokens.push(token),
+                Some(_) => {},
                 None => node.starting.push(TokenList { end: span.end, ttype, tokens: vec![token] }),
             },
         }
@@ -335,6 +338,13 @@ impl QueryGraph {
     /// are returned, its own among them.
     fn completions(&mut self, words: &[(String, Vec<Span>)], source: &dyn TermSource) -> BTreeMap<usize, Vec<Term>> {
         let slots = self.slots();
+        let last = slots - 1;
+        let last_word = &self.nodes[last].node.token;
+        let numeric = last_word.chars().all(|c| decimal_digit(c).is_some());
+        // A numeric prefix may finish a word boundary or a suffix, but 1044 must never find 10440.
+        let allowed = |prefix: &str, term: &Term| {
+            !numeric || !term.token.strip_prefix(prefix).and_then(|s| s.chars().next()).is_some_and(|c| decimal_digit(c).is_some())
+        };
         for (word, spans) in words {
             let at_end: Vec<Span> = spans.iter().copied().filter(|s| s.end == slots).collect();
             if at_end.is_empty() {
@@ -342,14 +352,15 @@ impl QueryGraph {
             }
             for kind in [TermKind::Word, TermKind::HouseNumber, TermKind::Country] {
                 for term in source.prefix(kind, word, PREFIX_TERMS_MAX) {
-                    if term.token != *word {
+                    if term.token != *word && allowed(word, &term) {
                         self.add_term(&at_end, term);
                     }
                 }
             }
         }
-        let last = slots - 1;
-        BTreeMap::from([(last, source.prefix(TermKind::Partial, &self.nodes[last].node.token, PREFIX_TERMS_MAX))])
+        let prefix = &self.nodes[last].node.token;
+        let partials = source.prefix(TermKind::Partial, prefix, PREFIX_TERMS_MAX).into_iter().filter(|t| allowed(prefix, t)).collect();
+        BTreeMap::from([(last, partials)])
     }
 
     /// The photon mode's near spellings (Photon's AUTO fuzziness), in a query of
@@ -399,7 +410,6 @@ impl QueryGraph {
         }
 
         let word = node.node.word.clone();
-        let best = union.iter().map(|t| match_penalty(if t.lookup_word.is_empty() { &t.token } else { &t.lookup_word }, &word)).fold(f64::INFINITY, f64::min);
         let term = Term {
             kind: TermKind::Partial,
             token: node.node.token.clone(),
@@ -409,9 +419,20 @@ impl QueryGraph {
             count: union.iter().fold(0u32, |s, t| s.saturating_add(t.count.max(1))),
             addr_count: union.iter().fold(0u32, |s, t| s.saturating_add(t.addr_count.max(1))),
             info: TermInfo::None,
-            postings: union.into_iter().flat_map(|t| t.postings).collect(),
+            postings: union.iter().flat_map(|t| t.postings.iter().copied()).collect(),
         };
-        let id = self.intern(term);
+        let mut members: Vec<_> = union.into_iter().map(|member| {
+            let id = self.intern(member);
+            Token { term: id, penalty: match_penalty(&self.term(id).lookup_word, &term.lookup_word) }
+        }).collect();
+        let best = members.iter().map(|m| m.penalty).fold(f64::INFINITY, f64::min);
+        for member in &mut members {
+            member.penalty -= best;
+        }
+        // Equal text can widen differently at two positions: only the last gets prefix matches.
+        let id = TermId(self.terms.len() as u32);
+        self.terms.push(term);
+        self.partial_matches.insert(id, members);
         self.nodes[i].partial = Some(Token { term: id, penalty: PARTIAL_PENALTY + best });
     }
 
@@ -815,6 +836,31 @@ mod tests {
         assert_eq!(of_type(&g, 'w')[2], "2-3 pa pa 0.300");
         let partial_1044 = g.term(g.nodes[0].partial.unwrap().term);
         assert_eq!(partial_1044.count, 39);
+    }
+
+    #[test]
+    fn an_exact_partial_and_its_completions_keep_their_own_match_costs() {
+        use crate::profile::{Profile, SearchRequest};
+        use crate::query::plan::{read, Pass};
+        let req = SearchRequest::new("1044 liberty pa", Profile::Full);
+        let plan = read(&req, &typing(), Pass::First).unwrap();
+        let partial = plan.tokens.iter().find(|t| t.span.start == 2 && t.ttype == TokenType::Partial).unwrap();
+        let members = &plan.partial_matches[&partial.term];
+        let costs: Vec<_> = members.iter().map(|m| (plan.terms[m.term.0 as usize].token.as_str(), m.penalty)).collect();
+        assert_eq!(costs, [("pa", 0.0), ("park", 0.25)]);
+    }
+
+    #[test]
+    fn completing_a_number_does_not_extend_its_digits() {
+        let g = graph("1044", &typing(), Lookup::Prefix);
+        assert_eq!(of_type(&g, 'H'), ["0-1 1044 1044 0.000"]);
+        assert_eq!(g.term(g.partial(0).unwrap().term).count, 39);
+    }
+
+    #[test]
+    fn a_near_spelling_that_also_completes_the_query_is_one_token() {
+        let g = graph("austi", &typing(), Lookup::Typo);
+        assert_eq!(of_type(&g, 'W'), ["0-1 austin austin 0.167"]);
     }
 
     #[test]
