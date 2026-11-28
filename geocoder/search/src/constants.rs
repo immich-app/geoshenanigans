@@ -265,6 +265,19 @@ pub const SIMPLE_HOUSENUMBER_PENALTY: f64 = 0.5;
 /// A token other than a name or a partial pays this many times its match penalty
 /// (icu_tokenizer.py:299-300).
 pub const MATCH_PENALTY_FACTOR_OTHER: f64 = 2.0;
+/// The photon mode's last-word completions, and near spellings, looked up per kind and n-gram.
+pub const PREFIX_TERMS_MAX: usize = 64;
+pub const FUZZY_TERMS_MAX: usize = 64;
+/// Photon's AUTO fuzziness (SearchQueryBuilder.java:47-49, 113): no edit in a query shorter than
+/// TYPO_MIN_QUERY_CHARS; per word, one edit from TYPO_ONE_EDIT_MIN_CHARS characters and two from
+/// TYPO_TWO_EDITS_MIN_CHARS; the first TYPO_ANCHOR_SHORT characters kept as typed in a word of at
+/// most TYPO_ANCHOR_SHORT_MAX_CHARS, TYPO_ANCHOR_LONG in a longer one.
+pub const TYPO_MIN_QUERY_CHARS: usize = 4;
+pub const TYPO_ONE_EDIT_MIN_CHARS: usize = 3;
+pub const TYPO_TWO_EDITS_MIN_CHARS: usize = 6;
+pub const TYPO_ANCHOR_SHORT_MAX_CHARS: usize = 6;
+pub const TYPO_ANCHOR_SHORT: usize = 1;
+pub const TYPO_ANCHOR_LONG: usize = 2;
 /// The direction a query is read in is told for at most this many token slots, from two slots'
 /// difference over DIRECTION_TWO_SLOT_DIVISOR or a regression over more (query.py:24-25, 383-396).
 pub const DIRECTION_MAX_SLOTS: usize = 50;

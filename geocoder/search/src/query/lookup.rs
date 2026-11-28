@@ -1,18 +1,19 @@
 //! A query's tokens, as Nominatim's analyzer finds them (search/icu_tokenizer.py:116-300,
 //! search/query.py): every n-gram of its nodes looked up in a term source, its special phrases,
 //! house numbers of digits, postcodes from the parser, and the penalties tokens pay for each
-//! other and for how well they match the query.
+//! other and for how well they match the query. In the photon mode also the last word's
+//! completions and, in a second reading, near spellings of its words.
 use super::phrases::{Operator, Phrase, Phrases};
 use super::plan::TermId;
 use super::tokenize::{Node, Nodes};
 use crate::constants::*;
-use crate::index::terms::{Term, TermInfo, TermKind, TermSource};
+use crate::index::terms::{Fuzz, Term, TermInfo, TermKind, TermSource};
 use crate::text::difflib::{opcodes, Tag};
 use crate::text::normalize::decimal_digit;
 use crate::text::postcode::{Node as PostcodeNode, PostcodeParser};
 use crate::text::regex::is_python_space;
 use crate::text::Break;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 /// What a token stands for in a reading of the query (search/query.py:53-69).
@@ -51,6 +52,17 @@ impl TokenType {
             TermKind::Category | TermKind::AddressWord => TokenType::Qualifier,
         }
     }
+}
+
+/// How a query's words are looked up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lookup {
+    /// Each n-gram exactly: the nominatim mode.
+    Exact,
+    /// Also the last word's completions: the photon mode.
+    Prefix,
+    /// Also near spellings of each word: the photon mode's reading when the first finds nothing.
+    Typo,
 }
 
 /// Nodes `start..end` of a query, which a token spans.
@@ -114,8 +126,8 @@ pub struct QueryGraph {
     ids: HashMap<(TermKind, String, String, TermInfo), TermId>,
 }
 
-/// The tokens of `nodes`, their terms looked up in `source`.
-pub fn tokens(nodes: Nodes, source: &dyn TermSource) -> QueryGraph {
+/// The tokens of `nodes`, their terms looked up in `source` as `lookup` says.
+pub fn tokens(nodes: Nodes, source: &dyn TermSource, lookup: Lookup) -> QueryGraph {
     let mut g = QueryGraph {
         phrases: nodes.phrases,
         nodes: nodes.nodes.into_iter().map(|node| QueryNode { node, partial: None, starting: Vec::new() }).collect(),
@@ -139,6 +151,15 @@ pub fn tokens(nodes: Nodes, source: &dyn TermSource) -> QueryGraph {
         }
         for phrase in Phrases::get().of(word) {
             g.add_phrase(word, spans, phrase);
+        }
+    }
+    if lookup != Lookup::Exact {
+        let mut members = g.completions(&words, source);
+        if lookup == Lookup::Typo {
+            g.near_spellings(source, &mut members);
+        }
+        for (i, terms) in members {
+            g.widen_partial(i, terms);
         }
     }
     g.add_digit_housenumbers();
@@ -307,6 +328,91 @@ impl QueryGraph {
                 None => node.starting.push(TokenList { end: span.end, ttype, tokens: vec![token] }),
             },
         }
+    }
+
+    /// The photon mode's completions of the last word: every n-gram that ends with it gets the
+    /// names, house numbers and countries it starts; the last word's partial terms that it starts
+    /// are returned, its own among them.
+    fn completions(&mut self, words: &[(String, Vec<Span>)], source: &dyn TermSource) -> BTreeMap<usize, Vec<Term>> {
+        let slots = self.slots();
+        for (word, spans) in words {
+            let at_end: Vec<Span> = spans.iter().copied().filter(|s| s.end == slots).collect();
+            if at_end.is_empty() {
+                continue;
+            }
+            for kind in [TermKind::Word, TermKind::HouseNumber, TermKind::Country] {
+                for term in source.prefix(kind, word, PREFIX_TERMS_MAX) {
+                    if term.token != *word {
+                        self.add_term(&at_end, term);
+                    }
+                }
+            }
+        }
+        let last = slots - 1;
+        BTreeMap::from([(last, source.prefix(TermKind::Partial, &self.nodes[last].node.token, PREFIX_TERMS_MAX))])
+    }
+
+    /// The photon mode's near spellings (Photon's AUTO fuzziness), in a query of
+    /// TYPO_MIN_QUERY_CHARS or more: each word without digits gets the names within its edits,
+    /// and its partial terms within them go into `members`.
+    fn near_spellings(&mut self, source: &dyn TermSource, members: &mut BTreeMap<usize, Vec<Term>>) {
+        let slots = self.slots();
+        let query_chars = self.nodes[..slots].iter().map(|n| n.node.token.chars().count()).sum::<usize>() + slots - 1;
+        if query_chars < TYPO_MIN_QUERY_CHARS {
+            return;
+        }
+
+        for i in 0..slots {
+            let token = self.nodes[i].node.token.clone();
+            let chars = token.chars().count();
+            let edits = match chars {
+                n if n >= TYPO_TWO_EDITS_MIN_CHARS => 2,
+                n if n >= TYPO_ONE_EDIT_MIN_CHARS => 1,
+                _ => continue,
+            };
+            if token.chars().any(|c| decimal_digit(c).is_some()) {
+                continue;
+            }
+            let anchor = if chars <= TYPO_ANCHOR_SHORT_MAX_CHARS { TYPO_ANCHOR_SHORT } else { TYPO_ANCHOR_LONG };
+            let fuzz = Fuzz { edits, anchor };
+            for term in source.fuzzy(TermKind::Word, &token, fuzz, FUZZY_TERMS_MAX) {
+                if term.token != token {
+                    self.add_term(&[Span::new(i, i + 1)], term);
+                }
+            }
+            members.entry(i).or_default().extend(source.fuzzy(TermKind::Partial, &token, fuzz, FUZZY_TERMS_MAX));
+        }
+    }
+
+    /// Node `i`'s partial becomes the union of `members` and its own: their posting lists, their
+    /// summed counts, at the partial penalty and the best match penalty of any of them.
+    fn widen_partial(&mut self, i: usize, members: Vec<Term>) {
+        let node = &self.nodes[i];
+        let mut union: Vec<Term> = node.partial.map(|p| self.term(p.term).clone()).into_iter().collect();
+        for term in members {
+            if !union.iter().any(|u| (u.kind, &u.token, &u.word, &u.info) == (term.kind, &term.token, &term.word, &term.info)) {
+                union.push(term);
+            }
+        }
+        if union.len() <= 1 && node.partial.is_some() || union.is_empty() {
+            return;
+        }
+
+        let word = node.node.word.clone();
+        let best = union.iter().map(|t| match_penalty(if t.lookup_word.is_empty() { &t.token } else { &t.lookup_word }, &word)).fold(f64::INFINITY, f64::min);
+        let term = Term {
+            kind: TermKind::Partial,
+            token: node.node.token.clone(),
+            // No partial is made from an empty word, so the union is no term of the source.
+            word: String::new(),
+            lookup_word: word,
+            count: union.iter().fold(0u32, |s, t| s.saturating_add(t.count.max(1))),
+            addr_count: union.iter().fold(0u32, |s, t| s.saturating_add(t.addr_count.max(1))),
+            info: TermInfo::None,
+            postings: union.into_iter().flat_map(|t| t.postings).collect(),
+        };
+        let id = self.intern(term);
+        self.nodes[i].partial = Some(Token { term: id, penalty: PARTIAL_PENALTY + best });
     }
 
     /// A whole word of digits that no house-number term reads becomes one (icu_tokenizer.py:244-262).
@@ -491,8 +597,8 @@ mod tests {
     use crate::query::readings::{reading, readings};
     use crate::query::tokenize::split;
 
-    fn graph(q: &str, terms: &MemTerms) -> QueryGraph {
-        tokens(split(q).unwrap(), terms)
+    fn graph(q: &str, terms: &MemTerms, lookup: Lookup) -> QueryGraph {
+        tokens(split(q).unwrap(), terms, lookup)
     }
 
     /// The graph's tokens as Nominatim's debug page lists them, sorted: type, span, token, lookup
@@ -533,7 +639,7 @@ mod tests {
     #[test]
     fn reads_the_tokens_nominatim_read() {
         for r in readings() {
-            let g = graph(&r.q, &r.terms());
+            let g = graph(&r.q, &r.terms(), Lookup::Exact);
 
             let mut theirs: Vec<String> = r
                 .tokens
@@ -594,16 +700,16 @@ mod tests {
 
     #[test]
     fn n_grams_cross_no_phrase_break_and_span_at_most_twenty_nodes() {
-        let g = graph("a b, c d", &MemTerms::default());
+        let g = graph("a b, c d", &MemTerms::default(), Lookup::Exact);
 
         let words: Vec<(String, Vec<(usize, usize)>)> = g.words().into_iter().map(|(w, s)| (w, s.iter().map(|s| (s.start, s.end)).collect())).collect();
 
         let want: Vec<(String, Vec<(usize, usize)>)> =
             [("a", (0, 1)), ("a b", (0, 2)), ("b", (1, 2)), ("c", (2, 3)), ("c d", (2, 4)), ("d", (3, 4))].iter().map(|&(w, s)| (w.to_string(), vec![s])).collect();
         assert_eq!(words, want);
-        let long = graph(&(0..25).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" "), &MemTerms::default());
+        let long = graph(&(0..25).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" "), &MemTerms::default(), Lookup::Exact);
         assert_eq!(long.words().iter().flat_map(|(_, s)| s).map(|s| s.len()).max(), Some(NGRAM_MAX_NODES));
-        let repeated = graph("park park", &MemTerms::default());
+        let repeated = graph("park park", &MemTerms::default(), Lookup::Exact);
         assert_eq!(repeated.words()[0].1, [Span::new(0, 1), Span::new(1, 2)]);
     }
 
@@ -611,21 +717,21 @@ mod tests {
     fn a_whole_word_of_four_digits_or_fewer_reads_as_a_house_number() {
         let terms = MemTerms::default();
 
-        assert_eq!(of_type(&graph("zijldijk 8", &terms), 'H'), ["1-2 8 8 0.200"]);
-        assert_eq!(of_type(&graph("1044 liberty", &terms), 'H'), ["0-1 1044 1044 0.200"]);
-        assert!(of_type(&graph("12345 liberty", &terms), 'H').is_empty());
-        assert!(of_type(&graph("12-14", &terms), 'H').is_empty(), "words joined by a hyphen are no whole words");
-        assert!(of_type(&graph("8a", &terms), 'H').is_empty());
+        assert_eq!(of_type(&graph("zijldijk 8", &terms, Lookup::Exact), 'H'), ["1-2 8 8 0.200"]);
+        assert_eq!(of_type(&graph("1044 liberty", &terms, Lookup::Exact), 'H'), ["0-1 1044 1044 0.200"]);
+        assert!(of_type(&graph("12345 liberty", &terms, Lookup::Exact), 'H').is_empty());
+        assert!(of_type(&graph("12-14", &terms, Lookup::Exact), 'H').is_empty(), "words joined by a hyphen are no whole words");
+        assert!(of_type(&graph("8a", &terms, Lookup::Exact), 'H').is_empty());
         let mut known = MemTerms::default();
         known.insert(TermKind::HouseNumber, "8", ("", ""), (12, 1), TermInfo::None);
-        assert_eq!(of_type(&graph("zijldijk 8", &known), 'H'), ["1-2 8 8 0.000"]);
+        assert_eq!(of_type(&graph("zijldijk 8", &known, Lookup::Exact), 'H'), ["1-2 8 8 0.000"]);
     }
 
     #[test]
     fn a_category_phrase_is_a_near_item_at_the_start_else_a_qualifier() {
         let terms = MemTerms::default();
         let categories = |q: &str| {
-            let g = graph(q, &terms);
+            let g = graph(q, &terms, Lookup::Exact);
             let mut found: Vec<String> = Vec::new();
             for (i, n) in g.nodes.iter().enumerate() {
                 for list in n.starting.iter().filter(|l| matches!(l.ttype, TokenType::Qualifier | TokenType::NearItem)) {
@@ -649,7 +755,7 @@ mod tests {
 
     #[test]
     fn postcodes_come_from_the_parser_with_their_code_as_lookup_word() {
-        let g = graph("2361 AB", &reading("postcode-nl").terms());
+        let g = graph("2361 AB", &reading("postcode-nl").terms(), Lookup::Exact);
 
         let postcodes = of_type(&g, 'P');
 
@@ -659,8 +765,8 @@ mod tests {
 
     #[test]
     fn a_postcode_reading_costs_the_other_tokens_but_a_short_house_number() {
-        let liberty = graph("1044 Liberty Park Drive", &reading("liberty").terms());
-        let research = graph("12345 Research Blvd", &reading("postcode-hnr").terms());
+        let liberty = graph("1044 Liberty Park Drive", &reading("liberty").terms(), Lookup::Exact);
+        let research = graph("12345 Research Blvd", &reading("postcode-hnr").terms(), Lookup::Exact);
 
         assert_eq!(of_type(&liberty, 'W')[0], "0-1 1044 1044 0.390");
         assert_eq!(of_type(&liberty, 'H'), ["0-1 1044 1044 0.000"]);
@@ -671,10 +777,74 @@ mod tests {
 
     #[test]
     fn a_simple_house_number_reading_costs_the_other_tokens() {
-        let g = graph("zijldijk 8a", &reading("zijldijk").terms());
+        let g = graph("zijldijk 8a", &reading("zijldijk").terms(), Lookup::Exact);
 
         assert_eq!(of_type(&g, 'W'), ["0-1 zijldijk zijldijk 0.000", "1-2 8a 8a 0.400"]);
         assert_eq!(of_type(&g, 'w'), ["0-1 zijldijk zijldijk 0.300", "1-2 8a 8a 0.700"]);
         assert_eq!(of_type(&g, 'H'), ["1-2 8a 8 a 0.767"]);
+    }
+
+    /// "1044 Liberty Park Drive" as typed so far, and terms near it.
+    fn typing() -> MemTerms {
+        let mut terms = MemTerms::default();
+        terms.insert(TermKind::Partial, "1044", ("", ""), (39, 100), TermInfo::None);
+        terms.insert(TermKind::Partial, "10440", ("", ""), (3, 5), TermInfo::None);
+        terms.insert(TermKind::HouseNumber, "1044", ("", ""), (16, 1), TermInfo::None);
+        terms.insert(TermKind::HouseNumber, "10440", ("", ""), (2, 1), TermInfo::None);
+        terms.insert(TermKind::Partial, "liberty", ("", ""), (1060, 10787), TermInfo::None);
+        terms.insert(TermKind::Partial, "pa", ("", ""), (40, 30), TermInfo::None);
+        terms.insert(TermKind::Partial, "park", ("", ""), (32610, 51438), TermInfo::None);
+        terms.insert(TermKind::Word, "liberty park drive", ("", ""), (5, 2), TermInfo::None);
+        terms.insert(TermKind::Partial, "austin", ("", ""), (2818, 56467), TermInfo::None);
+        terms.insert(TermKind::Word, "austin", ("", ""), (16, 55241), TermInfo::None);
+        terms
+    }
+
+    #[test]
+    fn the_photon_mode_completes_the_last_word_alone() {
+        let terms = typing();
+
+        let g = graph("1044 liberty pa", &terms, Lookup::Prefix);
+
+        assert_eq!(of_type(&g, 'H'), ["0-1 1044 1044 0.000"], "1044 is no prefix of 10440 here");
+        assert_eq!(of_type(&g, 'W'), ["1-3 liberty park drive liberty park drive 0.056"]);
+        let last = g.term(g.nodes[2].partial.unwrap().term);
+        assert_eq!((last.token.as_str(), last.count, last.addr_count), ("pa", 40 + 32_610, 30 + 51_438), "the exact word and its completions");
+        assert_eq!(of_type(&g, 'w')[2], "2-3 pa pa 0.300");
+        let partial_1044 = g.term(g.nodes[0].partial.unwrap().term);
+        assert_eq!(partial_1044.count, 39);
+    }
+
+    #[test]
+    fn a_completion_alone_costs_its_match() {
+        let g = graph("1044 liberty par", &typing(), Lookup::Prefix);
+
+        assert_eq!(of_type(&g, 'w')[2], "2-3 par par 0.550");
+    }
+
+    #[test]
+    fn the_nominatim_mode_has_no_completion_and_no_near_spelling() {
+        let terms = typing();
+
+        let g = graph("1044 liberty pa", &terms, Lookup::Exact);
+        let typo = graph("futo austn", &terms, Lookup::Exact);
+
+        assert!(of_type(&g, 'W').is_empty());
+        assert_eq!(g.term(g.nodes[2].partial.unwrap().term).count, 40);
+        assert!(typo.nodes[1].partial.is_none());
+    }
+
+    #[test]
+    fn a_typo_reading_takes_near_spellings_of_words_but_numbers() {
+        let terms = typing();
+
+        let g = graph("futo austn", &terms, Lookup::Typo);
+        let numbers = graph("1045 austin", &terms, Lookup::Typo);
+        let short = graph("asn", &terms, Lookup::Typo);
+
+        assert_eq!(of_type(&g, 'W'), ["1-2 austin austin 0.167"]);
+        assert_eq!(of_type(&g, 'w'), ["1-2 austn austn 0.467"]);
+        assert!(numbers.nodes[0].partial.is_none());
+        assert!(short.nodes[0].partial.is_none(), "a query of three characters is read as typed");
     }
 }
