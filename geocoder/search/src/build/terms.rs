@@ -118,13 +118,14 @@ struct NameInput {
 }
 
 impl NameInput {
-    // A numeric sort groups identical analyses and walks display-name strings in offset order.
-    fn sort_row(self, entity: EntityRef, id: u32, importance: u32) -> [u32; 7] {
+    // Keep a window of display names hot while walking its tag bundles in offset order.
+    fn sort_row(self, entity: EntityRef, id: u32, importance: u32) -> [u32; 8] {
         let country = u32::from(u16::from_be_bytes(self.country));
         let scope = country | (u32::from(self.country_term) << u16::BITS);
         [
-            self.name,
+            self.name / NAME_WINDOW_BYTES,
             self.bundle.unwrap_or(query_server::NO_DATA),
+            self.name,
             self.own.unwrap_or(query_server::NO_DATA),
             scope,
             entity.packed(),
@@ -133,7 +134,7 @@ impl NameInput {
         ]
     }
 
-    fn from_row([name, bundle, own, scope, packed, id, importance]: [u32; 7]) -> (Self, EntityRef, u32, u32) {
+    fn from_row([_, bundle, name, own, scope, packed, id, importance]: [u32; 8]) -> (Self, EntityRef, u32, u32) {
         let entity = EntityRef::unpack(packed).unwrap();
         let input = Self {
             name,
@@ -742,7 +743,12 @@ mod name_order_tests {
         let input =
             NameInput { name: 4, own: Some(3), bundle: Some(5), poi: true, country_term: false, country: *b"de" };
         let row = input.sort_row(e, 41, 87);
-        assert_eq!(row[0], input.name);
+        let mut neighbours = [
+            NameInput { name: 90, bundle: Some(1), ..input }.sort_row(e, 0, 0),
+            NameInput { name: 7, bundle: Some(2), ..input }.sort_row(e, 0, 0),
+        ];
+        neighbours.sort_unstable();
+        assert_eq!(NameInput::from_row(neighbours[0]).0.bundle, Some(1));
         let (restored, entity, id, imp) = NameInput::from_row(row);
         assert!(restored == input);
         assert_eq!((entity, id, imp), (e, 41, 87));
