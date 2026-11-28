@@ -4,9 +4,10 @@
 //! boundaries' rings as arcs, query_server's arc fixture), and the place-search index built from
 //! it the way `place-search build` builds one.
 use crate::build::{build_all, held_subs, index_meta, BuildOpts};
-use crate::constants::{ADMIN_TAGS_FILE, PLACE_TAGS_FILE, POI_TAGS_FILE, SUB_INDEXES};
+use crate::constants::{ADMIN_TAGS_FILE, PLACE_TAGS_FILE, POI_TAGS_FILE, PLACES_SUB_INDEXES};
 use crate::model::PLACE_FLAG_LABEL_OF;
 use crate::profile::{Profile, SearchRequest};
+use crate::constants::TAG_TIERS;
 use crate::tags;
 use query_server::arc_fixture::{self, ArcFixture};
 use query_server::{
@@ -103,6 +104,7 @@ impl Side {
 #[derive(Default)]
 pub struct Geo {
     strings: Vec<u8>,
+    tag_strings: [Vec<u8>; 2],
     /// (record, closed rings as (lat, lng) in degrees, the outer one first)
     polygons: Vec<(AdminPolygon, Vec<Vec<(f32, f32)>>)>,
     nodes: Vec<PlaceNode>,
@@ -274,7 +276,10 @@ impl Geo {
     /// Record `record`'s bundle of `tags`, a string of the pool's, in the side file `side`.
     fn bundle(&mut self, side: Side, record: u32, tags: &[(&str, &str)]) {
         let bundle = tags::encode(tags.iter().copied()).expect("tags a bundle holds");
-        let bundle_id = self.string(&bundle);
+        let pool = &mut self.tag_strings[usize::from(side == Side::PoiTags)];
+        let bundle_id = pool.len() as u32;
+        pool.extend_from_slice(bundle.as_bytes());
+        pool.push(0);
         self.side(side, record, bundle_id);
     }
 
@@ -315,9 +320,15 @@ impl Geo {
         let (admin_cells, admin_entries) = cell_pairs::write_pairs(admin, cell_pairs::ADMIN);
         let (places, place_rows) = place_files::encode(&self.nodes, DEFAULT_ADMIN_CELL_LEVEL);
         let end = self.strings.len();
-        let tiers: Vec<String> = (0..STR_TIER_COUNT)
+        let mut tiers: Vec<String> = (0..STR_TIER_COUNT)
             .map(|t| format!("{{\"start\": {}, \"end\": {end}}}", if t == 0 { 0 } else { end }))
             .collect();
+        let mut base = end;
+        for (name, pool) in TAG_TIERS.iter().zip(&self.tag_strings) {
+            let start = base;
+            base += pool.len();
+            tiers.push(format!(r#"{{"file":"{name}","start":{start},"end":{base}}}"#));
+        }
         let mut own_names = self.own_names.clone();
         own_names.sort_unstable();
         let own_names = own_names.iter().flat_map(|&(poly, name)| [poly, name]).flat_map(u32::to_le_bytes).collect();
@@ -361,13 +372,20 @@ impl Geo {
             let (centroids, cells) = postcode_files::encode_points(&self.centroids, DEFAULT_ADMIN_CELL_LEVEL);
             files.extend([(postcode_files::CENTROIDS_FILE, centroids), (postcode_files::CELLS_FILE, cells)]);
         }
+        for (name, pool) in TAG_TIERS.into_iter().zip(&self.tag_strings) {
+            if !pool.is_empty() { files.push((name, strings::encode(pool))); }
+        }
         for (&side, set) in &self.sides {
             let mut values = vec![NO_DATA; self.records_beside(side)];
             for &(record, value) in set {
                 // The place files order their nodes by cell (place_files::encode); every other
                 // file keeps its records in the order they were added.
                 let row = if side == Side::PlaceTags { place_rows[record as usize] } else { record };
-                values[row as usize] = value;
+                values[row as usize] = value + match side {
+                    Side::PlaceTags | Side::AdminTags => end as u32,
+                    Side::PoiTags => (end + self.tag_strings[0].len()) as u32,
+                    _ => 0,
+                };
             }
             files.push((side.file(), side_blocks::encode(&values)));
         }
@@ -460,7 +478,7 @@ fn way_pair(kind: way_files::Kind, ways: &[Way]) -> [(&'static str, Vec<u8>); 2]
 pub fn build_search(geo: &Index, out: &Path, extras: Option<&Path>) {
     let opts = BuildOpts { extras: extras.map(|p| p.to_str().unwrap().to_string()), ..BuildOpts::new(out.join("tmp")) };
     let meta = index_meta(geo, &opts).into();
-    build_all(geo, &held_subs(geo, SUB_INDEXES), out, &opts, || Ok(meta)).unwrap();
+    build_all(geo, &held_subs(geo, PLACES_SUB_INDEXES), out, &opts, || Ok(meta)).unwrap();
 }
 
 /// A country code as the builder packs it: upper case, the first letter the high byte.
@@ -483,9 +501,9 @@ pub fn new_request(q: &str, limit: usize) -> SearchRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tags::TagBundle;
+    use crate::dataset::SearchFiles;
+    use crate::model::Kind;
     use query_server::side_blocks::SideBlocks;
-    use query_server::FileBytes;
 
     /// Austin, a street in it with an address point and an interpolation line, and a centroid.
     fn austin() -> Geo {
@@ -579,16 +597,13 @@ mod tests {
 
         let geo = g.load(&dir.0);
 
-        let tag = |file: &str, record: u32, key: &str| {
-            let side = SideBlocks::open(FileBytes::Owned(std::fs::read(dir.0.join(file)).unwrap()), file).unwrap();
-            let offset = side.get(record).unwrap();
-            (offset != NO_DATA).then(|| TagBundle::parse(geo.get_string(offset).into_owned()).unwrap().get(key).unwrap().to_string())
-        };
+        let files = SearchFiles::open(&dir.0, &geo).unwrap();
+        let tag = |kind, record, key: &str| files.bundle(kind, record).and_then(|b| b.get(key).map(str::to_owned));
         let place_row = |name: &str| (0..geo.place_node_count()).find(|&row| geo.get_string(geo.place_node_record(row).unwrap().name_id) == name).unwrap();
-        assert_eq!(tag(PLACE_TAGS_FILE, place_row("Munich"), "name:it").as_deref(), Some("Monaco di Baviera"));
-        assert_eq!(tag(PLACE_TAGS_FILE, place_row("Garching"), "name"), None);
-        assert_eq!(tag(ADMIN_TAGS_FILE, land, "ISO3166-2").as_deref(), Some("DE-BY"));
-        assert_eq!(tag(POI_TAGS_FILE, cafe, "amenity").as_deref(), Some("cafe"));
+        assert_eq!(tag(Kind::Place, place_row("Munich"), "name:it").as_deref(), Some("Monaco di Baviera"));
+        assert_eq!(tag(Kind::Place, place_row("Garching"), "name"), None);
+        assert_eq!(tag(Kind::Area, land, "ISO3166-2").as_deref(), Some("DE-BY"));
+        assert_eq!(tag(Kind::Poi, cafe, "amenity").as_deref(), Some("cafe"));
     }
 
     #[test]
@@ -605,10 +620,10 @@ mod tests {
 
         let geo = g.load(&dir.0);
 
-        let side = SideBlocks::open(FileBytes::Owned(std::fs::read(dir.0.join(PLACE_TAGS_FILE)).unwrap()), PLACE_TAGS_FILE).unwrap();
+        let files = SearchFiles::open(&dir.0, &geo).unwrap();
         let rows: Vec<(String, String)> = (0..geo.place_node_count())
             .map(|row| {
-                let bundle = TagBundle::parse(geo.get_string(side.get(row).unwrap()).into_owned()).unwrap();
+                let bundle = files.bundle(Kind::Place, row).unwrap();
                 (geo.get_string(geo.place_node_record(row).unwrap().name_id).into_owned(), bundle.get("name").unwrap().to_string())
             })
             .collect();

@@ -25,6 +25,68 @@ use std::sync::Arc;
 
 pub use query_server::{Stamps, DATASET_FILES};
 
+/// Search-only files. Opening reverse data never reads a bundle or importance column.
+#[derive(Default)]
+pub struct SearchFiles {
+    tiers: [Option<(u32, query_server::strings::Tier)>; 2],
+    tags: [Option<query_server::side_blocks::SideBlocks>; 3],
+    wiki: [Option<query_server::side_blocks::SideBlocks>; 3],
+}
+
+impl SearchFiles {
+    pub fn open(dir: &Path, geo: &Index) -> Result<Self, String> {
+        let mut files = Self::default();
+        let counts = [geo.place_node_count(), geo.admin_polygon_count(), geo.poi_records.as_ref().map_or(0, |p| p.len())];
+        let optional = |name: &str| {
+            let path = dir.join(name);
+            if !path.try_exists().map_err(|e| e.to_string())? { return Ok(None); }
+            query_server::mmap_file(path.to_str().ok_or("invalid dataset path")?).map(Some)
+        };
+        for (i, name) in [PLACE_TAGS_FILE, ADMIN_TAGS_FILE, POI_TAGS_FILE].into_iter().enumerate() {
+            for (file, col) in [(name, &mut files.tags[i]), (IMPORTANCE_FILES[i], &mut files.wiki[i])] {
+                if let Some(bytes) = optional(file)? {
+                    let side = query_server::side_blocks::SideBlocks::open(bytes, file)?;
+                    if side.count() != counts[i] { return Err(format!("{file} has {} rows, expected {}", side.count(), counts[i])); }
+                    *col = Some(side);
+                }
+            }
+        }
+        for (i, name) in TAG_TIERS.into_iter().enumerate() {
+            if let Some(bytes) = optional(name)? {
+                let layout: Value = serde_json::from_reader(File::open(dir.join("strings_layout.json")).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+                let entry = layout["tiers"].as_array().and_then(|ts| ts.iter().find(|t| t["file"] == name))
+                    .ok_or_else(|| format!("missing layout for {name}"))?;
+                let bounds = |field: &str| entry[field].as_u64().and_then(|u| u32::try_from(u).ok()).ok_or_else(|| format!("bad {field} for {name}"));
+                let tier = query_server::strings::Tier::open(bytes)?;
+                let base = bounds("start")?;
+                if tier.len() > bounds("end")?.checked_sub(base).ok_or("reversed tier bounds")? {
+                    return Err(format!("{name} exceeds its layout"));
+                }
+                files.tiers[i] = Some((base, tier));
+            }
+        }
+        Ok(files)
+    }
+
+    /// Place rows, admin slots and POI rows respectively.
+    pub fn bundle(&self, kind: crate::model::Kind, row: u32) -> Option<crate::tags::TagBundle<'_>> {
+        let k = Self::column(kind);
+        let offset = self.tags[k].as_ref()?.get(row)?;
+        let (base, tier) = self.tiers[usize::from(k == 2)].as_ref()?;
+        crate::tags::TagBundle::parse(tier.get(offset.checked_sub(*base)?))
+    }
+
+    pub fn wiki_importance(&self, kind: crate::model::Kind, row: u32) -> Option<u32> {
+        self.wiki[Self::column(kind)].as_ref()?.get(row).filter(|&v| v != 0)
+    }
+
+    fn column(kind: crate::model::Kind) -> usize {
+        use crate::model::Kind;
+        match kind { Kind::Place | Kind::Minor => 0, Kind::Area | Kind::Linked => 1, Kind::Poi => 2 }
+    }
+}
+
 /// The sha256 (hex) of each dataset file present, by name.
 pub type Fingerprint = BTreeMap<String, String>;
 
@@ -86,6 +148,12 @@ impl HashCache {
     /// The fingerprint of the dataset in `dir`, its files stamped `stamps`: only those whose
     /// stamp the cache has not seen are hashed.
     pub fn fingerprint(&mut self, dir: &Path, stamps: &Stamps) -> std::io::Result<Fingerprint> {
+        let mut inputs = stamps.clone();
+        inputs.0.retain(|name, _| DATASET_FILES.contains(&name.as_str()));
+        self.fingerprint_inputs(dir, &inputs)
+    }
+
+    fn fingerprint_inputs(&mut self, dir: &Path, stamps: &Stamps) -> std::io::Result<Fingerprint> {
         self.0.retain(|name, _| stamps.0.contains_key(name));
         let mut out = Fingerprint::new();
         for (name, stamp) in &stamps.0 {
@@ -121,13 +189,23 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// hashes `hashes` holds reused: refused when they no longer have those stamps, before the
 /// hashing or after it, as the files hashed would not be the ones loaded.
 fn fingerprint_loaded(dir: &Path, loaded: &Stamps, hashes: &mut HashCache) -> Result<Fingerprint, String> {
+    checked_fingerprint(dir, loaded, || hashes.fingerprint(dir, loaded))
+}
+
+pub(crate) fn core_fingerprint(dir: &Path, loaded: &Stamps, hashes: &mut HashCache) -> Result<Fingerprint, String> {
+    checked_fingerprint(dir, loaded, || hashes.fingerprint_inputs(dir, loaded))
+}
+
+fn checked_fingerprint(
+    dir: &Path, loaded: &Stamps, fingerprint: impl FnOnce() -> std::io::Result<Fingerprint>,
+) -> Result<Fingerprint, String> {
     let io = |e: std::io::Error| format!("{}: {e}", dir.display());
     let unchanged = || match Stamps::of(dir).map_err(|e| e.to_string())? {
         now if now == *loaded => Ok(()),
         _ => Err(format!("The dataset in {} changed since it was loaded: load it again", dir.display())),
     };
     unchanged()?;
-    let have = hashes.fingerprint(dir, loaded).map_err(io)?;
+    let have = fingerprint().map_err(io)?;
     unchanged()?;
     Ok(have)
 }
@@ -165,7 +243,7 @@ pub fn merged_meta(geo: &Index, loaded: &Stamps, opts: &BuildOpts, dir: &Path, o
     }
     build::check_retained_names(out, &replacing, opts.extras.is_some())?;
     let dataset = fingerprint_loaded(dir, loaded, &mut HashCache::default())?;
-    let kept = SUB_INDEXES.iter().find(|s| !replacing.contains(s) && has_sub_index(out, s));
+    let kept = PLACES_SUB_INDEXES.iter().find(|s| !replacing.contains(s) && has_sub_index(out, s));
     if let Some(kept) = kept.filter(|_| built_from(out).as_ref() != Some(&dataset)) {
         return Err(format!("retained {kept} sub-index was built from other dataset files; rebuild with --sub all"));
     }
@@ -207,14 +285,14 @@ impl Default for BuildOnDevice {
 /// Whether `index` holds every file `SearchIndex::open` maps for `geo`: a `place-search build
 /// --sub` into an empty directory records the whole dataset, but holds only what it built.
 fn is_complete(geo: &Index, index: &Path) -> bool {
-    let sub_files = held_subs(geo, SUB_INDEXES).into_iter().flat_map(sub_index_files);
+    let sub_files = held_subs(geo, PLACES_SUB_INDEXES).into_iter().flat_map(sub_index_files);
     sub_files.chain([BOUNDARY_FILE.to_string()]).all(|f| index.join(f).is_file())
 }
 
 /// Opens the place search index in `index` of the dataset in `dir` (loaded as `geo` from files
 /// stamped `loaded`, by `load`): the one there when it is whole (`is_complete`), no publish into
 /// it was left unfinished and it was built from these files in this build's format
-/// (INDEX_FORMAT) without extra names (it has no extra-names file to read them with), else one
+/// (PLACES_INDEX_FORMAT) without extra names (it has no extra-names file to read them with), else one
 /// built from them first by `build_held` with the default options (staged in `index`, every file
 /// moved in only once all are complete). Fails when the files are no longer the ones loaded. The
 /// open holds `index` (`HeldIndexDir`, which every build takes) until the index is mapped,
@@ -247,7 +325,7 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
         let _ = std::fs::remove_dir_all(index.join(BUILD_STAGE_DIR));
         let opts = BuildOpts { threads: on_device.threads, mem_mb: on_device.mem_mb, ..BuildOpts::new(index.join("tmp")) };
         let meta = index_meta(geo, &opts, &have);
-        build_held(geo, &held_subs(geo, SUB_INDEXES), &held, &opts, || Ok(meta.into()))?;
+        build_held(geo, &held_subs(geo, PLACES_SUB_INDEXES), &held, &opts, || Ok(meta.into()))?;
         Origin::Built
     };
     // Only saves a later open the hashing; a read-only index dir is fine.
@@ -256,6 +334,55 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
     let opened = SearchIndex::open(geo, index, None, None)?;
     drop(held);
     Ok((opened, origin))
+}
+
+/// Checks a published core without rebuilding it. A query can only reuse the profile
+/// and dataset whose entity ids the postings address.
+pub fn read_core(dir: &Path, index: &Path, profile: Profile) -> Result<crate::index::CoreIndex, String> {
+    let held = HeldIndexDir::take(index, Contended::Wait)?;
+    let loaded = Stamps::of(dir).map_err(|e| e.to_string())?;
+    let cache = index.join(HASH_CACHE_FILE);
+    let mut hashes = HashCache::load(&cache);
+    let have = core_fingerprint(dir, &loaded, &mut hashes)?;
+    if !meta_of(index).is_some_and(|m| m["profile"] == profile.as_str() && m["core"][META_DATASET_KEY] == json!(have)) {
+        return Err(format!("{} does not match the requested dataset and profile", index.display()));
+    }
+    let core = crate::index::CoreIndex::open_held(index, &held).map_err(|e| e.to_string())?;
+    let _ = hashes.save(&cache);
+    Ok(core)
+}
+
+/// Opens or builds the requested core, keeping the dataset fingerprint, generation and
+/// mappings together under the publish lock.
+pub fn open_core(
+    geo: &Index,
+    loaded: &Stamps,
+    dir: &Path,
+    index: &Path,
+    profile: Profile,
+    on_device: &BuildOnDevice,
+) -> Result<(crate::index::CoreIndex, Origin), String> {
+    use crate::index::CoreIndex;
+    let held = HeldIndexDir::take(index, Contended::Wait)?;
+    let cache = index.join(HASH_CACHE_FILE);
+    let mut hashes = HashCache::load(&cache);
+    let have = core_fingerprint(dir, loaded, &mut hashes)?;
+    let current = meta_of(index).is_some_and(|m| {
+        m["profile"] == profile.as_str()
+            && m["poi_max_tier"] == MAX_CORE_POI_TIER
+            && m["core"][META_DATASET_KEY] == json!(have)
+    });
+    if current {
+        if let Ok(core) = CoreIndex::open_held(index, &held) {
+            let _ = hashes.save(&cache);
+            return Ok((core, Origin::Current));
+        }
+    }
+    let opts = BuildOpts { threads: on_device.threads, mem_mb: on_device.mem_mb, ..BuildOpts::new(index.join("tmp")) };
+    build::build_core_held(geo, loaded, dir, &held, profile, &opts, &mut hashes)?;
+    let core = CoreIndex::open_held(index, &held).map_err(|e| e.to_string())?;
+    let _ = hashes.save(&cache);
+    Ok((core, Origin::Built))
 }
 
 /// A place search `open` opened, held with the geocoder index its postings point into, so that it
@@ -373,7 +500,7 @@ mod tests {
         let (geo, _) = load_dataset(ci);
         let opts = BuildOpts::new(ci.join("tmp"));
         let meta = index_meta(&geo, &opts, &fingerprint(ci).unwrap());
-        build_all(&geo, &held_subs(&geo, SUB_INDEXES), out, &opts, || Ok(meta.into())).unwrap();
+        build_all(&geo, &held_subs(&geo, PLACES_SUB_INDEXES), out, &opts, || Ok(meta.into())).unwrap();
     }
 
     /// `dataset(names)` with one POI named `poi`.
@@ -531,18 +658,18 @@ mod tests {
 
     #[test]
     fn a_partial_build_over_an_index_of_another_format_is_refused() {
-        for &kept in SUB_INDEXES {
+        for &kept in PLACES_SUB_INDEXES {
             let ds = TempDir::new("partial-format");
             let index = ds.0.join("search");
             with_poi(["Testville", "Otherton"], "Old Mill").write(&ds.0);
-            build_subs(&ds.0, &index, SUB_INDEXES).unwrap();
+            build_subs(&ds.0, &index, PLACES_SUB_INDEXES).unwrap();
             set_meta(&index, "format", Some(json!(1)));
-            let building: Vec<&str> = SUB_INDEXES.iter().copied().filter(|&s| s != kept).collect();
+            let building: Vec<&str> = PLACES_SUB_INDEXES.iter().copied().filter(|&s| s != kept).collect();
 
             let refused = build_subs(&ds.0, &index, &building);
 
             assert!(refused.as_ref().is_err_and(|e| e.contains(&format!("retained {kept} sub-index"))), "{kept}: {refused:?}");
-            build_subs(&ds.0, &index, SUB_INDEXES).unwrap();
+            build_subs(&ds.0, &index, PLACES_SUB_INDEXES).unwrap();
             let (geo, stamps) = load_dataset(&ds.0);
             assert_eq!(open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap().1, Origin::Current, "{kept}");
         }
@@ -605,7 +732,7 @@ mod tests {
         let stage = index.join(BUILD_STAGE_DIR);
         let opts = BuildOpts { area_proxy: true, ..BuildOpts::new(dir.join("tmp")) };
         let meta = index_meta(geo, &opts, &fingerprint(dir).unwrap());
-        build_all(geo, &held_subs(geo, SUB_INDEXES), &stage, &opts, || Ok(meta.into())).unwrap();
+        build_all(geo, &held_subs(geo, PLACES_SUB_INDEXES), &stage, &opts, || Ok(meta.into())).unwrap();
         let aside = stage.join(BUILD_ASIDE_DIR);
         std::fs::create_dir(&aside).unwrap();
         for f in ["places.bnd", "places.fst"] {
@@ -691,7 +818,7 @@ mod tests {
         let (geo, stamps) = load_dataset(&ds.0);
         // Patched between the load and the META_FILE: the index would hold the old names.
         dataset(["Nestville", "Otherton"]).write(&ds.0);
-        let (opts, subs) = (BuildOpts::new(ds.0.join("tmp")), held_subs(&geo, SUB_INDEXES));
+        let (opts, subs) = (BuildOpts::new(ds.0.join("tmp")), held_subs(&geo, PLACES_SUB_INDEXES));
 
         let refused = build_all(&geo, &subs, &index, &opts, || merged_meta(&geo, &stamps, &opts, &ds.0, &index, &subs));
 
@@ -748,13 +875,13 @@ mod tests {
 
     #[test]
     fn a_partial_build_over_an_index_of_other_files_is_refused() {
-        for &kept in SUB_INDEXES {
+        for &kept in PLACES_SUB_INDEXES {
             let ds = TempDir::new("partial");
             let index = ds.0.join("search");
             with_poi(["Testville", "Otherton"], "Old Mill").write(&ds.0);
-            build_subs(&ds.0, &index, SUB_INDEXES).unwrap();
+            build_subs(&ds.0, &index, PLACES_SUB_INDEXES).unwrap();
             with_poi(["Nestville", "Otherton"], "New Mill").write(&ds.0);
-            let building: Vec<&str> = SUB_INDEXES.iter().copied().filter(|&s| s != kept).collect();
+            let building: Vec<&str> = PLACES_SUB_INDEXES.iter().copied().filter(|&s| s != kept).collect();
 
             let refused = build_subs(&ds.0, &index, &building);
 
@@ -771,7 +898,7 @@ mod tests {
         let ds = TempDir::new("partial-same");
         let index = ds.0.join("search");
         with_poi(["Testville", "Otherton"], "Old Mill").write(&ds.0);
-        build_subs(&ds.0, &index, SUB_INDEXES).unwrap();
+        build_subs(&ds.0, &index, PLACES_SUB_INDEXES).unwrap();
         let poi = FileStamp::of(&std::fs::metadata(index.join("poi.fst")).unwrap());
 
         build_subs(&ds.0, &index, &["places"]).unwrap();
@@ -786,7 +913,7 @@ mod tests {
     #[test]
     fn an_index_of_some_sub_indexes_is_built_whole() {
         // `place-search build --sub` into an empty directory records the whole dataset.
-        for &sub in SUB_INDEXES {
+        for &sub in PLACES_SUB_INDEXES {
             let ds = TempDir::new("some-subs");
             let index = ds.0.join("search");
             with_poi(["Testville", "Otherton"], "Old Mill").write(&ds.0);
@@ -803,11 +930,11 @@ mod tests {
 
     #[test]
     fn an_index_missing_a_file_is_built_again() {
-        for file in SUB_INDEXES.iter().copied().flat_map(sub_index_files).chain([BOUNDARY_FILE.to_string()]) {
+        for file in PLACES_SUB_INDEXES.iter().copied().flat_map(sub_index_files).chain([BOUNDARY_FILE.to_string()]) {
             let ds = TempDir::new("missing-file");
             let index = ds.0.join("search");
             with_poi(["Testville", "Otherton"], "Old Mill").write(&ds.0);
-            build_subs(&ds.0, &index, SUB_INDEXES).unwrap();
+            build_subs(&ds.0, &index, PLACES_SUB_INDEXES).unwrap();
             // A download cut short, or a file removed by hand.
             std::fs::remove_file(index.join(&file)).unwrap();
             let (geo, stamps) = load_dataset(&ds.0);
@@ -832,7 +959,7 @@ mod tests {
         let (geo, stamps) = load_dataset(&ds.0);
         let opts = BuildOpts { extras: Some(bin.to_str().unwrap().into()), ..BuildOpts::new(ds.0.join("tmp")) };
         let meta = index_meta(&geo, &opts, &fingerprint(&ds.0).unwrap());
-        build_all(&geo, &held_subs(&geo, SUB_INDEXES), &index, &opts, || Ok(meta.into())).unwrap();
+        build_all(&geo, &held_subs(&geo, PLACES_SUB_INDEXES), &index, &opts, || Ok(meta.into())).unwrap();
 
         let (idx, origin) = open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap();
 

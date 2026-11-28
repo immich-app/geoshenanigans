@@ -7,6 +7,14 @@
 //! `<name>.post`, `<name>.pfx.fst` + `<name>.pfx` (prefix table), and for places `places.bnd`
 //! (boundary slots, `Boundaries`). Nothing else is stored: names, points and types stay in the
 //! geocoder files, a labelled boundary's point too (its label node's).
+mod chains;
+mod counts;
+pub(crate) mod sources;
+mod terms;
+mod write;
+pub use write::build_core;
+pub(crate) use write::build_core_held;
+
 use crate::constants::*;
 use crate::entities::*;
 use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI};
@@ -885,7 +893,7 @@ pub fn index_meta(geo: &Index, opts: &BuildOpts) -> serde_json::Map<String, serd
     let n_place_nodes = geo.place_node_count();
     [
         ("n_place_nodes", json!(n_place_nodes)),
-        (META_FORMAT_KEY, json!(INDEX_FORMAT)),
+        (META_FORMAT_KEY, json!(PLACES_INDEX_FORMAT)),
         ("extras", json!(opts.extras.is_some())),
         ("imp", json!(opts.imp_dir.is_some())),
         ("area_proxy", json!(opts.area_proxy)),
@@ -902,10 +910,10 @@ pub fn has_extra_names(meta: &serde_json::Value) -> bool {
     meta["extras"].as_bool().unwrap_or(false)
 }
 
-/// Whether the index whose META_FILE is `meta` has this build's layout (INDEX_FORMAT): one of
+/// Whether the index whose META_FILE is `meta` has this build's layout (PLACES_INDEX_FORMAT): one of
 /// another, or without a format, is no index `SearchIndex::open` reads.
 pub fn is_current_format(meta: &serde_json::Value) -> bool {
-    meta[META_FORMAT_KEY].as_u64() == Some(INDEX_FORMAT)
+    meta[META_FORMAT_KEY].as_u64() == Some(PLACES_INDEX_FORMAT)
 }
 
 /// Builds the sub-indexes `subs` of `geo` for the index directory `out`, the value `meta` gives
@@ -1054,7 +1062,7 @@ pub fn check_retained_names(out: &Path, building: &[&str], with_extras: bool) ->
         Err(e) => return Err(e.to_string()),
     };
     let meta: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    for &name in SUB_INDEXES {
+    for &name in PLACES_SUB_INDEXES {
         if !building.contains(&name) && has_sub_index(out, name)
             && has_extra_names(&meta) != with_extras {
             return Err(format!("retained {name} sub-index uses a different extra-name setting; rebuild with --sub all or the same --extras setting"));
@@ -1520,7 +1528,7 @@ mod tests {
         let files = |threads: usize| {
             let out = dir.0.join(format!("idx-{threads}"));
             let opts = BuildOpts { threads, ..BuildOpts::new(dir.0.join(format!("tmp-{threads}"))) };
-            build_all(&geo, &held_subs(&geo, SUB_INDEXES), &out, &opts, || Ok(serde_json::json!({}))).unwrap();
+            build_all(&geo, &held_subs(&geo, PLACES_SUB_INDEXES), &out, &opts, || Ok(serde_json::json!({}))).unwrap();
             let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(&out)
                 .unwrap()
                 .map(|e| e.unwrap().path())

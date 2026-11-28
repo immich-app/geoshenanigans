@@ -1,3 +1,4 @@
 build/
+!search/src/build/
 target/
 *.osm.pbf

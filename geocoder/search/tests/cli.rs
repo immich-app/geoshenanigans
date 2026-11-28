@@ -133,3 +133,45 @@ fn a_flag_given_last_without_its_value_is_a_usage_error() {
         assert_eq!(String::from_utf8_lossy(&out.stderr), format!("{} needs a value\n", args[3]), "{args:?}");
     }
 }
+
+#[test]
+fn profiled_build_and_query_read_the_same_core_dictionary() {
+    let tmp = TempDir::new("cli-core");
+    let set = tmp.0.join("set");
+    let index = tmp.0.join("index");
+    write_dataset(&set);
+    let cli = env!("CARGO_BIN_EXE_place-search");
+    let run = Command::new(cli).arg("build").arg(&set).arg(&index).args(["--profile", "immich"]).output().unwrap();
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    assert!(index.join("core.ent").exists());
+    let mut query = Command::new(cli)
+        .arg("query")
+        .arg(&set)
+        .arg(&index)
+        .args(["--profile", "immich", "--mode", "nominatim"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(query.stdin.take().unwrap(), "Testville").unwrap();
+    let result = query.wait_with_output().unwrap();
+    assert!(result.status.success());
+    let line: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(line["tokens"].as_array().unwrap().iter().any(|t| t["word_token"] == "testville" && t["count"] == 1));
+}
+
+#[test]
+fn profiled_queries_require_the_matching_dataset_and_profile() {
+    let tmp = TempDir::new("cli-core-identity");
+    let set = tmp.0.join("set");
+    let index = tmp.0.join("index");
+    write_dataset(&set);
+    let cli = env!("CARGO_BIN_EXE_place-search");
+    let invoke = |cmd: &str, profile: &str| {
+        Command::new(cli).arg(cmd).arg(&set).arg(&index).args(["--profile", profile]).output().unwrap()
+    };
+    assert!(invoke("build", "immich").status.success());
+    assert!(!invoke("query", "full").status.success());
+    std::fs::remove_file(set.join("place_nodes.bin")).unwrap();
+    assert!(!invoke("query", "immich").status.success());
+}

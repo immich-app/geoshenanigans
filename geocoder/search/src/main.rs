@@ -4,13 +4,18 @@
 //!   search_meta.json records the set's files (dataset.rs): the index belongs to that set alone,
 //!   so --sub builds only over an index of the same files, and files replaced since the set was
 //!   loaded fail the build
+//! place-search build <set dir> <index dir> --profile immich|full [--sub core] [--threads N] [--mem-mb M]
+//! place-search query <set dir> <index dir> --profile immich|full [--mode nominatim|photon]
+//!   reads queries against the core and prints their query-plan token statistics
+//! place-search bench <set dir> <index dir> [--profile immich|full] [--mode nominatim|photon] [--bench REPEATS]
+//!   times query reading against the mapped core
 //! place-search pack-extras <extra_names.tsv> <extra_names.bin>
 //! place-search query <set dir> <index dir> [--extras F] [--iso F] [--limit N]
 //!                    [--bench REPEATS [--no-warmup]]
 //!   one query per stdin line; default one JSON line per query, --bench latency percentiles
 //! place-search ctxbench <set dir> <index dir> < "lat lng" lines   (reverse-lookup cost per point)
 use place_search::build::{build_all, held_subs, BuildOpts};
-use place_search::constants::SUB_INDEXES;
+use place_search::constants::PLACES_SUB_INDEXES;
 use place_search::profile::Profile;
 use place_search::reader::SearchIndex;
 use place_search::query::Searcher;
@@ -55,7 +60,7 @@ fn selected_subs(sub: &str) -> Result<&'static [&'static str], String> {
     match sub {
         "places" => Ok(&["places"]),
         "poi" => Ok(&["poi"]),
-        "all" => Ok(SUB_INDEXES),
+        "all" => Ok(PLACES_SUB_INDEXES),
         _ => Err(format!("--sub {sub:?}: expected places, poi or all")),
     }
 }
@@ -63,11 +68,9 @@ fn selected_subs(sub: &str) -> Result<&'static [&'static str], String> {
 fn cmd_build(args: &[String]) {
     let (set, out) = (&args[2], PathBuf::from(&args[3]));
     let sub = opt(args, "--sub").unwrap_or_else(|| "all".into());
-    let selected = selected_subs(&sub).unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(2)
-    });
-    let (geo, loaded) = place_search::dataset::load(Path::new(set), || Ok(load_geo(set))).unwrap_or_else(|e| panic!("{e}"));
+
+    let (geo, loaded) =
+        place_search::dataset::load(Path::new(set), || Ok(load_geo(set))).unwrap_or_else(|e| panic!("{e}"));
     let base = BuildOpts::new(opt(args, "--tmp").map(PathBuf::from).unwrap_or_else(|| out.join("tmp")));
     let opts = BuildOpts {
         threads: opt(args, "--threads").map(|v| v.parse().unwrap()).unwrap_or(base.threads),
@@ -78,6 +81,19 @@ fn cmd_build(args: &[String]) {
         poi_max_tier: opt(args, "--poi-max-tier").map(|v| v.parse().unwrap()).unwrap_or(base.poi_max_tier),
         ..base
     };
+    if flag(args, "--profile") || sub == "core" {
+        if !matches!(sub.as_str(), "core" | "all") {
+            eprintln!("expected --sub core");
+            std::process::exit(2)
+        }
+        place_search::build::build_core(&geo, &loaded, Path::new(set), &out, profile(args), &opts)
+            .unwrap_or_else(|e| panic!("{e}"));
+        return;
+    }
+    let selected = selected_subs(&sub).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     let subs = held_subs(&geo, selected);
     let meta = || place_search::dataset::merged_meta(&geo, &loaded, &opts, Path::new(set), &out, &subs);
     let stats = build_all(&geo, &subs, &out, &opts, meta).unwrap_or_else(|e| panic!("{e}"));
@@ -106,6 +122,66 @@ fn answer_lines(input: impl BufRead, out: &mut impl Write,
         out.flush()?;
     }
     Ok(())
+}
+
+fn profile(args: &[String]) -> Profile {
+    opt(args, "--profile").map_or(Profile::Immich, |v| {
+        v.parse().unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        })
+    })
+}
+
+fn cmd_core_query(args: &[String], bench: bool) {
+    use place_search::{
+        dataset::read_core,
+        profile::SearchRequest,
+        query::plan::{read, Pass},
+    };
+    let profile = profile(args);
+    let mut request = SearchRequest::new("", profile);
+    if let Some(v) = opt(args, "--mode") {
+        request.mode = v.parse().unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        })
+    }
+    let index = read_core(Path::new(&args[2]), Path::new(&args[3]), profile).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1)
+    });
+    let plan = |q: &str, req: &mut SearchRequest| {
+        q.clone_into(&mut req.q);
+        read(req, &index.terms, Pass::First)
+    };
+    if bench {
+        let queries: Vec<_> = std::io::stdin().lock().lines().collect::<Result<_, _>>().expect("queries");
+        let repeats = opt(args, "--bench").map_or(1, |v| v.parse::<usize>().expect("repeat count"));
+        let mut times = Vec::new();
+        for _ in 0..repeats {
+            for q in &queries {
+                let t = Instant::now();
+                let _ = std::hint::black_box(plan(q, &mut request));
+                times.push(t.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+        println!("{}", latency_summary(&mut times).expect("at least one query and repeat"));
+        return;
+    }
+    answer_lines(std::io::stdin().lock(),&mut std::io::stdout().lock(),|q|{
+        match plan(q,&mut request){
+            Ok(p)=>{
+                let tokens:Vec<_>=p.tokens.iter().map(|r|{
+                    let t=&p.terms[r.term.0 as usize];
+                    json!({"type":r.ttype.letter().to_string(),"from":r.span.start,"to":r.span.end,"word_token":t.token,
+                        "word":t.word,"lookup_word":r.lookup_word,"penalty":r.penalty,"count":t.count,"addr_count":t.addr_count})
+                }).collect();
+                json!({"tokens":tokens,"searches":p.searches.len()})
+            },
+            Err(e)=>json!({"error":e.to_string()}),
+        }
+    }).expect("query input/output");
 }
 
 fn cmd_query(args: &[String]) {
@@ -248,7 +324,9 @@ fn main() {
             let (n, k) = place_search::extras::pack(&args[2], &args[3]).expect("pack");
             eprintln!("records {n}, names {k}");
         }
+        Some("query") if flag(&args,"--profile") || flag(&args,"--mode") => cmd_core_query(&args,flag(&args,"--bench")),
         Some("query") => cmd_query(&args),
+        Some("bench") => cmd_core_query(&args,true),
         Some("ctxbench") => cmd_ctxbench(&args),
         Some("diff") => cmd_diff(&args),
         _ => eprintln!("usage: see the header of main.rs"),

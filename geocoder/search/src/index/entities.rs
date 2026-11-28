@@ -135,6 +135,36 @@ pub trait Entities {
     fn read(&self, e: EntityRef) -> Option<EntityRecord<'_>>;
 }
 
+/// Chain-sorted four-byte entity references in the published core.
+pub struct EntityTable {
+    bytes: memmap2::Mmap,
+    count: u32,
+}
+impl EntityTable {
+    pub(crate) fn open(dir: &std::path::Path) -> std::io::Result<Self> {
+        use super::{invalid, map, number};
+        let bytes = map(&dir.join("core.ent"))?;
+        let count = number(&bytes, 4).ok_or_else(|| invalid("missing entity count"))?;
+        if bytes.get(..4) != Some(crate::constants::ENTITY_MAGIC) || bytes.len() as u64 != 8 + 4 * u64::from(count) {
+            return Err(invalid("bad entity table"));
+        }
+        Ok(Self { bytes, count })
+    }
+    pub fn len(&self) -> u32 {
+        self.count
+    }
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+    pub fn get(&self, id: u32) -> Option<EntityRef> {
+        if id >= self.count {
+            return None;
+        }
+        EntityRef::unpack(super::number(&self.bytes, 8 + id as usize * 4)?)
+            .filter(|e| crate::constants::CORE_KINDS.contains(&e.kind()))
+    }
+}
+
 /// Records held in memory, for the tests of what reads them.
 #[cfg(test)]
 #[derive(Default)]

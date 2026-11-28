@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
 use place_search::build::sub_index_files;
-use place_search::constants::{BOUNDARY_FILE, SUB_INDEXES};
+use place_search::constants::{BOUNDARY_FILE, PLACES_SUB_INDEXES};
 use place_search::dataset::{Origin, PlaceSearch, Stamps};
 use place_search::multi::MultiSearch;
 use query_server::{Index, MultiIndex};
@@ -275,7 +275,7 @@ impl Searches {
     /// linked; a file it can't link stays as it is.
     fn link_identical(&self) -> usize {
         use std::os::unix::fs::MetadataExt;
-        let names = SUB_INDEXES.iter().flat_map(|s| sub_index_files(s)).chain([BOUNDARY_FILE.to_string()]);
+        let names = PLACES_SUB_INDEXES.iter().flat_map(|s| sub_index_files(s)).chain([BOUNDARY_FILE.to_string()]);
         let mut linked = 0;
         for name in names {
             // The files kept so far: the inode, size and sha256 of each, and its path.

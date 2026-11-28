@@ -79,12 +79,12 @@ pub const DATASET_SEARCH_DIR: &str = "search";
 pub const META_FILE: &str = "search_meta.json";
 /// The layout of the index files (the lists and their offsets, the boundary slots), recorded in
 /// META_FILE as META_FORMAT_KEY: an index of another is built again, never read.
-pub const INDEX_FORMAT: u64 = 2;
+pub const PLACES_INDEX_FORMAT: u64 = 2;
 pub const META_FORMAT_KEY: &str = "format";
 /// The META_FILE field that holds the dataset's file hashes (dataset.rs).
 pub const META_DATASET_KEY: &str = "dataset";
 /// The sub-indexes an index can hold, in build order.
-pub const SUB_INDEXES: &[&str] = &["places", "poi"];
+pub const PLACES_SUB_INDEXES: &[&str] = &["places", "poi"];
 /// The files `<sub>.<ext>` of each sub-index: its keys, their postings and its prefix table.
 pub const SUB_INDEX_EXTS: [&str; 4] = ["fst", "post", "pfx.fst", "pfx"];
 /// The boundary slots of the places sub-index.
@@ -368,3 +368,57 @@ pub const BOTH_PARTIALS_TERMS: usize = 3;
 /// At most this many searches run (geocoder.py:310), and with a [class=type] near query only
 /// that many are wrapped (geocoder.py:276).
 pub const SEARCHES_MAX: usize = 50;
+
+pub const INDEX_FORMAT: u64 = 3;
+pub const SUB_INDEXES: &[&str] = &["core", "addr"];
+pub const CORE_FILES: &[&str] =
+    &["core.ent", "core.chn", "core.area", "core.fst", "core.post", "core.pfx.fst", "core.pfx"];
+pub const ENTITY_MAGIC: &[u8; 4] = b"PSE3";
+pub const SKIP_EVERY: u32 = 128;
+pub const TOPK_MIN_DF: u32 = 1024;
+pub const TOPK_PER_TERM: usize = 256;
+pub const IMP_UNIT: f64 = 1.0 / 655_350_000.0;
+pub const DEFAULT_IMPORTANCE_BASE: f64 = 0.40001;
+pub const IMPORTANCE_RANK_DIVISOR: f64 = 75.0;
+pub const POI_SEARCH_RANK: u8 = 30;
+pub const COUNTRY_LEVEL: u8 = 2;
+pub const PLACE_AREA_LEVEL: u8 = 15;
+pub const ADMIN_LEVEL_MAX: u8 = 12;
+pub const CORE_KINDS: [crate::index::entities::EntityKind; 3] = [
+    crate::index::entities::EntityKind::Place,
+    crate::index::entities::EntityKind::Area,
+    crate::index::entities::EntityKind::Poi,
+];
+/// Odd FST values carry singleton entity ids. Even values address the posting file.
+pub const INLINE_POSTING: u64 = 1;
+pub const SKIP_BYTES: usize = 2 * size_of::<u32>();
+pub const POSTING_BUFFER_BYTES: usize = WRITE_BUFFER;
+pub const CHAIN_CACHE_CELLS: usize = 64;
+pub const PHOTON_MAX_EDITS: u8 = 2;
+pub const TAG_TIERS: [&str; 2] = ["strings_tags_core.bin", "strings_tags_poi.bin"];
+pub const IMPORTANCE_FILES: [&str; 3] = ["place_imp.bin", "admin_imp.bin", "poi_imp.bin"];
+pub const CORE_CHAIN_FILES: [&str; 3] = ["place_chains.bin", "admin_chains.bin", "poi_chains.bin"];
+pub const CHAIN_DICTIONARY: &str = "search_chains.bin";
+pub const CORE_RECOVERY_DIR: &str = ".core-rebuild";
+pub const WORD_BEFORE: u8 = 1;
+pub const WORD_SAME: u8 = 2;
+pub const WORD_AFTER: u8 = 3;
+pub const LOOKUP_IS_TOKEN: u8 = 1;
+pub const SPELLING_SLOT_BYTES: usize = 1024;
+pub const MAX_SPELLING_SLOTS: usize = 2048;
+pub const SPELLING_BUDGET_DIVISOR: usize = 16;
+pub const MAX_CORE_POI_TIER: u8 = 3;
+
+/// Upper search rank and radius in metres of an unlinked place node's fuzzy area
+/// (Nominatim's place_node_fuzzy_area).
+pub const PLACE_NODE_FUZZY_RADII: [(u8, u32); 5] =
+    [(16, 15_000), (18, 4_000), (19, 2_000), (20, 1_000), (u8::MAX, 500)];
+pub const CORE_RECORD_BYTES: usize = 3 * size_of::<u32>();
+pub const OSM_ID_FILES: [&str; 3] = ["place_nodes.osm_ids", "admin_polygons.osm_ids", "poi_rows.osm_ids"];
+pub const OSM_SLOT_MAGIC: u32 = 0xd0510ead;
+pub const OSM_SLOT_VERSION: u32 = 1;
+pub const OSM_SLOT_HEADER: usize = 3 * size_of::<u32>();
+pub const OSM_SLOT_BYTES: usize = 4 + size_of::<u64>();
+pub const OSM_SLOT_TOMBSTONE: u8 = 1;
+pub const NAME_OCCURRENCE: u32 = 0;
+pub const AREA_MEMBERS: u32 = 1;

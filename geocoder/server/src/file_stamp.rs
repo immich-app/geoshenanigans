@@ -40,7 +40,7 @@ impl FileStamp {
 /// tiers of their names (the polygons' own names beside them among them) and the boundary
 /// geometry its label points come from, the boundary tier's own arcs among it (the records and
 /// rings are the same in every tier).
-pub const DATASET_FILES: [&str; 12] = [
+pub const DATASET_FILES: [&str; 20] = [
     "admin_own_names.bin",
     "admin_polygons.bin",
     "admin_rings.bin",
@@ -53,6 +53,24 @@ pub const DATASET_FILES: [&str; 12] = [
     "strings_core.bin",
     "strings_layout.json",
     "strings_poi.bin",
+    "strings_tags_core.bin",
+    "strings_tags_poi.bin",
+    "place_tags.bin",
+    "admin_tags.bin",
+    "poi_tags.bin",
+    "place_imp.bin",
+    "admin_imp.bin",
+    "poi_imp.bin",
+];
+
+/// The membership inputs used by the chain-sorted core.
+const CHAIN_INPUTS: [&str; 6] = [
+    "admin_cells.bin",
+    "admin_entries.bin",
+    "search_chains.bin",
+    "place_chains.bin",
+    "admin_chains.bin",
+    "poi_chains.bin",
 ];
 
 /// The stat of each dataset file present, by name. A file's hash is reused while it keeps its
@@ -63,7 +81,9 @@ pub struct Stamps(pub BTreeMap<String, FileStamp>);
 impl Stamps {
     /// The stamps of the dataset files in `dir`.
     pub fn of(dir: &Path) -> std::io::Result<Stamps> {
-        stamps_of(dir, &DATASET_FILES).map(Stamps)
+        let mut files = stamps_of(dir, &DATASET_FILES)?;
+        files.extend(stamps_of(dir, &CHAIN_INPUTS)?);
+        Ok(Stamps(files))
     }
 }
 

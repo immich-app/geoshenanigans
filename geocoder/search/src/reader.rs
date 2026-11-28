@@ -6,7 +6,7 @@
 //! what the open reads, and read as no key, no posting or no slot by the query that meets it
 //! otherwise.
 use crate::build::{has_extra_names, has_sub_index, is_current_format, sub_index_files};
-use crate::constants::{BOUNDARY_FILE, INDEX_FORMAT, META_FILE, META_FORMAT_KEY};
+use crate::constants::{BOUNDARY_FILE, PLACES_INDEX_FORMAT, META_FILE, META_FORMAT_KEY};
 use crate::entities::{Boundaries, Entities};
 use crate::extras::Extras;
 use crate::keys::Keys;
@@ -156,7 +156,7 @@ pub struct SearchIndex<'g> {
 impl<'g> SearchIndex<'g> {
     /// `dir` holds the built index (places.*, optional poi.*, search_meta.json); `extras` the
     /// decompressed extra-names file the index was built with, `iso` the ISO code list. An error
-    /// for an index of another format (INDEX_FORMAT) or of another count of place nodes, and for
+    /// for an index of another format (PLACES_INDEX_FORMAT) or of another count of place nodes, and for
     /// a meta file, an fst or a boundary file no build writes.
     pub fn open(geo: &'g Index, dir: &Path, extras: Option<&str>, iso: Option<&str>) -> Result<Self, String> {
         let meta: serde_json::Value = serde_json::from_str(
@@ -164,7 +164,7 @@ impl<'g> SearchIndex<'g> {
         )
         .map_err(|e| format!("{META_FILE}: {e}"))?;
         if !is_current_format(&meta) {
-            return Err(format!("{}: an index of format {}, not {INDEX_FORMAT}: build it again", dir.display(), meta[META_FORMAT_KEY]));
+            return Err(format!("{}: an index of format {}, not {PLACES_INDEX_FORMAT}: build it again", dir.display(), meta[META_FORMAT_KEY]));
         }
         let extras = match (has_extra_names(&meta), extras) {
             (true, Some(p)) => Some(Extras::open(p)?),

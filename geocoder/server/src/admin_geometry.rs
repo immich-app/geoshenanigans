@@ -291,6 +291,20 @@ impl AdminGeometry {
         joined.rings.iter().map(|r| r.iter().map(lng_lat).collect()).collect()
     }
 
+    /// Visits the vertices of all rings, in storage order. A shared arc endpoint may
+    /// be visited twice. A malformed block returns None.
+    pub fn for_each_vertex(&self, poly: &AdminPolygon, visit: impl FnMut(PointE7)) -> Option<()> {
+        struct Vertices<'a, F> { arcs: ArcFiles<'a>, visit: F }
+        impl<F: FnMut(PointE7)> RingVisitor for Vertices<'_, F> {
+            fn wants_chunk(&mut self, _: &ChunkBox) -> bool { true }
+            fn arc(&mut self, r: ArcRef) -> Option<()> {
+                arc_vertices(self.arcs.block(r.slot)?, &mut self.visit)?;
+                Some(())
+            }
+        }
+        walk_rings(self.ring_block(poly)?, &mut Vertices { arcs: self.arcs(), visit })
+    }
+
     /// `poly`'s centroid as (lat, lng) degrees: ST_Centroid of its rings on lon/lat, the outer
     /// ring's centre weighted by its area less its holes'. None without rings, with a malformed
     /// ring block or of no area.
