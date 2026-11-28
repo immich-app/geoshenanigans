@@ -447,16 +447,7 @@ impl RunReader {
             return Ok(None);
         }
         if R::PREFIX_KEYS {
-            let encoded = crate::varint::read_u32(&mut self.r)?;
-            if let Some(suffix) = encoded.checked_sub(1) {
-                let shared = crate::varint::read_u32(&mut self.r)? as usize;
-                let len = shared
-                    .checked_add(suffix as usize)
-                    .filter(|&n| n <= MAX_KEY_BYTES && shared <= key.len())
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid run key prefix"))?;
-                key.resize(len, 0);
-                self.r.read_exact(&mut key[shared..])?;
-            }
+            read_prefix(&mut self.r, key)?;
         } else {
             let mut len = [0u8; 2];
             self.r.read_exact(&mut len)?;
@@ -467,6 +458,20 @@ impl RunReader {
         self.r.read_exact(&mut self.rec)?;
         Ok(Some(R::get(&self.rec)))
     }
+}
+
+fn read_prefix(r: &mut impl Read, key: &mut Vec<u8>) -> std::io::Result<()> {
+    let encoded = crate::varint::read_u32(r)?;
+    if let Some(suffix) = encoded.checked_sub(1) {
+        let shared = crate::varint::read_u32(r)? as usize;
+        let len = shared
+            .checked_add(suffix as usize)
+            .filter(|&n| n <= MAX_KEY_BYTES && shared <= key.len())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid run key prefix"))?;
+        key.resize(len, 0);
+        r.read_exact(&mut key[shared..])?;
+    }
+    Ok(())
 }
 
 /// Sort-run memory of each of `threads` workers sharing `mem_mb`; an error below
@@ -495,6 +500,22 @@ mod tests {
     use crate::fixture::{Rng, TempDir};
 
     /// A test record: a number and a byte, ordered as the pair.
+    #[test]
+    fn a_front_coded_run_rejects_invalid_or_truncated_keys() {
+        let mut key = b"abc".to_vec();
+        read_prefix(&mut &[0][..], &mut key).unwrap();
+        assert_eq!(key, b"abc");
+        read_prefix(&mut &[2, 2, b'x'][..], &mut key).unwrap();
+        assert_eq!(key, b"abx");
+        for mut invalid in [&[2, 4, b'x'][..], &[3, 2, b'x'], &[0xff; 5]] {
+            assert!(read_prefix(&mut invalid, &mut key).is_err());
+        }
+        let mut long = Vec::new();
+        crate::varint::put(&mut long, MAX_KEY_BYTES as u64 + 2);
+        long.push(0);
+        assert!(read_prefix(&mut long.as_slice(), &mut key).is_err());
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     struct Rec(u32, u8);
 

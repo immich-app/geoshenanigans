@@ -242,6 +242,30 @@ impl TermSource for Dictionary {
 mod tests {
     use super::*;
     #[test]
+    fn invalid_block_entries_do_not_hide_the_next_route() {
+        let dir = crate::fixture::TempDir::new("dictionary-damage");
+        let mut fst = fst::MapBuilder::memory();
+        let word = TermKind::Word as u8;
+        fst.insert([word, b'a'], TERM_BLOCK).unwrap();
+        fst.insert([word, b'z', 0, crate::constants::WORD_SAME], INLINE_POSTING << 1).unwrap();
+        std::fs::write(dir.0.join("core.fst"), fst.into_inner().unwrap()).unwrap();
+        let same = crate::constants::WORD_SAME;
+        for (block, matches) in [
+            (vec![2, 0, 2, 0, same, 1, 0, 3, b'b', 0, same, 1], 2),
+            (vec![TERM_BLOCK_ROWS as u8 + 1], 0),
+            (vec![1, 1, 0, 1], 0),
+            (vec![1, 0, 5, 0], 0),
+            (vec![1, 0, 2, 0, same, 2], 0),
+            (vec![2, 0, 2, 0, same, 1], 1),
+        ] {
+            std::fs::write(dir.0.join("core.post"), block).unwrap();
+            let dictionary = Dictionary::open(&dir.0, 1).unwrap();
+            assert_eq!(dictionary.prefix(TermKind::Word, "a", 4).len(), matches);
+            assert_eq!(dictionary.exact(TermKind::Word, "z").len(), 1);
+        }
+    }
+
+    #[test]
     fn fuzzy_lookups_share_the_tables_for_each_supported_distance() {
         for edits in 0..=crate::constants::PHOTON_MAX_EDITS {
             let builder = edit_builder(edits).unwrap();
