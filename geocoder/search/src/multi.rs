@@ -64,25 +64,35 @@ impl MultiSearch {
 
     pub fn search(&self, req: &SearchRequest) -> Result<(Vec<Found<'_>>, QueryStats), RequestError> {
         self.require_supported(req)?;
-        let regions: Vec<_> = self.regions.iter().filter(|(region, _)| matches_region(*region, req.viewbox)).collect();
+        let regions: Vec<_> = self
+            .regions
+            .iter()
+            .enumerate()
+            .filter_map(|(region, (boundary, search))| matches_region(*boundary, req.viewbox).then_some((region, search)))
+            .collect();
         match regions.as_slice() {
             [] => return Ok((Vec::new(), QueryStats::default())),
             [(_, search)] => return search.search(req),
             _ => {}
         }
 
-        let mut found = Vec::new();
+        let mut candidates = Vec::new();
         let mut stats = QueryStats::default();
-        for (_, search) in regions {
+        for (region, search) in regions {
             // A hit suppressed by a neighbour in one region can survive the merged dedupe
             // when that neighbour is itself suppressed by a better hit from another region.
-            let (mut candidates, work) = search.candidates(req);
+            let (hits, work) = search.candidates(req);
             stats += work;
-            found.append(&mut candidates);
+            candidates.extend(hits.into_iter().map(|hit| (region, hit)));
         }
-        found.sort_by(|a, b| b.hit.score.total_cmp(&a.hit.score));
+        candidates.sort_by(|(_, a), (_, b)| b.hit.score.total_cmp(&a.hit.score));
         let mut kept = SameName::default();
-        let results = found.into_iter().filter(|r| kept.keep(&r.name, (r.lat, r.lng))).take(req.limit).collect();
+        let results = candidates
+            .into_iter()
+            .filter(|(_, hit)| kept.keep(&hit.name, hit.point))
+            .take(req.limit)
+            .map(|(region, hit)| self.regions[region].1.describe_candidate(hit, &mut stats))
+            .collect();
         Ok((results, stats))
     }
 }
@@ -111,9 +121,17 @@ mod tests {
         let mut east = Geo::default();
         east.place("Testville", 1, 39.0, 45.0);
         east.place("Testville", 4, 38.8, 45.0);
+        let country = east.boundary("Eastland", 2, [38.0, 44.0, 40.0, 46.0]);
+        east.country(country, *b"de");
+        east.boundary("Eaststate", 4, [38.2, 44.2, 39.8, 45.8]);
+        east.boundary("Eastcounty", 6, [38.4, 44.4, 38.9, 45.6]);
         east.write(&asia);
         let mut west = Geo::default();
         west.place("Testville", 0, 39.2, 45.0);
+        let country = west.boundary("Westland", 2, [38.0, 44.0, 40.0, 46.0]);
+        west.country(country, *b"us");
+        west.boundary("Weststate", 4, [38.2, 44.2, 39.8, 45.8]);
+        west.boundary("Westcounty", 6, [38.4, 44.4, 39.6, 45.6]);
         west.write(&europe);
 
         let index = load(&dir.0);
@@ -121,6 +139,45 @@ mod tests {
         assert_eq!(origin, Origin::Built);
         let (found, _) = search.search(&new_request("Testville", 2)).unwrap();
         assert_eq!(found.iter().map(|r| r.lat).collect::<Vec<_>>(), [39.2, 38.8]);
+
+        for (result, (region, query, admin)) in found.iter().zip([
+            ("europe", "Testville", ["Westland", "US", "Weststate", "Westcounty"]),
+            ("asia", "Testville, Eastcounty", ["Eastland", "DE", "Eaststate", "Eastcounty"]),
+        ]) {
+            let (_, local) = search.regions.iter().find(|(c, _)| c.is_some_and(|c| c.name == region)).unwrap();
+            let (local, _) = local.search(&new_request(query, 1)).unwrap();
+            let local = &local[0];
+            assert_eq!(result.hit.entity, local.hit.entity, "{region}");
+            let got = result.to_json();
+            assert_eq!(got, local.to_json(), "{region}");
+            for (field, want) in ["country", "country_code", "admin1name", "admin2name"].into_iter().zip(admin) {
+                assert_eq!(got[field], want, "{region} {field}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_merged_search_looks_up_display_context_only_for_its_results() {
+        let dir = TempDir::new("continent-context");
+        let limit = 2;
+        for (name, lat, lon) in [("europe", 50.0, 14.0), ("asia", 35.0, 90.0)] {
+            let mut geo = Geo::default();
+            for offset in 0..=limit {
+                geo.place("Testville", 1, lat + offset as f32, lon);
+            }
+            geo.write(&dir.0.join(name));
+        }
+
+        let index = load(&dir.0);
+        let (search, _) = MultiSearch::open(&index, None, &BuildOnDevice::default()).unwrap();
+        let req = new_request("Testville", limit);
+        for (_, region) in &search.regions {
+            assert!(region.candidates(&req).0.len() > limit);
+        }
+
+        let (found, stats) = search.search(&req).unwrap();
+        assert_eq!(found.len(), limit);
+        assert_eq!(stats.reverse_lookups, found.len());
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::build::{
 };
 use crate::constants::*;
 use crate::profile::{MatchMode, Profile, RequestError, SearchRequest};
-use crate::query::{Found, QueryStats, Searcher};
+use crate::query::{Found, QueryStats, SearchCandidate, Searcher};
 use crate::reader::SearchIndex;
 use query_server::{lower_hex, stamps_of, FileStamp, Index, WATER_DIR, WATER_FILES};
 use serde_json::{json, Value};
@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 
 pub use query_server::{Stamps, DATASET_FILES};
@@ -288,8 +289,14 @@ impl PlaceSearch {
         Ok(self.searcher.search(&req.q, req.limit))
     }
 
-    pub(crate) fn candidates(&self, req: &SearchRequest) -> (Vec<Found<'_>>, QueryStats) {
+    pub(crate) fn candidates(&self, req: &SearchRequest) -> (Vec<SearchCandidate>, QueryStats) {
         self.searcher.candidates(&req.q, req.limit)
+    }
+
+    pub(crate) fn describe_candidate(&self, candidate: SearchCandidate, stats: &mut QueryStats) -> Found<'_> {
+        let (lat, lng) = candidate.point;
+        stats.reverse_lookups += 1;
+        candidate.with_context(Rc::new(self.searcher.context_at(lat, lng)))
     }
 }
 

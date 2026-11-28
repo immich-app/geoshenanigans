@@ -91,6 +91,22 @@ impl SameName {
     }
 }
 
+/// A ranked hit ready for display context.
+pub(crate) struct SearchCandidate {
+    pub hit: Hit,
+    pub name: String,
+    pub point: (f32, f32),
+    kind: Kind,
+    typ: String,
+}
+
+impl SearchCandidate {
+    pub(crate) fn with_context(self, ctx: Rc<Ctx<'_>>) -> Found<'_> {
+        let (lat, lng) = self.point;
+        Found { hit: self.hit, name: self.name, lat, lng, kind: self.kind, typ: self.typ, ctx }
+    }
+}
+
 pub struct Found<'g> {
     pub hit: Hit,
     pub name: String,
@@ -776,15 +792,23 @@ impl<'a, 'g> Searcher<'a, 'g> {
         *read = cands.len();
     }
 
+    fn with_display_context(&self, st: &mut State<'g>, candidate: SearchCandidate) -> Found<'g> {
+        let ctx = self.ctx_of(st, candidate.hit.entity, candidate.point);
+        candidate.with_context(ctx)
+    }
+
     pub fn search(&self, q: &str, limit: usize) -> (Vec<Found<'g>>, QueryStats) {
-        self.collect(q, limit, Collect::Unique)
+        // Materialize each attempt so reverse work and the cache carry over on a retry.
+        self.collect(q, limit, Collect::Unique, Self::with_display_context)
     }
 
-    pub(crate) fn candidates(&self, q: &str, limit: usize) -> (Vec<Found<'g>>, QueryStats) {
-        self.collect(q, limit, Collect::All)
+    pub(crate) fn candidates(&self, q: &str, limit: usize) -> (Vec<SearchCandidate>, QueryStats) {
+        self.collect(q, limit, Collect::All, |_, _, candidate| candidate)
     }
 
-    fn collect(&self, q: &str, limit: usize, collect: Collect) -> (Vec<Found<'g>>, QueryStats) {
+    fn collect<T>(
+        &self, q: &str, limit: usize, collect: Collect, finish: impl Fn(&Self, &mut State<'g>, SearchCandidate) -> T,
+    ) -> (Vec<T>, QueryStats) {
         if limit == 0 { return (Vec::new(), QueryStats::default()); }
         let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
         // An entity can be nowhere: its record or its slot does not read (a damaged file). A
@@ -806,11 +830,11 @@ impl<'a, 'g> Searcher<'a, 'g> {
         // takes a hit at or below its threshold (the one it had when it set them aside, if it
         // did). A search that meets one of those entities nowhere runs again, reading first,
         // with its own budget of context checks.
-        let found = match self.search_once::<false>(&mut st, q, limit, collect) {
+        let found = match self.search_once::<false, _>(&mut st, q, limit, collect, &finish) {
             Some(found) => found,
             None => {
                 let first = std::mem::take(&mut st.stats);
-                let found = self.search_once::<true>(&mut st, q, limit, collect).unwrap_or_default();
+                let found = self.search_once::<true, _>(&mut st, q, limit, collect, &finish).unwrap_or_default();
                 st.stats += first;
                 found
             }
@@ -820,7 +844,9 @@ impl<'a, 'g> Searcher<'a, 'g> {
 
     /// `search`'s results; with `READ_FIRST`, those of the search it answers as. None, without,
     /// for a search that met an entity it took in unread nowhere (`score_split`).
-    fn search_once<const READ_FIRST: bool>(&self, st: &mut State<'g>, q: &str, limit: usize, collect: Collect) -> Option<Vec<Found<'g>>> {
+    fn search_once<const READ_FIRST: bool, T>(
+        &self, st: &mut State<'g>, q: &str, limit: usize, collect: Collect, finish: &impl Fn(&Self, &mut State<'g>, SearchCandidate) -> T,
+    ) -> Option<Vec<T>> {
         let mut pool = Pool::new(self.limits.pool, limit * CONTEXT_CUTOFF_FACTOR);
         let mut phrases: Vec<String> = Vec::new();
         if let Some((name, rest)) = q.split_once(',') {
@@ -862,7 +888,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
         if !self.place_before_its_area(&mut hits, check.then_some(&mut ready)) {
             return None;
         }
-        let mut out: Vec<Found<'g>> = Vec::new();
+        let mut out = Vec::new();
         let mut kept = SameName::default();
         for h in hits {
             let Some(at) = ents.point(h.entity).filter(|_| ready(&h)) else {
@@ -876,8 +902,8 @@ impl<'a, 'g> Searcher<'a, 'g> {
                 continue;
             }
             let (kind, typ) = self.idx.ents.kind_and_type(h.entity);
-            let ctx = self.ctx_of(st, h.entity, at);
-            out.push(Found { name, lat: at.0, lng: at.1, kind, typ: typ.into_owned(), ctx, hit: h });
+            let candidate = SearchCandidate { hit: h, name, point: at, kind, typ: typ.into_owned() };
+            out.push(finish(self, st, candidate));
             if collect == Collect::Unique && out.len() >= limit {
                 break;
             }
@@ -1257,7 +1283,7 @@ mod tests {
             let s = Searcher::new(&idx);
             let found = if read_first {
                 let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
-                s.search_once::<true>(&mut st, "old mill, b", 2, Collect::Unique).unwrap()
+                s.search_once::<true, _>(&mut st, "old mill, b", 2, Collect::Unique, &Searcher::with_display_context).unwrap()
             } else {
                 s.search("old mill, b", 2).0
             };
@@ -1405,9 +1431,9 @@ mod tests {
             CUT_BACK_LOOKS.set(0);
             let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
             let found = if read_first {
-                s.search_once::<true>(&mut st, "olde mill, b", IMMICH_DEFAULT_LIMIT, Collect::Unique)
+                s.search_once::<true, _>(&mut st, "olde mill, b", IMMICH_DEFAULT_LIMIT, Collect::Unique, &Searcher::with_display_context)
             } else {
-                s.search_once::<false>(&mut st, "olde mill, b", IMMICH_DEFAULT_LIMIT, Collect::Unique)
+                s.search_once::<false, _>(&mut st, "olde mill, b", IMMICH_DEFAULT_LIMIT, Collect::Unique, &Searcher::with_display_context)
             };
             (answer(&found.unwrap()), CUT_BACK_LOOKS.get())
         };
@@ -1431,7 +1457,7 @@ mod tests {
     /// The results of `q` as a search answers it and as one that reads every entity first does.
     fn both_answers(s: &Searcher, q: &str, limit: usize) -> [Answer; 2] {
         let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
-        let read_first = s.search_once::<true>(&mut st, q, limit, Collect::Unique).unwrap();
+        let read_first = s.search_once::<true, _>(&mut st, q, limit, Collect::Unique, &Searcher::with_display_context).unwrap();
         [answer(&s.search(q, limit).0), answer(&read_first)]
     }
 
@@ -1812,9 +1838,10 @@ mod tests {
                         for limit in [1 + rng.below(2), 3 + rng.below(6)] {
                             let got = answer(&s.search(&q, limit).0);
                             let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
-                            let read_first = answer(&s.search_once::<true>(&mut st, &q, limit, Collect::Unique).unwrap());
+                            let first = s.search_once::<true, _>(&mut st, &q, limit, Collect::Unique, &Searcher::with_display_context).unwrap();
+                            let read_first = answer(&first);
                             let mut once = State { ctx: HashMap::new(), stats: QueryStats::default() };
-                            let ran_once = s.search_once::<false>(&mut once, &q, limit, Collect::Unique).is_some();
+                            let ran_once = s.search_once::<false, _>(&mut once, &q, limit, Collect::Unique, &Searcher::with_display_context).is_some();
                             cases += 1;
                             again += !ran_once as usize;
                             damaged += (got != answer(&as_built.search(&q, limit).0)) as usize;
