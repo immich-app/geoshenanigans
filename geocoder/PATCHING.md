@@ -422,7 +422,7 @@ also carries Nominatim's `licence` string (README.md).
 2. Choose a date >= oldest_indexes (typically use latest)
 3. GET builds/{date}/configurations.json
 4. Choose region (e.g. europe), mode (e.g. full), quality (e.g. simplified), POI tier (e.g. notable)
-   and water (e.g. none)
+   water (e.g. none), and names (e.g. en)
 5. Download every file the selected components and the variants they pick
    list (their `files`, the `optional_files` that appear in `files`, minus
    any `replaces`):
@@ -436,6 +436,8 @@ also carries Nominatim's `licence` string (README.md).
      city files are only in a region holding the United States)
    - builds/{date}/europe/quality/simplified/…  (4 files)
    - builds/{date}/europe/poi/notable/…         (7 files + 1 optional, with a POI tier)
+   - builds/{date}/europe/full/names-en/…       (core names and their row columns)
+   - builds/{date}/europe/poi/notable/names-en/… (POI names and their row column)
    - builds/{date}/europe/water/all/simplified/… (11 files, optional), into <dataset>/water/
    The JSON files (strings_layout.json, poi_meta.json, water_meta.json,
    attribution.json, poi_attribution.json) are part of the set: the server
@@ -462,6 +464,8 @@ also carries Nominatim's `licence` string (README.md).
    - Download builds/{date}/europe/full/patch.gcpatch → apply to mode files
    - Download builds/{date}/europe/quality/simplified/patch.gcpatch → apply to quality files
    - Download builds/{date}/europe/poi/notable/patch.gcpatch → apply to POI files (if using POIs)
+   - Download builds/{date}/europe/full/names-en/patch.gcpatch → apply to core name files
+   - Download builds/{date}/europe/poi/notable/names-en/patch.gcpatch → apply to POI name files (if using POIs)
    - Download builds/{date}/europe/water/all/simplified/patch.gcpatch → apply to <dataset>/water/ (if using water)
    The water patch applies only to a water dir the client holds. A client
    with no water dir for its selection (it switched to water after its local
@@ -505,6 +509,12 @@ Quality changes don't require patching — just download the new quality files:
    admin_rings.bin, arc_index.bin and arc_vertices.bin
 ```
 
+### Switching Search Names
+
+Resolve the components again with the new `names` value. Download the newly
+selected name files and install them by basename as a set. The next search
+open rebuilds its index from the selected names if the file hashes changed.
+
 ### Switching Water
 
 The water dir is a set of its own, so a switch downloads the new value's
@@ -527,8 +537,7 @@ runs them as it starts, from the configuration the PUT kept. Other names in
 ### Switching Region
 
 Regions are independent. Download the new region's mode + quality directories,
-and its dirs of the selected POI tier and water value (none for `none`); its
-water dir goes into `<dataset>/water/`, replacing the old region's.
+and the selected POI, names and water directories. Its water dir goes into `<dataset>/water/`, replacing the old region's.
 
 ## Retention Policy
 
