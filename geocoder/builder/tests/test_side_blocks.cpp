@@ -588,3 +588,17 @@ TEST(tag_blocks_omit_absent_values_and_empty_blocks) {
         CHECK(refusal_of([&] { decode(bad, file); }).find("invalid presence") != std::string::npos);
     }
 }
+
+TEST(tag_blocks_refuse_invalid_extents_and_absent_values_in_the_payload) {
+    const char* file = "place_tags.bin";
+    const std::vector<uint32_t> values(sb::BLOCK_VALUES + 1, 7);
+    auto bytes = sb::encode(file, values.data(), values.size());
+    const auto footer = sb::read_footer(file, bytes.data() + bytes.size() - sb::FOOTER_BYTES, bytes.size());
+    sb::put32(bytes.data() + footer.table_at + sb::TABLE_ENTRY_BYTES, footer.table_at + 1);
+    CHECK_EQ(refusal_of([&] { decode(bytes, file); }), "Malformed place_tags.bin: invalid tag block extent");
+
+    auto full = sb::encode("dense.bin", values.data(), sb::BLOCK_VALUES);
+    full[1] = full[2] = full[3] = full[4] = 0xff;
+    std::copy_n(bytes.end() - 4, 4, full.end() - 4);
+    CHECK(refusal_of([&] { decode(full, file); }) == "Malformed place_tags.bin: invalid presence or size of block 0");
+}

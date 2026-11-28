@@ -320,3 +320,51 @@ fn side_files_read_as_the_shared_vectors_say_and_the_test_encoder_writes_them() 
     }
     assert!(rows.len() >= 75);
 }
+
+fn open_tags(bytes: &[u8]) -> Result<SideBlocks, String> {
+    SideBlocks::open_tags(FileBytes::Owned(bytes.to_vec()), "place_tags.bin")
+}
+
+fn as_tags(mut bytes: Vec<u8>) -> Vec<u8> {
+    let magic = bytes.len() - TAG_MAGIC.len();
+    bytes[magic..].copy_from_slice(TAG_MAGIC);
+    bytes
+}
+
+#[test]
+fn tags_read_a_mixed_block_an_empty_block_and_a_full_block() {
+    let mut rows = vec![NO_DATA; 2 * BLOCK_VALUES];
+    rows[1] = 42;
+    rows[BLOCK_VALUES - 1] = 101;
+    rows.extend([4, 9]);
+    let tags = open_tags(&encode_tags(&rows)).unwrap();
+    assert_eq!(tags.get(0), None);
+    assert_eq!(tags.get(1), Some(42));
+    assert_eq!(tags.get((BLOCK_VALUES - 1) as u32), Some(101));
+    assert_eq!(tags.get(BLOCK_VALUES as u32), None);
+    assert_eq!(tags.get((2 * BLOCK_VALUES + 1) as u32), Some(9));
+    assert_eq!(tags.values().collect::<Vec<_>>(),
+               rows.iter().map(|&v| (v != NO_DATA).then_some(v)).collect::<Vec<_>>());
+}
+
+#[test]
+fn tag_and_side_column_footers_are_distinct_and_tags_check_the_size_bounds() {
+    assert_eq!(open_tags(&encode(&[0])).err().unwrap(), "place_tags.bin has no STG1 footer");
+    assert_eq!(open(&encode_tags(&[0])).err().unwrap(), "way_postcodes.bin has no SDB1 footer");
+    let oversized = as_tags(file_of(&[vec![0; BLOCK_MAX_BYTES + PRESENCE_BYTES + 1]], 1));
+    assert_eq!(open_tags(&oversized).err().unwrap(),
+               "place_tags.bin has blocks of a size its values cannot take");
+}
+
+#[test]
+fn tag_reader_refuses_invalid_masks_and_a_dense_no_data_value() {
+    for mask in [0u64, 0b111, 0b1001] {
+        let block = [&[MODE_PRESENT][..], &mask.to_le_bytes(), &for_block(7, 0, &[])].concat();
+        let tags = open_tags(&as_tags(file_of(&[block], 3))).unwrap();
+        assert_eq!(tags.get(0), None, "mask {mask}");
+        assert_eq!(tags.values().collect::<Vec<_>>(), [None; 3], "mask {mask}");
+    }
+    let tags = open_tags(&as_tags(encode(&[NO_DATA]))).unwrap();
+    assert_eq!(tags.get(0), None);
+    assert_eq!(tags.values().collect::<Vec<_>>(), [None]);
+}

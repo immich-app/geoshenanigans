@@ -570,6 +570,20 @@ TEST(gcs_side_decoder_refuses_a_malformed_block_or_table) {
     }
 }
 
+TEST(gcs_tag_decoder_refuses_an_extent_past_its_table) {
+    ScratchDir dir("gcs-test");
+    const auto written = side_file_of("place_tags", std::vector<uint32_t>(side_blocks::BLOCK_VALUES + 1, 7));
+    std::vector<uint8_t> file(written.begin(), written.end());
+    const auto footer = side_blocks::read_footer("place_tags.bin", file.data() + file.size() - side_blocks::FOOTER_BYTES, file.size());
+    wr32(file.data() + footer.table_at + side_blocks::TABLE_ENTRY_BYTES, footer.table_at + 1);
+    write_bytes(dir.path() + "/place_tags.bin", file);
+    CHECK_EQ(refusal_of([&] {
+                 side::Dec dec(dir.path(), "place_tags");
+                 decode_all(dec);
+             }),
+             "Malformed place_tags.bin: invalid tag block extent");
+}
+
 TEST(gcs_side_encoder_refuses_a_stream_ending_inside_a_value) {
     // A full replacement whose payload is not whole u32s: refused at the
     // finish, not written as a file of the whole ones.
