@@ -554,3 +554,18 @@ TEST(side_blocks_are_the_shared_vectors_byte_for_byte) {
     CHECK(cases >= 75);
     CHECK(dictionaries >= 20 && fors >= 20);
 }
+
+TEST(search_offset_and_importance_columns_use_the_side_block_codec) {
+    for (const std::string kind : {"place", "admin", "poi"}) {
+        for (const std::string suffix : {"_tags.bin", "_imp.bin"}) {
+            const auto name = kind + suffix;
+            size_t registered = 0;
+            for (const auto& file : sb::SIDE_FILES) registered += file.file == name;
+            CHECK(registered == 1);
+            const std::vector<uint32_t> values(sb::BLOCK_VALUES, suffix == "_imp.bin" ? 0 : NONE);
+            const auto bytes = sb::encode(name, values.data(), values.size());
+            CHECK(decode(bytes) == values);
+            CHECK(bytes.size() == sb::FOR_HEAD_BYTES + sb::TABLE_ENTRY_BYTES + sb::FOOTER_BYTES);
+        }
+    }
+}

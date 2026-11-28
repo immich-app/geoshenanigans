@@ -92,11 +92,58 @@ static size_t get_rss_mb() {
 // --- String remap ---
 
 // The string tier pools as one side of string_offset_pairs.
-static std::vector<StringPoolSegment> string_tier_segments(const std::array<MappedFile, 5>& maps,
-                                                           std::vector<char>& concat) {
-    std::vector<std::pair<const char*, size_t>> pools;
-    for (const auto& m : maps) pools.push_back({m.data, m.size});
-    return string_pool_segments(pools, concat);
+using TierMaps = std::array<MappedFile, STRING_TIER_COUNT>;
+using TierBases = std::array<uint32_t, STRING_TIER_COUNT + 1>;
+
+// Admin-minimal has a local string space. The tag tiers are local to the
+// directory that ships them, even when their layout reserves a wider range.
+static bool borrows_tier(const std::string& dir, size_t tier) {
+    auto component = std::filesystem::path(dir).lexically_normal();
+    if (component.filename().empty()) component = component.parent_path();
+    return tier < STR_TIER_TAGS_CORE && component.filename() != "admin-minimal";
+}
+
+// Mode dirs can omit tiers and POI dirs can ship just a prefix. Once a
+// later tier has references, its base comes from the writer's layout.
+static TierBases tier_bases(const std::string& dir, const TierMaps& maps) {
+    TierBases bases{};
+    if (maps[STR_TIER_TAGS_CORE].size || maps[STR_TIER_TAGS_POI].size) {
+        std::ifstream layout(dir + "/strings_layout.json");
+        if (layout) {
+            std::string json((std::istreambuf_iterator<char>(layout)), {});
+            size_t at = 0;
+            for (int t = 0; t < STRING_TIER_COUNT; ++t) {
+                at = json.find("\"end\"", at);
+                if (at == json.npos || (at = json.find(':', at)) == json.npos)
+                    throw std::runtime_error("missing tier end in " + dir);
+                size_t consumed;
+                auto end = std::stoull(json.substr(++at), &consumed);
+                if (end > UINT32_MAX || end < uint64_t(bases[t]) + maps[t].size)
+                    throw std::runtime_error("invalid tier extent in " + dir);
+                bases[t + 1] = static_cast<uint32_t>(end);
+                at += consumed;
+            }
+            return bases;
+        }
+    }
+    for (int t = 0; t < STRING_TIER_COUNT; ++t) bases[t + 1] = bases[t] + maps[t].size;
+    return bases;
+}
+
+static SortedU32Map tier_remap(const TierMaps& old_maps, const TierBases& ob, const TierMaps& new_maps, const TierBases& nb) {
+    std::vector<SortedU32Map::Pair> pairs;
+    // Normal names can change tier. Tag tiers each own their copy of a bundle.
+    for (auto [first, end] : {std::pair<size_t, size_t>{0, STR_TIER_TAGS_CORE},
+                              {STR_TIER_TAGS_CORE, STR_TIER_TAGS_POI}, {STR_TIER_TAGS_POI, STRING_TIER_COUNT}}) {
+        std::vector<StringPoolSegment> olds, news;
+        for (size_t t = first; t < end; ++t) {
+            if (old_maps[t].size) olds.push_back({old_maps[t].data, old_maps[t].size, ob[t]});
+            if (new_maps[t].size) news.push_back({new_maps[t].data, new_maps[t].size, nb[t]});
+        }
+        auto group = string_offset_pairs(olds, news);
+        pairs.insert(pairs.end(), group.begin(), group.end());
+    }
+    return SortedU32Map(std::move(pairs));
 }
 
 // --- Remap + fixup helpers ---
@@ -983,9 +1030,10 @@ static int logical_size(const std::string& dir) {
         if (std::find(std::begin(STRING_TIER_FILES), std::end(STRING_TIER_FILES), name) != std::end(STRING_TIER_FILES)) continue;
         mapped += e.file_size();
     }
-    for (const char* tier : STRING_TIER_FILES) {
+    for (size_t t = 0; t < STRING_TIER_COUNT; ++t) {
         for (const char* in : {"/", "/../full/", "/../../full/"}) {
-            const uint64_t pool = string_pool_size(dir + in + tier);
+            if (in[1] && !borrows_tier(dir, t)) break;
+            const uint64_t pool = string_pool_size(dir + in + STRING_TIER_FILES[t]);
             if (pool == 0) continue;
             scratch += pool;
             break;
@@ -1386,19 +1434,24 @@ static int run(int argc, char* argv[]) {
     // str_remap ends up empty and records that should match (after name_id
     // re-tier) get classified as INSERT/DELETE → byte-block walker produces
     // patches the size of the whole vertex stream.
-    std::array<MappedFile, 5> old_tier_maps{}, new_tier_maps{};
-    std::array<uint64_t, 5> old_tier_hash{}, new_tier_hash{};
-    auto load_tiers = [&](const std::string& dir, const std::string& day, std::array<MappedFile, 5>& maps,
-                          std::array<uint64_t, 5>& hashes) {
+    std::array<MappedFile, STRING_TIER_COUNT> old_tier_maps{}, new_tier_maps{};
+    std::array<uint64_t, STRING_TIER_COUNT> old_tier_hash{}, new_tier_hash{};
+    auto load_tiers = [&](const std::string& dir, const std::string& day, std::array<MappedFile, STRING_TIER_COUNT>& maps,
+                          std::array<uint64_t, STRING_TIER_COUNT>& hashes) {
         size_t pools = 0;
         auto load_tier = [&](const std::string& path) {
             return map_string_pool(path, scratch.path() + "/pool-" + day + "-" + std::to_string(pools++));
         };
-        for (int t = 0; t < 5; t++) {
+        for (int t = 0; t < STRING_TIER_COUNT; t++) {
             const char* name = STRING_TIER_FILES[t];
             if (shipped >> t & 1) {
                 maps[t] = load_tier(dir + "/" + name);
                 hashes[t] = string_tier_file_hash_of(dir + "/" + name);
+                continue;
+            }
+            // Only the files of this dir can reference its tag tiers.
+            if (!borrows_tier(dir, t)) {
+                maps[t] = load_tier(dir + "/" + name);
                 continue;
             }
             for (const char* in : {"/", "/../full/", "/../../full/"}) {
@@ -1499,14 +1552,9 @@ static int run(int argc, char* argv[]) {
     }
     if (old_tiers_failed) std::rethrow_exception(old_tiers_failed);
     if (new_tiers_failed) std::rethrow_exception(new_tiers_failed);
-    std::array<uint32_t, 6> old_tier_bases{};
-    for (int t = 0; t < 5; t++) old_tier_bases[t + 1] = old_tier_bases[t] + static_cast<uint32_t>(old_tier_maps[t].size);
-    SortedU32Map str_remap;
-    {
-        std::vector<char> old_concat, new_concat;
-        str_remap = SortedU32Map(string_offset_pairs(string_tier_segments(old_tier_maps, old_concat),
-                                                     string_tier_segments(new_tier_maps, new_concat)));
-    }
+    const auto old_tier_bases = tier_bases(old_dir, old_tier_maps);
+    const auto new_tier_bases = tier_bases(new_dir, new_tier_maps);
+    auto str_remap = tier_remap(old_tier_maps, old_tier_bases, new_tier_maps, new_tier_bases);
 
     const size_t way_stride = WAY_HEADER_STRIDE;
     const size_t interp_stride = INTERP_WAY_STRIDE;
@@ -1545,6 +1593,8 @@ static int run(int argc, char* argv[]) {
         for (int t = 0; t < STRING_TIER_COUNT; t++) {
             tiers[t] = {old_tier_maps[t].data, old_tier_maps[t].size, new_tier_maps[t].data, new_tier_maps[t].size,
                         old_tier_hash[t], new_tier_hash[t]};
+            tiers[t].old_gap = old_tier_bases[t + 1] - old_tier_bases[t] - old_tier_maps[t].size;
+            tiers[t].new_gap = new_tier_bases[t + 1] - new_tier_bases[t] - new_tier_maps[t].size;
             tier_ends[t] = old_tier_bases[t + 1];
         }
         const uint32_t referenced =
@@ -1556,7 +1606,7 @@ static int run(int argc, char* argv[]) {
                           << stats.runs_bytes[t] << " bytes, not shipped)" << std::endl;
             else if (shipped >> t & 1)
                 std::cerr << "  " << STRING_TIER_FILES[t] << ": +" << stats.n_added[t] << " -" << stats.n_deleted[t]
-                          << " strings" << std::endl;
+                          << " strings, " << stats.edit_bytes[t] << " patch bytes" << std::endl;
         }
         std::cerr << "  String remap: shipped tiers 0x" << std::hex << shipped << ", newly shipped 0x"
                   << tier_files.newly_shipped << ", referenced 0x" << referenced << std::dec << ", "
@@ -1568,7 +1618,7 @@ static int run(int argc, char* argv[]) {
         unsent_string_pairs.swap(stats.unsent_pairs);
     }
     const PatcherStringRemap patcher_strings(str_remap, std::move(unsent_string_pairs), string_fixup_limits);
-    for (int t = 0; t < 5; t++) {
+    for (int t = 0; t < STRING_TIER_COUNT; t++) {
         unmap_file(old_tier_maps[t]);
         unmap_file(new_tier_maps[t]);
     }
@@ -2781,8 +2831,11 @@ static int run(int argc, char* argv[]) {
                   << " inserted values, " << n_changes << " changes of " << p_new << std::endl;
     };
     for (const auto& f : SPARSE_DELTA_FILES) {
+        const auto before = patch.size();
         if (const ParallelDeltaFile* pf = parallel_delta_file(f.fid)) emit_parallel_delta(*pf);
         else emit_sparse_delta(f.fid, patch_file_names[(uint32_t)f.fid], f.value_stride, f.remap_kind);
+        if (patch.size() != before && f.fid >= PatchFileId::PLACE_TAGS)
+            std::cerr << "  " << patch_file_names[uint32_t(f.fid)] << ": " << patch.size() - before << " patch bytes\n";
     }
     for (const auto& parent : parent_merges) std::vector<char>().swap(parent.second->seq.data);
     // ADDR_VERTICES was already serialized as a byte-merge just after

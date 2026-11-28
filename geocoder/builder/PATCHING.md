@@ -762,13 +762,13 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=25 (u32) + flags=0 (u32)
-  (a v25 patcher accepts only v25 patches; the v8 to v25 changes are marked
+Header: "GCPATCH\0" (8) + version=26 (u32) + flags=0 (u32)
+  (a v26 patcher accepts only v26 patches; the v8 to v26 changes are marked
   below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   + n × {name_len:u16, name, size:u64, inline:u8, [bytes] if inline}
-  Every file the new variant dir holds except *.osm_ids, *.gcpatch, *.zst and
+  Every file the new variant dir holds except *.host, *.osm_ids, *.gcpatch, *.zst and
   dotfiles, sorted by name, each once: at most 1024 files (MAX_CLIENT_FILES)
   of names at most 255 bytes long; the diff refuses a new dir it cannot list
   so. JSON files (strings_layout.json, poi_meta.json, attribution.json,
@@ -782,8 +782,10 @@ Old file sizes: n (u32) + n × {file_id:u32, old_size:u64}
   file, which no build writes); 0 = absent. The patcher checks them first.)
 
 Strings: marker 0xFFFFFFF6 (u32)
-  + 5 × {old_size:u32, new_size:u32} (core, street, addr, postcode, poi: the
-  build's tiers, which place every global offset)
+  + 7 × {old_size:u32, new_size:u32, old_gap:u32, new_gap:u32}
+  (core, street, addr, postcode, poi, tags_core, tags_poi).
+  Size counts the decoded bytes present. Size plus gap gives the extent
+  in strings_layout.json, including the unshipped tail of a POI tier.
   + shipped (u32, bit per tier the dir rebuilds; each must be a listed
   client file, and a listed tier without its bit comes in a per-file section)
   + sent (u32, bit per unshipped tier the dir's old files reference)
@@ -1166,6 +1168,11 @@ own names beside the admin polygons.
 | 38 | `addr_cities.bin` | parallel delta along addr_points, remap kind 2 (v22), after `interp_postcodes.bin`'s |
 | 39 | `water_cut_arcs.bin` | a water dir's cut arcs: sparse delta of its u32 words, remap kind 0 (v24) |
 | 40 | `admin_own_names.bin` | merge at stride 8 (v25), string field `name_id` at byte 4 (the slot at 0 a polygon keeps), after the admin geometry |
+| 41, 42 | `strings_tags_core.bin`, `strings_tags_poi.bin` | FCC2 bundle tiers, edited in record order |
+| 43 | reserved for `strings_poi_everything.bin` | |
+| 44, 46 | `place_tags.bin`, `poi_tags.bin` | SDB1 bundle offsets, parallel delta along place and POI rows, string remap |
+| 45 | `admin_tags.bin` | SDB1 bundle offsets, sparse delta by polygon slot, string remap |
+| 47–49 | `place_imp.bin`, `admin_imp.bin`, `poi_imp.bin` | SDB1 importance values, zero for absent, no remap |
 
 The four admin geometry files (`ADMIN_SLOT_FAMILIES`) follow the place nodes
 as arc_index, arc_vertices, admin_polygons, admin_rings, ahead of the admin
@@ -1187,6 +1194,29 @@ by slot. It merges by content as any record file of a string field: a polygon
 whose own name only moved in the strings MATCHes, a polygon newly named so is
 an INSERT, and one no longer named so a DELETE. The planet's boundary tiers hold
 about 26,000 of them.
+
+### Search tags and host files
+
+Each bundle holds bytewise-sorted key/value pairs separated by U+001E.
+U+001F separates each key from its value. A row holding only its existing
+name has offset NO_DATA. Places and admin slots share tier 5. POIs use
+tier 6 and each POI directory ships a prefix ordered by the first tier
+that needs each bundle. The seven entries in `strings_layout.json` give
+the global offsets even for selections that omit tiers. Admin-minimal
+compacts its rows, slots and bundles. Its POI-compatible variant retains
+the shared tier bases.
+
+With `--host-data`, street, address, interpolation and POI address tags
+are row-indexed in `street_tags.host`, `addr_tags.host`, `interp_tags.host`
+and `poi_addr.host`. Each block of up to 4,096 rows starts with count+1
+little-endian u32 offsets relative to its UTF-8 payload. The footer holds
+one u64 file offset per block and a u32 total row count. Each POI
+directory has an SDB1 `poi_classes.host` of ids into its local
+`poi_class_names.host` dictionary in the same block format. Place and
+POI row maps are `place_nodes.osm_ids` and `poi_rows.osm_ids`. The
+simplified admin tier gets its polygon slot map beside its geometry.
+These host files are excluded from client selections, patches and
+compression.
 
 ## Performance
 

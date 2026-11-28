@@ -595,6 +595,23 @@ BuildDir json_files(int n) {
 }
 }  // namespace
 
+TEST(patch_round_trip_keeps_tag_offsets_in_the_tier_their_rows_reference) {
+    BuildDir old_d, new_d;
+    for (const char* file : {"strings_tags_core.bin", "strings_tags_poi.bin"}) {
+        old_d[file] = {'a', TAG_KEY_SEP, 'x', 0};
+        new_d[file] = {'a', TAG_KEY_SEP, 'y', 0, 'a', TAG_KEY_SEP, 'x', 0};
+    }
+    for (const std::string k : {"place", "admin", "poi"}) {
+        const uint32_t old_base = k == "poi" ? 4 : 0;
+        const uint32_t new_base = k == "poi" ? 8 : 0;
+        old_d[k + "_tags.bin"] = bytes_of(std::vector<uint32_t>{old_base, NO_DATA});
+        new_d[k + "_tags.bin"] = bytes_of(std::vector<uint32_t>{new_base + 4, new_base});
+        old_d[k + "_imp.bin"] = bytes_of(std::vector<uint32_t>{0, 0});
+        new_d[k + "_imp.bin"] = bytes_of(std::vector<uint32_t>{0, 7});
+    }
+    CHECK(round_trip(old_d, new_d).mismatches.empty());
+}
+
 TEST(patch_round_trip_keeps_the_street_ids_of_unchanged_street_ways) {
     BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
     put_shifted_streets(old_d, new_d);

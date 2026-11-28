@@ -107,8 +107,9 @@ logical_sizes() {
 # 64 MiB.
 side_weight_kib() {
   local dir=$1 mapped=$2 tier f strings=0
-  for tier in core street addr postcode poi; do
+  for tier in core street addr postcode poi tags_core tags_poi; do
     for f in "$dir" "$dir/../full" "$dir/../../full"; do
+      if [[ "$f" != "$dir" && ( "${dir%/}" == */admin-minimal || "$tier" == tags_* ) ]]; then break; fi
       if [ -s "$f/strings_$tier.bin" ]; then strings=$((strings + $(size_kib "$f/strings_$tier.bin"))); break; fi
     done
   done
@@ -119,7 +120,7 @@ side_weight_kib() {
 # links and verify_patch.sh compares. Printed as %.0f: an awk whose %d is 32
 # bits wide would cap the sum at 2 GiB.
 client_bytes() {
-  find "$1" -maxdepth 1 -type f ! -name '.*' ! -name '*.osm_ids' ! -name '*.gcpatch' ! -name '*.zst' -printf '%s\n' \
+  find "$1" -maxdepth 1 -type f ! -name '.*' ! -name '*.osm_ids' ! -name '*.host' ! -name '*.gcpatch' ! -name '*.zst' -printf '%s\n' \
     | awk '{s += $1} END {printf "%.0f", s}'
 }
 
