@@ -263,6 +263,18 @@ impl SearchRequest {
         self.profile.policy()
     }
 
+    /// Fails unless the limit is 1 to the profile's max_limit. A transport that takes any limit
+    /// clamps it first, as Nominatim (v1/server_glue.py:352) and Photon (RequestBase.java:72-75)
+    /// do.
+    pub fn require_limit(&self) -> Result<(), RequestError> {
+        let max = self.policy().max_limit;
+        if !(1..=max).contains(&self.limit) {
+            return Err(RequestError::LimitOutOfRange { limit: self.limit, max });
+        }
+
+        Ok(())
+    }
+
     /// The results a search fetches before its dedupe drops some: limit + min(DEDUPE_EXTRA_MAX,
     /// limit) where it deduplicates as Nominatim does (v1/server_glue.py:352-354), else the limit.
     pub fn fetch_limit(&self) -> usize {
@@ -283,6 +295,8 @@ pub enum RequestError {
     ProfileNotBuilt(Profile),
     /// The index answers no request that sets this option.
     UnsupportedOption(&'static str),
+    /// A limit of no result, or of more than the profile's max_limit.
+    LimitOutOfRange { limit: usize, max: usize },
 }
 
 impl fmt::Display for RequestError {
@@ -293,6 +307,7 @@ impl fmt::Display for RequestError {
             RequestError::UnknownLayer(s) => write!(f, "Unknown layer: {s}"),
             RequestError::ProfileNotBuilt(p) => write!(f, "Profile not built: {}", p.as_str()),
             RequestError::UnsupportedOption(option) => write!(f, "Option not supported: {option}"),
+            RequestError::LimitOutOfRange { limit, max } => write!(f, "Limit out of range: {limit} (1 to {max})"),
         }
     }
 }
@@ -402,6 +417,23 @@ mod tests {
     }
 
     #[test]
+    fn a_request_limit_is_one_to_its_profiles_maximum() {
+        for (profile, limit, allowed) in [
+            (Profile::Immich, 0, false),
+            (Profile::Immich, 1, true),
+            (Profile::Immich, 50, true),
+            (Profile::Immich, 51, false),
+            (Profile::Full, 50, true),
+            (Profile::Full, usize::MAX, false),
+        ] {
+            let req = SearchRequest { limit, ..SearchRequest::new("x", profile) };
+
+            let want = if allowed { Ok(()) } else { Err(RequestError::LimitOutOfRange { limit, max: 50 }) };
+            assert_eq!(req.require_limit(), want, "{profile:?} {limit}");
+        }
+    }
+
+    #[test]
     fn a_bias_takes_photons_default_zoom_and_scale() {
         assert_eq!(Bias::at(30.4, -97.8), Bias { lat: 30.4, lon: -97.8, zoom: 12, scale: 0.4 });
     }
@@ -411,5 +443,6 @@ mod tests {
         assert_eq!(RequestError::UnknownProfile("hosted".into()).to_string(), "Unknown profile: hosted");
         assert_eq!(RequestError::ProfileNotBuilt(Profile::Full).to_string(), "Profile not built: full");
         assert_eq!(RequestError::UnsupportedOption("viewbox").to_string(), "Option not supported: viewbox");
+        assert_eq!(RequestError::LimitOutOfRange { limit: 51, max: 50 }.to_string(), "Limit out of range: 51 (1 to 50)");
     }
 }

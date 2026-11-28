@@ -1,6 +1,7 @@
 //! What a search answers: its results, best first, each what the outputs (Immich's eight
 //! fields, Nominatim's jsonv2, Photon's GeoJSON) are drawn from, with the dataset for display.
 use crate::index::entities::{BBox, Category, EntityRef, OsmRef};
+use crate::index::streets::{NumberRow, NumberTarget};
 use std::borrow::Cow;
 
 /// The kind of a result: what the test page letters it by and the full output names it.
@@ -11,7 +12,8 @@ pub enum ResultKind {
     Poi,
     /// A way of a street.
     Street,
-    /// An address point found by its number: on its street, or on its place.
+    /// A house found by its number: an address point, POI or named address on its street, or an
+    /// address point on its place.
     House,
     /// A number of an OSM interpolation line.
     Interpolation,
@@ -69,16 +71,24 @@ impl ResultKind {
 /// What a result is, by the records it is read from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Target {
-    /// An entity found by its names or its own number: a place, area, POI, address point that is
-    /// an entity (one numbered on a place among them) or postcode.
+    /// An entity found by its names: a place, area, POI, address point that is an entity (one
+    /// numbered on a place, whose number is a name of its own, among them) or postcode.
     Entity(EntityRef),
     /// Way `way` (street_ways.bin) of street `street`.
     Way { street: EntityRef, way: u32 },
-    /// Address point `address` (addr_points.bin), on way `way` of street `street`.
-    House { street: EntityRef, way: u32, address: u32 },
+    /// What a house number on way `way` of street `street` numbers. The way is the one the index
+    /// filed the house on, which can differ from the parent street its record holds.
+    House { street: EntityRef, way: u32, target: NumberTarget },
     /// `number` of interpolation `interpolation` (interp_ways.bin), an OSM line or a TIGER range,
     /// on way `way` of street `street`.
     Interpolated { street: EntityRef, way: u32, interpolation: u32, number: u32 },
+}
+
+impl Target {
+    /// The house of number row `row` of street `street`.
+    pub fn house(street: EntityRef, row: &NumberRow) -> Target {
+        Target::House { street, way: row.way, target: row.target }
+    }
 }
 
 /// One answer of a search, as the search ranked it.
@@ -109,6 +119,7 @@ pub struct SearchResult<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::entities::EntityKind;
 
     #[test]
     fn each_kind_has_a_name_and_a_letter_of_its_own() {
@@ -128,5 +139,17 @@ mod tests {
                 ("named_address", 'N'),
             ]
         );
+    }
+
+    #[test]
+    fn a_house_keeps_the_way_its_number_was_found_on_whatever_it_numbers() {
+        let street = EntityRef::new(EntityKind::Street, 7).unwrap();
+        let poi = EntityRef::new(EntityKind::Poi, 3).unwrap();
+
+        for target in [NumberTarget::Entity(poi), NumberTarget::Address(9)] {
+            let row = NumberRow { number: "1044".into(), way: 12, target, partial: false };
+
+            assert_eq!(Target::house(street, &row), Target::House { street, way: 12, target });
+        }
     }
 }

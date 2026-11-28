@@ -327,9 +327,10 @@ impl PlaceSearch {
 
     /// `Searcher::search` of the request's query and limit: the results, best first, and the work
     /// they took. They borrow this search, which they can't outlive. A request it can't honour
-    /// (`require_supported`) is refused.
+    /// (`require_supported`), or of a limit its profile refuses, is refused.
     pub fn search(&self, req: &SearchRequest) -> Result<(Vec<Found<'_>>, QueryStats), RequestError> {
         require_supported(req)?;
+        req.require_limit()?;
         Ok(self.searcher.search(&req.q, req.limit))
     }
 }
@@ -929,6 +930,21 @@ mod tests {
             assert_eq!(search.search(&req).map(drop), Err(RequestError::UnsupportedOption(option)), "{option}");
         }
         assert_eq!(search.search(&immich()).map(|(found, _)| found.len()), Ok(1));
+    }
+
+    #[test]
+    fn a_place_search_refuses_a_limit_outside_its_profiles_range() {
+        let ds = TempDir::new("place-search-limit");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let (geo, stamps) = load_dataset(&ds.0);
+        let (search, _) = PlaceSearch::open(Arc::new(geo), &stamps, &ds.0, &ds.0.join("search"), &BuildOnDevice::default()).unwrap();
+
+        for limit in [0, 51, usize::MAX] {
+            let refused = search.search(&new_request("otherton", limit));
+
+            assert_eq!(refused.map(drop), Err(RequestError::LimitOutOfRange { limit, max: 50 }), "{limit}");
+        }
+        assert_eq!(search.search(&new_request("otherton", 50)).map(|(found, _)| found.len()), Ok(1));
     }
 
     #[test]

@@ -144,7 +144,7 @@ impl Geocoder {
 
     /// Place search on the libuv worker pool, once `openPlaceSearch` resolved. Resolves to a JSON
     /// array of { name, latitude, longitude, admin1name, admin2name, country, country_code, type },
-    /// best first.
+    /// best first, at most `limit` of them (1 to 50, 20 without one; another limit rejects).
     #[napi(ts_return_type = "Promise<string>")]
     pub fn search_places(&self, query: String, limit: Option<u32>) -> Result<AsyncTask<SearchTask>> {
         let search = self.search.read().unwrap().clone().ok_or_else(|| Error::from_reason("Place search is not open"))?;

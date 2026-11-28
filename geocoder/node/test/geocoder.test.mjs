@@ -402,6 +402,16 @@ test('place search opens the immich profile alone', async () => {
   assert.deepEqual(await names(geocoder, 'testville'), ['Testville']);
 });
 
+test('a search limit outside 1 to 50 is refused', async () => {
+  const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));
+  await geocoder.openPlaceSearch();
+
+  for (const limit of [0, 51]) {
+    await assert.rejects(geocoder.searchPlaces('testville', limit), /Limit out of range/, `${limit}`);
+  }
+  assert.equal(JSON.parse(await geocoder.searchPlaces('testville', 50)).length, 1);
+});
+
 test('search before opening is refused', () => {
   const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));
 
