@@ -11,6 +11,7 @@ use crate::constants::*;
 use crate::entities::*;
 use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI};
 use crate::model::*;
+use crate::sort::{run_budget, ExternalSort, MapVec, SortRecord, SortedRuns};
 use crate::text::normalize::{join, tokens, transliterate};
 use memmap2::Mmap;
 use query_server::{Index, PlaceNode, NO_DATA};
@@ -407,352 +408,22 @@ fn keys_of(geo: &Index, e: &EntityBuf, out: &mut Vec<(String, u8, bool, u8)>) {
 
 // ------------------------------------------------------------------ sort runs
 
-/// A fixed-capacity array in its own anonymous mapping. Dropping it unmaps it, so a phase's
-/// buffers go back to the system before the next phase: glibc keeps freed heap memory for reuse
-/// once a block this large has been freed, and the next phase's buffers came on top of it.
-struct MapVec<T: Copy> {
-    map: memmap2::MmapMut,
-    len: usize,
-    cap: usize,
-    _t: std::marker::PhantomData<T>,
-}
+/// A key's posting in a sort run: u32 entity, importance, partial | class << 1, ordinal. Postings
+/// of a key sort by entity, then by the rest of them.
+impl SortRecord for Posting {
+    const BYTES: usize = 7;
 
-impl<T: Copy> MapVec<T> {
-    fn with_capacity(cap: usize) -> std::io::Result<Self> {
-        let map = memmap2::MmapOptions::new().len((cap * std::mem::size_of::<T>()).max(1)).map_anon()?;
-        Ok(MapVec { map, len: 0, cap, _t: std::marker::PhantomData })
+    fn put(&self, out: &mut [u8]) {
+        out[..4].copy_from_slice(&self.entity.to_le_bytes());
+        out[4..].copy_from_slice(&[self.imp_q, self.partial as u8 | self.class << 1, self.ord]);
     }
 
-    fn capacity(&self) -> usize {
-        self.cap
+    fn get(b: &[u8]) -> Self {
+        Posting { entity: u32::from_le_bytes(b[..4].try_into().unwrap()), imp_q: b[4], partial: b[5] & 1 == 1, class: b[5] >> 1, ord: b[6] }
     }
 
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn clear(&mut self) {
-        self.len = 0;
-    }
-
-    fn push(&mut self, v: T) {
-        assert!(self.len < self.cap, "MapVec full");
-        // SAFETY: in bounds of the mapping, which is page-aligned (so aligned for T).
-        unsafe { (self.map.as_mut_ptr() as *mut T).add(self.len).write(v) };
-        self.len += 1;
-    }
-
-    fn extend_from_slice(&mut self, s: &[T]) {
-        assert!(self.len + s.len() <= self.cap, "MapVec full");
-        // SAFETY: in bounds (checked above); a fresh mapping never overlaps `s`.
-        unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), (self.map.as_mut_ptr() as *mut T).add(self.len), s.len()) };
-        self.len += s.len();
-    }
-
-    fn as_slice(&self) -> &[T] {
-        // SAFETY: the first `len` elements were written by push.
-        unsafe { std::slice::from_raw_parts(self.map.as_ptr() as *const T, self.len) }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [T] {
-        // SAFETY: as in as_slice.
-        unsafe { std::slice::from_raw_parts_mut(self.map.as_mut_ptr() as *mut T, self.len) }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Item {
-    off: u32,
-    len: u16,
-    flags: u8,
-    ord: u8,
-    entity: u32,
-    imp: u8,
-}
-
-/// Sort run files, removed when dropped. A run is held from its file's creation until the merge
-/// that reads it is done with it, through the worker that spilled it and the sub-index's
-/// `KeyRuns`, so a build that fails anywhere leaves none behind.
-#[derive(Default)]
-struct RunFiles(Vec<PathBuf>);
-
-impl RunFiles {
-    fn push(&mut self, path: PathBuf) {
-        self.0.push(path);
-    }
-
-    /// Takes over `other`'s runs, after this one's.
-    fn append(&mut self, mut other: RunFiles) {
-        self.0.append(&mut other.0);
-    }
-
-    /// The first `n` runs, no longer held here.
-    fn take_first(&mut self, n: usize) -> RunFiles {
-        RunFiles(self.0.drain(..n).collect())
-    }
-}
-
-impl std::ops::Deref for RunFiles {
-    type Target = [PathBuf];
-
-    fn deref(&self) -> &[PathBuf] {
-        &self.0
-    }
-}
-
-impl Drop for RunFiles {
-    fn drop(&mut self) {
-        for f in &self.0 {
-            let _ = std::fs::remove_file(f);
-        }
-    }
-}
-
-struct Runs {
-    arena: MapVec<u8>,
-    items: MapVec<Item>,
-    files: RunFiles,
-    dir: PathBuf,
-    tag: String,
-    spilled_bytes: u64,
-}
-
-impl Runs {
-    fn new(budget: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
-        Self::with_arena_limit(budget, MAX_RUN_ARENA_BYTES, dir, tag)
-    }
-
-    /// `new` with at most `arena_limit` key bytes per run.
-    fn with_arena_limit(budget: usize, arena_limit: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
-        // Fixed capacities: a run spills when either fills, so memory never exceeds the budget.
-        let (arena_cap, items_cap) = run_capacities(budget, arena_limit);
-        Ok(Runs {
-            arena: MapVec::with_capacity(arena_cap)?,
-            items: MapVec::with_capacity(items_cap.max(1024))?,
-            files: RunFiles::default(),
-            dir: dir.to_path_buf(),
-            tag,
-            spilled_bytes: 0,
-        })
-    }
-
-    /// Adds one key entry; an error for a key longer than a run holds: MAX_KEY_BYTES (a run entry's
-    /// u16 length), or the run's key arena when that is smaller.
-    fn push(&mut self, key: &[u8], p: Posting) -> std::io::Result<()> {
-        let fits = MAX_KEY_BYTES.min(self.arena.capacity());
-        if key.len() > fits {
-            let e = format!("entity {}: a key of {} bytes, over the {fits} bytes a sort run holds", p.entity, key.len());
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e));
-        }
-
-        if self.arena.len() + key.len() > self.arena.capacity() || self.items.len() == self.items.capacity() {
-            self.spill()?;
-        }
-        let off = self.arena.len() as u32;
-        self.arena.extend_from_slice(key);
-        self.items.push(Item { off, len: key.len() as u16, flags: entry_flags(&p), ord: p.ord, entity: p.entity, imp: p.imp_q });
-        Ok(())
-    }
-
-    /// Spills the last run and frees the buffers: the run files and the bytes spilled.
-    fn finish(mut self) -> std::io::Result<(RunFiles, u64)> {
-        self.spill()?;
-        Ok((self.files, self.spilled_bytes))
-    }
-
-    fn spill(&mut self) -> std::io::Result<()> {
-        if self.items.is_empty() {
-            return Ok(());
-        }
-        let arena = self.arena.as_slice();
-        let key = |it: &Item| &arena[it.off as usize..it.off as usize + it.len as usize];
-        self.items.as_mut_slice().sort_unstable_by(|a, b| key(a).cmp(key(b)).then(a.entity.cmp(&b.entity)));
-        let path = self.dir.join(format!("{}-{}.run", self.tag, self.files.len()));
-        let file = File::create(&path)?;
-        // Held from here: a run whose write fails goes with the others.
-        self.files.push(path);
-        let mut w = BufWriter::with_capacity(WRITE_BUFFER, file);
-        for it in self.items.as_slice() {
-            self.spilled_bytes += write_entry(&mut w, key(it), it.entity, it.imp, it.flags, it.ord)?;
-        }
-        w.flush()?;
-        self.items.clear();
-        self.arena.clear();
-        Ok(())
-    }
-}
-
-/// (key bytes, entries) one sort run of `budget` bytes holds: RUN_ARENA_PERCENT of the budget for
-/// keys, at most `arena_limit` of it, and the rest for entries.
-fn run_capacities(budget: usize, arena_limit: usize) -> (usize, usize) {
-    let arena_share = budget * RUN_ARENA_PERCENT / 100;
-    (arena_share.min(arena_limit), (budget - arena_share) / std::mem::size_of::<Item>())
-}
-
-/// Sort-run memory of each of `threads` workers sharing `mem_mb`; an error below
-/// MIN_RUN_BUDGET_BYTES, where the longest key would not fit a run.
-fn run_budget(mem_mb: usize, threads: usize) -> Result<usize, String> {
-    let budget = (mem_mb << 20) / threads;
-    if budget < MIN_RUN_BUDGET_BYTES {
-        return Err(format!("Sort budget too small: {budget} bytes per thread, at least {MIN_RUN_BUDGET_BYTES}"));
-    }
-
-    Ok(budget)
-}
-
-/// One run entry: u16 key length, key, u32 entity, importance, partial | class << 1, ordinal.
-/// Returns the bytes written.
-fn write_entry(w: &mut impl Write, key: &[u8], entity: u32, imp: u8, flags: u8, ord: u8) -> std::io::Result<u64> {
-    w.write_all(&(key.len() as u16).to_le_bytes())?;
-    w.write_all(key)?;
-    w.write_all(&entity.to_le_bytes())?;
-    w.write_all(&[imp, flags, ord])?;
-    Ok(2 + key.len() as u64 + 7)
-}
-
-fn entry_flags(p: &Posting) -> u8 {
-    (p.partial as u8) | (p.class << 1)
-}
-
-/// The entries of several sorted runs in (key, entity, run) order.
-struct Merge {
-    files: Vec<PathBuf>,
-    readers: Vec<RunReader>,
-    heap: BinaryHeap<Head>,
-}
-
-impl Merge {
-    fn open(files: &[PathBuf]) -> std::io::Result<Self> {
-        let mut readers = Vec::with_capacity(files.len());
-        for f in files {
-            readers.push(RunReader { r: BufReader::with_capacity(RUN_READ_BUFFER, File::open(f).map_err(|e| run_error(f, e))?) });
-        }
-        let mut heap = BinaryHeap::with_capacity(readers.len());
-        for (i, r) in readers.iter_mut().enumerate() {
-            let mut h = Head { key: Vec::new(), p: Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 }, run: i };
-            if r.read_into(&mut h).map_err(|e| run_error(&files[i], e))? {
-                heap.push(h);
-            }
-        }
-        Ok(Merge { files: files.to_vec(), readers, heap })
-    }
-
-    /// Copies the next entry into `key` and `p`; false after the last, an error for a run that
-    /// fails to read or is cut short.
-    fn next(&mut self, key: &mut Vec<u8>, p: &mut Posting) -> std::io::Result<bool> {
-        let Some(mut top) = self.heap.peek_mut() else { return Ok(false) };
-        key.clear();
-        key.extend_from_slice(&top.key);
-        *p = top.p;
-        let run = top.run;
-        if !self.readers[run].read_into(&mut top).map_err(|e| run_error(&self.files[run], e))? {
-            std::collections::binary_heap::PeekMut::pop(top);
-        }
-        Ok(true)
-    }
-}
-
-/// A sort run's open or read error, naming the run.
-fn run_error(path: &Path, e: std::io::Error) -> std::io::Error {
-    std::io::Error::new(e.kind(), format!("sort run {}: {e}", path.display()))
-}
-
-/// Merges groups of at most MERGE_FAN_IN consecutive runs into longer runs until at most
-/// MERGE_FAN_IN are left (consecutive, so entries that compare equal keep their run order).
-/// Each pass merges every run while more than MERGE_FAN_IN² are left, then only as many of the
-/// last runs as it takes to leave MERGE_FAN_IN. Returns the runs left and the bytes rewritten.
-fn reduce_runs(mut files: RunFiles, dir: &Path, tag: &str) -> std::io::Result<(RunFiles, u64)> {
-    let mut rewritten = 0u64;
-    let mut pass = 0;
-    while files.len() > MERGE_FAN_IN {
-        let n = files.len();
-        let excess = n - MERGE_FAN_IN;
-        let merged = if n > MERGE_FAN_IN * MERGE_FAN_IN { n } else { excess + excess.div_ceil(MERGE_FAN_IN - 1) };
-        // The runs left as they are, then each group's merged run; `files` holds those not merged
-        // yet, so every run has one holder until its group's merge has removed it.
-        let mut next = files.take_first(n - merged);
-        let mut i = 0;
-        while !files.is_empty() {
-            let group = files.take_first(MERGE_FAN_IN.min(files.len()));
-            if group.len() == 1 {
-                next.append(group);
-                continue;
-            }
-            let path = dir.join(format!("{tag}-m{pass}-{i}.run"));
-            let file = File::create(&path)?;
-            next.push(path);
-            let mut w = BufWriter::with_capacity(WRITE_BUFFER, file);
-            let mut m = Merge::open(&group)?;
-            let mut key = Vec::new();
-            let mut p = Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 };
-            while m.next(&mut key, &mut p)? {
-                rewritten += write_entry(&mut w, &key, p.entity, p.imp_q, entry_flags(&p), p.ord)?;
-            }
-            w.flush()?;
-            drop(m);
-            drop(group);
-            i += 1;
-        }
-        files = next;
-        pass += 1;
-    }
-    Ok((files, rewritten))
-}
-
-struct Head {
-    key: Vec<u8>,
-    p: Posting,
-    run: usize,
-}
-
-impl PartialEq for Head {
-    fn eq(&self, o: &Self) -> bool {
-        self.key == o.key && self.p.entity == o.p.entity
-    }
-}
-impl Eq for Head {}
-impl PartialOrd for Head {
-    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(o))
-    }
-}
-impl Ord for Head {
-    // reversed: BinaryHeap pops the smallest key first
-    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-        o.key.cmp(&self.key).then(o.p.entity.cmp(&self.p.entity)).then(o.run.cmp(&self.run))
-    }
-}
-
-struct RunReader {
-    r: BufReader<File>,
-}
-
-impl RunReader {
-    /// The run's next record into `h`: false at the run's end (nothing left before a record), an
-    /// error for a failed read or a record cut short.
-    fn read_into(&mut self, h: &mut Head) -> std::io::Result<bool> {
-        if self.r.fill_buf()?.is_empty() {
-            return Ok(false);
-        }
-        let mut len = [0u8; 2];
-        self.r.read_exact(&mut len)?;
-        let n = u16::from_le_bytes(len) as usize;
-        h.key.resize(n, 0);
-        self.r.read_exact(&mut h.key)?;
-        let mut rest = [0u8; 7];
-        self.r.read_exact(&mut rest)?;
-        h.p = Posting {
-            entity: u32::from_le_bytes(rest[0..4].try_into().unwrap()),
-            imp_q: rest[4],
-            partial: rest[5] & 1 == 1,
-            class: rest[5] >> 1,
-            ord: rest[6],
-        };
-        Ok(true)
+    fn order(&self, o: &Self) -> std::cmp::Ordering {
+        (self.entity, self.partial, self.class, self.ord, self.imp_q).cmp(&(o.entity, o.partial, o.class, o.ord, o.imp_q))
     }
 }
 
@@ -1004,11 +675,10 @@ pub fn build(geo: &Index, names: &[&str], out: &Path, opts: &BuildOpts) -> Resul
 /// merge takes them (a failed build leaves none of a sub-index it never merged).
 pub struct KeyRuns {
     name: String,
-    files: RunFiles,
+    runs: SortedRuns<Posting>,
     st: Stats,
     ents: u64,
     entries: u64,
-    spilled: u64,
     t_src: Duration,
     t_keys: Duration,
 }
@@ -1041,7 +711,7 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
 
     // ---- keys -> sorted runs, one worker per contiguous range of entities
     let n = src.len();
-    type RunsOut = (RunFiles, u64, u64, u64);
+    type RunsOut = (SortedRuns<Posting>, u64, u64);
     let results: Vec<Result<RunsOut, String>> = std::thread::scope(|sc| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
@@ -1051,7 +721,7 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
                 sc.spawn(move || -> Result<RunsOut, String> {
                     let lo = (n as u64 * t as u64 / threads as u64) as u32;
                     let hi = (n as u64 * (t as u64 + 1) / threads as u64) as u32;
-                    let mut runs = Runs::new(budget, tmp, tag).map_err(|x| x.to_string())?;
+                    let mut sort = ExternalSort::new(budget, tmp, tag).map_err(|x| x.to_string())?;
                     let mut e = EntityBuf::default();
                     let mut keys = Vec::new();
                     let (mut ents, mut entries) = (0u64, 0u64);
@@ -1065,42 +735,42 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
                         ents += 1;
                         let imp_q = quantize(e.imp);
                         for (k, ord, partial, class) in &keys {
-                            runs.push(k.as_bytes(), Posting { entity: e.id, imp_q, partial: *partial, class: *class, ord: *ord })
-                                .map_err(|x| x.to_string())?;
+                            sort.push(k.as_bytes(), Posting { entity: e.id, imp_q, partial: *partial, class: *class, ord: *ord })
+                                .map_err(|x| format!("entity {}: {x}", e.id))?;
                             entries += 1;
                         }
                         Ok(())
                     })?;
                     // Hands the run memory back before the merge.
-                    let (files, spilled) = runs.finish().map_err(|x| x.to_string())?;
-                    Ok((files, spilled, ents, entries))
+                    let runs = sort.finish().map_err(|x| x.to_string())?;
+                    Ok((runs, ents, entries))
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     // Every worker's runs are held until the merge takes them, a failed worker's siblings' too.
-    let mut files = RunFiles::default();
-    let (mut ents, mut entries, mut spilled) = (0u64, 0u64, 0u64);
+    let mut runs = SortedRuns::default();
+    let (mut ents, mut entries) = (0u64, 0u64);
     for r in results {
-        let (f, s, e, k) = r?;
+        let (worker_runs, e, k) = r?;
         ents += e;
         entries += k;
-        spilled += s;
-        files.append(f);
+        runs.append(worker_runs);
     }
     drop(src);
     let t_keys = t0.elapsed() - t_src;
-    Ok(KeyRuns { name: name.to_string(), files, st, ents, entries, spilled, t_src, t_keys })
+    Ok(KeyRuns { name: name.to_string(), runs, st, ents, entries, t_src, t_keys })
 }
 
 /// Merge phase of one sub-index: its runs -> `<name>.fst`, `.post`, `.pfx.fst` and `.pfx` in `out`.
 pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, String> {
     let t0 = Instant::now();
-    let KeyRuns { name, files, mut st, ents, entries, spilled, t_src, t_keys } = runs;
+    let KeyRuns { name, runs, mut st, ents, entries, t_src, t_keys } = runs;
     let name = name.as_str();
-    let n_runs = files.len();
-    let (files, rewritten) = reduce_runs(files, &opts.tmp, name).map_err(|e| e.to_string())?;
+    let (n_runs, spilled) = (runs.len(), runs.spilled_bytes());
+    let mut m = runs.merge(&opts.tmp, name).map_err(|e| e.to_string())?;
+    let rewritten = m.rewritten_bytes();
     let [keys_path, post_path, pfx_keys_path, pfx_path] = sub_index_files(name).map(|f| out.join(f));
     let mk = |path: &Path| File::create(path).map_err(|e| e.to_string());
     let mut w = Writer {
@@ -1119,12 +789,10 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
         postings: 0,
         longest: 0,
     };
-    let mut m = Merge::open(&files).map_err(|e| e.to_string())?;
     let mut cur: Vec<u8> = Vec::new();
     let mut key: Vec<u8> = Vec::new();
-    let mut p = Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 };
     let mut group = Group::default();
-    while m.next(&mut key, &mut p).map_err(|e| e.to_string())? {
+    while let Some(p) = m.next(&mut key).map_err(|e| e.to_string())? {
         if key != cur {
             if !group.is_empty() {
                 group.take(|list| w.add(&cur, list))?;
@@ -1137,7 +805,6 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
         group.take(|list| w.add(&cur, list))?;
     }
     drop(m);
-    drop(files);
     let Writer { fst, mut post, mut slots, keys, postings, longest, .. } = w;
     fst.finish().map_err(|e| e.to_string())?;
     post.flush().map_err(|e| e.to_string())?;
@@ -1399,18 +1066,7 @@ pub fn check_retained_names(out: &Path, building: &[&str], with_extras: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// xorshift: deterministic test values without a dependency.
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-    }
+    use crate::fixture::Rng;
 
     fn posting(entity: u32, imp_q: u8, partial: bool, class: u8) -> Posting {
         Posting { entity, imp_q, partial, class, ord: (entity % 16) as u8 }
@@ -1423,48 +1079,6 @@ mod tests {
         d
     }
 
-    /// Writes one sorted run of `entries` and returns its path.
-    fn write_run(dir: &Path, name: &str, entries: &mut [(Vec<u8>, Posting)]) -> PathBuf {
-        entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.entity.cmp(&b.1.entity)));
-        let path = dir.join(name);
-        let mut w = BufWriter::new(File::create(&path).unwrap());
-        for (k, p) in entries.iter() {
-            write_entry(&mut w, k, p.entity, p.imp_q, entry_flags(p), p.ord).unwrap();
-        }
-        w.flush().unwrap();
-        path
-    }
-
-    fn read_all(files: &[PathBuf]) -> Vec<(Vec<u8>, Posting)> {
-        let mut m = Merge::open(files).unwrap();
-        let (mut key, mut p) = (Vec::new(), posting(0, 0, false, 0));
-        let mut out = Vec::new();
-        while m.next(&mut key, &mut p).unwrap() {
-            out.push((key.clone(), p));
-        }
-        out
-    }
-
-    /// `n` runs of random entries; returns the run files and every entry in merge order.
-    fn random_runs(dir: &Path, n: usize, rng: &mut Rng) -> (Vec<PathBuf>, Vec<(Vec<u8>, Posting)>) {
-        let mut all = Vec::new();
-        let mut files = Vec::new();
-        let mut entity = 0u32;
-        for r in 0..n {
-            let mut run: Vec<(Vec<u8>, Posting)> = (0..(1 + rng.next() % 40))
-                .map(|_| {
-                    entity += 1;
-                    let key = format!("k{}", rng.next() % 50).into_bytes();
-                    (key, posting(entity, (rng.next() % 200) as u8, rng.next().is_multiple_of(2), (rng.next() % 6) as u8))
-                })
-                .collect();
-            files.push(write_run(dir, &format!("t-{r}.run"), &mut run));
-            all.extend(run);
-        }
-        all.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.entity.cmp(&b.1.entity)));
-        (files, all)
-    }
-
     #[test]
     fn bits_set_and_get_across_words() {
         let mut b = Bits::new(130);
@@ -1475,123 +1089,35 @@ mod tests {
         assert_eq!(set, vec![0, 63, 64, 129]);
     }
 
-    #[test]
-    fn map_vec_holds_what_was_pushed() {
-        let mut v: MapVec<Item> = MapVec::with_capacity(4).unwrap();
-        let item = |entity| Item { off: 0, len: 0, flags: 0, ord: 0, entity, imp: 0 };
-        v.push(item(3));
-        v.extend_from_slice(&[item(1), item(2)]);
-        v.as_mut_slice().sort_unstable_by_key(|it| it.entity);
-        assert_eq!(v.as_slice().iter().map(|it| it.entity).collect::<Vec<_>>(), vec![1, 2, 3]);
-        v.clear();
-        assert!(v.is_empty());
-        assert_eq!(v.capacity(), 4);
+    fn run_bytes(p: &Posting) -> [u8; Posting::BYTES] {
+        let mut b = [0; Posting::BYTES];
+        p.put(&mut b);
+        b
     }
 
     #[test]
-    #[should_panic(expected = "MapVec full")]
-    fn map_vec_refuses_to_grow() {
-        let mut v: MapVec<u8> = MapVec::with_capacity(2).unwrap();
-        v.extend_from_slice(b"abc");
-    }
-
-    #[test]
-    fn run_budget_refuses_less_than_the_longest_key_needs() {
-        for (mem_mb, threads, want) in
-            [(0, 1, None), (1, 16, None), (1, 9, Some((1 << 20) / 9)), (DEFAULT_RUN_BUDGET_MB, 1, Some(DEFAULT_RUN_BUDGET_MB << 20))]
-        {
-            assert_eq!(run_budget(mem_mb, threads).ok(), want, "{mem_mb} MiB, {threads} threads");
-        }
-        assert_eq!(run_budget(0, 1), Err(format!("Sort budget too small: 0 bytes per thread, at least {MIN_RUN_BUDGET_BYTES}")));
-    }
-
-    #[test]
-    fn runs_hold_the_longest_key_at_the_least_budget() {
-        let dir = tmp_dir("runs-longest");
-        let longest = vec![b'z'; MAX_KEY_BYTES];
-        let mut sut = Runs::new(MIN_RUN_BUDGET_BYTES, &dir, "t".into()).unwrap();
-        sut.push(b"a", posting(1, 0, false, 0)).unwrap();
-        sut.push(&longest, posting(2, 0, false, 0)).unwrap();
-        sut.push(b"b", posting(3, 0, false, 0)).unwrap();
-        let (files, _) = sut.finish().unwrap();
-        let keys: Vec<Vec<u8>> = read_all(&files).into_iter().map(|(k, _)| k).collect();
-        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), longest]);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn run_keys_stay_addressable_at_any_budget() {
-        // An entry addresses its key by a u32 offset into the run's arena.
-        for mem_mb in [DEFAULT_RUN_BUDGET_MB, 6_826, 6_827, 6_828, 1 << 20] {
-            let budget = run_budget(mem_mb, 1).unwrap();
-            let (arena, items) = run_capacities(budget, MAX_RUN_ARENA_BYTES);
-            assert!(arena <= u32::MAX as usize, "{mem_mb} MiB: {arena} key bytes");
-            assert_eq!(items, (budget - budget * RUN_ARENA_PERCENT / 100) / std::mem::size_of::<Item>());
+    fn a_posting_reads_back_from_its_run_bytes() {
+        let last = Posting { entity: u32::MAX, imp_q: u8::MAX, partial: true, class: 5, ord: MAX_NAME_ORD };
+        for p in [posting(0, 0, false, 0), posting(7, 9, true, 3), last] {
+            assert_eq!(Posting::get(&run_bytes(&p)), p);
         }
     }
 
     #[test]
-    fn runs_spill_at_the_arena_limit() {
-        let dir = tmp_dir("runs-arena-limit");
-        let mut sut = Runs::with_arena_limit(1 << 20, 64, &dir, "t".into()).unwrap();
-        let keys: Vec<Vec<u8>> = (0..40).rev().map(|k: u32| format!("key{k:03}").into_bytes()).collect();
-        for (entity, key) in keys.iter().enumerate() {
-            sut.push(key, posting(entity as u32, 0, false, 0)).unwrap();
+    fn postings_sort_by_entity_and_tell_apart_any_two_written_differently() {
+        let mut postings = Vec::new();
+        for entity in [3, 4] {
+            for (imp_q, partial, class, ord) in [(0, false, 0, 0), (9, false, 0, 0), (0, true, 0, 0), (0, false, 5, 0), (0, false, 0, 2)] {
+                postings.push(Posting { entity, imp_q, partial, class, ord });
+            }
         }
-        let (files, _) = sut.finish().unwrap();
-        // 6-byte keys, 10 to a 64-byte arena.
-        assert_eq!(files.len(), 4);
-        let mut sorted = keys.clone();
-        sorted.sort();
-        assert_eq!(read_all(&files).into_iter().map(|(k, _)| k).collect::<Vec<_>>(), sorted);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn runs_refuse_a_key_they_cannot_hold() {
-        for (budget, key_len) in [(0, 1), (MIN_RUN_BUDGET_BYTES - 1, MAX_KEY_BYTES), (2 * MIN_RUN_BUDGET_BYTES, MAX_KEY_BYTES + 1)] {
-            let dir = tmp_dir(&format!("runs-refuse-{budget}"));
-            let mut sut = Runs::new(budget, &dir, "t".into()).unwrap();
-            let err = sut.push(&vec![b'z'; key_len], posting(1, 0, false, 0)).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "budget {budget}, key {key_len}");
-            let (files, _) = sut.finish().unwrap();
-            assert!(files.is_empty());
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-    }
-
-    #[test]
-    fn merge_streams_runs_in_key_then_entity_order() {
-        let dir = tmp_dir("merge");
-        let (files, all) = random_runs(&dir, 5, &mut Rng(7));
-        assert_eq!(read_all(&files), all);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reduce_runs_merges_only_the_runs_over_the_fan_in() {
-        let dir = tmp_dir("reduce-excess");
-        let (files, all) = random_runs(&dir, MERGE_FAN_IN + 1, &mut Rng(11));
-        let last_two: u64 = files[MERGE_FAN_IN - 1..].iter().map(|f| std::fs::metadata(f).unwrap().len()).sum();
-        let (left, rewritten) = reduce_runs(RunFiles(files.clone()), &dir, "t").unwrap();
-        assert_eq!(left.len(), MERGE_FAN_IN);
-        assert_eq!(left[..MERGE_FAN_IN - 1], files[..MERGE_FAN_IN - 1]);
-        assert_eq!(rewritten, last_two);
-        assert!(!files[MERGE_FAN_IN].exists());
-        assert_eq!(read_all(&left), all);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reduce_runs_takes_passes_until_the_fan_in_is_left() {
-        for n in [MERGE_FAN_IN, 3 * MERGE_FAN_IN + 5, MERGE_FAN_IN * MERGE_FAN_IN + 3] {
-            let dir = tmp_dir(&format!("reduce-{n}"));
-            let (files, all) = random_runs(&dir, n, &mut Rng(n as u64));
-            let (left, rewritten) = reduce_runs(RunFiles(files), &dir, "t").unwrap();
-            assert!(left.len() <= MERGE_FAN_IN);
-            assert_eq!(rewritten == 0, n <= MERGE_FAN_IN);
-            assert_eq!(read_all(&left), all);
-            let _ = std::fs::remove_dir_all(&dir);
+        for a in &postings {
+            for b in &postings {
+                assert_eq!(a.order(b) == std::cmp::Ordering::Equal, run_bytes(a) == run_bytes(b), "{a:?} {b:?}");
+                if a.entity != b.entity {
+                    assert_eq!(a.order(b), a.entity.cmp(&b.entity), "{a:?} {b:?}");
+                }
+            }
         }
     }
 
@@ -1715,16 +1241,16 @@ mod tests {
     /// list bytes (`.post`).
     fn merge_one_key(n: u32) -> (usize, usize) {
         let dir = tmp_dir(&format!("merge-heap-{n}"));
-        let mut run: Vec<(Vec<u8>, Posting)> =
-            (0..n).map(|entity| (b"church".to_vec(), Posting { entity, imp_q: 100, partial: false, class: 0, ord: 0 })).collect();
-        let files = RunFiles(vec![write_run(&dir, "k.run", &mut run)]);
+        let mut sort = ExternalSort::new(DEFAULT_RUN_BUDGET_MB << 20, &dir, "k".into()).unwrap();
+        for entity in 0..n {
+            sort.push(b"church", Posting { entity, imp_q: 100, partial: false, class: 0, ord: 0 }).unwrap();
+        }
         let runs = KeyRuns {
             name: "poi".into(),
-            files,
+            runs: sort.finish().unwrap(),
             st: Stats::default(),
             ents: 0,
             entries: 0,
-            spilled: 0,
             t_src: Duration::ZERO,
             t_keys: Duration::ZERO,
         };
@@ -1754,23 +1280,6 @@ mod tests {
         let copy = n as usize * std::mem::size_of::<Posting>();
         let growth = peak - base;
         assert!(growth < 2 * copy + post, "heap grew {growth} bytes: postings {copy} bytes, encoded list {post} bytes");
-    }
-
-    #[test]
-    fn runs_refuse_keys_over_the_length_limit() {
-        let dir = tmp_dir("long-key");
-        let mut runs = Runs::new(1 << 20, &dir, "t".into()).unwrap();
-        let p = posting(1, 9, false, 0);
-        let longest = vec![b'a'; u16::MAX as usize];
-        assert!(runs.push(&longest, p).is_ok());
-
-        // One byte over: ASCII, and a two-byte character across the limit.
-        for key in [vec![b'a'; u16::MAX as usize + 1], [&longest[1..], "ж".as_bytes()].concat()] {
-            assert_eq!(runs.push(&key, p).map_err(|e| e.kind()), Err(std::io::ErrorKind::InvalidInput), "{} bytes", key.len());
-        }
-        runs.spill().unwrap();
-        assert_eq!(read_all(&runs.files), [(longest, p)]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1948,31 +1457,6 @@ mod tests {
         assert_eq!(k, b"a");
         assert_eq!(hits.len(), PREFIX_TABLE_TOP);
     }
-    #[test]
-    fn run_reader_tells_the_end_from_a_cut_record() {
-        // u16 key length, key, u32 entity, importance, flags, ordinal (Runs::spill).
-        let record = [&2u16.to_le_bytes()[..], b"ab", &7u32.to_le_bytes(), &[9, 3, 1]].concat();
-        let path = std::env::temp_dir().join(format!("run-cut-{}.run", std::process::id()));
-        let read_all = |bytes: &[u8]| -> std::io::Result<Vec<u32>> {
-            std::fs::write(&path, bytes).unwrap();
-            let mut r = RunReader { r: BufReader::new(File::open(&path).unwrap()) };
-            let mut h = Head { key: Vec::new(), p: Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 }, run: 0 };
-            let mut entities = Vec::new();
-            while r.read_into(&mut h)? {
-                entities.push(h.p.entity);
-            }
-            Ok(entities)
-        };
-        assert!(read_all(&[]).unwrap().is_empty());
-        assert_eq!(read_all(&record).unwrap(), vec![7u32]);
-        // The next record cut in its length, its key and its posting.
-        for cut in [1, 3, record.len() - 1] {
-            let bytes = [&record[..], &record[..cut]].concat();
-            assert_eq!(read_all(&bytes).map_err(|e| e.kind()), Err(std::io::ErrorKind::UnexpectedEof), "cut at {cut}");
-        }
-        std::fs::remove_file(&path).unwrap();
-    }
-
     #[test]
     fn prefix_reader_tells_the_end_from_a_cut_entry() {
         // u16 prefix length, prefix, u32 blob length, blob (flush_slot).

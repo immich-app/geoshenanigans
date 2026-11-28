@@ -16,6 +16,7 @@ pub mod profile;
 pub mod query;
 pub mod reader;
 pub mod result;
+pub mod sort;
 pub mod tags;
 pub mod text;
 pub mod varint;
