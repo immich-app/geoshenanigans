@@ -1,6 +1,6 @@
 use crate::{
     constants::*,
-    index::{entities::*, invalid},
+    index::{areas::AreaLabel, entities::*, invalid},
     model::PLACE_NODE_TYPES,
     tags::TagBundle,
 };
@@ -12,7 +12,9 @@ pub(crate) fn side(path: &Path, count: u32) -> io::Result<Option<SideBlocks>> {
         return Ok(None);
     }
     let name = path.to_str().ok_or_else(|| invalid("non UTF-8 dataset path"))?;
-    let rows = SideBlocks::open(query_server::mmap_file(name).map_err(invalid)?, name).map_err(invalid)?;
+    let bytes = query_server::mmap_file(name).map_err(invalid)?;
+    bytes.advise_in_order(true);
+    let rows = SideBlocks::open(bytes, name).map_err(invalid)?;
     if rows.count() != count {
         return Err(invalid(format!("{} has {} rows, expected {count}", path.display(), rows.count())));
     }
@@ -128,14 +130,22 @@ pub struct CoreRecords<'a> {
 }
 impl<'a> CoreRecords<'a> {
     pub fn open(geo: &'a Index, set: &Path) -> io::Result<Self> {
-        Self::with_areas(geo, set, None)
+        Self::with_areas(geo, set, None, false)
+    }
+    pub(super) fn for_build(geo: &'a Index, set: &Path) -> io::Result<Self> {
+        Self::with_areas(geo, set, None, true)
     }
     /// A resolver for the same generation as the index's entities and outline bounds.
     pub fn for_index(geo: &'a Index, set: &Path, core: &'a crate::index::CoreIndex) -> io::Result<Self> {
-        Self::with_areas(geo, set, (core.areas.profile == crate::profile::Profile::Full).then_some(&core.areas))
+        Self::with_areas(geo, set, (core.areas.profile == crate::profile::Profile::Full).then_some(&core.areas), false)
     }
 
-    fn with_areas(geo: &'a Index, set: &Path, areas: Option<&'a crate::index::areas::AreaRanges>) -> io::Result<Self> {
+    fn with_areas(
+        geo: &'a Index,
+        set: &Path,
+        areas: Option<&'a crate::index::areas::AreaRanges>,
+        sequential: bool,
+    ) -> io::Result<Self> {
         let sizes =
             [geo.place_node_count(), geo.admin_polygon_count(), geo.poi_records.as_ref().map_or(0, |p| p.len())];
         let mut osm = [None, None, None];
@@ -144,7 +154,13 @@ impl<'a> CoreRecords<'a> {
                 *map = OsmRows::open(&set.join(file), n)?;
             }
         }
-        Ok(Self { geo, files: crate::dataset::SearchFiles::open(set, geo).map_err(invalid)?, sizes, areas, osm })
+        Ok(Self {
+            geo,
+            files: crate::dataset::SearchFiles::with_access(set, geo, sequential).map_err(invalid)?,
+            sizes,
+            areas,
+            osm,
+        })
     }
     pub(super) fn row(&self, e: EntityRef) -> Option<SourceRow> {
         let i = e.record();
@@ -176,14 +192,53 @@ impl<'a> CoreRecords<'a> {
             _ => unreachable!(),
         }
     }
+    pub(super) fn string_directory_bytes(&self) -> usize {
+        self.files.string_directory_bytes()
+            + self.geo.strings.tiers.iter().flatten().map(|tier| tier.directory_bytes()).sum::<usize>()
+    }
+
+    pub(super) fn bundle_id(&self, e: EntityRef) -> Option<u32> {
+        self.files.bundle_id(Self::kind(e), e.record())
+    }
+    pub(super) fn bundle_at(&self, poi: bool, offset: u32) -> Option<TagBundle<'_>> {
+        self.files.bundle_at(poi, offset)
+    }
     pub(super) fn tags(&self, e: EntityRef) -> Option<TagBundle<'_>> {
         self.files.bundle(Self::kind(e), e.record())
     }
     pub(super) fn importance(&self, e: EntityRef, row: SourceRow, cc: &str) -> u32 {
-        self.files.wiki_importance(Self::kind(e), e.record()).unwrap_or_else(|| {
-            let rank = row.ranks(cc).0;
-            ((DEFAULT_IMPORTANCE_BASE - f64::from(rank) / IMPORTANCE_RANK_DIVISOR) / IMP_UNIT).round() as u32
-        })
+        self.files.wiki_importance(Self::kind(e), e.record()).unwrap_or_else(|| Self::default_importance(row, cc))
+    }
+    fn default_importance(row: SourceRow, cc: &str) -> u32 {
+        let rank = row.ranks(cc).0;
+        ((DEFAULT_IMPORTANCE_BASE - f64::from(rank) / IMPORTANCE_RANK_DIVISOR) / IMP_UNIT).round() as u32
+    }
+    pub(crate) fn candidate_importance(&self, e: EntityRef) -> Option<u32> {
+        let row = self.row(e)?;
+        let label = self.area_label(e);
+        let point = label.map(|label| label.point).or_else(|| row.point(self.geo))?;
+        if self.geo.get_string(row.name_id()).is_empty() {
+            return None;
+        }
+        if let Some(wiki) = self.files.wiki_importance(Self::kind(e), e.record()) {
+            return Some(wiki);
+        }
+        let cc = match row {
+            SourceRow::Area(_) => label
+                .map(|label| label.country)
+                .unwrap_or_else(|| row.country().or_else(|| self.geo.find_admin(point.0, point.1).country_code)),
+            _ => None,
+        };
+        let cc = cc.unwrap_or_default().map(|b| b.to_ascii_uppercase());
+        Some(Self::default_importance(row, std::str::from_utf8(&cc).unwrap_or("")))
+    }
+
+    fn area_label(&self, e: EntityRef) -> Option<AreaLabel> {
+        if e.kind() == EntityKind::Area {
+            self.areas?.label(e.record())
+        } else {
+            None
+        }
     }
 }
 impl Entities for CoreRecords<'_> {
@@ -192,25 +247,27 @@ impl Entities for CoreRecords<'_> {
     }
     fn read_in_chain(&self, e: EntityRef, outer_slot: Option<u32>) -> Option<EntityRecord<'_>> {
         let row = self.row(e)?;
-        let point = row.point(self.geo)?;
+        let label = self.area_label(e);
+        let point = label.map(|label| label.point).or_else(|| row.point(self.geo))?;
         // A point chain starts with its containing country. An area's parent chain can
         // cross a border away from its label point, and a closed country way can have no rank.
-        let mut country_code = row
-            .country()
-            .or_else(|| {
-                if matches!(row, SourceRow::Area(_)) {
-                    return None;
-                }
-                let slot = outer_slot?;
-                let poly = self.geo.admin_polygon(slot)?;
-                if poly.admin_level != COUNTRY_LEVEL
-                    || query_server::polygon_field(&query_server::RankedPoly::of(slot, poly)) != Some("country")
-                {
-                    return None;
-                }
-                query_server::country_code_bytes(poly.country_code)
-            })
-            .or_else(|| self.geo.find_admin(point.0, point.1).country_code);
+        let mut country_code = label.map(|label| label.country).unwrap_or_else(|| {
+            row.country()
+                .or_else(|| {
+                    if matches!(row, SourceRow::Area(_)) {
+                        return None;
+                    }
+                    let slot = outer_slot?;
+                    let poly = self.geo.admin_polygon(slot)?;
+                    if poly.admin_level != COUNTRY_LEVEL
+                        || query_server::polygon_field(&query_server::RankedPoly::of(slot, poly)) != Some("country")
+                    {
+                        return None;
+                    }
+                    query_server::country_code_bytes(poly.country_code)
+                })
+                .or_else(|| self.geo.find_admin(point.0, point.1).country_code)
+        });
         if let Some(cc) = &mut country_code {
             cc.make_ascii_lowercase();
         }

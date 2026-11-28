@@ -122,6 +122,11 @@ impl Tier {
         Ok(Tier { file, raw_size, body, raw_starts, coded_starts, jump })
     }
 
+    /// Heap bytes retained by the offset and jump tables, separate from the mapped file.
+    pub fn directory_bytes(&self) -> usize {
+        (self.raw_starts.capacity() + self.coded_starts.capacity() + self.jump.capacity()) * size_of::<u32>()
+    }
+
     /// The pool's bytes.
     pub fn len(&self) -> u32 {
         self.raw_size
@@ -325,6 +330,7 @@ mod tests {
         assert_eq!(encode(&pool), file);
         let t = Tier::open(FileBytes::Owned(file)).unwrap();
         assert_eq!(t.len() as usize, pool.len());
+        assert_eq!(t.directory_bytes(), 4 * size_of::<u32>());
         for off in 0..pool.len() + 3 {
             assert_eq!(t.get(off as u32), raw_get(&pool, off), "offset {off}");
         }

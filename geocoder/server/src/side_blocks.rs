@@ -34,6 +34,37 @@ pub struct SideBlocks {
     tags: bool,
 }
 
+enum Base<'a> {
+    Frame(u32),
+    Dictionary(&'a [u8]),
+}
+struct Block<'a> {
+    base: Base<'a>,
+    fields: &'a [u8],
+    width: u32,
+    presence: Option<u64>,
+    tags: bool,
+}
+impl Block<'_> {
+    fn get(&self, row: usize) -> Option<u32> {
+        let row = if let Some(mask) = self.presence {
+            let bit = 1u64 << row;
+            if mask & bit == 0 {
+                return None;
+            }
+            (mask & (bit - 1)).count_ones() as usize
+        } else {
+            row
+        };
+        let value = bits_at(self.fields, row * self.width as usize, self.width)?;
+        match &self.base {
+            Base::Frame(base) => base.checked_add(value),
+            Base::Dictionary(entries) => u32_at(entries, (value as usize).checked_mul(size_of::<u32>())?),
+        }
+        .filter(|&value| !self.tags || value != crate::NO_DATA)
+    }
+}
+
 impl SideBlocks {
     /// The file `name` of a dir, mapped; an error that names it for one no builder writes (a bad
     /// footer, a table past the file, blocks of a size no blocks of that many values have), which
@@ -79,8 +110,23 @@ impl SideBlocks {
         if id >= self.count {
             return None;
         }
+        self.block(id as usize / BLOCK_VALUES)?.get(id as usize % BLOCK_VALUES)
+    }
+
+    /// Values in record order. A damaged value occupies its original row.
+    pub fn values(&self) -> impl Iterator<Item = Option<u32>> + '_ {
+        let mut current = None;
+        (0..self.count as usize).map(move |row| {
+            let j = row % BLOCK_VALUES;
+            if j == 0 {
+                current = self.block(row / BLOCK_VALUES);
+            }
+            current.as_ref()?.get(j)
+        })
+    }
+
+    fn block(&self, b: usize) -> Option<Block<'_>> {
         let file = self.bytes.as_slice();
-        let (b, j) = (id as usize / BLOCK_VALUES, id as usize % BLOCK_VALUES);
         let entry = self.table_at + b * TABLE_ENTRY_BYTES;
         let at = u32_at(file, entry)? as usize;
         // The block's values, and where it ends: BLOCK_VALUES and the next block's start, or
@@ -93,54 +139,41 @@ impl SideBlocks {
         }
         // The blocks end where the table starts: a block is none of the table's bytes.
         let mut block = file.get(..self.table_at)?.get(at..end)?;
-        let (mut at, mut c, mut j) = (at, c, j);
-        if self.tags && *block.first()? == MODE_PRESENT {
+        let (mut at, mut c) = (at, c);
+        let presence = if self.tags && *block.first()? == MODE_PRESENT {
             let mask = u64::from_le_bytes(*block.get(1..)?.first_chunk::<8>()?);
-            let below = (1u64 << j) - 1;
             let present = mask.count_ones() as usize;
-            if present >= c || (c < BLOCK_VALUES && mask >> c != 0) || mask & (1u64 << j) == 0 {
+            if present == 0 || present >= c || (c < BLOCK_VALUES && mask >> c != 0) {
                 return None;
             }
-            j = (mask & below).count_ones() as usize;
             c = present;
             at += PRESENCE_BYTES;
             block = block.get(PRESENCE_BYTES..)?;
-        }
-        // Field j of the block's c fields of w bits, which start `head` bytes into it and end
-        // where it does: one 8-byte load, which the bytes after the block (blocks, the table,
-        // the footer) leave room for. None for a block of other bytes than its head and its
-        // fields take, and for a width past 32 bits.
-        let field = |head: usize, w: u32| {
-            if block.len() != head + (c * w as usize).div_ceil(8) {
-                return None;
-            }
-            bits_at(file.get(at + head..)?, j * w as usize, w)
+            Some(mask)
+        } else {
+            None
         };
-        let value = match *block.first()? {
-            MODE_FOR => {
-                let w = *block.get(FOR_HEAD_BYTES - 1)? as u32;
-                u32_at(block, 1)?.checked_add(field(FOR_HEAD_BYTES, w)?)
-            }
+        let (base, head, width) = match *block.first()? {
+            MODE_FOR => (Base::Frame(u32_at(block, 1)?), FOR_HEAD_BYTES, *block.get(FOR_HEAD_BYTES - 1)? as u32),
             MODE_DICTIONARY => {
-                // 1 to c entries, and indexes of the bits the last entry's takes.
                 let k = *block.get(1)? as usize;
                 if k == 0 || k > c {
                     return None;
                 }
-                let head = 3 + 4 * k;
-                let w = *block.get(head - 1)? as u32;
-                if w != bit_length(k as u32 - 1) {
+                let head = 3 + size_of::<u32>() * k;
+                let width = *block.get(head - 1)? as u32;
+                if width != bit_length(k as u32 - 1) {
                     return None;
                 }
-                let x = field(head, w)? as usize;
-                if x >= k {
-                    return None;
-                }
-                u32_at(block, 2 + 4 * x)
+                (Base::Dictionary(&block[2..head - 1]), head, width)
             }
-            _ => None,
-        }?;
-        (!self.tags || value != crate::NO_DATA).then_some(value)
+            _ => return None,
+        };
+        if width > u32::BITS || block.len() != head + (c * width as usize).div_ceil(8) {
+            return None;
+        }
+        // bits_at takes an eight-byte load. Following blocks and the footer supply the padding.
+        Some(Block { base, fields: file.get(at + head..)?, width, presence, tags: self.tags })
     }
 }
 

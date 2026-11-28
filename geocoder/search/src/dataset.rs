@@ -41,36 +41,57 @@ pub struct SearchFiles {
 
 impl SearchFiles {
     pub fn open(dir: &Path, geo: &Index) -> Result<Self, String> {
+        Self::with_access(dir, geo, false)
+    }
+
+    pub(crate) fn with_access(dir: &Path, geo: &Index, sequential: bool) -> Result<Self, String> {
         let mut files = Self::default();
-        let counts = [geo.place_node_count(), geo.admin_polygon_count(), geo.poi_records.as_ref().map_or(0, |p| p.len())];
-        let optional = |name: &str| {
+        let counts =
+            [geo.place_node_count(), geo.admin_polygon_count(), geo.poi_records.as_ref().map_or(0, |p| p.len())];
+        let optional = |name: &str, in_order: bool| {
             let path = dir.join(name);
-            if !path.try_exists().map_err(|e| e.to_string())? { return Ok(None); }
-            query_server::mmap_file(path.to_str().ok_or("invalid dataset path")?).map(Some)
+            if !path.try_exists().map_err(|e| e.to_string())? {
+                return Ok(None);
+            }
+            let bytes = query_server::mmap_file(path.to_str().ok_or("invalid dataset path")?)?;
+            if in_order {
+                bytes.advise_in_order(true);
+            }
+            Ok::<_, String>(Some(bytes))
         };
         use query_server::side_blocks::SideBlocks;
         for (i, name) in [PLACE_TAGS_FILE, ADMIN_TAGS_FILE, POI_TAGS_FILE].into_iter().enumerate() {
-            files.tags[i] = optional(name)?.map(|bytes| SideBlocks::open_tags(bytes, name)).transpose()?;
             let wiki = IMPORTANCE_FILES[i];
-            files.wiki[i] = optional(wiki)?.map(|bytes| SideBlocks::open(bytes, wiki)).transpose()?;
-            for (name, column) in [(name, &files.tags[i]), (wiki, &files.wiki[i])] {
+            files.tags[i] = optional(name, sequential)?.map(|bytes| SideBlocks::open_tags(bytes, name)).transpose()?;
+            files.wiki[i] = optional(wiki, sequential)?.map(|bytes| SideBlocks::open(bytes, wiki)).transpose()?;
+            for (file, column) in [(name, &files.tags[i]), (wiki, &files.wiki[i])] {
                 if let Some(side) = column {
-                    if side.count() != counts[i] { return Err(format!("{name} has {} rows, expected {}", side.count(), counts[i])); }
+                    if side.count() != counts[i] { return Err(format!("{file} has {} rows, expected {}", side.count(), counts[i])); }
                 }
             }
         }
         for (i, name) in TAG_TIERS.into_iter().enumerate() {
-            files.tiers[i] = optional(name)?.map(query_server::strings::Tier::open).transpose()?;
+            files.tiers[i] = optional(name, false)?.map(query_server::strings::Tier::open).transpose()?;
         }
         Ok(files)
     }
 
     /// Place rows, admin slots and POI rows respectively.
     pub fn bundle(&self, kind: crate::model::Kind, row: u32) -> Option<crate::tags::TagBundle<'_>> {
-        let k = Self::column(kind);
-        let offset = self.tags[k].as_ref()?.get(row)?;
-        let tier = self.tiers[usize::from(k == 2)].as_ref()?;
+        self.bundle_at(Self::column(kind) == 2, self.bundle_id(kind, row)?)
+    }
+
+    pub(crate) fn bundle_at(&self, poi: bool, offset: u32) -> Option<crate::tags::TagBundle<'_>> {
+        let tier = self.tiers[usize::from(poi)].as_ref()?;
         crate::tags::TagBundle::parse(tier.get(offset))
+    }
+
+    pub(crate) fn string_directory_bytes(&self) -> usize {
+        self.tiers.iter().flatten().map(|tier| tier.directory_bytes()).sum()
+    }
+
+    pub(crate) fn bundle_id(&self, kind: crate::model::Kind, row: u32) -> Option<u32> {
+        self.tags[Self::column(kind)].as_ref()?.get(row).filter(|&v| v != query_server::NO_DATA)
     }
 
     pub fn wiki_importance(&self, kind: crate::model::Kind, row: u32) -> Option<u32> {

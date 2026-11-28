@@ -2646,17 +2646,35 @@ impl Index {
     /// The centroid of the area `poly` as Nominatim has it: the place node its boundary links
     /// where that lies inside it (linked_centre), else its point on surface (get_center_point).
     pub fn area_centre(&self, poly: &AdminPolygon) -> Option<(f64, f64)> {
-        self.linked_centre(poly).or_else(|| self.admin_geometry.point_on_surface_memo(poly))
+        self.area_centre_with(poly, &self.linked_centres)
+    }
+
+    /// A sequential consumer can release its label table after the polygon pass.
+    pub fn area_centre_with(
+        &self,
+        poly: &AdminPolygon,
+        labels: &std::sync::OnceLock<Vec<(u64, f32, f32)>>,
+    ) -> Option<(f64, f64)> {
+        self.linked_centre_with(poly, labels).or_else(|| self.admin_geometry.point_on_surface_memo(poly))
     }
 
     /// The place node the boundary of `poly` links (linked_centres) where it lies inside `poly`,
     /// which Nominatim takes for the boundary's centroid (placex_triggers.sql:1121-1125). A
     /// namesake boundary elsewhere, of the same key, links none inside it.
     fn linked_centre(&self, poly: &AdminPolygon) -> Option<(f64, f64)> {
+        self.linked_centre_with(poly, &self.linked_centres)
+    }
+
+    fn linked_centre_with(
+        &self,
+        poly: &AdminPolygon,
+        labels: &std::sync::OnceLock<Vec<(u64, f32, f32)>>,
+    ) -> Option<(f64, f64)> {
         let key = boundary_key(poly);
-        let centres = self.linked_centres.get_or_init(|| self.read_linked_centres());
+        let centres = self.linked_centres.get().unwrap_or_else(|| labels.get_or_init(|| self.read_linked_centres()));
         let geometry = &self.admin_geometry;
-        centres[centres.partition_point(|&(k, _, _)| k < key)..].iter()
+        centres[centres.partition_point(|&(k, _, _)| k < key)..]
+            .iter()
             .take_while(|&&(k, _, _)| k == key)
             .map(|&(_, lat, lng)| (f64::from(lat), f64::from(lng)))
             .find(|&(lat, lng)| geometry.contains_once(poly, AdminPoint::new(lat, lng)))

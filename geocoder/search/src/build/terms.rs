@@ -1,14 +1,20 @@
-use super::fst_writer::FstWriter;
 use super::{
     counts::Coverage,
+    dictionary::TermBlocks,
+    fst_writer::FstWriter,
     sources::{CoreRecords, SourceRow},
     write::{invalid_size, writer},
     BuildOpts,
 };
 use crate::{
     constants::*,
-    index::{areas::AreaRanges, entities::EntityRef, invalid, map, number, terms::TermKind},
-    sort::{ExternalSort, SortedRuns},
+    index::{
+        areas::AreaRanges,
+        entities::{EntityKind, EntityRef},
+        invalid, map, number,
+        terms::TermKind,
+    },
+    sort::{ExternalSort, SortRecord, SortedRuns},
     text::{
         normalize::{name_normalized, transliterated},
         sanitize::Place,
@@ -101,20 +107,86 @@ impl SpellingCache {
     }
 }
 
-fn name_keys(
-    records: &CoreRecords,
-    e: EntityRef,
-    row: SourceRow,
-    country: &str,
-    cache: &mut SpellingCache,
-) -> Vec<Vec<u8>> {
-    let bundle = records.tags(e);
-    let name = records.geo.get_string(row.name_id());
-    let own = if matches!(row, SourceRow::Area(_)) {
-        records.geo.admin_own_name(e.record()).map(|id| records.geo.get_string(id))
-    } else {
-        None
-    };
+#[derive(Copy, Clone, Hash, PartialEq, Eq)]
+struct NameInput {
+    name: u32,
+    own: Option<u32>,
+    bundle: Option<u32>,
+    poi: bool,
+    country_term: bool,
+    country: [u8; 2],
+}
+
+impl NameInput {
+    // Keep a window of display names hot while walking its tag bundles in offset order.
+    fn sort_row(self, entity: EntityRef, id: u32, importance: u32) -> [u32; 8] {
+        let country = u32::from(u16::from_be_bytes(self.country));
+        let scope = country | (u32::from(self.country_term) << u16::BITS);
+        [
+            self.name / NAME_WINDOW_BYTES,
+            self.bundle.unwrap_or(query_server::NO_DATA),
+            self.name,
+            self.own.unwrap_or(query_server::NO_DATA),
+            scope,
+            entity.packed(),
+            id,
+            importance,
+        ]
+    }
+
+    fn from_row([_, bundle, name, own, scope, packed, id, importance]: [u32; 8]) -> (Self, EntityRef, u32, u32) {
+        let entity = EntityRef::unpack(packed).unwrap();
+        let input = Self {
+            name,
+            own: (own != query_server::NO_DATA).then_some(own),
+            bundle: (bundle != query_server::NO_DATA).then_some(bundle),
+            poi: entity.kind() == EntityKind::Poi,
+            country_term: scope >> u16::BITS != 0,
+            country: (scope as u16).to_be_bytes(),
+        };
+        (input, entity, id, importance)
+    }
+}
+
+/// Bundle and display-name offsets identify every language tag before opening a string page.
+struct KeyCache {
+    slots: Vec<Option<(NameInput, Vec<Vec<u8>>)>>,
+}
+impl KeyCache {
+    fn new(n: usize) -> Self {
+        Self { slots: vec![None; n] }
+    }
+
+    fn with<R>(
+        &mut self,
+        input: NameInput,
+        make: impl FnOnce() -> Vec<Vec<u8>>,
+        use_keys: impl FnOnce(&[Vec<u8>]) -> R,
+    ) -> R {
+        let mut hash = DefaultHasher::new();
+        input.hash(&mut hash);
+        let Some(i) = (hash.finish() as usize).checked_rem(self.slots.len()) else {
+            return use_keys(&make());
+        };
+        if let Some((_, keys)) = self.slots[i].as_ref().filter(|(key, _)| *key == input) {
+            return use_keys(keys);
+        }
+        let keys = make();
+        let result = use_keys(&keys);
+        let bytes = size_of_val(&self.slots[i])
+            + keys.capacity() * size_of::<Vec<u8>>()
+            + keys.iter().map(Vec::capacity).sum::<usize>();
+        if bytes <= SPELLING_SLOT_BYTES {
+            self.slots[i] = Some((input, keys));
+        }
+        result
+    }
+}
+
+fn name_keys(records: &CoreRecords, input: NameInput, country: &str, cache: &mut SpellingCache) -> Vec<Vec<u8>> {
+    let bundle = input.bundle.and_then(|offset| records.bundle_at(input.poi, offset));
+    let name = records.geo.get_string(input.name);
+    let own = input.own.map(|id| records.geo.get_string(id));
     let mut tags: Vec<_> = bundle.iter().flat_map(|b| b.iter()).collect();
     for s in std::iter::once(&*name).chain(own.as_deref()) {
         if !s.is_empty() && !tags.iter().any(|&(_, v)| v == s) {
@@ -129,7 +201,7 @@ fn name_keys(
                 keys.push(key(TermKind::Partial, w, w, w, None));
             }
         });
-        if row.is_country() && !country.is_empty() {
+        if input.country_term && !country.is_empty() {
             let word = name_normalized(&n.name);
             let token = transliterated(&word);
             if !word.is_empty() && !token.is_empty() {
@@ -137,7 +209,7 @@ fn name_keys(
             }
         }
     }
-    if row.is_country() && !country.is_empty() {
+    if input.country_term && !country.is_empty() {
         keys.push(key(TermKind::Country, country, country, country, Some(country)))
     }
     keys.sort_unstable();
@@ -147,12 +219,33 @@ fn name_keys(
 
 // A name posting and an address interval are interleaved by start, so both statistics
 // are final when the last row of a key leaves the merge.
-type Occurrence = [u32; 3];
+#[derive(Clone, Copy, Default)]
+struct Occurrence([u32; 2]);
+impl SortRecord for Occurrence {
+    const BYTES: usize = size_of::<Self>();
+    const PREFIX_KEYS: bool = true;
+    fn put(&self, dst: &mut [u8]) {
+        self.0.put(dst);
+    }
+    fn get(src: &[u8]) -> Self {
+        Self(<[u32; 2]>::get(src))
+    }
+    fn order(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
 
-/// Checking polygon label points can leave the linked-node tables resident. Deduct
-/// their actual allocations once across the workers before sizing the sort runs.
+fn occurrence(id: u32, kind: u32, value: u32) -> Occurrence {
+    // The three core families each have at most 2^29 records, leaving a tag bit.
+    Occurrence([id * 2 + kind, value])
+}
+
+/// The string and label directories stay resident during emission. Leave file pages
+/// available for the display-name window as well as the fixed merge-read buffers.
 fn worker_buffers(per_worker: usize, threads: usize, resident: usize) -> (usize, usize) {
     let budget = per_worker.saturating_sub(resident.div_ceil(threads)).max(MIN_RUN_BUDGET_BYTES);
+    let window = (budget / NAME_WINDOW_BUDGET_DIVISOR).min(NAME_WINDOW_BYTES as usize);
+    let budget = budget.saturating_sub(window).max(MIN_RUN_BUDGET_BYTES);
     let cache_bytes = (budget / SPELLING_BUDGET_DIVISOR).min(budget - MIN_RUN_BUDGET_BYTES);
     let slots = (cache_bytes / SPELLING_SLOT_BYTES).min(MAX_SPELLING_SLOTS);
     (budget - slots * SPELLING_SLOT_BYTES, slots)
@@ -171,8 +264,10 @@ fn emit(
     worker: usize,
 ) -> io::Result<SortedRuns<Occurrence>> {
     let (budget, slots) = buffers;
-    let mut cache = SpellingCache::new(slots);
-    let mut sort = ExternalSort::new(budget, tmp, format!("names-{worker}"))?;
+    let spelling_slots = slots / 2;
+    let mut cache = SpellingCache::new(spelling_slots);
+    let mut keys = KeyCache::new(slots - spelling_slots);
+    let mut order = ExternalSort::fixed(budget, tmp, format!("string-offsets-{worker}"))?;
     for b in rows.chunks_exact(CORE_RECORD_BYTES) {
         let e = EntityRef::unpack(number(b, 0).unwrap()).unwrap();
         let id = number(b, 4).unwrap();
@@ -182,14 +277,40 @@ fn emit(
         let country = std::str::from_utf8(&upper).unwrap_or("").trim();
         let imp = records.importance(e, row, country);
         let is_area = matches!(row, SourceRow::Area(_));
-        for k in name_keys(records, e, row, &country.to_ascii_lowercase(), &mut cache) {
-            sort.push(&k, [id, NAME_OCCURRENCE, imp])?;
-            if is_area && k[0] != TermKind::Country as u8 {
-                for r in areas.ranges(e.record()) {
-                    sort.push(&k, [r.start, AREA_MEMBERS, r.end])?;
+        let input = NameInput {
+            name: row.name_id(),
+            own: is_area.then(|| records.geo.admin_own_name(e.record())).flatten(),
+            bundle: records.bundle_id(e),
+            poi: matches!(row, SourceRow::Poi(_)),
+            country_term: row.is_country(),
+            country: upper.map(|b| b.to_ascii_lowercase()),
+        };
+        order.push(&[], input.sort_row(e, id, imp))?;
+    }
+    let mut ordered = order.finish()?.merge(tmp, &format!("string-merge-{worker}"))?;
+    let mut key = Vec::new();
+    let mut sort = ExternalSort::new(
+        budget.saturating_sub(MERGE_FAN_IN * RUN_READ_BUFFER).max(MIN_RUN_BUDGET_BYTES),
+        tmp,
+        format!("names-{worker}"),
+    )?;
+    while let Some(row) = ordered.next(&mut key)? {
+        let (input, e, id, imp) = NameInput::from_row(row);
+        keys.with(
+            input,
+            || name_keys(records, input, std::str::from_utf8(&input.country).unwrap_or("").trim(), &mut cache),
+            |keys| -> io::Result<()> {
+                for k in keys {
+                    sort.push(k, occurrence(id, NAME_OCCURRENCE, imp))?;
+                    if e.kind() == EntityKind::Area && k[0] != TermKind::Country as u8 {
+                        for r in areas.ranges(e.record()) {
+                            sort.push(k, occurrence(r.start, AREA_MEMBERS, r.end))?;
+                        }
+                    }
                 }
-            }
-        }
+                Ok(())
+            },
+        )?;
     }
     sort.finish()
 }
@@ -259,8 +380,9 @@ impl ListWriter {
             scratch: Vec::new(),
         })
     }
-    fn add(&mut self, [id, kind, v]: Occurrence) -> io::Result<()> {
-        if kind == AREA_MEMBERS {
+    fn add(&mut self, Occurrence([tagged, v]): Occurrence) -> io::Result<()> {
+        let id = tagged >> 1;
+        if tagged & AREA_MEMBERS != 0 {
             self.coverage.include(id, v);
             return Ok(());
         }
@@ -296,7 +418,7 @@ impl ListWriter {
         } else {
             let value = *pos << 1;
             self.scratch.clear();
-            for v in [self.df, self.coverage.count, self.df, self.df / SKIP_EVERY, self.deltas.len] {
+            for v in [self.df, self.coverage.count, self.deltas.len] {
                 varint::put(&mut self.scratch, v.into());
             }
             *pos += self.scratch.len() as u64 + u64::from(self.deltas.len) + u64::from(self.skips.len);
@@ -400,6 +522,8 @@ pub(super) struct TermStats {
     pub merge_s: f64,
     pub fst_s: f64,
     pub prefix_s: f64,
+    pub spilled_bytes: u64,
+    pub rewritten_bytes: u64,
     pub sort_runs: usize,
     pub merge_passes: usize,
 }
@@ -416,7 +540,9 @@ pub(super) fn build(
     let rows = map(&tmp.join("records"))?;
     let areas = AreaRanges::open(out, n, profile)?;
     let budget = crate::sort::run_budget(opts.mem_mb, opts.threads).map_err(invalid)?;
-    let resident = table_bytes(&records.geo.linked_centres) + table_bytes(&records.geo.linked_names);
+    let resident = records.string_directory_bytes()
+        + table_bytes(&records.geo.linked_centres)
+        + table_bytes(&records.geo.linked_names);
     let buffers = worker_buffers(budget, opts.threads, resident);
     let mut names = SortedRuns::default();
     std::thread::scope(|scope| -> io::Result<()> {
@@ -443,16 +569,21 @@ pub(super) fn build(
 
 fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<TermStats> {
     let start = Instant::now();
-    let mut stats =
-        TermStats { sort_runs: names.len(), sort_s: names.spill_time().as_secs_f64(), ..TermStats::default() };
+    let mut stats = TermStats {
+        spilled_bytes: names.spilled_bytes(),
+        sort_runs: names.len(),
+        sort_s: names.spill_time().as_secs_f64(),
+        ..TermStats::default()
+    };
     let mut rows = names.merge(tmp, "name-merge")?;
     stats.merge_s = start.elapsed().as_secs_f64();
     stats.merge_passes = rows.passes();
+    stats.rewritten_bytes = rows.rewritten_bytes();
     // The final merge streams directly into the posting and FST writers.
     let start = Instant::now();
     let mut list = ListWriter::new(tmp)?;
     let mut prefixes = (0..2 * PREFIX_TABLE_MAX_CHARS).map(|i| Prefix::new(tmp, i)).collect::<io::Result<Vec<_>>>()?;
-    let mut fst = FstWriter::new(writer(&out.join("core.fst"))?)?;
+    let mut dictionary = TermBlocks::new(out)?;
     let mut post = writer(&out.join("core.post"))?;
     let (mut prev, mut top, mut pos, mut terms, mut postings) = (Vec::new(), Vec::new(), 0u64, 0u64, 0u64);
     let mut flush = |k: &[u8], list: &mut ListWriter| -> io::Result<()> {
@@ -462,7 +593,7 @@ fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<Te
         postings += u64::from(list.df);
         terms += 1;
         let value = list.finish(&mut post, &mut pos, &mut top)?;
-        fst.insert(k, value)?;
+        dictionary.add(k, value, &mut post, &mut pos)?;
         if k[0] == TermKind::Word as u8 || k[0] == TermKind::Partial as u8 {
             let token = std::str::from_utf8(k[1..].split(|&b| b == 0).next().unwrap()).map_err(io::Error::other)?;
             let first = if k[0] == TermKind::Word as u8 { 0 } else { PREFIX_TABLE_MAX_CHARS };
@@ -504,7 +635,7 @@ fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<Te
         }
     }
     flush(&prev, &mut list)?;
-    fst.finish()?;
+    dictionary.finish(&mut post, &mut pos)?;
     post.flush()?;
     drop(rows);
     stats.fst_s = (start.elapsed() - final_read).as_secs_f64();
@@ -525,12 +656,12 @@ mod tests {
         index::{terms::TermSource, Dictionary},
     };
     #[test]
-    fn term_workers_share_the_budget_with_resident_label_tables() {
+    fn term_workers_share_the_budget_with_resident_tables_and_string_pages() {
         let mib = 1 << 20;
         let (run, slots) = worker_buffers(16 * mib, 1, 7 * mib);
-        assert_eq!(run + slots * SPELLING_SLOT_BYTES, 9 * mib);
+        assert_eq!(run + slots * SPELLING_SLOT_BYTES, 9 * mib * 7 / 8);
         let (run, slots) = worker_buffers(4 * mib, 4, 7 * mib);
-        assert_eq!(4 * (run + slots * SPELLING_SLOT_BYTES), 9 * mib);
+        assert_eq!(4 * (run + slots * SPELLING_SLOT_BYTES), 9 * mib * 7 / 8);
         assert_eq!(worker_buffers(mib, 1, 2 * mib), (MIN_RUN_BUDGET_BYTES, 0));
         let mut uncached = SpellingCache::new(0);
         let mut spellings = Vec::new();
@@ -546,11 +677,13 @@ mod tests {
         let mut sort = ExternalSort::new(budget, &dir.0, "input".into()).unwrap();
         let k = key(TermKind::Partial, "de", "de", "de", None);
         for i in (0..N).rev() {
-            sort.push(&k, [i, NAME_OCCURRENCE, i]).unwrap()
+            sort.push(&k, occurrence(i, NAME_OCCURRENCE, i)).unwrap()
         }
         let empty = key(TermKind::Partial, "z", "z", "z", None);
-        sort.push(&empty, [2, AREA_MEMBERS, 19]).unwrap();
-        let stats = merge(sort.finish().unwrap(), &dir.0, &dir.0).unwrap();
+        sort.push(&empty, occurrence(2, AREA_MEMBERS, 19)).unwrap();
+        let runs = sort.finish().unwrap();
+        assert!(runs.spilled_bytes() < u64::from(N) * 11, "repeated keys occupied {} bytes", runs.spilled_bytes());
+        let stats = merge(runs, &dir.0, &dir.0).unwrap();
         assert_eq!((stats.terms, stats.postings), (2, N.into()));
         let terms = Dictionary::open(&dir.0, N).unwrap();
         let term = &terms.exact(TermKind::Partial, "de")[0];
@@ -561,5 +694,70 @@ mod tests {
         let zero = &terms.exact(TermKind::Partial, "z")[0];
         assert_eq!((zero.count, zero.addr_count), (0, 17));
         assert_eq!(terms.posting(zero.postings[0]).unwrap().ids().next(), None);
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_lists_store_each_statistic_once() {
+        let dir = crate::fixture::TempDir::new("list-size");
+        let mut list = ListWriter::new(&dir.0).unwrap();
+        list.add(occurrence(2, NAME_OCCURRENCE, 5)).unwrap();
+        list.add(occurrence(3, NAME_OCCURRENCE, 7)).unwrap();
+        let mut out = Vec::new();
+        list.finish(&mut out, &mut 0, &mut Vec::new()).unwrap();
+        assert_eq!(out, [2, 0, 2, 2, 1]);
+    }
+
+    #[test]
+    fn an_occurrence_fits_two_sort_words() {
+        assert_eq!(size_of::<Occurrence>(), 2 * size_of::<u32>());
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    #[test]
+    fn a_repeated_bundle_reuses_the_emitted_keys_only_in_its_country() {
+        let mut cache = KeyCache::new(1);
+        let mut input =
+            NameInput { name: 0, own: None, bundle: Some(0), poi: true, country_term: false, country: *b"de" };
+        let keys = || vec![b"aprt".to_vec()];
+        cache.with(input, keys, |k| assert_eq!(k, &keys()));
+        cache.with(input, || panic!("repeated analysis"), |k| assert_eq!(k, &keys()));
+        input.country = *b"us";
+        cache.with(input, || vec![vec![0; SPELLING_SLOT_BYTES]], |k| assert_eq!(k[0].len(), SPELLING_SLOT_BYTES));
+        cache.with(input, keys, |k| assert_eq!(k, &keys()));
+        KeyCache::new(0).with(input, keys, |k| assert_eq!(k, &keys()));
+    }
+}
+
+#[cfg(test)]
+mod name_order_tests {
+    use super::*;
+
+    #[test]
+    fn sorting_names_preserves_the_analysis_context_and_entity() {
+        use crate::index::entities::EntityKind;
+        let e = EntityRef::new(EntityKind::Poi, 19).unwrap();
+        let input =
+            NameInput { name: 4, own: Some(3), bundle: Some(5), poi: true, country_term: false, country: *b"de" };
+        let row = input.sort_row(e, 41, 87);
+        let mut neighbours = [
+            NameInput { name: 90, bundle: Some(1), ..input }.sort_row(e, 0, 0),
+            NameInput { name: 7, bundle: Some(2), ..input }.sort_row(e, 0, 0),
+        ];
+        neighbours.sort_unstable();
+        assert_eq!(NameInput::from_row(neighbours[0]).0.bundle, Some(1));
+        let (restored, entity, id, imp) = NameInput::from_row(row);
+        assert!(restored == input);
+        assert_eq!((entity, id, imp), (e, 41, 87));
+        let e = EntityRef::new(EntityKind::Area, 0).unwrap();
+        let input = NameInput { country_term: true, poi: false, country: *b"  ", own: None, bundle: None, ..input };
+        assert!(NameInput::from_row(input.sort_row(e, 0, 0)).0 == input);
     }
 }

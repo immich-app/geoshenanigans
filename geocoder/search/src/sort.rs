@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 pub trait SortRecord: Copy {
     /// Bytes of a record in a run file.
     const BYTES: usize;
+    /// Front-code sorted text keys that recur across many records.
+    const PREFIX_KEYS: bool = false;
     /// Writes the record into `out`, BYTES long.
     fn put(&self, out: &mut [u8]);
     /// The record `put` wrote into `b`.
@@ -127,6 +129,10 @@ impl<R: SortRecord> ExternalSort<R> {
         Self::with_arena_limit(budget, MAX_RUN_ARENA_BYTES, dir, tag)
     }
 
+    pub(crate) fn fixed(budget: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
+        Self::with_arena_limit(budget, 0, dir, tag)
+    }
+
     /// `new` with at most `arena_limit` key bytes per run.
     fn with_arena_limit(budget: usize, arena_limit: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
         let (arena_cap, items_cap) = run_capacities::<R>(budget, arena_limit);
@@ -182,8 +188,9 @@ impl<R: SortRecord> ExternalSort<R> {
         // Held from here: a run whose write fails goes with the others.
         self.runs.files.0.push(path);
         let mut w = BufWriter::with_capacity(WRITE_BUFFER, file);
+        let mut previous = Vec::new();
         for it in self.items.as_slice() {
-            self.runs.spilled += write_entry(&mut w, key(it), &it.rec, &mut self.scratch)?;
+            self.runs.spilled += write_entry(&mut w, key(it), &it.rec, &mut self.scratch, &mut previous)?;
         }
         w.flush()?;
         self.runs.spill_time += start.elapsed();
@@ -351,8 +358,9 @@ fn reduce_runs<R: SortRecord>(mut files: RunFiles, dir: &Path, tag: &str) -> std
             next.0.push(path);
             let mut w = BufWriter::with_capacity(WRITE_BUFFER, file);
             let mut m = Merged::<R>::open(group)?;
+            let mut previous = Vec::new();
             while let Some(rec) = m.next(&mut key)? {
-                rewritten += write_entry(&mut w, &key, &rec, &mut scratch)?;
+                rewritten += write_entry(&mut w, &key, &rec, &mut scratch, &mut previous)?;
             }
             w.flush()?;
         }
@@ -361,15 +369,40 @@ fn reduce_runs<R: SortRecord>(mut files: RunFiles, dir: &Path, tag: &str) -> std
     Ok((files, rewritten, passes))
 }
 
-/// One run entry: u16 key length, key, record (`scratch` holds its bytes). Returns the bytes
-/// written.
-fn write_entry<R: SortRecord>(w: &mut impl Write, key: &[u8], rec: &R, scratch: &mut Vec<u8>) -> std::io::Result<u64> {
+/// Returns the encoded size. Text runs share a prefix with the preceding key.
+fn write_entry<R: SortRecord>(
+    w: &mut impl Write,
+    key: &[u8],
+    rec: &R,
+    scratch: &mut Vec<u8>,
+    previous: &mut Vec<u8>,
+) -> std::io::Result<u64> {
+    let mut bytes = 0;
+    if R::PREFIX_KEYS {
+        scratch.clear();
+        if key == previous {
+            w.write_all(&[0])?;
+            bytes = 1;
+        } else {
+            let shared = key.iter().zip(previous.iter()).take_while(|(a, b)| a == b).count();
+            let suffix = &key[shared..];
+            crate::varint::put(scratch, suffix.len() as u64 + 1);
+            crate::varint::put(scratch, shared as u64);
+            w.write_all(scratch)?;
+            w.write_all(suffix)?;
+            bytes = scratch.len() + suffix.len();
+            previous.clear();
+            previous.extend_from_slice(key);
+        }
+    } else {
+        w.write_all(&(key.len() as u16).to_le_bytes())?;
+        w.write_all(key)?;
+        bytes += size_of::<u16>() + key.len();
+    }
     scratch.resize(R::BYTES, 0);
     rec.put(scratch);
-    w.write_all(&(key.len() as u16).to_le_bytes())?;
-    w.write_all(key)?;
     w.write_all(scratch)?;
-    Ok((2 + key.len() + R::BYTES) as u64)
+    Ok((bytes + R::BYTES) as u64)
 }
 
 /// A run's next entry at the head of a merge.
@@ -413,14 +446,32 @@ impl RunReader {
         if self.r.fill_buf()?.is_empty() {
             return Ok(None);
         }
-        let mut len = [0u8; 2];
-        self.r.read_exact(&mut len)?;
-        key.resize(u16::from_le_bytes(len) as usize, 0);
-        self.r.read_exact(key)?;
+        if R::PREFIX_KEYS {
+            read_prefix(&mut self.r, key)?;
+        } else {
+            let mut len = [0u8; 2];
+            self.r.read_exact(&mut len)?;
+            key.resize(u16::from_le_bytes(len) as usize, 0);
+            self.r.read_exact(key)?;
+        }
         self.rec.resize(R::BYTES, 0);
         self.r.read_exact(&mut self.rec)?;
         Ok(Some(R::get(&self.rec)))
     }
+}
+
+fn read_prefix(r: &mut impl Read, key: &mut Vec<u8>) -> std::io::Result<()> {
+    let encoded = crate::varint::read_u32(r)?;
+    if let Some(suffix) = encoded.checked_sub(1) {
+        let shared = crate::varint::read_u32(r)? as usize;
+        let len = shared
+            .checked_add(suffix as usize)
+            .filter(|&n| n <= MAX_KEY_BYTES && shared <= key.len())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid run key prefix"))?;
+        key.resize(len, 0);
+        r.read_exact(&mut key[shared..])?;
+    }
+    Ok(())
 }
 
 /// Sort-run memory of each of `threads` workers sharing `mem_mb`; an error below
@@ -447,6 +498,22 @@ fn run_capacities<R>(budget: usize, arena_limit: usize) -> (usize, usize) {
 mod tests {
     use super::*;
     use crate::fixture::{Rng, TempDir};
+
+    #[test]
+    fn a_front_coded_run_rejects_invalid_or_truncated_keys() {
+        let mut key = b"abc".to_vec();
+        read_prefix(&mut &[0][..], &mut key).unwrap();
+        assert_eq!(key, b"abc");
+        read_prefix(&mut &[2, 2, b'x'][..], &mut key).unwrap();
+        assert_eq!(key, b"abx");
+        for mut invalid in [&[2, 4, b'x'][..], &[3, 2, b'x'], &[0xff; 5]] {
+            assert!(read_prefix(&mut invalid, &mut key).is_err());
+        }
+        let mut long = Vec::new();
+        crate::varint::put(&mut long, MAX_KEY_BYTES as u64 + 2);
+        long.push(0);
+        assert!(read_prefix(&mut long.as_slice(), &mut key).is_err());
+    }
 
     /// A test record: a number and a byte, ordered as the pair.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -501,7 +568,7 @@ mod tests {
         let mut w = BufWriter::new(File::create(&path).unwrap());
         let mut scratch = Vec::new();
         for (k, r) in in_memory(entries.to_vec()) {
-            write_entry(&mut w, &k, &r, &mut scratch).unwrap();
+            write_entry(&mut w, &k, &r, &mut scratch, &mut Vec::new()).unwrap();
         }
         w.flush().unwrap();
         path
@@ -883,7 +950,7 @@ mod tests {
         let dir = TempDir::new("sort-merge-cut");
         let mut bytes = Vec::new();
         for (k, r) in [(&b"a"[..], Rec(1, 0)), (b"ab", Rec(3, 0))] {
-            write_entry(&mut bytes, k, &r, &mut Vec::new()).unwrap();
+            write_entry(&mut bytes, k, &r, &mut Vec::new(), &mut Vec::new()).unwrap();
         }
         bytes.truncate(bytes.len() - Rec::BYTES - 1);
         let cut = dir.0.join("cut.run");

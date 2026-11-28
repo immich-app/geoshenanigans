@@ -84,6 +84,8 @@ fn file_of(blocks: &[Vec<u8>], values: u32) -> Vec<u8> {
 /// The values of ids [0, n) of a file that opens.
 fn read(bytes: &[u8], n: u32) -> Vec<Option<u32>> {
     let f = open(bytes).unwrap();
+    let rows: Vec<_> = f.values().collect();
+    assert_eq!(rows, (0..f.count()).map(|id| f.get(id)).collect::<Vec<_>>());
     (0..n).map(|id| f.get(id)).collect()
 }
 
@@ -95,6 +97,7 @@ fn every_value_reads_back_at_its_id() {
             let values = random_values(&mut rng, n, kind);
             let f = open(&encode(&values)).unwrap();
             assert_eq!(f.count() as usize, n);
+            assert!(f.values().eq(values.iter().copied().map(Some)));
             for (id, v) in values.iter().enumerate() {
                 assert_eq!(f.get(id as u32), Some(*v), "value {id} of {n}, kind {kind}");
             }

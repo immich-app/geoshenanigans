@@ -36,8 +36,12 @@ fn core_membership_counts_and_names_follow_the_dataset() {
         let core = CoreIndex::open(&out).unwrap();
         let records = CoreRecords::open(&geo, &set).unwrap();
         assert_eq!(core.entities.len(), 6);
-        assert_eq!(fs::metadata(out.join("core.ent")).unwrap().len(), 8 + 4 * 6);
         let west: BTreeSet<_> = [county, city].into_iter().flat_map(|s| core.areas.ranges(s).flatten()).collect();
+        let mut words = core.address_words();
+        let matches: BTreeSet<_> = words.ranges("west").iter().cloned().flatten().collect();
+        assert_eq!(matches, west);
+        assert!(words.ranges("absent").is_empty());
+        assert_eq!(words.ranges("west").iter().cloned().flatten().count(), west.len());
         let mut brute = BTreeSet::new();
         let mut prev = None;
         for id in 0..core.entities.len() {
@@ -189,6 +193,10 @@ fn a_shipped_chain_dictionary_is_read_in_id_order_and_partial_inputs_fail() {
     fs::write(set.join("place_chains.bin"), query_server::side_blocks::encode(&[1])).unwrap();
     fs::write(set.join("poi_chains.bin"), query_server::side_blocks::encode(&[1, 0, 1])).unwrap();
     build("side").unwrap();
+    let fresh = f.load(&set);
+    build_core(&fresh, &crate::dataset::core_stamps(&set).unwrap(), &set, &tmp.0.join("fresh"), Profile::Immich, &opts)
+        .unwrap();
+    assert!(fresh.linked_centres.get().is_none(), "the record scan retained its label table");
     for file in crate::constants::CORE_FILES {
         assert_eq!(
             fs::read(tmp.0.join("side").join(file)).unwrap(),
@@ -690,6 +698,162 @@ fn an_unranked_area_uses_its_label_points_country_for_its_search_rank() {
     let id = (0..core.entities.len()).find(|&id| core.entities.get(id).unwrap().record() == region).unwrap();
     assert_eq!(core.record(id, &records).unwrap().rank_search, 10);
     assert!(!core.areas.ranges(county).any(|r| r.contains(&id)));
+}
+
+#[test]
+fn entity_blocks_restart_at_random_access_boundaries() {
+    let tmp = TempDir::new("entity-blocks");
+    let set = tmp.0.join("dataset");
+    let mut f = Geo::default();
+    let n = 389;
+    for _ in 0..n {
+        f.poi("Repeated", 0., 0., 0);
+    }
+    let geo = f.load(&set);
+    build_core(
+        &geo,
+        &crate::dataset::core_stamps(&set).unwrap(),
+        &set,
+        &tmp.0,
+        Profile::Immich,
+        &BuildOpts::new(tmp.0.join("runs")),
+    )
+    .unwrap();
+    let core = CoreIndex::open(&tmp.0).unwrap();
+    for id in (0..n).rev() {
+        let e = core.entities.get(id).unwrap();
+        assert_eq!((e.kind(), e.record()), (EntityKind::Poi, id));
+    }
+    assert!(core.entities.get(n).is_none());
+    assert!(fs::metadata(tmp.0.join("core.ent")).unwrap().len() < 2 * u64::from(n));
+}
+
+#[test]
+fn sparse_dictionary_blocks_preserve_order_across_variant_sources() {
+    let tmp = TempDir::new("token-sources");
+    let set = tmp.0.join("dataset");
+    let mut f = Geo::default();
+    let airport = f.poi("Airport", 0., 0., 0);
+    f.poi_tags(airport, &[("name:en", "Airport")]);
+    f.poi("Aprt", 0., 0., 0);
+    for i in 0..200 {
+        f.poi(&format!("Aprt{i:03}"), 0., 0., 0);
+    }
+    let geo = f.load(&set);
+    build_core(
+        &geo,
+        &crate::dataset::core_stamps(&set).unwrap(),
+        &set,
+        &tmp.0,
+        Profile::Immich,
+        &BuildOpts::new(tmp.0.join("runs")),
+    )
+    .unwrap();
+    let core = CoreIndex::open(&tmp.0).unwrap();
+    let terms = core.terms.exact(TermKind::Word, "aprt");
+    assert_eq!(terms.iter().map(|t| t.word.as_str()).collect::<Vec<_>>(), ["airport@en", "aprt"]);
+    let fst = crate::keys::Keys::new(fs::read(tmp.0.join("core.fst")).unwrap()).unwrap();
+    use fst::Streamer;
+    let mut stream = fst.stream();
+    let mut blocks = 0;
+    while stream.next().is_some() {
+        blocks += 1;
+    }
+    assert!(blocks < 100, "{blocks} entries for two families of 200 adjacent terms");
+    assert_eq!(core.terms.prefix(TermKind::Word, "aprt0", 101).len(), 100);
+    assert_eq!(core.terms.exact(TermKind::Word, "aprt099")[0].word, "aprt099");
+    assert!(core.terms.exact(TermKind::Word, "aprt09").is_empty());
+    assert_eq!(core.terms.fuzzy(TermKind::Word, "aprt099", Fuzz { edits: 1, anchor: 4 }, 2).len(), 2);
+}
+
+#[test]
+fn reading_a_full_area_uses_its_indexed_label_point() {
+    let tmp = TempDir::new("label-point");
+    let set = tmp.0.join("dataset");
+    let mut f = Geo::default();
+    let polygon = f.boundary("Boundary", 6, [-1., -1., 1., 1.]);
+    let label = f.place("Boundary", 1, 0.125, -0.25);
+    f.claim(polygon, label);
+    let geo = f.load(&set);
+    build_core(
+        &geo,
+        &crate::dataset::core_stamps(&set).unwrap(),
+        &set,
+        &tmp.0,
+        Profile::Full,
+        &BuildOpts::new(tmp.0.join("runs")),
+    )
+    .unwrap();
+    let core = CoreIndex::open(&tmp.0).unwrap();
+    let geo = f.load(&set);
+    let rows = CoreRecords::for_index(&geo, &set, &core).unwrap();
+    let record = core.record(0, &rows).unwrap();
+    assert_eq!(record.point, (0.125, -0.25));
+    assert!(geo.linked_centres.get().is_none());
+}
+
+#[test]
+fn ranking_reads_only_eligible_records_and_returns_the_resolved_importance() {
+    let tmp = TempDir::new("ranking-fields");
+    let set = tmp.0.join("dataset");
+    let mut f = Geo::default();
+    let country = f.boundary("Canada", 2, [-2., -2., 2., 2.]);
+    f.country(country, *b"CA");
+    f.place("Village", 1, 1., 1.);
+    f.poi("Store", 1., 1., 0);
+    f.poi("", 1., 1., 0);
+    let geo = f.load(&set);
+    fs::write(set.join("poi_imp.bin"), query_server::side_blocks::encode(&[123, 456])).unwrap();
+    for profile in [Profile::Full, Profile::Immich] {
+        let out = tmp.0.join(profile.as_str());
+        build_core(
+            &geo,
+            &crate::dataset::core_stamps(&set).unwrap(),
+            &set,
+            &out,
+            profile,
+            &BuildOpts::new(tmp.0.join("runs")),
+        )
+        .unwrap();
+        let core = CoreIndex::open(&out).unwrap();
+        let records = CoreRecords::for_index(&geo, &set, &core).unwrap();
+        for id in 0..=core.entities.len() {
+            let expected =
+                core.record(id, &records).map(|r| (r.importance / crate::constants::IMP_UNIT).round() as u32);
+            assert_eq!(core.candidate_importance(id, &records), expected);
+        }
+    }
+}
+
+#[test]
+fn batch_ranking_preserves_input_order_and_missing_records() {
+    let tmp = TempDir::new("batch-ranking");
+    let set = tmp.0.join("dataset");
+    let mut f = Geo::default();
+    for i in 0..400 {
+        f.poi(&format!("Store {i}"), 1., 1., 0);
+    }
+    let geo = f.load(&set);
+    build_core(
+        &geo,
+        &crate::dataset::core_stamps(&set).unwrap(),
+        &set,
+        &tmp.0,
+        Profile::Full,
+        &BuildOpts::new(tmp.0.join("runs")),
+    )
+    .unwrap();
+    let core = CoreIndex::open(&tmp.0).unwrap();
+    let records = CoreRecords::for_index(&geo, &set, &core).unwrap();
+    let ids = (0..402).rev().chain([17, 18, 17]).collect::<Vec<_>>();
+    for batch in [&ids[..], &ids[..1], &[]] {
+        let mut found = Vec::new();
+        core.rank_candidates(batch, &records, |id, score| found.push((id, score)));
+        assert_eq!(
+            found,
+            batch.iter().filter_map(|&id| Some((id, core.candidate_importance(id, &records)?))).collect::<Vec<_>>()
+        );
+    }
 }
 
 #[test]

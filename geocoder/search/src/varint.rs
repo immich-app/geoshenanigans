@@ -28,9 +28,39 @@ pub fn try_get(buf: &[u8], pos: &mut usize) -> Option<u64> {
     }
 }
 
+/// Reads one unsigned 32-bit LEB128 from a buffered stream without reading ahead into the next value.
+pub(crate) fn read_u32(r: &mut impl std::io::Read) -> std::io::Result<u32> {
+    let mut value = 0;
+    for shift in (0..u32::BITS).step_by(7) {
+        let mut byte = [0];
+        r.read_exact(&mut byte)?;
+        let byte = u32::from(byte[0]);
+        if byte > u32::MAX >> shift {
+            break;
+        }
+        value |= (byte & 0x7f) << shift;
+        if byte < 0x80 {
+            return Ok(value);
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "varint exceeds u32"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_values_stop_at_the_next_value_and_reject_overflow() {
+        let mut bytes = Vec::new();
+        put(&mut bytes, u64::from(u32::MAX));
+        put(&mut bytes, 0);
+        let mut reader = bytes.as_slice();
+        assert_eq!(read_u32(&mut reader).unwrap(), u32::MAX);
+        assert_eq!(read_u32(&mut reader).unwrap(), 0);
+        assert_eq!(read_u32(&mut &[0x80][..]).unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(read_u32(&mut &[0xff; 5][..]).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn round_trips() {

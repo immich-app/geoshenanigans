@@ -380,7 +380,18 @@ pub const CORE_FILES: &[&str] =
     &["core.ent", "core.chn", "core.area", "core.fst", "core.post", "core.pfx.fst", "core.pfx"];
 pub const BBOX_COORDS: usize = 4;
 pub const BBOX_BYTES: usize = BBOX_COORDS * size_of::<i32>();
+/// The exact label point and its resolved country follow the four outline bounds.
+pub const AREA_POINT_BYTES: usize = 2 * size_of::<f64>() + size_of::<u32>();
+pub const AREA_DETAIL_BYTES: usize = BBOX_BYTES + AREA_POINT_BYTES;
 pub const ENTITY_MAGIC: &[u8; 4] = b"PSE3";
+pub const ENTITY_BLOCK_ROWS: u32 = 128;
+pub const CORE_KIND_BITS: u32 = 2;
+pub const KINDS_PER_BYTE: u32 = u8::BITS / CORE_KIND_BITS;
+pub const ENTITY_HEADER_BYTES: usize = ENTITY_MAGIC.len() + size_of::<u32>();
+/// Bound the off-thread reads and scratch space of a broad, cold posting walk.
+pub const SCORE_BATCH_ROWS: usize = 1024;
+pub const SCORE_MIN_ROWS_PER_READER: usize = 64;
+pub const SCORE_READERS: usize = 4;
 pub const SKIP_EVERY: u32 = 128;
 pub const TOPK_MIN_DF: u32 = 1024;
 pub const TOPK_PER_TERM: usize = 256;
@@ -400,8 +411,12 @@ pub const CORE_KINDS: [crate::index::entities::EntityKind; 3] = [
     crate::index::entities::EntityKind::Area,
     crate::index::entities::EntityKind::Poi,
 ];
-/// Odd FST values carry singleton entity ids. Even values address the posting file.
+/// Odd posting references carry singleton entity IDs. Even references address the posting file.
 pub const INLINE_POSTING: u64 = 1;
+/// A sparse FST entry points at a front-coded group; other entries hold their posting reference directly.
+pub const TERM_BLOCK: u64 = 1;
+pub const TERM_BLOCK_ROWS: usize = 64;
+pub const TERM_BLOCK_BYTES: usize = 64 * 1024;
 pub const SKIP_BYTES: usize = 2 * size_of::<u32>();
 /// Sixteen u16-length keys take at most one MiB alongside the final merge.
 pub const TERM_MERGE_BATCH: usize = 16;
@@ -424,6 +439,10 @@ pub const WORD_BEFORE: u8 = 1;
 pub const WORD_SAME: u8 = 2;
 pub const WORD_AFTER: u8 = 3;
 pub const LOOKUP_IS_TOKEN: u8 = 1;
+/// Raw display-name bytes per window of the name/bundle merge. Its compressed
+/// buckets share the device page cache with the tag tier and sort runs.
+pub const NAME_WINDOW_BYTES: u32 = 2 * 1024 * 1024;
+pub const NAME_WINDOW_BUDGET_DIVISOR: usize = 8;
 pub const SPELLING_SLOT_BYTES: usize = 1024;
 pub const MAX_SPELLING_SLOTS: usize = 2048;
 pub const SPELLING_BUDGET_DIVISOR: usize = 16;

@@ -1,6 +1,15 @@
 use super::{entities::BBox, small, BlobTable};
-use crate::{constants::BBOX_BYTES, profile::Profile};
+use crate::{
+    constants::{AREA_DETAIL_BYTES, BBOX_BYTES},
+    profile::Profile,
+};
 use std::{io, ops::Range, path::Path};
+#[derive(Clone, Copy)]
+pub(crate) struct AreaLabel {
+    pub point: (f64, f64),
+    pub country: Option<[u8; 2]>,
+}
+
 pub struct AreaRanges {
     table: BlobTable,
     entities: u32,
@@ -8,7 +17,7 @@ pub struct AreaRanges {
 }
 impl AreaRanges {
     pub(crate) fn open(dir: &Path, entities: u32, profile: Profile) -> io::Result<Self> {
-        let stride = size_of::<u32>() + if profile == Profile::Full { BBOX_BYTES } else { 0 };
+        let stride = size_of::<u32>() + if profile == Profile::Full { AREA_DETAIL_BYTES } else { 0 };
         Ok(Self { table: BlobTable::open(&dir.join("core.area"), stride)?, entities, profile })
     }
 
@@ -22,6 +31,20 @@ impl AreaRanges {
         let (max_lat, max_lon) = query_server::PointE7 { lat: coord(2)?, lng: coord(3)? }.degrees();
         (min_lat < max_lat && min_lon < max_lon).then_some(BBox { min_lat, min_lon, max_lat, max_lon })
     }
+    pub(crate) fn label(&self, slot: u32) -> Option<AreaLabel> {
+        self.bbox(slot)?;
+        let row = slot as usize;
+        let coord = |offset| {
+            let lo = u64::from(self.table.field(row, offset)?);
+            let hi = u64::from(self.table.field(row, offset + size_of::<u32>())?);
+            Some(f64::from_bits(hi << u32::BITS | lo))
+        };
+        let lat = coord(BBOX_BYTES)?;
+        let lon = coord(BBOX_BYTES + size_of::<f64>())?;
+        let code = u16::try_from(self.table.field(row, BBOX_BYTES + 2 * size_of::<f64>())?).ok()?;
+        query_server::coords_in_range(lat, lon)
+            .then_some(AreaLabel { point: (lat, lon), country: query_server::country_code_bytes(code) })
+    }
     /// Disjoint half-open ranges, including any sampled intersections.
     pub fn ranges(&self, slot: u32) -> impl Iterator<Item = Range<u32>> + '_ {
         let bytes = self.table.slice(slot as usize).unwrap_or_default();
@@ -32,5 +55,48 @@ impl AreaRanges {
             (end > start && end <= self.entities).then_some(start..end)
         })
         .fuse()
+    }
+}
+
+/// Address-word unions shared by the alternate searches of one query.
+pub struct AddressWords<'a> {
+    core: &'a super::CoreIndex,
+    words: std::collections::HashMap<String, Vec<Range<u32>>>,
+}
+
+impl super::CoreIndex {
+    pub fn address_words(&self) -> AddressWords<'_> {
+        AddressWords { core: self, words: Default::default() }
+    }
+}
+
+impl AddressWords<'_> {
+    pub fn ranges(&mut self, word: &str) -> &[Range<u32>] {
+        use super::{
+            entities::EntityKind,
+            terms::{TermKind, TermSource},
+        };
+        self.words.entry(word.to_owned()).or_insert_with(|| {
+            let mut ranges = Vec::new();
+            for term in self.core.terms.exact(TermKind::Partial, word) {
+                for posting in term.postings {
+                    let Some(list) = self.core.terms.posting(posting) else { continue };
+                    for id in list.ids().filter(|&id| self.core.entities.kind(id) == Some(EntityKind::Area)) {
+                        if let Some(entity) = self.core.entities.get(id) {
+                            ranges.extend(self.core.areas.ranges(entity.record()));
+                        }
+                    }
+                }
+            }
+            ranges.sort_unstable_by_key(|r| r.start);
+            ranges.dedup_by(|next, prev| {
+                if next.start > prev.end {
+                    return false;
+                }
+                prev.end = prev.end.max(next.end);
+                true
+            });
+            ranges
+        })
     }
 }

@@ -95,6 +95,52 @@ impl CoreIndex {
         records.read_in_chain(self.entities.get(id)?, self.chains.outer_slot(id))
     }
 
+    /// The score for an ID that passed posting and range filters. Validate the row,
+    /// point and name as a full read would, without fetching display tags or OSM IDs.
+    pub fn candidate_importance(&self, id: u32, records: &CoreRecords<'_>) -> Option<u32> {
+        records.candidate_importance(self.entities.get(id)?)
+    }
+
+    /// Scores candidates that already passed posting and range filters. Independent
+    /// readers overlap cold faults. Results retain the caller's order and tie breaks.
+    pub fn rank_candidates(&self, ids: &[u32], records: &CoreRecords<'_>, mut ranked: impl FnMut(u32, u32)) {
+        use crate::constants::{SCORE_BATCH_ROWS, SCORE_MIN_ROWS_PER_READER, SCORE_READERS};
+        // Concurrent queries already overlap their reads. Only one borrows extra readers.
+        static READERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let readers = (ids.len() >= SCORE_MIN_ROWS_PER_READER * 2).then(|| READERS.try_lock().ok()).flatten();
+        let mut scores = [None; SCORE_BATCH_ROWS];
+        for batch in ids.chunks(SCORE_BATCH_ROWS) {
+            let slots = &mut scores[..batch.len()];
+            let resolve = |ids: &[u32], slots: &mut [Option<u32>]| {
+                for (&id, dst) in ids.iter().zip(slots) {
+                    *dst = self.candidate_importance(id, records);
+                }
+            };
+            let width = batch.len().div_ceil(SCORE_READERS).max(SCORE_MIN_ROWS_PER_READER);
+            let parallel = readers.is_some()
+                && batch.len() > width
+                && std::thread::scope(|scope| {
+                    let mut chunks = batch.chunks(width).zip(slots.chunks_mut(width));
+                    let (ids, main) = chunks.next().unwrap();
+                    let mut started = true;
+                    for (group, outputs) in chunks {
+                        started &=
+                            std::thread::Builder::new().spawn_scoped(scope, move || resolve(group, outputs)).is_ok();
+                    }
+                    resolve(ids, main);
+                    started
+                });
+            if !parallel {
+                resolve(batch, slots);
+            }
+            for (&id, &score) in batch.iter().zip(slots.iter()) {
+                if let Some(score) = score {
+                    ranked(id, score);
+                }
+            }
+        }
+    }
+
     /// The most important readable matches of a posting after the caller's filters.
     pub fn best(
         &self,
