@@ -585,12 +585,14 @@ fn country_names_use_only_their_identity_spelling() {
     let mut f = Geo::default();
     let country = f.boundary("Saint Lucia", 2, [1., 1., 2., 2.]);
     f.country(country, *b"LC");
-    f.area_tags(country, &[("name:en", "Saint Lucia")]);
+    f.area_tags(country, &[("name:en", "Saint Lucia"), ("name:fr", "Sainte-Lucie")]);
     let geo = f.load(&set);
     let stamps = crate::dataset::load(&set, || Ok(())).unwrap().1;
     build_core(&geo, &stamps, &set, &tmp.0, Profile::Immich, &BuildOpts::new(tmp.0.join("tmp"))).unwrap();
     let core = CoreIndex::open(&tmp.0).unwrap();
+    assert_eq!(core.terms.exact(TermKind::Country, "sainte lucie")[0].word, "sainte lucie");
     for (kind, token, present) in [
+        (TermKind::Country, "sainte lucie", true),
         (TermKind::Country, "lc", true),
         (TermKind::Country, "saint lucia", true),
         (TermKind::Country, "st lucia", false),

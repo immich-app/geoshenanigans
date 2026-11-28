@@ -10,7 +10,7 @@ use crate::{
     index::{areas::AreaRanges, entities::EntityRef, invalid, map, number, terms::TermKind},
     sort::{ExternalSort, SortedRuns},
     text::{
-        normalize::{name_normalized, normalized, transliterated},
+        normalize::{name_normalized, transliterated},
         sanitize::Place,
         variants::{Spelling, Variants},
     },
@@ -127,7 +127,7 @@ fn name_keys(
             }
         });
         if row.is_country() && !country.is_empty() {
-            let word = normalized(&n.name);
+            let word = name_normalized(&n.name);
             let token = transliterated(&word);
             if !word.is_empty() && !token.is_empty() {
                 keys.push(key(TermKind::Country, &token, &word, &word, Some(country)));
