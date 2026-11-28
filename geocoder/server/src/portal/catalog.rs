@@ -23,9 +23,12 @@ use query_server::WATER_DIR;
 use place_search::dataset::DATASET_FILES;
 use query_server::ADMIN_GEOMETRY_FILES;
 
+const PLANET_REGION: &str = "planet";
+const FULL_MODE: &str = "full";
+
 /// A region list must be explicit before the portal downloads continental packs.
 pub fn default_regions() -> Vec<String> {
-    vec!["planet".to_string()]
+    vec![PLANET_REGION.to_string()]
 }
 
 /// The preset a /reverse or /polygons without dataset= answers: the
@@ -133,7 +136,7 @@ const AXES: [&str; 3] = ["mode", "quality", "poi_tier"];
 /// `<region>/` where the region isn't planet.
 pub fn dataset_id(sel: &RegionSelection) -> String {
     let id = format!("{}.{}.{}", sel.mode, sel.quality, sel.poi_tier);
-    if sel.region == "planet" {
+    if sel.region == PLANET_REGION {
         id
     } else {
         format!("{}/{}", sel.region, id)
@@ -343,7 +346,7 @@ pub fn validate_regions(regions: &[String]) -> Result<(), String> {
     }
 
     for region in regions {
-        if region != "planet" && !query_server::continents().iter().any(|c| c.name == region) {
+        if region != PLANET_REGION && !query_server::continents().iter().any(|c| c.name == region) {
             return Err(format!("Unknown region: {region}"));
         }
         if !seen.insert(region) {
@@ -429,7 +432,7 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest, regions: &[String]) -> Re
                         selection: sel,
                         label: {
                             let mut labels = [mode_value, quality_value, tier_value].map(|v| v.label.as_str()).to_vec();
-                            if region != "planet" {
+                            if region != PLANET_REGION {
                                 labels.insert(0, &manifest.axes["region"].values[region].label);
                             }
                             labels.join(" · ")
@@ -639,7 +642,7 @@ fn groups(cfg: &Configurations, manifest: &Manifest, datasets: &mut [Dataset]) -
         let size = |geometry: bool| -> u64 {
             DATASET_FILES.iter().filter(|name| ADMIN_GEOMETRY_FILES.contains(*name) == geometry).filter_map(|name| file(name)).map(|f| f.size_raw).sum()
         };
-        let full = (dataset.selection.mode == "full").then(|| dataset.id.clone());
+        let full = (dataset.selection.mode == FULL_MODE).then(|| dataset.id.clone());
         dataset.group = *by_files.entry((dataset.selection.region.clone(), full, sha256)).or_insert_with(|| {
             groups.push(Group { name: dataset.id.clone(), datasets: Vec::new(), cost: (size(false), size(true)), shipped: None });
             groups.len() - 1
@@ -793,7 +796,7 @@ impl Water {
     /// dataset's).
     pub fn set(&self) -> String {
         let set = format!("{WATER_DIR}/{}", self.id);
-        if self.region == "planet" {
+        if self.region == PLANET_REGION {
             set
         } else {
             format!("{}/{set}", self.region)
