@@ -153,17 +153,7 @@ private:
 
 }  // namespace
 
-bool english_only_country(uint16_t cc) {
-    // country_settings.yaml's countries of `languages: en` alone.
-    static constexpr char kCodes[][3] = {
-        "AG", "AI", "AU", "BB", "BM", "BS", "BZ", "DM", "FJ", "FK", "FM", "GB", "GD", "GG", "GH", "GI", "GM", "GS", "GY",
-        "IM", "IO", "JE", "JM", "KI", "KN", "KY", "LC", "LR", "MS", "NG", "SB", "SH", "SL", "SS", "TC", "TO", "TT", "TV",
-        "US", "VC", "VG", "ZM",
-    };
-    for (const char* code : kCodes)
-        if (pack_country_code(code[0], code[1]) == cc) return true;
-    return false;
-}
+bool english_only_country(uint16_t cc) { return country_language(cc) == "en"; }
 
 std::string_view linked_english_name(bool own_name_en, uint16_t polygon_country, std::string_view node_name_en,
                                      std::string_view node_name, uint16_t node_country) {
