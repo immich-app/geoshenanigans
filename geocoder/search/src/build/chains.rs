@@ -211,6 +211,7 @@ pub(super) fn build(
             if e.kind() == EntityKind::Area {
                 let poly =
                     records.geo.admin_polygon(e.record()).ok_or_else(|| invalid("missing polygon of shipped chain"))?;
+                let outline = poly.rank_address == 0 && max_rank > OUTLINE_ADDRESS_MIN_RANK;
                 let mut bbox = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
                 let mut last = Vec::new();
                 let mut added = Ok(());
@@ -222,6 +223,9 @@ pub(super) fn build(
                     bbox[1] = bbox[1].min(v.lng as i32);
                     bbox[2] = bbox[2].max(v.lat as i32);
                     bbox[3] = bbox[3].max(v.lng as i32);
+                    if !outline {
+                        return;
+                    }
                     let (lat, lon) = v.degrees();
                     let parents = points.get(lat, lon);
                     if parents != last {

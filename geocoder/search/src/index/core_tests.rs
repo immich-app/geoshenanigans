@@ -204,44 +204,53 @@ fn a_shipped_chain_dictionary_is_read_in_id_order_and_partial_inputs_fail() {
 }
 
 #[test]
-fn a_city_crossing_the_county_line_is_in_both_counties_in_the_full_profile() {
+fn only_an_unranked_area_above_rank_ten_joins_the_areas_its_outline_meets_in_the_full_profile() {
     let tmp = TempDir::new("crossing");
     let set = tmp.0.join("set");
     let mut f = Geo::default();
     let west = f.boundary("West County", 6, [0., 0., 1., 0.5]);
     let east = f.boundary("East County", 6, [0., 0.5, 1., 1.]);
     let city = f.place_area("Crossing", 1, [0.3, 0.3, 0.7, 0.6]);
+    let town = f.boundary("Unranked town", 8, [0.2, 0.2, 0.8, 0.6]);
+    f.area_rank(town, 0);
+    let north = f.boundary("North", 2, [10., 0., 11., 0.5]);
+    let south = f.boundary("South", 2, [10., 0.5, 11., 1.]);
+    f.country(north, *b"AT");
+    f.country(south, *b"CH");
+    let state = f.boundary("Unranked state", 4, [10.2, 0.2, 10.8, 0.6]);
+    f.area_rank(state, 0);
     // The fixture lists each polygon in the cells of its records, as the builder does for vertices.
-    f.poi("Corner", 0.3, 0.6, 0);
-    f.poi("Corner", 0.3, 0.3, 0);
+    for (lat, lon) in [(0.3, 0.6), (0.3, 0.3), (0.2, 0.6), (10.2, 0.6)] {
+        f.poi("Corner", lat, lon, 0);
+    }
     f.poi("Border", 0., 0.5, 0);
-    let unranked = f.boundary("Unranked town", 8, [0.2, 0.2, 0.8, 0.6]);
-    f.area_rank(unranked, 0);
     let geo = f.load(&set);
     let stamp = crate::dataset::core_stamps(&set).unwrap();
     for profile in Profile::ALL {
         let out = tmp.0.join(profile.as_str());
         build_core(&geo, &stamp, &set, &out, profile, &BuildOpts::new(tmp.0.join("sort"))).unwrap();
         let core = CoreIndex::open(&out).unwrap();
-        let id = (0..core.entities.len())
-            .find(|&id| core.entities.get(id).is_some_and(|e| e.kind() == EntityKind::Area && e.record() == city))
-            .unwrap();
-        let counties = [west, east].into_iter().filter(|&c| core.areas.ranges(c).any(|r| r.contains(&id))).count();
-        assert_eq!(counties, if profile == Profile::Full { 2 } else { 1 });
+        let outline = profile == Profile::Full;
+        let mut seen = BTreeSet::new();
         for id in 0..core.entities.len() {
             let e = core.entities.get(id).unwrap();
             if e.kind() != EntityKind::Area {
                 continue;
             }
             let member = |s| core.areas.ranges(s).any(|r| r.contains(&id));
-            if [west, east].contains(&e.record()) {
+            let r = e.record();
+            if r == city {
+                assert_eq!((member(west), member(east)), (true, false), "{profile:?}");
+            } else if r == town {
+                assert_eq!((member(west), member(east), member(city)), (true, outline, false), "{profile:?}");
+            } else if r == state {
+                assert_eq!((member(north), member(south)), (true, false), "{profile:?}");
+            } else if [west, east].contains(&r) {
                 assert!(!member(west) && !member(east));
             }
-            if e.record() == unranked {
-                assert!(member(west));
-                assert!(!member(city));
-            }
+            seen.insert(r);
         }
+        assert!([city, town, state, west, east].iter().all(|r| seen.contains(r)));
     }
 }
 

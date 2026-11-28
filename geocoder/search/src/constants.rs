@@ -388,6 +388,9 @@ pub const IMP_UNIT: f64 = 1.0 / 655_350_000.0;
 pub const DEFAULT_IMPORTANCE_BASE: f64 = 0.40001;
 pub const IMPORTANCE_RANK_DIVISOR: f64 = 75.0;
 pub const MAX_ADDRESS_RANK: u8 = 25;
+/// Nominatim addresses a ranked polygon from its centroid. An unranked one whose rank
+/// is above this takes the areas its outline meets (placex_triggers.sql:1183-1197).
+pub const OUTLINE_ADDRESS_MIN_RANK: u8 = 10;
 pub const POI_SEARCH_RANK: u8 = 30;
 pub const COUNTRY_LEVEL: u8 = 2;
 pub const PLACE_AREA_LEVEL: u8 = 15;
