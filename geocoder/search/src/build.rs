@@ -17,6 +17,7 @@ pub use write::build_core;
 pub(crate) use write::build_core_held;
 
 use crate::constants::*;
+use crate::dataset::SearchFiles;
 use crate::entities::*;
 use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI};
 use crate::model::*;
@@ -29,6 +30,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct BuildOpts {
@@ -36,6 +38,7 @@ pub struct BuildOpts {
     pub mem_mb: usize,
     pub tmp: PathBuf,
     pub extras: Option<String>,
+    pub name_bundles: Option<Arc<SearchFiles>>,
     /// Directory with imp_places.u8 / imp_polys.u8 / imp_poi.u8 (the shipped importance bytes, one
     /// per record); a file left out leaves its records without them.
     pub imp_dir: Option<String>,
@@ -53,6 +56,7 @@ impl BuildOpts {
             mem_mb: DEFAULT_RUN_BUDGET_MB,
             tmp,
             extras: None,
+            name_bundles: None,
             imp_dir: None,
             area_proxy: false,
             poi_max_tier: 3,
@@ -140,13 +144,14 @@ pub struct PlacesSource<'a> {
     imp_places: Option<Mmap>,
     imp_polys: Option<Mmap>,
     extras: Option<&'a Extras>,
+    name_bundles: Option<&'a SearchFiles>,
     area_proxy: bool,
 }
 
 impl<'a> PlacesSource<'a> {
     /// Derives the boundary slots and writes them to `bnd_path` (`Boundaries`): the labelled ones
     /// in one pass over the polygons, then the unlabelled ones and their label points in another.
-    pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>, bnd_path: &Path) -> std::io::Result<Self> {
+    pub fn new(geo: &'a Index, opts: &'a BuildOpts, extras: Option<&'a Extras>, bnd_path: &Path) -> std::io::Result<Self> {
         let n_place_nodes = geo.place_node_count();
         let n_poly = geo.admin_polygon_count();
         // A hidden node that names its claiming boundary is that boundary's label point.
@@ -210,6 +215,7 @@ impl<'a> PlacesSource<'a> {
             imp_places: map_importance(dir, "imp_places.u8", n_place_nodes)?,
             imp_polys: map_importance(dir, "imp_polys.u8", n_poly)?,
             extras,
+            name_bundles: opts.name_bundles.as_deref(),
             area_proxy: opts.area_proxy,
         })
     }
@@ -222,7 +228,7 @@ impl<'a> PlacesSource<'a> {
     fn fill_slot(&self, pos: usize, e: &mut EntityBuf) -> bool {
         e.names.clear();
         let geo = self.geo;
-        let (rrefs, base_id) = {
+        let (rrefs, base_id, polygon) = {
             let Some((s, ap)) = self.bnd.at(geo, pos).and_then(|s| Some((s, polygon_raw(geo, s.poly)?))) else { return false };
             let node = s.linked().then(|| place_node_raw(geo, s.node)).flatten();
             let kind = if s.linked() { Kind::Linked } else { Kind::Area };
@@ -240,9 +246,10 @@ impl<'a> PlacesSource<'a> {
                     e.names.push((0, ORD_BOUNDARY_NAME, true, n.to_string()));
                 }
             }
-            (s.record_refs(), primary)
+            (s.record_refs(), primary, s.poly)
         };
-        fill_names(geo, self.extras, &rrefs, base_id, e)
+        let bundle = self.name_bundles.and_then(|files| files.bundle(Kind::Area, polygon));
+        fill_names(geo, self.extras, &rrefs, base_id, bundle, e)
     }
 
     /// The entity of place node `i`, `pn`; false when it is not one on its own or has no name.
@@ -257,7 +264,8 @@ impl<'a> PlacesSource<'a> {
         e.id = i;
         e.imp = W_TYPE * type_base(kind, typ, 0) + extra_importance(byte_at(&self.imp_places, i));
         e.cc_poly = pn.parent_poly_id;
-        fill_names(self.geo, self.extras, &[record_ref(KIND_PLACE_NODE, i)], pn.name_id, e)
+        let bundle = self.name_bundles.and_then(|files| files.bundle(kind, i));
+        fill_names(self.geo, self.extras, &[record_ref(KIND_PLACE_NODE, i)], pn.name_id, bundle, e)
     }
 
     /// Calls `f` with the entity of each position of [lo, hi) that is one: the boundary slots in
@@ -303,13 +311,14 @@ pub struct PoiSource<'a> {
     max_tier: u8,
     imp_poi: Option<Mmap>,
     extras: Option<&'a Extras>,
+    name_bundles: Option<&'a SearchFiles>,
 }
 
 impl<'a> PoiSource<'a> {
-    pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>) -> std::io::Result<Self> {
+    pub fn new(geo: &'a Index, opts: &'a BuildOpts, extras: Option<&'a Extras>) -> std::io::Result<Self> {
         let n = geo.poi_records.as_ref().expect("poi_records").len();
         let imp_poi = map_importance(opts.imp_dir.as_deref(), "imp_poi.u8", n)?;
-        Ok(PoiSource { geo, n, max_tier: opts.poi_max_tier, imp_poi, extras })
+        Ok(PoiSource { geo, n, max_tier: opts.poi_max_tier, imp_poi, extras, name_bundles: opts.name_bundles.as_deref() })
     }
 
     /// The entity of POI record `pos` (below `n`); false when it is not one (a tombstone, a
@@ -325,13 +334,17 @@ impl<'a> PoiSource<'a> {
         e.id = pos;
         e.imp = poi_importance(r.importance, byte_at(&self.imp_poi, pos));
         e.cc_poly = r.parent_poly_id;
-        Ok(fill_names(self.geo, self.extras, &[record_ref(KIND_POI, pos)], r.name_id, e))
+        let bundle = self.name_bundles.and_then(|files| files.bundle(Kind::Poi, pos));
+        Ok(fill_names(self.geo, self.extras, &[record_ref(KIND_POI, pos)], r.name_id, bundle, e))
     }
 }
 
 /// An entity's names: its base name, then the extra names of its records (`rrefs`, in the order
 /// `Entities::record_refs` gives them, which numbers the ordinals).
-fn fill_names(geo: &Index, extras: Option<&Extras>, rrefs: &[u32], base_id: u32, e: &mut EntityBuf) -> bool {
+fn fill_names(
+    geo: &Index, extras: Option<&Extras>, rrefs: &[u32], base_id: u32,
+    bundle: Option<crate::tags::TagBundle<'_>>, e: &mut EntityBuf,
+) -> bool {
     let base = geo.get_string(base_id);
     if !base.is_empty() {
         e.names.insert(0, (0, 0, true, base.to_string()));
@@ -340,6 +353,13 @@ fn fill_names(geo: &Index, extras: Option<&Extras>, rrefs: &[u32], base_id: u32,
         for (k, n) in x.names_of(rrefs).into_iter().enumerate() {
             let ord = if k < MAX_EXTRA_ORD as usize { k as u8 + 1 } else { MAX_NAME_ORD };
             e.names.push((n.class, ord, n.key == "name", n.name.to_string()));
+        }
+    } else if let Some(bundle) = bundle {
+        for (key, value) in bundle.iter() {
+            for name in value.split(';').map(str::trim).filter(|&name| !name.is_empty() && name != base) {
+                // These aliases match the query while the result keeps its stored name.
+                e.names.push((class_of(key), MAX_NAME_ORD, key == "name", name.to_string()));
+            }
         }
     }
     !e.names.is_empty()
@@ -1267,7 +1287,7 @@ mod tests {
             threads: 1,
             mem_mb: DEFAULT_RUN_BUDGET_MB,
             tmp: dir.clone(),
-            extras: None,
+            extras: None, name_bundles: None,
             imp_dir: None,
             area_proxy: false,
             poi_max_tier: 3,
@@ -1303,7 +1323,7 @@ mod tests {
         let geo = g.load(&dir.0.join("geo"));
         let opts = BuildOpts {
             threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"),
-            extras: Some(bin.to_str().unwrap().into()), imp_dir: None, area_proxy: false, poi_max_tier: 3,
+            extras: Some(bin.to_str().unwrap().into()), imp_dir: None, area_proxy: false, poi_max_tier: 3, name_bundles: None,
         };
 
         let err = build(&geo, &["places"], &dir.0.join("idx"), &opts).err();
@@ -1376,7 +1396,8 @@ mod tests {
         g.claim(land, capital);
         let dir = TempDir::new("entity-batches");
         let geo = g.load(&dir.0.join("geo"));
-        let src = PlacesSource::new(&geo, &BuildOpts::new(dir.0.join("tmp")), None, &dir.0.join("places.bnd")).unwrap();
+        let opts = BuildOpts::new(dir.0.join("tmp"));
+        let src = PlacesSource::new(&geo, &opts, None, &dir.0.join("places.bnd")).unwrap();
         let entities = |lo: u32, hi: u32, batch: u32| {
             let (mut e, mut out) = (EntityBuf::default(), Vec::new());
             let mut take = |e: &EntityBuf| -> Result<(), ()> {
@@ -1687,7 +1708,7 @@ mod tests {
             std::fs::write(imp.join(file), vec![200u8; n]).unwrap();
         }
         let opts = BuildOpts {
-            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), extras: None,
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), extras: None, name_bundles: None,
             imp_dir: Some(imp.to_str().unwrap().into()), area_proxy: false, poi_max_tier: 3,
         };
 
@@ -1720,7 +1741,7 @@ mod tests {
             std::fs::write(imp.join(file), vec![200u8; n]).unwrap();
         }
         let opts = BuildOpts {
-            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: out.join("tmp"), extras: None,
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: out.join("tmp"), extras: None, name_bundles: None,
             imp_dir: Some(imp.to_str().unwrap().into()), area_proxy: false, poi_max_tier: 3,
         };
 
@@ -1823,7 +1844,7 @@ mod tests {
         std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
         std::fs::write(&kept, "old places.fst").unwrap();
         let opts = BuildOpts {
-            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), extras: None,
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), extras: None, name_bundles: None,
             imp_dir: None, area_proxy: false, poi_max_tier: 3,
         };
 
@@ -1856,7 +1877,7 @@ mod tests {
         };
         let before = entries(&out);
         let opts = BuildOpts {
-            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), extras: None,
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), extras: None, name_bundles: None,
             imp_dir: None, area_proxy: false, poi_max_tier: 3,
         };
         let mut read_meta = false;
@@ -1928,7 +1949,7 @@ mod tests {
         let (imp, out) = (dir.0.join("imp"), dir.0.join("idx"));
         std::fs::create_dir_all(&imp).unwrap();
         let opts = BuildOpts {
-            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), extras: None,
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), extras: None, name_bundles: None,
             imp_dir: Some(imp.to_str().unwrap().into()), area_proxy: false, poi_max_tier: 3,
         };
         // One byte per place node, polygon and POI record.

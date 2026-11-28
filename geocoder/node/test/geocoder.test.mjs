@@ -331,6 +331,33 @@ test('a missing index is built on the device', async () => {
   assert.deepEqual(await names(geocoder, 'testville'), ['Testville']);
 });
 
+test('the selected name tier supplies aliases to an index built on the device', async () => {
+  const dir = dataset(['Testville', 'Otherton']);
+  const tags = (bundle) => fcc2([Buffer.from(bundle)]);
+  const tier = join(dir, 'strings_tags_core.bin');
+  writeFileSync(tier, tags('name:en\x1fEnglishville\x1eref\x1fTV42'));
+  // Row 1 holds offset 0. Row 0 has no tag values.
+  const mask = Buffer.alloc(8);
+  mask.writeBigUInt64LE(2n);
+  writeFileSync(join(dir, 'place_tags.bin'), Buffer.concat([
+    Buffer.from([2]), mask, Buffer.from([0]), u32(0), Buffer.from([0]), u32(0), u32(2), Buffer.from('STG1'),
+  ]));
+
+  const en = Geocoder.load(dir);
+  assert.equal(await en.openPlaceSearch(), 'built');
+  assert.deepEqual(await names(en, 'Englishville'), ['Testville']);
+  assert.deepEqual(await names(en, 'Altville'), []);
+  assert.deepEqual(await names(en, 'TV42'), ['Testville']);
+
+  writeFileSync(tier + '.new', tags('alt_name\x1fAltville\x1ename:en\x1fEnglishville\x1eref\x1fTV42'));
+  renameSync(tier + '.new', tier);
+  const all = Geocoder.load(dir);
+  assert.equal(await all.openPlaceSearch(), 'built');
+  assert.deepEqual(await names(all, 'Englishville'), ['Testville']);
+  assert.deepEqual(await names(all, 'Altville'), ['Testville']);
+  assert.deepEqual(await names(all, 'Testville'), ['Testville']);
+});
+
 test('an index shipped for these files is used as is', async () => {
   const ci = dataset(['Testville', 'Otherton']);
   await Geocoder.load(ci).openPlaceSearch();

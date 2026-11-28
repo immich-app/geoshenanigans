@@ -691,3 +691,34 @@ fn an_unranked_area_uses_its_label_points_country_for_its_search_rank() {
     assert_eq!(core.record(id, &records).unwrap().rank_search, 10);
     assert!(!core.areas.ranges(county).any(|r| r.contains(&id)));
 }
+
+#[test]
+fn core_terms_follow_the_selected_name_tier() {
+    let tmp = TempDir::new("name-tiers");
+    let out = tmp.0.join("index");
+    let opts = BuildOpts::new(tmp.0.join("runs"));
+    for names in ["all", "en"] {
+        let set = tmp.0.join(names);
+        let mut g = Geo::default();
+        let city = g.place("Mainville", 0, 0.4, 0.4);
+        let poi = g.poi("Main Hall", 0.6, 0.6, 0);
+        if names == "all" {
+            g.place_tags(city, &[("alt_name", "Oldville"), ("name:en", "Englishville"), ("ref", "MAINREF")]);
+            g.poi_tags(poi, &[("alt_name", "Oldhall"), ("name:en", "English Hall")]);
+        } else {
+            g.place_tags(city, &[("name:en", "Englishville"), ("ref", "MAINREF")]);
+            g.poi_tags(poi, &[("name:en", "English Hall")]);
+        }
+        let geo = g.load(&set);
+        let stamps = crate::dataset::core_stamps(&set).unwrap();
+        build_core(&geo, &stamps, &set, &out, Profile::Immich, &opts).unwrap();
+        let core = crate::dataset::read_core(&set, &out, Profile::Immich).unwrap();
+        for term in ["mainville", "main hall", "englishville", "english hall", "mainref"] {
+            assert!(!core.terms.exact(TermKind::Word, term).is_empty(), "{names}: {term}");
+        }
+        for term in ["oldville", "oldhall"] {
+            assert_eq!(core.terms.exact(TermKind::Word, term).is_empty(), names == "en", "{names}: {term}");
+        }
+    }
+    assert!(crate::dataset::read_core(&tmp.0.join("all"), &out, Profile::Immich).is_err());
+}

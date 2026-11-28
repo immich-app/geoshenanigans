@@ -308,7 +308,7 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
     let held = HeldIndexDir::take(index, Contended::Wait)?;
     let cache = index.join(HASH_CACHE_FILE);
     let mut hashes = HashCache::load(&cache);
-    let search_files = SearchFiles::open(dir, geo)?;
+    let search_files = Arc::new(SearchFiles::open(dir, geo)?);
     let have = fingerprint_loaded(dir, loaded, &mut hashes)?;
 
     // Held, so an unfinished publish is a dead build's: some files there may be its own and some
@@ -330,7 +330,10 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
             _ => {}
         }
         let _ = std::fs::remove_dir_all(index.join(BUILD_STAGE_DIR));
-        let opts = BuildOpts { threads: on_device.threads, mem_mb: on_device.mem_mb, ..BuildOpts::new(index.join("tmp")) };
+        let opts = BuildOpts {
+            threads: on_device.threads, mem_mb: on_device.mem_mb, name_bundles: Some(search_files.clone()),
+            ..BuildOpts::new(index.join("tmp"))
+        };
         let meta = index_meta(geo, &opts, &have);
         build_held(geo, &held_subs(geo, PLACES_SUB_INDEXES), &held, &opts, || Ok(meta.into()))?;
         Origin::Built

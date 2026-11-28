@@ -147,7 +147,7 @@ impl Iso {
 
 pub struct SearchIndex<'g> {
     pub geo: &'g Index,
-    pub search_files: crate::dataset::SearchFiles,
+    pub search_files: std::sync::Arc<crate::dataset::SearchFiles>,
     pub places: SubIndex,
     pub poi: Option<SubIndex>,
     pub ents: Entities<'g>,

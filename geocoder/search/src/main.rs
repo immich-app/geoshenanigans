@@ -95,6 +95,8 @@ fn cmd_build(args: &[String]) {
         std::process::exit(2)
     });
     let subs = held_subs(&geo, selected);
+    let names = place_search::dataset::SearchFiles::open(Path::new(set), &geo).unwrap_or_else(|e| panic!("{e}"));
+    let opts = BuildOpts { name_bundles: Some(std::sync::Arc::new(names)), ..opts };
     let meta = || place_search::dataset::merged_meta(&geo, &loaded, &opts, Path::new(set), &out, &subs);
     let stats = build_all(&geo, &subs, &out, &opts, meta).unwrap_or_else(|e| panic!("{e}"));
     for (s, st) in &stats {
