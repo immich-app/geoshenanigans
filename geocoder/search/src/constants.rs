@@ -282,3 +282,24 @@ pub const TYPO_ANCHOR_LONG: usize = 2;
 /// difference over DIRECTION_TWO_SLOT_DIVISOR or a regression over more (query.py:24-25, 383-396).
 pub const DIRECTION_MAX_SLOTS: usize = 50;
 pub const DIRECTION_TWO_SLOT_DIVISOR: f64 = 3.0;
+/// Readings (token_assignment.py): a house number with two partial ranges on the side its
+/// reading puts the name pays HOUSENUMBER_TWO_PRIORS_PENALTY, one with more is no reading
+/// (:210-243); one with a near item pays HOUSENUMBER_NEAR_ITEM_PENALTY (:244-245).
+pub const HOUSENUMBER_PRIORS_MAX: usize = 2;
+pub const HOUSENUMBER_TWO_PRIORS_PENALTY: f64 = 0.8;
+pub const HOUSENUMBER_NEAR_ITEM_PENALTY: f64 = 1.0;
+/// A postcode search with an address pays POSTCODE_LATE_PENALTY when the postcode comes last and
+/// POSTCODE_EXTRA_ADDRESS_PENALTY for each address range past the first (:256-265); an address
+/// reading with the postcode first pays POSTCODE_FIRST_PENALTY (:379-381).
+pub const POSTCODE_LATE_PENALTY: f64 = 0.1;
+pub const POSTCODE_EXTRA_ADDRESS_PENALTY: f64 = 0.1;
+pub const POSTCODE_FIRST_PENALTY: f64 = 0.1;
+/// A name split off the first range pays SPLIT_PENALTY with a house number after it or commas in
+/// the query; one split off the last range SPLIT_AFTER_HOUSENUMBER_PENALTY with a house number
+/// before it and SPLIT_PENALTY with commas (:297-301, 343-346).
+pub const SPLIT_PENALTY: f64 = 0.25;
+pub const SPLIT_AFTER_HOUSENUMBER_PENALTY: f64 = 0.4;
+/// The house-number search of a reading costs its best address reading's penalty, at most its own
+/// plus HOUSENUMBER_READING_SPAN, and HOUSENUMBER_READING_PENALTY more (:383, 397-399).
+pub const HOUSENUMBER_READING_SPAN: f64 = 2.0;
+pub const HOUSENUMBER_READING_PENALTY: f64 = 0.1;
