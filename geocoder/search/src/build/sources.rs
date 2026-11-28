@@ -130,14 +130,22 @@ pub struct CoreRecords<'a> {
 }
 impl<'a> CoreRecords<'a> {
     pub fn open(geo: &'a Index, set: &Path) -> io::Result<Self> {
-        Self::with_areas(geo, set, None)
+        Self::with_areas(geo, set, None, false)
+    }
+    pub(super) fn for_build(geo: &'a Index, set: &Path) -> io::Result<Self> {
+        Self::with_areas(geo, set, None, true)
     }
     /// A resolver for the same generation as the index's entities and outline bounds.
     pub fn for_index(geo: &'a Index, set: &Path, core: &'a crate::index::CoreIndex) -> io::Result<Self> {
-        Self::with_areas(geo, set, (core.areas.profile == crate::profile::Profile::Full).then_some(&core.areas))
+        Self::with_areas(geo, set, (core.areas.profile == crate::profile::Profile::Full).then_some(&core.areas), false)
     }
 
-    fn with_areas(geo: &'a Index, set: &Path, areas: Option<&'a crate::index::areas::AreaRanges>) -> io::Result<Self> {
+    fn with_areas(
+        geo: &'a Index,
+        set: &Path,
+        areas: Option<&'a crate::index::areas::AreaRanges>,
+        sequential: bool,
+    ) -> io::Result<Self> {
         let sizes =
             [geo.place_node_count(), geo.admin_polygon_count(), geo.poi_records.as_ref().map_or(0, |p| p.len())];
         let mut osm = [None, None, None];
@@ -146,7 +154,13 @@ impl<'a> CoreRecords<'a> {
                 *map = OsmRows::open(&set.join(file), n)?;
             }
         }
-        Ok(Self { geo, files: crate::dataset::SearchFiles::open(set, geo).map_err(invalid)?, sizes, areas, osm })
+        Ok(Self {
+            geo,
+            files: crate::dataset::SearchFiles::with_access(set, geo, sequential).map_err(invalid)?,
+            sizes,
+            areas,
+            osm,
+        })
     }
     pub(super) fn row(&self, e: EntityRef) -> Option<SourceRow> {
         let i = e.record();
@@ -177,6 +191,9 @@ impl<'a> CoreRecords<'a> {
             EntityKind::Poi => crate::model::Kind::Poi,
             _ => unreachable!(),
         }
+    }
+    pub(super) fn bundle_id(&self, e: EntityRef) -> Option<u32> {
+        self.files.bundle_id(Self::kind(e), e.record())
     }
     pub(super) fn tags(&self, e: EntityRef) -> Option<TagBundle<'_>> {
         self.files.bundle(Self::kind(e), e.record())

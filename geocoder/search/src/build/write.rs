@@ -193,7 +193,7 @@ pub(crate) fn build_core_held(
             .expect("scratch directory number overflow")?;
         let built = (|| -> io::Result<()> {
             let start = Instant::now();
-            let records = CoreRecords::open(geo, set)?;
+            let records = CoreRecords::for_build(geo, set)?;
             let n = chains::build(&records, set, &stage, &tmp, opts, profile)?;
             let chain_s = start.elapsed().as_secs_f64();
             let stats = terms::build(records, &stage, &tmp, opts, n, profile)?;
@@ -216,6 +216,8 @@ pub(crate) fn build_core_held(
                     "fst_s": stats.fst_s,
                     "prefix_s": stats.prefix_s,
                     "sort_runs": stats.sort_runs,
+                    "spilled_bytes": stats.spilled_bytes,
+                    "rewritten_bytes": stats.rewritten_bytes,
                     "merge_passes": stats.merge_passes,
                     "bytes": bytes,
                     "chain_s": chain_s,

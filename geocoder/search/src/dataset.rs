@@ -41,12 +41,23 @@ pub struct SearchFiles {
 
 impl SearchFiles {
     pub fn open(dir: &Path, geo: &Index) -> Result<Self, String> {
+        Self::with_access(dir, geo, false)
+    }
+
+    pub(crate) fn with_access(dir: &Path, geo: &Index, sequential: bool) -> Result<Self, String> {
         let mut files = Self::default();
-        let counts = [geo.place_node_count(), geo.admin_polygon_count(), geo.poi_records.as_ref().map_or(0, |p| p.len())];
+        let counts =
+            [geo.place_node_count(), geo.admin_polygon_count(), geo.poi_records.as_ref().map_or(0, |p| p.len())];
         let optional = |name: &str| {
             let path = dir.join(name);
-            if !path.try_exists().map_err(|e| e.to_string())? { return Ok(None); }
-            query_server::mmap_file(path.to_str().ok_or("invalid dataset path")?).map(Some)
+            if !path.try_exists().map_err(|e| e.to_string())? {
+                return Ok(None);
+            }
+            let bytes = query_server::mmap_file(path.to_str().ok_or("invalid dataset path")?)?;
+            if sequential {
+                bytes.advise_in_order(true);
+            }
+            Ok::<_, String>(Some(bytes))
         };
         for (i, name) in [PLACE_TAGS_FILE, ADMIN_TAGS_FILE, POI_TAGS_FILE].into_iter().enumerate() {
             for (file, col) in [(name, &mut files.tags[i]), (IMPORTANCE_FILES[i], &mut files.wiki[i])] {
@@ -78,9 +89,13 @@ impl SearchFiles {
     /// Place rows, admin slots and POI rows respectively.
     pub fn bundle(&self, kind: crate::model::Kind, row: u32) -> Option<crate::tags::TagBundle<'_>> {
         let k = Self::column(kind);
-        let offset = self.tags[k].as_ref()?.get(row)?;
+        let offset = self.bundle_id(kind, row)?;
         let (base, tier) = self.tiers[usize::from(k == 2)].as_ref()?;
         crate::tags::TagBundle::parse(tier.get(offset.checked_sub(*base)?))
+    }
+
+    pub(crate) fn bundle_id(&self, kind: crate::model::Kind, row: u32) -> Option<u32> {
+        self.tags[Self::column(kind)].as_ref()?.get(row).filter(|&v| v != query_server::NO_DATA)
     }
 
     pub fn wiki_importance(&self, kind: crate::model::Kind, row: u32) -> Option<u32> {
