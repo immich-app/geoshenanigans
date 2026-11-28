@@ -137,7 +137,8 @@ pub(super) fn build(
             let Some((lat, lon)) = row.point(records.geo) else { continue };
             key.clear();
             if let Some(ids) = &ids {
-                let id = ids.get(i).filter(|&id| id != NO_DATA).ok_or_else(|| invalid("incomplete shipped chain files"))?;
+                let id =
+                    ids.get(i).filter(|&id| id != NO_DATA).ok_or_else(|| invalid("incomplete shipped chain files"))?;
                 key.extend_from_slice(&id.to_be_bytes());
             } else {
                 for field in points.get(lat, lon) {
@@ -166,7 +167,9 @@ pub(super) fn build(
         let file = std::fs::File::options().read(true).write(true).create_new(true).open(tmp.join("bounds"))?;
         file.set_len(u64::from(records.geo.admin_polygon_count()) * BBOX_BYTES as u64)?;
         Some(file)
-    } else { None };
+    } else {
+        None
+    };
     while let Some([packed, rank]) = input.next(&mut key)? {
         if prev.as_ref() != Some(&key) {
             transition(&mut parents, 0, n, &mut ranges)?;
@@ -223,7 +226,11 @@ pub(super) fn build(
                     let parents = points.get(lat, lon);
                     if parents != last {
                         for s in parents.iter().filter_map(|v| v.checked_sub(1)).filter(|s| !slots.contains(s)) {
-                            if !records.geo.admin_polygon(s).is_some_and(|p| p.rank_address != 0 && p.rank_address < max_rank) {
+                            if !records
+                                .geo
+                                .admin_polygon(s)
+                                .is_some_and(|p| p.rank_address != 0 && p.rank_address < max_rank)
+                            {
                                 continue;
                             }
                             if let Err(e) = ranges.push(&[], [s, n, end]) {

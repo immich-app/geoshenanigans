@@ -55,7 +55,8 @@ fn core_membership_counts_and_names_follow_the_dataset() {
             if e.kind() == EntityKind::Area && e.record() == city {
                 assert!(west.contains(&id));
             }
-            let slots: BTreeSet<_> = hits.into_iter().filter(|p| p.poly.rank_address < max_rank).map(|p| p.slot).collect();
+            let slots: BTreeSet<_> =
+                hits.into_iter().filter(|p| p.poly.rank_address < max_rank).map(|p| p.slot).collect();
             let chain = core.chains.of_entity(id).unwrap();
             let levels: [Vec<u32>; 16] = std::array::from_fn(|level| {
                 chain
@@ -229,7 +230,9 @@ fn a_city_crossing_the_county_line_is_in_both_counties_in_the_full_profile() {
         assert_eq!(counties, if profile == Profile::Full { 2 } else { 1 });
         for id in 0..core.entities.len() {
             let e = core.entities.get(id).unwrap();
-            if e.kind() != EntityKind::Area { continue; }
+            if e.kind() != EntityKind::Area {
+                continue;
+            }
             let member = |s| core.areas.ranges(s).any(|r| r.contains(&id));
             if [west, east].contains(&e.record()) {
                 assert!(!member(west) && !member(east));
@@ -422,14 +425,17 @@ fn full_records_read_outline_bounds_and_optional_host_object_ids() {
     let stamps = crate::dataset::load(&tmp.0, || Ok(())).unwrap().1;
     build_core(&geo, &stamps, &tmp.0, &out, Profile::Full, &BuildOpts::new(out.join("tmp"))).unwrap();
     let core = CoreIndex::open(&out).unwrap();
-    let mut expected = BBox { min_lat: f64::INFINITY, min_lon: f64::INFINITY, max_lat: f64::NEG_INFINITY, max_lon: f64::NEG_INFINITY };
-    geo.admin_geometry.for_each_vertex(&geo.admin_polygon(poly).unwrap(), |v| {
-        let (lat, lon) = v.degrees();
-        expected.min_lat = expected.min_lat.min(lat);
-        expected.max_lat = expected.max_lat.max(lat);
-        expected.min_lon = expected.min_lon.min(lon);
-        expected.max_lon = expected.max_lon.max(lon);
-    }).unwrap();
+    let mut expected =
+        BBox { min_lat: f64::INFINITY, min_lon: f64::INFINITY, max_lat: f64::NEG_INFINITY, max_lon: f64::NEG_INFINITY };
+    geo.admin_geometry
+        .for_each_vertex(&geo.admin_polygon(poly).unwrap(), |v| {
+            let (lat, lon) = v.degrees();
+            expected.min_lat = expected.min_lat.min(lat);
+            expected.max_lat = expected.max_lat.max(lat);
+            expected.min_lon = expected.min_lon.min(lon);
+            expected.max_lon = expected.max_lon.max(lon);
+        })
+        .unwrap();
     assert_eq!(core.areas.bbox(poly), Some(expected));
     assert_eq!(core.areas.bbox(unused), None);
     assert_eq!(core.areas.bbox(u32::MAX), None);

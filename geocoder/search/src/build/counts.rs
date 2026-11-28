@@ -1,7 +1,12 @@
 use super::write::TableWriter;
-use crate::{index::invalid, sort::ExternalSort, varint};
 use crate::constants::{BBOX_BYTES, BBOX_COORDS};
-use std::{fs::File, io::{self, BufReader, Seek, Read}, ops::Range, path::Path};
+use crate::{index::invalid, sort::ExternalSort, varint};
+use std::{
+    fs::File,
+    io::{self, BufReader, Read, Seek},
+    ops::Range,
+    path::Path,
+};
 
 /// The input intervals arrive in start order. Only their rightmost covered point
 /// is needed to count the union, even for a word shared by nested polygons.
@@ -16,13 +21,21 @@ impl Coverage {
         self.end = self.end.max(end);
     }
 }
-pub(super) fn write(sort: ExternalSort<[u32; 3]>, out: &Path, tmp: &Path, slots: u32, mut bounds: Option<File>) -> io::Result<()> {
+pub(super) fn write(
+    sort: ExternalSort<[u32; 3]>,
+    out: &Path,
+    tmp: &Path,
+    slots: u32,
+    mut bounds: Option<File>,
+) -> io::Result<()> {
     let mut rows = sort.finish()?.merge(tmp, "area-merge")?;
     let mut key = Vec::new();
     let mut next = rows.next(&mut key)?;
     let mut table = TableWriter::new(out, "core.area", tmp)?;
     let mut bytes = Vec::new();
-    if let Some(file) = &mut bounds { file.rewind()?; }
+    if let Some(file) = &mut bounds {
+        file.rewind()?;
+    }
     let mut bounds = bounds.map(BufReader::new);
     let mut fields = vec![0; if bounds.is_some() { BBOX_COORDS } else { 0 }];
     for slot in 0..slots {

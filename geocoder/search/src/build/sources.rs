@@ -57,8 +57,11 @@ impl SourceRow {
             Self::Area(a) if a.rank_address == 0 => {
                 // Approximate geometry_to_rank by rank_search. Even a country outside
                 // the address hierarchy can supply the country's search rank rules.
-                let country = self.country().or_else(|| geo.find_admin(point.0, point.1).country_code)
-                    .unwrap_or_default().map(|b| b.to_ascii_uppercase());
+                let country = self
+                    .country()
+                    .or_else(|| geo.find_admin(point.0, point.1).country_code)
+                    .unwrap_or_default()
+                    .map(|b| b.to_ascii_uppercase());
                 query_server::area_search_rank(&a, std::str::from_utf8(&country).unwrap_or(""))
             }
             Self::Area(a) => a.rank_address,

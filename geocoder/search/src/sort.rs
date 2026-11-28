@@ -223,7 +223,9 @@ impl<R: SortRecord> SortedRuns<R> {
     }
 
     /// Total worker time spent sorting and writing the initial runs.
-    pub fn spill_time(&self) -> std::time::Duration { self.spill_time }
+    pub fn spill_time(&self) -> std::time::Duration {
+        self.spill_time
+    }
 
     /// Takes over `other`'s runs, after this one's.
     pub fn append(&mut self, mut other: SortedRuns<R>) {
@@ -274,9 +276,11 @@ impl<R: SortRecord> Merged<R> {
     pub fn rewritten_bytes(&self) -> u64 {
         self.rewritten
     }
-    /// Merge depth including the final streaming scan, zero for an empty input.
-    pub fn passes(&self) -> usize { self.passes }
 
+    /// Merge depth including the final streaming scan, zero for an empty input.
+    pub fn passes(&self) -> usize {
+        self.passes
+    }
 
     /// The next entry's record and its key in `key`, or None at the end. A run read failure
     /// returns the same error on this and all subsequent calls.

@@ -388,7 +388,14 @@ pub(super) struct TermStats {
     pub merge_passes: usize,
 }
 
-pub(super) fn build(records: CoreRecords, out: &Path, tmp: &Path, opts: &BuildOpts, n: u32, profile: crate::profile::Profile) -> io::Result<TermStats> {
+pub(super) fn build(
+    records: CoreRecords,
+    out: &Path,
+    tmp: &Path,
+    opts: &BuildOpts,
+    n: u32,
+    profile: crate::profile::Profile,
+) -> io::Result<TermStats> {
     let start = Instant::now();
     let rows = map(&tmp.join("records"))?;
     let areas = AreaRanges::open(out, n, profile)?;
@@ -418,7 +425,8 @@ pub(super) fn build(records: CoreRecords, out: &Path, tmp: &Path, opts: &BuildOp
 
 fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<TermStats> {
     let start = Instant::now();
-    let mut stats = TermStats { sort_runs: names.len(), sort_s: names.spill_time().as_secs_f64(), ..TermStats::default() };
+    let mut stats =
+        TermStats { sort_runs: names.len(), sort_s: names.spill_time().as_secs_f64(), ..TermStats::default() };
     let mut rows = names.merge(tmp, "name-merge")?;
     stats.merge_s = start.elapsed().as_secs_f64();
     stats.merge_passes = rows.passes();
@@ -473,7 +481,9 @@ fn merge(names: SortedRuns<Occurrence>, out: &Path, tmp: &Path) -> io::Result<Te
             }
             list.add(*row)?;
         }
-        if count < batch.len() { break; }
+        if count < batch.len() {
+            break;
+        }
     }
     flush(&prev, &mut list)?;
     fst.finish()?;

@@ -210,7 +210,10 @@ pub(crate) fn core_fingerprint(dir: &Path, loaded: &Stamps, hashes: &mut HashCac
 }
 
 fn checked_fingerprint(
-    dir: &Path, loaded: &Stamps, stamps: fn(&Path) -> std::io::Result<Stamps>, fingerprint: impl FnOnce() -> std::io::Result<Fingerprint>,
+    dir: &Path,
+    loaded: &Stamps,
+    stamps: fn(&Path) -> std::io::Result<Stamps>,
+    fingerprint: impl FnOnce() -> std::io::Result<Fingerprint>,
 ) -> Result<Fingerprint, String> {
     let io = |e: std::io::Error| format!("{}: {e}", dir.display());
     let unchanged = || match stamps(dir).map_err(|e| e.to_string())? {

@@ -79,7 +79,8 @@ impl CoreIndex {
         if meta[META_FORMAT_KEY] != INDEX_FORMAT {
             return Err(invalid("expected a format 3 index"));
         }
-        let profile = meta["profile"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| invalid("unknown core profile"))?;
+        let profile =
+            meta["profile"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| invalid("unknown core profile"))?;
         let entities = entities::EntityTable::open(dir)?;
         Ok(Self {
             chains: chains::ChainTable::open(dir, entities.len())?,
