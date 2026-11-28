@@ -1,6 +1,6 @@
 use crate::{
     constants::*,
-    index::{entities::*, invalid},
+    index::{areas::AreaLabel, entities::*, invalid},
     model::PLACE_NODE_TYPES,
     tags::TagBundle,
 };
@@ -211,7 +211,7 @@ impl<'a> CoreRecords<'a> {
     pub(crate) fn candidate_importance(&self, e: EntityRef) -> Option<u32> {
         let row = self.row(e)?;
         let label = self.area_label(e);
-        let point = label.map(|(p, _)| p).or_else(|| row.point(self.geo))?;
+        let point = label.map(|label| label.point).or_else(|| row.point(self.geo))?;
         if self.geo.get_string(row.name_id()).is_empty() {
             return None;
         }
@@ -220,7 +220,7 @@ impl<'a> CoreRecords<'a> {
         }
         let cc = match row {
             SourceRow::Area(_) => label
-                .map(|(_, cc)| cc)
+                .map(|label| label.country)
                 .unwrap_or_else(|| row.country().or_else(|| self.geo.find_admin(point.0, point.1).country_code)),
             _ => None,
         };
@@ -228,7 +228,7 @@ impl<'a> CoreRecords<'a> {
         Some(Self::default_importance(row, std::str::from_utf8(&cc).unwrap_or("")))
     }
 
-    fn area_label(&self, e: EntityRef) -> Option<((f64, f64), Option<[u8; 2]>)> {
+    fn area_label(&self, e: EntityRef) -> Option<AreaLabel> {
         if e.kind() == EntityKind::Area {
             self.areas?.label(e.record())
         } else {
@@ -243,10 +243,10 @@ impl Entities for CoreRecords<'_> {
     fn read_in_chain(&self, e: EntityRef, outer_slot: Option<u32>) -> Option<EntityRecord<'_>> {
         let row = self.row(e)?;
         let label = self.area_label(e);
-        let point = label.map(|(point, _)| point).or_else(|| row.point(self.geo))?;
+        let point = label.map(|label| label.point).or_else(|| row.point(self.geo))?;
         // A point chain starts with its containing country. An area's parent chain can
         // cross a border away from its label point, and a closed country way can have no rank.
-        let mut country_code = label.map(|(_, cc)| cc).unwrap_or_else(|| {
+        let mut country_code = label.map(|label| label.country).unwrap_or_else(|| {
             row.country()
                 .or_else(|| {
                     if matches!(row, SourceRow::Area(_)) {

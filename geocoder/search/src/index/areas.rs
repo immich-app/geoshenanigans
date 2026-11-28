@@ -4,6 +4,12 @@ use crate::{
     profile::Profile,
 };
 use std::{io, ops::Range, path::Path};
+#[derive(Clone, Copy)]
+pub(crate) struct AreaLabel {
+    pub point: (f64, f64),
+    pub country: Option<[u8; 2]>,
+}
+
 pub struct AreaRanges {
     table: BlobTable,
     entities: u32,
@@ -25,7 +31,7 @@ impl AreaRanges {
         let (max_lat, max_lon) = query_server::PointE7 { lat: coord(2)?, lng: coord(3)? }.degrees();
         (min_lat < max_lat && min_lon < max_lon).then_some(BBox { min_lat, min_lon, max_lat, max_lon })
     }
-    pub(crate) fn label(&self, slot: u32) -> Option<((f64, f64), Option<[u8; 2]>)> {
+    pub(crate) fn label(&self, slot: u32) -> Option<AreaLabel> {
         self.bbox(slot)?;
         let row = slot as usize;
         let coord = |offset| {
@@ -36,7 +42,8 @@ impl AreaRanges {
         let lat = coord(BBOX_BYTES)?;
         let lon = coord(BBOX_BYTES + size_of::<f64>())?;
         let code = u16::try_from(self.table.field(row, BBOX_BYTES + 2 * size_of::<f64>())?).ok()?;
-        query_server::coords_in_range(lat, lon).then_some(((lat, lon), query_server::country_code_bytes(code)))
+        query_server::coords_in_range(lat, lon)
+            .then_some(AreaLabel { point: (lat, lon), country: query_server::country_code_bytes(code) })
     }
     /// Disjoint half-open ranges, including any sampled intersections.
     pub fn ranges(&self, slot: u32) -> impl Iterator<Item = Range<u32>> + '_ {

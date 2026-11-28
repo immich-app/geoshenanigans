@@ -388,6 +388,10 @@ pub const ENTITY_BLOCK_ROWS: u32 = 128;
 pub const CORE_KIND_BITS: u32 = 2;
 pub const KINDS_PER_BYTE: u32 = u8::BITS / CORE_KIND_BITS;
 pub const ENTITY_HEADER_BYTES: usize = ENTITY_MAGIC.len() + size_of::<u32>();
+/// Bound the off-thread reads and scratch space of a broad, cold posting walk.
+pub const SCORE_BATCH_ROWS: usize = 1024;
+pub const SCORE_MIN_ROWS_PER_READER: usize = 64;
+pub const SCORE_READERS: usize = 4;
 pub const SKIP_EVERY: u32 = 128;
 pub const TOPK_MIN_DF: u32 = 1024;
 pub const TOPK_PER_TERM: usize = 256;

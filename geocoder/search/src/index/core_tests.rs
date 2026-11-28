@@ -819,3 +819,34 @@ fn ranking_reads_only_eligible_records_and_returns_the_resolved_importance() {
         }
     }
 }
+
+#[test]
+fn batch_ranking_preserves_input_order_and_missing_records() {
+    let tmp = TempDir::new("batch-ranking");
+    let set = tmp.0.join("dataset");
+    let mut f = Geo::default();
+    for i in 0..400 {
+        f.poi(&format!("Store {i}"), 1., 1., 0);
+    }
+    let geo = f.load(&set);
+    build_core(
+        &geo,
+        &crate::dataset::core_stamps(&set).unwrap(),
+        &set,
+        &tmp.0,
+        Profile::Full,
+        &BuildOpts::new(tmp.0.join("runs")),
+    )
+    .unwrap();
+    let core = CoreIndex::open(&tmp.0).unwrap();
+    let records = CoreRecords::for_index(&geo, &set, &core).unwrap();
+    let ids = (0..402).rev().chain([17, 18, 17]).collect::<Vec<_>>();
+    for batch in [&ids[..], &ids[..1], &[]] {
+        let mut found = Vec::new();
+        core.rank_candidates(batch, &records, |id, score| found.push((id, score)));
+        assert_eq!(
+            found,
+            batch.iter().filter_map(|&id| Some((id, core.candidate_importance(id, &records)?))).collect::<Vec<_>>()
+        );
+    }
+}
